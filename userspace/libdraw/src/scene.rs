@@ -204,7 +204,13 @@ pub fn render_reference() -> MemFramebuffer {
 /// is cleared to comes from the theme, and the theme's ground between windows went from
 /// `#0E141B` to `#2A5570` — so every pixel of the scene not covered by a surface changed. That
 /// is the reason, and it is the whole reason: no surface moved.
-pub const REFERENCE_HASH: u64 = 0xbe4c_6dbe_8ed2_8ecd;
+///
+/// **Moved 2026-09-18 (desktop refresh, Part A): the desktop's ground took the design's.**
+/// `#2A5570` to `#13525D`, the deep teal of the design's wallpaper — the same single cause as
+/// the move above, and again no surface moved. The scene's surfaces carry their own colours
+/// rather than the theme's, so the refresh's new palette reaches this number only through the
+/// ground.
+pub const REFERENCE_HASH: u64 = 0x4c11_d044_5f77_996e;
 
 /// Hash the reference scene.
 pub fn reference_hash() -> u64 {

@@ -59,6 +59,16 @@ pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow::single
 /// every consumer to a runtime lookup for a value that has not changed since boot.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Theme {
+    /// Which of the two built-in palettes this theme starts from.
+    ///
+    /// **A field and not only a key**, because two things need it after the file is read. The
+    /// compositor draws a window's shadow from compiled values and never sees the file (M11
+    /// decision 1), and the design's shadow is much darker on a dark desktop — so the shell has
+    /// to tell it which scheme is in force. And a theme handed on the wire has to say which
+    /// palette it came from, or a reader has no way to know what the washes derived from
+    /// [`accent`](Self::accent) should be.
+    pub scheme: Scheme,
+
     // ---- surfaces ----
     /// What a damaged region is cleared to — a window's own ground.
     ///
@@ -72,6 +82,14 @@ pub struct Theme {
     pub background: Rgb,
     /// Text and other ink.
     pub foreground: Rgb,
+    /// Ink that should be read second: a menu's section headers, a path beside a place's name, a
+    /// file's size beside its name.
+    ///
+    /// **The design's `--fgdim`, and its most-used colour after the foreground** — sixty-seven
+    /// uses in the page. A secondary column in the foreground colour competes with the column it
+    /// annotates; derived from the foreground by a shade, it would be a different amount of
+    /// "dim" on a light ground from a dark one, which the two palettes' own values show it is not.
+    pub foreground_dim: Rgb,
 
     // ---- widgets ----
     /// A button's face at rest.
@@ -80,8 +98,15 @@ pub struct Theme {
     pub face_hover: Rgb,
     /// Its face while held.
     pub face_pressed: Rgb,
-    /// The ring drawn around the focused widget.
-    pub focus_ring: Rgb,
+    /// **The one colour of emphasis**: the ring around the focused widget, the caret, and the
+    /// colour the selection and the hover washes are made from.
+    ///
+    /// **It replaced `focus_ring` and `selection` in the desktop refresh**, which is the design's
+    /// own model: its page stores one accent and *computes* the selection (`accent` at 20%) and
+    /// the hover (`accent` at 10%, 18% in the dark scheme) from it, so a person who changes the
+    /// accent changes all three. Storing them would be storing a computation, and a file that
+    /// named all three could set them out of step. See [`selection`](Theme::selection).
+    pub accent: Rgb,
     /// A list's ground — the paper its rows sit on.
     ///
     /// **It was the scrollbar's groove as well until M15**, and this field's own note said why
@@ -103,15 +128,15 @@ pub struct Theme {
     /// why it is a colour rather than a derivation. A sidebar drawn in the list's ground is a
     /// list with a gap in it; what makes it read as chrome is that it is plainly not paper.
     pub sidebar: Rgb,
+    /// The ground of the desktop's own bars — the top panel and the bottom one.
+    ///
+    /// **Not [`sidebar`](Self::sidebar), and not [`face`](Self::face)**, which the refresh's detail
+    /// pass left as an open question and the design's two palettes answer: in the light scheme the
+    /// panel is *lighter* than a button's face and in the dark one it is the darkest surface on
+    /// the screen, so no fixed shade of either field produces it.
+    pub panel: Rgb,
     /// A scrollbar's thumb.
     pub thumb: Rgb,
-    /// The background behind selected text.
-    ///
-    /// **A background rather than an inverted foreground**, which is what a terminal does: a
-    /// terminal owns every cell's colours and can swap them, while a toolkit draws text over
-    /// whatever a widget's own layers put down. Darker than [`focus_ring`](Self::focus_ring) so
-    /// black text stays legible on it — the one constraint a selection colour actually has.
-    pub selection: Rgb,
 
     // ---- syntax highlighting ----
     //
@@ -141,8 +166,26 @@ pub struct Theme {
     /// colour in an `nxsh` file; a kind shared by every language would not have caught it.
     pub syntax_variable: Rgb,
 
+    // ---- state ----
+    /// Something working as it should — a running window's dot in the window list.
+    pub ok: Rgb,
+    /// Something that destroys or reaches past the person's own files — a destructive menu item,
+    /// and `Root` in the Places menu.
+    ///
+    /// **Legible as text on every ground a menu can have**, which is why the dark scheme's is not
+    /// the design's. The design uses one `--deny` for both palettes, at 2.9:1 on its dark ground,
+    /// because the one place it drew `deny` as text was `End session` — which was dropped. Here
+    /// it colours destructive menu items, so it has to be read.
+    ///
+    /// The design's `--warn` has no field: it is defined in the page and used nowhere in it.
+    pub deny: Rgb,
+
     // ---- window chrome ----
     /// A title bar's face while its window holds the keyboard.
+    ///
+    /// **The accent, washed over the face** — the refresh's one deliberate divergence from the
+    /// design, which barely distinguishes a focused window from an unfocused one. The maintainer:
+    /// "a different color indicating the focused window would be superior".
     pub title_active: Rgb,
     /// A title bar's face while it does not.
     ///
@@ -272,47 +315,80 @@ impl WallpaperMode {
     }
 }
 
+/// Which built-in palette a theme starts from. See [`Theme::scheme`].
+///
+/// **Named for what CSS calls it** (`color-scheme`), not "palette": `libterm::Palette` is already
+/// the terminal's sixteen ANSI colours, and a second meaning for the word would be read wrong.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum Scheme {
+    /// Dark ink on light grounds. The built-in theme's.
+    #[default]
+    Light,
+    /// Light ink on dark grounds.
+    Dark,
+}
+
+impl Scheme {
+    /// The name this writes and reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Light => "light",
+            Scheme::Dark => "dark",
+        }
+    }
+
+    /// Parse a scheme name — `None` for one that does not exist.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "light" => Some(Scheme::Light),
+            "dark" => Some(Scheme::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// How much of the accent a selection is: the design's `accent + '33'`, 20%, in both schemes.
+pub const SELECTION_COVERAGE: u8 = 0x33;
+
 impl Theme {
-    /// The light theme — the only one that ships.
+    /// The light scheme — the built-in theme.
     ///
-    /// **Named rather than anonymous**, which is decision 4 of M11's details pass made visible in
-    /// the code: every value is chosen once and `check-display` keeps one reference, while the
-    /// *mechanism* can hold a second theme the day somebody wants one. A `Theme::light()` beside
-    /// this would be a constructor, not a redesign — and there *was* one until M11 Part E's first
-    /// batch, which replaced it rather than joining it, for the reason decision 4 gives: two
-    /// themes double the reference pictures and double the judgement each polish item takes.
+    /// **The design's light palette** (desktop refresh, Part A), read out of the page's own
+    /// stylesheet rather than off its screenshots — `docs/design/nitrox-shell/`. It replaced the
+    /// palette M11 sampled pixel by pixel from a MATE desktop; `docs/planning/m11-polish-list.md`
+    /// is the record of that one. Where a field has no token of its own in the design, its doc
+    /// says which token it takes and why, and the table in `docs/spec/theme-toml-schema.md` has
+    /// all of them in one place.
     ///
-    /// **The values are measured rather than invented.** They come from a MATE desktop the
-    /// maintainer named as the reference, sampled pixel by pixel — see
-    /// `docs/planning/m11-polish-list.md`. Where this departs from it, it is because a value here
-    /// has to serve a surface MATE splits into two.
+    /// **No longer the only scheme**, which reverses M11's decision 4 ("one theme … nothing ships
+    /// a second"). The design specifies two and the maintainer asked for both; the decision log
+    /// carries the reversal, and what decision 4 was right about — that two palettes double every
+    /// judgement — is what the host renders of both exist to pay for.
     pub const fn light() -> Self {
         Self {
+            scheme: Scheme::Light,
             background: Rgb::new(0xFF, 0xFF, 0xFF),
-            foreground: Rgb::new(0x2F, 0x2F, 0x2F),
+            foreground: Rgb::new(0x16, 0x20, 0x1F),
+            foreground_dim: Rgb::new(0x5B, 0x67, 0x66),
 
-            face: Rgb::new(0xED, 0xEC, 0xEB),
-            face_hover: Rgb::new(0xF6, 0xF5, 0xF4),
-            face_pressed: Rgb::new(0xDC, 0xDA, 0xD9),
-            focus_ring: Rgb::new(0x4B, 0x6E, 0x9B),
-            // **Between the reference's two.** It puts a list's ground at `#FCFCFC` and a
-            // scrollbar's groove at `#E6E4E3`; one field has to be both, so it is a near-white
-            // that separates a list from the window around it and still reads as a groove under
-            // the thumb. Splitting them is a field, and a field is worth more evidence than one
-            // screenshot.
-            track: Rgb::new(0xF0, 0xEF, 0xEE),
-            // **The reference's own groove**, which this palette had been rounding into `track`
-            // since M11: `#E6E4E3` against a `#F0EFEE` list is a channel you can see without
-            // being a difference anybody has to look for.
-            groove: Rgb::new(0xE6, 0xE4, 0xE3),
-            // Darker again, because a panel is further from paper than a groove is.
-            sidebar: Rgb::new(0xDD, 0xDA, 0xD6),
-            thumb: Rgb::new(0x8E, 0xB1, 0xDD),
-            selection: Rgb::new(0x93, 0xB5, 0xE0),
+            // `--face` at rest, `--faceHi` under the pointer and `--faceLo` held, which is the
+            // mapping the design's own mock `theme.toml` writes out for the first two.
+            face: Rgb::new(0xED, 0xEC, 0xE9),
+            face_hover: Rgb::new(0xF8, 0xF7, 0xF4),
+            face_pressed: Rgb::new(0xDF, 0xDD, 0xD8),
+            accent: Rgb::new(0x2C, 0x7F, 0x92),
+            // A list sits on the window's own ground in the design; its scrollbar's track is
+            // `--faceLo` and its thumb is `--line`.
+            track: Rgb::new(0xFF, 0xFF, 0xFF),
+            groove: Rgb::new(0xDF, 0xDD, 0xD8),
+            sidebar: Rgb::new(0xE5, 0xE3, 0xDE),
+            panel: Rgb::new(0xF2, 0xF1, 0xED),
+            thumb: Rgb::new(0xC7, 0xC4, 0xBD),
 
-            // Dark enough to read on white, and far enough apart in hue to be told apart at a
-            // glance, which is the whole job: a scheme whose keyword and number differ by a
-            // shade is a scheme that colours text for no benefit.
+            // **Unchanged by the refresh.** The design's mock editor colours TOML's keys in the
+            // accent, which is not a kind this scanner has, and specifies no scheme for the six it
+            // does. These were chosen for contrast on white (M14 Part G), and the ground is still
+            // white.
             syntax_keyword: Rgb::new(0x7A, 0x3E, 0x9D),
             syntax_string: Rgb::new(0xA0, 0x30, 0x00),
             syntax_comment: Rgb::new(0x5E, 0x7A, 0x5E),
@@ -320,22 +396,31 @@ impl Theme {
             syntax_heading: Rgb::new(0x1A, 0x4C, 0x8B),
             syntax_variable: Rgb::new(0x8A, 0x5A, 0x00),
 
-            title_active: Rgb::new(0xE0, 0xDE, 0xDC),
-            title_inactive: Rgb::new(0xD4, 0xD2, 0xD0),
+            ok: Rgb::new(0x3C, 0x7A, 0x5A),
+            deny: Rgb::new(0xA4, 0x45, 0x3C),
+
+            // The accent at 18% over `face`, against `face` itself.
+            title_active: Rgb::new(0xCA, 0xD8, 0xD9),
+            title_inactive: Rgb::new(0xED, 0xEC, 0xE9),
 
             cursor_body: Rgb::new(0xFF, 0xFF, 0xFF),
             cursor_outline: Rgb::new(0x00, 0x00, 0x00),
             // **Saturated, because it is the one colour drawn over both grounds.** A resize
             // outline, a snap preview and a drop target are composited over the desktop *and*
-            // over the windows on it, and those are now a dark blue and a white — so the pale
-            // grey that read against a dark desktop would vanish over half the screen.
+            // over the windows on it. Not the accent: the design has no outline to copy, and a
+            // teal outline over the teal desktop below would vanish.
             outline: Rgb::new(0x2C, 0x65, 0xAE),
 
-            border: Rgb::new(0x8D, 0x8C, 0x8B),
-            desktop: Rgb::new(0x2A, 0x55, 0x70),
+            border: Rgb::new(0xC7, 0xC4, 0xBD),
+            // The deep teal of the design's `reef` wallpaper (its third stop), for a desktop with
+            // no picture on it. The same in both schemes: the design's wallpaper does not change
+            // with them either.
+            desktop: Rgb::new(0x13, 0x52, 0x5D),
 
             font_px: 16.0,
-            bevel: 12,
+            // **Flat**, as the design is: not one gradient in the page. The key stays, because a
+            // bevel is still a theme a person may want.
+            bevel: 0,
             font_ui: ThemePath::new(crate::text::UI_FONT_PATH),
             font_mono: ThemePath::new(crate::text::MONO_FONT_PATH),
             // **The shipped theme names no picture**, which is the honest default: a wallpaper
@@ -344,6 +429,78 @@ impl Theme {
             wallpaper: None,
             wallpaper_mode: WallpaperMode::Fit,
         }
+    }
+
+    /// The dark scheme: the design's `deep` palette, where it has one.
+    ///
+    /// **Everything the design specifies for `deep` is taken as written.** What it does not
+    /// specify is chosen here and says why: the six syntax colours (lighter counterparts of the
+    /// light scheme's hues, each at least 6:1 on this ground), `deny` (see its field), and the two
+    /// title faces (the same construction as the light scheme's). The accent, `ok`, the cursor,
+    /// the outline and the desktop's own ground are the light scheme's — the design keeps its
+    /// accent and state colours outside its palettes too.
+    pub const fn dark() -> Self {
+        Self {
+            scheme: Scheme::Dark,
+            background: Rgb::new(0x13, 0x1A, 0x1B),
+            foreground: Rgb::new(0xE6, 0xED, 0xEC),
+            foreground_dim: Rgb::new(0x8B, 0x9A, 0x99),
+
+            face: Rgb::new(0x1E, 0x27, 0x28),
+            face_hover: Rgb::new(0x23, 0x2D, 0x2E),
+            face_pressed: Rgb::new(0x17, 0x1F, 0x20),
+            accent: Rgb::new(0x2C, 0x7F, 0x92),
+            track: Rgb::new(0x13, 0x1A, 0x1B),
+            groove: Rgb::new(0x17, 0x1F, 0x20),
+            sidebar: Rgb::new(0x18, 0x20, 0x20),
+            panel: Rgb::new(0x10, 0x16, 0x17),
+            thumb: Rgb::new(0x36, 0x43, 0x42),
+
+            syntax_keyword: Rgb::new(0xC3, 0x9B, 0xE0),
+            syntax_string: Rgb::new(0xE8, 0x89, 0x6A),
+            syntax_comment: Rgb::new(0x86, 0xA3, 0x86),
+            syntax_number: Rgb::new(0x6F, 0xB4, 0xE8),
+            syntax_heading: Rgb::new(0x8F, 0xB4, 0xF0),
+            syntax_variable: Rgb::new(0xD9, 0xA8, 0x45),
+
+            ok: Rgb::new(0x3C, 0x7A, 0x5A),
+            deny: Rgb::new(0xD4, 0x6F, 0x63),
+
+            title_active: Rgb::new(0x21, 0x37, 0x3B),
+            title_inactive: Rgb::new(0x1E, 0x27, 0x28),
+
+            cursor_body: Rgb::new(0xFF, 0xFF, 0xFF),
+            cursor_outline: Rgb::new(0x00, 0x00, 0x00),
+            outline: Rgb::new(0x2C, 0x65, 0xAE),
+
+            border: Rgb::new(0x36, 0x43, 0x42),
+            desktop: Rgb::new(0x13, 0x52, 0x5D),
+
+            font_px: 16.0,
+            bevel: 0,
+            font_ui: ThemePath::new(crate::text::UI_FONT_PATH),
+            font_mono: ThemePath::new(crate::text::MONO_FONT_PATH),
+            wallpaper: None,
+            wallpaper_mode: WallpaperMode::Fit,
+        }
+    }
+
+    /// The built-in theme `scheme` names.
+    pub const fn for_scheme(scheme: Scheme) -> Self {
+        match scheme {
+            Scheme::Light => Self::light(),
+            Scheme::Dark => Self::dark(),
+        }
+    }
+
+    /// The colour behind selected text and a selected row: the [`accent`](Self::accent) at
+    /// [`SELECTION_COVERAGE`] over the [`background`](Self::background).
+    ///
+    /// **Derived, not stored** — see `accent`. Opaque, and exact on the window's own ground,
+    /// which is where text is selected; a selected row on a sidebar is a wash of the accent over
+    /// *that* ground, which the toolkit draws with `blend_rect` from Part B of the refresh on.
+    pub const fn selection(&self) -> Rgb {
+        self.accent.blend(self.background, SELECTION_COVERAGE)
     }
 }
 
@@ -383,7 +540,8 @@ pub enum IssueKind {
 }
 
 impl Theme {
-    /// Read a theme from `key = "value"` lines, starting from [`dark`](Self::dark).
+    /// Read a theme from `key = "value"` lines, starting from the scheme the file names —
+    /// [`light`](Self::light) when it names none.
     ///
     /// **A focused reader, not a TOML parser**, in the house style: `init`'s `toml_lite` handles
     /// table arrays and one-level subtables, `service-mgr`'s `service_toml` tracks two-level
@@ -395,13 +553,29 @@ impl Theme {
     /// **Missing keys keep their defaults and unknown keys are skipped**, which is the same
     /// forward-compatibility rule `service-toml-schema.md` states: a file written by a newer
     /// system must still start an older one. A file that is empty, absent, or entirely comments
-    /// is therefore exactly [`dark`](Self::dark).
+    /// is therefore exactly [`light`](Self::light). (This said `dark` until the refresh, from a
+    /// `Theme::dark()` that M11 Part E had deleted — a sentence that was about to become true
+    /// again and still be wrong about which scheme is the default.)
+    ///
+    /// **`scheme` is read first, wherever it is in the file**, because it decides what every
+    /// other line is an override *on*. A file that sets `accent` and then `scheme = "dark"` means
+    /// the dark scheme with that accent, not the accent thrown away by a reset halfway down; a
+    /// person does not expect the order of two lines to matter, and TOML says it does not.
     ///
     /// Colours are `"#RRGGBB"`; `font_px` is a decimal number. Comments run from `#` to the end
     /// of a line — except inside the quotes of a value, which is the whole reason this is a
     /// parser rather than a `split('#')`.
     pub fn from_config(text: &str) -> (Self, alloc::vec::Vec<Issue>) {
-        let mut t = Self::light();
+        // The last well-formed `scheme` line decides the starting palette; a bad one is reported
+        // by the main loop below, like any other bad value, and starts from the default.
+        let scheme = text
+            .lines()
+            .filter_map(|raw| strip_comment(raw).trim().split_once('='))
+            .filter(|(k, _)| k.trim() == "scheme")
+            .filter_map(|(_, v)| v.trim().strip_prefix('"')?.strip_suffix('"').and_then(Scheme::parse))
+            .last()
+            .unwrap_or_default();
+        let mut t = Self::for_scheme(scheme);
         let mut issues = alloc::vec::Vec::new();
         for (n, raw) in text.lines().enumerate() {
             let line = strip_comment(raw).trim();
@@ -422,23 +596,28 @@ impl Theme {
                 continue;
             };
             let ok = match key {
+                // Already applied above; here only to be checked, so a bad one is named.
+                "scheme" => raw.starts_with('"') && Scheme::parse(value).is_some(),
                 "background" => set(&mut t.background, value),
                 "foreground" => set(&mut t.foreground, value),
+                "foreground_dim" => set(&mut t.foreground_dim, value),
                 "face" => set(&mut t.face, value),
                 "face_hover" => set(&mut t.face_hover, value),
                 "face_pressed" => set(&mut t.face_pressed, value),
-                "focus_ring" => set(&mut t.focus_ring, value),
+                "accent" => set(&mut t.accent, value),
                 "track" => set(&mut t.track, value),
                 "groove" => set(&mut t.groove, value),
                 "sidebar" => set(&mut t.sidebar, value),
+                "panel" => set(&mut t.panel, value),
                 "thumb" => set(&mut t.thumb, value),
-                "selection" => set(&mut t.selection, value),
                 "syntax_keyword" => set(&mut t.syntax_keyword, value),
                 "syntax_string" => set(&mut t.syntax_string, value),
                 "syntax_comment" => set(&mut t.syntax_comment, value),
                 "syntax_number" => set(&mut t.syntax_number, value),
                 "syntax_heading" => set(&mut t.syntax_heading, value),
                 "syntax_variable" => set(&mut t.syntax_variable, value),
+                "ok" => set(&mut t.ok, value),
+                "deny" => set(&mut t.deny, value),
                 "title_active" => set(&mut t.title_active, value),
                 "title_inactive" => set(&mut t.title_inactive, value),
                 "cursor_body" => set(&mut t.cursor_body, value),
@@ -540,23 +719,27 @@ impl Theme {
         // theme" property quietly gone (PR #263 review, optional 1). Adding a field to `Theme`
         // now fails to compile until it is written out.
         let Theme {
+            scheme,
             background,
             foreground,
+            foreground_dim,
             face,
             face_hover,
             face_pressed,
-            focus_ring,
+            accent,
             track,
             groove,
             sidebar,
+            panel,
             thumb,
-            selection,
             syntax_keyword,
             syntax_string,
             syntax_comment,
             syntax_number,
             syntax_heading,
             syntax_variable,
+            ok,
+            deny,
             title_active,
             title_inactive,
             cursor_body,
@@ -572,24 +755,30 @@ impl Theme {
             wallpaper_mode,
         } = *self;
         let mut s = alloc::string::String::new();
+        // **First**, though the reader does not need it to be: a person reading the file sees
+        // what the colours below are overrides on before reading any of them.
+        let _ = writeln!(s, "scheme = \"{}\"", scheme.as_str());
         for (k, c) in [
             ("background", background),
             ("foreground", foreground),
+            ("foreground_dim", foreground_dim),
             ("face", face),
             ("face_hover", face_hover),
             ("face_pressed", face_pressed),
-            ("focus_ring", focus_ring),
+            ("accent", accent),
             ("track", track),
             ("groove", groove),
             ("sidebar", sidebar),
+            ("panel", panel),
             ("thumb", thumb),
-            ("selection", selection),
             ("syntax_keyword", syntax_keyword),
             ("syntax_string", syntax_string),
             ("syntax_comment", syntax_comment),
             ("syntax_number", syntax_number),
             ("syntax_heading", syntax_heading),
             ("syntax_variable", syntax_variable),
+            ("ok", ok),
+            ("deny", deny),
             ("title_active", title_active),
             ("title_inactive", title_inactive),
             ("cursor_body", cursor_body),
@@ -913,8 +1102,8 @@ mod tests {
     fn a_hash_inside_a_value_is_not_a_comment() {
         // The whole reason this is a parser rather than `split('#')`: every colour begins with
         // the comment character.
-        let (t, issues) = Theme::from_config("focus_ring = \"#ABCDEF\" # the ring\n");
-        assert_eq!(t.focus_ring, Rgb::new(0xAB, 0xCD, 0xEF));
+        let (t, issues) = Theme::from_config("accent = \"#ABCDEF\" # the ring\n");
+        assert_eq!(t.accent, Rgb::new(0xAB, 0xCD, 0xEF));
         assert!(issues.is_empty(), "{issues:?}");
     }
 
@@ -925,7 +1114,7 @@ mod tests {
         // trip is the cheap half; the field count is the half that matters.
         let mut t = Theme::light();
         t.background = Rgb::new(0x01, 0x02, 0x03);
-        t.selection = Rgb::new(0xFE, 0xDC, 0xBA);
+        t.accent = Rgb::new(0xFE, 0xDC, 0xBA);
         t.font_px = 13.0;
         t.font_ui = ThemePath::new("/home/Fancy.ttf");
         t.wallpaper = Some(ThemePath::new("/home/alice/hills.png"));
@@ -933,9 +1122,9 @@ mod tests {
         let text = t.to_config();
         assert_eq!(
             text.lines().count(),
-            30,
-            "eighteen colours, six syntax colours, a size, a bevel, two fonts, a wallpaper and \
-             its mode"
+            34,
+            "a scheme, twenty-one colours, six syntax colours, a size, a bevel, two fonts, a \
+             wallpaper and its mode"
         );
         let (back, issues) = Theme::from_config(&text);
         assert_eq!(back, t);
@@ -1137,5 +1326,117 @@ mod tests {
         // And the ground a *window* draws on is now a different colour, which is the whole point
         // of the split: a test that passed while they were equal would say nothing.
         assert_ne!(t.background, crate::scene::BACKGROUND);
+    }
+
+    // ---- the two schemes (desktop refresh, Part A) ----
+
+    #[test]
+    fn a_file_names_its_scheme_and_the_rest_of_it_is_overrides_on_that() {
+        let (t, issues) = Theme::from_config("scheme = \"dark\"\n");
+        assert_eq!(t, Theme::dark());
+        assert!(issues.is_empty(), "{issues:?}");
+
+        // **Order does not matter**, in either direction: an override above the scheme line is
+        // not thrown away by it, and one below is not either.
+        for text in [
+            "accent = \"#102030\"\nscheme = \"dark\"\n",
+            "scheme = \"dark\"\naccent = \"#102030\"\n",
+        ] {
+            let (t, issues) = Theme::from_config(text);
+            assert!(issues.is_empty(), "{text:?} {issues:?}");
+            assert_eq!(t.accent, Rgb::new(0x10, 0x20, 0x30), "{text:?}");
+            assert_eq!(t.background, Theme::dark().background, "{text:?} is not on the dark scheme");
+            assert_eq!(t.scheme, Scheme::Dark);
+        }
+    }
+
+    #[test]
+    fn a_scheme_that_does_not_exist_is_named_and_the_file_starts_from_light() {
+        for bad in ["scheme = \"sepia\"\n", "scheme = dark\n", "scheme = \"Dark\"\n"] {
+            let (t, issues) = Theme::from_config(bad);
+            assert_eq!(t, Theme::light(), "{bad:?}");
+            assert_eq!(issues, [Issue { line: 1, kind: IssueKind::BadValue }], "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_dark_theme_round_trips_and_says_which_scheme_it_is() {
+        // **The wire has to carry the scheme**, not only the colours: a theme received complete
+        // still has to tell its reader what `accent` washes over, and the shell has to tell the
+        // compositor which shadow to draw.
+        let mut t = Theme::dark();
+        t.accent = Rgb::new(0x3B, 0x5F, 0x8A);
+        let text = t.to_config();
+        assert!(text.starts_with("scheme = \"dark\"\n"), "{text}");
+        let (back, issues) = Theme::from_config(&text);
+        assert_eq!(back, t);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn the_selection_is_the_accent_and_follows_it() {
+        for base in [Theme::light(), Theme::dark()] {
+            assert_eq!(base.selection(), base.accent.blend(base.background, SELECTION_COVERAGE));
+            // Change the accent and the selection moves with it — which is the reason it stopped
+            // being a key a file could set out of step.
+            let mut t = base;
+            t.accent = Rgb::new(0x9C, 0x5B, 0x3C);
+            assert_ne!(t.selection(), base.selection(), "{:?}", base.scheme);
+        }
+    }
+
+    #[test]
+    fn the_focused_title_bar_is_the_accent_washed_over_the_face_in_both_schemes() {
+        // The construction the field's doc claims, checked so a retuned value cannot quietly
+        // stop being it. 0x2E is the design's dark-scheme hover coverage, 18%.
+        for t in [Theme::light(), Theme::dark()] {
+            assert_eq!(t.title_active, t.accent.blend(t.face, 0x2E), "{:?}", t.scheme);
+            assert_eq!(t.title_inactive, t.face, "{:?}", t.scheme);
+        }
+    }
+
+    /// WCAG 2's contrast ratio between two colours. A host-only test helper: the shipped code
+    /// has no business in floating point (see `corner`), and a ratio is a judgement about a
+    /// palette, which is made here once rather than at run time.
+    fn contrast(a: Rgb, b: Rgb) -> f64 {
+        fn lum(c: Rgb) -> f64 {
+            let ch = |v: u8| {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+        }
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn every_colour_drawn_as_text_can_be_read_in_both_schemes() {
+        // **The one property a palette has to have and a picture cannot promise.** WCAG's 4.5:1
+        // for text, 7:1 for the body text. It found the design's `--deny` at 2.9:1 on its own dark
+        // ground, which is why the dark scheme's is not the design's.
+        for t in [Theme::light(), Theme::dark()] {
+            let s = t.scheme;
+            assert!(contrast(t.foreground, t.background) >= 7.0, "{s:?} foreground");
+            assert!(contrast(t.foreground, t.selection()) >= 7.0, "{s:?} selected text");
+            assert!(contrast(t.foreground, t.title_active) >= 7.0, "{s:?} a focused title");
+            for (name, c) in [
+                ("foreground_dim", t.foreground_dim),
+                ("syntax_keyword", t.syntax_keyword),
+                ("syntax_string", t.syntax_string),
+                ("syntax_comment", t.syntax_comment),
+                ("syntax_number", t.syntax_number),
+                ("syntax_heading", t.syntax_heading),
+                ("syntax_variable", t.syntax_variable),
+            ] {
+                let r = contrast(c, t.background);
+                assert!(r >= 4.5, "{s:?} {name} is {r:.2}:1 on the background");
+            }
+            // A destructive menu item sits on whatever the menu's ground is.
+            for (ground, g) in [("background", t.background), ("face", t.face), ("panel", t.panel)] {
+                let r = contrast(t.deny, g);
+                assert!(r >= 4.5, "{s:?} deny is {r:.2}:1 on {ground}");
+            }
+        }
     }
 }

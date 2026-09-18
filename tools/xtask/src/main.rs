@@ -7748,11 +7748,18 @@ fn reference_frame(
 /// **Each arrangement takes the face its guest counterpart loads** (M11 Part D): the toolkit's
 /// window is the desktop's proportional font and the terminal's is the fixed-advance one. They
 /// took one font between them until Part D, because the system had only one.
+///
+/// **`ui-dark` is the one frame no gate compares against** (desktop refresh, Part A), because no
+/// guest draws it: the test client paints the built-in theme, which is the light scheme. It is
+/// here because the refresh decided how two schemes are covered without doubling the boots —
+/// **the host renders both and a boot proves one**, since a scheme is data and a boot proves that
+/// data reaches the screen. So the dark scheme's judgement costs a glance, like the light one's.
 fn preview_frames(
     (ui, mono): &(libdraw::text::Font, libdraw::text::Font),
 ) -> Vec<(&'static str, libdraw::framebuffer::MemFramebuffer)> {
     vec![
         ("ui", libui::reference::render(ui)),
+        ("ui-dark", libui::reference::render_with(ui, &libdraw::theme::Theme::dark())),
         ("term", libterm::render::reference::render_with(mono)),
     ]
 }
@@ -7795,6 +7802,59 @@ fn encode_png(w: u32, h: u32, rgb: &[u8]) -> R<Vec<u8>> {
         writer.write_image_data(rgb).map_err(|e| format!("png data: {e}"))?;
     }
     Ok(out)
+}
+
+/// The demo user's `theme.toml`, and the theme it reads as.
+///
+/// **Shipped with every field shown** (M11 Part C). It could ship empty or not at
+/// all — a missing file is the built-in theme, which is what the host tests pin — and a file
+/// naming every value is what makes the thing *discoverable*: a person who wants to change a
+/// colour opens it and sees which colours there are. It is written from `Theme::light()`
+/// rather than typed out, so the file and the constants cannot drift.
+///
+/// **Shown, and only the deliberate ones live** (desktop refresh, Part A). Every value that is
+/// the scheme's own is written commented out. Until there were two schemes this file wrote
+/// every line live, which was harmless while it restated the only palette there was — and
+/// with two it would pin every colour to the light one, so a person who changed `scheme` to
+/// "dark" would see nothing happen but the shadow. The plan's words for what a theme file
+/// should be: "an override on a palette rather than a list of thirty colours".
+fn staged_theme() -> R<(libdraw::theme::Theme, String)> {
+    let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n#\n");
+    text.push_str("# `scheme` picks the built-in palette the rest of this file adjusts: \"light\" or\n");
+    text.push_str("# \"dark\". Everything else is shown as that scheme has it, commented out; remove\n");
+    text.push_str("# the `#` from a line to change it. Colours are \"#RRGGBB\"; font_px is a size\n");
+    text.push_str("# in pixels per em.\n\n");
+    // Written from `Theme::light()` so the file and the constants cannot drift — except for the
+    // three fields below, each deliberately not the default and each read back by a gate.
+    let mut shipped = libdraw::theme::Theme::light();
+    shipped.font_px = f32::from(THEME_FONT_PX);
+    // **The theme names the wallpaper** (M12 Part F). It is the *file* that decides the
+    // desktop has a picture behind it — the built-in theme names none, deliberately, because
+    // a wallpaper is a file a person supplies and a default would make the desktop's ground
+    // depend on whatever the build happened to stage.
+    shipped.wallpaper = Some(
+        libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
+            .ok_or("the staged wallpaper path does not fit a ThemePath")?,
+    );
+    // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
+    // a fitted picture leaves bars of bare ground down both sides of the screen.
+    shipped.wallpaper_mode = libdraw::theme::WallpaperMode::Fill;
+    // Line for line against the scheme's own theme: `to_config` writes every field in one
+    // order, so a line that matches is a value this file does not change. `scheme` stays live
+    // whatever it says — it is the one line a person is expected to edit.
+    let base = libdraw::theme::Theme::for_scheme(shipped.scheme).to_config();
+    let lines = shipped.to_config();
+    if lines.lines().count() != base.lines().count() {
+        return Err("the staged theme and its scheme wrote different numbers of lines".into());
+    }
+    for (line, default) in lines.lines().zip(base.lines()) {
+        if line == default && !line.starts_with("scheme ") {
+            text.push_str("# ");
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    Ok((shipped, text))
 }
 
 /// The staged wallpaper's bytes: [`WALLPAPER_ASSET`], centre-cropped to 16:10.
@@ -13033,30 +13093,9 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // (auth Part E). The user shell writes into it, and since M11 Part C it arrives holding
     // the session's theme.
     fs::create_dir_all(staging.join(DEMO_HOME.trim_start_matches('/')))?;
-    // **The theme, shipped with every field written out** (M11 Part C). It could ship empty or
-    // not at all — a missing file is the built-in theme, which is what the host tests pin — and
-    // a file naming every value is what makes the thing *discoverable*: a person who wants to
-    // change a colour opens it and sees which colours there are. It is written from
-    // `Theme::light()` rather than typed out, so the file and the constants cannot drift.
+    // The theme, shown in full and live only where it differs — see `staged_theme`.
     {
-        let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
-        text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
-        // Written from `Theme::light()` so the file and the constants cannot drift — except for
-        // the one field the gate reads back, which is deliberately not the default.
-        let mut shipped = libdraw::theme::Theme::light();
-        shipped.font_px = f32::from(THEME_FONT_PX);
-        // **The theme names the wallpaper** (M12 Part F). It is the *file* that decides the
-        // desktop has a picture behind it — the built-in theme names none, deliberately, because
-        // a wallpaper is a file a person supplies and a default would make the desktop's ground
-        // depend on whatever the build happened to stage.
-        shipped.wallpaper = Some(
-            libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
-                .ok_or("the staged wallpaper path does not fit a ThemePath")?,
-        );
-        // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
-        // a fitted picture leaves bars of bare ground down both sides of the screen.
-        shipped.wallpaper_mode = libdraw::theme::WallpaperMode::Fill;
-        text.push_str(&shipped.to_config());
+        let (_, text) = staged_theme()?;
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
     }
@@ -13414,6 +13453,30 @@ mod tests {
     /// by this crate, and this is the only place both are in scope. The control is the second
     /// assertion: a private-use codepoint no face carries, which proves the check can fail.
     #[test]
+    fn the_staged_theme_reads_back_as_itself_and_only_its_overrides_are_live() {
+        let (shipped, text) = super::staged_theme().unwrap();
+        let (read, issues) = libdraw::theme::Theme::from_config(&text);
+        assert!(issues.is_empty(), "{issues:?}\n{text}");
+        assert_eq!(read, shipped);
+        // **Live lines are exactly the deliberate ones**: the scheme, and the three fields a gate
+        // reads back. Every colour is shown but commented, which is what lets the scheme line do
+        // anything at all.
+        let live: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split(" =").next())
+            .collect();
+        assert_eq!(live, ["scheme", "font_px", "wallpaper", "wallpaper_mode"], "{text}");
+        assert!(text.contains("\n# accent = \"#2C7F92\"\n"), "the colours are shown:\n{text}");
+        // And changing that one line changes the palette, keeping the overrides.
+        let dark = text.replace("scheme = \"light\"", "scheme = \"dark\"");
+        let (read, issues) = libdraw::theme::Theme::from_config(&dark);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(read.background, libdraw::theme::Theme::dark().background);
+        assert_eq!((read.font_px, read.wallpaper), (shipped.font_px, shipped.wallpaper));
+    }
+
+    #[test]
     fn the_menu_mark_exists_in_the_shipped_face() {
         let (ui, _) = host_faces().expect("the built-in theme's faces load on the host");
         let mark = libui::menu::MARK.chars().next().expect("MARK is not empty");
@@ -13455,9 +13518,23 @@ mod tests {
             sizes,
             [
                 ("ui", libui::reference::WIDTH, libui::reference::HEIGHT),
+                ("ui-dark", libui::reference::WIDTH, libui::reference::HEIGHT),
                 ("term", term.w, term.h),
             ],
             "the previews are the gate's arrangements, at the gate's sizes"
+        );
+        // And the dark one really is dark. (60, 4) is inside the menu bar's highlighted `Edit`,
+        // which is the selection — the accent washed over the scheme's background, `#D5E5E9` in
+        // the light scheme — so the frames differ there and the dark one is the darker.
+        let px = |n: &str| {
+            let f = &frames.iter().find(|(name, _)| *name == n).expect("a frame").1;
+            Framebuffer::get_pixel(f, 60, 4).expect("in bounds")
+        };
+        let (light, dark) = (px("ui"), px("ui-dark"));
+        assert!(
+            u32::from(dark.r) + u32::from(dark.g) + u32::from(dark.b)
+                < u32::from(light.r) + u32::from(light.g) + u32::from(light.b),
+            "the dark frame is not darker where the menu bar is: {dark:?} against {light:?}"
         );
 
         for (name, frame) in &frames {

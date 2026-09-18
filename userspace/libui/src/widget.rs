@@ -91,7 +91,7 @@ pub fn button<Msg>(
     // draws and what this toolkit had only around a focused control.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
-        layers.push(fill(theme.focus_ring));
+        layers.push(fill(theme.accent));
         layers.push(padding(Insets::all(RING), fill(face)));
     } else {
         layers.push(fill(theme.border));
@@ -395,8 +395,8 @@ pub fn menu_item<Msg: Clone>(
 ) -> Element<Msg> {
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if hovered {
-        layers.push(fill(theme.focus_ring));
-        layers.push(padding(Insets::all(1), bevel(theme.selection)));
+        layers.push(fill(theme.accent));
+        layers.push(padding(Insets::all(1), bevel(theme.selection())));
     }
     layers.push(padding(MENU_ITEM_PAD, text(label)));
     stack(layers).on_press(msg)
@@ -999,7 +999,7 @@ pub fn text_field<Msg>(
     let mut content = alloc::vec::Vec::with_capacity(3);
     content.push(text(render(before)));
     if state.active {
-        content.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
+        content.push(sized(Size::new(CARET, 0), fill(theme.accent)));
     }
     content.push(text(render(after)));
 
@@ -1007,7 +1007,7 @@ pub fn text_field<Msg>(
     // idea: a well the content sits in, rather than a face that stands out of the surface.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
-        layers.push(fill(theme.focus_ring));
+        layers.push(fill(theme.accent));
         layers.push(padding(Insets::all(RING), fill(theme.track)));
     } else {
         layers.push(fill(theme.track));
@@ -1979,7 +1979,7 @@ pub fn text_area<Msg>(
         let mut pieces: Vec<Element<Msg>> = Vec::with_capacity(cuts.len());
         for (k, &from) in cuts.iter().enumerate() {
             if caret == Some(from) {
-                pieces.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
+                pieces.push(sized(Size::new(CARET, 0), fill(theme.accent)));
             }
             let Some(&to) = cuts.get(k + 1) else { break };
             let mut piece = text(String::from(&l[from..to]));
@@ -1990,7 +1990,7 @@ pub fn text_area<Msg>(
             if span.is_some_and(|(f, t)| from >= f && to <= t) {
                 // The highlight is a `fill` *under* the run: `fill` measures as zero, so the
                 // stack takes the text's size and the colour covers exactly the glyphs' box.
-                piece = stack(alloc::vec![fill(theme.selection), piece]);
+                piece = stack(alloc::vec![fill(theme.selection()), piece]);
             }
             pieces.push(piece);
         }
@@ -2305,8 +2305,8 @@ pub fn list_view<Msg>(
         let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
         let row_el = if primary {
             stack(alloc::vec![
-                fill(theme.focus_ring),
-                padding(Insets::all(1), bevel(theme.selection)),
+                fill(theme.accent),
+                padding(Insets::all(1), bevel(theme.selection())),
                 padding(ROW_PAD, text(r.label)),
             ])
         } else {
@@ -2536,7 +2536,7 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection)),
+            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection())),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -2690,8 +2690,8 @@ mod list_view_tests {
 
         // The same two layers a selected list row gets: a border in the focus blue, and the
         // selection colour bevelled inside it.
-        assert_eq!(fills(&hot), alloc::vec![p.focus_ring], "no border on the hovered item");
-        assert_eq!(bevels(&hot), alloc::vec![p.selection], "no selection fill on the hovered item");
+        assert_eq!(fills(&hot), alloc::vec![p.accent], "no border on the hovered item");
+        assert_eq!(bevels(&hot), alloc::vec![p.selection()], "no selection fill on the hovered item");
 
         // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
         // an item that paints a face when it is not hovered is a menu with every row lit.
@@ -2900,8 +2900,8 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
-        assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
+        assert_eq!(row_faces(&e)[1], p.accent, "the hovered row has no border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the hovered row is not the blue");
         assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
     }
 
@@ -2925,8 +2925,8 @@ mod list_view_tests {
         );
         let faces = row_faces(&e);
         assert_eq!(faces[0], p.face_hover, "the hovered row did not react");
-        assert_eq!(faces[1], p.focus_ring, "the selected row lost its border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the selected row lost its fill");
+        assert_eq!(faces[1], p.accent, "the selected row lost its border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the selected row lost its fill");
 
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
@@ -2941,7 +2941,7 @@ mod list_view_tests {
             None,
             &p,
         );
-        assert_eq!(row_faces(&e)[1], p.focus_ring, "selection lost to hover");
+        assert_eq!(row_faces(&e)[1], p.accent, "selection lost to hover");
     }
 
     /// The selected row paints differently, or selection is invisible.
@@ -2958,10 +2958,10 @@ mod list_view_tests {
         // the focus blue, and the selection colour bevelled inside it. Asserting only the fill
         // would pass for a selection with no edge, which is the thing that makes two adjacent
         // selected rows read as one block.
-        assert_eq!(faces[1], p.focus_ring, "the selected row has no border");
+        assert_eq!(faces[1], p.accent, "the selected row has no border");
         assert_eq!(faces[0], p.track, "an unselected row is the list's own ground");
         let bevels = row_bevels(&e);
-        assert_eq!(bevels[1], Some(p.selection), "the selected row is not the selection colour");
+        assert_eq!(bevels[1], Some(p.selection()), "the selected row is not the selection colour");
         assert_eq!(bevels[0], None, "an unselected row is a flat fill, not a gradient");
     }
 
@@ -3467,7 +3467,7 @@ mod tests {
             button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.focus_ring), "the ring is on the edge");
+        assert_eq!(fb.get_pixel(0, 0), Some(p.accent), "the ring is on the edge");
         // **Inside the ring but away from the label**, which is centred since M15: the middle
         // of the button is where the word is, so a sample taken there is a glyph.
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
@@ -4243,7 +4243,7 @@ two");
         let p = Theme::default();
         let draw = |a: &mut TextAreaState| -> usize {
             let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], None, &p);
-            fills(&e, p.focus_ring)
+            fills(&e, p.accent)
         };
 
         let mut a = area();
@@ -4271,7 +4271,7 @@ two");
         let mut a = area();
         a.apply(KEY_END, 0);
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], None, &p);
-        assert_eq!(fills(&e, p.focus_ring), 0, "and none at all when the widget is not active");
+        assert_eq!(fills(&e, p.accent), 0, "and none at all when the widget is not active");
     }
 
     /// Every `(text, ink)` pair in a tree, in order — an ink node's text, or `None` for plain.
@@ -4396,7 +4396,7 @@ two");
         }
         assert_eq!(a.cursor(), (0, 2), "precondition: mid-line, with no selection");
         let e: Element<()> = text_area(&mut a, 16, 16, true, &[], None, &p);
-        assert_eq!(fills(&e, p.focus_ring), 1, "no caret while typing in the middle of a line");
+        assert_eq!(fills(&e, p.accent), 1, "no caret while typing in the middle of a line");
     }
 
     /// A coloured run under a selection keeps its colour.
@@ -4421,7 +4421,7 @@ two");
             None,
             &p,
         );
-        assert_eq!(fills(&e, p.selection), 1, "precondition: the keyword is selected");
+        assert_eq!(fills(&e, p.selection()), 1, "precondition: the keyword is selected");
         assert!(
             inked(&e).contains(&(String::from("let"), Some(KEYWORD))),
             "the selection took the colour with it: {:?}",
@@ -4490,11 +4490,11 @@ two");
         a.apply(KEY_RIGHT, 0);
         a.apply(KEY_DOWN, MOD_SHIFT);
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
-        assert_eq!(fills(&e, p.selection), 2, "the tail of line 0 and the head of line 1");
+        assert_eq!(fills(&e, p.selection()), 2, "the tail of line 0 and the head of line 1");
 
         let mut a = area();
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
-        assert_eq!(fills(&e, p.selection), 0, "and nothing when nothing is selected");
+        assert_eq!(fills(&e, p.selection()), 0, "and nothing when nothing is selected");
     }
 
     #[test]
@@ -4512,7 +4512,7 @@ two");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
-        assert_eq!(fills(&e, Theme::default().selection), 0, "nothing is selected, so nothing \
+        assert_eq!(fills(&e, Theme::default().selection()), 0, "nothing is selected, so nothing \
             is highlighted");
 
         // The quieter symptom of the same defect: typing instead of deleting used to leave a

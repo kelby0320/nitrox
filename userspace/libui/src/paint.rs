@@ -327,9 +327,15 @@ mod tests {
         out
     }
 
-    /// Whether every painted pixel is a neutral grey — what the default ink blends to.
-    fn all_grey(c: &[Rgb]) -> bool {
-        c.iter().all(|p| p.r == p.g && p.g == p.b)
+    /// Whether every colour in `c` is the theme's foreground over its background at some coverage
+    /// — text drawn in the theme's ink and in nothing else.
+    ///
+    /// **Not "grey"**, which is what this checked until the desktop refresh: the old ink was
+    /// `#2F2F2F`, so a neutral pixel meant the theme's ink, and the design's `#16201F` is not
+    /// neutral. The property was always "the theme's ink"; greyness was a proxy that held for one
+    /// palette.
+    fn all_theme_ink(c: &[Rgb], t: &Theme) -> bool {
+        c.iter().all(|p| (0..=255u8).any(|a| t.foreground.blend(t.background, a) == *p))
     }
 
     /// Whether anything was drawn whose red channel leads, i.e. in [`RED`].
@@ -353,7 +359,7 @@ mod tests {
         go(&mut plain, &f, &t, &column(vec![text("Hi")]), Rect::new(0, 0, W, H));
         let before = painted(&plain, &t);
         assert!(!before.is_empty(), "nothing was drawn at all");
-        assert!(all_grey(&before), "the theme's grey ink is what text uses by default");
+        assert!(all_theme_ink(&before, &t), "the theme's ink is what text uses by default");
 
         let mut coloured = fb();
         let e: Element<Msg> = column(vec![crate::element::ink(RED, text("Hi"))]);
@@ -361,7 +367,7 @@ mod tests {
         let after = painted(&coloured, &t);
         assert!(any_reddish(&after), "the wrapper's colour never reached the glyphs");
         assert!(
-            !all_grey(&after) && !after.iter().any(|p| *p == t.foreground),
+            !all_theme_ink(&after, &t) && !after.iter().any(|p| *p == t.foreground),
             "the theme's ink was drawn as well, so the leaf ignored what it was given"
         );
     }
