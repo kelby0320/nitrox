@@ -26639,19 +26639,40 @@ and almost nothing in light. We already carry `title_active` and `title_inactive
 differ visibly. A desktop where you cannot tell which window has the keyboard gets reported as a
 focus bug, and this one is meant to be used on a laptop with no pointer worth speaking of.
 
-**The structural rule this milestone is written around.** A redesign is the change most able to
+**The structural rule this plan is written around.** A redesign is the change most able to
 turn `check-display` into a tautology: every visual assertion moves at once, and the tempting
 repair is to adjust the reference until it matches whatever the code now draws. So nothing — no
-colour, radius or metric — is written twice. It goes in the theme; the toolkit reads the theme;
-the reference render reads the same theme. A gate then fails when the code disagrees with the
-design, which is the only disagreement worth gating. The design makes this easy by containing its
-own `theme.toml`.
+colour — is written twice. Colours go in the theme; the toolkit reads the theme; the reference
+render reads the same theme. A gate then fails when the code disagrees with the design, which is
+the only disagreement worth gating. The design makes this easy by containing its own `theme.toml`.
 
-**And one thing the detail pass found that a screenshot cannot show.** Rounded corners are not a
-painting change. `compose_exposed` skips the background under any surface that `covers` its
-rectangle, and a rounded window does not cover its rectangle — its corners must show whatever is
-behind them. The three ways out are in the milestone; the one worth costing first makes `covers` a
-*region* rather than a predicate, because the alternatives are either wrong where windows overlap
-or pay M13 Part A's measured double-write on every pixel of every window. On a machine where a
-framebuffer mistake cost 45× three days ago, that is not a detail to discover during
-implementation.
+**The rule stops at colour, and the first draft did not say so.** M11 decision 2 is that chrome
+metrics are *not* themeable, and `xtask` copies each one with a comment giving the reason: "a gate
+that read the shell's layout to know where to aim could agree with a shell that had stopped
+drawing where it says". That is the same anti-tautology argument reaching the opposite conclusion,
+because a colour is compared against a computed render while a metric is where a gate aims a
+click. `radius_px` is a compiled constant for a second reason: after this work the corner is drawn
+by the compositor and the title bar by the client, and the compositor never reads a theme file
+(M11 decision 1), so a value reaching only one of them shows as a wedge at every corner.
+
+**Dark mode reverses M11 decision 4** — "One theme … Dark-and-light doubles both … nothing ships
+one" — which was decided before there was a design specifying two. Named here rather than
+quietly outgrown. It also needs a mechanism the plan owes: the compositor paints the shadow, the
+ground, the outline and the cursor from compiled `Theme::light()` values, and the design's two
+palettes differ in exactly those.
+
+**And the detail pass's headline finding was wrong, which is the most useful thing in this
+entry.** It claimed rounded corners were a `covers` change. `covers` decides only which background
+`compose_exposed` fills, and `compose_exposed` is *tested* to draw the same picture as `compose`,
+which has no `covers` at all — so no change to it can alter an output pixel. The corner is written
+by `blit_rows`, a `memcpy` of the whole rectangle. What rounds a corner is a **masked blit**, which
+the draft never mentioned; `covers`-minus-corners is the optimisation that accompanies the mask.
+The draft also priced the alpha alternative against M13 Part A's double-write measurement, which
+found removing half the pixel writes bought **6%** — "the writes were never the cost". The cost is
+losing the `memcpy` fast path that made compose 5× faster, which an alpha window would pay on
+every pixel.
+
+Three of the five errors a review found in that draft came from the same place: **reading a
+picture as a specification.** The switcher's rule, the overview's thumbnails and the page's own
+size were all taken off screenshots rather than out of the source, and all three were wrong. A
+design is evidence about appearance, and not about architecture.

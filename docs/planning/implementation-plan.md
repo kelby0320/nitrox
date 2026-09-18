@@ -65,13 +65,14 @@ Then Phase 6. The signal that would reorder this: if the admin work turns out to
 iteration on real hardware, USB is what makes that cheap — the laptop has no network and no USB,
 so today the only way to get anything onto it is a reinstall from a stick.
 
-**Unscheduled, and written down so it is not lost**:
+**Written down so it is not lost** (the first of these is now scheduled; see the table):
 
 - [administration.md](administration.md) — elevation (the capability-system answer to `sudo`),
   administrative accounts as policy rather than identity, and the tools an installed system needs:
-  partitioning, formatting, mounting, accounts, passwords. A **stub**; its scope and its place in
-  the phase order are decided once Phase 5 completes. It exists because Phase 5 Part H's installer
-  is its first client, and an installer built without a destination is one that gets replaced.
+  partitioning, formatting, mounting, accounts, passwords. **Scheduled** as of 2026-09-17 — it is
+  in the table above, after the desktop refresh — but still a **stub**: its internal scope is
+  decided when it is taken up. It exists because Phase 5 Part H's installer is its first client,
+  and an installer built without a destination is one that gets replaced.
 
 **Subproject plans** (detailed breakdowns that hang off a phase):
 
