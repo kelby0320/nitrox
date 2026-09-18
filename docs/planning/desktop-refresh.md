@@ -119,7 +119,7 @@ choosing two colours that do.
 - [ ] **Part E — the overview**, whose layout changes.
 - [ ] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
       has.
-- [ ] **Part G — type**: the design's faces, weights and size scale.
+- [ ] **Part G — type, in DejaVu**: a smaller body size, a size scale, and weight only if it earns it.
 - [ ] **Part H — the parts of a window**: title and subtitle, the focus border, the tab strip, the
       status bar, fields and buttons — shared by all three applications.
 - [ ] **Part I — the file browser**: toolbar, columns, sidebar, status bar.
@@ -392,6 +392,13 @@ Part C that is where the distance to the design is. The maintainer, comparing th
 close enough to the nitrox shell.html reference"*. The parts below are that distance, written
 down.
 
+**A north star, not an overlay** (maintainer, 2026-09-18). A screendump and the page are not
+expected to lie on top of each other, and no time goes into moving things a pixel or two to make
+them. What should match is the **structure** — which parts a window has, in what order, how they
+are grouped — the **colours**, and the **rhythm** of the spacing: that a toolbar breathes and a
+status bar is tight. The numbers below are proportions to aim at, not targets to hit; our face is
+not the page's (Part G), so text-bound measurements could not match exactly anyway.
+
 **Measured, not read.** Until Part C this plan took its numbers from the page's markup, which
 worked for the bars and gets error-prone inside a window. `docs/design/nitrox-shell/drive.mjs` now
 runs the page in headless Chrome and writes every element of a window with the rectangle, colours,
@@ -425,26 +432,35 @@ or left out (Part I).
 its size and modification time (`librsproto::file::OwnedEntry`), so the columns need no protocol
 change — only a renderer.
 
-## Part G — type
+## Part G — type, in DejaVu
 
-**The single most visible difference in every window.** The design sets everything in IBM Plex
-Sans and Mono at 10–12.5 px, in three weights; we draw everything in DejaVu at one size and one
-weight. **The same words are 35% wider in ours** — `Documents` is 59 px in the page's Plex at
-11.5 and 80 in our DejaVu at the staged 14, and five names measured all fall at 1.32–1.35 — and the
-design's hierarchy (a semibold title, medium tab labels, dim 10.5 px metadata) is carried almost
-entirely by size and weight, where we have one of each.
+**The single most visible difference in every window.** The page sets everything in IBM Plex Sans
+and Mono at 10–12.5 px, in three weights; we draw everything in DejaVu at one size and one weight.
+**The same words are 35% wider in ours** — `Documents` is 59 px in the page's Plex at 11.5 and 80
+in our DejaVu at the staged 14, and five names measured all fall at 1.32–1.35 — and the design's
+hierarchy (a semibold title, medium tab labels, dim 10.5 px metadata) is carried almost entirely by
+size and weight, where we have one of each.
 
-- [ ] **The faces.** IBM Plex Sans and Mono, which are under the SIL Open Font License, so they
-      ship beside their licence exactly as DejaVu's does. The theme's `font_ui` and `font_mono`
-      keys stay; what changes is what they name by default. **A decision for the maintainer**:
-      it is an asset in the image, and a look.
-- [ ] **Weights.** The toolkit has one UI face, so a 600 title and a 500 tab label have nowhere to
-      come from. A second face and a weight on the text node, or a synthetic weight — to be
-      decided by measuring both on a screendump, not by argument.
-- [ ] **A size scale instead of one size.** The design uses 12.5 (top bar), 12 (titles, the
+**DejaVu stays** (maintainer, 2026-09-18). Plex was considered — it is under the SIL Open Font
+License and would ship as freely — and not taken, to keep the image and the build as they are.
+**Most of the gap is size rather than face**, which is what makes that cheap:
+
+| DejaVu Sans at | 14 (staged today) | 13 | 12 | 11.5 | 11 |
+|---|---|---|---|---|---|
+| width against the page's Plex 11.5 | 1.35× | 1.25× | 1.15× | 1.11× | 1.06× |
+
+- [ ] **A smaller body size**, chosen on a screendump rather than from the table: DejaVu's large
+      x-height reads bigger than its pixel size, so 12 may read like the page's 11.5. The staged
+      `font_px` and the built-in default move together.
+- [ ] **A size scale instead of one size.** The page uses 12.5 (top bar), 12 (titles, the
       terminal), 11.5 (menus, rows, fields), 10.5 (headers, status bars, byte counts) and 10
-      (hints). The theme keeps one number — `font_px`, the body size — and the toolkit derives
-      the others from it, so a theme still sets one value and the steps between them are ours.
+      (hints). The theme keeps one number — `font_px`, the body size — and the toolkit derives the
+      others from it, so a theme still sets one value and the steps between them are ours. Status
+      bars and column headers are where a smaller step shows most.
+- [ ] **Weight, if a screendump asks for it.** The title is the one place the page leans on it.
+      DejaVu Sans Bold is the same family under the same licence, so it would ship beside
+      `DejaVuSans.ttf` with nothing new to decide; if the title reads well enough in the dim-and-
+      size hierarchy alone, no second face.
 - [ ] **Every aim moves, and each is pinned first.** Part C's arrangement — the gates' literals
       pinned by host tests at the staged size and the built-in one — is what makes this change
       reviewable rather than a boot-by-boot hunt.
@@ -455,9 +471,10 @@ entirely by size and weight, where we have one of each.
 
 Toolkit pieces the three applications share, so each is built once and restyled once.
 
-- [ ] **Title and subtitle**: the title 12 px semibold, then a dim 11.5 px subtitle — the directory
-      for Files, the working directory for a terminal (which needs the shell to tell its terminal
-      where it is), and for the editor the design's single `theme.toml — Text Editor`.
+- [ ] **Title and subtitle**: the title — bold if Part G adds the face — then a dim subtitle:
+      the directory for Files, the working directory for a terminal (which needs the shell to
+      tell its terminal where it is), and for the editor the design's single
+      `theme.toml — Text Editor`.
 - [ ] **The focused window's border in the accent**, the design's own focus cue. We keep the
       tinted title bar as well (the deliberate divergence above); this is additive and cheap,
       since a client knows its own focus and draws its own `Outline`.

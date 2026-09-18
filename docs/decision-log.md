@@ -26939,7 +26939,7 @@ the page draws them in, and `move_pointer_to` now records where it leaves the po
 had to, and two in `shot` did not). The design README's "cannot be driven headlessly" was true of
 the tools to hand, not of the page.
 
-**Five parts, G–K, in `desktop-refresh.md`**: type (the design's faces, weights and a size scale),
+**Five parts, G–K, in `desktop-refresh.md`**: type (a size scale and a smaller body size),
 the parts of a window shared by all three applications (title and subtitle, the focus border, the
 tab strip, the status bar, fields and buttons), then the file browser, the editor and the
 terminal's window. **Type is proposed first**: our text is 35% wider than the page's for the same
@@ -26952,3 +26952,11 @@ real filter or not at all; and the page's `Go`, `View` and `Terminal` menus are 
 nothing, so a menu word is added only with items behind it — Part C's rule for `Run Application…`.
 One thing turned out cheaper than it looked: a directory entry already carries size and mtime, so
 the file browser's columns need a renderer and no protocol.
+
+**Two decisions from the maintainer, the same day.** **The page is a north star, not an overlay**:
+the structure, the colours and the rhythm of the spacing should match, and no time goes into
+moving things a pixel or two to make a screendump lie on the page. And **DejaVu stays** — IBM
+Plex, the page's face, is under the SIL Open Font License and was not taken, to keep things simple.
+Most of the width gap is size rather than face: DejaVu is 1.35× the page's width at the staged 14
+and 1.15× at 12, so Part G is a smaller body size and a scale derived from it, with DejaVu Sans
+Bold (the same family and licence) only if a screendump says the title needs a weight.
