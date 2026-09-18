@@ -237,6 +237,25 @@ pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
     }
 }
 
+/// The radius a window of `role` at `bounds` is cut to, on a screen `screen`: [`corner_for`]'s,
+/// unless the window covers the whole screen, when it is square.
+///
+/// **Because a screen-sized window's corners are the screen's**, and there is nothing beside them
+/// for a curve to show. The overview is exactly that — a `Popup` the size of the screen — and the
+/// first version of this rounded it, on the claim that its corners sat under the shell's two bars
+/// and so showed nowhere. They sit *over* them: the overview is created after the bars and never
+/// lowered beneath them, and it dims the whole screen, bars included, so each cut corner showed a
+/// notch of undimmed bar — measured on a screendump by the PR #313 review. A rule about the
+/// screen's shape, rather than about the overview, is what stops the next full-screen surface
+/// from doing the same.
+pub fn corner_of(role: Role, bounds: Rect, screen: Rect) -> u32 {
+    let covers = bounds.origin.x <= screen.origin.x
+        && bounds.origin.y <= screen.origin.y
+        && bounds.right() >= screen.right()
+        && bounds.bottom() >= screen.bottom();
+    if covers { 0 } else { corner_for(role) }
+}
+
 /// The radius `role`'s corners are cut to (desktop refresh, Part B).
 ///
 /// **The roles that float, as for the shadow, and for the same reason**: a window, a menu and a
@@ -245,10 +264,10 @@ pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
 /// [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS), because the window's own toolkit draws its
 /// border along the same curve and the two must not disagree by a crescent.
 ///
-/// **The overview is a `Popup` the size of the screen, and is rounded with the rest** — which
-/// shows nowhere, because its four corners are the screen's and the shell's two bars sit above
-/// it there. A maximised window is rounded too: the compositor does not know a window is
-/// maximised (the manager does), and a rule that needed to would be a second copy of that state.
+/// **A window that covers the whole screen is not rounded** — see [`corner_of`], which is what
+/// compositing asks. A maximised window *is* rounded: it fills the work area, not the screen, and
+/// the compositor does not know a window is maximised (the manager does), so a rule that needed
+/// to would be a second copy of that state.
 pub const fn corner_for(role: Role) -> u32 {
     match role {
         Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => libdraw::corner::WINDOW_RADIUS,
@@ -1369,6 +1388,7 @@ impl WindowStack {
         S: BufferSource + ?Sized,
     {
         let mut surfaces: Vec<SurfaceRef<'_>> = Vec::new();
+        let screen = fb.geometry().bounds();
         for w in &self.windows {
             // **Not composited unless it is on screen** — configured (M6 B4), not minimized,
             // and on the current desktop or sticky. A client that commits before its first
@@ -1386,7 +1406,9 @@ impl WindowStack {
             if px.len() < b.geometry.byte_len() {
                 continue;
             }
-            let surface = SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_for(w.role));
+            let bounds = Rect::new(w.origin.x, w.origin.y, b.geometry.width, b.geometry.height);
+            let surface =
+                SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_of(w.role, bounds, screen));
             surfaces.push(match w.shadow {
                 Some(sh) => surface.with_shadow(sh),
                 None => surface,
@@ -2492,16 +2514,25 @@ mod tests {
     // ---- shadows (M13 Part C) ----
 
     #[test]
-    fn a_floating_window_is_rounded_and_a_panel_is_not() {
-        // Through `compose_into`, like the shadow's role test beside it, so this covers the
-        // wiring as well as the rule: the very corner pixel of a rounded window is outside its
-        // curve and shows the ground; a panel's is its own.
-        for (role, rounded) in [
-            (Role::Normal, true),
-            (Role::Panel { dock: Edge::Top, reserve: 0 }, false),
+    fn every_floating_role_is_rounded_and_a_panel_is_not() {
+        // Through `compose_into`, like the shadow's role test beside it, so this covers the wiring
+        // as well as the rule: the very corner pixel of a rounded window is outside its curve and
+        // shows the ground; a panel's is its own. **All four roles**, because a menu's border is
+        // drawn on the promise that the compositor cuts its corners — with only `Normal` here,
+        // popups and dialogs could stop being rounded and every test would still pass (PR #313
+        // review, finding 3).
+        for (make_role, rounded) in [
+            ((|_| Role::Normal) as fn(u32) -> Role, true),
+            ((|p| Role::Popup { parent: p }) as fn(u32) -> Role, true),
+            ((|p| Role::Dialog { parent: p }) as fn(u32) -> Role, true),
+            ((|_| Role::Panel { dock: Edge::Top, reserve: 0 }) as fn(u32) -> Role, false),
         ] {
             let mut s = WindowStack::new();
             let mut src = MapSource::default();
+            // A parent for the two roles that need one, kept off the sample points below.
+            let parent = shown(&mut s, &CreateWindowRequest::new(2, 2, Role::Normal));
+            let _ = s.place(parent, Point::new(80, 80));
+            let role = make_role(parent);
             let id = shown(&mut s, &CreateWindowRequest::new(24, 20, role));
             s.attach(&attach(id, 0, 24, 20)).unwrap();
             let ink = Rgb::new(200, 30, 30);
@@ -2518,6 +2549,41 @@ mod tests {
             assert_eq!(middle, ink, "{role:?}: the middle is the window's own");
             assert_eq!(corner != ink, rounded, "{role:?}: its corner pixel is {corner:?}");
         }
+    }
+
+    #[test]
+    fn a_window_that_covers_the_screen_is_not_rounded() {
+        // **The overview's shape**: a popup the size of the screen, over a panel. Rounded, each
+        // cut corner showed the panel beneath at full brightness through a dimmed overlay — the
+        // first version claimed the bars sat on top and hid it, and a screendump said otherwise
+        // (PR #313 review, finding 1). Its corners are the screen's; there is nothing to round.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let screen = big_screen().geometry().bounds();
+        let bar = shown(&mut s, &CreateWindowRequest::new(screen.size.w, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
+        s.attach(&attach(bar, 0, screen.size.w, 10)).unwrap();
+        let bar_ink = Rgb::new(215, 214, 212);
+        src.put(bar, 0, geom(screen.size.w, 10), bar_ink);
+        s.commit(&commit(bar, 0)).unwrap();
+        let cover = shown(
+            &mut s,
+            &CreateWindowRequest::new(screen.size.w, screen.size.h, Role::Popup { parent: bar }),
+        );
+        s.attach(&attach(cover, 0, screen.size.w, screen.size.h)).unwrap();
+        let cover_ink = Rgb::new(42, 42, 41);
+        src.put(cover, 0, geom(screen.size.w, screen.size.h), cover_ink);
+        s.commit(&commit(cover, 0)).unwrap();
+        let mut fb = big_screen();
+        s.compose_into(&mut fb, Rgb::BLACK, &src, &[screen]);
+        assert_eq!(s.window(cover).unwrap().origin, Point::new(0, 0), "precondition: at the origin");
+        for (x, y) in [(0, 0), (screen.size.w - 1, 0), (0, screen.size.h - 1)] {
+            assert_eq!(fb.get_pixel(x, y), Some(cover_ink), "({x},{y}) shows what is beneath the cover");
+        }
+        // The rule is about covering the screen, not about being a popup: the same popup a pixel
+        // short of the screen is rounded.
+        assert_eq!(corner_of(Role::Popup { parent: bar }, screen, screen), 0);
+        let short = Rect::new(0, 0, screen.size.w - 1, screen.size.h);
+        assert_eq!(corner_of(Role::Popup { parent: bar }, short, screen), libdraw::corner::WINDOW_RADIUS);
     }
 
     #[test]

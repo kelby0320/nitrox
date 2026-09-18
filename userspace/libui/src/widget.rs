@@ -143,6 +143,16 @@ const POPUP_BORDER: u32 = 1;
 /// two are exactly the parts that are treated differently. An application that wants no frame
 /// simply does not call this; the greeter does not, having no title bar to be flush with.
 pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    frame_layers(title, content, None, theme)
+}
+
+/// [`window_frame`]'s layers, with an optional corner layer drawn before the border.
+fn frame_layers<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    corner: Option<Element<Msg>>,
+    theme: &Theme,
+) -> Element<Msg> {
     // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
     // container's children to be all keyed or all unkeyed, and every caller keys its title bar —
     // so docking the title directly beside an unkeyed content pane is a `MixedKeying` error at
@@ -160,11 +170,34 @@ pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &The
     // under a face inset by a pixel; the compositor now cuts a window's corners to
     // `WINDOW_RADIUS`, which would take a square border's corners off with them. So the edge is
     // an outline along the same curve, painted over the content it curves into.
-    stack(alloc::vec![
-        fill(theme.face),
-        padding(Insets::all(WINDOW_BORDER), inner),
-        outline(theme.border, libdraw::corner::WINDOW_RADIUS),
-    ])
+    let mut layers = alloc::vec![fill(theme.face), padding(Insets::all(WINDOW_BORDER), inner)];
+    layers.extend(corner);
+    layers.push(outline(theme.border, libdraw::corner::WINDOW_RADIUS));
+    stack(layers)
+}
+
+/// [`window_frame`], with a resize grip in its bottom-right corner — **inside the border, and
+/// under it**.
+///
+/// **Why the frame places the grip rather than the application.** All three applications stacked
+/// their grip over the finished frame, which painted its face over the last sixteen pixels of the
+/// bottom and right border and over the whole bottom-right curve, so the one corner a person
+/// reaches for was the one corner whose border was missing (PR #313 review, optional 4). Placed
+/// here, the grip is a layer *before* the outline, so the border is drawn over it along the curve,
+/// and it sits inside the border rather than on it.
+///
+/// `window` is the window's own size, which is where the corner is; an `offset` sized to the grip
+/// is what keeps it from taking presses anywhere else — a full-size overlay would be the outline's
+/// bug again.
+pub fn window_frame_with_grip<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    grip: Element<Msg>,
+    window: Size,
+    theme: &Theme,
+) -> Element<Msg> {
+    let at = |len: u32| len.saturating_sub(WINDOW_BORDER + GRIP_W) as i32;
+    frame_layers(title, content, Some(crate::element::offset(at(window.w), at(window.h), grip)), theme)
 }
 
 /// How thick the line around a window is.
@@ -4919,6 +4952,115 @@ two");
         let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, &theme);
         assert_eq!(all_text(&a), "notes");
         assert_eq!(all_text(&b), "* notes");
+    }
+
+    #[test]
+    fn the_title_buttons_land_where_the_gates_aim() {
+        // **The literals the gates' `chrome` table types**, asserted against a framed window that
+        // is actually built — the same guard `dialog_buttons_land_where_the_constants_say` gives
+        // the dialog, and for its reason: `title_button_centre` moves with the constants, so a
+        // change to the padding moved it and this crate's own tests together and left the gates
+        // aiming four pixels off with nothing saying so (PR #313 review, optional 6). In a window
+        // 400 wide: close 18 in from the right, maximise 50, minimise 82, all 16 down.
+        assert_eq!(title_button_centre(400, 0), (382, 16));
+        assert_eq!(title_button_centre(400, 1), (350, 16));
+        assert_eq!(title_button_centre(400, 2), (318, 16));
+
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let theme = Theme::default();
+        let bar = title_bar(
+            "a window",
+            true,
+            M::Drag,
+            TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+            &theme,
+        )
+        .key(1);
+        let e: Element<M> = window_frame(bar, sized(Size::new(0, 0), text("")).key(2), &theme);
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let l = crate::layout::layout(&e, Rect::new(0, 0, 400, 200), &cell);
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        let click = |(x, y): (i32, i32)| {
+            let at = |pressed: bool| PointerEvent {
+                kind: POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let _ = r.pointer(&tree, &e, &l, at(true));
+            r.pointer(&tree, &e, &l, at(false)).0
+        };
+        assert_eq!(click((382, 16)), vec![M::Close]);
+        assert_eq!(click((350, 16)), vec![M::Max]);
+        assert_eq!(click((318, 16)), vec![M::Min]);
+    }
+
+    #[test]
+    fn a_framed_windows_grip_is_inside_its_border_and_under_it() {
+        // **The one corner a person reaches for was the one whose border was missing**: all three
+        // applications stacked the grip over the finished frame (PR #313 review, optional 4). The
+        // frame places it now — inside the border, as a layer before the border — and takes no
+        // presses anywhere but the grip, which a full-size overlay would.
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Content,
+            Grip,
+        }
+        let theme = Theme::default();
+        let window = Size::new(200, 120);
+        let content: Element<M> = sized(Size::new(0, 0), crate::element::custom(1, Size::new(0, 0)))
+            .on_press(M::Content)
+            .key(2);
+        let e = window_frame_with_grip(
+            sized(Size::new(0, TITLE_BAR_H), fill(theme.face)).key(1),
+            content,
+            resize_grip(M::Grip, &theme).key(3),
+            window,
+            &theme,
+        );
+        let crate::element::Node::Stack(layers) = &e.node else { panic!("the frame is a stack") };
+        assert!(
+            matches!(layers.last().map(|l| &l.node), Some(crate::element::Node::Outline { .. })),
+            "the border is not the top layer, so the grip is painted over it"
+        );
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let l = crate::layout::layout(&e, Rect::new(0, 0, window.w, window.h), &cell);
+        let grip = crate::layout::locate(&e, &l, 3).expect("the grip is keyed");
+        assert_eq!(
+            (grip.right(), grip.bottom()),
+            ((window.w - WINDOW_BORDER) as i64, (window.h - WINDOW_BORDER) as i64),
+            "the grip is not in the corner inside the border: {grip:?}"
+        );
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        let click = |x: i32, y: i32| {
+            let at = |pressed: bool| PointerEvent {
+                kind: POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let mut got = r.pointer(&tree, &e, &l, at(true)).0;
+            got.extend(r.pointer(&tree, &e, &l, at(false)).0);
+            got
+        };
+        assert_eq!(click(window.w as i32 - 8, window.h as i32 - 8), vec![M::Grip], "the grip's middle");
+        assert_eq!(click(window.w as i32 - 30, window.h as i32 - 8), vec![M::Content], "beside it is content");
     }
 
     #[test]

@@ -26757,8 +26757,13 @@ rounded, the title bar and the menus take the design's shape, and selection is a
 
 **What is rounded is the roles that already cast a shadow** — normal, popup, dialog — cut to
 `libdraw::corner::WINDOW_RADIUS` (8). A panel is docked to the screen's edge, where a rounded
-corner is a notch of wallpaper. The overview is a screen-sized popup and is rounded with the rest;
-its corners are under the shell's bars, so it shows nowhere. The window's border is a
+corner is a notch of wallpaper. **A window that covers the whole screen is square too**, and this
+entry first said otherwise: that the overview, a screen-sized popup, could be rounded because its
+corners sat under the shell's bars and showed nowhere. They sit *over* them — the overview is
+created after the bars and dims the whole screen, bars included — so each cut corner showed a notch
+of undimmed bar. The PR #313 review measured it on a screendump; I had never checked the stacking I
+was describing. `compositor::corner_of` now leaves any window covering the screen square. The
+window's border is a
 `Node::Outline` painted *last* along the same curve, because the curve bends into whatever the
 window has in its corners. **It blends at a share rather than a coverage**: the compositor already
 fades the curve when it blends the surface over what is below, and a border faded by its own
@@ -26796,7 +26801,12 @@ ground, with the cell origin moved by it. **The first version of that was wrong 
 passed it**: it moved the cells and left the margin showing the window's face, because a custom
 node covers only the cells it declares. A screendump measured it — the dark ground began 12 pixels
 in, where the text did — and the pane is an element of its own now, with a test pinning its ground,
-its margin and the origin together.
+its margin and the origin together. **Two more layout slips the review measured**: the margin went into
+the sum the scrollbar is sized from, though it lives inside the pane and not beside the bar, so the
+bar stopped 19 pixels above the resize grip; and all three applications stacked the grip over the
+finished frame, which painted over the border's bottom-right curve — the one corner a person reaches
+for. `window_frame_with_grip` places the grip inside the border and under it, and a test now requires
+the bar to end where the grip begins rather than only not to overlap it.
 
 **Selection is a wash** — `Node::Wash`, the accent at 20% for a selection and at the scheme's hover
 coverage (10%, 18% dark) for a hover — replacing a one-pixel accent ring round a bevelled fill.

@@ -33,13 +33,13 @@ use librsproto::surface::{
 use alloc::vec;
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
+    Edge, Element, Insets, column, dock, docked, padding, row, sized, text,
     with_spacing,
 };
 use libui::widget::{
     DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
     TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame,
+    popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame_with_grip,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -2373,7 +2373,7 @@ impl App {
         // needs to know nothing about it (M14 Part I).
         .on_wheel(Msg::Wheel);
 
-        let body = window_frame(
+        window_frame_with_grip(
             title,
             dock(
                 alloc::vec![
@@ -2403,16 +2403,10 @@ impl App {
             // wrapper as the reliable way to keep the two in step.
                 sized(Size::new(0, h), list).key(LIST_KEY),
             ),
-            &ui,
-        );
-
-        // The grip over the bottom-right corner, as `nxterm` places its own.
-        let grip = offset(
-            self.window.w.saturating_sub(GRIP_W) as i32,
-            self.window.h.saturating_sub(GRIP_W) as i32,
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
-        );
-        stack(alloc::vec![body, grip])
+            self.window,
+            &ui,
+        )
     }
 }
 

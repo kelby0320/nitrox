@@ -36,10 +36,10 @@ use librsproto::surface::{
     POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED,
     WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
-use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
+use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, sized};
 use libui::widget::{
     GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
-    title_bar, window_frame,
+    title_bar, window_frame_with_grip,
 };
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::widget::{
@@ -107,17 +107,26 @@ pub const TITLE: &str = "nxterm";
 /// Width of the scrollbar, in pixels.
 pub const SCROLL_W: u32 = 12;
 
-/// What the chrome costs the grid horizontally: the scrollbar, and the window's frame.
+/// What the chrome costs the grid horizontally: the scrollbar, the window's frame, and the pane's
+/// margin either side of the cells.
 ///
-/// **One pair of constants, because three places compute this** — `resize` fits the cells,
-/// `grid_origin` places them, and `track_h` sizes the scrollbar against the same content box.
-/// They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed only because nothing
-/// had ever been added between the window's edge and its content. M11 Part E batch 2b added
-/// something (PR #265).
+/// **What fits the cells, and only that.** `resize` fits them with this and `grid_origin` places
+/// them inside the margin. They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed
+/// only because nothing had ever been added between the window's edge and its content; M11 Part E
+/// batch 2b added something (PR #265).
 const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W + 2 * GRID_PAD_X;
 
-/// And vertically: the title bar, the menu bar, and the frame.
-const CHROME_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H + 2 * GRID_PAD_Y;
+/// And vertically: the bars above the pane, the window's frame, and the pane's margin.
+const CHROME_H: u32 = BARS_H + 2 * GRID_PAD_Y;
+
+/// What stands above and below the **pane** — the title bar, the menu bar, the tab strip and the
+/// frame — which is the box the scrollbar sits beside.
+///
+/// **Not `CHROME_H`, since the pane gained a margin** (desktop refresh, Part B). The margin is
+/// *inside* the pane, around the cells; the scrollbar is beside the pane and runs its full height.
+/// `track_h` took `CHROME_H` and sized the bar 18 pixels short of its slot, leaving a patch of the
+/// window's face between the bar and the grip (PR #313 review, finding 2).
+const BARS_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 
 /// The margin between the grid's cells and the edge of the pane they sit in, across — in the
 /// terminal's own ground.
@@ -1218,7 +1227,7 @@ impl App {
         // cannot be pressed. That is not hypothetical: `MIN_THUMB` is 16 and a following view
         // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
         // its thumb *entirely* under the grip.
-        self.window.h.saturating_sub(CHROME_H + GRIP_W)
+        self.window.h.saturating_sub(BARS_H + GRIP_W)
     }
 
     /// Record where each bar word sits, so an open menu knows where to hang from.
@@ -1402,7 +1411,13 @@ impl App {
             &ui,
         )
         .key(TITLE_KEY);
-        let body = window_frame(
+        // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
+        // reserved for it would take a row of cells from every terminal for a control that is
+        // only ever aimed at; over the corner it costs nothing and is exactly where a person
+        // reaches. `window_frame_with_grip` places it, inside the border and under it, since the
+        // desktop refresh's Part B — this stacked it over the finished frame, which painted over
+        // the border's bottom-right curve.
+        let body = window_frame_with_grip(
             title,
             dock(
                 vec![
@@ -1457,20 +1472,11 @@ impl App {
             // scrollbar or the tab strip scrolls the terminal too — which is what a person
             // expects, and what putting it on the grid alone would have made a dead zone of.
             .on_wheel(Msg::Wheel),
+            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
+            self.window,
             &ui,
         );
 
-        // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
-        // reserved for it would take a row of cells from every terminal for a control that is
-        // only ever aimed at; stacked over the corner it costs nothing and is exactly where a
-        // person reaches. `offset` places it, because a `stack` layer otherwise gets the whole
-        // area and `sized` alone would put it top-left.
-        let grip = offset(
-            (self.window.w.saturating_sub(GRIP_W)) as i32,
-            (self.window.h.saturating_sub(GRIP_W)) as i32,
-            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
-        );
-        let body = stack(vec![body, grip]);
 
         // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
         // window — a layer inside the 24-pixel bar would have been clipped to 24 pixels, so it
@@ -1703,8 +1709,15 @@ mod tests {
             bar.intersect(&grip).is_none(),
             "the grip {grip:?} overlaps the scrollbar {bar:?}"
         );
-        assert_eq!(grip.bottom(), bounds.bottom(), "and the grip is still in the corner");
-        assert_eq!(grip.right(), bounds.right());
+        // **And it ends where the grip begins**, not short of it. Not overlapping is half of it: a
+        // bar sized against the wrong box stopped 19 pixels above the grip and left a patch of the
+        // window's face between them, which the half above passes (PR #313 review, finding 2).
+        assert_eq!(bar.bottom(), grip.origin.y as i64, "the scrollbar {bar:?} stops short of the grip {grip:?}");
+        // **In the corner, inside the border** — since the desktop refresh's Part B the frame places
+        // the grip under its border, so the border is drawn over the grip's corner.
+        let border = libui::widget::WINDOW_BORDER as i64;
+        assert_eq!(grip.bottom(), bounds.bottom() - border, "and the grip is still in the corner");
+        assert_eq!(grip.right(), bounds.right() - border);
     }
 
     #[test]
@@ -2317,17 +2330,17 @@ mod tests {
             }
             a.menus.set_anchors(vec![anchor, None]);
             // **The same shape whether the menu is open or not**, which is the property: the
-            // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
-            // a stack of two — the body and the resize grip over its corner — rather than the
-            // dock alone, and that is still fixed.
+            // menu is a *window*, so opening it adds nothing here. The root is the framed window
+            // — its face, the content, the resize grip in the corner, and the border over all of
+            // them, since the desktop refresh's Part B moved the grip inside the frame (it was a
+            // stack of two, the body and the grip over it, from M9 Part E) — and that is fixed.
             let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default(), None).node else {
-                panic!("open={open}: the window's tree is the body under its grip");
+                panic!("open={open}: the window's tree is the framed window");
             };
-            assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
+            assert_eq!(layers.len(), 4, "open={open}: face, content, grip and border, and nothing else");
             assert!(
-                matches!(layers[0].node, libui::element::Node::Stack { .. }),
-                "open={open}: the body is the framed window — a border, a face and the dock \
-                 inside them, since M11 Part E batch 2b"
+                matches!(layers[3].node, libui::element::Node::Outline { .. }),
+                "open={open}: the border is the top layer, over the grip"
             );
         }
     }

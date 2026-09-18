@@ -72,8 +72,11 @@ const FAT32_MIN_MIB: u64 = 33;
 // `docs/architecture/session-and-auth.md`.
 /// **A framed window's chrome, as the gates aim at it** — `libui::widget`'s geometry, copied on
 /// purpose (M11 decision 2): a gate that read the toolkit to know where to click could agree with a
-/// toolkit that had stopped drawing where it says. `libui`'s own tests pin the other side against
-/// built trees (`title_button_centre`, `dialog_buttons_land_where_the_constants_say`).
+/// toolkit that had stopped drawing where it says. `libui`'s own tests pin the other side, as
+/// literals pressed on built trees: `the_title_buttons_land_where_the_gates_aim` for the title bar
+/// and `dialog_buttons_land_where_the_constants_say` for a dialog. (This doc named
+/// `title_button_centre` as the pin; it is a helper that moves with the constants, and the literal
+/// test is the PR #313 review's optional 6.)
 ///
 /// **One table since the desktop refresh's Part B**, which moved every one of these: the title bar
 /// grew from 26 to 31, its buttons went from contiguous 26-pixel slots to the design's 23 with 9

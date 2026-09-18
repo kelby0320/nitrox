@@ -496,6 +496,7 @@ is:
 | Widget | Why it exists |
 |---|---|
 | `window_frame` | A window's own edge: a one-pixel border, rounded along the compositor's curve and drawn last as a `Node::Outline`, with the content flush against it (`WINDOW_FRAME` is 0 since the desktop refresh's Part B, which took away a three-pixel margin the design does not have) and the title bar at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
+| `window_frame_with_grip` | `window_frame` with a resize grip in its bottom-right corner, **inside the border and under it**: the grip is a layer before the border, so the border's curve is drawn over it. All three applications used to stack the grip over the finished frame, which covered that corner's border |
 | `popup_frame` | A menu or modal's edge, rounded like a window's. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
 | `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
 | `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |

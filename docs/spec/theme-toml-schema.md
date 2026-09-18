@@ -65,7 +65,7 @@ once did, because it still showed the dark theme M11 Part E replaced (PR #265 re
 | `foreground` | `"#RRGGBB"` | Text and other ink | `--fg` |
 | `foreground_dim` | `"#RRGGBB"` | Ink read second: section headers, a path beside a name, a size | `--fgdim` |
 | `face` | `"#RRGGBB"` | A button at rest | `--face` |
-| `face_hover` | `"#RRGGBB"` | A button under the pointer | `--faceHi` |
+| `face_hover` | `"#RRGGBB"` | A button under the pointer, and every application's menu bar (desktop refresh, Part B) | `--faceHi` |
 | `face_pressed` | `"#RRGGBB"` | A button being held | `--faceLo` |
 | `accent` | `"#RRGGBB"` | The focus ring and caret, and what the selection is made from | `--accent` |
 | `track` | `"#RRGGBB"` | A list's ground | `--bg` |

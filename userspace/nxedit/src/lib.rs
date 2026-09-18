@@ -39,14 +39,14 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
+    Edge, Element, Insets, column, dock, docked, padding, row, sized, text,
     with_spacing,
 };
 use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
     TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
     tab_strip,
-    text_area, text_field, title_bar, window_frame,
+    text_area, text_field, title_bar, window_frame_with_grip,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -2253,7 +2253,7 @@ impl App {
             area.key(AREA_INNER_KEY),
         );
 
-        let body = window_frame(
+        window_frame_with_grip(
             title,
             dock(
                 alloc::vec![
@@ -2287,15 +2287,10 @@ impl App {
             // rows for one height and be drawn at another.
                 sized(Size::new(0, h), area).key(AREA_KEY),
             ),
-            &ui,
-        );
-
-        let grip = offset(
-            self.window.w.saturating_sub(GRIP_W) as i32,
-            self.window.h.saturating_sub(GRIP_W) as i32,
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
-        );
-        stack(alloc::vec![body, grip])
+            self.window,
+            &ui,
+        )
     }
 
     /// The element tree for the confirmation dialog — a **second window's** whole face.

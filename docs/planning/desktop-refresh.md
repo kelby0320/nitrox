@@ -210,7 +210,8 @@ ever paints whole surfaces.
 
 - [x] **Rounded corners** (2026-09-18): the compositor cuts every role that floats — normal,
       popup, dialog, the ones that already cast a shadow — to `WINDOW_RADIUS` (8); panels stay
-      square. The window's own border is a `Node::Outline` along the same curve, painted last and
+      square, and so does any window covering the whole screen — the overview, whose cut corners
+      showed the undimmed bars beneath it until the PR #313 review measured them. The window's own border is a `Node::Outline` along the same curve, painted last and
       blended at `corner::border_share` so the curve is not faded twice. **It is never a hit-test
       target** — painted last and full-size, the first version took every press in every framed
       window. `check-display` composes its expectation through `libdraw::compose` and leaves out

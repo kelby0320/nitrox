@@ -173,9 +173,11 @@ each (M13 Part C) and, since the desktop refresh's Part B, cuts each one's corne
 curve — `libdraw::corner::WINDOW_RADIUS`, compiled into both the compositor and the toolkit,
 because the client draws its border along the same curve. The cut writes nothing outside the curve
 and blends the pixels on it, so a window's corner shows whatever is beneath it. A bar is docked to
-the screen's edge, where a rounded corner would be a notch of wallpaper. The overview is a popup
-the size of the screen and is rounded with the rest, invisibly: its corners are the screen's, under
-the shell's two bars.
+the screen's edge, where a rounded corner would be a notch of wallpaper. **A window that covers the
+whole screen is not rounded either** (`compositor::corner_of`): its corners are the screen's, and a
+cut would show whatever is beneath it there. The overview is that window — a popup the size of the
+screen, created after the shell's bars and so above them — and while it was rounded, each cut
+corner showed a notch of undimmed bar through its dimmed overlay.
 
 **A panel reserves space.** A maximised window must not cover the bars, which X calls struts.
 The compositor subtracts reserved edges from the area it offers to `normal` windows.
