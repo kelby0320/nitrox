@@ -215,7 +215,8 @@ and layering a second one would be comparing two shadows and calling the sum an 
 tool for *relative* judgements between candidates; confirm the pick with `shot`.
 
 `cargo xtask preview` writes `tools/build-cache/preview-{ui,term}.png` — the same renders
-`check-display` compares the guest against, drawn here and made viewable. **It exists so that a
+`check-display` compares the guest against, drawn here and made viewable — and `preview-ui-dark.png`,
+the toolkit in the dark scheme, which no gate compares against because no guest draws it. **It exists so that a
 judgement about how something looks costs a glance rather than a boot** (M11 Part A), which is
 what makes a polish loop affordable at all. It shows the *toolkit's* surfaces only: anything the
 compositor draws — the cursor, the drag outline, the background between windows — and the

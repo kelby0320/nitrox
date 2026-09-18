@@ -1074,9 +1074,10 @@ pub const OP_MGR_REGISTER_SNAP_ZONE: u16 = 0x0927;
 pub const MAX_SNAP_ZONES: usize = 16;
 /// `Manage::SetCurrentDesktop` — switch which desktop is composited.
 ///
-/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every other manager
-/// request names a window in its first four bytes and this one names none, because it is a
-/// property of the screen. `0` is refused — see [`MgrDesktop`].
+/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every request in that
+/// block names a window in its first four bytes and this one names none, because it is a
+/// property of the screen. `0` is refused — see [`MgrDesktop`]. (This said "every other manager
+/// request", which `RegisterHotkey`, `QueryLayout` and now `SetScheme` all contradict.)
 pub const OP_MGR_SET_CURRENT_DESKTOP: u16 = 0x091D;
 /// `Manage::SetScheme` — which built-in scheme the compositor's own drawing follows.
 ///

@@ -47,9 +47,12 @@ thing to catch in review** — it makes CI resolve something nobody tested.
   `libdraw` and `libterm` are dependencies here. A golden file would rot the first time a widget
   changed, and nothing would say whether the rot was the change or the file.
 - **One source per expected answer.** `cargo xtask preview` and `check-display` render from
-  `preview_frames`, so a preview cannot drift into being a picture of something the gate never
-  demands. Two call sites that "obviously" build the same thing is how that drift starts (PR #261
-  review).
+  `preview_frames`, so every picture a gate compares against is a preview and cannot drift from
+  one. Two call sites that "obviously" build the same thing is how that drift starts (PR #261
+  review). **The converse has one named exception**: `ui-dark` is a preview no gate compares
+  against, because no guest draws the dark scheme — the desktop refresh's Part A decided that the
+  host renders both schemes and a boot proves one. It is not a violation of this rule, and wiring
+  it into a gate would need a guest that draws it.
 
 ## Tests
 

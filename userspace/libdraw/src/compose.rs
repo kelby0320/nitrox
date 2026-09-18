@@ -1394,6 +1394,17 @@ mod tests {
         // Its reach is the union: the wide layer's here, which contains the contact layer's.
         let sh = Shadow { layers: [wide, contact] };
         assert_eq!(sh.around(bounds), wide.around(bounds));
+        // **And a layer that sticks out past the other widens it.** The assertion above passes
+        // for an `around` that reads only the first layer, because in that fixture the wide
+        // layer contains the contact one — as it does in both shipped schemes. A contact layer
+        // dropped further than the wide one reaches is what `tune --contact-drop 40` makes, and
+        // missing that strip would leave shadow behind every move (PR #312 review, finding 2).
+        let dropped = ShadowLayer { radius: 3, offset: Point::new(0, 30), colour: Rgb::BLACK, strength: 60 };
+        let sticks_out = Shadow { layers: [wide, dropped] };
+        let reach = sticks_out.around(bounds);
+        assert!(reach.bottom() > wide.around(bounds).bottom(), "the dropped layer's strip is missing");
+        assert_eq!(reach.bottom(), dropped.around(bounds).bottom());
+        assert_eq!(reach.origin, wide.around(bounds).origin, "and the wide layer still sets the rest");
         // And a layer with nothing to draw neither draws nor widens the damage.
         assert_eq!(Shadow::single(wide).around(bounds), wide.around(bounds));
         assert_eq!(ShadowLayer::NONE.around(bounds), bounds);
@@ -1710,19 +1721,26 @@ mod tests {
 
     #[test]
     fn a_square_surface_draws_what_it_drew_before_corners_existed() {
-        // `corner: 0` is every existing caller, and every gate's expected picture. The masked path
-        // must not be taken, and the shadow must be the square one — checked against a surface
-        // built without ever mentioning corners.
+        // `corner: 0` is every existing caller, and every gate's expected picture. So the picture
+        // is checked against **the definitions that predate corners**, assembled by hand: the
+        // ground, then each layer of the shadow through the old per-pixel loop, then the surface
+        // through the unmasked blit. This compared `compose` against itself until the PR #312
+        // review — a surface `with_corner(0)` is the same struct as one without, so the two calls
+        // could not differ, and a shadow off by one at `c == 0` passed it.
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let (sg, spx) = patterned(20, 16, 20 * 4, 0x60);
-        let plain = [SurfaceRef::new(sg, Point::new(9, 7), &spx).with_shadow(shade())];
-        let zero = [plain[0].with_corner(0)];
-        let (mut a, mut b) = (crate::framebuffer::MemFramebuffer::new(g), crate::framebuffer::MemFramebuffer::new(g));
-        compose(&mut a, bg, &plain, &[g.bounds()]);
-        compose(&mut b, bg, &zero, &[g.bounds()]);
-        assert_eq!(a, b);
-        assert_eq!(covered_by(&plain[0]), [Some(plain[0].bounds()), None, None]);
+        let surface = SurfaceRef::new(sg, Point::new(9, 7), &spx).with_shadow(shade());
+        let mut got = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut got, bg, &[surface], &[g.bounds()]);
+
+        let mut want = crate::framebuffer::MemFramebuffer::filled(g, bg);
+        for layer in &shade().layers {
+            draw_layer_reference(&mut want, surface.bounds(), 0, layer, &g.bounds());
+        }
+        blit_span(&mut want, &surface, surface.bounds().intersect(&g.bounds()).unwrap());
+        assert_eq!(got, want);
+        assert_eq!(covered_by(&surface), [Some(surface.bounds()), None, None]);
     }
 
     /// And it is less work — which is the whole point, and would otherwise be a refactor.

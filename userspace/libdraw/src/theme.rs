@@ -158,11 +158,13 @@ pub struct Theme {
 
     // ---- syntax highlighting ----
     //
-    // **The one place M11's "not a colour of its own" rule does not apply.** Every other colour
-    // in this file is a surface or its ink, and a widget that wanted a third was told to derive
-    // it — a keyword and a comment cannot be derived from a window's ground and its foreground,
-    // because what they encode is *meaning* rather than depth. Six, because six is what a
-    // tolerant table-driven scanner can actually tell apart (M14 Part G).
+    // **Where M11's "not a colour of its own" rule does not apply** — here, and in `accent`, `ok`
+    // and `deny` since the desktop refresh. Every other colour in this file is a surface or its
+    // ink, and a widget that wanted a third was told to derive it; a keyword and a comment cannot
+    // be derived from a window's ground and its foreground, because what they encode is
+    // *meaning* rather than depth, and neither can emphasis, "working" or "destructive". This
+    // said it was "the one place" until the PR #312 review. Six syntax colours, because six is
+    // what a tolerant table-driven scanner can actually tell apart (M14 Part G).
     //
     // Chosen for contrast against a white ground rather than measured off the reference
     // desktop, which is the honest description: MATE's editor ships several schemes and no

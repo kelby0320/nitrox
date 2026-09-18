@@ -970,9 +970,9 @@ sticky, so a current desktop of `0` would blank every non-sticky window *and*, b
 a new window is created onto the current desktop, make every window created afterwards silently
 sticky.
 
-**Numbered outside the `0x0910`–`0x0917` block on purpose.** Every other manager request names
+**Numbered outside the `0x0910`–`0x0917` block on purpose.** Every request in that block names
 a window in its first four bytes; this one names none, because it is a property of the screen
-rather than of a window. The block is not a category — see the note under
+rather than of a window — as `SetScheme` is. The block is not a category — see the note under
 [`Configure`](#configure-0x0915) — but the shape difference is real, and a reader who assumes
 "offset 0 is a window id" is right about every request in that range and would be wrong here.
 
@@ -993,6 +993,11 @@ contents are its client's.
 that boots a session boots a light theme; a message sent only for dark would be a path no boot ever
 took. The compositor logs `compositor: scheme light` (or `dark`) on every one it accepts, and
 `check-login` asserts the staged theme's.
+
+**It does not outlive the manager.** When the manager's channel closes the compositor returns to
+the light scheme, as it forgets that manager's chords and snap zones: what is drawn next — the
+greeter, after a logout — is drawn from the built-in theme, and a departed dark session's shadows
+under it would be two and a half times too strong.
 
 **Not a way to restyle the compositor at large.** It names one of two palettes compiled into the
 compositor, rather than carrying colours, for the reason M11 decision 1 gave: nothing needs a

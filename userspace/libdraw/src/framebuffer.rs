@@ -127,9 +127,13 @@ pub trait Framebuffer {
     /// Composite `colour` over what is already at `(x, y)` at `coverage`.
     ///
     /// A read-modify-write, which is why it is a method here rather than arithmetic at the
-    /// call site: the read must go through [`get_pixel`](Self::get_pixel) so a buffer whose
-    /// format decodes differently from the writer's assumption cannot silently blend against
-    /// the wrong colour.
+    /// call site: the read must decode through the buffer's own format, as
+    /// [`get_pixel`](Self::get_pixel) does, so a buffer whose format decodes differently from the
+    /// writer's assumption cannot silently blend against the wrong colour.
+    ///
+    /// **It no longer calls `get_pixel` and `put_pixel`, though** (see below), so an implementor
+    /// that overrode either would not be consulted by a blend. None in the tree does; one that
+    /// needs to should override this too.
     ///
     /// **The endpoints short-circuit, and that is purely an optimisation** — it skips a read,
     /// which on a mapped framebuffer aperture is uncached memory. An earlier version of this

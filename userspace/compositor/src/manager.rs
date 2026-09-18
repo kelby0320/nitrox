@@ -36,9 +36,11 @@ pub enum MgrOutcome {
     /// Applied. `dirty` is the region to repaint, in screen coordinates.
     ///
     /// **`None` means "everything"** — the same convention `server::Outcome` uses, and the answer
-    /// anything that cannot name its region must give. Since 2026-08-26 the only request that
-    /// gives it is `SetCurrentDesktop`, where it is the literal truth: every window on screen is
-    /// replaced by a different set.
+    /// anything that cannot name its region must give. Two requests give it, and for both it is
+    /// the literal truth: `SetCurrentDesktop` (since 2026-08-26), where every window on screen is
+    /// replaced by a different set, and `SetScheme` (since 2026-09-18), where every shadow on
+    /// screen is replaced by a different one. This said `SetCurrentDesktop` was the only one
+    /// until the PR #312 review found `SetScheme` had joined it.
     ///
     /// **A restack is no longer one of them**, and this doc said it was: "which pixels change
     /// depends on every overlap in the stack" is true of *which* of them change and irrelevant to
@@ -244,9 +246,9 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.set_current_desktop(req.desktop) {
-                // **`None`, because this request names no window.** Every other manager request
-                // names one, and `Applied.window` exists so the caller can release that
-                // window's held initial `Configure`; this one releases none.
+                // **`None`, because this request names no window.** The window requests name
+                // one, and `Applied.window` exists so the caller can release that window's held
+                // initial `Configure`; this one releases none, and neither does `SetScheme`.
                 Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
                 Ok(false) => {
                     MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }

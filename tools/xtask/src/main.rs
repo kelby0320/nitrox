@@ -403,7 +403,7 @@ fn print_help() {
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
-           preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
+           preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
            shot              boot the release image and photograph the desktop;\n  \
            \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
@@ -3834,11 +3834,17 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // send the `Place` that would release it; only the 200 ms configure deadline broke the tie.
     session.expect("desktop-shell: bottom bar presented")?;
     session.expect("desktop-shell: manager channel held")?;
-    // **The theme's scheme reached the compositor** (desktop refresh, Part A) — the one process
-    // that never reads the file, and the one that draws every window's shadow. The shell sends it
-    // whatever it is, so this line appears on a light boot too; and it is *the staged theme's*
-    // scheme, computed rather than written here, because a compositor that ignored the message
-    // would still be light and a literal `light` would pass against it.
+    // **The shell's `SetScheme` reached the compositor and was accepted** (desktop refresh, Part
+    // A) — the one process that never reads the theme file, and the one that draws every window's
+    // shadow. The shell sends it whatever the scheme, so the line appears on a light boot too.
+    //
+    // **What this proves on this image is the path, not the value.** The staged scheme is light
+    // and the compositor starts light, so a compositor that accepted the message and applied
+    // nothing would log the same line and pass. The value's mapping is pinned by the manager's
+    // unit test, `a_scheme_repaints_everything_once_and_an_unknown_one_is_refused`. The expected
+    // name is computed from the staged theme rather than written as `light` so that the day the
+    // staged scheme changes, this starts checking the value without anyone remembering to
+    // (PR #312 review, optional 7, which caught the comment claiming more).
     let scheme = staged_theme()?.0.scheme;
     session.expect(&format!("compositor: scheme {}", scheme.as_str()))?;
 
@@ -7200,12 +7206,13 @@ fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
 /// is the *binding* — base address, stride, channel order — not the compositing, which
 /// §8b already covers.
 ///
-/// `cargo xtask preview [ui|term|all]` — render the toolkit on the host and write it as a PNG.
+/// `cargo xtask preview [ui|ui-dark|term|all]` — render the toolkit on the host and write it as a PNG.
 ///
 /// **The whole point is that a judgement about how something looks should cost a glance rather
 /// than a boot** (M11 Part A). Polish is a hundred small decisions, and a decision that costs
 /// three minutes of QEMU is a decision not made — so this puts the same renders `check-display`
-/// adjudicates against into a file anyone can open.
+/// adjudicates against into a file anyone can open, plus `ui-dark`, the one no gate adjudicates
+/// (see [`preview_frames`]).
 ///
 /// **The same renderer, deliberately.** `xtask` already links `libui`, `libdraw` and `libterm`
 /// because the display gate renders the expected picture here rather than checking in a golden
@@ -13464,12 +13471,6 @@ fn format_cmd(cmd: &Command) -> String {
 mod tests {
     use super::*;
 
-    /// The shipped UI face carries the glyph a marked menu row draws.
-    ///
-    /// **A missing glyph is a silent failure** — `.notdef`, drawn as a blank or a box, reported
-    /// nowhere — so a decorative character picked in `libui` is a claim about a font file staged
-    /// by this crate, and this is the only place both are in scope. The control is the second
-    /// assertion: a private-use codepoint no face carries, which proves the check can fail.
     #[test]
     fn the_staged_theme_reads_back_as_itself_and_only_its_overrides_are_live() {
         let (shipped, text) = super::staged_theme().unwrap();
@@ -13494,6 +13495,12 @@ mod tests {
         assert_eq!((read.font_px, read.wallpaper), (shipped.font_px, shipped.wallpaper));
     }
 
+    /// The shipped UI face carries the glyph a marked menu row draws.
+    ///
+    /// **A missing glyph is a silent failure** — `.notdef`, drawn as a blank or a box, reported
+    /// nowhere — so a decorative character picked in `libui` is a claim about a font file staged
+    /// by this crate, and this is the only place both are in scope. The control is the second
+    /// assertion: a private-use codepoint no face carries, which proves the check can fail.
     #[test]
     fn the_menu_mark_exists_in_the_shipped_face() {
         let (ui, _) = host_faces().expect("the built-in theme's faces load on the host");
@@ -13505,7 +13512,8 @@ mod tests {
         assert!(!ui.has_glyph('\u{E000}'), "a private-use codepoint should be absent");
     }
 
-    /// A preview is the same picture the display gate demands of the guest.
+    /// Every picture the display gate demands of the guest is a preview, at the gate's size — and
+    /// the one preview it does not demand, `ui-dark`, is really the dark scheme.
     ///
     /// **What this pins, and what it deliberately no longer claims to.** *Sharing* is structural
     /// now: `cmd_check_display` reads its expected frames from `preview_frames`, so a preview
@@ -13522,7 +13530,7 @@ mod tests {
     /// Decoded rather than compared against what went in, because a round trip through one
     /// library's encoder and back tests the encoder; what is under test here is the pixels.
     #[test]
-    fn a_preview_is_the_picture_the_display_gate_demands() {
+    fn the_gates_pictures_are_previews_and_the_dark_one_is_dark() {
         use libdraw::framebuffer::Framebuffer;
         let faces = host_faces().expect("the vendored fonts");
         let frames = preview_frames(&faces);
@@ -13539,7 +13547,7 @@ mod tests {
                 ("ui-dark", libui::reference::WIDTH, libui::reference::HEIGHT),
                 ("term", term.w, term.h),
             ],
-            "the previews are the gate's arrangements, at the gate's sizes"
+            "the previews are the gate's arrangements at the gate's sizes, and ui-dark"
         );
         // And the dark one really is dark. (60, 4) is inside the menu bar's highlighted `Edit`,
         // which is the selection — the accent washed over the scheme's background, `#D5E5E9` in

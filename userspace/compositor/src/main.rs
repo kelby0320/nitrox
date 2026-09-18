@@ -1800,8 +1800,8 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
             // A manager that only wants to position a window sends `Place` and nothing else;
             // making it wait out the deadline would mean every launch is slow by design. The
             // configure goes out carrying the origin the manager just set.
-            // `None` is a request that named no window — `SetCurrentDesktop` — so there is
-            // no held configure to release.
+            // `None` is a request that named no window — `SetCurrentDesktop` or `SetScheme` —
+            // so there is no held configure to release.
             if let Some(window) = window {
                 release_configure(srv, screen, window);
             }
@@ -2016,6 +2016,14 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
                 repaint_region(srv, screen, r);
             }
         }
+    }
+    // **And the scheme it named** (desktop refresh, Part A; PR #312 review, optional 5). It came
+    // from the departed session's theme, and what is drawn next — the greeter, after a logout —
+    // is drawn from the built-in one. Left behind, a dark session's shadows would fall under a
+    // light greeter at two and a half times the strength until the next shell said otherwise.
+    if srv.stack.set_scheme(libdraw::theme::Scheme::Light) {
+        repaint(srv, screen);
+        kprint(b"compositor: scheme light (the manager that named another went away)\n");
     }
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has

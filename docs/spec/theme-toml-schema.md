@@ -127,10 +127,11 @@ only surfaces the refresh does not build — a primary button, a notification ba
 outside the design's two palettes too, and they belong to `libterm`'s sixteen, where retheming a
 desktop does not retheme `ls`.
 
-**The six `syntax_*` keys are the one place a colour is not derived from a surface** (M14
-Part G). Every other key here is a ground or its ink, and a widget wanting a third was told to
-derive one; a keyword and a comment cannot be derived from a window's ground, because what they
-encode is meaning rather than depth. They are read by whatever highlights text — today
+**The six `syntax_*` keys, and `accent`, `ok` and `deny`, are the colours not derived from a
+surface** (M14 Part G; the last three since the desktop refresh). Every other key here is a ground
+or its ink, and a widget wanting a third was told to derive one; a keyword and a comment cannot be
+derived from a window's ground, because what they encode is meaning rather than depth — and
+neither can emphasis, "working" or "destructive". They are read by whatever highlights text — today
 `nxedit` — and ignored by everything else, so a theme that omits them is a theme with the
 shipped scheme, like any other omitted key.
 
