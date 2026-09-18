@@ -4188,10 +4188,10 @@ mod tests {
         let mut tree = libui::diff::Tree::new();
         tree.update(&ui, &l).expect("the dialog is diffable");
         let mut router = libui::route::Router::new();
-        // The rightmost title-bar button, measured the way every gate in this tree measures one.
-        let x = CONFIRM_W as i32 - libui::widget::WINDOW_CONTENT_X as i32
-            - (libui::widget::TITLE_BUTTON_W / 2) as i32;
-        let y = (libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H / 2) as i32;
+        // The rightmost title-bar button. This re-derived it from contiguous slots and still
+        // landed inside after the desktop refresh's Part B gave the buttons gaps — by the luck of
+        // the arithmetic — so it asks the toolkit where the button is instead.
+        let (x, y) = libui::widget::title_button_centre(CONFIRM_W, 0);
         let at = |flags: u16, buttons: u16| librsproto::surface::PointerEvent {
             kind: librsproto::surface::POINTER_BUTTON,
             button: 0x110,

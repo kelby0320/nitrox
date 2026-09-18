@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, outline,
-    padding, row, sized, stack, text,
+    Edge, Element, IconKind, Insets, bevel, center, center_v, column, dock, docked, fill, icon,
+    ink, outline, padding, row, sized, stack, text,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -169,7 +169,13 @@ pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &The
 pub const WINDOW_BORDER: u32 = 1;
 
 /// How much frame shows between a window's content and its edge.
-pub const WINDOW_FRAME: u32 = 3;
+///
+/// **None, since the desktop refresh's Part B**: the design's content runs flush to the border.
+/// It was 3, a margin of the button face around everything below the title bar — the reference
+/// desktop's, which the design does not have. Kept as a named zero because applications subtract
+/// the frame from their content size through `WINDOW_FRAME_W` and `WINDOW_FRAME_H`, and those
+/// still mean what they say.
+pub const WINDOW_FRAME: u32 = 0;
 
 /// What [`window_frame`] takes off a window's width before its content sees it.
 ///
@@ -656,22 +662,59 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
 /// inside the window it drops from. This is the part the terminal's chrome needs; the anchor it
 /// is dropped from comes from [`layout::locate`](crate::layout::locate).
 pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, theme: &Theme) -> Element<Msg> {
+    // **The design's menu bar** (desktop refresh, Part B): `--faceHi` behind the words, which
+    // sets it apart from the title bar above in the same family of greys, and a `--lineSoft` rule
+    // under it. The rule is `border` at half strength over the bar's own face — the derivation
+    // Part A measured in both palettes — and is drawn *inside* `height` rather than below it:
+    // the design's bar is 25 with its rule, and three applications and their gates carry 24,
+    // which is a pixel of divergence rather than a pixel of every aim moving.
+    let rule = theme.border.blend(theme.face_hover, 128);
     sized(
         Size::new(0, height),
-        stack(alloc::vec![fill(theme.face), row(items)]),
+        dock(
+            alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(rule)))],
+            stack(alloc::vec![fill(theme.face_hover), row(items)]),
+        ),
     )
 }
 
 
-/// How tall a title bar is, in pixels.
+/// How tall a title bar is, in pixels — the rule along its bottom included.
 ///
 /// One number rather than a measurement of the font, because a client sizes its window around
 /// it: a bar that grew with the theme would change every window's content area when the theme
 /// changed, and M11 is where a theme becomes changeable.
-pub const TITLE_BAR_H: u32 = 26;
+///
+/// **31 since the desktop refresh's Part B**, the design's own (`height:31px` with a one-pixel
+/// `border-bottom`, box-sized). It was 26; the design's metrics are physical sizes on this
+/// machine and transfer as written (Part A's metrics decision). The gates carry their own copy,
+/// on purpose (M11 decision 2).
+pub const TITLE_BAR_H: u32 = 31;
 
-/// How wide each title-bar button is.
-pub const TITLE_BUTTON_W: u32 = 26;
+/// How wide each title-bar button is: the design's 23.
+pub const TITLE_BUTTON_W: u32 = 23;
+
+/// How tall the face of each is — 21, centred in the bar. The press lands anywhere in the
+/// button's column of the bar, which is the easier target and the one a gate aims at.
+pub const TITLE_BUTTON_H: u32 = 21;
+
+/// The gap between two title-bar buttons: the design's 9.
+pub const TITLE_BUTTON_GAP: u32 = 9;
+
+/// The space after the last button, before the window's border: the design's 5.
+pub const TITLE_BUTTON_PAD: u32 = 5;
+
+/// The centre of the `nth` title-bar button counting from the **right** — the close button is
+/// `0` — in a framed window `window_w` wide, in the window's own coordinates.
+///
+/// **For an application's tests, not for a gate**: a gate keeps its own copy of these numbers
+/// (M11 decision 2), and this exists so the three applications stop each re-deriving the
+/// arithmetic, which is how one of them came to aim a slot to the left.
+pub const fn title_button_centre(window_w: u32, nth: u32) -> (i32, i32) {
+    let right = window_w - WINDOW_BORDER - TITLE_BUTTON_PAD;
+    let x = right - nth * (TITLE_BUTTON_W + TITLE_BUTTON_GAP) - TITLE_BUTTON_W / 2 - 1;
+    (x as i32, (WINDOW_CONTENT_Y + (TITLE_BAR_H - 1) / 2) as i32)
+}
 
 /// A window's title bar: its name, and the three things you can do to a window.
 ///
@@ -702,38 +745,54 @@ pub fn title_bar<Msg: Clone>(
 ) -> Element<Msg> {
     let face = if focused { theme.title_active } else { theme.title_inactive };
     // **A glyph, not a letter** (M11 Part E, batch 2). These were `_`, `[]` and `X` — three
-    // characters standing in for three controls, which read as text on a bar full of text. They
-    // are drawn now, and the button keeps its size, so nothing a gate clicks has moved.
+    // characters standing in for three controls, which read as text on a bar full of text.
+    //
+    // **In the dim ink, on no face of their own** — the design's controls are borderless and
+    // `--fgdim`, and read as part of the bar rather than as three buttons on it. Each takes its
+    // whole column of the bar as a target and draws its glyph in the middle of the design's 23x21.
     let btn = |glyph: IconKind, msg: Msg| {
         sized(
-            Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
-            stack(alloc::vec![icon(glyph)]).on_press(msg),
+            Size::new(TITLE_BUTTON_W, 0),
+            center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(alloc::vec![icon(glyph)]))),
         )
+        .on_press(msg)
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
     // does nothing, and a control that looks live and is not is the defect this milestone's
     // predecessor shipped three of (M8's overview). The buttons arrive with the parts that give
     // them somewhere to go: minimise and maximise in Part B, close in Part C.
-    let mut controls = alloc::vec::Vec::with_capacity(4);
-    controls.push(padding(TITLE_PAD, text(title)).flex(1));
+    let mut glyphs = alloc::vec::Vec::with_capacity(3);
     if let Some(m) = buttons.minimise {
-        controls.push(btn(IconKind::Minimise, m));
+        glyphs.push(btn(IconKind::Minimise, m));
     }
     if let Some(m) = buttons.maximise {
-        controls.push(btn(IconKind::Maximise, m));
+        glyphs.push(btn(IconKind::Maximise, m));
     }
     if let Some(m) = buttons.close {
-        controls.push(btn(IconKind::Close, m));
+        glyphs.push(btn(IconKind::Close, m));
     }
+    let mut controls = alloc::vec::Vec::with_capacity(3);
+    controls.push(padding(TITLE_PAD, center_v(text(title))).flex(1));
+    controls.push(ink(
+        theme.foreground_dim,
+        crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),
+    ));
+    controls.push(sized(Size::new(TITLE_BUTTON_PAD, 0), text("")));
     // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
     // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
     // handler on the face below it is never reached, and the first version of this widget
     // produced nothing at all for a press in the middle of its own title. On the bar, a press
     // that lands on the label or on empty space walks up to here, and one that lands on a button
     // stops at the button, because that is where the walk finds a handler first.
+    // **A rule along the bottom**, the design's `border-bottom: 1px solid var(--line)`: it is what
+    // separates a title bar from a menu bar the same colour as it, and it is inside `TITLE_BAR_H`.
     sized(
         Size::new(0, TITLE_BAR_H),
-        stack(alloc::vec![fill(face), row(controls)]).on_press_down(drag),
+        dock(
+            alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))],
+            stack(alloc::vec![fill(face), row(controls)]),
+        )
+        .on_press_down(drag),
     )
 }
 
@@ -802,8 +861,9 @@ impl<Msg> Default for TitleButtons<Msg> {
     }
 }
 
-/// Space between a title bar's text and its edge.
-const TITLE_PAD: Insets = Insets { top: 5, right: 6, bottom: 5, left: 8 };
+/// Space between a title bar's text and its edge: the design's 11 on the left, and the text
+/// centred down the bar.
+const TITLE_PAD: Insets = Insets { top: 0, right: 6, bottom: 0, left: 11 };
 
 /// Space between a text field's content and its edge.
 const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
@@ -3554,8 +3614,9 @@ mod tests {
         ];
         let e = menu_bar(items, 24, &p);
         let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
-        // sized -> stack -> [face fill, row] ; row -> the two buttons
-        let row = &l.children[0].children[1];
+        // sized -> dock -> [the rule, stack] ; stack -> [face fill, row] ; row -> the buttons.
+        // (One level deeper since the desktop refresh's Part B put a rule under the bar.)
+        let row = &l.children[0].children[1].children[1];
         let (a, b) = (row.children[0].rect, row.children[1].rect);
         assert!(a.size.w > 0, "the first item measured to nothing");
         assert!(b.size.w > 0, "the second item got no width — the first one ate the row");
@@ -3613,23 +3674,42 @@ mod tests {
             &p,
         );
         let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
-        // sized -> stack -> [face, row] ; row -> [label, min, max, close]
-        let stack = &l.children[0];
-        let face = stack.children[0].rect;
-        let row = &stack.children[1];
-        assert_eq!(face.size.h, TITLE_BAR_H, "the draggable face is the bar");
-        assert_eq!(face.size.w, 400, "and it spans it");
-
-        let close = row.children[3].rect;
-        assert_eq!(close.right(), 400, "the close button is at the right edge");
-        assert_eq!(close.size.w, TITLE_BUTTON_W);
-        let label = row.children[0].rect;
-        assert_eq!(label.origin.x, 0, "the title starts at the left");
-        assert!(
-            label.right() <= row.children[1].rect.origin.x as i64,
-            "the title overlaps the buttons: {label:?} vs {:?}",
-            row.children[1].rect
-        );
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        // **Asked of the router, not read off the layout tree**, which this used to walk by child
+        // index and which changed shape when the bar gained a rule and its buttons an ink
+        // (desktop refresh, Part B). Where a press *lands* is the property; the tree's shape was
+        // only ever a way of guessing it.
+        let click = |x: i32, y: i32| {
+            let at = |pressed: bool| librsproto::surface::PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { librsproto::surface::POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let mut got = r.pointer(&tree, &e, &l, at(true)).0;
+            got.extend(r.pointer(&tree, &e, &l, at(false)).0);
+            got
+        };
+        assert_eq!(l.rect.size.h, TITLE_BAR_H, "the bar is its height");
+        // The buttons sit at the right edge, `TITLE_BUTTON_PAD` in, each answering across its
+        // whole column and not a pixel beyond it.
+        let right = (400 - TITLE_BUTTON_PAD) as i32;
+        let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
+        for (nth, want) in [(0, M::Close), (1, M::Max), (2, M::Min)] {
+            let end = right - nth * step;
+            let start = end - TITLE_BUTTON_W as i32;
+            assert_eq!(click(start, 12), vec![want.clone()], "{want:?}'s first column");
+            assert_eq!(click(end - 1, 12), vec![want.clone()], "{want:?}'s last column");
+            assert_eq!(click(end, 12), vec![M::Drag], "just past {want:?} is the bar");
+        }
+        // And the face takes the rest: the title's end of the bar, the gaps, the padding.
+        assert_eq!(click(1, 12), vec![M::Drag], "the title starts at the left and drags");
+        assert_eq!(click(399, 12), vec![M::Drag], "the padding after close drags");
     }
 
     // ---- the text area (M10 Part C) ----
@@ -4673,22 +4753,30 @@ two");
         let down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
         let up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
 
+        // The buttons' centres in a bare 400-wide bar, from the constants — the close button ends
+        // `TITLE_BUTTON_PAD` in from the right, each is `TITLE_BUTTON_W` wide, `TITLE_BUTTON_GAP`
+        // apart. These were 390 and 364 in contiguous 26-pixel slots until the desktop refresh's
+        // Part B, and 364 now falls in a gap, which drags.
+        let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
+        let close_x = (400 - TITLE_BUTTON_PAD - TITLE_BUTTON_W / 2 - 1) as i32;
+        let max_x = close_x - step;
+
         let mut r = Router::new();
         assert_eq!(down(&mut r, 200), vec![M::Drag], "the bar moves the window on the press…");
         assert_eq!(up(&mut r, 200), vec![], "…and the release adds nothing");
 
         let mut r = Router::new();
         assert_eq!(
-            down(&mut r, 390),
+            down(&mut r, close_x),
             vec![],
             "a press on close must not also drag: the window would move under the pointer while \
              the user is aiming at a button"
         );
-        assert_eq!(up(&mut r, 390), vec![M::Close], "and the click is the close");
+        assert_eq!(up(&mut r, close_x), vec![M::Close], "and the click is the close");
 
         let mut r = Router::new();
-        assert_eq!(down(&mut r, 364), vec![], "the same for maximise");
-        assert_eq!(up(&mut r, 364), vec![M::Max]);
+        assert_eq!(down(&mut r, max_x), vec![], "the same for maximise");
+        assert_eq!(up(&mut r, max_x), vec![M::Max]);
 
         // **And a second button pressed mid-drag is not a second drag.** While a capture is held
         // the router routes to the *captured* widget, so every later press was reaching the bar
@@ -4819,8 +4907,12 @@ two");
         // The literals matter as much as the derivation. Comparing derived constants against a
         // tree built from the same constants pins nothing — both sides move together, and the
         // gate's own table is linked to neither (PR #267 review, finding 2).
+        //
+        // **Moved by the desktop refresh's Part B**, from (91, 249, 103): the window's content now
+        // runs flush to its border (`WINDOW_FRAME` 3 → 0), so the strip is three pixels wider on
+        // each side and three pixels lower. `check-login`'s `CONFIRM_*` moved in the same change.
         assert_eq!((DIALOG_W, DIALOG_H), (340, 132));
-        assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (91, 249, 103));
+        assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (89, 250, 106));
 
         #[derive(Clone, PartialEq, Eq, Debug)]
         enum M {

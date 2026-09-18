@@ -495,7 +495,7 @@ is:
 
 | Widget | Why it exists |
 |---|---|
-| `window_frame` | A window's own edge: a one-pixel border, rounded along the compositor's curve and drawn last as a `Node::Outline`, three pixels of frame on the left, right and bottom, and the title bar flush at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
+| `window_frame` | A window's own edge: a one-pixel border, rounded along the compositor's curve and drawn last as a `Node::Outline`, with the content flush against it (`WINDOW_FRAME` is 0 since the desktop refresh's Part B, which took away a three-pixel margin the design does not have) and the title bar at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
 | `popup_frame` | A menu or modal's edge, rounded like a window's. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
 | `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
 | `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |
@@ -882,8 +882,8 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 
   **Metrics are still constants**, and that is a decision rather than a leftover: padding,
   title-bar height and the resize grip stay compiled in because the gates click title bars at
-  `+13` and close buttons at `-39`, and a gate that had to read a theme to know where to click
-  could disagree with the thing it is checking (M11 decision 2).
+  `+16` and close buttons at `-18` (the `chrome` table in `xtask`), and a gate that had to read a
+  theme to know where to click could disagree with the thing it is checking (M11 decision 2).
 
   **Where the values come from is a file**, since M11 Part C: `/home/theme.toml`, read once by
   the shell and handed to every application on the setup record

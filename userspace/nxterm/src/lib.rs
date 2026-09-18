@@ -1747,11 +1747,15 @@ mod tests {
         let want = Size::new(1280, 752);
         assert!(a.resize(want).is_some(), "a new size is a change");
         assert_eq!(a.window_size(), want, "committed at exactly what was asked for");
-        assert_eq!(a.grid().cols(), ((1280 - SCROLL_W) / m.cell_w) as usize);
-        assert_eq!(a.grid().rows(), ((752 - BAR_H - TAB_STRIP_H - TITLE_BAR_H) / m.cell_h) as usize);
+        // **The whole chrome, frame included** — `CHROME_W` and `CHROME_H`, the sums the terminal
+        // lays itself out with. These lines left the window's frame out and agreed only while the
+        // rounding happened to; the desktop refresh's Part B took the frame from 3 pixels to none
+        // and moved the answer by a row.
+        assert_eq!(a.grid().cols(), ((1280 - CHROME_W) / m.cell_w) as usize);
+        assert_eq!(a.grid().rows(), ((752 - CHROME_H) / m.cell_h) as usize);
         // And the cells really do fit: chrome plus grid is no larger than the window.
         let g = m.pixel_size(a.grid().cols(), a.grid().rows());
-        assert!(g.w + SCROLL_W <= want.w && g.h + BAR_H + TAB_STRIP_H + TITLE_BAR_H <= want.h);
+        assert!(g.w + CHROME_W <= want.w && g.h + CHROME_H <= want.h);
     }
 
     #[test]
@@ -2693,14 +2697,13 @@ mod tests {
     ///
     /// **Through the router**, because the message the button carries is the thing under test:
     /// reading the state instead would pass for a toggle that never reached the bar. The
-    /// buttons are laid out from the right edge — close, maximise, minimise — each
-    /// `TITLE_BUTTON_W` wide, so the middle of the maximise button is a slot and a half in.
+    /// buttons are laid out from the right edge — close, maximise, minimise — and
+    /// `title_button_centre` is where the second one is; this re-derived it from contiguous
+    /// 26-pixel slots until the desktop refresh's Part B gave them gaps.
     fn click_maximise(a: &mut App) {
-        use libui::widget::TITLE_BUTTON_W;
         let (t, l, mut r) = window(a);
         let e = a.view(&UiTheme::default(), None);
-        let x = a.window_size().w as i32 - (TITLE_BUTTON_W as i32 + TITLE_BUTTON_W as i32 / 2);
-        let y = TITLE_BAR_H as i32 / 2;
+        let (x, y) = libui::widget::title_button_centre(a.window_size().w, 1);
         let mut msgs = alloc::vec::Vec::new();
         for (flags, held) in [(librsproto::surface::POINTER_PRESSED, 1), (0, 0)] {
             let p = PointerEvent {

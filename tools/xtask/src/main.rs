@@ -70,6 +70,32 @@ const FAT32_MIN_MIB: u64 = 33;
 // login selftest (auth Part E) must use these same literals. A fixed salt keeps the
 // image build reproducible (a single demo user makes salt-uniqueness moot). See
 // `docs/architecture/session-and-auth.md`.
+/// **A framed window's chrome, as the gates aim at it** — `libui::widget`'s geometry, copied on
+/// purpose (M11 decision 2): a gate that read the toolkit to know where to click could agree with a
+/// toolkit that had stopped drawing where it says. `libui`'s own tests pin the other side against
+/// built trees (`title_button_centre`, `dialog_buttons_land_where_the_constants_say`).
+///
+/// **One table since the desktop refresh's Part B**, which moved every one of these: the title bar
+/// grew from 26 to 31, its buttons went from contiguous 26-pixel slots to the design's 23 with 9
+/// between, and a window's content lost its 3-pixel frame. They were a dozen inline numbers —
+/// `+ 13`, `- 39`, `- 65`, `+ 4` — and a change to the chrome was a search for all of them.
+mod chrome {
+    /// A title bar's height, its bottom rule included (`libui::widget::TITLE_BAR_H`).
+    pub const TITLE_BAR_H: i32 = 31;
+    /// How far below a window's top edge its title bar is aimed at: the middle of the bar's face,
+    /// below the one-pixel border.
+    pub const TITLE_Y: i32 = 16;
+    /// How far left of a window's right edge the **close** button's centre is: the border, five
+    /// of padding, and half of a 23-pixel button.
+    pub const CLOSE_X: i32 = 18;
+    /// The **maximise** button's, one button and one 9-pixel gap further left.
+    pub const MAXIMISE_X: i32 = 50;
+    /// The **minimise** button's, one more further.
+    pub const MINIMISE_X: i32 = 82;
+    /// How far right of a window's left edge its content starts: the border, and no frame.
+    pub const CONTENT_X: i32 = 1;
+}
+
 const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
@@ -3984,15 +4010,15 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      `Surface::RequestState`, the compositor forwards it, and the shell decides.
     //
     // **The buttons are measured from the right edge in layout order** — minimise, maximise,
-    // close, each `TITLE_BUTTON_W` (26) wide. Part C added close, which moved the other two a
-    // slot left; the first run after that clicked *close* where it meant maximise, which is what
-    // a coordinate constant hides and a changing layout exposes.
-    let button_y = term_y + 13;
+    // close; see `chrome`. Part C added close, which moved the other two a slot left; the first
+    // run after that clicked *close* where it meant maximise, which is what a coordinate constant
+    // hides and a changing layout exposes.
+    let button_y = term_y + chrome::TITLE_Y;
     // Measured from the window's **right edge**, which is its origin plus its width — not from
     // its width, which is the same number only while windows are placed at x=0.
     let right = term_x + term_w as i32;
-    let maximise_at = (right - 39, button_y);
-    let minimise_at = (right - 65, button_y);
+    let maximise_at = (right - chrome::MAXIMISE_X, button_y);
+    let minimise_at = (right - chrome::MINIMISE_X, button_y);
 
     // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
     // that it answered with the *work area* rather than the screen. What the client does with
@@ -4022,7 +4048,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         "desktop-shell: window {term_id} geometry {},{} {}x{}",
         work.0, work.1, work.2, work.3
     ))?;
-    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - 39, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
     session.expect("nxterm: asked the shell for window state 0")?;
     session.expect(&format!("desktop-shell: restore window {term_id} to "))?;
     // The size is pinned by the client's own line rather than by the shell's: the shell prints
@@ -4517,8 +4543,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     const DRAG_STEPS: i32 = 4;
     const DRAG_DX: i32 = 10;
     const DRAG_DY: i32 = 5;
-    // The title bar is the top 26 px of the window; x=100 is clear of the buttons at its right.
-    let press_at = (100, term_y + 13);
+    // The title bar is the top of the window; x=100 is clear of the buttons at its right.
+    let press_at = (100, term_y + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
@@ -4566,7 +4592,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // was placed plus what the drag injected.
     let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
-    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 39, moved_y + 13)?;
+    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - chrome::MAXIMISE_X, moved_y + chrome::TITLE_Y)?;
     session.expect("nxterm: asked the shell for window state 2")?;
     session.expect(&format!(
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
@@ -4663,14 +4689,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     line that says which of the two the shell used.
     //
     //     The window is `resized_w x resized_h` at the work area's origin after 6j, so its title
-    //     bar is at `work.1 + 13` and clear of the buttons at `x = 100`.
+    //     bar is at `work.1 + chrome::TITLE_Y` and clear of the buttons at `x = 100`.
     // **First the control, as a step of its own with a positive assertion**: a drag that passes
     // *through* a zone and is released outside it must snap nothing — and what it must do
     // instead is the ordinary move, so the assertion is the geometry that move produces. A
     // compositor that snapped on entry rather than on release would report the zone's target
     // here, and this line is what catches it. Asserting the absence of a snap would not: the
     // step after this one produces exactly that line, and an `expect` scans forward.
-    let press_at = (100, work.1 + 13);
+    let press_at = (100, work.1 + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
@@ -4796,7 +4822,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      6k then dropped it at the left edge, so its right edge is the work area's midpoint.
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - 13, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - chrome::CLOSE_X, work.1 + chrome::TITLE_Y)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");
@@ -4971,7 +4997,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **And the margin around it** (M15 Part E), which moved every sidebar row down by its height
     // without moving a listing row at all. `nxfiles::SIDEBAR_PAD` is the browser's own version.
     const SIDEBAR_PAD: i32 = 6;
-    const TITLE_BAR_H: i32 = 26;
+    const TITLE_BAR_H: i32 = chrome::TITLE_BAR_H;
     const PATH_H: i32 = 24;
     const ROW_H: i32 = 20;
     // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
@@ -5231,7 +5257,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    a window at the screen's right edge is M9 Part F's own gesture, so the geometry the
     //    drag then uses is the work area's half rather than a number this gate invented.
     let (edit_id, ex, ey, ew, _eh) = edit_win;
-    let title_grab = (ex + ew as i32 / 2, ey + 13);
+    let title_grab = (ex + ew as i32 / 2, ey + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, title_grab.0, title_grab.1)?;
     qmp.pointer = Some(title_grab);
     qmp.send_button("left", true)?;
@@ -5400,14 +5426,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     const TAB_STRIP_H: i32 = 24;
     // The editor is the work area's right half after the snap above.
     let ed = (work.0 + (work.2 / 2) as i32, work.1);
-    // Tab `i`'s label area: 4 is `WINDOW_CONTENT_X`, `TAB_W` per tab, and 40 into the label —
+    // Tab `i`'s label area: `chrome::CONTENT_X`, `TAB_W` per tab, and 40 into the label —
     // clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
     // **Below the editor's menu bar since M14 Part A**, which put one above the strip to match
     // the browser. The strip did not move relative to anything it contains; the whole of it moved
     // down by a bar, and a gate that aimed at the old y clicked the menus instead — which is how
     // this failed, silently, as a tab that never became current.
     let tab = |i: i32| {
-        (ed.0 + 4 + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
+        (ed.0 + chrome::CONTENT_X + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
     };
     let tab0 = tab(0);
     click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
@@ -5752,12 +5778,16 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     while ry < py + ph as i32 - MENU_FRAME {
         move_pointer_to(&mut qmp, rx, ry)?;
         qmp.pointer = Some((rx, ry));
-        // A poll rather than a wait: the receipt lands on the frame after the motion, and a step
-        // that arrived on another row says so just as fast.
-        if session.expect_within(
-            &format!("nxfiles: menu hover {RENAME_ROW}"),
-            std::time::Duration::from_millis(300),
-        )? {
+        // **The row the pointer settled on, not the first one it crossed** — see
+        // `Session::settled_line`. The receipt lands on the frame after the motion; a step that
+        // arrived nowhere new says nothing, and the next step is taken.
+        let over = session.settled_line(
+            "nxfiles: menu hover ",
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(400),
+        )?;
+        if over.as_deref() == Some(RENAME_ROW.to_string().as_str()) {
+            println!("  ok: the pointer settled over row {RENAME_ROW}");
             rename_at = Some((rx, ry));
             break;
         }
@@ -5894,9 +5924,12 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     compiler cannot see.)
     const CONFIRM_W: i32 = 340;
     const CONFIRM_H: i32 = 132;
-    const CONFIRM_DISCARD_CX: i32 = 91;
-    const CONFIRM_KEEP_CX: i32 = 249;
-    const CONFIRM_BUTTON_CY: i32 = 103;
+    // **Moved by the desktop refresh's Part B** from (91, 249, 103): the dialog's content runs
+    // flush to its border now, three pixels wider each side and three lower. `libui`'s pin moved
+    // with them, in the same change.
+    const CONFIRM_DISCARD_CX: i32 = 89;
+    const CONFIRM_KEEP_CX: i32 = 250;
+    const CONFIRM_BUTTON_CY: i32 = 106;
     // **And the editor's own size, `nxedit::START_SIZE`, because the geometry line cannot be
     // read this late.** The shell logs at most `MAX_LOGGED_GEOMETRY` of them per session and
     // this run passed that long ago — a bound that exists because the event is client-driven,
@@ -5914,7 +5947,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // three title-bar controls, measured from the window's right edge — the same arithmetic 6a2
     // uses, and the same one 6i used on `nxterm`, whose close button really does just exit.
     let untitled_right = untitled_x + EDITOR_W;
-    let close_at = (untitled_right - 13, untitled_y + 13);
+    let close_at = (untitled_right - chrome::CLOSE_X, untitled_y + chrome::TITLE_Y);
     click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
     // **The editor's line comes first, and it is ordered by construction rather than by luck.**
     // It is printed *before* the dialog is asked for, because a dialog's first `Configure` is
@@ -6961,12 +6994,18 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     while cy < py + ph as i32 - 3 {
         move_pointer_to(&mut qmp, cx, cy)?;
         qmp.pointer = Some((cx, cy));
-        // Short, because this is a poll rather than a wait: the receipt is emitted on the frame
-        // after the motion, and a step that landed on another row will say so just as fast.
-        if session.expect_within(
-            &format!("nxterm: menu hover {CLEAR_ROW}"),
-            std::time::Duration::from_millis(300),
-        )? {
+        // **The row the pointer settled on, not the first one it crossed.** The first step here
+        // comes from wherever the last click left the pointer, in 100-pixel packets, and the
+        // guest reports every row it passes: after the desktop refresh's Part B moved this popup
+        // four pixels, the approach's first packet landed on `Clear` itself, the walk took that
+        // for arrival, and clicked the disabled `Copy` at the top. See `Session::settled_line`.
+        let over = session.settled_line(
+            "nxterm: menu hover ",
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(400),
+        )?;
+        if over.as_deref() == Some(CLEAR_ROW.to_string().as_str()) {
+            println!("  ok: the pointer settled over row {CLEAR_ROW}");
             found = Some(cy);
             break;
         }
@@ -7012,6 +7051,15 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // a click chooses. Nothing had ever arrowed.
     //
     // The popup takes the keyboard while it is up, so these keys reach *it* and never the grid.
+    //
+    // **And the terminal has to have the keyboard back before F1 goes**, which is why this waits
+    // for `focus=1`. Choosing closes the popup, and the compositor announces the terminal's focus
+    // only once the popup has gone; F1 sent on `chose Clear` alone could arrive while the
+    // closing popup still held the keyboard, and open nothing. It did, twice: once in the desktop
+    // refresh's Part A under host load, and again in Part B without it, both transcripts ending
+    // `chose Clear`, `focus=1`, and silence. The key's destination cannot be logged — console lines
+    // never carry what was typed — so the evidence is the ordering: this is the transcript's own.
+    session.expect("nxterm: focus=1")?;
     qmp.send_key("f1", true)?;
     qmp.send_key("f1", false)?;
     session.expect("nxterm: menu popup ")?;
@@ -8474,6 +8522,18 @@ fn desktop_round_trip(
     Ok(())
 }
 
+/// The last **complete** line of `fresh` containing `prefix` — what follows `prefix` on it,
+/// trimmed — and how many bytes of `fresh` are whole lines. See [`Session::settled_line`].
+///
+/// **Whole lines only**: the reader appends as bytes arrive, and a half-written `hover 10` is not
+/// row 10. The count lets the caller stop at the last complete line and read the rest next time.
+fn last_receipt(fresh: &str, prefix: &str) -> (Option<String>, usize) {
+    let whole = fresh.rfind('\n').map_or(0, |i| i + 1);
+    let line = fresh[..whole].lines().filter(|l| l.contains(prefix)).last();
+    let rest = line.map(|l| l[l.find(prefix).map_or(0, |i| i + prefix.len())..].trim().to_string());
+    (rest, whole)
+}
+
 /// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`.
 ///
 /// QEMU writes exactly this format, and it is what `libdraw::ppm` emits, so the two ends
@@ -9117,6 +9177,53 @@ impl Session {
             }
             if std::time::Instant::now() > deadline {
                 return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The **last** line starting `prefix` once such lines have stopped arriving for `quiet` —
+    /// the rest of it after `prefix` — or `None` if none arrived before `limit`. Consumes
+    /// everything read.
+    ///
+    /// **For a receipt that the path to a position can also produce.** An injected move is a run
+    /// of relative packets, and the guest reports every row the pointer crosses on the way, not
+    /// only the one it stops on. `expect_within` takes the *first* matching line, so a walk that
+    /// polled for "hover over row N" accepted a row the pointer merely passed through, and clicked
+    /// where it had stopped instead — which is what `check-terminal` did once the desktop
+    /// refresh's Part B moved a menu popup four pixels, putting the approach's first 100-pixel
+    /// step on the very row the walk was looking for. The row the pointer is *over* is the last
+    /// one it reported, and only once it has stopped reporting.
+    fn settled_line(
+        &mut self,
+        prefix: &str,
+        quiet: std::time::Duration,
+        limit: std::time::Duration,
+    ) -> R<Option<String>> {
+        let start = std::time::Instant::now();
+        let mut last: Option<String> = None;
+        let mut changed = start;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                // **Whole lines only**: the reader appends as bytes arrive, and a half-written
+                // `hover 10` is not row 10. The cursor stops at the last complete line, so the
+                // rest is read on the next poll.
+                let (receipt, whole) = last_receipt(&g[self.cursor..], prefix);
+                if let Some(r) = receipt {
+                    last = Some(r);
+                    // Only a receipt restarts the wait: other output — a heartbeat — says nothing
+                    // about whether the pointer is still moving.
+                    changed = std::time::Instant::now();
+                }
+                self.cursor += whole;
+            }
+            let now = std::time::Instant::now();
+            if last.is_some() && now.duration_since(changed) >= quiet {
+                return Ok(last);
+            }
+            if now.duration_since(start) >= limit {
+                return Ok(last);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -13457,6 +13564,22 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settled_receipt_is_the_last_whole_one() {
+        // The approach crosses `Clear` and stops on `Copy`: the answer is where it stopped.
+        let text = "nxterm: menu hover 106\nheartbeat\nnxterm: menu hover 100\n";
+        assert_eq!(last_receipt(text, "nxterm: menu hover "), (Some("100".to_string()), text.len()));
+        // A line still being written is not read, and not consumed.
+        let partial = "nxterm: menu hover 100\nnxterm: menu hover 10";
+        assert_eq!(
+            last_receipt(partial, "nxterm: menu hover "),
+            (Some("100".to_string()), "nxterm: menu hover 100\n".len())
+        );
+        // Nothing complete, nothing read.
+        assert_eq!(last_receipt("nxterm: menu hov", "nxterm: menu hover "), (None, 0));
+        assert_eq!(last_receipt("heartbeat\n", "nxterm: menu hover "), (None, 10));
+    }
 
     #[test]
     fn the_staged_theme_reads_back_as_itself_and_only_its_overrides_are_live() {

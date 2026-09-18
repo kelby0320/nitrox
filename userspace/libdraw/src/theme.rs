@@ -21,9 +21,9 @@
 //! retheming `ls` output.
 //!
 //! **Chrome metrics** — padding, title-bar height, the resize grip. Colour and text size move
-//! (M11's decision 2); the rest stay constants, because gates click title bars at `+13` and
-//! close buttons at `-39`, and a gate that had to read a theme to know where to click is a gate
-//! that can disagree with the thing it is checking.
+//! (M11's decision 2); the rest stay constants, because gates click title bars at `+16` and
+//! close buttons at `-18` (`xtask`'s `chrome` table), and a gate that had to read a theme to know
+//! where to click is a gate that can disagree with the thing it is checking.
 
 use crate::format::Rgb;
 
