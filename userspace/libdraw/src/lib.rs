@@ -48,6 +48,7 @@ extern crate alloc;
 #[cfg(feature = "io")]
 pub mod acquire;
 pub mod compose;
+pub mod corner;
 pub mod format;
 pub mod framebuffer;
 pub mod geom;

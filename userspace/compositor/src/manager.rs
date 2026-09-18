@@ -23,8 +23,9 @@ use librsproto::surface::{
     OP_MGR_CLOSE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE,
     OP_MGR_REGISTER_HOTKEY, OP_MGR_REGISTER_SNAP_ZONE,
     OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
-    OP_MGR_SET_WINDOW_DESKTOP,
+    OP_MGR_SET_SCHEME, OP_MGR_SET_WINDOW_DESKTOP, MgrScheme, SCHEME_DARK, SCHEME_LIGHT,
 };
+use libdraw::theme::Scheme;
 
 use crate::server::SurfaceError;
 use crate::{StackError, WindowStack};
@@ -35,9 +36,11 @@ pub enum MgrOutcome {
     /// Applied. `dirty` is the region to repaint, in screen coordinates.
     ///
     /// **`None` means "everything"** — the same convention `server::Outcome` uses, and the answer
-    /// anything that cannot name its region must give. Since 2026-08-26 the only request that
-    /// gives it is `SetCurrentDesktop`, where it is the literal truth: every window on screen is
-    /// replaced by a different set.
+    /// anything that cannot name its region must give. Two requests give it, and for both it is
+    /// the literal truth: `SetCurrentDesktop` (since 2026-08-26), where every window on screen is
+    /// replaced by a different set, and `SetScheme` (since 2026-09-18), where every shadow on
+    /// screen is replaced by a different one. This said `SetCurrentDesktop` was the only one
+    /// until the PR #312 review found `SetScheme` had joined it.
     ///
     /// **A restack is no longer one of them**, and this doc said it was: "which pixels change
     /// depends on every overlap in the stack" is true of *which* of them change and irrelevant to
@@ -243,14 +246,31 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.set_current_desktop(req.desktop) {
-                // **`None`, because this request names no window.** Every other manager request
-                // names one, and `Applied.window` exists so the caller can release that
-                // window's held initial `Configure`; this one releases none.
+                // **`None`, because this request names no window.** The window requests name
+                // one, and `Applied.window` exists so the caller can release that window's held
+                // initial `Configure`; this one releases none, and neither does `SetScheme`.
                 Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
                 Ok(false) => {
                     MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
                 }
                 Err(e) => refused(e),
+            }
+        }
+        OP_MGR_SET_SCHEME => {
+            let scheme = match MgrScheme::read(body).map(|r| r.scheme) {
+                Some(SCHEME_LIGHT) => Scheme::Light,
+                Some(SCHEME_DARK) => Scheme::Dark,
+                // A scheme this compositor does not know, or no body at all. Not the nearest
+                // scheme: a shell and a compositor disagreeing about a number would each look
+                // right on its own.
+                _ => return MgrOutcome::Failed(SurfaceError::Malformed),
+            };
+            if stack.set_scheme(scheme) {
+                // **Everything**, and literally: every shadow on screen changed, and a darker one
+                // reaches further than the one it replaces. See `WindowStack::set_scheme`.
+                MgrOutcome::Applied { window: None, dirty: None }
+            } else {
+                MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
             }
         }
         OP_MGR_REGISTER_HOTKEY => {
@@ -597,6 +617,40 @@ mod tests {
             MgrOutcome::Failed(SurfaceError::Malformed),
         );
         assert_eq!(s.current_desktop(), 1, "and the current desktop is untouched");
+    }
+
+    #[test]
+    fn a_scheme_repaints_everything_once_and_an_unknown_one_is_refused() {
+        let (mut s, _) = stack_with(1);
+        let body = |scheme: u32| {
+            let mut b = [0u8; 4];
+            MgrScheme { scheme }.write(&mut b).unwrap();
+            b
+        };
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_SCHEME, &body(SCHEME_DARK)),
+            MgrOutcome::Applied { window: None, dirty: None },
+            "a change repaints the whole screen"
+        );
+        assert_eq!(s.scheme(), Scheme::Dark);
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_SCHEME, &body(SCHEME_DARK)),
+            MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
+            "the same scheme again changes nothing"
+        );
+        for bad in [&body(2)[..], &body(u32::MAX)[..], &[0u8; 3][..]] {
+            assert_eq!(
+                dispatch(&mut s, OP_MGR_SET_SCHEME, bad),
+                MgrOutcome::Failed(SurfaceError::Malformed),
+                "{bad:?} was taken as a scheme"
+            );
+        }
+        assert_eq!(s.scheme(), Scheme::Dark, "and a refusal leaves the scheme alone");
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_SCHEME, &body(SCHEME_LIGHT)),
+            MgrOutcome::Applied { window: None, dirty: None },
+        );
+        assert_eq!(s.scheme(), Scheme::Light);
     }
 
     #[test]

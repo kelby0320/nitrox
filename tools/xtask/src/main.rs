@@ -403,7 +403,7 @@ fn print_help() {
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
-           preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
+           preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
            shot              boot the release image and photograph the desktop;\n  \
            \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
@@ -3834,6 +3834,19 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // send the `Place` that would release it; only the 200 ms configure deadline broke the tie.
     session.expect("desktop-shell: bottom bar presented")?;
     session.expect("desktop-shell: manager channel held")?;
+    // **The shell's `SetScheme` reached the compositor and was accepted** (desktop refresh, Part
+    // A) — the one process that never reads the theme file, and the one that draws every window's
+    // shadow. The shell sends it whatever the scheme, so the line appears on a light boot too.
+    //
+    // **What this proves on this image is the path, not the value.** The staged scheme is light
+    // and the compositor starts light, so a compositor that accepted the message and applied
+    // nothing would log the same line and pass. The value's mapping is pinned by the manager's
+    // unit test, `a_scheme_repaints_everything_once_and_an_unknown_one_is_refused`. The expected
+    // name is computed from the staged theme rather than written as `light` so that the day the
+    // staged scheme changes, this starts checking the value without anyone remembering to
+    // (PR #312 review, optional 7, which caught the comment claiming more).
+    let scheme = staged_theme()?.0.scheme;
+    session.expect(&format!("compositor: scheme {}", scheme.as_str()))?;
 
     // **The work area, and that it is not the screen** (M9 Part B). The shell asks the
     // compositor rather than subtracting its own bars, because any `panel`-role client declares
@@ -7193,12 +7206,13 @@ fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
 /// is the *binding* — base address, stride, channel order — not the compositing, which
 /// §8b already covers.
 ///
-/// `cargo xtask preview [ui|term|all]` — render the toolkit on the host and write it as a PNG.
+/// `cargo xtask preview [ui|ui-dark|term|all]` — render the toolkit on the host and write it as a PNG.
 ///
 /// **The whole point is that a judgement about how something looks should cost a glance rather
 /// than a boot** (M11 Part A). Polish is a hundred small decisions, and a decision that costs
 /// three minutes of QEMU is a decision not made — so this puts the same renders `check-display`
-/// adjudicates against into a file anyone can open.
+/// adjudicates against into a file anyone can open, plus `ui-dark`, the one no gate adjudicates
+/// (see [`preview_frames`]).
 ///
 /// **The same renderer, deliberately.** `xtask` already links `libui`, `libdraw` and `libterm`
 /// because the display gate renders the expected picture here rather than checking in a golden
@@ -7236,8 +7250,14 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
-/// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]` — try the
+/// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]
+/// [--contact-radius N] [--contact-strength N] [--contact-drop N] [--corner N] [--dark]` — try the
 /// overview's opacity and a window's shadow **without booting**.
+///
+/// The shadow has two layers since the desktop refresh's Part A: `--radius`, `--strength` and
+/// `--drop` are the wide one, as they always were, and the `--contact-` three are the tight one
+/// that seats a window's edge. `--corner` rounds the mock windows, so a shadow can be judged
+/// against the corners it will actually be cast from.
 ///
 /// **The loop `preview` exists for, pointed at the two things `preview` could not show** (M13
 /// Part C). `preview` renders the toolkit's own surfaces; the overview's translucency and a
@@ -7252,9 +7272,12 @@ fn cmd_preview(what: &str) -> R<()> {
 /// the ground behind them, not the labels on them.
 ///
 /// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used so a good
-/// one can be copied into `libdraw::theme::WINDOW_SHADOW` and `desktop-shell`'s constants.
+/// one can be copied into `libdraw::theme::window_shadow` and `desktop-shell`'s constants.
+///
+/// `--dark` starts from the dark scheme's shadow and draws the mock windows in the dark scheme,
+/// because a shadow's strength is judged against the windows it falls on.
 fn cmd_tune(args: &[String]) -> R<()> {
-    use libdraw::compose::{Shadow, SurfaceRef, compose_exposed};
+    use libdraw::compose::{Shadow, ShadowLayer, SurfaceRef, compose_exposed};
     use libdraw::format::{PixelFormat, Rgb};
     use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
     use libdraw::geom::{Point, Rect};
@@ -7269,13 +7292,29 @@ fn cmd_tune(args: &[String]) -> R<()> {
             None => Ok(default),
         }
     };
-    let theme_shadow = libdraw::theme::WINDOW_SHADOW;
-    let shadow = Shadow {
-        radius: num("--radius", theme_shadow.radius)?,
-        offset: Point::new(0, num("--drop", theme_shadow.offset.y as u32)? as i32),
-        colour: theme_shadow.colour,
-        strength: num("--strength", theme_shadow.strength as u32)?.min(255) as u8,
+    let scheme = if args.iter().any(|a| a == "--dark") {
+        libdraw::theme::Scheme::Dark
+    } else {
+        libdraw::theme::Scheme::Light
     };
+    let [wide, contact] = libdraw::theme::window_shadow(scheme).layers;
+    let shadow = Shadow {
+        layers: [
+            ShadowLayer {
+                radius: num("--radius", wide.radius)?,
+                offset: Point::new(0, num("--drop", wide.offset.y as u32)? as i32),
+                colour: wide.colour,
+                strength: num("--strength", wide.strength as u32)?.min(255) as u8,
+            },
+            ShadowLayer {
+                radius: num("--contact-radius", contact.radius)?,
+                offset: Point::new(0, num("--contact-drop", contact.offset.y as u32)? as i32),
+                colour: wide.colour,
+                strength: num("--contact-strength", contact.strength as u32)?.min(255) as u8,
+            },
+        ],
+    };
+    let corner = num("--corner", 0)?;
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
@@ -7321,7 +7360,7 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let (wp, wg) = wallpaper_for_screen(sw, sh)?;
     let mut shot_fb = MemFramebuffer::new(g);
     let faces = host_faces()?;
-    let ui = reference_frame(&faces, "ui")?;
+    let ui = reference_frame(&faces, if scheme == libdraw::theme::Scheme::Dark { "ui-dark" } else { "ui" })?;
     let (uw, uh) = {
         let ug = Framebuffer::geometry(&ui);
         (ug.width, ug.height)
@@ -7330,9 +7369,11 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let wall = SurfaceRef::new(wg, Point::new(0, 0), &wp);
     let bar = SurfaceRef::new(panel.geometry(), Point::new(0, 0), panel.bytes());
     let a = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120, 140), ui.bytes())
-        .with_shadow(shadow);
+        .with_shadow(shadow)
+        .with_corner(corner);
     let b = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120 + uw as i32 / 2, 140 + uh as i32 / 2), ui.bytes())
-        .with_shadow(shadow);
+        .with_shadow(shadow)
+        .with_corner(corner);
     compose_exposed(&mut shot_fb, Rgb::new(0x2A, 0x55, 0x70), &[wall, bar, a, b], &[g.bounds()]);
     let (w1, h1, rgb1) = rgb_of(&shot_fb);
     let p1 = dir.join("tune-shadow.png");
@@ -7366,11 +7407,16 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let p2 = dir.join("tune-overview.png");
     write_png(&p2, w2, h2, &rgb2)?;
 
+    let [w, c] = shadow.layers;
     println!(
-        "xtask: shadow radius {} drop {} strength {}  ->  {}",
-        shadow.radius,
-        shadow.offset.y,
-        shadow.strength,
+        "xtask: shadow radius {} drop {} strength {}, contact radius {} drop {} strength {}, \
+         corner {corner}  ->  {}",
+        w.radius,
+        w.offset.y,
+        w.strength,
+        c.radius,
+        c.offset.y,
+        c.strength,
         p1.display()
     );
     println!(
@@ -7724,11 +7770,18 @@ fn reference_frame(
 /// **Each arrangement takes the face its guest counterpart loads** (M11 Part D): the toolkit's
 /// window is the desktop's proportional font and the terminal's is the fixed-advance one. They
 /// took one font between them until Part D, because the system had only one.
+///
+/// **`ui-dark` is the one frame no gate compares against** (desktop refresh, Part A), because no
+/// guest draws it: the test client paints the built-in theme, which is the light scheme. It is
+/// here because the refresh decided how two schemes are covered without doubling the boots —
+/// **the host renders both and a boot proves one**, since a scheme is data and a boot proves that
+/// data reaches the screen. So the dark scheme's judgement costs a glance, like the light one's.
 fn preview_frames(
     (ui, mono): &(libdraw::text::Font, libdraw::text::Font),
 ) -> Vec<(&'static str, libdraw::framebuffer::MemFramebuffer)> {
     vec![
         ("ui", libui::reference::render(ui)),
+        ("ui-dark", libui::reference::render_with(ui, &libdraw::theme::Theme::dark())),
         ("term", libterm::render::reference::render_with(mono)),
     ]
 }
@@ -7771,6 +7824,59 @@ fn encode_png(w: u32, h: u32, rgb: &[u8]) -> R<Vec<u8>> {
         writer.write_image_data(rgb).map_err(|e| format!("png data: {e}"))?;
     }
     Ok(out)
+}
+
+/// The demo user's `theme.toml`, and the theme it reads as.
+///
+/// **Shipped with every field shown** (M11 Part C). It could ship empty or not at
+/// all — a missing file is the built-in theme, which is what the host tests pin — and a file
+/// naming every value is what makes the thing *discoverable*: a person who wants to change a
+/// colour opens it and sees which colours there are. It is written from `Theme::light()`
+/// rather than typed out, so the file and the constants cannot drift.
+///
+/// **Shown, and only the deliberate ones live** (desktop refresh, Part A). Every value that is
+/// the scheme's own is written commented out. Until there were two schemes this file wrote
+/// every line live, which was harmless while it restated the only palette there was — and
+/// with two it would pin every colour to the light one, so a person who changed `scheme` to
+/// "dark" would see nothing happen but the shadow. The plan's words for what a theme file
+/// should be: "an override on a palette rather than a list of thirty colours".
+fn staged_theme() -> R<(libdraw::theme::Theme, String)> {
+    let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n#\n");
+    text.push_str("# `scheme` picks the built-in palette the rest of this file adjusts: \"light\" or\n");
+    text.push_str("# \"dark\". Everything else is shown as that scheme has it, commented out; remove\n");
+    text.push_str("# the `#` from a line to change it. Colours are \"#RRGGBB\"; font_px is a size\n");
+    text.push_str("# in pixels per em.\n\n");
+    // Written from `Theme::light()` so the file and the constants cannot drift — except for the
+    // three fields below, each deliberately not the default and each read back by a gate.
+    let mut shipped = libdraw::theme::Theme::light();
+    shipped.font_px = f32::from(THEME_FONT_PX);
+    // **The theme names the wallpaper** (M12 Part F). It is the *file* that decides the
+    // desktop has a picture behind it — the built-in theme names none, deliberately, because
+    // a wallpaper is a file a person supplies and a default would make the desktop's ground
+    // depend on whatever the build happened to stage.
+    shipped.wallpaper = Some(
+        libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
+            .ok_or("the staged wallpaper path does not fit a ThemePath")?,
+    );
+    // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
+    // a fitted picture leaves bars of bare ground down both sides of the screen.
+    shipped.wallpaper_mode = libdraw::theme::WallpaperMode::Fill;
+    // Line for line against the scheme's own theme: `to_config` writes every field in one
+    // order, so a line that matches is a value this file does not change. `scheme` stays live
+    // whatever it says — it is the one line a person is expected to edit.
+    let base = libdraw::theme::Theme::for_scheme(shipped.scheme).to_config();
+    let lines = shipped.to_config();
+    if lines.lines().count() != base.lines().count() {
+        return Err("the staged theme and its scheme wrote different numbers of lines".into());
+    }
+    for (line, default) in lines.lines().zip(base.lines()) {
+        if line == default && !line.starts_with("scheme ") {
+            text.push_str("# ");
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    Ok((shipped, text))
 }
 
 /// The staged wallpaper's bytes: [`WALLPAPER_ASSET`], centre-cropped to 16:10.
@@ -8087,9 +8193,14 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // past the window above it would land in a region the exclusion does not cover, and the gate
     // would report unexplained pixel mismatches instead of the real cause. One font-size change
     // to the terminal reference is all it takes.
-    let sh_reach = libdraw::theme::WINDOW_SHADOW;
-    let reach_x = sh_reach.radius;
-    let reach_y = sh_reach.radius + sh_reach.offset.y.max(0) as u32;
+    // How far past a one-pixel window the shadow paints, rightward and downward — over every
+    // layer, since the refresh's shadow has two and the wider need not be the one dropped further.
+    // **The light scheme's**, because nothing in a self-test boot says otherwise: there is no
+    // session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
+    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
+    let reach = shadow.around(libdraw::geom::Rect::new(0, 0, 1, 1));
+    let reach_x = (reach.right() - 1) as u32;
+    let reach_y = (reach.bottom() - 1) as u32;
     if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
         return Err(format!(
             "a reference window's shadow would fall outside the window above it: scene \
@@ -8108,7 +8219,9 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     libdraw::compose::draw_shadow(
         &mut term,
         libdraw::geom::Rect::new(0, 0, sw, sh),
-        &libdraw::theme::WINDOW_SHADOW,
+        // Square: the reference windows are not rounded until Part B rounds real ones.
+        0,
+        &shadow,
         &libdraw::geom::Rect::new(0, 0, tw, th),
     );
     let term = term;
@@ -8150,7 +8263,9 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     libdraw::compose::draw_shadow(
         &mut ui,
         libdraw::geom::Rect::new(0, 0, tw, th),
-        &libdraw::theme::WINDOW_SHADOW,
+        // Square: the reference windows are not rounded until Part B rounds real ones.
+        0,
+        &shadow,
         &libdraw::geom::Rect::new(0, 0, uw, uh),
     );
     let ui = ui;
@@ -13003,30 +13118,9 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // (auth Part E). The user shell writes into it, and since M11 Part C it arrives holding
     // the session's theme.
     fs::create_dir_all(staging.join(DEMO_HOME.trim_start_matches('/')))?;
-    // **The theme, shipped with every field written out** (M11 Part C). It could ship empty or
-    // not at all — a missing file is the built-in theme, which is what the host tests pin — and
-    // a file naming every value is what makes the thing *discoverable*: a person who wants to
-    // change a colour opens it and sees which colours there are. It is written from
-    // `Theme::light()` rather than typed out, so the file and the constants cannot drift.
+    // The theme, shown in full and live only where it differs — see `staged_theme`.
     {
-        let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
-        text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
-        // Written from `Theme::light()` so the file and the constants cannot drift — except for
-        // the one field the gate reads back, which is deliberately not the default.
-        let mut shipped = libdraw::theme::Theme::light();
-        shipped.font_px = f32::from(THEME_FONT_PX);
-        // **The theme names the wallpaper** (M12 Part F). It is the *file* that decides the
-        // desktop has a picture behind it — the built-in theme names none, deliberately, because
-        // a wallpaper is a file a person supplies and a default would make the desktop's ground
-        // depend on whatever the build happened to stage.
-        shipped.wallpaper = Some(
-            libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
-                .ok_or("the staged wallpaper path does not fit a ThemePath")?,
-        );
-        // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
-        // a fitted picture leaves bars of bare ground down both sides of the screen.
-        shipped.wallpaper_mode = libdraw::theme::WallpaperMode::Fill;
-        text.push_str(&shipped.to_config());
+        let (_, text) = staged_theme()?;
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
     }
@@ -13377,6 +13471,30 @@ fn format_cmd(cmd: &Command) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_staged_theme_reads_back_as_itself_and_only_its_overrides_are_live() {
+        let (shipped, text) = super::staged_theme().unwrap();
+        let (read, issues) = libdraw::theme::Theme::from_config(&text);
+        assert!(issues.is_empty(), "{issues:?}\n{text}");
+        assert_eq!(read, shipped);
+        // **Live lines are exactly the deliberate ones**: the scheme, and the three fields a gate
+        // reads back. Every colour is shown but commented, which is what lets the scheme line do
+        // anything at all.
+        let live: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split(" =").next())
+            .collect();
+        assert_eq!(live, ["scheme", "font_px", "wallpaper", "wallpaper_mode"], "{text}");
+        assert!(text.contains("\n# accent = \"#2C7F92\"\n"), "the colours are shown:\n{text}");
+        // And changing that one line changes the palette, keeping the overrides.
+        let dark = text.replace("scheme = \"light\"", "scheme = \"dark\"");
+        let (read, issues) = libdraw::theme::Theme::from_config(&dark);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(read.background, libdraw::theme::Theme::dark().background);
+        assert_eq!((read.font_px, read.wallpaper), (shipped.font_px, shipped.wallpaper));
+    }
+
     /// The shipped UI face carries the glyph a marked menu row draws.
     ///
     /// **A missing glyph is a silent failure** — `.notdef`, drawn as a blank or a box, reported
@@ -13394,7 +13512,8 @@ mod tests {
         assert!(!ui.has_glyph('\u{E000}'), "a private-use codepoint should be absent");
     }
 
-    /// A preview is the same picture the display gate demands of the guest.
+    /// Every picture the display gate demands of the guest is a preview, at the gate's size — and
+    /// the one preview it does not demand, `ui-dark`, is really the dark scheme.
     ///
     /// **What this pins, and what it deliberately no longer claims to.** *Sharing* is structural
     /// now: `cmd_check_display` reads its expected frames from `preview_frames`, so a preview
@@ -13411,7 +13530,7 @@ mod tests {
     /// Decoded rather than compared against what went in, because a round trip through one
     /// library's encoder and back tests the encoder; what is under test here is the pixels.
     #[test]
-    fn a_preview_is_the_picture_the_display_gate_demands() {
+    fn the_gates_pictures_are_previews_and_the_dark_one_is_dark() {
         use libdraw::framebuffer::Framebuffer;
         let faces = host_faces().expect("the vendored fonts");
         let frames = preview_frames(&faces);
@@ -13425,9 +13544,23 @@ mod tests {
             sizes,
             [
                 ("ui", libui::reference::WIDTH, libui::reference::HEIGHT),
+                ("ui-dark", libui::reference::WIDTH, libui::reference::HEIGHT),
                 ("term", term.w, term.h),
             ],
-            "the previews are the gate's arrangements, at the gate's sizes"
+            "the previews are the gate's arrangements at the gate's sizes, and ui-dark"
+        );
+        // And the dark one really is dark. (60, 4) is inside the menu bar's highlighted `Edit`,
+        // which is the selection — the accent washed over the scheme's background, `#D5E5E9` in
+        // the light scheme — so the frames differ there and the dark one is the darker.
+        let px = |n: &str| {
+            let f = &frames.iter().find(|(name, _)| *name == n).expect("a frame").1;
+            Framebuffer::get_pixel(f, 60, 4).expect("in bounds")
+        };
+        let (light, dark) = (px("ui"), px("ui-dark"));
+        assert!(
+            u32::from(dark.r) + u32::from(dark.g) + u32::from(dark.b)
+                < u32::from(light.r) + u32::from(light.g) + u32::from(light.b),
+            "the dark frame is not darker where the menu bar is: {dark:?} against {light:?}"
         );
 
         for (name, frame) in &frames {

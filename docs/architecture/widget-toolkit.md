@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-17, when a review found this document naming a `Theme::dark()` that has never existed), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and the theming section was checked against it), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -878,13 +878,13 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   **Where the values come from is a file**, since M11 Part C: `/home/theme.toml`, read once by
   the shell and handed to every application on the setup record
   ([`theme-toml-schema.md`](../spec/theme-toml-schema.md)). A missing or broken file is the
-  built-in theme, which is `Theme::light()` — the name in this sentence was `Theme::dark()`, a
-  function that has never existed, and the fallback has been the light theme since M11 Part C
-  turned the desktop light. A second palette was "a constructor rather than a redesign, and
-  nothing ships one"; [the desktop refresh](../planning/desktop-refresh.md) ships one, so
-  `Theme::dark()` becomes real and this sentence will need checking again then — the fallback
-  stays `light()`. A change takes effect when an application starts; pushing one
-  to running windows is protocol work whose trigger is a control panel.
+  built-in theme, which is `Theme::light()`, and so is a file that names no `scheme`.
+  **`Theme::dark()` exists since the desktop refresh's Part A** (2026-09-18), and a file reaches it
+  only by saying `scheme = "dark"`: it is the palette a file starts from, never a fallback. (This
+  sentence named `Theme::dark()` as the fallback until 2026-09-17, when that function had not
+  existed since M11 Part E — and was flagged then because the refresh was about to make the name
+  real while leaving the claim wrong.) A change takes effect when an application starts; pushing
+  one to running windows is protocol work whose trigger is a control panel.
 
   **And the theme names the font**, since M11 Part D — two of them. `font_ui` is what this
   toolkit draws with and is *proportional*; `font_mono` is the fixed-advance face

@@ -1773,6 +1773,13 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
         };
     }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
+    // **Said on the console, changed or not**, because it is the one proof a boot can give that
+    // the shell's theme reached this process: the compositor never reads the file, and every gate
+    // that boots a session boots the light scheme — the scheme this compositor already started
+    // in — so a line only on a *change* would say nothing on exactly the boots that check it.
+    if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
+        Line::new().s(b"compositor: scheme ").s(srv.stack.scheme().as_str().as_bytes()).end();
+    }
     // **A manager acting on a window invalidates what that window last *asked* to be.** The
     // dedup on `RequestState` compares against a value only client requests were writing, and
     // the manager changes a window's state by four other routes — a taskbar click, a chord, the
@@ -1793,8 +1800,8 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
             // A manager that only wants to position a window sends `Place` and nothing else;
             // making it wait out the deadline would mean every launch is slow by design. The
             // configure goes out carrying the origin the manager just set.
-            // `None` is a request that named no window — `SetCurrentDesktop` — so there is
-            // no held configure to release.
+            // `None` is a request that named no window — `SetCurrentDesktop` or `SetScheme` —
+            // so there is no held configure to release.
             if let Some(window) = window {
                 release_configure(srv, screen, window);
             }
@@ -2009,6 +2016,14 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
                 repaint_region(srv, screen, r);
             }
         }
+    }
+    // **And the scheme it named** (desktop refresh, Part A; PR #312 review, optional 5). It came
+    // from the departed session's theme, and what is drawn next — the greeter, after a logout —
+    // is drawn from the built-in one. Left behind, a dark session's shadows would fall under a
+    // light greeter at two and a half times the strength until the next shell said otherwise.
+    if srv.stack.set_scheme(libdraw::theme::Scheme::Light) {
+        repaint(srv, screen);
+        kprint(b"compositor: scheme light (the manager that named another went away)\n");
     }
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has

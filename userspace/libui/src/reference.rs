@@ -136,7 +136,14 @@ const AREA_H: u32 = 2 * ROW_H;
 /// Public because the client renders it and the host renders it, and because a test that wants
 /// to assert about the tree should not have to rebuild it from this module's prose.
 pub fn view() -> Element<Msg> {
-    let theme = Theme::default();
+    view_with(&Theme::default())
+}
+
+/// [`view`], drawn from `theme` — which is how `cargo xtask preview` shows the reference in the
+/// dark scheme as well as the light one (desktop refresh, Part A). The gate compares against the
+/// light one only, because that is what the guest's test client draws.
+pub fn view_with(theme: &Theme) -> Element<Msg> {
+    let theme = *theme;
     // Mid-scroll on purpose: a thumb at offset 0 is where an off-by-one in the position
     // arithmetic is invisible, because zero times anything is zero.
     let scroll = ScrollState { offset: 30, visible: 25, total: 100 };
@@ -319,12 +326,17 @@ pub fn draw_custom<F: Framebuffer + ?Sized>(kind: u32, rect: Rect, clip: Rect, f
 /// Deterministic: the same font bytes give the same buffer, which is the property the gate
 /// rests on.
 pub fn render(font: &Font) -> MemFramebuffer {
+    render_with(font, &Theme::default())
+}
+
+/// [`render`], in `theme`. See [`view_with`].
+pub fn render_with(font: &Font, theme: &Theme) -> MemFramebuffer {
     let mut fb = MemFramebuffer::new(geometry());
-    let ui = view();
+    let ui = view_with(theme);
     let bounds = Rect::new(0, 0, WIDTH, HEIGHT);
     let metrics = FontMetrics::new(font, FONT_PX);
     let l = layout(&ui, bounds, &metrics);
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    let theme = Theme { font_px: FONT_PX, ..*theme };
     paint(&mut fb, font, &theme, &ui, &l, bounds, &mut draw_custom);
     fb
 }
@@ -375,7 +387,7 @@ mod tests {
         let chrome = [
             Theme::default().background,
             theme.face,
-            theme.focus_ring,
+            theme.accent,
             theme.track,
             theme.thumb,
         ];
@@ -423,7 +435,7 @@ mod tests {
             theme.background,
             theme.foreground,
             theme.face,
-            theme.focus_ring,
+            theme.accent,
             theme.track,
             theme.thumb,
         ];

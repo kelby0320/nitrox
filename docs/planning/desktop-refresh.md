@@ -109,7 +109,7 @@ desktop that will be reported as a focus bug. We already carry `title_active` an
 — two keys that exist for this and currently barely differ — so the divergence costs nothing but
 choosing two colours that do.
 
-- [ ] **Part A — the design as data**: the theme gains what the design needs, in two palettes,
+- [x] **Part A — the design as data**: the theme gains what the design needs, in two palettes,
       and `libdraw` gains the three primitives they imply.
 - [ ] **Part B — window chrome**: rounded corners, the new titlebar, focus that reads, and menus
       in the design's style.
@@ -132,40 +132,72 @@ The token set, read out of the page's own stylesheet:
 --sh 0 10px 28px rgba(0,0,0,.22), 0 2px 6px rgba(0,0,0,.14)
 ```
 
-- [ ] **`theme.toml` gains `panel`, `ok`, `warn`, `deny` and `term`**, plus `accent` and `fgdim`,
-      which Parts B, C and E all use — the outline on the current desktop card, the dim section
-      headers, the dim hint column. `radius_px` is **not** among them; see above. The schema doc
-      and the parser move together; `docs/spec/theme-toml-schema.md` is the contract.
-- [ ] **Decide the near-duplicates before adding them.** The page also defines `--faceHi`/
-      `--faceLo` (about our `face_hover`/`face_pressed`), `--lineSoft`, `--panelFg` and
-      `--accentInk`, and `--soft` is 18% in the dark palette against 10% in light. Each is a key
-      that is nearly a key we have, and a theme grows thirty of them one reasonable addition at a
-      time. The same question as `panel` versus `sidebar` below.
-- [ ] **Colours may carry alpha.** `--sel` and `--soft` are the accent at 20% and 10%, and the
-      parser today requires exactly six hex digits (`libdraw/src/theme.rs`). Eight-digit hex, for
-      the slots that want it.
-- [ ] **`Theme::dark()` beside `Theme::light()`**, and a key that names which a file starts from,
-      so a theme file is an override on a palette rather than a list of thirty colours. `light()`
-      is already a `const fn` and the compositor depends on that; `dark()` matches it.
-- [ ] **`blend_rect` in `libdraw`.** A translucent wash over content. The arithmetic exists
-      (`Rgb::blend`), the loop exists (`fill_rect`), and `blend_pixel` already pairs them for
-      antialiasing — this is the rectangle case, which nothing has needed until now.
-      `fill_rect_alpha` is **not** it: that stores an opacity for something further down to
-      composite, which is the overview's trick, not a wash.
-- [ ] **Rounded rectangles** for toolkit surfaces, at the compiled radius.
-- [ ] **A masked blit** on the compositor's row path — the primitive Part B's corners need, and
-      the only thing that actually rounds one.
-- [ ] **A two-layer shadow.** The design's is a wide soft one plus a tight dark one; ours is
-      single. `cargo xtask tune` is how the parameters get chosen — it exists so this judgement
-      costs a second rather than a boot.
-- [ ] **Both palettes are covered**, and the decision about how is part of this part rather than
-      discovered in CI. So is **how the compositor learns which palette is in force**, since it
-      cannot read a theme file and it draws the shadow, the ground, the outline and the cursor.
-- [ ] **Which of the design's metrics are absolute and which are relative**, given it was composed
-      for a screen 24% larger than the target. This is a decision, not a transcription.
-- [ ] **`widget-toolkit.md` stops naming a `Theme::dark()` that does not exist.** A review found
-      it (2026-09-17); once this part adds a real one, that sentence would read as true and still
-      be wrong about which theme is the fallback, which stays `light()`.
+- [x] **`theme.toml` gains `accent`, `foreground_dim`, `panel`, `ok` and `deny`** (2026-09-18).
+      **Not `warn`**: the page defines `--warn` and uses it nowhere. **Not `term`**: `--term` sits
+      outside the design's two palettes and belongs to `libterm`'s sixteen, which is Part F's —
+      this list contradicted Part F as first written. `fgdim` is `foreground_dim`, in the
+      schema's own naming. `accent` **replaced** `focus_ring` and `selection` rather than joining
+      them — see the next item. The schema doc and the parser moved together.
+- [x] **The near-duplicates, decided from the page's code rather than its pictures.** Its
+      `apply()` *computes* `--sel` (accent + `33`) and `--soft` (accent + `1A`, or `2E` in the dark
+      palette) from `--accent`, so storing them would be storing a computation: `selection` became
+      `Theme::selection()`, derived. `--faceHi`/`--faceLo` are `face_hover`/`face_pressed`, the
+      mapping the design's own mock `theme.toml` writes. `--lineSoft` is `--line` at half strength
+      over the ground in **both** palettes (0.49–0.56 per channel), so it is a derivation.
+      `panel` and `sidebar` are two colours: the panel is lighter than `face` in light and the
+      darkest surface in dark, which no fixed shade of either produces. `--panelFg` is used nowhere;
+      `--accentInk` only on surfaces this refresh does not build.
+- [x] **Colours may carry alpha — not built, because nothing needs it.** The only alpha colours
+      were the two washes, and they are derived. Eight-digit hex would have been parsing for a
+      value no file should hold.
+- [x] **`Theme::dark()` beside `Theme::light()`**, both `const fn`, and **`scheme = "light" |
+      "dark"`** naming which one a file starts from — read first wherever it sits, so a line above
+      it is not thrown away. The staged `theme.toml` now shows every value but writes only its
+      deliberate overrides live; thirty live colour lines would have pinned the desktop to light
+      whatever `scheme` said. **Two departures from the design, each tested**: the dark scheme's
+      `deny` is `#D46F63` (the design's is 2.9:1 on its own dark ground, and `deny` is drawn as
+      text here), and `title_active` is the accent washed over the face (the divergence below). A
+      test holds every colour drawn as text to 4.5:1 (7:1 for body text) in both schemes.
+- [x] **`blend_rect` in `libdraw`**, and `fill_rounded_rect`.
+- [x] **Rounded rectangles** — `fill_rounded_rect`, through one integer curve
+      (`libdraw::corner`) shared with the masked blit, so the toolkit's corners and the
+      compositor's cannot disagree by a crescent. **The radius is 8**, the design's default, as a
+      physical size (see the metrics item); the constant lands with its first user in Part B.
+- [x] **A masked blit** on the compositor's row path: a rounded surface is three bands, the
+      middle one the `memcpy` it always was, each corner row a shorter span down the same path, and
+      only the pixels on the curve blended. **"`covers` minus the corners" turned out to be
+      required, not an optimisation**: cut the whole rectangle and the corners keep whatever the
+      framebuffer last held. The rounded `compose`/`compose_exposed` equivalence test over a stale
+      framebuffer fails without it.
+- [x] **A two-layer shadow**, and the design's numbers taken as they are — `tune` compared them
+      against the shipped layer and two scaled pairs, and nothing argued for moving off them. **It
+      cost a boot first**: the pair measured 2.0× the single layer, and `test-qemu`'s idle check
+      failed. The shadow loop visited every pixel of a window's overlap with the damage to reject
+      the covered ones; skipping them as a span, and blending with one pixel lookup instead of two,
+      took the shipped single layer from 1.39 to 0.71 ms and the pair to 1.51 ms on the host, with
+      byte-identical output (a test holds the fast loop to the old one).
+- [x] **Both schemes are covered: the host renders both and a boot proves one**, since a scheme is
+      data. `preview` draws `ui-dark` beside `ui`, and says it is the one frame no gate compares
+      against. **The compositor learns the scheme from the manager's `SetScheme`** (`0x0928`), which
+      the shell sends on every session start, light included, so every graphical boot runs the path;
+      `check-login` asserts the compositor's `scheme light` line against the staged theme. It
+      decides one thing today — how dark the shadow is — because the cursor, the drag outline and the
+      desktop's ground are the same in both schemes.
+- [x] **Which metrics are absolute and which relative — decided, and the type needed no change.**
+      **Absolute, because a CSS pixel is this machine's pixel**: CSS defines one as 1/96 inch and
+      the laptop's panel is about 100 per inch (1366 across 15.6 in), so the design's pixel metrics
+      are physical sizes and transfer as written — a 30 px panel, a 31 px title bar, 8 px corners,
+      the design's shadow. **Relative: whatever was composed against the 1440×900 canvas** —
+      default window sizes and positions, the overview's cards — which becomes a fraction of the
+      work area, because 24% less screen means less fits, not smaller things. **The type is already
+      the design's**: `font_px` is `ab_glyph`'s ascent-to-descent height, 1.164 em for DejaVu Sans,
+      so the staged theme's 14 is a 12.0 px em — and measured the same way off the design's own 1:1
+      screenshot, its `n` is 7 px tall and DejaVu's at 14 is 7 px (at the built-in 16, 8). The
+      built-in stays 16, because `check-login`'s proof that the theme reaches a window needs the
+      staged value to differ from it; a session with no theme file draws text one step larger than
+      the design, and that divergence is named rather than accidental.
+- [x] **`widget-toolkit.md` stops naming a `Theme::dark()` as the fallback** — and so does
+      `Theme::from_config`'s own doc, which said the same thing and had not been found.
 
 **The risk worth stating: a blended wash depends on what is under it**, so every damage path must
 paint the ground before the wash. `libdraw`'s gradient code already carries this warning in

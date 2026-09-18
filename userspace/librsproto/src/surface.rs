@@ -1074,10 +1074,19 @@ pub const OP_MGR_REGISTER_SNAP_ZONE: u16 = 0x0927;
 pub const MAX_SNAP_ZONES: usize = 16;
 /// `Manage::SetCurrentDesktop` — switch which desktop is composited.
 ///
-/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every other manager
-/// request names a window in its first four bytes and this one names none, because it is a
-/// property of the screen. `0` is refused — see [`MgrDesktop`].
+/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every request in that
+/// block names a window in its first four bytes and this one names none, because it is a
+/// property of the screen. `0` is refused — see [`MgrDesktop`]. (This said "every other manager
+/// request", which `RegisterHotkey`, `QueryLayout` and now `SetScheme` all contradict.)
 pub const OP_MGR_SET_CURRENT_DESKTOP: u16 = 0x091D;
+/// `Manage::SetScheme` — which built-in scheme the compositor's own drawing follows.
+///
+/// **The compositor never reads a theme file** — `init` starts it, and a theme reaches a session
+/// on the setup record (M11 decision 1) — so the shell, which read the file, says which scheme it
+/// named. Today that decides one thing: how dark a window's shadow is, which the design specifies
+/// per palette (desktop refresh, Part A). Shaped like [`SetCurrentDesktop`](OP_MGR_SET_CURRENT_DESKTOP):
+/// it names no window, because it is a property of the screen. See [`MgrScheme`].
+pub const OP_MGR_SET_SCHEME: u16 = 0x0928;
 /// `Manage::Configure` — ask a window to be a given size and position.
 ///
 /// The manager's half of the [`Configure`](OP_CONFIGURE) a client receives. Sent in answer to a
@@ -1580,6 +1589,43 @@ impl MgrDesktop {
             return None;
         }
         Some(Self { desktop: get_u32(b, 0) })
+    }
+}
+
+/// A manager request naming a scheme — [`SetScheme`](OP_MGR_SET_SCHEME).
+///
+/// **A number rather than a name**, like every other body on this channel, and only the two
+/// below are legal: anything else is refused as `Malformed` rather than taken as the nearest
+/// scheme, because a shell and a compositor that disagreed about what `2` meant would each look
+/// right on its own.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrScheme {
+    /// [`SCHEME_LIGHT`] or [`SCHEME_DARK`].
+    pub scheme: u32,
+}
+
+/// The light scheme, in a [`MgrScheme`].
+pub const SCHEME_LIGHT: u32 = 0;
+/// The dark scheme, in a [`MgrScheme`].
+pub const SCHEME_DARK: u32 = 1;
+
+impl MgrScheme {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 4 {
+            return None;
+        }
+        put_u32(out, 0, self.scheme);
+        Some(4)
+    }
+
+    /// Parse from the first 4 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self { scheme: get_u32(b, 0) })
     }
 }
 
@@ -2839,6 +2885,12 @@ mod tests {
         assert_eq!(&d[0..4], &0x3132_3334u32.to_le_bytes(), "desktop @0");
         assert_eq!(MgrDesktop::read(&d).unwrap().desktop, 0x3132_3334);
         assert_eq!(MgrDesktop::read(&d[..3]), None, "3 bytes must not parse");
+
+        let mut sc = [0u8; 4];
+        MgrScheme { scheme: SCHEME_DARK }.write(&mut sc).unwrap();
+        assert_eq!(&sc, &1u32.to_le_bytes(), "scheme @0");
+        assert_eq!(MgrScheme::read(&sc).unwrap().scheme, SCHEME_DARK);
+        assert_eq!(MgrScheme::read(&sc[..3]), None, "3 bytes must not parse");
     }
 
     #[test]

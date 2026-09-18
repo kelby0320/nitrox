@@ -431,8 +431,8 @@ pub fn popup<Msg: Clone>(
 fn menu_row<Msg>(body: Element<Msg>, lit: bool, _enabled: bool, theme: &Theme) -> Element<Msg> {
     let mut layers = Vec::with_capacity(3);
     if lit {
-        layers.push(fill(theme.focus_ring));
-        layers.push(padding(Insets::all(1), bevel(theme.selection)));
+        layers.push(fill(theme.accent));
+        layers.push(padding(Insets::all(1), bevel(theme.selection())));
     }
     layers.push(padding(ROW_PAD, body));
     stack(layers)

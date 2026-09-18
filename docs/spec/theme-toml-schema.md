@@ -5,8 +5,10 @@ The colours and text size a graphical session draws itself in. Read once by
 application it launches; see [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 11
 Part C.
 
-**Built as of M11 Part D.** What is not here yet: any way to change a theme without restarting
-what draws with it. That is deliberate — see "Not a live protocol" below.
+**Built as of M11 Part D; two schemes and the design's palette since the desktop refresh's Part A**
+(2026-09-18, [`desktop-refresh.md`](../planning/desktop-refresh.md)). What is not here yet: any way
+to change a theme without restarting what draws with it. That is deliberate — see "Not a live
+protocol" below.
 
 ## Where it lives
 
@@ -29,59 +31,107 @@ of a value — which matters, because every colour begins with `#`.
 
 ```toml
 # The session's theme. Delete this file for the built-in one.
-background = "#FFFFFF"
-foreground = "#2F2F2F"
-font_px = 16
-bevel = 12
-font_ui = "/system/fonts/DejaVuSans.ttf"
-wallpaper = ""
-wallpaper_mode = "fit"
+#
+# `scheme` picks the built-in palette the rest of this file adjusts: "light" or
+# "dark". Everything else is shown as that scheme has it, commented out; remove
+# the `#` from a line to change it. Colours are "#RRGGBB"; font_px is a size
+# in pixels per em.
+
+scheme = "light"
+# background = "#FFFFFF"
+# foreground = "#16201F"
+# foreground_dim = "#5B6766"
+…
+font_px = 14
+# bevel = 0
+…
+wallpaper = "/home/wallpaper.png"
+wallpaper_mode = "fill"
 ```
 
-**Those are the built-in values**, and the first line is what the image build writes at the top of
-the shipped file — so this block is a fragment of the real thing rather than an illustration.
-Copying it and changing one colour is the intended way to start; copying a *stale* one and getting
-near-white widgets on a near-black ground is what this example used to do, because it still showed
-the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file also carries a
-`font_px` that is deliberately not the default — see `check-login`, which reads it back.
+**That is the head of the file the image build ships**, elided where marked — a fragment of the
+real thing rather than an illustration. **Every value the scheme already has is written commented
+out**, and only the file's own choices are live: the scheme, and three values deliberately not the
+default, each read back by a gate (`check-login` reads the `font_px` and the wallpaper). Until the
+refresh the file wrote every line live, which was harmless while it restated the only palette there
+was; with two, thirty live colour lines would pin a desktop to the light one whatever `scheme` said.
+Copying a *stale* example and getting near-white widgets on a near-black ground is what this block
+once did, because it still showed the dark theme M11 Part E replaced (PR #265 review, finding 6).
 
-| Key | Type | What it colours |
-|---|---|---|
-| `background` | `"#RRGGBB"` | A window's ground (**not** the space between windows — see below) |
-| `foreground` | `"#RRGGBB"` | Text and other ink |
-| `face` | `"#RRGGBB"` | A button at rest |
-| `face_hover` | `"#RRGGBB"` | A button under the pointer |
-| `face_pressed` | `"#RRGGBB"` | A button being held |
-| `focus_ring` | `"#RRGGBB"` | The ring around the focused widget, and the text caret |
-| `track` | `"#RRGGBB"` | A list's ground |
-| `groove` | `"#RRGGBB"` | A scrollbar's channel — **darker than `track`**, or the bar is invisible |
-| `sidebar` | `"#RRGGBB"` | A panel beside content, such as the file browser's |
-| `thumb` | `"#RRGGBB"` | A scrollbar's thumb |
-| `selection` | `"#RRGGBB"` | Behind selected text |
-| `syntax_keyword` | `"#RRGGBB"` | A language's reserved words, and TOML's `true`/`false` |
-| `syntax_string` | `"#RRGGBB"` | String literals, Markdown code spans and fenced blocks |
-| `syntax_comment` | `"#RRGGBB"` | Comments, and Markdown block quotes |
-| `syntax_number` | `"#RRGGBB"` | Numeric literals |
-| `syntax_heading` | `"#RRGGBB"` | A Markdown heading, a TOML `[table]` header |
-| `syntax_variable` | `"#RRGGBB"` | A shell variable — `$name` and `${name}` |
-| `title_active` | `"#RRGGBB"` | A title bar whose window holds the keyboard |
-| `title_inactive` | `"#RRGGBB"` | A title bar whose window does not |
-| `cursor_body` | `"#RRGGBB"` | The pointer's fill |
-| `cursor_outline` | `"#RRGGBB"` | The pointer's outline |
-| `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target |
-| `border` | `"#RRGGBB"` | The line around a window, a menu, or anything with an edge |
-| `desktop` | `"#RRGGBB"` | The ground between windows |
-| `font_px` | number, `6`–`16` | Text size in pixels per em, read to the nearest hundredth |
-| `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens |
-| `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
-| `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
-| `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none |
-| `wallpaper_mode` | `"fit"` or `"fill"` | How it is placed when it is not the screen's size |
+| Key | Type | What it colours | Design token |
+|---|---|---|---|
+| `scheme` | `"light"` or `"dark"` | Nothing itself: which palette every other key adjusts — see below | the page's `theme` |
+| `background` | `"#RRGGBB"` | A window's ground (**not** the space between windows — see below) | `--bg` |
+| `foreground` | `"#RRGGBB"` | Text and other ink | `--fg` |
+| `foreground_dim` | `"#RRGGBB"` | Ink read second: section headers, a path beside a name, a size | `--fgdim` |
+| `face` | `"#RRGGBB"` | A button at rest | `--face` |
+| `face_hover` | `"#RRGGBB"` | A button under the pointer | `--faceHi` |
+| `face_pressed` | `"#RRGGBB"` | A button being held | `--faceLo` |
+| `accent` | `"#RRGGBB"` | The focus ring and caret, and what the selection is made from | `--accent` |
+| `track` | `"#RRGGBB"` | A list's ground | `--bg` |
+| `groove` | `"#RRGGBB"` | A scrollbar's channel — **darker than `track`**, or the bar is invisible | `--faceLo` |
+| `sidebar` | `"#RRGGBB"` | A panel beside content, such as the file browser's | `--sidebar` |
+| `panel` | `"#RRGGBB"` | The desktop's own bars, top and bottom | `--panel` |
+| `thumb` | `"#RRGGBB"` | A scrollbar's thumb | `--line` |
+| `syntax_keyword` | `"#RRGGBB"` | A language's reserved words, and TOML's `true`/`false` | — |
+| `syntax_string` | `"#RRGGBB"` | String literals, Markdown code spans and fenced blocks | — |
+| `syntax_comment` | `"#RRGGBB"` | Comments, and Markdown block quotes | — |
+| `syntax_number` | `"#RRGGBB"` | Numeric literals | — |
+| `syntax_heading` | `"#RRGGBB"` | A Markdown heading, a TOML `[table]` header | — |
+| `syntax_variable` | `"#RRGGBB"` | A shell variable — `$name` and `${name}` | — |
+| `ok` | `"#RRGGBB"` | Something working: a running window's dot | `--ok` |
+| `deny` | `"#RRGGBB"` | Something destructive: such a menu item, `Root` in Places | `--deny`, light only |
+| `title_active` | `"#RRGGBB"` | A title bar whose window holds the keyboard | `--accent` over `--face` |
+| `title_inactive` | `"#RRGGBB"` | A title bar whose window does not | `--face` |
+| `cursor_body` | `"#RRGGBB"` | The pointer's fill | — |
+| `cursor_outline` | `"#RRGGBB"` | The pointer's outline | — |
+| `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target | — |
+| `border` | `"#RRGGBB"` | The line around a window, a menu, or anything with an edge | `--line` |
+| `desktop` | `"#RRGGBB"` | The ground between windows | the `reef` wallpaper |
+| `font_px` | number, `6`–`16` | Text size in pixels per em, read to the nearest hundredth | |
+| `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens | flat: `0` |
+| `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional | |
+| `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance | |
+| `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none | |
+| `wallpaper_mode` | `"fit"` or `"fill"` | How it is placed when it is not the screen's size | |
 
-**The six `syntax_*` keys are the one place a colour is not derived from a surface** (M14
-Part G). Every other key here is a ground or its ink, and a widget wanting a third was told to
-derive one; a keyword and a comment cannot be derived from a window's ground, because what they
-encode is meaning rather than depth. They are read by whatever highlights text — today
+**The design token column** names where each built-in value comes from in
+[the design](../design/nitrox-shell/) (`docs/design/nitrox-shell/nitrox-shell.html`): its light
+palette for the light scheme, its `deep` palette for the dark one. A dash is a key the design has
+no token for, and the value's doc comment in [`libdraw::theme`](../../userspace/libdraw/src/theme.rs)
+says what was chosen instead and why.
+
+## Two schemes
+
+**`scheme` decides what every other line is an override on**, and it is read first wherever it is
+in the file: a file that sets `accent` and then `scheme = "dark"` is the dark scheme with that
+accent. A file with no `scheme` is the light one, which is also what a missing file is. A value
+other than the two names is reported like any bad value and leaves the file on the light scheme.
+
+**Two schemes reverse M11's decision 4** — "one theme … nothing ships a second" — on the
+evidence of a design that specifies both and a maintainer who asked for both (decision log,
+2026-09-17). What decision 4 was right about is the cost: every judgement is made twice. The
+host-side renders are what pay for that, not the boots.
+
+**What changed about the keys, and why.** `focus_ring` and `selection` are gone and `accent`
+replaced them, which is the design's own model: its page stores one accent and *computes* the
+selection (the accent at 20%) and a hover (10%, 18% in the dark scheme) from it, so a file that
+named all three could set them out of step. A file written before the refresh that names either
+old key has that line reported as unknown and otherwise reads as it did. The design's `--faceHi`
+and `--faceLo` were already keys (`face_hover`, `face_pressed`); its `--lineSoft` is `border` at
+half strength over the ground in both palettes, which is a derivation rather than a key. Its
+`--warn` and `--panelFg` are defined in the page and used nowhere in it, and `--accentInk` colours
+only surfaces the refresh does not build — a primary button, a notification badge.
+
+**The terminal's colours are not here**, as they were not before: `--term` and `--termFg` sit
+outside the design's two palettes too, and they belong to `libterm`'s sixteen, where retheming a
+desktop does not retheme `ls`.
+
+**The six `syntax_*` keys, and `accent`, `ok` and `deny`, are the colours not derived from a
+surface** (M14 Part G; the last three since the desktop refresh). Every other key here is a ground
+or its ink, and a widget wanting a third was told to derive one; a keyword and a comment cannot be
+derived from a window's ground, because what they encode is meaning rather than depth — and
+neither can emphasis, "working" or "destructive". They are read by whatever highlights text — today
 `nxedit` — and ignored by everything else, so a theme that omits them is a theme with the
 shipped scheme, like any other omitted key.
 
@@ -148,7 +198,8 @@ decision to revisit, not this number.
 **`bevel` is one number for every gradient in the system** — a title bar, a scrollbar's thumb, a
 selected row. The reference desktop's own gradients span ±10 and ±14 around their midpoints, so
 one amount reproduces both; two colours per gradient would be eight more values for a palette to
-keep coherent. `0` is flat, and is a theme somebody may legitimately want.
+keep coherent. **Both built-in schemes are `0`, flat, since the refresh** — the design has not one
+gradient in it — and the key stays because a bevel is still a theme somebody may want.
 
 **`cursor_body`, `cursor_outline`, `outline` and `desktop` are read but do not take effect.** They are drawn
 by the *compositor*, which `init` starts rather than the session — so it never sees a setup
@@ -156,6 +207,12 @@ record and uses the built-in values. They are listed because they are part of on
 file that omitted them would be describing a different thing than the type does. **Trigger for
 making them live: a control panel that wants to restyle the cursor** — the mechanism is a manager
 op on a channel the shell already holds.
+
+**`scheme` does reach the compositor, and by exactly that mechanism** (desktop refresh, Part A).
+The shell sends the manager's [`SetScheme`](rsproto-surface-ops.md#setscheme-0x0928) on every
+session start, and the compositor draws each window's shadow for that scheme — the design's dark
+shadow is more than twice as strong as its light one. It names one of the two compiled palettes
+rather than carrying colours, so the four keys above stay what they were: read, and not live.
 
 **And `background` is live for window interiors only**, for exactly the same reason. The ground
 *between* windows is the compositor's `scene::BACKGROUND`, a compile-time constant taken from the
