@@ -212,6 +212,7 @@ fn draw<F, Msg, C>(
         // drawn; passing the clip would make a one-row repaint paint a one-row gradient.
         Node::Bevel(colour) => fb.fill_rect_bevel(l.rect, clip, *colour, theme.bevel),
         Node::Outline { colour, radius } => fb.outline_rounded_rect(l.rect, clip, *colour, *radius),
+        Node::Wash { colour, coverage } => fb.blend_rect(clip, *colour, *coverage),
         Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, ink),
         // **Not a container arm**, which is what would happen by default and is the whole bug
         // this node exists to avoid: it would paint its child correctly and ignore the colour.

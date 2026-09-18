@@ -26749,3 +26749,71 @@ host-side `tune` renders were loading the machine, and passed alone. The transcr
 with F1 landing on the popup that had just been chosen from — the gate sends it on `chose Clear`,
 and `focus=1` is logged after — but that is a reading of one transcript, not a cause shown, and it
 is unrelated to this part.
+
+## 2026-09-18 — Desktop refresh Part B: the window chrome, and two gate races it uncovered
+
+Part B of [`desktop-refresh.md`](planning/desktop-refresh.md) is built: floating windows are
+rounded, the title bar and the menus take the design's shape, and selection is a wash.
+
+**What is rounded is the roles that already cast a shadow** — normal, popup, dialog — cut to
+`libdraw::corner::WINDOW_RADIUS` (8). A panel is docked to the screen's edge, where a rounded
+corner is a notch of wallpaper. The overview is a screen-sized popup and is rounded with the rest;
+its corners are under the shell's bars, so it shows nowhere. The window's border is a
+`Node::Outline` painted *last* along the same curve, because the curve bends into whatever the
+window has in its corners. **It blends at a share rather than a coverage**: the compositor already
+fades the curve when it blends the surface over what is below, and a border faded by its own
+coverage as well draws paler on the curve than on the straight edge.
+
+**The outline broke every button in every framed window, and a test said so on the first run.**
+Painted last and spanning the window, it was the topmost thing under every press; having no
+handler, it answered none of them. `dialog_buttons_land_where_the_constants_say` failed, and the
+router now passes over an outline as if it were not there. The rule, now pinned directly: a border
+is decoration, not a target.
+
+**`check-display` composes its expectation now, through `libdraw::compose`.** Rounded, each
+reference window's corners show the window beneath it, so the hand-built expectation — each render,
+the shadow above it, the window above excluded — would have needed an exclusion and a blend per
+curve. The three pictures are still rendered independently; what the gate adds is the guest
+applying compose's rounding and shadowing, and the binding. **Its first run failed on nineteen
+pixels, at the shared corner**, and the reason was not the compositor: the self-test image's
+`nxterm` sits at the origin *beneath* the reference windows, invisible while they were square. The
+gate leaves out only the bottom window's four corner squares, where that shows through, and a
+control — a square expectation — fails it at the scene's corner, so it still sees whether the guest
+rounds.
+
+**The chrome's metrics are the design's, and the gates' copies are one table.** Title bar 26 → 31
+with its rule; controls 23 wide, 9 apart, 5 from the border, in the dim ink; a window's content
+flush to its border (`WINDOW_FRAME` 3 → 0). The menu bar keeps 24 with its rule drawn inside it —
+the design's 25 with the rule, a pixel of divergence against a pixel of every aim moving in three
+applications and two gates. `xtask`'s `chrome` table replaces a dozen inline aims (`+ 13`, `- 39`,
+`- 65`, `+ 4`), still copied rather than read from `libui`, per M11 decision 2.
+`libui::widget::title_button_centre` exists for application tests, two of which re-derived the
+controls from contiguous slots — one still landing inside only by luck.
+
+**The flush content took away `nxterm`'s only margin**, and its first column of text touched the
+window's edge. It has the design's own now: 9 above and below, 11 either side, in the terminal's
+ground, with the cell origin moved by it. **The first version of that was wrong and every test
+passed it**: it moved the cells and left the margin showing the window's face, because a custom
+node covers only the cells it declares. A screendump measured it — the dark ground began 12 pixels
+in, where the text did — and the pane is an element of its own now, with a test pinning its ground,
+its margin and the origin together.
+
+**Selection is a wash** — `Node::Wash`, the accent at 20% for a selection and at the scheme's hover
+coverage (10%, 18% dark) for a hover — replacing a one-pixel accent ring round a bevelled fill.
+Menus sit on the window's ground with the design's padding and edge-to-edge `--lineSoft` rules; the
+chord column and disabled rows are in `foreground_dim`, which closes a gap the toolkit doc had
+recorded since M14; `Item::destructive` draws the file browser's `Delete` in `deny`, and disabled
+wins over it.
+
+**Not built: hover on the title bar's controls.** `title_bar` takes no hover, and giving it one
+threads the router's hovered key through three applications. Named in the plan.
+
+**Two races in `check-terminal`, both older than this part, and both shaken loose by geometry.**
+The menu walks took the *first* `hover N` receipt, but an injected move is a run of 100-pixel
+packets and the guest reports every row the pointer crosses: Part B moved a popup four pixels,
+the approach's first packet landed on `Clear` itself, and the walk clicked the disabled `Copy` it
+had actually stopped on. `Session::settled_line` takes the last receipt once they stop. And F1
+was sent on `chose Clear`, before the terminal had the keyboard back from the closing popup — the
+failure the Part A entry recorded as unproven and unacted on. It happened again here without host
+load; the gate now waits for `focus=1`, the transcript's own order, and passed three runs running.
+The key's destination cannot be logged, so that is the evidence, and it is stated as that.

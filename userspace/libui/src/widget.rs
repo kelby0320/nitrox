@@ -30,7 +30,7 @@ use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
     Edge, Element, IconKind, Insets, bevel, center, center_v, column, dock, docked, fill, icon,
-    ink, outline, padding, row, sized, stack, text,
+    ink, outline, padding, row, sized, stack, text, wash,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -120,8 +120,10 @@ pub fn button<Msg>(
 /// [`outline`](crate::element::outline) drawn last, along that curve, rather than a square
 /// fill the cut would have taken the corners off.
 pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    // **On the window's own ground**, the design's `--bg`, rather than a button's face: a menu is
+    // a list of things to read, and it reads as one on paper (desktop refresh, Part B).
     stack(alloc::vec![
-        fill(theme.face),
+        fill(theme.background),
         padding(Insets::all(POPUP_BORDER), content),
         outline(theme.border, libdraw::corner::WINDOW_RADIUS),
     ])
@@ -408,10 +410,12 @@ pub fn menu_item<Msg: Clone>(
     hovered: bool,
     theme: &Theme,
 ) -> Element<Msg> {
-    let mut layers = alloc::vec::Vec::with_capacity(3);
+    // **A wash over the bar, not a ring round a fill** (desktop refresh, Part B) — the design's
+    // `--soft`. The bar's own face is painted beneath this by `menu_bar`, first, which is the
+    // ground a wash needs.
+    let mut layers = alloc::vec::Vec::with_capacity(2);
     if hovered {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(1), bevel(theme.selection())));
+        layers.push(wash(theme.accent, theme.scheme.hover_coverage()));
     }
     layers.push(padding(MENU_ITEM_PAD, text(label)));
     stack(layers).on_press(msg)
@@ -2346,24 +2350,25 @@ pub fn list_view<Msg>(
     let max_offset = rows.len().saturating_sub(visible);
     state.offset = state.offset.min(max_offset);
 
-    // **The surface the rows sit on, and what one looks like under the pointer.** A row used to
-    // fill `theme.track` whatever the list's ground was, so a panel with a ground of its own had
-    // list-coloured tiles painted over it and the panel showed only below the last row (M15
-    // Part F). A caller that names a ground gets its hover derived from it, because a hover is
-    // "this surface, lit" rather than a colour of its own — and the default path keeps
-    // `face_hover` exactly, so every other list in the system paints as it did.
-    let (ground, lit) = match ground {
-        Some(g) => (g, g.shade(HOVER_LIFT)),
-        None => (theme.track, theme.face_hover),
-    };
+    // **The surface the rows sit on.** A row used to fill `theme.track` whatever the list's
+    // ground was, so a panel with a ground of its own had list-coloured tiles painted over it and
+    // the panel showed only below the last row (M15 Part F).
+    //
+    // **And a highlight is a wash over it** (desktop refresh, Part B): the accent at the
+    // selection's 20%, or at the scheme's hover coverage. That is the design's model, and it is
+    // why the hover no longer has to be derived per ground — "this surface, lit" was what the
+    // derivation approximated, and a wash over whatever surface is under it is that exactly.
+    let ground = ground.unwrap_or(theme.track);
+    let hover = theme.scheme.hover_coverage();
     let last = (state.offset + visible).min(rows.len());
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
         let selected = state.selected == Some(i) || r.marked;
-        // **A selection is blue with a darker edge**, not a lighter grey (M11 Part E, batch 2).
-        // The reference draws a one-pixel border in the same blue the focus ring uses and fills
-        // the inside with a gradient, and that border is what separates a selected row from the
-        // row above it — without it two adjacent selections would merge into one block.
+        // **A selection is the accent washed over the ground**, flat, since the desktop refresh's
+        // Part B. It was a one-pixel accent border around a bevelled fill (M11 Part E, batch 2),
+        // the reference desktop's, and the border was what kept two adjacent selections from
+        // merging into one block; the design lets them merge, as a block is what a run of
+        // selected rows is.
         //
         // **Hover is quieter than selection and loses to it** (batch 3) — *unless nothing is
         // selected*, in which case it is the answer and gets the blue (batch 5). The rule is
@@ -2372,16 +2377,14 @@ pub fn list_view<Msg>(
         // not competing. The applications modal is exactly that list — it keeps no selection at
         // all, so every hover landed on the quiet branch and the menu highlighted in grey.
         let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
-        let row_el = if primary {
-            stack(alloc::vec![
-                fill(theme.accent),
-                padding(Insets::all(1), bevel(theme.selection())),
-                padding(ROW_PAD, text(r.label)),
-            ])
-        } else {
-            let face = if hovered == Some(r.key) { lit } else { ground };
-            stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))])
-        };
+        let mut layers = alloc::vec![fill(ground)];
+        if primary {
+            layers.push(wash(theme.accent, libdraw::theme::SELECTION_COVERAGE));
+        } else if hovered == Some(r.key) {
+            layers.push(wash(theme.accent, hover));
+        }
+        layers.push(padding(ROW_PAD, text(r.label)));
+        let row_el = stack(layers);
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
         // **A press *down* on a row, for the caller that needs the gesture rather than the
@@ -2421,13 +2424,6 @@ pub fn list_view<Msg>(
     };
     stack(alloc::vec![fill(ground), body]).focusable()
 }
-
-/// How far a row is lightened under the pointer, per channel.
-///
-/// **The step this palette already uses**: `face_hover` is `face` plus nine. Deriving it means a
-/// list on any ground gets a hover that belongs to the same desktop, rather than one that only
-/// suits the ground the toolkit shipped with.
-const HOVER_LIFT: i16 = 9;
 
 /// How wide a list's scrollbar is, in pixels.
 const SCROLLBAR_W: u32 = 12;
@@ -2476,52 +2472,55 @@ mod list_view_tests {
     ///
     /// **A row used to fill `theme.track` whatever the list's ground was** (M15 Part F), so a
     /// panel with a ground of its own had list-coloured tiles painted over it — the panel showed
-    /// only in the gap below the last row, which is not what a panel is. The hover is derived
-    /// from the ground for the same reason: a hover is "this surface, lit", not a colour of its
-    /// own, and one fixed near-white belongs to exactly one ground.
+    /// only in the gap below the last row, which is not what a panel is. The hover is a wash of
+    /// the accent over that ground since the desktop refresh's Part B — "this surface, lit",
+    /// which a hover derived by shading the ground only approximated.
     #[test]
-    fn a_rows_ground_is_the_lists_and_its_hover_is_derived_from_it() {
+    fn a_rows_ground_is_the_lists_and_its_hover_is_a_wash_over_it() {
+        use crate::element::Node;
         let p = Theme::default();
         let data = [(1u64, "alpha"), (2, "beta")];
         let panel = Rgb::new(0xDD, 0xDA, 0xD6);
         // **A selection is kept, and the hover is on a *different* row.** With nothing selected
-        // a hovered row is the primary highlight — the blue one — so a fixture without a
-        // selection never reaches the hover branch at all (M11 Part E, batch 5).
-        let fills_of = |ground: Option<Rgb>, hovered: Option<u64>| {
+        // a hovered row is the primary highlight, so a fixture without a selection never reaches
+        // the hover branch at all (M11 Part E, batch 5).
+        //
+        // Each row's fill and wash, in order.
+        let rows_of = |ground: Option<Rgb>, hovered: Option<u64>| {
             let mut st = ListState::at(Some(0), 0);
             let e: Element<u64> =
                 list_view(&rows(&data), &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
-            let mut out = Vec::new();
-            fn walk<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
-                if let crate::element::Node::Fill(c) = &e.node {
-                    out.push(*c);
+            let mut out: Vec<(Option<Rgb>, Option<(Rgb, u8)>)> = Vec::new();
+            walk(&e, &mut |n| {
+                if n.key.is_none() {
+                    return;
                 }
-                for c in e.children() {
-                    walk(c, out);
-                }
-            }
-            walk(&e, &mut out);
+                let (mut f, mut w) = (None, None);
+                walk(n, &mut |c| match &c.node {
+                    Node::Fill(rgb) if f.is_none() => f = Some(*rgb),
+                    Node::Wash { colour, coverage } => w = Some((*colour, *coverage)),
+                    _ => {}
+                });
+                out.push((f, w));
+            });
             out
         };
+        let hover = p.scheme.hover_coverage();
+        let sel = libdraw::theme::SELECTION_COVERAGE;
 
-        // The default list is untouched: rows on `track`, lit with `face_hover`.
-        let plain = fills_of(None, Some(2));
-        assert!(plain.contains(&p.track), "the ordinary list stopped using the theme's ground");
-        assert!(plain.contains(&p.face_hover), "…or its hover");
-
-        // A list on a panel rests on the panel and lights from it.
-        let on_panel = fills_of(Some(panel), None);
-        assert!(on_panel.contains(&panel), "the rows are not on the ground they were given");
-        assert!(
-            !on_panel.contains(&p.track),
-            "a row painted the list's default ground over the panel: {on_panel:?}"
+        // The default list: rows on `track`; the selected row washed at 20%, the hovered one at
+        // the hover's coverage, both over their own ground.
+        assert_eq!(
+            rows_of(None, Some(2)),
+            [(Some(p.track), Some((p.accent, sel))), (Some(p.track), Some((p.accent, hover)))]
         );
-        let hovered = fills_of(Some(panel), Some(2));
-        assert!(
-            hovered.contains(&panel.shade(HOVER_LIFT)),
-            "the hover was not derived from the ground: {hovered:?}"
+        // A list on a panel rests on the panel, and the same washes land on it.
+        assert_eq!(
+            rows_of(Some(panel), Some(2)),
+            [(Some(panel), Some((p.accent, sel))), (Some(panel), Some((p.accent, hover)))]
         );
-        assert!(!hovered.contains(&p.face_hover), "…and it is not the default one either");
+        // And a row nobody is pointing at is its ground and nothing more.
+        assert_eq!(rows_of(Some(panel), None)[1], (Some(panel), None));
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.
@@ -2605,7 +2604,9 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection())),
+            row_washes(&e)
+                .iter()
+                .any(|w| *w == Some((Theme::default().accent, libdraw::theme::SELECTION_COVERAGE))),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -2738,33 +2739,29 @@ mod list_view_tests {
         let hot: Element<u8> = menu_item("Clear", 1, true, &p);
         let cold: Element<u8> = menu_item("Clear", 1, false, &p);
 
-        let fills = |e: &Element<u8>| {
+        // Every painting node in the item, whatever its kind.
+        let paints = |e: &Element<u8>| {
             let mut out = alloc::vec::Vec::new();
-            walk(e, &mut |n| {
-                if let Node::Fill(c) = &n.node {
-                    out.push(*c);
-                }
-            });
-            out
-        };
-        let bevels = |e: &Element<u8>| {
-            let mut out = alloc::vec::Vec::new();
-            walk(e, &mut |n| {
-                if let Node::Bevel(c) = &n.node {
-                    out.push(*c);
-                }
+            walk(e, &mut |n| match &n.node {
+                Node::Fill(c) | Node::Bevel(c) => out.push((*c, 255)),
+                Node::Wash { colour, coverage } => out.push((*colour, *coverage)),
+                _ => {}
             });
             out
         };
 
-        // The same two layers a selected list row gets: a border in the focus blue, and the
-        // selection colour bevelled inside it.
-        assert_eq!(fills(&hot), alloc::vec![p.accent], "no border on the hovered item");
-        assert_eq!(bevels(&hot), alloc::vec![p.selection()], "no selection fill on the hovered item");
+        // **One layer: the accent washed over the bar at the hover's coverage** (desktop refresh,
+        // Part B) — the design's `--soft`. It was a border in the accent and the selection
+        // bevelled inside it.
+        assert_eq!(
+            paints(&hot),
+            alloc::vec![(p.accent, p.scheme.hover_coverage())],
+            "the hovered item is not the hover wash"
+        );
 
         // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
         // an item that paints a face when it is not hovered is a menu with every row lit.
-        assert!(fills(&cold).is_empty() && bevels(&cold).is_empty(), "an idle item drew a face");
+        assert!(paints(&cold).is_empty(), "an idle item drew a face");
     }
 
     #[test]
@@ -2969,9 +2966,11 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
-        assert_eq!(row_faces(&e)[1], p.accent, "the hovered row has no border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the hovered row is not the blue");
-        assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
+        // The primary highlight is the selection's wash, not the quieter hover's.
+        let sel = Some((p.accent, libdraw::theme::SELECTION_COVERAGE));
+        assert_eq!(row_washes(&e)[1], sel, "the hovered row is not the primary highlight");
+        assert_eq!(row_washes(&e)[0], None, "an untouched row reacted");
+        assert_eq!(row_faces(&e)[0], p.track, "and it is the list's ground");
     }
 
     #[test]
@@ -2992,10 +2991,12 @@ mod list_view_tests {
             None,
             &p,
         );
-        let faces = row_faces(&e);
-        assert_eq!(faces[0], p.face_hover, "the hovered row did not react");
-        assert_eq!(faces[1], p.accent, "the selected row lost its border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the selected row lost its fill");
+        // Quieter: the hover's coverage against the selection's — 10% against 20% in the light
+        // scheme, which is the whole difference in weight.
+        let washes = row_washes(&e);
+        assert_eq!(washes[0], Some((p.accent, p.scheme.hover_coverage())), "the hovered row did not react");
+        assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row lost it");
+        assert!(p.scheme.hover_coverage() < libdraw::theme::SELECTION_COVERAGE, "the hover is not quieter");
 
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
@@ -3010,7 +3011,11 @@ mod list_view_tests {
             None,
             &p,
         );
-        assert_eq!(row_faces(&e)[1], p.accent, "selection lost to hover");
+        assert_eq!(
+            row_washes(&e)[1],
+            Some((p.accent, libdraw::theme::SELECTION_COVERAGE)),
+            "selection lost to hover"
+        );
     }
 
     /// The selected row paints differently, or selection is invisible.
@@ -3020,18 +3025,16 @@ mod list_view_tests {
         let p = Theme::default();
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
+        // **The ground and a wash over it** (desktop refresh, Part B): both rows rest on the
+        // list's ground, and the selected one carries the accent at the selection's 20%. It was a
+        // one-pixel accent border and the selection bevelled inside it (M11 Part E, batch 2); the
+        // design is flat, so a gradient on either row is now the regression.
         let faces = row_faces(&e);
-        assert_eq!(faces.len(), 2);
-        assert_ne!(faces[0], faces[1], "the selected row looks like the others");
-        // **Two layers, and both are the claim** (M11 Part E, batch 2): a one-pixel border in
-        // the focus blue, and the selection colour bevelled inside it. Asserting only the fill
-        // would pass for a selection with no edge, which is the thing that makes two adjacent
-        // selected rows read as one block.
-        assert_eq!(faces[1], p.accent, "the selected row has no border");
-        assert_eq!(faces[0], p.track, "an unselected row is the list's own ground");
-        let bevels = row_bevels(&e);
-        assert_eq!(bevels[1], Some(p.selection()), "the selected row is not the selection colour");
-        assert_eq!(bevels[0], None, "an unselected row is a flat fill, not a gradient");
+        assert_eq!(faces, [p.track, p.track], "a row is not on the list's own ground");
+        let washes = row_washes(&e);
+        assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row looks like the others");
+        assert_eq!(washes[0], None, "an unselected row is washed too");
+        assert_eq!(row_bevels(&e), [None, None], "a row is drawn with a gradient");
     }
 
     /// A scrollbar that is always there wastes width; one that never appears strands rows.
@@ -3093,8 +3096,29 @@ mod list_view_tests {
         out
     }
 
-    /// The bevelled fill each row carries, if any — the visible face of a selected row since
-    /// M11 Part E, where `row_faces` now reports the one-pixel border drawn behind it.
+    /// The wash each row carries, if any — `(colour, coverage)` — which is how a selected or a
+    /// hovered row is drawn since the desktop refresh's Part B.
+    fn row_washes<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<(Rgb, u8)>> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut found = None;
+            walk(n, &mut |c| {
+                if found.is_none()
+                    && let Node::Wash { colour, coverage } = &c.node
+                {
+                    found = Some((*colour, *coverage));
+                }
+            });
+            out.push(found);
+        });
+        out
+    }
+
+    /// The bevelled fill each row carries, if any — the visible face of a selected row from M11
+    /// Part E until the desktop refresh's Part B, and the negative a flat design has to keep.
     fn row_bevels<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<Rgb>> {
         let mut out = alloc::vec::Vec::new();
         walk(e, &mut |n| {

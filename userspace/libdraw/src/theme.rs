@@ -370,6 +370,18 @@ impl Scheme {
 /// How much of the accent a selection is: the design's `accent + '33'`, 20%, in both schemes.
 pub const SELECTION_COVERAGE: u8 = 0x33;
 
+impl Scheme {
+    /// How much of the accent a hovered row or menu item is: the design's `--soft`, which is
+    /// `accent + '1A'` (10%) in the light palette and `accent + '2E'` (18%) in the dark one — the
+    /// same accent needs more of itself to read against a dark ground.
+    pub const fn hover_coverage(self) -> u8 {
+        match self {
+            Scheme::Light => 0x1A,
+            Scheme::Dark => 0x2E,
+        }
+    }
+}
+
 impl Theme {
     /// The light scheme — the built-in theme.
     ///

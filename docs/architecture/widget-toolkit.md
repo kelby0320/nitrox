@@ -540,10 +540,20 @@ wrong picture but as a menu that opens, reports its size, and never draws a fram
 `the_popup_diffs_from_one_highlight_to_the_next` is the host test that pins it, and each
 application has the same test for its own window.
 
-**What is still missing, and it is a gap rather than a decision.** A disabled row is not
-*dimmed*: `paint` draws every `Text` in `theme.foreground` and there is no per-element ink, so
-"unavailable" shows only as a row that does not light under the pointer and that arrowing skips.
-The colour arrives with the ink wrapper M14 Part G adds for syntax highlighting.
+**A disabled row is dimmed since the desktop refresh's Part B**, and this paragraph used to
+record that it was not: "unavailable" showed only as a row that did not light under the pointer
+and that arrowing skipped, waiting for the ink wrapper M14 Part G added. A popup now wraps a
+disabled row in `theme.foreground_dim`, its chord column in the same, and a row marked
+`Item::destructive` — the file browser's `Delete` — in `theme.deny`; disabled wins, so a greyed
+row never shouts.
+
+**Selection and hover are washes since the same part.** `Node::Wash` blends a colour at a
+coverage over whatever is painted beneath it, and a selected row is the accent at 20%
+(`SELECTION_COVERAGE`), a hovered row or menu item the accent at the scheme's hover coverage (10%,
+18% dark) — the design's `--sel` and `--soft`. It replaced a one-pixel accent border around a
+bevelled fill. A wash is half the colour under it, so every caller puts it in a `Stack` after the
+ground it sits on, and `paint` clears a damaged area and draws the tree in order, which keeps a
+repaint from washing over its own wash.
 
 Two painting primitives arrived with them: `Node::Bevel`, a fill with the theme's gradient — a
 *second* fill rather than a flag on the first, because a flat fill is correct from the clip alone

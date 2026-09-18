@@ -114,13 +114,31 @@ pub const SCROLL_W: u32 = 12;
 /// They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed only because nothing
 /// had ever been added between the window's edge and its content. M11 Part E batch 2b added
 /// something (PR #265).
-const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W;
+const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W + 2 * GRID_PAD_X;
 
 /// And vertically: the title bar, the menu bar, and the frame.
-const CHROME_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
+const CHROME_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H + 2 * GRID_PAD_Y;
+
+/// The margin between the grid's cells and the edge of the pane they sit in, across — in the
+/// terminal's own ground.
+///
+/// **The design's `padding: 9px 11px`** (desktop refresh, Part B). The terminal had none of its
+/// own: the window's three-pixel frame was its only margin, and when Part B ran a window's content
+/// flush to its border, the first column of text touched the window's edge. So the pane keeps a
+/// margin, and the cells start inside it.
+const GRID_PAD_X: u32 = 11;
+
+/// And down — the design's 9.
+const GRID_PAD_Y: u32 = 9;
 
 /// The element key on the tab strip.
 pub const TAB_STRIP_KEY: u64 = 7;
+
+/// The element key on the pane the grid sits in — its ground and its margin.
+///
+/// **Keyed because the dock's other children are**: the diff pairs a parent's children all by key
+/// or all by position, and the grid itself is now one level down, inside the pane.
+pub const GRID_PANE_KEY: u64 = 8;
 
 /// The key that selects everything, with **Ctrl and Shift** held: `a`.
 ///
@@ -547,11 +565,14 @@ impl App {
     /// Where the grid's top-left sits inside the window.
     pub fn grid_origin(&self) -> libdraw::geom::Point {
         libdraw::geom::Point::new(
-            WINDOW_CONTENT_X as i32,
+            (WINDOW_CONTENT_X + GRID_PAD_X) as i32,
             // **`TAB_STRIP_H` since M14 Part B**, and leaving it out draws the grid *underneath*
             // the strip — which `the_window_is_the_grid_plus_its_chrome` caught, because it adds
-            // the chrome up rather than checking the parts it remembers.
-            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H) as i32,
+            // the chrome up rather than checking the parts it remembers. **And the pane's margin
+            // since the desktop refresh's Part B**: the cells start inside it, and this is what
+            // maps a pointer to a cell, so a margin the origin did not know about would move
+            // every click by it.
+            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H + GRID_PAD_Y) as i32,
         )
     }
 
@@ -1405,12 +1426,31 @@ impl App {
                     .key(SCROLLBAR_KEY),
                 ),
                 ],
-                custom(GRID_KIND, grid_px)
-                    .key(GRID_KEY)
-                    .on_key(|k| Some(Msg::Key(k)))
-                    // **The grid takes the pointer since M12 Part E.** It had none: nothing in
-                    // the terminal reacted to the pointer except the scrollbar and the chrome.
-                    .on_pointer(Msg::GridPointer),
+                // **The pane: the terminal's own ground, and the cells inside its margin**
+                // (desktop refresh, Part B). A custom node takes the size it declares, so the
+                // grid's node covers the cells and nothing else; the first version of the margin
+                // moved the cells and left the margin showing the window's face under them —
+                // measured on a screendump, not seen in a test. The ground is filled across the
+                // whole pane here, in the palette the cells are drawn in.
+                libui::element::stack(vec![
+                    libui::element::fill(self.palette.background),
+                    libui::element::padding(
+                        libui::element::Insets {
+                            top: GRID_PAD_Y,
+                            right: GRID_PAD_X,
+                            bottom: GRID_PAD_Y,
+                            left: GRID_PAD_X,
+                        },
+                        custom(GRID_KIND, grid_px)
+                            .key(GRID_KEY)
+                            .on_key(|k| Some(Msg::Key(k)))
+                            // **The grid takes the pointer since M12 Part E.** It had none:
+                            // nothing in the terminal reacted to the pointer except the scrollbar
+                            // and the chrome.
+                            .on_pointer(Msg::GridPointer),
+                    ),
+                ])
+                .key(GRID_PANE_KEY),
             )
             // **The wheel is the whole body's, not the grid's** (M14 Part I). A wheel walks up
             // from whatever it landed on, so hanging it here means turning it over the
@@ -2356,17 +2396,17 @@ mod tests {
         assert_eq!(
             a.grid_origin(),
             libdraw::geom::Point::new(
-                WINDOW_CONTENT_X as i32,
-                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H) as i32
+                (WINDOW_CONTENT_X + GRID_PAD_X) as i32,
+                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H + GRID_PAD_Y) as i32
             ),
-            "the grid starts below the bars and the tab strip, and inside the frame"
+            "the grid starts below the bars and the tab strip, inside the frame and the pane's margin"
         );
         // The window is the grid plus chrome, and the chrome is *all* of it — a test that added
         // up only the parts it remembered would pass for a frame that took space from the grid.
         assert_eq!(
             a.window_size().h - a.grid_origin().y as u32 - g.h,
-            libui::widget::WINDOW_BORDER + libui::widget::WINDOW_FRAME,
-            "what is left below the grid is the frame and the border, and nothing else"
+            GRID_PAD_Y + libui::widget::WINDOW_BORDER + libui::widget::WINDOW_FRAME,
+            "what is left below the grid is the margin, the frame and the border, and nothing else"
         );
     }
 
@@ -2678,6 +2718,35 @@ mod tests {
     /// has already established that it belongs to this window.
     fn key_ev(code: u16, pressed: u16) -> KeyEvent {
         KeyEvent::new(1, code, pressed, 0)
+    }
+
+    #[test]
+    fn the_grid_sits_in_a_margin_of_the_terminals_own_ground() {
+        // **What a screendump showed and no test did** (desktop refresh, Part B): the first
+        // version moved the cells in by the margin and left the margin itself showing the
+        // window's face, because a custom node covers only the cells it declares. So the pane is
+        // an element of its own, and this pins its three properties.
+        let a = app();
+        let (t, _, _) = window(&a);
+        fn find(w: &libui::diff::Widget, key: u64) -> Option<&libui::diff::Widget> {
+            if w.key == Some(key) {
+                return Some(w);
+            }
+            w.children.iter().find_map(|c| find(c, key))
+        }
+        let root = t.root().expect("a frame");
+        let grid = find(root, GRID_KEY).expect("the grid is keyed");
+        let pane = find(root, GRID_PANE_KEY).expect("the pane is keyed");
+        // The cells' node starts where `grid_origin` says — the origin maps a pointer to a cell,
+        // and the cells are drawn from it.
+        assert_eq!(grid.rect.origin, a.grid_origin(), "the cells are not where the origin says");
+        // The pane surrounds it by the margin.
+        assert_eq!(grid.rect.origin.x - pane.rect.origin.x, GRID_PAD_X as i32);
+        assert_eq!(grid.rect.origin.y - pane.rect.origin.y, GRID_PAD_Y as i32);
+        // And its ground is the terminal's, across the whole of it.
+        let ground = pane.children.first().expect("the pane has its ground");
+        assert_eq!(ground.print, libui::diff::Fingerprint::Fill(a.palette.background));
+        assert_eq!(ground.rect, pane.rect, "the ground does not fill the pane");
     }
 
     /// The tree, layout and router of a live window, with the grid focused as `main` does it.

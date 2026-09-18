@@ -1896,7 +1896,9 @@ impl App {
                     act("New File", Action::NewFile),
                     act("New Folder", Action::NewFolder),
                     act("Rename", Action::Rename),
-                    act("Delete", Action::Delete),
+                    // **In `deny`** (desktop refresh, Part B): the one row here that destroys
+                    // something, drawn as the design draws such a row. It still asks first.
+                    act("Delete", Action::Delete).destructive(true),
                     // **Last, and after the destructive row rather than before it.** Properties
                     // is the one row here that changes nothing, so it sits where a mis-aimed
                     // press lands on it instead of on Delete.

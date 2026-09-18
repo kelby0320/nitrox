@@ -65,6 +65,8 @@ pub enum Fingerprint {
     Fill(libdraw::format::Rgb),
     /// [`Node::Outline`], with its colour and radius — either one changing repaints.
     Outline(libdraw::format::Rgb, u32),
+    /// [`Node::Wash`], with its colour and coverage — either one changing repaints.
+    Wash(libdraw::format::Rgb, u8),
     /// [`Node::Offset`].
     ///
     /// **Without its shift**, deliberately. A first version carried `(dx, dy)` on the grounds
@@ -96,6 +98,7 @@ impl Fingerprint {
             Node::Fill(c) => Fingerprint::Fill(*c),
             Node::Bevel(c) => Fingerprint::Bevel(*c),
             Node::Outline { colour, radius } => Fingerprint::Outline(*colour, *radius),
+            Node::Wash { colour, coverage } => Fingerprint::Wash(*colour, *coverage),
             Node::Icon(k) => Fingerprint::Icon(*k),
             Node::Offset { .. } => Fingerprint::Offset,
             // **With its colour**, unlike `Offset` and for the reason `Fill` carries one: an

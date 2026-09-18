@@ -5760,7 +5760,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // menu now holds a **separator**, which occupies height without being a row, so no division
     // names the right one. The client says which row the pointer is over, so the gate walks down
     // the popup and stops when the guest agrees it is over `Rename`.
-    const MENU_FRAME: i32 = 3;
+    // The popup's border and the space above its first row: one and five since the desktop
+    // refresh's Part B (the design's `padding: 5px 0`), one and two before.
+    const MENU_FRAME: i32 = 6;
     // `Rename` is `MENU_ROW_KEY + 8`: New Tab, Close Tab, a rule, New Window, Quit, a rule, New
     // File, New Folder, Rename. **It has moved twice** — once when the menu gained separators and
     // again when M14 Part B added the window rows — and each time the gate failed as a *prompt*
