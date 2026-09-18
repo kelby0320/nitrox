@@ -220,6 +220,82 @@ pub trait Framebuffer {
         }
     }
 
+    /// Wash `rect`, clipped to the visible area, with `colour` at `coverage` — a translucent
+    /// colour mixed *into* what is already there.
+    ///
+    /// **The rectangle case of [`blend_pixel`](Self::blend_pixel)**, and not
+    /// [`fill_rect_alpha`](Self::fill_rect_alpha), which stores an opacity for something further
+    /// down to composite. This leaves every pixel opaque. It is how a selected row or a hovered
+    /// menu item is drawn in the refreshed desktop: the design gives those as the accent at 20%
+    /// and 10%, and a wash is one colour that works on white, on a sidebar and on a button face,
+    /// where a precomputed opaque colour would be right on only one of them.
+    ///
+    /// **Whatever is underneath has to be painted first, on every path that repaints this
+    /// area** — the ground a wash lands on is half its colour. A damage path that repaints the
+    /// wash without first repainting what is under it blends the wash into itself and darkens it
+    /// a step per frame. That is the same hazard [`fill_rect_bevel`](Self::fill_rect_bevel)'s
+    /// doc describes from the other side, and it is invisible to a test that only paints whole
+    /// surfaces once.
+    fn blend_rect(&mut self, rect: Rect, colour: Rgb, coverage: u8) {
+        match coverage {
+            0 => {}
+            // A plain store, as `blend_pixel`'s endpoint is — and a row at a time rather than a
+            // read per pixel.
+            255 => self.fill_rect(rect, colour),
+            a => {
+                let Some(clipped) = rect.intersect(&self.geometry().bounds()) else { return };
+                for y in clipped.origin.y..clipped.bottom() as i32 {
+                    for x in clipped.origin.x..clipped.right() as i32 {
+                        self.blend_pixel(x as u32, y as u32, colour, a);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill `rect` with its corners rounded to `radius`, painting only inside `clip`.
+    ///
+    /// **The corners are antialiased against what is already there**, through
+    /// [`corner::coverage`](crate::corner::coverage) — the same curve the compositor's masked
+    /// blit cuts a window's corner with, so a surface drawn with this inside a rounded window
+    /// meets the window's own edge without a crescent between them.
+    ///
+    /// `rect` fixes the shape and `clip` is how much of it this frame repaints, for the reason
+    /// [`fill_rect_bevel`](Self::fill_rect_bevel) gives: a curve computed from the clip would
+    /// round a partial repaint's corners where the shape has none. The radius is clamped to half
+    /// the shorter side. A radius of zero is [`fill_rect`](Self::fill_rect).
+    fn fill_rounded_rect(&mut self, rect: Rect, clip: Rect, colour: Rgb, radius: u32) {
+        let Some(paint) = rect.intersect(&clip) else { return };
+        let r = crate::corner::clamp(radius, rect.size.w, rect.size.h);
+        if r == 0 {
+            self.fill_rect(paint, colour);
+            return;
+        }
+        let (left, right) = (rect.origin.x, rect.right() as i32);
+        let (top, bottom) = (rect.origin.y, rect.bottom() as i32);
+        for y in paint.origin.y..paint.bottom() as i32 {
+            // Rows from the nearer horizontal edge; past the radius the row is the straight part.
+            let dy = (y - top).min(bottom - 1 - y) as u32;
+            let shape = crate::corner::row(r, dy);
+            // The run between the curves, stored whole — the common case, and every row of a
+            // rectangle taller than twice its radius outside the top and bottom bands.
+            let inset = (shape.clear + shape.partial) as i32;
+            let run = Rect::new(left + inset, y, (right - left - 2 * inset).max(0) as u32, 1);
+            if let Some(run) = run.intersect(&paint) {
+                self.fill_rect(run, colour);
+            }
+            // The partial pixels at each end, blended against what is underneath.
+            for i in shape.clear..shape.clear + shape.partial {
+                let a = crate::corner::coverage(r, i, dy);
+                for x in [left + i as i32, right - 1 - i as i32] {
+                    if paint.contains(x, y) {
+                        self.blend_pixel(x as u32, y as u32, colour, a);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fill the entire visible area.
     fn clear(&mut self, colour: Rgb) {
         let bounds = self.geometry().bounds();
@@ -566,5 +642,121 @@ mod tests {
             assert_eq!(f.encode(src.blend(under, 0)), f.encode(under), "zero coverage at {w:#x}");
             assert_eq!(f.encode(src.blend(under, 255)), f.encode(src), "full coverage at {w:#x}");
         }
+    }
+
+    #[test]
+    fn a_wash_blends_into_what_is_there_and_its_endpoints_are_a_store_and_nothing() {
+        let under = Rgb::new(0xFF, 0xFF, 0xFF);
+        let accent = Rgb::new(0x2C, 0x7F, 0x92);
+        let g = Geometry::packed(6, 4, PixelFormat::XRGB8888);
+        let wash = Rect::new(1, 1, 4, 2);
+
+        let mut fb = MemFramebuffer::filled(g, under);
+        fb.blend_rect(wash, accent, 51);
+        assert_eq!(fb.get_pixel(2, 1), Some(accent.blend(under, 51)), "a pixel inside is mixed");
+        assert_eq!(fb.get_pixel(0, 0), Some(under), "a pixel outside is untouched");
+        assert_eq!(fb.get_pixel(5, 3), Some(under), "and so is the far corner");
+
+        // The endpoints, which skip the read: zero leaves the buffer alone and full is a fill.
+        let mut none = MemFramebuffer::filled(g, under);
+        none.blend_rect(wash, accent, 0);
+        assert_eq!(none, MemFramebuffer::filled(g, under));
+        let (mut full, mut fill) = (MemFramebuffer::filled(g, under), MemFramebuffer::filled(g, under));
+        full.blend_rect(wash, accent, 255);
+        fill.fill_rect(wash, accent);
+        assert_eq!(full, fill);
+
+        // Clipped to the buffer rather than wrapping or panicking.
+        let mut edge = MemFramebuffer::filled(g, under);
+        edge.blend_rect(Rect::new(-3, 3, 20, 9), accent, 51);
+        assert_eq!(edge.get_pixel(0, 3), Some(accent.blend(under, 51)));
+        assert_eq!(edge.get_pixel(0, 2), Some(under));
+    }
+
+    #[test]
+    fn a_wash_painted_twice_is_darker_which_is_why_its_ground_goes_first() {
+        // Pinned because it is the hazard the method's doc names: a damage path that repaints a
+        // wash without repainting its ground changes the picture. Nothing here prevents that —
+        // the caller has to — so the test states the arithmetic the caller is protecting against.
+        let under = Rgb::new(0xFF, 0xFF, 0xFF);
+        let accent = Rgb::new(0x2C, 0x7F, 0x92);
+        let g = Geometry::packed(2, 1, PixelFormat::XRGB8888);
+        let r = Rect::new(0, 0, 2, 1);
+        let mut once = MemFramebuffer::filled(g, under);
+        once.blend_rect(r, accent, 51);
+        let mut twice = once.clone();
+        twice.blend_rect(r, accent, 51);
+        assert_ne!(once, twice);
+    }
+
+    #[test]
+    fn a_rounded_rect_leaves_its_corners_and_blends_the_curve() {
+        let under = Rgb::new(0x10, 0x20, 0x30);
+        let fill = Rgb::new(0xF0, 0xE0, 0xD0);
+        let g = Geometry::packed(40, 30, PixelFormat::XRGB8888);
+        let shape = Rect::new(4, 3, 30, 20);
+        let mut fb = MemFramebuffer::filled(g, under);
+        fb.fill_rounded_rect(shape, g.bounds(), fill, 8);
+
+        // All four very-corner pixels are outside a radius-8 curve, and nothing outside the
+        // rectangle is touched at all.
+        for (x, y) in [(4, 3), (33, 3), (4, 22), (33, 22)] {
+            assert_eq!(fb.get_pixel(x, y), Some(under), "corner ({x},{y})");
+        }
+        assert_eq!(fb.get_pixel(3, 10), Some(under));
+        assert_eq!(fb.get_pixel(34, 10), Some(under));
+        // The straight edges and the middle are the colour itself.
+        for (x, y) in [(4, 11), (33, 11), (19, 3), (19, 22), (19, 12)] {
+            assert_eq!(fb.get_pixel(x, y), Some(fill), "edge or middle ({x},{y})");
+        }
+        // Every pixel in a corner square is the colour at that pixel's coverage, mirrored the
+        // same way in all four — which checks the mirroring as well as the blend.
+        for dy in 0..8u32 {
+            for dx in 0..8u32 {
+                let want = fill.blend(under, crate::corner::coverage(8, dx, dy));
+                let (l, t, r, b) = (4 + dx, 3 + dy, 33 - dx, 22 - dy);
+                for (x, y) in [(l, t), (r, t), (l, b), (r, b)] {
+                    assert_eq!(fb.get_pixel(x, y), Some(want), "({x},{y}) is ({dx},{dy}) in");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rounded_rect_repainted_in_pieces_is_the_same_picture() {
+        // The curve belongs to the shape, not to the clip — a partial repaint that rounded its own
+        // corners would put notches in the middle of a window's edge.
+        let under = Rgb::new(0x10, 0x20, 0x30);
+        let fill = Rgb::new(0xF0, 0xE0, 0xD0);
+        let g = Geometry::packed(40, 30, PixelFormat::XRGB8888);
+        let shape = Rect::new(4, 3, 30, 20);
+        let mut whole = MemFramebuffer::filled(g, under);
+        whole.fill_rounded_rect(shape, g.bounds(), fill, 8);
+        let mut pieces = MemFramebuffer::filled(g, under);
+        for y in (0..30).step_by(3) {
+            for x in (0..40).step_by(7) {
+                pieces.fill_rounded_rect(shape, Rect::new(x, y, 7, 3), fill, 8);
+            }
+        }
+        assert_eq!(pieces, whole);
+    }
+
+    #[test]
+    fn a_radius_of_zero_is_a_fill_and_a_large_one_is_clamped() {
+        let under = Rgb::new(0x10, 0x20, 0x30);
+        let fill = Rgb::new(0xF0, 0xE0, 0xD0);
+        let g = Geometry::packed(20, 10, PixelFormat::XRGB8888);
+        let shape = Rect::new(2, 2, 16, 6);
+        let (mut round, mut square) = (MemFramebuffer::filled(g, under), MemFramebuffer::filled(g, under));
+        round.fill_rounded_rect(shape, g.bounds(), fill, 0);
+        square.fill_rect(shape, fill);
+        assert_eq!(round, square);
+
+        // A radius past half the shorter side is that half: 6 tall rounds at 3, and asking for
+        // 50 draws exactly what asking for 3 does.
+        let (mut big, mut three) = (MemFramebuffer::filled(g, under), MemFramebuffer::filled(g, under));
+        big.fill_rounded_rect(shape, g.bounds(), fill, 50);
+        three.fill_rounded_rect(shape, g.bounds(), fill, 3);
+        assert_eq!(big, three);
     }
 }

@@ -43,13 +43,13 @@ use crate::format::Rgb;
 /// values were roughly twice this opacity and read as a drawn border rather than as depth; the
 /// curve was the larger half of that — see [`draw_shadow`](crate::compose::draw_shadow). At 60,
 /// the shadow is 24% opaque where it meets the window and under 6% half a radius out.
-pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow {
+pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow::single(crate::compose::ShadowLayer {
     radius: 16,
     // Dropped, not centred: a shadow directly under a window reads as a glow.
     offset: crate::geom::Point::new(0, 4),
     colour: crate::format::Rgb::new(0, 0, 0),
     strength: 60,
-};
+});
 
 /// The colours and text size everything on screen is drawn from.
 ///

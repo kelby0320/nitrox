@@ -7236,8 +7236,14 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
-/// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]` — try the
+/// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]
+/// [--contact-radius N] [--contact-strength N] [--contact-drop N] [--corner N]` — try the
 /// overview's opacity and a window's shadow **without booting**.
+///
+/// The shadow has two layers since the desktop refresh's Part A: `--radius`, `--strength` and
+/// `--drop` are the wide one, as they always were, and the `--contact-` three are the tight one
+/// that seats a window's edge. `--corner` rounds the mock windows, so a shadow can be judged
+/// against the corners it will actually be cast from.
 ///
 /// **The loop `preview` exists for, pointed at the two things `preview` could not show** (M13
 /// Part C). `preview` renders the toolkit's own surfaces; the overview's translucency and a
@@ -7254,7 +7260,7 @@ fn cmd_preview(what: &str) -> R<()> {
 /// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used so a good
 /// one can be copied into `libdraw::theme::WINDOW_SHADOW` and `desktop-shell`'s constants.
 fn cmd_tune(args: &[String]) -> R<()> {
-    use libdraw::compose::{Shadow, SurfaceRef, compose_exposed};
+    use libdraw::compose::{Shadow, ShadowLayer, SurfaceRef, compose_exposed};
     use libdraw::format::{PixelFormat, Rgb};
     use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
     use libdraw::geom::{Point, Rect};
@@ -7269,13 +7275,24 @@ fn cmd_tune(args: &[String]) -> R<()> {
             None => Ok(default),
         }
     };
-    let theme_shadow = libdraw::theme::WINDOW_SHADOW;
+    let [wide, contact] = libdraw::theme::WINDOW_SHADOW.layers;
     let shadow = Shadow {
-        radius: num("--radius", theme_shadow.radius)?,
-        offset: Point::new(0, num("--drop", theme_shadow.offset.y as u32)? as i32),
-        colour: theme_shadow.colour,
-        strength: num("--strength", theme_shadow.strength as u32)?.min(255) as u8,
+        layers: [
+            ShadowLayer {
+                radius: num("--radius", wide.radius)?,
+                offset: Point::new(0, num("--drop", wide.offset.y as u32)? as i32),
+                colour: wide.colour,
+                strength: num("--strength", wide.strength as u32)?.min(255) as u8,
+            },
+            ShadowLayer {
+                radius: num("--contact-radius", contact.radius)?,
+                offset: Point::new(0, num("--contact-drop", contact.offset.y as u32)? as i32),
+                colour: wide.colour,
+                strength: num("--contact-strength", contact.strength as u32)?.min(255) as u8,
+            },
+        ],
     };
+    let corner = num("--corner", 0)?;
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
@@ -7330,9 +7347,11 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let wall = SurfaceRef::new(wg, Point::new(0, 0), &wp);
     let bar = SurfaceRef::new(panel.geometry(), Point::new(0, 0), panel.bytes());
     let a = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120, 140), ui.bytes())
-        .with_shadow(shadow);
+        .with_shadow(shadow)
+        .with_corner(corner);
     let b = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120 + uw as i32 / 2, 140 + uh as i32 / 2), ui.bytes())
-        .with_shadow(shadow);
+        .with_shadow(shadow)
+        .with_corner(corner);
     compose_exposed(&mut shot_fb, Rgb::new(0x2A, 0x55, 0x70), &[wall, bar, a, b], &[g.bounds()]);
     let (w1, h1, rgb1) = rgb_of(&shot_fb);
     let p1 = dir.join("tune-shadow.png");
@@ -7366,11 +7385,16 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let p2 = dir.join("tune-overview.png");
     write_png(&p2, w2, h2, &rgb2)?;
 
+    let [w, c] = shadow.layers;
     println!(
-        "xtask: shadow radius {} drop {} strength {}  ->  {}",
-        shadow.radius,
-        shadow.offset.y,
-        shadow.strength,
+        "xtask: shadow radius {} drop {} strength {}, contact radius {} drop {} strength {}, \
+         corner {corner}  ->  {}",
+        w.radius,
+        w.offset.y,
+        w.strength,
+        c.radius,
+        c.offset.y,
+        c.strength,
         p1.display()
     );
     println!(
@@ -8087,9 +8111,11 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // past the window above it would land in a region the exclusion does not cover, and the gate
     // would report unexplained pixel mismatches instead of the real cause. One font-size change
     // to the terminal reference is all it takes.
-    let sh_reach = libdraw::theme::WINDOW_SHADOW;
-    let reach_x = sh_reach.radius;
-    let reach_y = sh_reach.radius + sh_reach.offset.y.max(0) as u32;
+    // How far past a one-pixel window the shadow paints, rightward and downward — over every
+    // layer, since the refresh's shadow has two and the wider need not be the one dropped further.
+    let reach = libdraw::theme::WINDOW_SHADOW.around(libdraw::geom::Rect::new(0, 0, 1, 1));
+    let reach_x = (reach.right() - 1) as u32;
+    let reach_y = (reach.bottom() - 1) as u32;
     if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
         return Err(format!(
             "a reference window's shadow would fall outside the window above it: scene \
@@ -8108,6 +8134,8 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     libdraw::compose::draw_shadow(
         &mut term,
         libdraw::geom::Rect::new(0, 0, sw, sh),
+        // Square: the reference windows are not rounded until Part B rounds real ones.
+        0,
         &libdraw::theme::WINDOW_SHADOW,
         &libdraw::geom::Rect::new(0, 0, tw, th),
     );
@@ -8150,6 +8178,8 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     libdraw::compose::draw_shadow(
         &mut ui,
         libdraw::geom::Rect::new(0, 0, tw, th),
+        // Square: the reference windows are not rounded until Part B rounds real ones.
+        0,
         &libdraw::theme::WINDOW_SHADOW,
         &libdraw::geom::Rect::new(0, 0, uw, uh),
     );

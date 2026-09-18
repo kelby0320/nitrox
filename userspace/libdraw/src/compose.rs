@@ -32,17 +32,40 @@ pub struct SurfaceRef<'a> {
     /// existing construction still says `None`, and the equivalence tests between them keep
     /// meaning what they meant.
     pub shadow: Option<Shadow>,
+    /// The radius its corners are rounded to, or zero for square ones.
+    ///
+    /// **A property of the surface, for the reason [`shadow`](Self::shadow) is**: no parameter on
+    /// [`compose`], so the equivalence between it and [`compose_exposed`] keeps meaning what it
+    /// meant. The pixels outside the curve are *not written* — whatever the surfaces below put
+    /// there shows through — and the pixels on it are blended at the curve's coverage. See
+    /// `blit_clipped` for the mechanism and [`corner`](crate::corner) for the curve.
+    ///
+    /// **Not an alpha channel**, which would round a corner too, at the cost of the row `memcpy`
+    /// on every pixel of the surface rather than a blend on a few per corner row (desktop
+    /// refresh, Part B). Clamped to half the surface's shorter side.
+    pub corner: u32,
 }
 
 impl<'a> SurfaceRef<'a> {
-    /// A surface at `origin` over `pixels`, casting no shadow.
+    /// A surface at `origin` over `pixels`, square-cornered and casting no shadow.
     pub const fn new(geometry: Geometry, origin: Point, pixels: &'a [u8]) -> Self {
-        Self { geometry, origin, pixels, shadow: None }
+        Self { geometry, origin, pixels, shadow: None, corner: 0 }
     }
 
     /// The same surface, casting `shadow`.
     pub const fn with_shadow(self, shadow: Shadow) -> Self {
         Self { shadow: Some(shadow), ..self }
+    }
+
+    /// The same surface, with its corners rounded to `radius`.
+    pub const fn with_corner(self, radius: u32) -> Self {
+        Self { corner: radius, ..self }
+    }
+
+    /// The corner radius this surface is actually drawn with: [`corner`](Self::corner), clamped
+    /// to what its size can hold.
+    pub const fn radius(&self) -> u32 {
+        crate::corner::clamp(self.corner, self.geometry.width, self.geometry.height)
     }
 
     /// The surface's bounds in screen space.
@@ -70,20 +93,66 @@ impl<'a> SurfaceRef<'a> {
 /// usually work — would put the shadow inside the window's bounds, and then the compositor's
 /// answer to "what did the pointer hit" would include a region nobody can see or click. Here the
 /// shadow is outside `bounds` by construction and hit-testing needs to know nothing about it.
+///
+/// ## Two layers (desktop refresh, Part A)
+///
+/// **A wide soft layer for depth and a tight dark one for contact**, which is how the design
+/// specifies it — `0 10px 28px` at 22% and `0 2px 6px` at 14% — and how most desktops draw one. A
+/// single layer has to choose: wide enough to read as depth leaves the window's edge floating on
+/// a haze, and tight enough to seat the edge is a dark outline with no depth behind it. The wide
+/// layer is drawn first, so the tight one darkens it where they overlap, as two real shadows do.
+///
+/// A layer whose strength or radius is zero contributes nothing — its [`around`](ShadowLayer::around)
+/// is the surface itself and [`draw_shadow`] skips it — so [`single`](Self::single) is how a
+/// one-layer shadow is still said.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Shadow {
-    /// How far the shadow reaches beyond the surface, in pixels.
+    /// The layers, drawn in order: the wide one first.
+    pub layers: [ShadowLayer; 2],
+}
+
+impl Shadow {
+    /// A shadow of one layer.
+    pub const fn single(layer: ShadowLayer) -> Self {
+        Self { layers: [layer, ShadowLayer::NONE] }
+    }
+
+    /// The rectangle this shadow can paint into, around a surface at `bounds` — every layer's
+    /// [`around`](ShadowLayer::around), unioned.
+    pub const fn around(&self, bounds: Rect) -> Rect {
+        let a = self.layers[0].around(bounds);
+        let b = self.layers[1].around(bounds);
+        let (l, t) = (min_i32(a.origin.x, b.origin.x), min_i32(a.origin.y, b.origin.y));
+        let r_edge = max_i32(a.right() as i32, b.right() as i32);
+        let b_edge = max_i32(a.bottom() as i32, b.bottom() as i32);
+        Rect::new(l, t, (r_edge - l) as u32, (b_edge - t) as u32)
+    }
+}
+
+/// One layer of a [`Shadow`]: a dark edge that falls off with distance from the surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShadowLayer {
+    /// How far the layer reaches beyond the surface, in pixels.
     pub radius: u32,
-    /// How far the shadow is displaced, in pixels — positive `y` drops it downward.
+    /// How far the layer is displaced, in pixels — positive `y` drops it downward.
     pub offset: Point,
-    /// The shadow's colour, blended at a coverage that falls off with distance.
+    /// The layer's colour, blended at a coverage that falls off with distance.
     pub colour: Rgb,
     /// Coverage directly against the surface's edge, where the falloff begins.
     pub strength: u8,
 }
 
-impl Shadow {
-    /// The rectangle this shadow can paint into, around a surface at `bounds`.
+impl ShadowLayer {
+    /// A layer that draws nothing — the second layer of a [`Shadow::single`].
+    pub const NONE: ShadowLayer =
+        ShadowLayer { radius: 0, offset: Point::new(0, 0), colour: Rgb::BLACK, strength: 0 };
+
+    /// Whether this layer paints anything at all.
+    pub const fn is_visible(&self) -> bool {
+        self.radius > 0 && self.strength > 0
+    }
+
+    /// The rectangle this layer can paint into, around a surface at `bounds`.
     ///
     /// **Unioned with `bounds`, which matters at an offset larger than the radius.** Callers use
     /// this as the region to repaint, and an offset that displaces the shadow further than it
@@ -93,6 +162,9 @@ impl Shadow {
     /// (PR #276 review, optional 9). Cheaper to make the union unconditional than to make the
     /// constraint a rule nobody reads.
     pub const fn around(&self, bounds: Rect) -> Rect {
+        if !self.is_visible() {
+            return bounds;
+        }
         let r = self.radius as i32;
         let cast = Rect::new(
             bounds.origin.x + self.offset.x - r,
@@ -140,41 +212,94 @@ const fn max_i32(a: i32, b: i32) -> i32 {
 /// should contain and compares the guest's screen against it, and a window above now darkens the
 /// one below — so the host has to apply the same shadow rather than tolerate the difference.
 /// `tools/CLAUDE.md`: the gate is "the place a gate's expected answer is *computed*, not stored".
-pub fn draw_shadow<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, shadow: &Shadow, clip: &Rect) {
-    if shadow.radius == 0 || shadow.strength == 0 {
+///
+/// ## A rounded surface casts a rounded shadow
+///
+/// `corner` is the surface's corner radius, and it changes two things. The distance is measured
+/// to the *rounded* rectangle — the cast shrunk by `corner` on every side, then `corner` taken off
+/// the distance — so the shadow's own corners follow the window's rather than squaring off
+/// beneath them. And a pixel inside `bounds` is skipped only when the curve covers it *entirely*:
+/// outside the curve the blit leaves the pixel alone, so the shadow is all it will get, and on the
+/// curve the blit blends the window's edge over whatever is there, which has to include the
+/// shadow. At `corner == 0` both reduce exactly to the square case.
+pub fn draw_shadow<F: Framebuffer + ?Sized>(
+    fb: &mut F,
+    bounds: Rect,
+    corner: u32,
+    shadow: &Shadow,
+    clip: &Rect,
+) {
+    for layer in &shadow.layers {
+        draw_layer(fb, bounds, corner, layer, clip);
+    }
+}
+
+/// One layer of [`draw_shadow`].
+fn draw_layer<F: Framebuffer + ?Sized>(
+    fb: &mut F,
+    bounds: Rect,
+    corner: u32,
+    shadow: &ShadowLayer,
+    clip: &Rect,
+) {
+    if !shadow.is_visible() {
         return;
     }
-    let cast = Rect::new(
-        bounds.origin.x + shadow.offset.x,
-        bounds.origin.y + shadow.offset.y,
-        bounds.size.w,
-        bounds.size.h,
+    let c = crate::corner::clamp(corner, bounds.size.w, bounds.size.h);
+    // The cast with its corners' centres as its own corners: distance to *this*, less `c`, is
+    // distance to the rounded shape.
+    let inner = Rect::new(
+        bounds.origin.x + shadow.offset.x + c as i32,
+        bounds.origin.y + shadow.offset.y + c as i32,
+        bounds.size.w - 2 * c,
+        bounds.size.h - 2 * c,
     );
     let Some(area) = shadow.around(bounds).intersect(clip) else { return };
     let r = shadow.radius as i64;
     let rr = r * r;
     for y in area.origin.y..area.bottom() as i32 {
         for x in area.origin.x..area.right() as i32 {
-            // Inside the surface: the blit is about to cover this pixel.
+            // Inside the surface, where the blit is about to cover this pixel whole.
             if x >= bounds.origin.x
                 && y >= bounds.origin.y
                 && x < bounds.right() as i32
                 && y < bounds.bottom() as i32
+                && covered(bounds, c, x, y) == 255
             {
                 continue;
             }
-            let dx = (cast.origin.x - x).max(x - (cast.right() as i32 - 1)).max(0) as i64;
-            let dy = (cast.origin.y - y).max(y - (cast.bottom() as i32 - 1)).max(0) as i64;
-            let d2 = dx * dx + dy * dy;
-            if d2 >= rr {
+            // `inner` is empty on an axis where the surface is exactly `2c` across, and then its
+            // right edge is its left: `right() - 1` would sit one pixel *before* the origin and
+            // every pixel between would measure a distance of one.
+            let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
+            let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
+            let dx = (ix0 - x).max(x - ix1).max(0) as i64;
+            let dy = (iy0 - y).max(y - iy1).max(0) as i64;
+            // `isqrt` floors, so a pixel is never darker than its true distance would make it.
+            let d = ((dx * dx + dy * dy) as u64).isqrt() as i64 - c as i64;
+            let d = d.max(0);
+            if d >= r {
                 continue;
             }
-            // `isqrt` floors, so a pixel is never darker than its true distance would make it.
-            let t = r - (d2 as u64).isqrt() as i64;
+            let t = r - d;
             let coverage = (shadow.strength as i64 * t * t / rr) as u8;
             fb.blend_pixel(x as u32, y as u32, shadow.colour, coverage);
         }
     }
+}
+
+/// How much of the screen pixel `(x, y)` a surface at `bounds` with corners of `radius` covers.
+///
+/// `(x, y)` must be inside `bounds`; `radius` must already be clamped to it. Mirrors the pixel
+/// into the nearest corner and asks [`corner::coverage`](crate::corner::coverage), so all four
+/// corners are the one curve.
+fn covered(bounds: Rect, radius: u32, x: i32, y: i32) -> u8 {
+    if radius == 0 {
+        return 255;
+    }
+    let dx = (x - bounds.origin.x).min(bounds.right() as i32 - 1 - x) as u32;
+    let dy = (y - bounds.origin.y).min(bounds.bottom() as i32 - 1 - y) as u32;
+    crate::corner::coverage(radius, dx, dy)
 }
 
 /// Composite `surfaces` onto `fb` within `damage`.
@@ -252,7 +377,14 @@ pub fn compose_exposed<F: Framebuffer + ?Sized>(
             if !covers(surface) {
                 continue;
             }
-            subtract_from(&mut exposed, &surface.bounds());
+            // A rounded surface covers its rectangle less its four corner squares, and the
+            // background under those corners must still be filled: the blit leaves the outside
+            // of each curve unwritten and blends the curve itself, so either way the pixel
+            // shows what was painted beneath it. Cutting the whole rectangle would leave the
+            // corners holding whatever the framebuffer last held.
+            for cut in covered_by(surface).iter().flatten() {
+                subtract_from(&mut exposed, cut);
+            }
         }
         for piece in exposed.iter().flatten() {
             fb.fill_rect(*piece, background);
@@ -273,7 +405,7 @@ pub fn compose_exposed<F: Framebuffer + ?Sized>(
 /// overlap.
 fn paint_surface<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, area: &Rect) {
     if let Some(shadow) = &surface.shadow {
-        draw_shadow(fb, surface.bounds(), shadow, area);
+        draw_shadow(fb, surface.bounds(), surface.radius(), shadow, area);
     }
     blit_clipped(fb, surface, area);
 }
@@ -308,6 +440,29 @@ const MAX_EXPOSED: usize = 16;
 /// the Part B author would be standing in this function. They were; it was.
 fn covers(surface: &SurfaceRef<'_>) -> bool {
     !surface.geometry.format.has_alpha() && surface.pixels.len() >= surface.geometry.byte_len()
+}
+
+/// The rectangles a [`covers`] surface paints every pixel of, opaquely: its bounds, or — rounded
+/// — its bounds less the four corner squares, as three bands.
+///
+/// **Three cuts rather than one, and any subset of them is safe.** [`subtract_from`] refuses a cut
+/// that does not fit and leaves the region as it was, so a crowded region may take the middle band
+/// and not the other two. That over-fills the strips above and below, which the surface then
+/// covers — the failure mode `subtract_from` is built to have.
+fn covered_by(surface: &SurfaceRef<'_>) -> [Option<Rect>; 3] {
+    let b = surface.bounds();
+    let r = surface.radius();
+    if r == 0 {
+        return [Some(b), None, None];
+    }
+    let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.w, b.size.h);
+    [
+        // The full-width middle, between the two rows of corners.
+        Some(Rect::new(x, y + r as i32, w, h - 2 * r)),
+        // Above and below it, between the corners.
+        Some(Rect::new(x + r as i32, y, w - 2 * r, r)),
+        Some(Rect::new(x + r as i32, y + (h - r) as i32, w - 2 * r, r)),
+    ]
 }
 
 /// Cut `cut` out of every rectangle in `region`, in place — **or leave `region` untouched**.
@@ -394,6 +549,61 @@ pub fn compose_full<F: Framebuffer + ?Sized>(
 /// and would silently swap channels the moment the two formats differ.
 fn blit_clipped<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, area: &Rect) {
     let Some(visible) = surface.bounds().intersect(area) else { return };
+    let r = surface.radius();
+    if r == 0 {
+        blit_span(fb, surface, visible);
+        return;
+    }
+    // **The masked blit** (desktop refresh, Part A). A rounded surface is three bands: the rows
+    // of its top corners, the rows between, and the rows of its bottom corners. The middle band
+    // is a plain rectangle and goes down the path it always did — the `memcpy`, for every real
+    // window. Each corner row is a shorter span between the two curves, down the same path, plus
+    // the few pixels *on* each curve, blended at their coverage. Pixels outside the curve are
+    // not touched, so what the surfaces below painted there is what shows.
+    let b = surface.bounds();
+    let (top, bottom) = (b.origin.y, b.bottom() as i32);
+    let middle = Rect::new(b.origin.x, top + r as i32, b.size.w, b.size.h - 2 * r);
+    if let Some(m) = middle.intersect(&visible) {
+        blit_span(fb, surface, m);
+    }
+    for y in (top..top + r as i32).chain(bottom - r as i32..bottom) {
+        if y < visible.origin.y || y >= visible.bottom() as i32 {
+            continue;
+        }
+        let dy = (y - top).min(bottom - 1 - y) as u32;
+        let shape = crate::corner::row(r, dy);
+        let inset = shape.clear + shape.partial;
+        let span = Rect::new(b.origin.x + inset as i32, y, b.size.w - 2 * inset, 1);
+        if let Some(s) = span.intersect(&visible) {
+            blit_span(fb, surface, s);
+        }
+        for i in shape.clear..inset {
+            let a = crate::corner::coverage(r, i, dy);
+            for x in [b.origin.x + i as i32, b.right() as i32 - 1 - i as i32] {
+                if visible.contains(x, y) {
+                    blend_one(fb, surface, x, y, a);
+                }
+            }
+        }
+    }
+}
+
+/// One pixel of `surface` at screen `(x, y)`, blended at `coverage` — the edge of a rounded
+/// corner. A surface with its own alpha has the two multiplied, so a translucent window's curve
+/// is as translucent as the rest of it.
+fn blend_one<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, x: i32, y: i32, coverage: u8) {
+    let src = surface.geometry;
+    let (sx, sy) = ((x - surface.origin.x) as u32, (y - surface.origin.y) as u32);
+    let Some(off) = src.offset_of(sx, sy) else { return };
+    let Some(bytes) = surface.pixels.get(off..off + 4) else { return };
+    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let alpha = src.format.alpha_of(word) as u32;
+    let a = ((alpha * coverage as u32 + 127) / 255) as u8;
+    fb.blend_pixel(x as u32, y as u32, src.format.decode(word), a);
+}
+
+/// Draw the whole of `visible` from `surface` by whichever path its format takes.
+fn blit_span<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
     let src = surface.geometry;
 
     // **The formats match on every real path, and then a row is a `memcpy`.** A client's surface
@@ -579,7 +789,12 @@ mod tests {
 
     /// The shadow the tests below cast: reaching 6px, dropped 2px, black.
     fn shade() -> Shadow {
-        Shadow { radius: 6, offset: Point::new(0, 2), colour: Rgb::new(0, 0, 0), strength: 160 }
+        Shadow::single(ShadowLayer {
+            radius: 6,
+            offset: Point::new(0, 2),
+            colour: Rgb::new(0, 0, 0),
+            strength: 160,
+        })
     }
 
     #[test]
@@ -616,7 +831,12 @@ mod tests {
         // 94% / 75% / 44% at these three points; this one gives 56% / 25% / 6%.
         let g = screen_geom();
         let bg = Rgb::new(255, 255, 255);
-        let sh = Shadow { radius: 16, offset: Point::new(0, 0), colour: Rgb::new(0, 0, 0), strength: 200 };
+        let sh = Shadow::single(ShadowLayer {
+            radius: 16,
+            offset: Point::new(0, 0),
+            colour: Rgb::new(0, 0, 0),
+            strength: 200,
+        });
         let (sg, px, o) = surface(24, 8, 8, 8, Rgb::new(200, 30, 30));
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(sh)], &[g.bounds()]);
@@ -727,7 +947,12 @@ mod tests {
         // unrepainted after a move. Not reachable with the shipped constants — which is exactly
         // why it needs a test rather than a person (PR #276 review, optional 9).
         let bounds = Rect::new(40, 30, 20, 16);
-        let far = Shadow { radius: 4, offset: Point::new(0, 30), colour: Rgb::new(0, 0, 0), strength: 80 };
+        let far = Shadow::single(ShadowLayer {
+            radius: 4,
+            offset: Point::new(0, 30),
+            colour: Rgb::new(0, 0, 0),
+            strength: 80,
+        });
         let r = far.around(bounds);
         assert!(
             r.origin.x <= bounds.origin.x
@@ -1124,6 +1349,272 @@ mod tests {
             compose_exposed(&mut b, bg, &surfaces, &damage);
             assert_eq!(a.bytes(), b.bytes(), "arrangement {origin_a:?}/{origin_b:?} {damage:?}");
         }
+    }
+
+    #[test]
+    fn a_two_layer_shadow_is_its_layers_drawn_wide_first() {
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let bounds = Rect::new(20, 12, 20, 14);
+        let wide = ShadowLayer { radius: 12, offset: Point::new(0, 5), colour: Rgb::BLACK, strength: 60 };
+        // Coloured, so the order of the two blends is visible where they overlap: two black
+        // layers commute to within a rounding, and a test built on them could not tell.
+        let contact = ShadowLayer { radius: 3, offset: Point::new(0, 1), colour: Rgb::new(200, 0, 0), strength: 120 };
+        let draw = |layers: &[ShadowLayer]| {
+            let mut fb = crate::framebuffer::MemFramebuffer::filled(g, bg);
+            for l in layers {
+                draw_shadow(&mut fb, bounds, 0, &Shadow::single(*l), &g.bounds());
+            }
+            fb
+        };
+        let mut both = crate::framebuffer::MemFramebuffer::filled(g, bg);
+        draw_shadow(&mut both, bounds, 0, &Shadow { layers: [wide, contact] }, &g.bounds());
+        assert_eq!(both, draw(&[wide, contact]), "the pair is its layers, wide first");
+        assert_ne!(both, draw(&[contact, wide]), "and the order is observable");
+
+        // Its reach is the union: the wide layer's here, which contains the contact layer's.
+        let sh = Shadow { layers: [wide, contact] };
+        assert_eq!(sh.around(bounds), wide.around(bounds));
+        // And a layer with nothing to draw neither draws nor widens the damage.
+        assert_eq!(Shadow::single(wide).around(bounds), wide.around(bounds));
+        assert_eq!(ShadowLayer::NONE.around(bounds), bounds);
+    }
+
+    // ---- rounded corners (desktop refresh, Part A) ----
+
+    /// A screen whose every pixel differs from its neighbours, so a corner that wrote the wrong
+    /// thing — the background colour, or a neighbour's pixel — cannot match by accident.
+    fn patterned_ground() -> crate::framebuffer::MemFramebuffer {
+        let (pg, ground) = patterned(64, 48, 64 * 4, 0x33);
+        let mut fb = crate::framebuffer::MemFramebuffer::new(pg);
+        fb.bytes_mut().copy_from_slice(&ground);
+        fb
+    }
+
+    /// What a rounded surface should put at every pixel of its bounds, computed the slow and
+    /// obvious way: the surface's own colour blended over `under` at the curve's coverage.
+    fn rounded_expectation(
+        under: &crate::framebuffer::MemFramebuffer,
+        surface: &SurfaceRef<'_>,
+    ) -> crate::framebuffer::MemFramebuffer {
+        let mut want = under.clone();
+        let b = surface.bounds();
+        let r = surface.radius();
+        for y in b.origin.y.max(0)..(b.bottom() as i32).min(under.geometry().height as i32) {
+            for x in b.origin.x.max(0)..(b.right() as i32).min(under.geometry().width as i32) {
+                let (sx, sy) = ((x - b.origin.x) as u32, (y - b.origin.y) as u32);
+                let off = surface.geometry.offset_of(sx, sy).unwrap();
+                let word = u32::from_le_bytes(surface.pixels[off..off + 4].try_into().unwrap());
+                let colour = surface.geometry.format.decode(word);
+                let alpha = surface.geometry.format.alpha_of(word) as u32;
+                let a = (alpha * covered(b, r, x, y) as u32 + 127) / 255;
+                want.blend_pixel(x as u32, y as u32, colour, a as u8);
+            }
+        }
+        want
+    }
+
+    #[test]
+    fn a_rounded_surface_blends_its_curve_and_leaves_the_outside_to_what_is_below() {
+        // Over a patterned ground rather than a flat one: a corner that copied the background
+        // colour instead of leaving the pixel alone would pass against a flat ground.
+        let g = screen_geom();
+        let under = patterned_ground();
+        let (sg, spx) = patterned(30, 20, 30 * 4 + 8, 0x90);
+        let surface = SurfaceRef::new(sg, Point::new(9, 7), &spx).with_corner(8);
+
+        let mut got = under.clone();
+        blit_clipped(&mut got, &surface, &g.bounds());
+        assert_eq!(got, rounded_expectation(&under, &surface));
+        // And the corners really were left: the very corner pixel is the ground's.
+        assert_eq!(got.get_pixel(9, 7), under.get_pixel(9, 7));
+        assert_ne!(got.get_pixel(9, 15), under.get_pixel(9, 15), "the straight edge was drawn");
+    }
+
+    #[test]
+    fn every_blit_path_rounds_the_same_curve() {
+        // The mask sits in front of three paths — the row copy, the per-pixel translation for a
+        // surface in another channel order, and the blend for one with alpha. Each must cut the
+        // same corner; the expectation is computed per pixel from the curve, not from any path.
+        let g = screen_geom();
+        let under = patterned_ground();
+        let (sg, spx) = patterned(24, 18, 24 * 4, 0x90);
+        let bgr = PixelFormat {
+            red: crate::format::Channel::new(0, 8),
+            blue: crate::format::Channel::new(16, 8),
+            ..PixelFormat::XRGB8888
+        };
+        let mut translucent = spx.clone();
+        for (i, p) in translucent.chunks_exact_mut(4).enumerate() {
+            p[3] = [255u8, 200, 90, 0][i % 4];
+        }
+        let cases: [(&str, Geometry, &[u8]); 3] = [
+            ("row copy", sg, &spx),
+            ("per pixel", Geometry { format: bgr, ..sg }, &spx),
+            ("blended", Geometry { format: PixelFormat::ARGB8888, ..sg }, &translucent),
+        ];
+        for (name, geometry, pixels) in cases {
+            for (origin, damage) in [
+                (Point::new(20, 15), g.bounds()),
+                (Point::new(-5, -3), g.bounds()),
+                (Point::new(50, 38), g.bounds()),
+                // A damage rectangle that cuts a corner in half.
+                (Point::new(20, 15), Rect::new(24, 18, 5, 40)),
+            ] {
+                let surface = SurfaceRef::new(geometry, origin, pixels).with_corner(6);
+                let mut got = under.clone();
+                blit_clipped(&mut got, &surface, &damage);
+                let mut want = rounded_expectation(&under, &surface);
+                // Outside the damage the expectation must be the ground again.
+                for y in 0..48 {
+                    for x in 0..64 {
+                        if !damage.contains(x, y) {
+                            let u = under.get_pixel(x as u32, y as u32).unwrap();
+                            want.put_pixel(x as u32, y as u32, u);
+                        }
+                    }
+                }
+                assert_eq!(got, want, "{name} at {origin:?} through {damage:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_exposed_draws_the_same_picture_as_compose_with_rounded_corners() {
+        // **The test the mask most needs.** A rounded window still covers most of its rectangle,
+        // so `compose_exposed` still skips most of the fill under it — but not the corners, where
+        // the blit writes nothing or blends. Cut the whole rectangle and the corners keep
+        // whatever the framebuffer last held, which the stale colour here makes visible.
+        let g = screen_geom();
+        let bg = Rgb::new(0x2A, 0x55, 0x70);
+        let stale = Rgb::new(240, 0, 240);
+        let (sg, spx) = patterned(20, 16, 20 * 4, 0x60);
+        let (tg, tpx) = patterned(24, 24, 24 * 4, 0xC0);
+        for (a_at, b_at, damage) in [
+            (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(4, 4, 20, 16)]),
+            (Point::new(9, 4), Point::new(40, 40), alloc::vec![
+                Rect::new(8, 4, 20, 16),
+                Rect::new(9, 4, 20, 16),
+            ]),
+            // Overlapping, so one window's corner shows the other rather than the background.
+            (Point::new(4, 4), Point::new(14, 10), alloc::vec![Rect::new(0, 0, 40, 40)]),
+            (Point::new(-6, -4), Point::new(56, 40), alloc::vec![Rect::new(0, 0, 64, 48)]),
+        ] {
+            for shadow in [None, Some(shade())] {
+                let mut surfaces = [
+                    SurfaceRef::new(sg, a_at, &spx).with_corner(6),
+                    SurfaceRef::new(tg, b_at, &tpx).with_corner(6),
+                ];
+                if let Some(sh) = shadow {
+                    surfaces = surfaces.map(|s| s.with_shadow(sh));
+                }
+                let mut plain = crate::framebuffer::MemFramebuffer::new(g);
+                plain.clear(stale);
+                compose(&mut plain, bg, &surfaces, &damage);
+                let mut exposed = crate::framebuffer::MemFramebuffer::new(g);
+                exposed.clear(stale);
+                compose_exposed(&mut exposed, bg, &surfaces, &damage);
+                assert_eq!(plain, exposed, "{a_at:?}/{b_at:?} {damage:?}, shadow {shadow:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rounded_window_over_another_shows_that_window_in_its_corner() {
+        // The claim the plan rests on: "a skipped pixel keeps whatever lower surface already
+        // painted there — the desktop where nothing is behind, the window below where something
+        // is". Checked as pixels rather than as an equivalence, so it cannot pass by both sides
+        // being wrong the same way.
+        let g = screen_geom();
+        let bg = Rgb::new(0x2A, 0x55, 0x70);
+        let below = Rgb::new(30, 200, 30);
+        let above = Rgb::new(200, 30, 30);
+        let (lg, lpx, _) = surface(0, 0, 40, 30, below);
+        let (ug, upx, _) = surface(0, 0, 20, 16, above);
+        let surfaces = [
+            SurfaceRef::new(lg, Point::new(0, 0), &lpx).with_corner(8),
+            SurfaceRef::new(ug, Point::new(10, 10), &upx).with_corner(8),
+        ];
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose_exposed(&mut fb, bg, &surfaces, &[g.bounds()]);
+        assert_eq!(fb.get_pixel(10, 10), Some(below), "the upper window's corner shows the lower");
+        assert_eq!(fb.get_pixel(0, 0), Some(bg), "the lower window's corner shows the desktop");
+        assert_eq!(fb.get_pixel(20, 18), Some(above));
+    }
+
+    #[test]
+    fn a_rounded_surface_repainted_in_pieces_is_the_same_picture() {
+        // The curve belongs to the surface: damage that cuts across a corner must not round the
+        // cut. Many small rectangles against one big one.
+        let g = screen_geom();
+        let bg = Rgb::new(0x2A, 0x55, 0x70);
+        let (sg, spx) = patterned(30, 22, 30 * 4, 0x60);
+        let surfaces = [SurfaceRef::new(sg, Point::new(7, 5), &spx).with_corner(8).with_shadow(shade())];
+        let mut whole = crate::framebuffer::MemFramebuffer::new(g);
+        compose_exposed(&mut whole, bg, &surfaces, &[g.bounds()]);
+        let mut pieces = crate::framebuffer::MemFramebuffer::new(g);
+        let mut damage = alloc::vec::Vec::new();
+        for y in (0..48).step_by(5) {
+            for x in (0..64).step_by(3) {
+                damage.push(Rect::new(x, y, 3, 5));
+            }
+        }
+        compose_exposed(&mut pieces, bg, &surfaces, &damage);
+        assert_eq!(pieces, whole);
+    }
+
+    #[test]
+    fn a_rounded_surface_casts_a_rounded_shadow_into_its_own_corners() {
+        // Outside the curve the blit writes nothing, so the shadow is all that pixel gets — and a
+        // shadow that skipped the whole of `bounds`, as the square one did, would leave a notch
+        // of bare ground at every corner of every window.
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let (sg, spx, o) = surface(20, 16, 20, 14, Rgb::new(200, 30, 30));
+        let sh = Shadow::single(ShadowLayer {
+            radius: 6,
+            offset: Point::new(0, 0),
+            colour: Rgb::new(0, 0, 0),
+            strength: 160,
+        });
+        let surfaces = [SurfaceRef::new(sg, o, &spx).with_corner(6).with_shadow(sh)];
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &surfaces, &[g.bounds()]);
+        let corner = fb.get_pixel(20, 16).unwrap();
+        assert!(corner.r < bg.r, "the very corner is shadowed, not bare ground: {corner:?}");
+
+        // And the shadow's own corner follows the window's. **Compared against the square
+        // shadow, not against the rounded one's own edge**: the first version of this test said
+        // "a pixel off the corner is lighter than one off an edge", which a square shadow also
+        // satisfies — distance to a rectangle is already Euclidean round its corners — and a
+        // control that squared the distance left it passing. Beside a straight edge the two
+        // shapes are the same distance away; off the corner the rounded one is further.
+        let draw = |corner: u32| {
+            let mut fb = crate::framebuffer::MemFramebuffer::filled(g, bg);
+            draw_shadow(&mut fb, Rect::new(20, 16, 20, 14), corner, &sh, &g.bounds());
+            fb
+        };
+        let (round, square) = (draw(6), draw(0));
+        assert_eq!(round.get_pixel(30, 13), square.get_pixel(30, 13), "beside the top edge");
+        let (r, q) = (round.get_pixel(17, 13).unwrap(), square.get_pixel(17, 13).unwrap());
+        assert!(r.r > q.r, "off the corner, rounded {r:?} is not lighter than square {q:?}");
+    }
+
+    #[test]
+    fn a_square_surface_draws_what_it_drew_before_corners_existed() {
+        // `corner: 0` is every existing caller, and every gate's expected picture. The masked path
+        // must not be taken, and the shadow must be the square one — checked against a surface
+        // built without ever mentioning corners.
+        let g = screen_geom();
+        let bg = Rgb::new(0x2A, 0x55, 0x70);
+        let (sg, spx) = patterned(20, 16, 20 * 4, 0x60);
+        let plain = [SurfaceRef::new(sg, Point::new(9, 7), &spx).with_shadow(shade())];
+        let zero = [plain[0].with_corner(0)];
+        let (mut a, mut b) = (crate::framebuffer::MemFramebuffer::new(g), crate::framebuffer::MemFramebuffer::new(g));
+        compose(&mut a, bg, &plain, &[g.bounds()]);
+        compose(&mut b, bg, &zero, &[g.bounds()]);
+        assert_eq!(a, b);
+        assert_eq!(covered_by(&plain[0]), [Some(plain[0].bounds()), None, None]);
     }
 
     /// And it is less work — which is the whole point, and would otherwise be a refactor.
