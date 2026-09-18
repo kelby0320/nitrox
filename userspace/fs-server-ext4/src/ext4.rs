@@ -122,6 +122,52 @@ struct Superblock {
     blocks_per_group: u32,
     /// The first data block (`1` for 1 KiB blocks, else `0`) — block numbering origin.
     first_data_block: u32,
+    /// Blocks in the filesystem (`s_blocks_count_lo`; the `_hi` half needs `64bit`, which
+    /// [`parse_superblock`] refuses). **The ceiling the allocator must not cross**: the last
+    /// group's bitmap has `blocks_per_group` bits whatever the group's real length, so a
+    /// filesystem whose size is not a whole number of groups has bits that address nothing.
+    blocks_count: u64,
+    /// Inodes in the filesystem (`s_inodes_count`), bounding the last group the same way.
+    inodes_count: u32,
+}
+
+impl Superblock {
+    /// How many block groups the filesystem has.
+    fn group_count(&self) -> u32 {
+        let data = self.blocks_count.saturating_sub(self.first_data_block as u64);
+        data.div_ceil(self.blocks_per_group as u64).max(1) as u32
+    }
+
+    /// The first block of `group`.
+    fn group_start(&self, group: u32) -> u64 {
+        self.first_data_block as u64 + group as u64 * self.blocks_per_group as u64
+    }
+
+    /// How many blocks `group` actually has — `blocks_per_group`, except for a final group
+    /// that the filesystem's size cuts short.
+    ///
+    /// **Not the bitmap's width.** `mke2fs` does mark the padding bits in use, so trusting
+    /// the bitmap alone would work today; this is the difference between depending on that
+    /// and not needing to. A bit set past the end of the filesystem is a block number no
+    /// reader can fetch, written into an extent that `e2fsck` then calls corrupt.
+    fn blocks_in_group(&self, group: u32) -> usize {
+        let start = self.group_start(group);
+        self.blocks_count.saturating_sub(start).min(self.blocks_per_group as u64) as usize
+    }
+
+    /// How many inodes `group` actually has, bounded the same way.
+    fn inodes_in_group(&self, group: u32) -> usize {
+        let first = group as u64 * self.inodes_per_group as u64;
+        (self.inodes_count as u64)
+            .saturating_sub(first)
+            .min(self.inodes_per_group as u64) as usize
+    }
+
+    /// Byte offset of `group`'s descriptor. The table is contiguous from
+    /// [`first_gdt_block`](Self::first_gdt_block), so this spans blocks without help.
+    fn group_desc_offset(&self, group: u32) -> u64 {
+        self.first_gdt_block * self.block_size as u64 + group as u64 * self.desc_size as u64
+    }
 }
 
 /// Why a device cannot be served, named specifically enough for a supervisor to print.
@@ -243,7 +289,18 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
         first_gdt_block: if block_size == 1024 { 2 } else { 1 },
         blocks_per_group,
         first_data_block,
+        blocks_count: rd_u32(sb, 4) as u64,
+        inodes_count: rd_u32(sb, 0),
     })
+}
+
+/// The filesystem's block size, for a caller that has to place file data itself.
+///
+/// The Model A data path never needs this — the kernel scales a `BlockRun` by the size it was
+/// told — but a program writing a filesystem's *contents* directly does: `nxinstall` maps a
+/// file it just grew and writes the bytes into those blocks.
+pub fn block_size<R: BlockReader>(r: &R) -> Result<u32, FsError> {
+    Ok(read_superblock(r)?.block_size)
 }
 
 fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
@@ -817,51 +874,82 @@ fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64,
     Ok(inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64)
 }
 
-/// Allocate one free filesystem block, preferring `goal` (for contiguity). Reads the goal
-/// block's group bitmap, sets a free bit (goal if free, else the first free bit in that
-/// group), and updates the group-descriptor + superblock free-block counts. Returns the
-/// allocated block number. `TooLarge` if the group is full (cross-group allocation is a
-/// later refinement). `metadata_csum` is off (fixtures), so no bitmap/desc checksums.
+/// Allocate one free filesystem block, preferring `goal` for contiguity.
+///
+/// Tries `goal`'s own group first — the goal bit itself, then any free bit in that group —
+/// and then **every other group in turn**, wrapping round. Sets the bitmap bit and decrements
+/// the group-descriptor and superblock free-block counts. `TooLarge` only when the whole
+/// filesystem is full.
+///
+/// **Cross-group since Phase 5 Part H.2**, and the reason is the installer: `nxinstall` makes a
+/// filesystem the size of the disk, and confined to group 0 that filesystem held about 112 MiB
+/// of a terabyte while reporting the whole disk free. The failure is a `TooLarge` with hundreds
+/// of gigabytes available — which reads as a bug in the caller, three steps from the cause.
+///
+/// A group whose descriptor says zero free blocks is skipped without reading its bitmap: this
+/// writer maintains that count and `mke2fs` sets it, and the alternative is reading every
+/// bitmap of every group on a full filesystem — 7,600 of them on a terabyte.
+///
+/// `metadata_csum` is off (the fixtures and our images are built `^metadata_csum`), so there
+/// are no bitmap or descriptor checksums to maintain, and no group is `BLOCK_UNINIT`.
 fn alloc_block<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     goal: u64,
 ) -> Result<u64, FsError> {
     let bs = sb.block_size as usize;
-    let group = ((goal - sb.first_data_block as u64) / sb.blocks_per_group as u64) as u32;
-    let group_start = sb.first_data_block as u64 + group as u64 * sb.blocks_per_group as u64;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let groups = sb.group_count();
+    let first = goal
+        .checked_sub(sb.first_data_block as u64)
+        .map(|b| (b / sb.blocks_per_group as u64) as u32)
+        .filter(|g| *g < groups)
+        .unwrap_or(0);
+
     let mut gd = [0u8; 64];
     let dsz = (sb.desc_size as usize).min(64);
-    rw.read_at(gd_off, &mut gd[..dsz])?;
-    let bitmap_block = rd_u32(&gd, 0) as u64; // bg_block_bitmap_lo
-
     let mut bitmap = [0u8; MAX_BLOCK];
-    rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    for n in 0..groups {
+        let group = (first + n) % groups;
+        let gd_off = sb.group_desc_offset(group);
+        rw.read_at(gd_off, &mut gd[..dsz])?;
+        // bg_free_blocks_count_lo @12. Zero means skip — see the doc comment.
+        if rd_u16(&gd, 12) == 0 {
+            continue;
+        }
+        let capacity = sb.blocks_in_group(group);
+        let bitmap_block = rd_u32(&gd, 0) as u64; // bg_block_bitmap_lo
+        rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
 
-    let goal_idx = (goal - group_start) as usize;
-    let idx = if goal_idx < sb.blocks_per_group as usize && bit_clear(&bitmap, goal_idx) {
-        goal_idx
-    } else {
-        (0..sb.blocks_per_group as usize)
-            .find(|&i| bit_clear(&bitmap, i))
-            .ok_or(FsError::TooLarge)?
-    };
-    bit_set(&mut bitmap, idx);
-    rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+        let group_start = sb.group_start(group);
+        // The goal bit is only a preference, and only in the group it belongs to.
+        let goal_idx = goal.checked_sub(group_start).unwrap_or(u64::MAX) as usize;
+        let idx = if n == 0 && goal_idx < capacity && bit_clear(&bitmap, goal_idx) {
+            goal_idx
+        } else {
+            match (0..capacity).find(|&i| bit_clear(&bitmap, i)) {
+                Some(i) => i,
+                // The descriptor's count disagreed with its bitmap. Not fatal, and not this
+                // function's to repair: move on rather than fail with space elsewhere.
+                None => continue,
+            }
+        };
+        bit_set(&mut bitmap, idx);
+        rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
-    // Decrement free-block counts: group descriptor (bg_free_blocks_count_lo @12, u16) and
-    // superblock (s_free_blocks_count_lo @12, u32).
-    let gfree = rd_u16(&gd, 12).wrapping_sub(1);
-    gd[12..14].copy_from_slice(&gfree.to_le_bytes());
-    rw.write_at(gd_off, &gd[..dsz])?;
-    let mut sbbuf = [0u8; 1024];
-    rw.read_at(1024, &mut sbbuf)?;
-    let sfree = rd_u32(&sbbuf, 12).wrapping_sub(1);
-    sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
-    rw.write_at(1024, &sbbuf)?;
+        // Decrement free-block counts: group descriptor (bg_free_blocks_count_lo @12, u16)
+        // and superblock (s_free_blocks_count_lo @12, u32).
+        let gfree = rd_u16(&gd, 12).wrapping_sub(1);
+        gd[12..14].copy_from_slice(&gfree.to_le_bytes());
+        rw.write_at(gd_off, &gd[..dsz])?;
+        let mut sbbuf = [0u8; 1024];
+        rw.read_at(1024, &mut sbbuf)?;
+        let sfree = rd_u32(&sbbuf, 12).wrapping_sub(1);
+        sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
+        rw.write_at(1024, &sbbuf)?;
 
-    Ok(group_start + idx as u64)
+        return Ok(group_start + idx as u64);
+    }
+    Err(FsError::TooLarge)
 }
 
 /// Grow the regular file at `path` to `new_size` bytes by allocating blocks and extending
@@ -919,38 +1007,57 @@ fn round4(n: usize) -> usize {
     (n + 3) & !3
 }
 
-/// Allocate one free inode from **group 0** (small fixtures keep everything there;
-/// cross-group is deferred, as with [`alloc_block`]). Sets the inode-bitmap bit and
-/// decrements the group-descriptor + superblock free-inode counts. Returns the inode
-/// number. `TooLarge` if group 0's inodes are exhausted.
+/// Allocate one free inode, taking the **first group that has one**.
+///
+/// Sets the inode-bitmap bit and decrements the group-descriptor and superblock free-inode
+/// counts. `TooLarge` only when every group is exhausted.
+///
+/// **Cross-group since Phase 5 Part H.2**, for [`alloc_block`]'s reason: group 0 holds
+/// `s_inodes_per_group` of them — 2,048 on a small fixture, 8,192 on a large filesystem — and
+/// a root that could hold no more files than that is not a root.
+///
+/// **Locality is not attempted.** Real ext4 places a new inode near its parent directory (the
+/// Orlov allocator) so that a directory's children share a group with it and with their data.
+/// This takes the lowest free inode instead, which keeps inodes packed at the front while
+/// their data blocks follow the write goal into later groups — correct, and worse for a
+/// spinning disk's seek pattern. The trigger for doing better is a measurement, and nothing
+/// has one yet.
 fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Result<u32, FsError> {
     let bs = sb.block_size as usize;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64; // group 0 descriptor
     let mut gd = [0u8; 64];
     let dsz = (sb.desc_size as usize).min(64);
-    rw.read_at(gd_off, &mut gd[..dsz])?;
-    let ibitmap_block = rd_u32(&gd, 4) as u64; // bg_inode_bitmap_lo
-
     let mut bitmap = [0u8; MAX_BLOCK];
-    rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
-    let idx = (0..sb.inodes_per_group as usize)
-        .find(|&i| bit_clear(&bitmap, i))
-        .ok_or(FsError::TooLarge)?;
-    bit_set(&mut bitmap, idx);
-    rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+    for group in 0..sb.group_count() {
+        let gd_off = sb.group_desc_offset(group);
+        rw.read_at(gd_off, &mut gd[..dsz])?;
+        // bg_free_inodes_count_lo @14. Zero means skip without reading the bitmap.
+        if rd_u16(&gd, 14) == 0 {
+            continue;
+        }
+        let capacity = sb.inodes_in_group(group);
+        let ibitmap_block = rd_u32(&gd, 4) as u64; // bg_inode_bitmap_lo
+        rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        let Some(idx) = (0..capacity).find(|&i| bit_clear(&bitmap, i)) else {
+            continue; // the count disagreed with the bitmap; try the next group
+        };
+        bit_set(&mut bitmap, idx);
+        rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
-    // Free-inode counts: group descriptor (bg_free_inodes_count_lo @14, u16) + superblock
-    // (s_free_inodes_count @16, u32).
-    let gfree = rd_u16(&gd, 14).wrapping_sub(1);
-    gd[14..16].copy_from_slice(&gfree.to_le_bytes());
-    rw.write_at(gd_off, &gd[..dsz])?;
-    let mut sbbuf = [0u8; 1024];
-    rw.read_at(1024, &mut sbbuf)?;
-    let sfree = rd_u32(&sbbuf, 16).wrapping_sub(1);
-    sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
-    rw.write_at(1024, &sbbuf)?;
+        // Free-inode counts: group descriptor (bg_free_inodes_count_lo @14, u16) + superblock
+        // (s_free_inodes_count @16, u32).
+        let gfree = rd_u16(&gd, 14).wrapping_sub(1);
+        gd[14..16].copy_from_slice(&gfree.to_le_bytes());
+        rw.write_at(gd_off, &gd[..dsz])?;
+        let mut sbbuf = [0u8; 1024];
+        rw.read_at(1024, &mut sbbuf)?;
+        let sfree = rd_u32(&sbbuf, 16).wrapping_sub(1);
+        sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
+        rw.write_at(1024, &sbbuf)?;
 
-    Ok(idx as u32 + 1) // inode numbers are 1-based; group 0
+        // Inode numbers are 1-based and run consecutively across groups.
+        return Ok(group * sb.inodes_per_group + idx as u32 + 1);
+    }
+    Err(FsError::TooLarge)
 }
 
 /// Insert a directory entry `(name → ino, file_type)` into directory `dir_inode` by
@@ -1888,6 +1995,70 @@ pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    /// The group geometry the allocators work from, and the **last group's short tail**.
+    ///
+    /// A bitmap always has `blocks_per_group` bits; a filesystem whose size is not a whole
+    /// number of groups therefore ends with bits that address blocks past the end of the
+    /// device. Setting one puts a block number into an extent that no reader can fetch and
+    /// `e2fsck` calls corrupt. `mke2fs` does mark those bits in use, so the bug needs the
+    /// bitmap to be wrong as well — which is exactly the kind of "two things must both fail"
+    /// reasoning that stops being true later.
+    #[test]
+    fn a_short_final_group_reports_only_the_blocks_it_has() {
+        use super::Superblock;
+        // The three-group 1 KiB fixture: 24,576 blocks, origin 1, so 24,575 addressable and
+        // the last group is one short of full.
+        let sb = Superblock {
+            block_size: 1024,
+            inodes_per_group: 2048,
+            inode_size: 256,
+            desc_size: 32,
+            first_gdt_block: 2,
+            blocks_per_group: 8192,
+            first_data_block: 1,
+            blocks_count: 24576,
+            inodes_count: 6144,
+        };
+        assert_eq!(sb.group_count(), 3);
+        assert_eq!(sb.blocks_in_group(0), 8192);
+        assert_eq!(sb.blocks_in_group(1), 8192);
+        assert_eq!(sb.blocks_in_group(2), 8191, "the tail group is short by one");
+        // The sum is every addressable block and not one more.
+        let total: usize = (0..3).map(|g| sb.blocks_in_group(g)).sum();
+        assert_eq!(total as u64, sb.blocks_count - sb.first_data_block as u64);
+        // Group starts run consecutively from the origin.
+        assert_eq!(sb.group_start(0), 1);
+        assert_eq!(sb.group_start(2), 16385);
+        // Inodes divide evenly here, and the clamp still holds when they would not.
+        assert_eq!(sb.inodes_in_group(2), 2048);
+        let odd = Superblock { inodes_count: 5000, ..sb };
+        assert_eq!(odd.inodes_in_group(2), 5000 - 2 * 2048);
+        assert_eq!(odd.inodes_in_group(9), 0, "a group past the end has nothing");
+    }
+
+    /// Descriptor offsets are a flat array from the table's first block, so the table
+    /// spanning more than one block needs no special case — but a filesystem with enough
+    /// groups for that is exactly what this part makes possible, so it is pinned.
+    #[test]
+    fn group_descriptors_are_a_flat_array_across_block_boundaries() {
+        use super::Superblock;
+        let sb = Superblock {
+            block_size: 1024,
+            inodes_per_group: 2048,
+            inode_size: 256,
+            desc_size: 32,
+            first_gdt_block: 2,
+            blocks_per_group: 8192,
+            first_data_block: 1,
+            blocks_count: 8 * 1024 * 1024,
+            inodes_count: 262_144,
+        };
+        assert_eq!(sb.group_desc_offset(0), 2048);
+        // 32 descriptors fill a 1 KiB block; the 33rd is the first byte of the next one.
+        assert_eq!(sb.group_desc_offset(31), 2048 + 31 * 32);
+        assert_eq!(sb.group_desc_offset(32), 2048 + 1024);
+    }
+
     /// `decode_time` must take the epoch-extension bits from the *matching* `extra`
     /// word. The fields are adjacent (`i_ctime_extra` at 132, `i_mtime_extra` at 136)
     /// and reading one for the other is invisible for any date before 2038 — which is

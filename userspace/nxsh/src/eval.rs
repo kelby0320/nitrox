@@ -4010,6 +4010,48 @@ x"), "5");
         assert_eq!(out.as_deref(), Some("n=12"));
     }
 
+    /// **A parenthesised expression is how you compute an external program's argument**, and
+    /// a bareword beside it stays literal.
+    ///
+    /// Both halves matter and they pull opposite ways. A bareword must not be evaluated —
+    /// `copy /home/a /home/b` names two paths, and `sort size` names a column — so argument
+    /// position lexes words, not expressions. That makes `copy src format("f-{}", i)` a parse
+    /// error and `copy src "f-" ++ i` three separate words, which is easy to mistake for "the
+    /// shell cannot compute an argument at all" (I did, 2026-09-17, and told the maintainer a
+    /// loop could not be written). Parentheses are the escape hatch, and nothing tested them
+    /// on an *external* call — the neighbouring test covers a call inside a **function**'s
+    /// argument list, which is a different grammar.
+    #[test]
+    fn a_parenthesised_argument_to_an_external_program_is_evaluated() {
+        let mut h = MockHost::new();
+        h.programs.push((String::from("copy"), 0, None));
+        let log = h.log();
+        let mut interp = Interp::with_host(Box::new(h), Mode::Script);
+        interp
+            .run_line(r#"for i in 1..4 { copy /src (format("/dst-{}.png", i)) }"#)
+            .expect("a loop with a computed destination should run");
+        let runs = log.borrow().runs.clone();
+        let argv: alloc::vec::Vec<alloc::vec::Vec<String>> =
+            runs.iter().map(|r| r[0].argv.clone()).collect();
+        assert_eq!(argv.len(), 3, "one spawn per iteration");
+        assert_eq!(argv[0], ["copy", "/src", "/dst-1.png"]);
+        assert_eq!(argv[2], ["copy", "/src", "/dst-3.png"]);
+
+        // And the bareword half: without the parentheses the words go through untouched,
+        // which is what makes paths and column names work.
+        let mut h = MockHost::new();
+        h.programs.push((String::from("copy"), 0, None));
+        let log = h.log();
+        let mut interp = Interp::with_host(Box::new(h), Mode::Script);
+        interp.run_line("let i = 7").unwrap();
+        interp.run_line("copy /src /dst-$i.png").unwrap();
+        assert_eq!(
+            log.borrow().runs[0][0].argv,
+            ["copy", "/src", "/dst-$i.png"],
+            "a bareword is literal — there is no interpolation (§8d)"
+        );
+    }
+
     /// Argument-position arithmetic means what it means everywhere else.
     ///
     /// The parser had a second copy of the binary tiers reachable only from an argument

@@ -79,6 +79,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-server-ext4"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "libcrypto"
 version = "0.1.0"
 
@@ -214,6 +222,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "fs-server-ext4",
  "libcrypto",
  "libdraw",
  "libterm",

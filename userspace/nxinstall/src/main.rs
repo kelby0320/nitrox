@@ -42,18 +42,24 @@
 
 extern crate alloc;
 
+mod copy;
+mod device;
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use fs_server_ext4::mkfs;
 use libgpt::table::{self, BACK_BYTES, BLOCK, FRONT_BYTES};
 use libkern::abi::{
     BlockDeviceInfo, BlockKind, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
 };
 use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
-    SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
-    SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4,
+    SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
+    SYS_MEMORY_CREATE,
+    SYS_CHANNEL_SEND, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
+    syscall2, syscall4, syscall6,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -83,6 +89,18 @@ const CHUNK: u64 = 256 * 1024;
 /// recognised among the RAM disks. It is deliberately not `nitrox-root`: the thing being copied
 /// is the live root, and what it becomes is named by the table this program writes.
 const LIVE_LABEL: &[u8] = b"nitrox-live";
+
+/// The block size of every filesystem this system makes or reads, and of the one it copies
+/// from. 4 KiB is the reader's scratch and the page size, so a file's blocks map to pages.
+const FS_BLOCK: u64 = 4096;
+
+/// Bytes of filesystem per inode — `mke2fs -i`'s default. `mkfs` caps the total, so this
+/// governs small filesystems and the cap governs large ones.
+const BYTES_PER_INODE: u32 = 16384;
+
+/// The scratch each filesystem window transfers through. Larger than the 64 KiB `copy_tree`
+/// hands over at once, so a file's data crosses in one transfer rather than two.
+const FS_SCRATCH: u64 = 128 * 1024;
 
 /// `sys_wait` scratch for a single pending operation.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
@@ -448,7 +466,11 @@ fn install(
 ) -> Result<(), String> {
     let block = target.info.logical_block_size as u64;
     let esp_bytes = srcs.esp.info.byte_capacity();
-    let root_bytes = srcs.root_extent.1 * BLOCK as u64;
+    // **Every timestamp in the new filesystem is the install's own.** These files are created
+    // now; carrying the source's times would date a fresh machine to whenever the image was
+    // built. A clock this system could not read leaves them at the epoch, which is wrong but
+    // not a reason to refuse to install.
+    let now = wall_clock_seconds();
 
     let (esp_guid, root_guid) = match (random_guid(), random_guid()) {
         (Some(a), Some(b)) => (a, b),
@@ -503,19 +525,117 @@ fn install(
         say,
     )?;
 
-    say(&format!("copying the root filesystem ({})", human(root_bytes)));
-    copy(
-        io,
-        srcs.root,
-        srcs.root_extent.0 * BLOCK as u64,
-        target,
+    // **A filesystem the size of the partition, then its contents** (Phase 5 Part H.2).
+    // H.1 copied the live root's sectors here, which put a 24 MiB filesystem on a partition
+    // the size of the disk: a filesystem records its own size, so it did not know about the
+    // space around it and nothing could grow it.
+    let root_bytes_dst = layout.root_blocks() * block;
+    say(&format!("making a filesystem of {}", human(root_bytes_dst)));
+    let (dst, _dst_scratch) = match partition_io(
+        target.handle,
         layout.root_first * BLOCK as u64,
-        root_bytes,
-        "root",
-        say,
-    )?;
-    log("wrote the partition table, the boot partition and the root filesystem");
+        root_bytes_dst,
+    ) {
+        Some(p) => p,
+        None => return Err(String::from("could not allocate a transfer buffer for the target")),
+    };
+    let uuid = random_guid().ok_or_else(|| {
+        String::from(
+            "the kernel would not give out random bytes, and a filesystem with an invented \
+             UUID collides with every other machine's. Nothing further was written.",
+        )
+    })?;
+    let geom = mkfs::format(
+        &dst,
+        &mkfs::Params {
+            blocks: root_bytes_dst / FS_BLOCK,
+            block_size: FS_BLOCK as u32,
+            bytes_per_inode: BYTES_PER_INODE,
+            uuid,
+            label: *b"nitrox-root\0\0\0\0\0",
+            now,
+        },
+        // **A line every so often, because this is the slow part.** Two bitmaps and an inode
+        // table per group is about 300 MiB of scattered writes on a terabyte, one command at a
+        // time — minutes, and a person watching a still screen cannot tell that from a hang.
+        // Every 256th group is roughly every few seconds.
+        &mut |done, total| {
+            if done == 1 || done == total || done % 256 == 0 {
+                say(&format!("  group {done} of {total}"));
+            }
+        },
+    )
+    .map_err(|e| format!("the filesystem would not lay out: {e:?}. The disk is partitioned \
+                          and its boot partition written; nothing readable is on the root."))?;
+    say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
+
+    // The source is the live root's own partition *inside* the RAM disk, read as the bytes on
+    // the device rather than through this session's view of them — see `copy`'s module doc.
+    let (src, _src_scratch) = match partition_io(
+        srcs.root.handle,
+        srcs.root_extent.0 * BLOCK as u64,
+        srcs.root_extent.1 * BLOCK as u64,
+    ) {
+        Some(p) => p,
+        None => return Err(String::from("could not allocate a transfer buffer for the source")),
+    };
+    say("copying the root filesystem");
+    let copied = copy::copy_tree(&src, &dst, now, say)
+        .map_err(|e| format!("copying the root filesystem failed: {e:?}"))?;
+    say(&format!(
+        "  {} director(ies), {} file(s), {}",
+        copied.dirs,
+        copied.files,
+        human(copied.bytes)
+    ));
+
+    log(&format!(
+        "wrote the partition table, the boot partition, and a {} root holding {} file(s)",
+        human(root_bytes_dst),
+        copied.files
+    ));
     Ok(())
+}
+
+/// Seconds since the epoch, or `0` if the clock cannot be read.
+fn wall_clock_seconds() -> i64 {
+    let mut nanos: u64 = 0;
+    // SAFETY: a valid writable `u64` out-param.
+    let r = unsafe {
+        syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64)
+    };
+    if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
+}
+
+/// A [`PartitionIo`] over `[base, base + len)` of `device`, with a scratch object of its own.
+///
+/// The scratch handle comes back beside it because closing it would unmap the buffer every
+/// transfer goes through; the caller holds it for as long as the window is used.
+fn partition_io(device: u64, base: u64, len: u64) -> Option<(device::PartitionIo, Scratch)> {
+    let (mem, addr) = scratch(FS_SCRATCH)?;
+    // SAFETY: `scratch` just created `mem` and mapped it read-write at `addr` for exactly
+    // `FS_SCRATCH` bytes, which is a multiple of a sector; the `Scratch` returned beside the
+    // window keeps both alive until the caller drops it.
+    let io = unsafe {
+        device::PartitionIo::new(device, base, len, mem, addr, FS_SCRATCH as usize)
+    };
+    Some((io, Scratch { mem, addr }))
+}
+
+/// A mapped scratch object, unmapped and closed when it goes out of scope.
+struct Scratch {
+    mem: u64,
+    addr: u64,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // SAFETY: our own mapping and handle, made by `scratch`.
+        unsafe {
+            syscall4(SYS_MEMORY_UNMAP, self.addr, FS_SCRATCH, 0, 0);
+            syscall1(SYS_HANDLE_CLOSE, self.mem);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -786,13 +906,90 @@ pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0:
         // Spawned without a shell: no `argv`, so the only thing it can do is list.
         None => (Vec::new(), None, None),
     };
+    // SAFETY: single-threaded, before anything can panic.
+    unsafe { PANIC_SINK = stderr.unwrap_or(0) };
     exit(run(namespace, &argv, stdout, stderr).status());
 }
 
-/// Nothing here is recoverable; say where it happened and stop.
+/// The `stderr` sink, kept for the panic handler.
+///
+/// **Because a panic here reached nobody.** The handler printed through `kprint`, which is
+/// `SYS_DEBUG_KPRINT` and so reaches COM1 and nothing else: on the machine this program is for
+/// there is no COM1, so an out-of-bounds index in `mkfs` showed up as `nxsh: pipeline failed:
+/// 'nxinstall' exited 1` under a screen of progress lines and nothing else at all (the second
+/// laptop install, 2026-09-17). A program whose every other word goes to the terminal has to
+/// say *this* there too — it is the one message where the alternative is a person guessing.
+static mut PANIC_SINK: u64 = 0;
+
+/// A panic message, built without allocating: the heap is the last thing to trust here.
+static mut PANIC_MSG: [u8; 4096] = [0; 4096];
+
+/// Nothing here is recoverable; say where it happened, on the terminal, and stop.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxinstall: panic\n");
-    let _ = info;
+    // SAFETY: single-threaded, and nothing runs after this.
+    unsafe {
+        let buf = &mut *(&raw mut PANIC_MSG);
+        let mut n = 0usize;
+        let mut put = |bytes: &[u8], n: &mut usize| {
+            let take = bytes.len().min(buf.len().saturating_sub(*n + 1));
+            buf[*n..*n + take].copy_from_slice(&bytes[..take]);
+            *n += take;
+        };
+        put(b"nxinstall: stopped by an internal error", &mut n);
+        if let Some(loc) = info.location() {
+            put(b" at ", &mut n);
+            put(loc.file().as_bytes(), &mut n);
+            put(b":", &mut n);
+            // The line number, without `format!`.
+            let mut line = loc.line();
+            let mut digits = [0u8; 10];
+            let mut d = digits.len();
+            loop {
+                d -= 1;
+                digits[d] = b'0' + (line % 10) as u8;
+                line /= 10;
+                if line == 0 || d == 0 {
+                    break;
+                }
+            }
+            put(&digits[d..], &mut n);
+        }
+        put(b". Nothing further was written.\n", &mut n);
+        kprint(&buf[..n]);
+        let sink = (&raw const PANIC_SINK).read();
+        if sink != 0 {
+            raw_send(sink, &buf[..n]);
+        }
+    }
     exit(EXIT_FAILURE);
 }
+
+/// Send one message on a channel without allocating — what the panic handler needs, where
+/// `IpcPort` would box a 4 KiB buffer.
+fn raw_send(channel: u64, payload: &[u8]) {
+    const OFF_PAYLOAD_LEN: usize = 4;
+    const OFF_PAYLOAD: usize = 24;
+    // SAFETY: single-threaded; this static is used by nothing else.
+    unsafe {
+        let msg = &mut *(&raw mut RAW_MSG);
+        let n = payload.len().min(msg.len() - OFF_PAYLOAD);
+        msg[..OFF_PAYLOAD].fill(0);
+        msg[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        msg[OFF_PAYLOAD..OFF_PAYLOAD + n].copy_from_slice(&payload[..n]);
+        let no_handles = [0u64; 1];
+        // Non-blocking: a full channel is not worth hanging a dying process over.
+        syscall6(
+            SYS_CHANNEL_SEND,
+            channel,
+            msg.as_ptr() as u64,
+            no_handles.as_ptr() as u64,
+            0,
+            libkern::abi::SENDMODE_NOBLOCK,
+            0,
+        );
+    }
+}
+
+/// The panic handler's outgoing message.
+static mut RAW_MSG: [u8; 4096] = [0; 4096];

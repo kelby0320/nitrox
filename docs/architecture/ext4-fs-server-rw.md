@@ -2,7 +2,8 @@
 
 **Status:** Implemented — `userspace/fs-server-ext4`, read **and** write, with host tests
 that build an image with `mke2fs` and require `e2fsck -fn` to find it clean. Individual
-deferrals are marked inline. Verified 2026-08-05.
+deferrals are marked inline. Verified 2026-09-17, when cross-group allocation landed and the
+deferred list was swept against the code.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -110,16 +111,24 @@ Each part builds on proven machinery and is independently verifiable.
   creates the file (idempotent — an existing name returns its inode), grows it to the
   requested size, then replies its map; the client writes + syncs, and a subsequent plain
   `sys_ns_lookup` of the new path resolves (proving the directory entry is on disk).
-  **Group 0 only** for now (cross-group inode/block allocation deferred), and directory
-  growth (a new dir block when the last block has no slack) is deferred — a full parent
-  directory yields `TooLarge`.
+  **Allocation reaches every block group** since Phase 5 Part H.2 (2026-09-17): `alloc_block`
+  scans outward from the goal's group and `alloc_inode` takes the first group with a free
+  inode, each clamped to the last group's short tail. It was group 0 only until the installer
+  made a root the size of a 931 GiB disk and found it held about 112 MiB. Directory growth — a
+  new directory block when the last has no slack — landed 2026-07-29.
 
-**Deferred**: cross-group inode/block allocation; new-directory-block growth on a full
-parent directory; extent-tree splitting / index nodes (depth > 0); jbd2 journaling +
+**Deferred**: extent-tree splitting / index nodes (depth > 0); jbd2 journaling +
 replay-on-mount (needs `has_journal` fixtures); `metadata_csum` checksums; a periodic
-writeback daemon; per-page dirty tracking; truncate / delete / rename; read-ahead /
-clustered fill; the standalone `MapRange`/`AllocRange` ops (the resolve reply carries the
-map today); the fs-server open-file cookie.
+writeback daemon; per-page dirty tracking; read-ahead / clustered fill; the standalone
+`MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
+open-file cookie; and inode **locality** — a new inode goes in the first group with a free
+one rather than near its parent, which is correct and worse for a seek pattern.
+
+**Five things this list claimed were deferred and were not** (corrected 2026-09-17):
+truncate (2026-07-24), delete and rename, new-directory-block growth (2026-07-29), and
+cross-group allocation (above). The crate's own `CLAUDE.md` had recorded each as it landed;
+this list did not, which is the drift a "Deferred" section collects if nothing sweeps it
+when an item closes.
 
 ## Verification
 

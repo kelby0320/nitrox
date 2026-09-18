@@ -1,14 +1,44 @@
 # Nitrox Implementation Plan — Phase 5 — Bare metal
 
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
-current status, the full phase list, and the cross-cutting workstreams. Phases 0–4 are
-complete; Phase 5 is active.
+current status, the full phase list, and the cross-cutting workstreams. Phases 0–5 are
+complete.
 
 ---
 
-## Phase 5: Bare metal
+## Phase 5: Bare metal ✅ **complete, 2026-09-17**
 
 **Goal:** Nitrox boots and runs on a real machine, installed on its own disk.
+
+**Done.** The Acer Aspire A315-51 boots Nitrox from its own internal disk with no other
+operating system on it, to a greeter that takes a login from its own keyboard and a terminal
+running `nxsh`. Every clause of the Definition of Done below is met, and the last of them was
+met by `nxinstall` writing the disk from a live USB stick rather than by anything staged from
+a build machine.
+
+**What the machine taught us that QEMU could not**, in the order it happened: the trackpad
+works (the firmware puts it on the i8042's auxiliary port, so Phase 6 owes less than the plan
+said); a full-screen redraw was **45× slower** than it should be, because this kernel dropped
+the bootloader's write-combining attribute at the namespace boundary; an ATA serial is padded
+on whichever end the drive likes, so an identity came back with twelve spaces inside it; a
+program's diagnostics reached **nobody** in a graphical session, because the fallback is COM1
+and this machine has none; a partition-table buffer sized for one block met a disk needing 59;
+and `e2fsck -fn` **exits 0 while reporting problems**, which had made a test helper decorative
+since July. Five of those six were invisible under emulation by construction — the sixth was
+invisible because every fixture was smaller than the structure it tested.
+
+**Left open, recorded rather than fixed**: `copy` and `remove` are slower on real storage than
+a 5400 rpm disk accounts for (`TODO(fs-throughput)`, undiagnosed — the measurement comes
+first); an installed machine's UEFI entry relies on the firmware creating one for
+`\EFI\BOOT\BOOTX64.EFI`, which this firmware does and another might not.
+
+**And one thing recorded wrongly, then corrected the same day.** Trying to write a script that
+wrote more than 112 MiB, I probed four forms, found all four failed, and concluded `nxsh` could
+not compute an external program's argument at all — filing a deferral saying so. It can:
+parentheses are the escape hatch, `for i in 1..50 { copy a (format("b-{}", i)) }` works, and the
+evaluator I had already read evaluates positional arguments. Four failing examples are not a
+grammar. The deferral is withdrawn, §8c-1 of the shell spec now says how to do it, and a test
+pins both halves — the parenthesised form evaluated, the bareword beside it literal.
 
 **Why this comes before the portable runtime, networking and the browser.** Everything built
 through Phase 4 has only ever executed under QEMU. That is not a small asterisk: an emulator
@@ -1098,8 +1128,10 @@ memory type for it — the ground Part G stands on. The machine also carries an 
       memory type of the framebuffer's own address, and a timed full-screen fill, so the fix is
       judged against a number rather than an expectation. `arch::memory_types` is the neutral
       interface; the range registers and the page-attribute table stay inside `arch/x86_64`.
-- [ ] A cache-attribute on `MemoryObject`, a way for the namespace server to set it, and a PAT
-      (or MTRR) story.
+- [x] A cache-attribute on `MemoryObject`, ~~a way for the namespace server to set it,~~ and a PAT
+      (or MTRR) story. **The struck-through half was not needed**: the aperture the kernel mints
+      is the only device object userspace maps, so the attribute belongs to the object rather
+      than to whoever binds it. See the deferral's Resolved entry.
 
 The deferral for this says it outright: under QEMU it is harmless and measured to cost nothing,
 but **on real hardware it is a correctness problem** — a PCI framebuffer BAR wants
@@ -1197,9 +1229,9 @@ not the cause of the remaining cost and the next question is what the compositor
 - **The self-hash's read path.** `libdraw::hash::hash_visible` reads the whole framebuffer and only
   the self-test build calls it; it stays correct and costs one slow pass there.
 
-## Part H — the installer ⬜
+## Part H — the installer ✅
 
-- [ ] A sized disk image (the current one is fixed at 128 MiB) and a way to write Nitrox to the
+- [x] A sized disk image (the current one is fixed at 128 MiB) and a way to write Nitrox to the
       internal disk: partition, format, populate, install the bootloader.
 
 The machine is a test machine and its Debian install has no value (maintainer, 2026-09-10), so
@@ -1365,21 +1397,71 @@ you use when there is no installed system to log into.
 
 **H.2 — a filesystem the size of the disk.**
 
-- [ ] **Cross-group allocation** in `fs-server-ext4` — `alloc_inode` and `alloc_block` beyond group
+- [x] **Cross-group allocation** in `fs-server-ext4` — `alloc_inode` and `alloc_block` beyond group
       0 — and the deferral moves out of `deferred-decisions.md`. Without it a "filesystem the size
       of the disk" holds about 112 MiB.
-- [ ] **`mkfs.ext4`, layout only**, beside the writer that populates it: superblock, group
+> **Landed 2026-09-17.** `alloc_block` scans outward from the goal's group and `alloc_inode` takes
+> the first group with a free inode, each **clamped to the last group's short tail** — a bitmap
+> always has `blocks_per_group` bits, so a filesystem whose size is not a whole number of groups
+> ends with bits that address nothing. A group whose descriptor says zero free is skipped without
+> reading its bitmap, because the alternative is reading 7,600 of them on a terabyte.
+>
+> **Why no test caught it: every fixture was one group.** `mke2fs` puts `8 * block_size` blocks in
+> a group and the fixture built 4,096, so the second group did not exist to fail to reach. There
+> is a `fixture_blocks` now; the two new tests grow a file past group 0 and create more files than
+> one group has inodes, both `e2fsck`-clean, and both fail against the old allocators.
+> Locality is *not* attempted — a new inode goes in the first group with a free one rather than
+> near its parent, which is correct and worse for a seek pattern.
+- [x] **`mkfs.ext4`, layout only**, beside the writer that populates it: superblock, group
       descriptors, bitmaps, inode table, root directory. **What `mke2fs` actually gives our images**
       is `ext_attr dir_index filetype extent flex_bg sparse_super large_file huge_file dir_nlink
       extra_isize` with flex groups of 16 — `flex_bg` and `sparse_super` are *layout* on a
       multi-group filesystem, so this either places packed metadata and backup superblocks or
       declares it does not. `e2fsck -fn` is the oracle; our own parser reads it back.
-- [ ] **`nxinstall` formats and copies**: a filesystem the size of the disk, and the live root
+> **Landed 2026-09-17 as `fs-server-ext4::mkfs`.** It **declares `sparse_super`, `extent`,
+> `filetype`, `large_file`, `huge_file`, `dir_nlink`, `extra_isize` and implements all of them**;
+> `flex_bg` is deliberately *not* declared, because packing several groups' metadata together is
+> an optimisation and a bit set for a layout that is not there describes a filesystem that does
+> not exist. A test reads the feature line back with `dumpe2fs` and holds it to that list, so the
+> claim is run rather than asserted in a comment.
+>
+> **Inodes are capped at about a million** whatever the ratio asks for. Without `metadata_csum`
+> there is no `lazy_itable_init`, so every inode is 256 bytes of zeroes written before the first
+> file exists: at `mke2fs`'s default ratio a 931 GiB disk asks for 61 million, which is 16 GiB to
+> write at install time. A million files is a generous ceiling for a personal machine's root and
+> costs 256 MiB.
+>
+> **The oracle was weaker than it read, and that is the finding worth carrying.** `e2fsck -fn`
+> **exits 0** while printing `Free blocks count wrong (7669, counted=7662). Fix? no` — measured
+> against 1.47.0 — and `assert_e2fsck_clean` had tested the exit status since 2026-07-24. Every
+> test using it was blind to summary-information corruption, which is exactly what a filesystem
+> *writer* gets wrong. It reads the output now; two tests that had hand-rolled their own copy of
+> the invocation call it instead. Under the stronger check every pre-existing writer test still
+> passes, so the code was right — the assurance was not.
+
+- [x] **`nxinstall` formats and copies**: a filesystem the size of the disk, and the live root
       copied into it file by file through `create_file`/`mkdir_at`. **What it copies from** has to
       be said: H.1's raw copy takes a root a session has been writing to, and dirty pages reach the
       disk only on `sys_file_sync` or unmap.
-- [ ] The gate asserts a write **past group 0**, not merely that the superblock names the disk's
+- [x] The gate asserts a write **past group 0**, not merely that the superblock names the disk's
       size — the size assertion passes with the allocator confined to group 0.
+
+> **H.2 closed 2026-09-17.** `nxinstall` lays out a filesystem the size of the root partition
+> and walks the source, creating each directory and file — 41 files into a 477 MiB root in the
+> gate, where H.1 put a 24 MiB filesystem on the same partition. Two things the box asked to be
+> said, now said in `copy.rs`: it copies **the source's bytes on the device**, not this session's
+> view of them, so an install carries the system as it shipped rather than one session's
+> accidents; and it carries **no permissions and no timestamps**, because nothing in this system
+> reads a mode bit — authority is the namespace's — and these files were created now.
+>
+> **The gate holds the installed root to three things a boot cannot show**, on the host, between
+> the two boots: `e2fsck -fn` clean, the superblock's block count being the *partition's*, and a
+> 136 MiB file reaching block 37,778 — past group 0 — written with the allocator the guest runs.
+> The third is the box's own point: a size assertion passes with allocation confined to the
+> first group. Doing it in the guest would mean moving 128 MiB at TCG speed for a property this
+> settles in a second, and the file is written to a copy so the disk that boots is the one the
+> installer made. Control: a filesystem laid out an eighth of the partition's size fails with
+> "it was copied onto the disk rather than made for it".
 
 **H.3 — what a person sees.**
 

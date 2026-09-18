@@ -21,6 +21,13 @@
 //!   idempotent and growing it smaller is a no-op, so without an explicit truncate the
 //!   old tail would survive past the new content — a file that is neither the old one nor
 //!   the new one. `copy` refused that case outright until the filesystem gained truncate.
+//! - **Slower on real storage than the disk accounts for — `TODO(fs-throughput)`.** Copying
+//!   and deleting about 180 MB under `/home` on the laptop (2026-09-17) is slower than a
+//!   5400 rpm disk explains, and worse on larger directories. Undiagnosed: a single file here
+//!   is a chain of unbatched IPC round trips — resolve, create, grow, map, write, sync — and
+//!   the directory insert is separately quadratic. If you are making this faster, start at
+//!   `docs/rationale/deferred-decisions.md`, which lists the suspects and says to measure
+//!   before picking one.
 //! - **It emits a table.** `Table<{source: String, destination: String, bytes: Int}>`, one
 //!   row per file copied. A stage that produced nothing would leave a downstream consumer
 //!   waiting on a stream that never arrives, and "what did it actually copy" is exactly

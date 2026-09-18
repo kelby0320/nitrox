@@ -26528,3 +26528,80 @@ the live root's 24 MiB — `nxinstall` copies raw sectors, so the filesystem doe
 space around it. H.2 owes both halves: `mkfs.ext4` layout, and cross-group allocation in
 `fs-server-ext4`, whose `alloc_inode`/`alloc_block` still search block group 0 only. Until then
 the installed machine has about 112 MiB to write into.
+
+## 2026-09-17 — Phase 5 closed: it runs on the machine
+
+The Acer Aspire A315-51 boots Nitrox from its own internal disk, with no other operating system
+on it, to a greeter that takes a login from its own keyboard and a terminal running `nxsh`. The
+disk was written by `nxinstall` from a live USB stick. Every clause of the phase's Definition of
+Done is met.
+
+**The phase's argument was about debuggability** — "a `std::thread` bug and an interrupt-routing
+bug look identical from userspace", and every phase built on an untested foundation inherits that
+ambiguity. Judged against that, here is what the machine found and an emulator could not:
+
+- **The trackpad works.** The firmware puts it on the i8042's auxiliary port, so the PS/2 driver
+  already drove it; the plan had assigned a pointer to Phase 6.
+- **A full screen redrew 45× too slowly**, because this kernel dropped the bootloader's
+  write-combining attribute at the namespace boundary. The deferral that predicted this called it
+  a *correctness* problem; it was a performance one, and only the number settled it.
+- **An ATA serial is padded on whichever end the drive chooses.** This Seagate right-justifies,
+  so an identity came back with twelve spaces inside it — and the installer then asked a person to
+  type it back exactly.
+- **A program's diagnostics reached nobody.** A stage's `stderr` was `None` and the fallback is
+  `kprint`, which is COM1; this machine has none. Every program's errors had been going nowhere in
+  a graphical session for as long as QEMU was the only machine.
+- **A partition-table buffer sized for one block met a disk needing 59**, and the installer died
+  with no message — the previous finding is why there was no message.
+- **`e2fsck -fn` exits 0 while reporting problems**, which had made a test helper decorative since
+  July.
+
+**Five of those six were invisible under emulation by construction.** The sixth — the oracle —
+was invisible because nobody had aimed a control at it. The two that were *not* about hardware at
+all are the ones worth carrying forward: a fixture smaller than the structure it tests proves the
+structure works at that size and nothing more, and that mistake was made twice in the same part,
+the second time while fixing the first.
+
+**Left open, recorded rather than fixed.** `copy` and `remove` are slower on real storage than a
+5400 rpm disk accounts for — undiagnosed, and deliberately not guessed at, because Part G is the
+worked example of a plausible explanation being wrong. An installed machine's boot entry relies on
+firmware creating one for `\EFI\BOOT\BOOTX64.EFI`; this firmware does, and that is one machine's
+answer rather than a general one. And `nxsh` cannot compute an external program's arguments, found
+while trying to write the obvious test for this phase's own work.
+
+**Phase 6 — USB — is next**, and it inherits a smaller debt than the plan assumed: the pointer
+question is answered, and the machine that will exercise a USB stack is now one that runs from its
+own disk.
+
+## 2026-09-17 — Four failing examples are not a grammar
+
+I told the maintainer `nxsh` could not compute an external program's argument, and filed a
+deferral saying so. It can. `for i in 1..50 { copy /home/w.png (format("/home/big-{}.png", i)) }`
+works, and produces exactly the argv you would want.
+
+**How the mistake was made.** Trying to write a script that would write more than 112 MiB — the
+test for Part H.2's own point — I probed four forms against the interpreter: an unparenthesised
+call (parse error), `"a" ++ i` (three literal words), `save format(…)` (wants a bareword), and
+`$i` (literal). All four failed, so I generalised to "there is no way", handed over a
+thirteen-line workaround, and wrote the generalisation into `deferred-decisions.md`.
+
+The probe was the right instinct — measuring beats guessing, and it is how the four *individual*
+answers were correct. What was wrong was the inference: **four examples that fail do not describe
+a grammar**, and I had already read the code that should have stopped me, `Arg::Positional(e) =>
+argv.push(self.eval(e)?.render())` — the evaluator evaluates positional arguments. The failures
+are all in the *lexer*: argument position scans words, and `(` closes a word, so an expression
+never forms unless you open one. That is a deliberate design (a bareword must stay literal, or
+`copy /home/a /home/b` and `sort size` break) with an escape hatch nobody had written down.
+
+**What changed.** The deferral is withdrawn rather than reworded — it described a limitation that
+does not exist. §8c-1 of `shell-language.md` documents the escape hatch, since its absence is
+what made the grammar read as though computing an argument were impossible. And
+`a_parenthesised_argument_to_an_external_program_is_evaluated` pins both halves: the
+parenthesised form is evaluated, the bareword beside it is not. The nearest existing test covered
+a call inside a **function**'s argument list, which is a different grammar and is why this went
+unnoticed.
+
+**The general lesson is about what a probe licenses.** A probe answers the question you asked it.
+Concluding a *capability does not exist* from a handful of failures is a claim about everything
+you did not try, and the cost here was a wrong deferral, a wrong answer to the maintainer, and a
+workaround thirteen lines long for something that fits on one.

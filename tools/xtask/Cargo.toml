@@ -25,6 +25,11 @@ libui = { path = "../../userspace/libui" }
 # one place that can see `libterm` and `libui` at once, which is what makes their shared
 # background colour checkable rather than merely claimed (PR #189 review, finding 6).
 libterm = { path = "../../userspace/libterm" }
+# **The ext4 library the guest runs**, so `check-install` can hold the filesystem an install
+# made to the allocator that will use it — rather than to a second implementation of the same
+# reasoning. Same principle as `libdraw` above: a gate's expected answer is computed by the
+# code under test, not written down beside it.
+fs-server-ext4 = { path = "../../userspace/fs-server-ext4" }
 # **An external crate, and the first in `tools/`.** The forbidden list is about the *kernel*, and
 # `userspace/CLAUDE.md`'s bar is about what ships in the image; this is build tooling that runs on
 # the host and reaches no target. What it buys is that a render made here can be *looked at* —

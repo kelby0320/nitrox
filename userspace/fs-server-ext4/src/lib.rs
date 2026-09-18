@@ -18,6 +18,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod ext4;
+pub mod mkfs;
 pub mod serve;
 
 pub use ext4::read_file;
@@ -148,6 +149,27 @@ pub(crate) mod test_support {
     pub(crate) const TEST_NOW: i64 = 1_784_900_730;
 
     pub(crate) fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
+        fixture_blocks(block_size, 4096, 0, content)
+    }
+
+    /// [`fixture`], with the filesystem's size in blocks chosen by the caller.
+    ///
+    /// **For crossing a block group.** `mke2fs` puts `8 * block_size` blocks in a group, so
+    /// the 4096-block default is a single group and no test built on it can reach a second
+    /// one — which is how "creation is group 0 only" went unnoticed until a real disk was
+    /// partitioned (Phase 5 Part H.2). At 1 KiB blocks a group is 8,192 blocks, so 24,576
+    /// gives three, the last of them deliberately short: 24,575 addressable blocks do not
+    /// divide by 8,192, and the bitmap's spare bits address nothing.
+    ///
+    /// `bytes_per_inode` is `mke2fs -i`, or `0` to let it choose. A large ratio gives *few*
+    /// inodes per group, which is how a test can exhaust group 0's inodes by creating a
+    /// couple of hundred files instead of eight thousand.
+    pub(crate) fn fixture_blocks(
+        block_size: u32,
+        blocks: u32,
+        bytes_per_inode: u32,
+        content: &[u8],
+    ) -> Vec<u8> {
         // A unique dir per call (cargo runs tests in parallel threads) so they
         // never share / remove each other's staging tree.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -162,14 +184,18 @@ pub(crate) mod test_support {
             .write_all(content)
             .unwrap();
         let img = dir.join("rootfs.ext4");
-        let status = Command::new("mke2fs")
-            .args(["-q", "-F", "-t", "ext4"])
+        let mut cmd = Command::new("mke2fs");
+        cmd.args(["-q", "-F", "-t", "ext4"])
             .args(["-O", "^has_journal,^64bit,^metadata_csum,^resize_inode"])
-            .args(["-b", &block_size.to_string()])
+            .args(["-b", &block_size.to_string()]);
+        if bytes_per_inode != 0 {
+            cmd.args(["-i", &bytes_per_inode.to_string()]);
+        }
+        let status = cmd
             .arg("-d")
             .arg(&dir)
             .arg(&img)
-            .arg("4096") // blocks
+            .arg(blocks.to_string())
             .status()
             .expect("mke2fs must be installed (e2fsprogs) to run fs-server-ext4 tests");
         assert!(status.success(), "mke2fs failed");
@@ -182,7 +208,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture};
+    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture, fixture_blocks};
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -761,22 +787,339 @@ mod tests {
     }
 
     /// Run `e2fsck -fn` over an image and assert it is clean (no changes needed, no errors).
+    /// **A file bigger than block group 0**, which is the whole of Part H.2's first box.
+    ///
+    /// Before cross-group allocation this failed with `TooLarge` while `dumpe2fs` showed most
+    /// of the filesystem free — and the number that matters is not this fixture's but the
+    /// laptop's: a 931 GiB root confined to group 0 held about 112 MiB. **No existing test
+    /// could have caught it**, because every fixture was 4,096 blocks and a group is 8,192, so
+    /// the second group did not exist to fail to reach.
+    ///
+    /// The physical block numbers are the assertion. A size assertion passes with the
+    /// allocator confined to group 0 — it would simply have failed earlier — and `e2fsck`
+    /// alone would pass on a filesystem that allocated nothing.
+    #[test]
+    fn a_file_grows_past_block_group_0_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        // Three groups of 8,192 1 KiB blocks. `flex_bg` packs all three groups' metadata into
+        // group 0, so group 0 has roughly 6,600 free data blocks and groups 1 and 2 are empty.
+        let rw = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"x\n")));
+        ext4::create_file(&rw, b"/", b"big", TEST_NOW).unwrap();
+        let size = 9 * 1024 * 1024; // 9,216 blocks — past what group 0 can hold
+        assert_eq!(ext4::grow_file(&rw, b"/big", size, TEST_NOW).unwrap(), size);
+        assert_eq!(ext4::stat_file(&rw, b"/big").unwrap(), size);
+
+        // Every block the file got, and the highest of them.
+        let mut runs = [BlockRun::default(); 8];
+        let n = ext4::map_range(&rw, b"/big", 0, 16384, &mut runs).unwrap();
+        let highest = runs[..n]
+            .iter()
+            .filter(|r| r.device_lba != 0)
+            .map(|r| r.device_lba + r.length as u64 - 1)
+            .max()
+            .expect("a grown file has blocks");
+        assert!(
+            highest > 8192,
+            "every block landed inside group 0 (highest {highest}), so the file cannot be \
+             {size} bytes — group 0 holds 8,192 blocks including all three groups' metadata"
+        );
+        // And nothing was placed past the end of the filesystem, which is the other half of
+        // the last group's short tail.
+        assert!(highest < 24576, "block {highest} is past the end of the device");
+        assert_e2fsck_clean(&rw.0.into_inner(), "grow-cross-group");
+    }
+
+    /// **More files than one group has inodes**, the other half of the same box.
+    ///
+    /// `-i 65536` gives this fixture 128 inodes per group, so the 129th file is the first that
+    /// cannot come from group 0. The assertion is that every create succeeds *and* that an
+    /// inode number exceeds what a group holds — read out of the superblock rather than
+    /// written down here, since `mke2fs` chooses it.
+    #[test]
+    fn more_files_than_group_0_holds_inodes_for_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let img = fixture_blocks(1024, 24576, 65536, b"x\n");
+        let per_group = rd_u32(&img[1024..2048], 40);
+        assert!(per_group > 0 && per_group < 200, "expected a small inode ratio, got {per_group}");
+        let rw = RwImage(RefCell::new(img));
+
+        let want = per_group as usize + 40;
+        let mut highest = 0u32;
+        for i in 0..want {
+            let name = std::format!("f{i:04}");
+            let ino = ext4::create_file(&rw, b"/", name.as_bytes(), TEST_NOW)
+                .unwrap_or_else(|e| panic!("create {name} (number {i}) failed: {e:?}"));
+            highest = highest.max(ino);
+        }
+        assert!(
+            highest > per_group,
+            "{want} files all fit in the {per_group} inodes of group 0 (highest inode \
+             {highest}), which cannot be true"
+        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "inodes-cross-group");
+    }
+
+    /// **`e2fsck -fn` on a filesystem we laid out ourselves**, which is the whole point of
+    /// `mkfs`: the oracle is somebody else's implementation of the format, and agreeing only
+    /// with our own reader would prove nothing.
+    fn format_image(blocks: u64, block_size: u32) -> (Vec<u8>, crate::mkfs::Geometry) {
+        use std::cell::RefCell;
+        let img = RwImage(RefCell::new(std::vec![0u8; (blocks * block_size as u64) as usize]));
+        let geom = crate::mkfs::format(
+            &img,
+            &crate::mkfs::Params {
+                blocks,
+                block_size,
+                bytes_per_inode: 16384,
+                uuid: *b"nitrox-test-uuid",
+                label: *b"nitrox-root\0\0\0\0\0",
+                now: TEST_NOW,
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        (img.0.into_inner(), geom)
+    }
+
+    #[test]
+    fn a_filesystem_we_made_is_clean_and_empty_at_three_block_sizes() {
+        for (blocks, bs) in [(24576u64, 1024u32), (16384, 2048), (16384, 4096)] {
+            use std::cell::RefCell;
+            let (img, geom) = format_image(blocks, bs);
+            assert_e2fsck_clean(&img.clone(), &std::format!("mkfs-{bs}"));
+
+            // And our own reader agrees it is an empty root directory. `e2fsck` accepting a
+            // filesystem this parser cannot walk would be half an answer.
+            let rw = RwImage(RefCell::new(img));
+            assert_eq!(ext4::resolve_dir(&rw, b"/").unwrap(), 2, "the root is inode 2");
+            assert_eq!(names_of(&rw, b"/"), [".", ".."], "a new root holds itself and nothing");
+            assert!(geom.groups >= 1);
+
+            // And it takes a file, which is the other half of "empty": the structures are
+            // not merely self-consistent, they are the ones the writer allocates into.
+            ext4::create_file(&rw, b"/", b"hello", TEST_NOW).unwrap();
+            ext4::grow_file(&rw, b"/hello", 40, TEST_NOW).unwrap();
+            assert_eq!(names_of(&rw, b"/"), [".", "..", "hello"]);
+            assert_e2fsck_clean(&rw.0.into_inner(), &std::format!("mkfs-{bs}-used"));
+        }
+    }
+
+    /// **What the module's doc says it declares, read back off the image by `dumpe2fs`.**
+    ///
+    /// The feature list is a promise about layout: `sparse_super` says where the backups are,
+    /// `extent` says how an inode addresses blocks, and a bit set for something not done
+    /// describes a filesystem that is not there. A comment claiming the set is an unrun
+    /// claim; this runs it.
+    #[test]
+    fn the_feature_set_is_exactly_what_the_module_says_it_makes() {
+        let (img, _) = format_image(16384, 4096);
+        let dir = std::env::temp_dir()
+            .join(std::format!("nitrox-mkfs-feat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, &img).unwrap();
+        let out = std::process::Command::new("dumpe2fs")
+            .args(["-h", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Filesystem features:"))
+            .expect("dumpe2fs printed no feature line");
+        let mut got: Vec<&str> = line["Filesystem features:".len()..].split_whitespace().collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            ["dir_nlink", "extent", "extra_isize", "filetype", "huge_file", "large_file",
+             "sparse_super"],
+            "the declared set drifted from the module doc: {line}"
+        );
+        // And the two that are deliberately absent, named so their absence is deliberate
+        // rather than forgotten: packed metadata, and checksums the writer does not maintain.
+        assert!(!line.contains("flex_bg"), "flex_bg is declared but not implemented: {line}");
+        assert!(!line.contains("metadata_csum"), "checksums are not maintained: {line}");
+        assert!(!line.contains("has_journal"), "there is no journal: {line}");
+    }
+
+    /// **More groups than one block of descriptors holds**, which is the case the installer
+    /// died on and no test could reach.
+    ///
+    /// A group-descriptor table is 32 bytes per group: one 1 KiB block describes 32 groups,
+    /// one 4 KiB block describes 128. The laptop's 931 GiB root has **7,452 groups — 59 blocks
+    /// of table** — and the first version of `format` built the whole thing in a single
+    /// one-block buffer, so it indexed past the end at group 128 and panicked. Every fixture
+    /// here was four groups or fewer, 128 bytes of descriptors, so nothing failed until a real
+    /// disk (2026-09-17). This is the same shape as the single-group fixture that hid
+    /// group-0-only allocation, and the lesson is the same: **a fixture smaller than the
+    /// structure it is testing proves the structure works at that size and nothing more.**
+    ///
+    /// **Written to a sparse file, not to memory.** 70 groups of 8 MiB is a 560 MiB filesystem;
+    /// `mkfs` touches a few hundred blocks of it, and the holes read as zeros, so this costs
+    /// about a megabyte of disk and no RAM at all. That is what makes testing a *large*
+    /// filesystem affordable, and the absence of it is why this bug shipped.
+    #[test]
+    fn a_descriptor_table_spanning_several_blocks_is_written_whole() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        /// A [`BlockWriter`] straight onto a file, so unwritten regions stay holes.
+        struct SparseFile(std::cell::RefCell<std::fs::File>);
+        impl BlockReader for SparseFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+                let mut f = self.0.borrow_mut();
+                f.seek(SeekFrom::Start(offset)).map_err(|_| FsError::Io)?;
+                f.read_exact(buf).map_err(|_| FsError::Io)
+            }
+        }
+        impl BlockWriter for SparseFile {
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+                let mut f = self.0.borrow_mut();
+                f.seek(SeekFrom::Start(offset)).map_err(|_| FsError::Io)?;
+                f.write_all(buf).map_err(|_| FsError::Io)
+            }
+        }
+
+        let dir = std::env::temp_dir()
+            .join(std::format!("nitrox-mkfs-wide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.ext4");
+        // 70 groups at 1 KiB blocks: 3 blocks of descriptors, and backups in 0, 1, 3, 5, 7,
+        // 9, 25, 27, 49 — nine copies of a table that is not one block.
+        let blocks = 70u64 * 8192;
+        let f = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(blocks * 1024).unwrap();
+        let img = SparseFile(std::cell::RefCell::new(f));
+        let geom = crate::mkfs::format(
+            &img,
+            &crate::mkfs::Params {
+                blocks,
+                block_size: 1024,
+                bytes_per_inode: 16384,
+                uuid: *b"nitrox-wide-uuid",
+                label: *b"nitrox-root\0\0\0\0\0",
+                now: TEST_NOW,
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(geom.groups, 70);
+        assert!(
+            geom.gdt_blocks > 1,
+            "this test means nothing with a one-block table ({} blocks)",
+            geom.gdt_blocks
+        );
+
+        // **The last group's descriptor, read back, before the oracle is asked.** A table
+        // truncated at its first block leaves this one zeroed — and `e2fsck` on a filesystem
+        // that broken does not report it, it *spins*: measured at ten minutes of CPU before
+        // being killed. A test whose failure mode is a hang is not a test, so the cheap,
+        // deterministic claim goes first and the oracle confirms the rest.
+        //
+        // The expected value is re-derived from the documented layout rather than read from
+        // the private helper that wrote it: a group's metadata starts after its superblock
+        // copy and descriptor table, if it has one.
+        let last = geom.groups - 1;
+        let expect = geom.group_start(last)
+            + if geom.has_super(last) { 1 + geom.gdt_blocks as u64 } else { 0 };
+        let mut d = [0u8; 32];
+        img.read_at(
+            (geom.first_data_block as u64 + 1) * 1024 + last as u64 * 32,
+            &mut d,
+        )
+        .unwrap();
+        let bitmap = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as u64;
+        assert_eq!(
+            bitmap, expect,
+            "group {last}'s descriptor is wrong ({bitmap}, expected {expect}) — the table is \
+             {} blocks and only the first was written",
+            geom.gdt_blocks
+        );
+        drop(img);
+
+        // The oracle reads every copy of the table it can find, so a truncated or misplaced
+        // one is its business, not ours to re-derive.
+        assert_e2fsck_clean_path(&path, "mkfs-wide");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A filesystem large enough to need **backup superblocks past group 1**, which is where
+    /// `sparse_super` stops being a rule about small numbers. `e2fsck -b` reads one of the
+    /// backups rather than the primary, so it fails if the copy is wrong or in the wrong place
+    /// — which a check of the primary alone would never notice.
+    #[test]
+    fn the_backup_superblocks_are_where_sparse_super_says_and_are_usable() {
+        // Nine groups at 1 KiB blocks, so backups land in 0, 1, 3, 5 and 7.
+        let blocks = 9 * 8192;
+        let (img, geom) = format_image(blocks, 1024);
+        assert_eq!(geom.groups, 9);
+        assert!(geom.has_super(3) && geom.has_super(5) && geom.has_super(7));
+        assert!(!geom.has_super(2) && !geom.has_super(4) && !geom.has_super(6));
+        assert_e2fsck_clean(&img, "mkfs-backups");
+
+        let dir = std::env::temp_dir()
+            .join(std::format!("nitrox-mkfs-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, &img).unwrap();
+        // Group 3's copy starts at its first block: 1 + 3 * 8192.
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", "-b", "24577", "-B", "1024", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "e2fsck could not use the backup in group 3:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
     fn assert_e2fsck_clean(img: &[u8], tag: &str) {
         let dir = std::env::temp_dir()
             .join(std::format!("nitrox-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, img).unwrap();
+        assert_e2fsck_clean_path(&p, tag);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
+    /// want in memory, or one a gate carved out of an image.
+    ///
+    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
+    /// how the status-only check below survived being noticed; a third copy would be the same
+    /// mistake with the ink still wet (PR #310 review).
+    fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
         let out = std::process::Command::new("e2fsck")
             .args(["-fn", p.to_str().unwrap()])
             .output()
             .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            out.status.success(),
-            "e2fsck reported errors:\n{}",
-            String::from_utf8_lossy(&out.stdout)
+        let text = std::format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
+        // **The exit status is not the oracle; the output is.** Measured against e2fsck
+        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
+        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
+        // helper trusted the status from the day it was written (2026-07-24), so every test
+        // using it was blind to the whole class of summary-information corruption — which is
+        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
+        //
+        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
+        // prompt is what to look for. The summary line is the other half: without it e2fsck
+        // stopped early and found nothing because it checked nothing.
+        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
+        assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
+        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
     }
 
     /// The inode number of a directory path (for the name-addressed mutation ops).
@@ -1028,22 +1371,10 @@ mod tests {
         }
 
         // e2fsck the mutated image: the metadata (extent tree, bitmap, free counts, inode)
-        // must be fully consistent. `-fn` makes no changes and exits non-zero on any error.
-        let img = rw.0.into_inner();
-        let dir = std::env::temp_dir().join(std::format!("nitrox-grow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("img.ext4");
-        std::fs::write(&p, &img).unwrap();
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", p.to_str().unwrap()])
-            .output()
-            .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            out.status.success(),
-            "e2fsck reported errors:\n{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
+        // must be fully consistent. **Through the shared helper** — this test and the one
+        // below each had their own copy of the invocation, which is how they went on
+        // trusting an exit status the helper had to stop trusting (Phase 5 Part H.2).
+        assert_e2fsck_clean(&rw.0.into_inner(), "grow");
     }
 
     #[test]
@@ -1064,20 +1395,6 @@ mod tests {
 
         // e2fsck the mutated image: the new inode, its dir entry, the bitmaps + counts, and
         // the extent must all be consistent.
-        let img = rw.0.into_inner();
-        let dir = std::env::temp_dir().join(std::format!("nitrox-create-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("img.ext4");
-        std::fs::write(&p, &img).unwrap();
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", p.to_str().unwrap()])
-            .output()
-            .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            out.status.success(),
-            "e2fsck reported errors:\n{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "create");
     }
 }

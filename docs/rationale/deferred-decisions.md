@@ -1391,11 +1391,28 @@ audit) — so they are mirrored here.
   are far past anything the shell or desktop needs. Trigger: a directory or file that
   genuinely needs a deeper tree — very large files, or a directory of thousands of
   subdirectories.
-- **Cross-group inode/block allocation.** Creation is group 0 only. Trigger: a filesystem
-  large or full enough that group 0 runs out.
 - **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
+
+**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`, undiagnosed.**
+Observed on the laptop, 2026-09-17, copying and then deleting about 180 MB under `/home`:
+both are slower than a 5400 rpm disk accounts for, and both get worse with larger directories
+(maintainer). **This is the first time either has run against real storage** — every previous
+number came from QEMU, where a RAM-backed or host-cached image hides exactly this.
+
+Not diagnosed, and deliberately not guessed at: the honest list of suspects is long and each
+one is separately recorded above. The **quadratic directory scan** predicts the
+worse-with-size half exactly (an insert re-reads a directory's blocks, so N entries cost N²).
+The constant factor has more candidates than that explains: the driver issues **one command at
+a time** with no NCQ; there is **no read-ahead or clustered fill**; the fs-server reads and
+writes metadata **one 4 KiB block per `sys_io_submit`**; and a single file copy is a chain of
+IPC round trips — resolve, create, grow, map, write, sync — none of them batched.
+
+**The measurement comes first**, as it did in Part G, where the plausible explanation was
+wrong: a write-back mapping was blamed for a 45× cost that turned out to be a dropped
+write-combining attribute, and only a number on the real machine settled it. **Trigger**: the
+first time somebody is waiting on it, or the next phase that moves bulk data — which is USB.
 
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
@@ -1974,6 +1991,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Cross-group inode/block allocation (`fs-server-ext4`) | 2026-09-17 | Both allocators scan every block group — `alloc_block` from the goal's group outward, `alloc_inode` from the first with a free one — clamped to the last group's short tail. The trigger fired exactly as written: `nxinstall` made a root the size of a 931 GiB disk and it held about 112 MiB. Phase 5 Part H.2. |
 | A cache attribute on a mapped device aperture (`framebuffer-cache-attr`) | 2026-09-16 | Phase 5 Part G, and **the entry above was wrong about what it would cost**: it called a write-back mapping of a PCI BAR a *correctness* problem — writes left in cache, reordered — and on the laptop nothing was ever cached, because the firmware's range registers call the graphics aperture uncacheable and the stronger of the two wins. It was a performance problem, and a 45x one: a full screen took 72930 us through a `/dev/framebuffer` mapping against 1368 through the bootloader's mapping of the same pixels. **The bootloader had already asked for write-combining**; this kernel dropped the attribute at the namespace boundary, where `protection_to_page_flags` gave every user mapping no attribute at all. The fix is `mm::Caching` on the `MemoryObject` and the VMA, `PageFlags::WRITE_COMBINING` selecting entry 5 of a table the kernel now programs itself on every CPU (keeping the bootloader's exact values, because two entries were already live in mappings it made), and the framebuffer aperture recording its answer once for the object and the boot's own measurement to read. "A way for the namespace server to set it" was **not** needed and is not built: the aperture the kernel mints is the only device object userspace maps, so the attribute is the object's. A compositor with no shadow buffer now refuses to serve rather than composing into the display, because composing into write-combining memory reads it back. Measured after: 1632 us, 2451 MiB/s. **Two of this part's own instruments lied before they worked** — the measurement built its second mapping with the attribute written into the measurement, and the handout line printed the aperture's value instead of the object's — each caught by a control that should have failed and did not. |
 | MSI (message-signalled interrupts) | 2026-09-11 | Phase 5 Part A, and **the trigger this entry carried was the wrong one** — it was filed as performance work ("NVMe, multi-queue NICs, or performance work on interrupt-heavy devices") when on real hardware it is a correctness unblocker: the AHCI driver took its GSI from the PCI interrupt-line register, which QEMU's firmware programs and real UEFI frequently leaves meaningless, the authoritative routing being the DSDT's `_PRT` — which needs AML, which means ACPICA. MSI needs none of it. `pci::read_msi` and `pci::program_msi` decode and program the capability, `ArchIrqInstall::install_msi` composes the x86 message, and AHCI prefers MSI while keeping INTx as the fallback for a function that advertises no capability. **Message Control bit 7 selects the structure, not the address width**: Message Data sits at `+0x0C` when the address is 64-bit and `+0x08` when it is not, and the two target controllers disagree — QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise Point-LP is not — so the branch the target machine takes is the one no QEMU boot can exercise. Host tests carry both shapes, built from the real captures, and are negative-controlled by forcing the offset to `+0x0C` unconditionally, which is the driver the emulator alone would have produced. Bus mastering and the INTx-disable bit came with it, being the same config-space plumbing: nothing in Nitrox had ever set either, and DMA worked only because the firmware did. MSI-X stays deferred with a consumer-based trigger of its own. |
 | A dedicated arch trait for the device-interrupt *installation* facility (`msi`) | 2026-09-11 | Built in Phase 5 Part A **at the second consumer**, which is what this entry asked for. `ArchIrqInstall` carries `install_intx` — the old neutral `install_pci_irq` free function, moved verbatim — and `install_msi`, in `kernel/src/arch/irq_install.rs` with the x86 half in `kernel/src/arch/x86_64/irq_install.rs`: a module of its own rather than more of `ioapic.rs`, because only the INTx half is the IOAPIC's business at all. The MSI half yields a **message** rather than programming a device, which is where the arch boundary falls — the address and data are architectural, the PCI capability they are written into is not. It also refuses rather than truncates when a destination will not fit the compatibility format's eight bits, a narrowing the dense-index binding already assumed and nothing had written down. **Closing this exposed a hole in `check-deferrals` itself**: the last `TODO(msi)` marker in the tree was the gate's own doc comment illustrating the tag syntax, so the entry was backed by an example rather than by a code site, and would have stayed green with its real marker deleted. The illustration is a placeholder now, and the gate fails correctly on an unbacked entry again. |
