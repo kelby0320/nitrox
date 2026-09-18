@@ -26612,7 +26612,7 @@ Phase 5 closed this morning. The remaining plan said Phase 6 is USB; two things 
 of it, and the phases are **not renumbered** — the numbers appear throughout this log, which is
 append-only, and shifting USB to 7 would make every historical reference wrong to tidy a table.
 
-**Display arm M16 — the design, adopted — comes first.** The maintainer designed a polished shell
+**The desktop refresh comes first.** The maintainer designed a polished shell
 with Claude Design and handed it over as a runnable page. It goes before the administration work
 for a reason that is the maintainer's own standing rule: the admin tools are UI surfaces, and
 building them against the current look to restyle them afterwards is building something that has

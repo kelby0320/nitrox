@@ -1,9 +1,9 @@
 # The Nitrox shell design
 
-**Status: the north star for the desktop's appearance, adopted by display-arm Milestone 16
-([display-arm-plan.md](../../planning/display-arm-plan.md)). Not a description of what is
-built** — `design/` never is. When a question about appearance comes up, open the page and see
-what it does; when the page and the code disagree, the page is the intent and the code is behind.
+**Status: the north star for the desktop's appearance, adopted by
+[the desktop refresh](../../planning/desktop-refresh.md). Not a description of what is built**
+— `design/` never is. When a question about appearance comes up, open the page and see what it
+does; when the page and the code disagree, the page is the intent and the code is behind.
 
 Produced with Claude Design by the maintainer, 2026-09-15, and handed over as a runnable page
 rather than a picture — so it answers questions about *behaviour* too: what a menu does when it
@@ -36,8 +36,8 @@ google-chrome --headless --disable-gpu --virtual-time-budget=8000 \
 The page's own stylesheet carries the token set (`--accent`, `--r`, `--sel`, …), and the mock
 text editor is displaying a `theme.toml` whose keys are nearly ours. **That is the useful part**:
 the design can be adopted as *data* rather than transcribed, which is what keeps `check-display`
-from becoming a picture of whatever the code happens to draw. Milestone 16's opening section
-argues this at length.
+from becoming a picture of whatever the code happens to draw. The refresh plan's opening
+section argues this at length.
 
 ## What was taken and what was not
 

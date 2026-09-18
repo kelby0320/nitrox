@@ -30,7 +30,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 3 — Service ecosystem | [phase-3-service-ecosystem.md](phase-3-service-ecosystem.md) | ✅ complete (2026-07-21) |
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
-| — Display arm M16 (the design, adopted) | [display-arm-plan.md](display-arm-plan.md) | 🚧 next |
+| — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | 🚧 next |
 | — Administration | [administration.md](administration.md) | planned, to be scoped |
 | 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
@@ -48,8 +48,11 @@ phase numbers appear throughout the decision log, which is append-only, so shift
 would make every historical reference wrong to save a tidier table. The order is what matters and
 the table states it:
 
-1. **Display arm M16 — the design, adopted.** A polished UI was designed outside the codebase
-   ([`docs/design/nitrox-shell/`](../design/nitrox-shell/)) and this adopts it. **It comes first
+1. **The desktop refresh.** A polished UI was designed outside the codebase
+   ([`docs/design/nitrox-shell/`](../design/nitrox-shell/)) and
+   [desktop-refresh.md](desktop-refresh.md) adopts it. **Its own document rather than a
+   milestone of the display arm**, which is complete at M15: appending live work to 5,300 lines
+   of ticked boxes buries the one thing still owed. **It comes first
    because the administration tools are UI surfaces**, and building them against the old look to
    restyle them afterwards is the thing this project's standing rule forbids — the admin phase
    also contains an unanswered display question of its own (a prompt the compositor trusts).
