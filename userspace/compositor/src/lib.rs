@@ -182,6 +182,15 @@ pub struct Window {
     /// restores from, and a second copy here could disagree with it. What it does know is what
     /// was last *asked*, which is enough to keep a looping client off a bounded queue.
     pub state_requested: Option<u32>,
+    /// The shadow this window casts — what its role casts in the stack's current scheme.
+    ///
+    /// **Stored, so the scheme reaches every reader of it without passing through each one.**
+    /// Damage is computed from [`painted_bounds`](Window::painted_bounds) in a dozen places and
+    /// compositing reads the shadow in one; a scheme argument threaded through all of them would
+    /// be a dozen chances to pass the wrong one. Written in exactly two places —
+    /// [`create`](WindowStack::create) and [`set_scheme`](WindowStack::set_scheme) — and a test
+    /// holds every window to [`shadow_for`] after a change.
+    pub shadow: Option<Shadow>,
 }
 
 impl Window {
@@ -204,7 +213,8 @@ impl Window {
     }
 }
 
-/// The shadow an ordinary window and a menu cast (M13 Part C).
+/// The shadow an ordinary window and a menu cast (M13 Part C) — in the scheme the manager last
+/// named, since the desktop refresh's Part A.
 ///
 /// **One shadow, not a per-role palette.** A menu wants a tighter one than a window on most
 /// desktops, and that is a refinement with no request behind it; a second set of numbers here
@@ -213,16 +223,16 @@ impl Window {
 /// The numbers live in `libdraw` because `check-display` needs them too — it renders what the
 /// screen should show and compares the guest against it, so a window's shadow has to be computed
 /// on both sides from one source. Which *roles* cast one is the decision that stays here.
-use libdraw::theme::WINDOW_SHADOW;
+use libdraw::theme::{Scheme, window_shadow};
 
-/// The shadow `role` casts, if it casts one.
+/// The shadow `role` casts in `scheme`, if it casts one.
 ///
 /// **Panels do not.** A bar is docked to a screen edge and a wallpaper *is* the ground; a shadow
 /// on either is a dark band along the edge of the screen with nothing above it to cast one. The
 /// three that do are the three that float: an application window, a menu, and a dialog.
-const fn shadow_for(role: Role) -> Option<Shadow> {
+pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
     match role {
-        Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => Some(WINDOW_SHADOW),
+        Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => Some(window_shadow(scheme)),
         Role::Panel { .. } => None,
     }
 }
@@ -237,7 +247,7 @@ impl Window {
     /// would make the shadow clickable and would tell a client it is sixteen pixels bigger than
     /// it asked to be.
     pub fn painted_bounds(&self) -> Rect {
-        match shadow_for(self.role) {
+        match self.shadow {
             Some(sh) => sh.around(self.bounds()),
             None => self.bounds(),
         }
@@ -619,6 +629,13 @@ pub struct WindowStack {
     geometry_log: Vec<u32>,
     /// Which desktop is composited. Never [`STICKY_DESKTOP`] — see [`Self::set_current_desktop`].
     current_desktop: u32,
+    /// Which scheme the compositor's own drawing follows — today, only how dark a shadow is.
+    ///
+    /// **Told, never read**: the compositor is started by `init` and never sees a theme file (M11
+    /// decision 1), so the shell, which read one, says which scheme it named with the manager's
+    /// `SetScheme`. Light until then, which is what the built-in theme is and what a session with
+    /// no shell — every self-test boot — keeps.
+    scheme: Scheme,
     /// The window the user is interactively dragging, and where it was when the drag began.
     ///
     /// **Here rather than in the router, because two paths need it.** The router runs the drag;
@@ -654,6 +671,7 @@ impl WindowStack {
             // desktop was the sticky value would composite only sticky windows and make every
             // window it created afterwards sticky too, by the create-onto-current rule.
             current_desktop: 1,
+            scheme: Scheme::Light,
             dragging: None,
         }
     }
@@ -744,6 +762,7 @@ impl WindowStack {
             minimized: false,
             acceptors: Vec::new(),
             state_requested: None,
+            shadow: shadow_for(req.role, self.scheme),
         });
         Ok(id)
     }
@@ -808,6 +827,30 @@ impl WindowStack {
         let changed = self.current_desktop != desktop;
         self.current_desktop = desktop;
         Ok(changed)
+    }
+
+    /// The scheme the compositor's own drawing follows.
+    pub fn scheme(&self) -> Scheme {
+        self.scheme
+    }
+
+    /// Follow `scheme` from now on, and re-derive every window's shadow. Returns whether it
+    /// changed.
+    ///
+    /// **The whole screen is dirty when it does**, and a caller repaints all of it: every window
+    /// that casts a shadow now casts a different one, and a dark scheme's reaches further than a
+    /// light one's, so the region to repaint is each window's *old or new* painted bounds, which
+    /// on a desktop with windows on it is most of the screen. Sent once per session, before most
+    /// windows exist, so the full repaint is the honest answer rather than an expensive one.
+    pub fn set_scheme(&mut self, scheme: Scheme) -> bool {
+        if self.scheme == scheme {
+            return false;
+        }
+        self.scheme = scheme;
+        for w in &mut self.windows {
+            w.shadow = shadow_for(w.role, scheme);
+        }
+        true
     }
 
 
@@ -1325,7 +1368,7 @@ impl WindowStack {
                 continue;
             }
             let surface = SurfaceRef::new(b.geometry, w.origin, px);
-            surfaces.push(match shadow_for(w.role) {
+            surfaces.push(match w.shadow {
                 Some(sh) => surface.with_shadow(sh),
                 None => surface,
             });
@@ -2189,7 +2232,7 @@ mod tests {
         // "both positions and nothing more" — and the two checks below it are what stop that from
         // being a restatement of the implementation: the region must strictly contain both window
         // rectangles, and `bounds` must not have grown.
-        let shadow = super::WINDOW_SHADOW;
+        let shadow = window_shadow(Scheme::Light);
         let dirty = s.place(w, Point::new(20, 10)).unwrap();
         assert_eq!(
             dirty.rect(),
@@ -2426,6 +2469,46 @@ mod tests {
     // ---- shadows (M13 Part C) ----
 
     #[test]
+    fn a_scheme_change_re_derives_every_windows_shadow_and_darkens_the_picture() {
+        // **The invariant the stored shadow rests on**: after `set_scheme`, every window casts
+        // exactly what `shadow_for` says its role casts in that scheme — including windows created
+        // *before* the change, which is the case a create-time-only derivation would get wrong.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let normal = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
+        let panel = shown(&mut s, &CreateWindowRequest::new(8, 2, Role::Panel { dock: Edge::Top, reserve: 0 }));
+        s.attach(&attach(normal, 0, 8, 8)).unwrap();
+        src.put(normal, 0, geom(8, 8), Rgb::new(200, 30, 30));
+        s.commit(&commit(normal, 0)).unwrap();
+        let _ = s.place(normal, Point::new(12, 4));
+
+        let ground = Rgb::new(120, 120, 120);
+        let beside = |s: &WindowStack| {
+            let mut fb = screen();
+            let full = fb.geometry().bounds();
+            s.compose_into(&mut fb, ground, &src, &[full]);
+            fb.get_pixel(10, 8).unwrap()
+        };
+        let light = beside(&s);
+        let light_bounds = s.window(normal).unwrap().painted_bounds();
+
+        assert!(s.set_scheme(Scheme::Dark), "a change reports itself");
+        assert!(!s.set_scheme(Scheme::Dark), "and a repeat does not");
+        for w in s.windows() {
+            assert_eq!(w.shadow, shadow_for(w.role, Scheme::Dark), "window {}", w.id);
+        }
+        assert_eq!(s.window(panel).unwrap().shadow, None, "a panel still casts none");
+        // The dark scheme's shadow reaches further and is stronger — the design's .55 against .22.
+        assert!(s.window(normal).unwrap().painted_bounds().size.w > light_bounds.size.w);
+        let dark = beside(&s);
+        assert!(dark.r < light.r, "beside the window: dark {dark:?}, light {light:?}");
+
+        // A window created after the change is born in it.
+        let later = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
+        assert_eq!(s.window(later).unwrap().shadow, shadow_for(Role::Normal, Scheme::Dark));
+    }
+
+    #[test]
     fn a_window_casts_a_shadow_and_a_panel_does_not() {
         // **Which roles float.** A bar is docked to a screen edge and the wallpaper *is* the
         // ground; a shadow on either is a dark band along the edge of the screen with nothing
@@ -2480,7 +2563,7 @@ mod tests {
 
         let w = s.window(id).expect("in the stack");
         assert_eq!(w.bounds(), Rect::new(100, 60, 40, 30));
-        assert_eq!(w.painted_bounds(), WINDOW_SHADOW.around(Rect::new(100, 60, 40, 30)));
+        assert_eq!(w.painted_bounds(), window_shadow(Scheme::Light).around(Rect::new(100, 60, 40, 30)));
 
         let info = s.info(id).expect("a window reports its geometry");
         assert_eq!((info.width, info.height), (40, 30), "a client is told its own size");

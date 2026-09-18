@@ -3834,6 +3834,13 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // send the `Place` that would release it; only the 200 ms configure deadline broke the tie.
     session.expect("desktop-shell: bottom bar presented")?;
     session.expect("desktop-shell: manager channel held")?;
+    // **The theme's scheme reached the compositor** (desktop refresh, Part A) — the one process
+    // that never reads the file, and the one that draws every window's shadow. The shell sends it
+    // whatever it is, so this line appears on a light boot too; and it is *the staged theme's*
+    // scheme, computed rather than written here, because a compositor that ignored the message
+    // would still be light and a literal `light` would pass against it.
+    let scheme = staged_theme()?.0.scheme;
+    session.expect(&format!("compositor: scheme {}", scheme.as_str()))?;
 
     // **The work area, and that it is not the screen** (M9 Part B). The shell asks the
     // compositor rather than subtracting its own bars, because any `panel`-role client declares
@@ -7237,7 +7244,7 @@ fn cmd_preview(what: &str) -> R<()> {
 }
 
 /// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]
-/// [--contact-radius N] [--contact-strength N] [--contact-drop N] [--corner N]` — try the
+/// [--contact-radius N] [--contact-strength N] [--contact-drop N] [--corner N] [--dark]` — try the
 /// overview's opacity and a window's shadow **without booting**.
 ///
 /// The shadow has two layers since the desktop refresh's Part A: `--radius`, `--strength` and
@@ -7258,7 +7265,10 @@ fn cmd_preview(what: &str) -> R<()> {
 /// the ground behind them, not the labels on them.
 ///
 /// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used so a good
-/// one can be copied into `libdraw::theme::WINDOW_SHADOW` and `desktop-shell`'s constants.
+/// one can be copied into `libdraw::theme::window_shadow` and `desktop-shell`'s constants.
+///
+/// `--dark` starts from the dark scheme's shadow and draws the mock windows in the dark scheme,
+/// because a shadow's strength is judged against the windows it falls on.
 fn cmd_tune(args: &[String]) -> R<()> {
     use libdraw::compose::{Shadow, ShadowLayer, SurfaceRef, compose_exposed};
     use libdraw::format::{PixelFormat, Rgb};
@@ -7275,7 +7285,12 @@ fn cmd_tune(args: &[String]) -> R<()> {
             None => Ok(default),
         }
     };
-    let [wide, contact] = libdraw::theme::WINDOW_SHADOW.layers;
+    let scheme = if args.iter().any(|a| a == "--dark") {
+        libdraw::theme::Scheme::Dark
+    } else {
+        libdraw::theme::Scheme::Light
+    };
+    let [wide, contact] = libdraw::theme::window_shadow(scheme).layers;
     let shadow = Shadow {
         layers: [
             ShadowLayer {
@@ -7338,7 +7353,7 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let (wp, wg) = wallpaper_for_screen(sw, sh)?;
     let mut shot_fb = MemFramebuffer::new(g);
     let faces = host_faces()?;
-    let ui = reference_frame(&faces, "ui")?;
+    let ui = reference_frame(&faces, if scheme == libdraw::theme::Scheme::Dark { "ui-dark" } else { "ui" })?;
     let (uw, uh) = {
         let ug = Framebuffer::geometry(&ui);
         (ug.width, ug.height)
@@ -8173,7 +8188,10 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // to the terminal reference is all it takes.
     // How far past a one-pixel window the shadow paints, rightward and downward — over every
     // layer, since the refresh's shadow has two and the wider need not be the one dropped further.
-    let reach = libdraw::theme::WINDOW_SHADOW.around(libdraw::geom::Rect::new(0, 0, 1, 1));
+    // **The light scheme's**, because nothing in a self-test boot says otherwise: there is no
+    // session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
+    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
+    let reach = shadow.around(libdraw::geom::Rect::new(0, 0, 1, 1));
     let reach_x = (reach.right() - 1) as u32;
     let reach_y = (reach.bottom() - 1) as u32;
     if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
@@ -8196,7 +8214,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         libdraw::geom::Rect::new(0, 0, sw, sh),
         // Square: the reference windows are not rounded until Part B rounds real ones.
         0,
-        &libdraw::theme::WINDOW_SHADOW,
+        &shadow,
         &libdraw::geom::Rect::new(0, 0, tw, th),
     );
     let term = term;
@@ -8240,7 +8258,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         libdraw::geom::Rect::new(0, 0, tw, th),
         // Square: the reference windows are not rounded until Part B rounds real ones.
         0,
-        &libdraw::theme::WINDOW_SHADOW,
+        &shadow,
         &libdraw::geom::Rect::new(0, 0, uw, uh),
     );
     let ui = ui;

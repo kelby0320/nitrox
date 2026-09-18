@@ -27,7 +27,8 @@
 
 use crate::format::Rgb;
 
-/// The shadow a floating window casts (M13 Part C).
+/// The shadow a floating window casts in `scheme` (M13 Part C; two layers and two schemes since
+/// the desktop refresh's Part A).
 ///
 /// **Here rather than in the compositor**, because two things must agree about it: the compositor
 /// draws it, and `cargo xtask check-display` renders what the screen should look like and compares
@@ -37,19 +38,36 @@ use crate::format::Rgb;
 ///
 /// **Not a `Theme` field**, though: a shadow is not a colour. It is black at a coverage, the way a
 /// glyph's antialiased edge is, so a palette that had to name it would be naming an effect. Which
-/// *roles* cast one stays the compositor's decision.
+/// *roles* cast one stays the compositor's decision. What *does* depend on the palette is how
+/// strong it is, which is why this takes a scheme — and why the compositor, which never reads a
+/// theme file, has to be told which scheme is in force (the manager's `SetScheme`).
 ///
-/// **Chosen by eye against a real desktop**, with `cargo xtask tune` (M13 Part C). The first
-/// values were roughly twice this opacity and read as a drawn border rather than as depth; the
-/// curve was the larger half of that — see [`draw_shadow`](crate::compose::draw_shadow). At 60,
-/// the shadow is 24% opaque where it meets the window and under 6% half a radius out.
-pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow::single(crate::compose::ShadowLayer {
-    radius: 16,
-    // Dropped, not centred: a shadow directly under a window reads as a glow.
-    offset: crate::geom::Point::new(0, 4),
-    colour: crate::format::Rgb::new(0, 0, 0),
-    strength: 60,
-});
+/// **The design's numbers, mapped rather than re-chosen**: its `--sh` is
+/// `0 10px 28px rgba(0,0,0,.22), 0 2px 6px rgba(0,0,0,.14)` in the light palette and
+/// `0 12px 34px .55, 0 2px 8px .4` in `deep`. A CSS blur radius and drop become this crate's
+/// radius and offset, and an alpha becomes a strength out of 255. `cargo xtask tune --corner 8`
+/// compared those against the single layer that shipped and against two scaled-down pairs; the
+/// differences were in how crisp the contact edge was, and nothing argued for moving off the
+/// design. A shadow is a depth cue, not a proportion of the screen, so the design's 1440×900
+/// canvas is no reason to shrink it.
+///
+/// **The single layer this replaced was chosen by eye too** (M13 Part C: radius 16, drop 4,
+/// strength 60). Its first values were roughly twice that opacity and read as a drawn border;
+/// the curve was the larger half of that — see [`draw_shadow`](crate::compose::draw_shadow).
+pub const fn window_shadow(scheme: Scheme) -> crate::compose::Shadow {
+    use crate::compose::{Shadow, ShadowLayer};
+    use crate::geom::Point;
+    let (wide, contact) = match scheme {
+        // Dropped, not centred, both of them: a shadow directly under a window reads as a glow.
+        Scheme::Light => ((28, 10, 56), (6, 2, 36)),
+        Scheme::Dark => ((34, 12, 140), (8, 2, 102)),
+    };
+    // A nested `const fn` rather than a closure, which a `const fn` cannot call.
+    const fn layer((radius, drop, strength): (u32, i32, u8)) -> ShadowLayer {
+        ShadowLayer { radius, offset: Point::new(0, drop), colour: Rgb::BLACK, strength }
+    }
+    Shadow { layers: [layer(wide), layer(contact)] }
+}
 
 /// The colours and text size everything on screen is drawn from.
 ///

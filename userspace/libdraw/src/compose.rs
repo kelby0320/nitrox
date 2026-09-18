@@ -257,33 +257,52 @@ fn draw_layer<F: Framebuffer + ?Sized>(
     let Some(area) = shadow.around(bounds).intersect(clip) else { return };
     let r = shadow.radius as i64;
     let rr = r * r;
+    // `inner` is empty on an axis where the surface is exactly `2c` across, and then its right
+    // edge is its left: `right() - 1` would sit one pixel *before* the origin and every pixel
+    // between would measure a distance of one.
+    let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
+    let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
+    let (left, right) = (bounds.origin.x, bounds.right() as i32);
+    let (top, bottom) = (bounds.origin.y, bounds.bottom() as i32);
     for y in area.origin.y..area.bottom() as i32 {
-        for x in area.origin.x..area.right() as i32 {
-            // Inside the surface, where the blit is about to cover this pixel whole.
-            if x >= bounds.origin.x
-                && y >= bounds.origin.y
-                && x < bounds.right() as i32
-                && y < bounds.bottom() as i32
-                && covered(bounds, c, x, y) == 255
-            {
+        // **The part of this row the surface covers whole, skipped as a span** (desktop refresh,
+        // Part A). This loop used to visit every pixel of the damage and reject the covered ones
+        // one at a time — for a window-sized damage rectangle, the whole window, per layer, and a
+        // second layer doubled it: the two-layer shadow measured 2.0x the single one on the host
+        // and failed `test-qemu`'s idle check under emulation — and failed it again when this
+        // loop was put back, which is what makes it the cause rather than a coincidence. The span
+        // is exactly the pixels `covered` answers 255 for — the row between the curves, from
+        // `corner::row`.
+        let (skip_from, skip_to) = if y >= top && y < bottom {
+            let shape = crate::corner::row(c, (y - top).min(bottom - 1 - y) as u32);
+            let inset = (shape.clear + shape.partial) as i32;
+            (left + inset, right - inset)
+        } else {
+            (0, 0)
+        };
+        let dy = (iy0 - y).max(y - iy1).max(0) as i64;
+        let mut x = area.origin.x;
+        while x < area.right() as i32 {
+            if x >= skip_from && x < skip_to {
+                x = skip_to;
                 continue;
             }
-            // `inner` is empty on an axis where the surface is exactly `2c` across, and then its
-            // right edge is its left: `right() - 1` would sit one pixel *before* the origin and
-            // every pixel between would measure a distance of one.
-            let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
-            let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
             let dx = (ix0 - x).max(x - ix1).max(0) as i64;
-            let dy = (iy0 - y).max(y - iy1).max(0) as i64;
-            // `isqrt` floors, so a pixel is never darker than its true distance would make it.
-            let d = ((dx * dx + dy * dy) as u64).isqrt() as i64 - c as i64;
-            let d = d.max(0);
-            if d >= r {
-                continue;
+            // Beside a straight edge one of the two is zero and the distance is the other,
+            // exactly — `isqrt` of a perfect square is its root — so the root is taken only off
+            // the corners, where both are non-zero. `isqrt` floors, so a pixel is never darker
+            // than its true distance would make it.
+            let d = match (dx, dy) {
+                (0, d) | (d, 0) => d,
+                _ => ((dx * dx + dy * dy) as u64).isqrt() as i64,
+            };
+            let d = (d - c as i64).max(0);
+            if d < r {
+                let t = r - d;
+                let coverage = (shadow.strength as i64 * t * t / rr) as u8;
+                fb.blend_pixel(x as u32, y as u32, shadow.colour, coverage);
             }
-            let t = r - d;
-            let coverage = (shadow.strength as i64 * t * t / rr) as u8;
-            fb.blend_pixel(x as u32, y as u32, shadow.colour, coverage);
+            x += 1;
         }
     }
 }
@@ -1378,6 +1397,95 @@ mod tests {
         // And a layer with nothing to draw neither draws nor widens the damage.
         assert_eq!(Shadow::single(wide).around(bounds), wide.around(bounds));
         assert_eq!(ShadowLayer::NONE.around(bounds), bounds);
+    }
+
+    #[test]
+    fn the_span_skipping_shadow_draws_exactly_what_the_per_pixel_one_did() {
+        // **Byte for byte**, because every gate's expected picture is drawn by this function and
+        // the change was made for speed alone. Arrangements chosen to hit each thing the fast
+        // path does differently: a corner of every size (the skipped span narrows along a curve),
+        // an offset past and inside the radius, a clip that starts or ends inside the skipped
+        // span, a window exactly `2c` across, and one partly off the screen.
+        let g = screen_geom();
+        let (pg, ground) = patterned(64, 48, 64 * 4, 0x33);
+        for corner in [0u32, 1, 3, 6, 8, 20] {
+            for layer in [
+                ShadowLayer { radius: 6, offset: Point::new(0, 2), colour: Rgb::BLACK, strength: 160 },
+                ShadowLayer { radius: 12, offset: Point::new(3, 7), colour: Rgb::new(40, 0, 90), strength: 90 },
+                ShadowLayer { radius: 3, offset: Point::new(0, 9), colour: Rgb::BLACK, strength: 255 },
+            ] {
+                for bounds in [Rect::new(14, 10, 30, 20), Rect::new(20, 12, 12, 12), Rect::new(-5, 30, 24, 25)] {
+                    for clip in [g.bounds(), Rect::new(20, 0, 9, 48), Rect::new(0, 15, 64, 4), Rect::new(30, 22, 30, 30)] {
+                        let draw = |f: fn(&mut crate::framebuffer::MemFramebuffer, Rect, u32, &ShadowLayer, &Rect)| {
+                            let mut fb = crate::framebuffer::MemFramebuffer::new(pg);
+                            fb.bytes_mut().copy_from_slice(&ground);
+                            f(&mut fb, bounds, corner, &layer, &clip);
+                            fb
+                        };
+                        assert_eq!(
+                            draw(draw_layer),
+                            draw(draw_layer_reference),
+                            "corner {corner}, {layer:?}, {bounds:?} through {clip:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The per-pixel `draw_layer` this module shipped before the span skip, kept as the
+    /// definition the fast one must agree with byte for byte.
+    fn draw_layer_reference<F: Framebuffer + ?Sized>(
+        fb: &mut F,
+        bounds: Rect,
+        corner: u32,
+        shadow: &ShadowLayer,
+        clip: &Rect,
+    ) {
+        if !shadow.is_visible() {
+            return;
+        }
+        let c = crate::corner::clamp(corner, bounds.size.w, bounds.size.h);
+        // The cast with its corners' centres as its own corners: distance to *this*, less `c`, is
+        // distance to the rounded shape.
+        let inner = Rect::new(
+            bounds.origin.x + shadow.offset.x + c as i32,
+            bounds.origin.y + shadow.offset.y + c as i32,
+            bounds.size.w - 2 * c,
+            bounds.size.h - 2 * c,
+        );
+        let Some(area) = shadow.around(bounds).intersect(clip) else { return };
+        let r = shadow.radius as i64;
+        let rr = r * r;
+        for y in area.origin.y..area.bottom() as i32 {
+            for x in area.origin.x..area.right() as i32 {
+                // Inside the surface, where the blit is about to cover this pixel whole.
+                if x >= bounds.origin.x
+                    && y >= bounds.origin.y
+                    && x < bounds.right() as i32
+                    && y < bounds.bottom() as i32
+                    && covered(bounds, c, x, y) == 255
+                {
+                    continue;
+                }
+                // `inner` is empty on an axis where the surface is exactly `2c` across, and then its
+                // right edge is its left: `right() - 1` would sit one pixel *before* the origin and
+                // every pixel between would measure a distance of one.
+                let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
+                let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
+                let dx = (ix0 - x).max(x - ix1).max(0) as i64;
+                let dy = (iy0 - y).max(y - iy1).max(0) as i64;
+                // `isqrt` floors, so a pixel is never darker than its true distance would make it.
+                let d = ((dx * dx + dy * dy) as u64).isqrt() as i64 - c as i64;
+                let d = d.max(0);
+                if d >= r {
+                    continue;
+                }
+                let t = r - d;
+                let coverage = (shadow.strength as i64 * t * t / rr) as u8;
+                fb.blend_pixel(x as u32, y as u32, shadow.colour, coverage);
+            }
+        }
     }
 
     // ---- rounded corners (desktop refresh, Part A) ----

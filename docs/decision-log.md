@@ -26676,3 +26676,76 @@ Three of the five errors a review found in that draft came from the same place: 
 picture as a specification.** The switcher's rule, the overview's thumbnails and the page's own
 size were all taken off screenshots rather than out of the source, and all three were wrong. A
 design is evidence about appearance, and not about architecture.
+
+## 2026-09-18 — Desktop refresh Part A: the design as data
+
+Part A of [`desktop-refresh.md`](planning/desktop-refresh.md) is built: the design's palette in two
+schemes, the three `libdraw` primitives its surfaces need, a two-layer shadow, and the one message
+that tells the compositor which scheme is in force. Nothing is restyled yet — every window is still
+square and still laid out as before — but every colour on the screen is now the design's.
+
+**The theme's keys changed once, here, so a file's format changes once.** `accent`,
+`foreground_dim`, `panel`, `ok` and `deny` are new; `scheme = "light" | "dark"` names which palette a
+file starts from. **`accent` replaced `focus_ring` and `selection` rather than joining them**, which
+is the design's own model: its page stores one accent and *computes* the selection and the hover
+from it (`a + '33'`, and `a + '1A'` or `'2E'` by palette). Storing them would be storing a
+computation, and a file could set the three out of step. With both washes derived, nothing needs a
+colour with alpha, so the plan's eight-digit hex was not built.
+
+**The near-duplicates were decided from the page's code, not its screenshots** — the lesson of the
+detail pass applied at once. `--lineSoft` measures as `--line` at half strength over the ground in
+both palettes, so it is a derivation. `panel` and `sidebar` are two colours, because the panel is
+lighter than a button's face in the light palette and the darkest surface in the dark one.
+
+**Two departures from the design, each held by a test.** The dark scheme's `deny` is `#D46F63`,
+because the design uses one `--deny` for both palettes and it is 2.9:1 on its own dark ground — and
+here `deny` is drawn as text. A test holds every text colour to WCAG's 4.5:1 in both schemes; it
+is what found that. And the focused title bar is the accent washed over the face: the divergence
+the plan argued for, in the maintainer's words "a different color".
+
+**The staged `theme.toml` now writes only its deliberate overrides live**, every other value shown
+but commented out. It used to write all thirty colours live, harmless while there was one palette —
+and with two it would have pinned the laptop to the light one whatever `scheme` said.
+
+**The metrics are absolute, and the type needed no change.** A CSS pixel is 1/96 inch and the
+laptop's panel is about 100 per inch, so the design's pixel metrics are physical sizes: a 30 px
+panel, a 31 px title bar, 8 px corners and its shadow transfer as written, while anything composed
+against its 1440×900 canvas becomes a fraction of the screen. **The type was already the design's**:
+`font_px` is `ab_glyph`'s ascent-to-descent height, which for DejaVu Sans is 1.164 em, so the staged
+14 is a 12.0 px em. Measured the same way off the design's 1:1 screenshot, its `n` is 7 px tall and
+DejaVu's at 14 is 7 px. I had been about to propose shrinking the text on the strength of the
+nominal numbers — 16 against 12.5 — which compare different quantities.
+
+**The compositor learns the scheme from the manager's `SetScheme`** (`0x0928`), M11 decision 1's
+own mechanism. The shell sends it on every session start, light included, so every graphical boot
+runs the path and `check-login` asserts the compositor's `scheme light` line against the staged
+theme. **The 2026-09-17 entry overstated what it has to carry**: it said the compositor's shadow,
+ground, outline and cursor were exactly where the palettes differ. Only the shadow does — the design
+keeps its wallpaper, accent and state colours outside its palettes, and the cursor and drag outline
+have no reason to change.
+
+**That entry's other claim about corners was also wrong, the other way.** It called
+`covers`-minus-the-corners "the optimisation that accompanies the mask". It is required: a rounded
+window that still counted as covering its whole rectangle leaves its corners holding whatever the
+framebuffer last held, because the background fill beneath them is skipped and the mask then writes
+nothing there. The rounded `compose`/`compose_exposed` equivalence test over a stale framebuffer
+fails without it.
+
+**The two-layer shadow cost a boot first, and my first explanation of why was wrong.** The design's
+pair measured 2.0× the single layer that shipped, and `test-qemu`'s idle check failed: `ui-testclient`
+had not finished churning 128 windows inside the five seconds the check waits. I blamed those
+windows' shadows — and they never reach the screen; the churn commits nothing. What the evidence
+supported was the loop itself: `draw_layer` visited every pixel of a window's overlap with *any*
+damage rectangle to reject the covered ones, so every repaint touching a window paid for its whole
+interior, per layer, and the second layer doubled that. Skipping the covered span per row, and
+blending with one pixel lookup instead of two, took the shipped layer from 1.39 to 0.71 ms and the
+pair to 1.51 ms on the host with byte-identical output. **Then the counterfactual**: with the old
+loop put back the idle check failed again the same way, and with the new one it passed on each of
+three boots. A test holds the fast loop to the old one byte for byte, because every gate's expected
+picture is drawn through it.
+
+**Also seen, and not acted on.** `check-terminal` failed once waiting for F1 to reopen a menu, while
+host-side `tune` renders were loading the machine, and passed alone. The transcript is consistent
+with F1 landing on the popup that had just been chosen from — the gate sends it on `chose Clear`,
+and `focus=1` is logged after — but that is a reading of one transcript, not a cause shown, and it
+is unrelated to this part.

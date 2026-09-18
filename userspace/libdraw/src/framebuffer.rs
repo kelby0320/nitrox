@@ -138,13 +138,22 @@ pub trait Framebuffer {
     /// and a narrow channel does round-trip `decode` → `encode` (`decode` replicates the high
     /// bits and `encode` truncates them back). Verified over all 65 536 words of a 5-6-5
     /// format before the claim was removed rather than reasoned about a second time.
+    ///
+    /// **One lookup, not two** (desktop refresh, Part A). This was `get_pixel` then `put_pixel`,
+    /// which copied the geometry and computed the offset twice per pixel — and blending is most
+    /// of what a shadow costs: taking it out of the two-layer shadow's loop left under a quarter
+    /// of the time. The arithmetic is unchanged, so every picture is the same bytes; the
+    /// `put_pixel`/`get_pixel` pair it replaced is kept as a test's definition of the result.
     fn blend_pixel(&mut self, x: u32, y: u32, colour: Rgb, coverage: u8) {
         match coverage {
             0 => {}
             255 => self.put_pixel(x, y, colour),
             a => {
-                let Some(under) = self.get_pixel(x, y) else { return };
-                self.put_pixel(x, y, colour.blend(under, a));
+                let g = self.geometry();
+                let Some(off) = g.offset_of(x, y) else { return };
+                let b = &mut self.bytes_mut()[off..off + 4];
+                let under = g.format.decode(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                b.copy_from_slice(&g.format.encode(colour.blend(under, a)).to_le_bytes());
             }
         }
     }
@@ -641,6 +650,40 @@ mod tests {
             let under = f.decode(w);
             assert_eq!(f.encode(src.blend(under, 0)), f.encode(under), "zero coverage at {w:#x}");
             assert_eq!(f.encode(src.blend(under, 255)), f.encode(src), "full coverage at {w:#x}");
+        }
+    }
+
+    #[test]
+    fn blend_pixel_writes_what_get_then_put_wrote() {
+        // **The definition the one-lookup `blend_pixel` must match byte for byte** (desktop
+        // refresh, Part A): it was `get_pixel` then `put_pixel`, and every picture a gate compares
+        // was drawn through it. A format with alpha is in the list because `put_pixel` writes an
+        // opaque alpha, and a fast path that copied the old one through would differ only there.
+        for format in [PixelFormat::XRGB8888, PixelFormat::XBGR8888, PixelFormat::ARGB8888] {
+            let g = Geometry::packed(3, 2, format);
+            let mut base = MemFramebuffer::new(g);
+            for (i, b) in base.bytes_mut().iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+            }
+            for colour in [Rgb::BLACK, Rgb::new(0x2C, 0x7F, 0x92), Rgb::new(255, 255, 255)] {
+                for coverage in [0u8, 1, 51, 127, 128, 200, 254, 255] {
+                    for (x, y) in [(0, 0), (2, 1), (3, 0), (0, 2)] {
+                        let mut fast = base.clone();
+                        fast.blend_pixel(x, y, colour, coverage);
+                        let mut want = base.clone();
+                        match coverage {
+                            0 => {}
+                            255 => want.put_pixel(x, y, colour),
+                            a => {
+                                if let Some(under) = want.get_pixel(x, y) {
+                                    want.put_pixel(x, y, colour.blend(under, a));
+                                }
+                            }
+                        }
+                        assert_eq!(fast, want, "{format:?} {colour:?} at {coverage} on ({x},{y})");
+                    }
+                }
+            }
         }
     }
 

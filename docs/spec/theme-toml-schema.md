@@ -207,6 +207,12 @@ file that omitted them would be describing a different thing than the type does.
 making them live: a control panel that wants to restyle the cursor** — the mechanism is a manager
 op on a channel the shell already holds.
 
+**`scheme` does reach the compositor, and by exactly that mechanism** (desktop refresh, Part A).
+The shell sends the manager's [`SetScheme`](rsproto-surface-ops.md#setscheme-0x0928) on every
+session start, and the compositor draws each window's shadow for that scheme — the design's dark
+shadow is more than twice as strong as its light one. It names one of the two compiled palettes
+rather than carrying colours, so the four keys above stay what they were: read, and not live.
+
 **And `background` is live for window interiors only**, for exactly the same reason. The ground
 *between* windows is the compositor's `scene::BACKGROUND`, a compile-time constant taken from the
 built-in theme — so a file that sets `background` recolours what windows draw on and leaves the

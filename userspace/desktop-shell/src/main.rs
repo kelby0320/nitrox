@@ -1963,6 +1963,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             None
         }
     };
+    // **The scheme, to the one process that cannot read it** (desktop refresh, Part A). The
+    // compositor draws every window's shadow, the design makes a dark scheme's much darker, and
+    // `init` started the compositor long before anyone read a theme. Sent before any application
+    // is launched, so no window is ever drawn with the wrong one.
+    if let Some(m) = manager.as_mut() {
+        tell_scheme(m, theme.scheme);
+    }
     // **The work area, from the compositor rather than from arithmetic here.** The shell's own
     // two bars are not the only struts a session can have — any `panel`-role client declares
     // one — and a maximised window computed from the screen's height less two bars would sit under the next
@@ -4454,6 +4461,30 @@ fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bo
             hcount,
             SENDMODE_NOBLOCK,
         ) == 0
+    }
+}
+
+/// Tell the compositor which scheme the session's theme named.
+///
+/// **Sent whatever the scheme is, light included**, though the compositor starts light. Every gate
+/// that boots a session boots the staged theme, which is light — so a message sent only for dark
+/// would be a path no boot ever took, and the compositor's `scheme light` line is the one piece of
+/// evidence a boot can give that the theme reached it.
+fn tell_scheme(mgr: &mut ChannelTransport, scheme: libdraw::theme::Scheme) {
+    use librsproto::surface::{MgrScheme, OP_MGR_SET_SCHEME, SCHEME_DARK, SCHEME_LIGHT};
+    let value = match scheme {
+        libdraw::theme::Scheme::Light => SCHEME_LIGHT,
+        libdraw::theme::Scheme::Dark => SCHEME_DARK,
+    };
+    let mut body = [0u8; core::mem::size_of::<MgrScheme>()];
+    if (MgrScheme { scheme: value }).write(&mut body).is_none() {
+        kprint(b"desktop-shell: a SetScheme body would not serialise\n");
+        return;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_SET_SCHEME, &body, None, &mut reply).is_err() {
+        // Not fatal: the windows are drawn, with the light scheme's shadows.
+        kprint(b"desktop-shell: SetScheme was refused; shadows stay the light scheme's\n");
     }
 }
 

@@ -1773,6 +1773,13 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
         };
     }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
+    // **Said on the console, changed or not**, because it is the one proof a boot can give that
+    // the shell's theme reached this process: the compositor never reads the file, and every gate
+    // that boots a session boots the light scheme — the scheme this compositor already started
+    // in — so a line only on a *change* would say nothing on exactly the boots that check it.
+    if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
+        Line::new().s(b"compositor: scheme ").s(srv.stack.scheme().as_str().as_bytes()).end();
+    }
     // **A manager acting on a window invalidates what that window last *asked* to be.** The
     // dedup on `RequestState` compares against a value only client requests were writing, and
     // the manager changes a window's state by four other routes — a taskbar click, a chord, the
