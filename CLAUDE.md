@@ -79,7 +79,7 @@ window, and stops producing motion, before the guest's cursor reaches the edge. 
 keystrokes are your desktop's rather than the guest's. `--grab` confines the pointer and takes
 the keyboard (Ctrl-Alt-G releases it); on a Wayland session it also runs the window through
 XWayland, because a grab is an X operation. The chords are `Super+A`
-(the applications modal, and a second one closes it), `Super+H`, `Super+1..4`,
+(the Applications menu, and a second one closes it), `Super+H`, `Super+1..4`,
 `Super+Shift+1..4`, `Super+R`. `Super` alone is unbound and **reserved for a full launcher**,
 should one be built.
 
@@ -157,7 +157,7 @@ timer tick instead of its own interrupt takes 3 s or more), and that a serial lo
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
 `check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
 menu entry with a blank disk attached, and drives the path a person takes on the laptop —
-Limine's menu, the **graphical** greeter, a terminal from the applications modal, and `nxinstall`
+Limine's menu, the **graphical** greeter, a terminal from the Applications menu, and `nxinstall`
 typed at the shell in it. Nothing reads the terminal's grid (a release image deliberately does
 not narrate it), so what it asserts on **in the guest** is the kernel log: the ESP module that
 entry alone loads, the four devices the session and then the shell hand on, and the milestones a
@@ -196,8 +196,8 @@ hand, from time to time, not in CI**: twenty boots is what confirming resolution
 costs, and no PR should pay it.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
-release image and driving it to five moments — the greeter, the bare desktop, the applications
-modal, two real windows, and the overview — then writing what QEMU says is on the display to
+release image and driving it to five moments — the greeter, the bare desktop, the Applications
+menu, two real windows, and the overview — then writing what QEMU says is on the display to
 `tools/build-cache/shot-*.png`. It costs a boot, and it is the only way to see the things
 `preview` cannot: the cursor, the window frames, the ground between windows, and how two windows
 sit next to each other. A tool rather than a gate — it asserts only enough to know the picture is
