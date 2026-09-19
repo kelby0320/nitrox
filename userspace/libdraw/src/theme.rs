@@ -449,7 +449,11 @@ impl Theme {
             // with them either.
             desktop: Rgb::new(0x13, 0x52, 0x5D),
 
-            font_px: 16.0,
+            // **13, the body size the refresh chose**, and one step above the 12 the image stages
+            // (desktop refresh, Part G): DejaVu's tall lowercase makes 12 read like the design's
+            // Plex at 11.5, which was judged on screendumps rather than from a width table. The
+            // two stay different on purpose — see `xtask`'s `THEME_FONT_PX`.
+            font_px: 13.0,
             // **Flat**, as the design is: not one gradient in the page. The key stays, because a
             // bevel is still a theme a person may want.
             bevel: 0,
@@ -508,7 +512,7 @@ impl Theme {
             border: Rgb::new(0x36, 0x43, 0x42),
             desktop: Rgb::new(0x13, 0x52, 0x5D),
 
-            font_px: 16.0,
+            font_px: 13.0,
             bevel: 0,
             font_ui: ThemePath::new(crate::text::UI_FONT_PATH),
             font_mono: ThemePath::new(crate::text::MONO_FONT_PATH),

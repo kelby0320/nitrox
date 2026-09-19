@@ -449,22 +449,45 @@ License and would ship as freely — and not taken, to keep the image and the bu
 |---|---|---|---|---|---|
 | width against the page's Plex 11.5 | 1.35× | 1.25× | 1.15× | 1.11× | 1.06× |
 
-- [ ] **A smaller body size**, chosen on a screendump rather than from the table: DejaVu's large
+- [x] **A smaller body size**, chosen on a screendump rather than from the table: DejaVu's large
       x-height reads bigger than its pixel size, so 12 may read like the page's 11.5. The staged
       `font_px` and the built-in default move together.
-- [ ] **A size scale instead of one size.** The page uses 12.5 (top bar), 12 (titles, the
+      **Built (2026-09-18): 12 staged, 13 built in** — 14 and 16 before. Beside the page on a
+      `shot`, 12 reads as the page's 11.5 does and 13 reads a size larger. The default stays one
+      step apart so that `check-login` can tell the file reached a client. The terminal's grid is
+      sized from the same number, so at 12 it is also the page's 12 px terminal. **The greeter
+      draws at 13**: it runs before there is a user and so before a `theme.toml`, which is
+      Part D's to look at.
+- [x] **A size scale instead of one size.** The page uses 12.5 (top bar), 12 (titles, the
       terminal), 11.5 (menus, rows, fields), 10.5 (headers, status bars, byte counts) and 10
       (hints). The theme keeps one number — `font_px`, the body size — and the toolkit derives the
       others from it, so a theme still sets one value and the steps between them are ours. Status
       bars and column headers are where a smaller step shows most.
-- [ ] **Weight, if a screendump asks for it.** The title is the one place the page leans on it.
+      **Built: three steps, `TextSize::{Small, Body, Large}`** — ⅞, 1 and 13⁄12 of `font_px`,
+      which is 10.5, 12 and 13 at the staged size — set by an inherited `scaled` wrapper that,
+      unlike `ink`, changes what the text inside measures (widget-toolkit §5). Used where the page
+      steps today: `Large` for the top bar's two words, and `Small` for a menu's shortcut column
+      and the editor's status line. Column headers and the other status bars are Parts H–J's,
+      which build them.
+- [x] **Weight, if a screendump asks for it.** The title is the one place the page leans on it.
       DejaVu Sans Bold is the same family under the same licence, so it would ship beside
       `DejaVuSans.ttf` with nothing new to decide; if the title reads well enough in the dim-and-
       size hierarchy alone, no second face.
-- [ ] **Every aim moves, and each is pinned first.** Part C's arrangement — the gates' literals
+      **It asked, and titles are bold at the body size.** At 2× beside the page, a regular title
+      set a step larger did not anchor the window, and an overstruck bold smudged the counters.
+      So `DejaVuSans-Bold.ttf` ships beside the regular face, attached as its bold by `load_ui`,
+      and staged and rendered on the host from the same path. Set at `Large` as well, it
+      overshot, because DejaVu's bold is already heavier than the page's semibold. Measured
+      against the menu's `File`, the title is 1.62× its width at the body size and 1.75× a step
+      up, where the page's is 1.47×.
+- [x] **Every aim moves, and each is pinned first.** Part C's arrangement — the gates' literals
       pinned by host tests at the staged size and the built-in one — is what makes this change
       reviewable rather than a boot-by-boot hunt.
-- [ ] **Why it comes first**: every part after it measures against text. Doing type after them
+      **Done.** The shell's pinned sizes moved to 12 and 13 before any aim did. Then each literal
+      moved into the overlap of the two sizes' targets, found by a host probe rather than by
+      booting: the Places press, the Applications menu's filtered row, the first Places row, and
+      the workspace switcher's arrow and first cell. The Applications press stayed where it was.
+- [x] **Why it comes first**: every part after it measures against text. Doing type after them
       would measure everything twice, the greeter included.
 
 ## Part H — the parts of a window

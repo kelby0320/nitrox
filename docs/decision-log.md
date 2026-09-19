@@ -26960,3 +26960,48 @@ Plex, the page's face, is under the SIL Open Font License and was not taken, to 
 Most of the width gap is size rather than face: DejaVu is 1.35× the page's width at the staged 14
 and 1.15× at 12, so Part G is a smaller body size and a scale derived from it, with DejaVu Sans
 Bold (the same family and licence) only if a screendump says the title needs a weight.
+
+## 2026-09-18 — Desktop refresh Part G: type, in DejaVu — a body size, a scale and a bold title
+
+**The body size is 12, chosen on a screendump.** The staged `theme.toml` sets `font_px = 12`, and
+the built-in default is 13; before, they were 14 and 16. DejaVu's large x-height makes it read
+bigger than its pixel size. Beside the page, 12 reads as the page's 11.5 and 13 reads a size
+larger. The default stays one step from the staged value on purpose: `check-login` proves the file
+reached a client by reading back a size that is not the default. The terminal's grid is sized from
+the same number, so it is now the page's 12 px as well. The greeter is the exception: it draws with
+the built-in theme, because it runs before there is a user whose `theme.toml` it could read.
+
+**A size scale derived from one number, not a second theme key.** `libui` sets text at
+`TextSize::{Small, Body, Large}`: ⅞, 1 and 13⁄12 of `font_px`. Those proportions come from the
+page's own steps around its 11.5 body: a 10–10.5 status bar and secondary columns, and a 12.5 top
+bar. The steps are inherited wrappers like `ink`, with one difference: they change what the text
+inside *measures*. So `measure` and `arrange` now carry a `TextStyle` down the tree, and each
+wrapper has its own `Fingerprint`, which is how a change of step alone repaints. A free size on
+the node was rejected, because it would be a number that does not move when a person changes
+`font_px`. Today `Large` is used for the top bar's two words, and `Small` for a menu's shortcut
+column and the editor's status line.
+
+**The title asked for a weight, and got a real one.**
+- **Size alone did not anchor the window.** At 2× beside the page, a regular title a step larger
+  still did not, and the page's semibold title is the one place its hierarchy leans on weight.
+- **A synthetic bold smudged the counters**, so `DejaVuSans-Bold.ttf` ships beside the regular
+  face. It is the same family, licence and notice, so there was nothing new to decide.
+- **The bold is a companion of the face, not a theme key.** `Font::bold` returns it or, when there
+  is none, the face itself. `load_ui` attaches it only to the built-in UI face, because a theme
+  that names another face has no bold this system knows about, and its titles stay regular.
+- **Guest and host use one path.** The image stages the file, and the host's reference renders
+  attach it, from the same `UI_BOLD_FONT_PATH`, so `check-display`'s two sides agree by
+  construction.
+- **Bold at the body size, not a step up as well.** DejaVu's bold is heavier than the page's
+  semibold already. Measured against the menu's `File`, the title is 1.62× its width at the body
+  size and 1.75× a step up, where the page's is 1.47×.
+
+**Every aim moved, and each was pinned first.** The shell's host tests moved their two sizes to 12
+and 13 before any literal changed. Each aim then moved into the overlap of its two targets, found
+by a host probe rather than by booting. That covered the Places press, the Applications menu's
+filtered row, the first Places row, and the switcher's arrow and first cell. Nothing about the
+arrangement was new: it is Part C's, and it is why this was a change to review rather than a hunt.
+
+**Corrected in passing.** The theme schema said a window bar was 24 pixels and shared the list
+row's 16-pixel bound; it has been 31 since Part B. The bound is the list row's alone, and the
+schema now says where the one step above the body is drawn.
