@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use libdraw::format::Rgb;
 use libdraw::geom::Size;
 use libui::element::{
-    Element, Insets, center, center_v, column, fill, ink, padding, rounded_fill, row, sized, stack,
-    text, wash, with_spacing,
+    Element, Insets, TextSize, center, center_v, column, fill, ink, padding, rounded_fill, row,
+    scaled, sized, stack, text, wash, with_spacing,
 };
 use libui::layout::{Constraints, Metrics, measure};
 use libui::menu::{Item, Menu, MenuState, popup, popup_headed};
@@ -128,12 +128,19 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
         lit(APPS_KEY, APPS),
         padding(
             APPS_PAD,
-            with_spacing(row(alloc::vec![center_v(dot), center_v(text("Applications"))]), APPS_GAP),
+            with_spacing(
+                row(alloc::vec![
+                    center_v(dot),
+                    center_v(scaled(TextSize::Large, text("Applications"))),
+                ]),
+                APPS_GAP,
+            ),
         ),
     )
     .on_press(TopMsg::Menu(APPS))
     .key(APPS_KEY);
-    let places = face(lit(PLACES_KEY, PLACES), padding(PLACES_PAD, center_v(text("Places"))))
+    let words = center_v(scaled(TextSize::Large, text("Places")));
+    let places = face(lit(PLACES_KEY, PLACES), padding(PLACES_PAD, words))
         .on_press(TopMsg::Menu(PLACES))
         .key(PLACES_KEY);
 
@@ -610,20 +617,21 @@ mod tests {
 
     /// `check-login`'s aim at the forward arrow, from the screen's right edge, with `work`
     /// current and one scratch desktop after it.
-    const NEXT_FROM_RIGHT: i32 = 75;
+    const NEXT_FROM_RIGHT: i32 = 67;
     /// Its aim at the first cell, from the right edge, with `Desktop 2` current of two.
-    const FIRST_CELL_FROM_RIGHT: i32 = 163;
+    const FIRST_CELL_FROM_RIGHT: i32 = 148;
 
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
     }
 
-    /// The text sizes every aim must hold at: **14, what the image stages** — `xtask`'s
-    /// `THEME_FONT_PX`, and so what every gate boots — and 16, the built-in theme's, for a session
-    /// with no theme file. The bars are laid out in the session's theme, so an aim pinned at one
-    /// size could drift out of its target at the other with nothing failing; the first version of
-    /// these tests pinned 16 alone while the guest drew 14 (PR #314 review, finding 4).
-    const FONT_SIZES: [f32; 2] = [14.0, 16.0];
+    /// The text sizes every aim must hold at: **12, what the image stages** — `xtask`'s
+    /// `THEME_FONT_PX`, and so what every gate boots — and 13, the built-in theme's, for a session
+    /// with no theme file (both since the desktop refresh's Part G; they were 14 and 16). The bars
+    /// are laid out in the session's theme, so an aim pinned at one size could drift out of its
+    /// target at the other with nothing failing; the first version of these tests pinned the
+    /// built-in size alone while the guest drew the staged one (PR #314 review, finding 4).
+    const FONT_SIZES: [f32; 2] = [12.0, 13.0];
 
     /// The light theme at each of [`FONT_SIZES`].
     fn themes() -> impl Iterator<Item = Theme> {
@@ -666,7 +674,8 @@ mod tests {
                 let bounds = Rect::new(0, 0, width, BAR_H);
                 let bar = top_bar("12:34", None, None, &theme);
                 assert_eq!(click(&bar, bounds, &m, 60, 12), [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
-                assert_eq!(click(&bar, bounds, &m, 158, 12), [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
+                let places = click(&bar, bounds, &m, 134, 12);
+                assert_eq!(places, [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
                 // And the clock is not a control: a press on it is a press on the bar.
                 assert!(click(&bar, bounds, &m, width as i32 / 2, 12).is_empty(), "the clock at {width}");
             }
@@ -832,10 +841,10 @@ mod tests {
                 });
                 (msgs, want)
             };
-            let (got, want) = aim(APPS, "nxterm", ROW_KEY_BASE, (60, 87));
+            let (got, want) = aim(APPS, "nxterm", ROW_KEY_BASE, (60, 82));
             assert_eq!(got, [want.unwrap()], "ROW1 is the one row left after typing nxterm");
             assert_eq!(got, [MenuMsg::Launch(1)]);
-            let (got, _) = aim(PLACES, "", ROW_KEY_BASE + 1, (180, 80));
+            let (got, _) = aim(PLACES, "", ROW_KEY_BASE + 1, (180, 75));
             assert_eq!(got, [MenuMsg::Place(1)], "PLACE_DOCUMENTS is the second row");
             assert_eq!(places[1].name, "Documents");
         }

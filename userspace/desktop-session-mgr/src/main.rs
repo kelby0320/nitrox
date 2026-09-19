@@ -119,11 +119,10 @@ impl Greeter {
     ///
     /// Rebuilt per frame, which is the toolkit's model: `view(&state) -> Element`.
     ///
-    /// **The theme comes from the caller**, because the caller is what paints this tree — and it
-    /// paints with `Theme { font_px: FONT_PX, .. }`, equal to the default today only because
-    /// `FONT_PX` happens to be `16.0`. One frame built from one theme and painted with another is
-    /// the mistake one type makes easy and the old two-type split made unwriteable
-    /// (PR #262 review, optional 5).
+    /// **The theme comes from the caller**, because the caller is what paints this tree — with
+    /// the built-in theme, for the reason `render` gives. One frame built from one theme and
+    /// painted with another is the mistake one type makes easy and the old two-type split made
+    /// unwriteable (PR #262 review, optional 5).
     fn view(&self, theme: &Theme) -> Element<()> {
         let active = |f: Focus| WidgetState { active: self.focus == f, ..Default::default() };
         let mut rows = alloc::vec::Vec::with_capacity(6);

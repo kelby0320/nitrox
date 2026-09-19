@@ -41,9 +41,15 @@ use crate::format::Rgb;
 use crate::framebuffer::Framebuffer;
 use crate::geom::{Point, Rect, Size};
 
-/// A loaded font.
+/// A loaded font — and, for a UI face, its bold companion if one was found.
 pub struct Font {
     inner: FontVec,
+    /// The same family's bold, which [`bold`](Self::bold) answers with (desktop refresh, Part G).
+    ///
+    /// **A companion rather than a second argument everywhere a font is passed**: a window title
+    /// is the only bold text on the desktop, and threading two faces through every `paint` and
+    /// every metric would put the weight in a hundred signatures for one line of text.
+    bold: Option<alloc::boxed::Box<Font>>,
 }
 
 /// What a font's vertical metrics come to at a given size.
@@ -63,7 +69,22 @@ impl Font {
     /// Takes ownership: the bytes come from a file read at runtime, not from a `'static`
     /// slice, which is what `FontVec` exists for.
     pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
-        FontVec::try_from_vec(data).ok().map(|inner| Self { inner })
+        FontVec::try_from_vec(data).ok().map(|inner| Self { inner, bold: None })
+    }
+
+    /// This face with `bold` as its bold companion.
+    pub fn with_bold(mut self, bold: Font) -> Self {
+        self.bold = Some(alloc::boxed::Box::new(bold));
+        self
+    }
+
+    /// The face bold text is drawn in: the companion if there is one, and this face if not.
+    ///
+    /// **The regular face when there is none**, rather than a faked weight: a title in the regular
+    /// weight is a desktop that looks slightly plainer, and a synthetic overstrike smudged the
+    /// counters of every `e` when it was tried against the real bold (Part G).
+    pub fn bold(&self) -> &Font {
+        self.bold.as_deref().unwrap_or(self)
     }
 
     /// Vertical metrics at `px`.
@@ -204,6 +225,14 @@ pub const UI_FONT_PATH: &str = "/system/fonts/DejaVuSans.ttf";
 /// a call site that did not choose a role no longer compiles.
 pub const MONO_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
 
+/// Where the proportional face's bold is — a window title's weight (desktop refresh, Part G).
+///
+/// **Not a theme key.** It is the bold of [`UI_FONT_PATH`], loaded beside it only when the theme
+/// uses that face: a theme naming another UI face has no matching bold this system knows of, so
+/// its titles are drawn in that face's regular weight. The same family and the same licence as the
+/// regular face, which is why adding it was a file and not a decision.
+pub const UI_BOLD_FONT_PATH: &str = "/system/fonts/DejaVuSans-Bold.ttf";
+
 /// The largest font file [`load`] will read.
 ///
 /// A bound rather than trust: the size comes from `sys_handle_stat` on a file this process
@@ -316,8 +345,29 @@ pub unsafe fn load_ui(
     theme: &crate::theme::Theme,
     who: &[u8],
 ) -> Result<(Font, ThemePath), LoadError> {
+    let builtin = crate::theme::Theme::light().font_ui;
     // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::light().font_ui, who) }
+    let (face, from) = unsafe { load_themed(root_ns, theme.font_ui, builtin, who) }?;
+    // **Its bold, when the face is the built-in one** — see `UI_BOLD_FONT_PATH`. A missing bold
+    // costs the titles their weight and nothing else, so it is said and not fatal.
+    if from != builtin {
+        return Ok((face, from));
+    }
+    // SAFETY: as above.
+    match unsafe { load(root_ns, UI_BOLD_FONT_PATH) } {
+        Ok(bold) => Ok((face.with_bold(bold), from)),
+        Err(e) => {
+            libkern::debug::Line::new()
+                .s(who)
+                .s(b": bold face ")
+                .s(UI_BOLD_FONT_PATH.as_bytes())
+                .s(b" ")
+                .s(e.why())
+                .s(b"; titles in the regular weight")
+                .end();
+            Ok((face, from))
+        }
+    }
 }
 
 /// Load the fixed-advance face a theme names, falling back to the built-in one.
@@ -393,6 +443,20 @@ mod tests {
 
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
+    }
+
+    /// `bold` answers with the companion when there is one and with the face itself when not.
+    #[test]
+    fn bold_is_the_companion_or_the_face_itself() {
+        const REGULAR: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        const BOLD: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans-Bold.ttf");
+        let plain = Font::from_bytes(REGULAR.to_vec()).unwrap();
+        assert!(core::ptr::eq(plain.bold(), &plain), "no companion: bold text is the regular face");
+        let bold = Font::from_bytes(BOLD.to_vec()).unwrap();
+        let paired = Font::from_bytes(REGULAR.to_vec()).unwrap().with_bold(bold);
+        assert!(!core::ptr::eq(paired.bold(), &paired));
+        let heavy = paired.bold().text_width("Files", 12.0);
+        assert!(heavy > paired.text_width("Files", 12.0), "and it is wider");
     }
 
     fn fb(w: u32, h: u32) -> MemFramebuffer {

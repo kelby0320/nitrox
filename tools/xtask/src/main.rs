@@ -103,13 +103,17 @@ const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
 
-/// The `font_px` the staged `theme.toml` carries — **deliberately not the built-in 16**.
+/// The `font_px` the staged `theme.toml` carries — **deliberately not the built-in 13**.
 ///
 /// A gate asserting the default proves nothing: a client that never received the theme reports
 /// the same number, so the assertion passes with the wire cut. This one can only have come from
 /// the file, through the shell, onto the setup record and into a window (PR #263 review,
 /// blocking 2). It is inside what the fixed chrome holds, which is what `MAX_FONT_PX` bounds.
-const THEME_FONT_PX: u8 = 14;
+///
+/// **12 since the desktop refresh's Part G**, which chose it by photographing the desktop at 13
+/// and 12 beside the design: DejaVu at 12 reads like the page's Plex at 11.5. It was 14, with the
+/// built-in 16 — the two moved together, and stay one step apart for the reason above.
+const THEME_FONT_PX: u8 = 12;
 
 /// Where the staged wallpaper goes, **as the session sees it**.
 ///
@@ -3820,7 +3824,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **The decoded size is the half that discriminates.** `1920x1200` can only have come from
     // an `IHDR` the guest actually read — the staged picture is deliberately not the screen's
     // size, so a shell that decoded nothing cannot report it, exactly as `THEME_FONT_PX` is
-    // deliberately not the built-in 16.
+    // deliberately not the built-in 13.
     //
     // **The drawn size tells fit from fill again, at the gates' screen** (Phase 5 Part E). On the
     // 1280×800 screen every gate booted until then, 16:10 into 16:10 is `1280x800 at 0,0` under
@@ -3951,8 +3955,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    pointing device until USB (Phase 6), so without a chord a session could be logged into
     //    and never used.
     //
-    //    The bar spans the screen at y=0 and `Applications` is its first word, 116 pixels wide
-    //    at the staged 14 px (126 at the built-in 16), so a press at (60, 12) lands inside it —
+    //    The bar spans the screen at y=0 and `Applications` is its first word, 105 pixels wide
+    //    at the staged 12 px (111 at the built-in 13), so a press at (60, 12) lands inside it —
     //    which `desktop_shell::panel`'s own test pins against this literal at both sizes
     //    (desktop refresh, Part C).
     //    Asserted through the compositor's own `press at` line first, for the reason
@@ -4165,11 +4169,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     type_into_menu(&mut qmp, &mut session, "nxterm")?;
     // **The menu hangs 8 pixels in from its word and 2 below the bar**, at (8, 32), with the
     // filter field above its rows (desktop refresh, Part C) — so the one row left sits a field's
-    // height below that, at y 71 to 97 in the staged 14 px (73 to 101 at the built-in 16).
-    // `desktop_shell::panel`'s own test pins this literal against a layout of the menu at both. `click_at` asserts the press position
-    // before anything downstream is checked, which is what separates "the pointer was not over
-    // the row" from "it was, and the click did nothing".
-    const ROW1: (i32, i32) = (60, 87);
+    // height below that, at y 69 to 93 in the staged 12 px (71 to 97 at the built-in 13).
+    // `desktop_shell::panel`'s own test pins this literal against a layout of the menu at both.
+    // `click_at` asserts the press position before anything downstream is checked, which is what
+    // separates "the pointer was not over the row" from "it was, and the click did nothing".
+    const ROW1: (i32, i32) = (60, 82);
     click_at(&mut qmp, &mut session, ROW1.0, ROW1.1)?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
@@ -4335,8 +4339,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      Aimed from the right edge, where the switcher is anchored; the name beside the arrows
     //      moves them, so `desktop_shell::panel`'s own test pins both aims with `work` and then
     //      `Desktop 2` as the name — the two states this step presses them in.
-    const NEXT_FROM_RIGHT: i32 = 75;
-    const FIRST_CELL_FROM_RIGHT: i32 = 163;
+    const NEXT_FROM_RIGHT: i32 = 67;
+    const FIRST_CELL_FROM_RIGHT: i32 = 148;
     let bar_y = size.bottom_bar_click_y();
     click_at(&mut qmp, &mut session, size.w as i32 - NEXT_FROM_RIGHT, bar_y)?;
     session.expect("desktop-shell: switched to Desktop 2")?;
@@ -6214,11 +6218,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     **Last, because it leaves a browser on screen** that nothing after it has to account
     //     for. Both aims are pinned against the bar's and the menu's layout by
     //     `desktop_shell::panel`'s own test at both text sizes, as `APPS_CLICK` and `ROW1` are.
-    //     In the staged 14 px the Places word is x 116 to 175 and the menu hangs at (124, 32)
-    //     with `Documents` its second row, y 64 to 90; at the built-in 16 they are 126 to 190,
-    //     (134, 32) and 66 to 94.
-    const PLACES_CLICK: (i32, i32) = (158, 12);
-    const PLACE_DOCUMENTS: (i32, i32) = (180, 80);
+    //     In the staged 12 px the Places word is x 105 to 158 and the menu hangs at (113, 32)
+    //     with `Documents` its second row, y 62 to 86; at the built-in 13 they are 111 to 167,
+    //     (119, 32) and 64 to 90. Both aims sit in the middle of what the two sizes share.
+    const PLACES_CLICK: (i32, i32) = (134, 12);
+    const PLACE_DOCUMENTS: (i32, i32) = (180, 75);
     click_at(&mut qmp, &mut session, PLACES_CLICK.0, PLACES_CLICK.1)?;
     session.expect("desktop-shell: places menu open")?;
     click_at(&mut qmp, &mut session, PLACE_DOCUMENTS.0, PLACE_DOCUMENTS.1)?;
@@ -7707,8 +7711,8 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
     Ok((info.width, info.height, buf))
 }
 
-/// `cargo xtask shot [all|greeter|desktop|apps|windows|overview]` — photograph the running
-/// desktop.
+/// `cargo xtask shot [all|greeter|desktop|apps|windows|terminal|files|editor|overview]` —
+/// photograph the running desktop.
 ///
 /// **The other half of `preview`, and the half it said it could not be.** Part A's command
 /// renders the toolkit's own surfaces on the host in about a second, and its doc names what that
@@ -7995,7 +7999,8 @@ fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
     .ok_or_else(|| format!("{} did not parse on the host", path.display()).into())
 }
 
-/// Both faces the built-in theme names, in the order [`preview_frames`] wants them.
+/// Both faces the built-in theme names, in the order [`preview_frames`] wants them — the
+/// proportional one with its bold attached, as `libdraw::text::load_ui` attaches it in the guest.
 ///
 /// **The built-in theme rather than the staged file**, and the difference matters: the file
 /// carries a deliberately non-default `font_px` for `check-login` to read back, while the guest
@@ -8004,7 +8009,8 @@ fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
 /// different themes and call the difference a display bug.
 fn host_faces() -> R<(libdraw::text::Font, libdraw::text::Font)> {
     let t = libdraw::theme::Theme::light();
-    Ok((host_font(t.font_ui.as_str())?, host_font(t.font_mono.as_str())?))
+    let ui = host_font(t.font_ui.as_str())?.with_bold(host_font(libdraw::text::UI_BOLD_FONT_PATH)?);
+    Ok((ui, host_font(t.font_mono.as_str())?))
 }
 
 /// One reference render by name, for the gate that compares it against a guest.
@@ -13556,7 +13562,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         );
     }
 
-    // `/system/fonts` — the two faces the desktop draws with, and their licence beside them.
+    // `/system/fonts` — the faces the desktop draws with, and their licence beside them.
     //
     // **Here and not in the initramfs**, which the plan settled before the code was written:
     // nothing that draws text runs before the root is mounted, and at 343 KiB the smaller file
@@ -13567,18 +13573,23 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // names a proportional face for the desktop and a fixed-advance one for the grid; staging
     // exactly those is what makes "the guest reads the font the host rendered with" a property
     // of the build instead of two lists somebody keeps equal. `font_asset` is the same mapping
-    // the previews and the display gate use.
+    // the previews and the display gate use. The proportional face's bold rides with it
+    // (desktop refresh, Part G): it is not a theme key but the companion `load_ui` looks for
+    // beside the built-in face, so it is named by `libdraw` rather than by the theme.
     //
     // The licence ships with them because the fonts are redistributed: DejaVu's terms are
-    // permissive but require the notice to travel with the files. One notice covers both — its
-    // `Files: *` stanza is the DejaVu family, which is also why the second face cost no new
-    // licence question.
+    // permissive but require the notice to travel with the files. One notice covers all three —
+    // its `Files: *` stanza is the DejaVu family, which is also why the second and third faces
+    // cost no new licence question.
     {
         let fonts = staging.join("system").join("fonts");
         fs::create_dir_all(&fonts)?;
         let theme = libdraw::theme::Theme::light();
-        let mut faces: Vec<PathBuf> =
-            vec![font_asset(theme.font_ui.as_str())?, font_asset(theme.font_mono.as_str())?];
+        let mut faces: Vec<PathBuf> = vec![
+            font_asset(theme.font_ui.as_str())?,
+            font_asset(libdraw::text::UI_BOLD_FONT_PATH)?,
+            font_asset(theme.font_mono.as_str())?,
+        ];
         faces.dedup();
         faces.push(repo_root().join("assets/fonts").join("LICENSE-DejaVu.txt"));
         let mut total = 0u64;
