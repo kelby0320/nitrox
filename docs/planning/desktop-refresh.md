@@ -576,8 +576,12 @@ Toolkit pieces the three applications share, so each is built once and restyled 
 
       **Built.** The field's sides are the design's 8, `button` is rounded to `CONTROL_RADIUS` —
       which is what makes an icon button a 24×24 of the same, since both applications' up-arrows
-      are buttons with a glyph on them — and `pill` is new: the accent as a ground with the
-      window's paper as its ink, which the editor's `Save` is now.
+      are buttons with a glyph on them — and `pill` is new: the accent as a ground with a light
+      ink on it, which the editor's `Save` is now. **Its ink is chosen rather than fixed** — the
+      further of the surface's two by weighted brightness, since the dark scheme's paper is
+      near-black on that accent — and its focus ring is a band of that ink, where the first
+      version drew the ground over the ground and put down no different pixel (PR #319 review).
+
 ## Part I — the file browser
 
 - [ ] **The toolbar row** (39 px with its rule; padding 7/9; gap 6): the `↑` icon button, the path

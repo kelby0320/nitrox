@@ -2472,7 +2472,7 @@ impl App {
             ]),
             DIALOG_GAP,
         );
-        dialog_frame(title, question, buttons, ui)
+        dialog_frame(title, question, buttons, self.dialog_focused, ui)
     }
 
     /// What is known about one entry: where it is, what it is, how big, when it changed.
@@ -2526,7 +2526,14 @@ impl App {
             )
             .key(PROPS_KEY + 31),
         ]);
-        libui::widget::dialog_frame_sized(Size::new(PROPS_W, PROPS_H), title, body, buttons, ui)
+        libui::widget::dialog_frame_sized(
+            Size::new(PROPS_W, PROPS_H),
+            title,
+            body,
+            buttons,
+            self.dialog_focused,
+            ui,
+        )
     }
 }
 

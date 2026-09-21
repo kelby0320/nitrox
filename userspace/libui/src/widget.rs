@@ -303,9 +303,10 @@ pub fn dialog_frame<Msg>(
     title: Element<Msg>,
     question: Element<Msg>,
     buttons: Element<Msg>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
-    dialog_frame_sized(Size::new(DIALOG_W, DIALOG_H), title, question, buttons, theme)
+    dialog_frame_sized(Size::new(DIALOG_W, DIALOG_H), title, question, buttons, focused, theme)
 }
 
 /// The same face at a size the caller picks.
@@ -329,6 +330,7 @@ pub fn dialog_frame_sized<Msg>(
     title: Element<Msg>,
     question: Element<Msg>,
     buttons: Element<Msg>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let strip = sized(
@@ -348,10 +350,13 @@ pub fn dialog_frame_sized<Msg>(
         window_frame(
             title,
             dock(alloc::vec![docked(Edge::Bottom, strip)], padding(Insets::all(0), question)),
-            // **A dialog draws itself focused.** It is a window of its own and it is up because
-            // something is waiting on it, so the accent edge is telling the truth about where
-            // the keyboard is going; a dialog behind its parent is not a state this has.
-            true,
+            // **A dialog's focus is the caller's to report**, like any other window's. This
+            // passed `true`, on the reasoning that a dialog is up because something is waiting
+            // on it — but the state that matters is a dialog that has *lost* the keyboard to
+            // another window, which is a click away and which every caller already tracks for
+            // its own title bar. Two windows edged in the accent is exactly what those flags
+            // exist to prevent (PR #319 review, blocking 1).
+            focused,
             theme,
         ),
     )
@@ -419,8 +424,8 @@ pub const TAB_CLOSE_W: u32 = 20;
 
 /// The centre of a tab's close box, measured from that tab's left edge.
 ///
-/// Published for the same reason [`DIALOG_LEFT_CX`] is: `check-login` presses it and cannot link
-/// this crate.
+/// Published for the same reason [`DIALOG_LEFT_CX`] is: `check-login` presses it from a copy of
+/// its own, because a gate aims from its own numbers (M11 decision 2).
 pub const TAB_CLOSE_CX: i32 = (TAB_W - TAB_CLOSE_W / 2) as i32;
 
 /// One tab: what it is called, whether it is marked, and what identifies it across frames.
@@ -474,7 +479,15 @@ pub fn tab_strip<Msg: Clone>(
             // **A face rather than a wash**, which every other momentary highlight here is: a
             // wash cannot be rounded, and a square highlight behind a rounded tab reads as a
             // second shape. One shade off the strip is enough to say "this one".
-            layers.extend(tab_face(theme.face));
+            //
+            // **Stopping above the rule**, which the current tab covers and no other tab may:
+            // running the hover face down to the strip's bottom made an inactive tab read as
+            // open at the bottom for as long as the pointer was over it — the one cue that is
+            // supposed to mark the current tab alone (PR #319 review, optional 7).
+            layers.push(padding(
+                Insets { top: 0, right: 0, bottom: TAB_RULE, left: 0 },
+                stack(tab_face(theme.face)),
+            ));
         }
         let ink_colour = if current { theme.foreground } else { theme.foreground_dim };
         layers.push(row(alloc::vec![
@@ -523,7 +536,15 @@ pub fn tab_strip<Msg: Clone>(
         match extras.right {
             // A right-hand slot for a window's own controls — the editor's byte count and its
             // Save. `dock` gives the tabs the rest, so the slot is the size it asks for.
-            Some(right) => dock(alloc::vec![docked(Edge::Right, right)], tabs_row),
+            //
+            // **Both sides wrapped**, as `status_bar` wraps its slots and for the same reason:
+            // the tabs beside it are keyed, so a caller that keys its own control — and Part J's
+            // Save must, for its hover — made this dock `MixedKeying` and the window then drew
+            // nothing at all (PR #319 review, worth fixing 6).
+            Some(right) => dock(
+                alloc::vec![docked(Edge::Right, padding(Insets::all(0), right))],
+                padding(Insets::all(0), tabs_row),
+            ),
             None => tabs_row,
         },
     ));
@@ -653,20 +674,54 @@ pub fn pill<Msg>(
     } else {
         theme.accent
     };
-    let mut layers = alloc::vec::Vec::with_capacity(3);
+    // **The label is whichever of the surface's two inks stands furthest from the ground** — the
+    // window's paper in the light scheme, which is the design's white on the accent, and its
+    // text colour in the dark one, where the paper is near-black and would sit at 3.8:1 on the
+    // same accent (PR #319 review, optional 9). One rule, so a scheme cannot be picked that
+    // makes this control unreadable.
+    let ink_colour = furthest_from(ground, theme.background, theme.foreground);
+    let mut layers = alloc::vec::Vec::with_capacity(4);
     layers.push(rounded_fill(ground, CONTROL_RADIUS));
     if state.active {
-        // The focus ring goes *inside* a filled control, in the paper colour: a ring in the
-        // accent around a ground of the accent is not a ring.
-        layers.push(padding(Insets::all(RING), rounded_fill(ground, CONTROL_RADIUS - RING)));
+        // **A band of the label's colour, inside the edge** — and it has to be a *band*: this
+        // drew the ground inset by the ring over a ground of the same colour, which is the same
+        // colour on the same colour and put down not one different pixel (review, optional 4).
+        layers.push(padding(
+            Insets::all(PILL_RING_INSET),
+            rounded_fill(ink_colour, CONTROL_RADIUS - PILL_RING_INSET),
+        ));
+        layers.push(padding(
+            Insets::all(PILL_RING_INSET + RING),
+            rounded_fill(ground, CONTROL_RADIUS - PILL_RING_INSET - RING),
+        ));
     }
-    layers.push(center(padding(PILL_PAD, ink(theme.background, text(label)))));
+    layers.push(center(padding(PILL_PAD, ink(ink_colour, text(label)))));
     stack(layers).on_press(msg).focusable()
 }
 
 /// How tall a pill is where a caller sizes one: the design's 21, which is a control sitting on a
 /// 24-pixel row rather than filling it.
 pub const PILL_H: u32 = 21;
+
+/// How far inside a pill's edge its focus ring is drawn.
+const PILL_RING_INSET: u32 = 1;
+
+/// Whichever of `a` and `b` stands further from `ground`, by weighted brightness.
+///
+/// **Weighted rather than a plain sum**, because green carries most of what an eye reads as
+/// light: `0.299r + 0.587g + 0.114b`, the usual integer form, which needs no `powf` — `libdraw`
+/// builds for a bare target and has no floating-point maths beyond arithmetic.
+///
+/// **It picks, and does not promise.** On the accent this system ships, it chooses white in the
+/// light scheme (4.6:1) and the near-white ink in the dark one (3.9:1, where the window's own
+/// paper would be 3.8:1). The dark figure is under WCAG's 4.5 and cannot be fixed here: `accent`
+/// is one colour in both schemes, so a readable pill in the dark scheme is a question about the
+/// palette, for whoever revisits it (PR #319 review, optional 9).
+fn furthest_from(ground: Rgb, a: Rgb, b: Rgb) -> Rgb {
+    let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
+    let (g, a_, b_) = (brightness(ground), brightness(a), brightness(b));
+    if (a_ - g).abs() >= (b_ - g).abs() { a } else { b }
+}
 
 /// A pill's sides: the design's 12.
 const PILL_PAD: Insets = Insets { top: 2, right: 12, bottom: 2, left: 12 };
@@ -5214,10 +5269,12 @@ two");
 
     #[test]
     fn a_tab_selects_where_it_is_and_its_close_box_does_not_select_it() {
-        // **The two published metrics, and the shadowing rule between them.** `check-login`
-        // presses a tab at `TAB_W * i + something` and its close box at `TAB_CLOSE_CX`, and it
-        // cannot link this crate — so the numbers are asserted here against a tree that is
-        // actually built, the way the dialog's aim points are.
+        // **The published metrics, and the shadowing rule between them.** `check-login` presses
+        // a tab at `TAB_SIDE + i * TAB_PITCH + something` and its close box at `TAB_CLOSE_CX`
+        // from its own copies, because a gate that aimed from the toolkit could agree with a
+        // toolkit that had stopped drawing where it says (M11 decision 2) — so the numbers are
+        // asserted here against a tree that is actually built, the way the dialog's aim points
+        // are, and `xtask`'s `the_gates_chrome_table_is_the_toolkits` compares the two sets.
         assert_eq!((TAB_W, TAB_STRIP_H, TAB_H, TAB_CLOSE_W), (120, 30, 24, 20));
         assert_eq!((TAB_SIDE, TAB_TOP, TAB_GAP, TAB_PITCH), (6, 5, 1, 121));
         assert_eq!(TAB_CLOSE_CX, 110);
@@ -5273,6 +5330,186 @@ two");
     /// How far off an exact ink a glyph's darkest pixel may land. A stem covers a pixel almost
     /// but not quite completely, so even body ink comes out a few units light.
     const ANTIALIAS_SLACK: u32 = 12;
+
+    /// A focused pill shows a ring, and its label reads in either scheme.
+    ///
+    /// **Two failures in one control** (PR #319 review, optionals 4 and 9). The ring was the
+    /// ground drawn over the ground — nought pixels of the 2400 differed between an active pill
+    /// and a resting one — and the label was the window's paper, which in the dark scheme is
+    /// near-black on the accent. Painted, and compared *between states* rather than against a
+    /// colour, because "a ring is visible" is exactly the claim a same-colour ring passes.
+    #[test]
+    fn a_pill_rings_when_focused_and_its_label_reads_in_either_scheme() {
+        let (w, h) = (80, 30);
+        let draw = |t: &Theme, state: WidgetState| {
+            let e: Element<Msg> = pill("Save", (), state, t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.face);
+            paint(&mut fb, &font(), t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let t = Theme::default();
+        let resting = draw(&t, WidgetState::default());
+        let active = draw(&t, WidgetState { active: true, ..Default::default() });
+        let differing = (0..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter(|(x, y)| resting.get_pixel(*x, *y) != active.get_pixel(*x, *y))
+            .count();
+        assert!(differing > 40, "a focused pill looks no different: {differing} pixels");
+        // **The label is the better-contrasting of the surface's two inks, in each scheme** —
+        // asserted as the *choice* rather than as a distance, because a distance passes for the
+        // wrong ink too: the dark scheme's near-black paper is a long way from the accent by any
+        // arithmetic and still unreadable on it (review, optional 9). In the light scheme that
+        // is the paper, in the dark scheme the text colour.
+        let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
+        for t in [Theme::light(), Theme::dark()] {
+            let fb = draw(&t, WidgetState::default());
+            let ground = brightness(t.accent);
+            let (paper, text_ink) = (brightness(t.background), brightness(t.foreground));
+            let wanted =
+                if (paper - ground).abs() >= (text_ink - ground).abs() { paper } else { text_ink };
+            // The label's extreme pixel on the middle row is the ink it is drawn in.
+            let row: alloc::vec::Vec<i32> =
+                (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(brightness).collect();
+            let reached = if wanted > ground {
+                *row.iter().max().expect("pixels")
+            } else {
+                *row.iter().min().expect("pixels")
+            };
+            let got = (reached - wanted).abs();
+            let other = (reached - if wanted == paper { text_ink } else { paper }).abs();
+            assert!(
+                got < other,
+                "the label is not the better-contrasting ink: reached {reached}, wanted \
+                 {wanted}, the other is {}",
+                if wanted == paper { text_ink } else { paper }
+            );
+        }
+    }
+
+    /// What a tab strip *looks* like: the current tab is the window's ground and covers the rule,
+    /// the others have no face and their labels are dim, and a keyed right slot is drawable.
+    ///
+    /// **The description's central claim, and nothing tested it** (PR #319 review, worth fixing
+    /// 5): every one of these could be broken with all 80 of this module's tests still passing,
+    /// which is the same "present and invisible" lesson as the close box, one level up.
+    #[test]
+    fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let (w, h) = (300, TAB_STRIP_H);
+        let tabs = [
+            Tab { key: 1, label: "one", marked: false },
+            Tab { key: 2, label: "two", marked: false },
+        ];
+        let paint_strip = |extras: TabExtras<M>, hovered: Option<u64>| {
+            let ui: Element<M> = tab_strip(&tabs, 1, hovered, M::Select, M::Close, extras, &t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&ui, all, &CELL);
+            let mut tree = crate::diff::Tree::new();
+            let diffable = tree.update(&ui, &l).is_ok();
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            (fb, diffable)
+        };
+        let (fb, _) = paint_strip(TabExtras::none(), None);
+        // Down the middle of each tab, clear of its label and its close box.
+        let (first, second) = (TAB_SIDE + 4, TAB_SIDE + TAB_PITCH + 4);
+        assert_eq!(
+            fb.get_pixel(first, TAB_TOP + TAB_H / 2),
+            Some(t.background),
+            "the current tab is the window's own ground"
+        );
+        assert_eq!(
+            fb.get_pixel(first, TAB_STRIP_H - 1),
+            Some(t.background),
+            "…and it covers the rule, so it runs into the content below"
+        );
+        assert_eq!(
+            fb.get_pixel(second, TAB_TOP + TAB_H / 2),
+            Some(t.face_hover),
+            "another tab has no face of its own: the strip's shows through"
+        );
+        assert_eq!(
+            fb.get_pixel(second, TAB_STRIP_H - 1),
+            Some(t.border),
+            "…and the rule runs under it"
+        );
+        // The inactive label is dim, and the current one is not.
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .map(darkness)
+                .min()
+                .expect("pixels")
+        };
+        assert!(
+            darkest(TAB_SIDE, TAB_SIDE + TAB_W - TAB_CLOSE_W) <= darkness(t.foreground) + 12,
+            "the current tab's label is body ink"
+        );
+        assert!(
+            darkest(second, second + TAB_W - TAB_CLOSE_W - 4) >= darkness(t.foreground_dim),
+            "another tab's label is dim"
+        );
+        // Hovering one of the others must not open it at the bottom: the rule stays.
+        let (hover, _) = paint_strip(TabExtras::none(), Some(2));
+        assert_eq!(
+            hover.get_pixel(second, TAB_STRIP_H - 1),
+            Some(t.border),
+            "a hovered tab still has the rule under it"
+        );
+        assert_ne!(
+            hover.get_pixel(second, TAB_TOP + TAB_H / 2),
+            Some(t.face_hover),
+            "…and it does light up"
+        );
+        // A keyed right-hand slot is drawable: the diff refuses a half-keyed container.
+        let keyed = TabExtras {
+            new_tab: None,
+            right: Some(ink(t.foreground, text("848 bytes")).key(99)),
+        };
+        let (_, diffable) = paint_strip(keyed, None);
+        assert!(diffable, "a caller that keys its right-hand control makes the window undiffable");
+    }
+
+    /// A dialog's edge follows *its* window's focus, not the fact that it is up.
+    ///
+    /// **Two windows edged in the accent is the failure** (PR #319 review, blocking 1): a dialog
+    /// that has lost the keyboard to another window is a click away — the compositor raises any
+    /// listed window, and a dialog is listed — and every caller already tracks that flag for the
+    /// dialog's own title bar. This passed `true` unconditionally, so the edge said "the
+    /// keyboard is here" while the title bar beside it said otherwise.
+    #[test]
+    fn a_dialogs_edge_follows_its_own_focus() {
+        let t = Theme::default();
+        let edge = |focused: bool| {
+            let ui: Element<Msg> = dialog_frame(
+                sized(Size::new(0, TITLE_BAR_H), fill(t.face)).key(1),
+                padding(Insets::all(DIALOG_PAD), text("Really?")).key(2),
+                sized(Size::new(0, 20), text("")).key(5),
+                focused,
+                &t,
+            );
+            let all = Rect::new(0, 0, DIALOG_W, DIALOG_H);
+            let l = layout(&ui, all, &CELL);
+            let mut fb =
+                MemFramebuffer::new(Geometry::packed(DIALOG_W, DIALOG_H, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb.get_pixel(0, DIALOG_H / 2)
+        };
+        assert_eq!(edge(true), Some(t.accent), "a dialog holding the keyboard is edged in it");
+        assert_eq!(edge(false), Some(t.border), "and one that has lost it is not");
+    }
 
     /// A pill is the accent filled in, with its label in the paper colour.
     ///
@@ -5441,14 +5678,21 @@ two");
             .map(darkness)
             .min()
             .expect("the bar has pixels");
-        let ink_pixels = (0..w)
-            .flat_map(|x| (0..h).map(move |y| (x, y)))
-            .filter(|(x, y)| {
-                let c = top.get_pixel(*x, *y);
-                c != Some(t.face_hover) && c != Some(t.border)
-            })
-            .count();
-        assert!(ink_pixels > 20, "the readings are drawn: {ink_pixels} pixels");
+        // **Each end counted separately** (PR #319 review, blocking 2). One count over the whole
+        // bar passes on the left reading alone, so dropping the right slot — which is where the
+        // editor's line and column live — failed nothing. Each half must have ink of its own.
+        let ink_between = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter(|(x, y)| {
+                    let c = top.get_pixel(*x, *y);
+                    c != Some(t.face_hover) && c != Some(t.border)
+                })
+                .count()
+        };
+        let (left_ink, right_ink) = (ink_between(0, w / 2), ink_between(w / 2, w));
+        assert!(left_ink > 20, "the left reading is drawn: {left_ink} pixels");
+        assert!(right_ink > 20, "the right reading is drawn: {right_ink} pixels");
         let floor = darkness(t.foreground_dim);
         assert!(
             darkest >= floor,
@@ -5669,6 +5913,7 @@ two");
                 DIALOG_GAP,
             )
             .key(5),
+            true,
             &theme,
         );
 

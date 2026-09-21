@@ -5538,8 +5538,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **The tabs are where the fixed width says they are**, which is what a fixed width buys: a
     // tab does not move when another opens. `libui::widget`'s constants are the source, pinned to
     // a real tree by `a_tab_selects_where_it_is_and_its_close_box_does_not_select_it`; this gate
-    // cannot link the crate, so `chrome` copies them and
-    // `the_gates_chrome_table_is_the_toolkits` compares the copies with that file.
+    // aims from `chrome`'s copies rather than from the toolkit (M11 decision 2), and
+    // `the_gates_chrome_table_is_the_toolkits` is what keeps those copies equal to it.
     //
     // **A tab strip in both applications** (M12 Part D): above the editor's text and below the
     // browser's menus, which moved every one of the browser's rows down again.
@@ -6042,8 +6042,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     with somewhere to put a question would ask it, and this one has no dialog to ask in".
     //
     //     **The dialog's geometry is hardcoded here**, the way this gate already hardcodes a
-    //     title bar's height and a list's row height, because it cannot link the crate that
-    //     defines them. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
+    //     title bar's height and a list's row height — not because the crate cannot be linked
+    //     (it is, for the display gate's reference frames) but because a gate that *aimed* from
+    //     the toolkit could agree with a toolkit that had stopped drawing where it says (M11
+    //     decision 2). A host test compares the two sets of numbers; a gate reads only its own. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
     //     were `nxedit`'s until M12 Part B moved them down beside `dialog_frame`, when a second
     //     confirmation would otherwise have given this gate two tables to keep in step — and
     //     `libui::widget::tests::dialog_buttons_land_where_the_constants_say` is the host test
@@ -13898,47 +13900,26 @@ mod tests {
     /// deliberate copy still needs something that fails when it goes stale. `libui`'s own tests
     /// pin the other side, pressing these literals on trees that are actually built.
     ///
+    /// **Imported rather than parsed.** This read the constants out of `widget.rs` with a little
+    /// parser and a guard against the pattern going stale; `xtask` links `libui` already — it
+    /// renders the display gate's reference frames with it — so the comparison is just a
+    /// comparison (PR #319 review, optional 8). Nothing about M11 decision 2 is weakened: a
+    /// *gate* still aims from `chrome`, and only this test sees both sides.
+    ///
     /// **Only the direct copies.** `TITLE_Y`, `CLOSE_X`, `MAXIMISE_X`, `MINIMISE_X` and
     /// `CONTENT_X` are sums over the toolkit's constants rather than any one of them, and
     /// `the_title_buttons_land_where_the_gates_aim` is what pins those.
     #[test]
     fn the_gates_chrome_table_is_the_toolkits() {
-        let path = repo_root().join("userspace/libui/src/widget.rs");
-        let text = fs::read_to_string(&path).expect("the toolkit's source is readable");
-        let mut found: BTreeMap<String, i32> = BTreeMap::new();
-        for line in text.lines() {
-            let t = line.trim();
-            let Some(rest) = t.strip_prefix("pub const ") else { continue };
-            let Some((name, tail)) = rest.split_once(':') else { continue };
-            let Some((ty, val)) = tail.split_once('=') else { continue };
-            if ty.trim() != "u32" {
-                continue;
-            }
-            // `TAB_PITCH` is `TAB_W + TAB_GAP` rather than a literal, so it is summed here from
-            // the two it is made of — the point is that the gate's number is the toolkit's, not
-            // that the toolkit spells it as a digit.
-            if let Ok(v) = val.trim().trim_end_matches(';').parse::<i32>() {
-                found.insert(name.trim().to_string(), v);
-            }
-        }
-        let get = |what: &str| {
-            *found.get(what).unwrap_or_else(|| {
-                panic!(
-                    "no `pub const {what}: u32` in {} — this checker's pattern has gone stale, \
-                     which silently stops comparing anything",
-                    path.display()
-                )
-            })
-        };
-        let pitch = get("TAB_W") + get("TAB_GAP");
+        use libui::widget as w;
         for (what, gate, toolkit) in [
-            ("TITLE_BAR_H", chrome::TITLE_BAR_H, get("TITLE_BAR_H")),
-            ("TAB_STRIP_H", chrome::TAB_STRIP_H, get("TAB_STRIP_H")),
-            ("TAB_H", chrome::TAB_H, get("TAB_H")),
-            ("TAB_TOP", chrome::TAB_TOP, get("TAB_TOP")),
-            ("TAB_W", chrome::TAB_W, get("TAB_W")),
-            ("TAB_SIDE", chrome::TAB_SIDE, get("TAB_SIDE")),
-            ("TAB_PITCH", chrome::TAB_PITCH, pitch),
+            ("TITLE_BAR_H", chrome::TITLE_BAR_H, w::TITLE_BAR_H as i32),
+            ("TAB_STRIP_H", chrome::TAB_STRIP_H, w::TAB_STRIP_H as i32),
+            ("TAB_H", chrome::TAB_H, w::TAB_H as i32),
+            ("TAB_TOP", chrome::TAB_TOP, w::TAB_TOP as i32),
+            ("TAB_W", chrome::TAB_W, w::TAB_W as i32),
+            ("TAB_SIDE", chrome::TAB_SIDE, w::TAB_SIDE as i32),
+            ("TAB_PITCH", chrome::TAB_PITCH, w::TAB_PITCH as i32),
         ] {
             assert_eq!(gate, toolkit, "`chrome::{what}` is {gate}, the toolkit's is {toolkit}");
         }

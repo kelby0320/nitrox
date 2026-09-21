@@ -444,6 +444,10 @@ pub struct App {
     /// from its parent sends both halves down one channel, and a title bar drawn from the wrong
     /// one would show two active windows or none.
     pub confirm_focused: bool,
+    /// Whether the **chooser's** window holds the keyboard, for the same reason and read the
+    /// same way: its frame is edged in the accent only while it does (desktop refresh, Part H,
+    /// PR #319 review).
+    pub chooser_focused: bool,
     /// The dialog's title bar was dragged, and the binary owes the compositor a `StartMove` **on
     /// the dialog's window**.
     ///
@@ -803,6 +807,7 @@ impl App {
             closing: false,
             confirming: None,
             confirm_focused: true,
+            chooser_focused: true,
             confirm_move_requested: false,
         }
     }
@@ -1712,6 +1717,7 @@ impl App {
             Msg::ChooserUp,
             Msg::ChooserAccept,
             Msg::ChooserCancel,
+            self.chooser_focused,
             ui,
         )
         // **The whole dialog takes the wheel** (M14 Part I), from outside the widget rather than
@@ -2389,7 +2395,7 @@ impl App {
             ]),
             libui::widget::DIALOG_GAP,
         );
-        dialog_frame(title, question, buttons, ui)
+        dialog_frame(title, question, buttons, self.confirm_focused, ui)
     }
 }
 

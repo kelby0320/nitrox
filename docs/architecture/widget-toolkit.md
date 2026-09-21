@@ -496,7 +496,7 @@ so they exist:
 
 | Widget | Why it exists |
 |---|---|
-| `pill` | A window's one primary action — the editor's `Save`. The accent as a ground with the window's paper as its ink, which is the inverse of every other control here and what makes it read as *the* action (desktop refresh, Part H) |
+| `pill` | A window's one primary action — the editor's `Save`. The accent as a ground, with whichever of the surface's two inks stands further from it by weighted brightness: the paper in the light scheme, the text colour in the dark one. The inverse of every other control here, which is what makes it read as *the* action (desktop refresh, Part H) |
 | `status_bar` | A window's foot: a ground, a rule on the edge that faces the content, and readings a step below the body in `foreground_dim`. A left slot and a right one (Part H) |
 | `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked. **Rounded, and edged at rest, since the desktop refresh's Part D** — it was a flat fill of `track`, which is the light scheme's own `--bg`, so a resting field on a window's ground was invisible; the greeter is where that showed, and today its field is the only one drawn at rest. Focused, the edge is the accent ring, rounded to the same curve |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |

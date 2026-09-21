@@ -124,6 +124,7 @@ pub fn view<Msg: Clone>(
     up: Msg,
     accept: Msg,
     cancel: Msg,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let title = padding(Insets::all(DIALOG_PAD), text(match mode {
@@ -233,6 +234,7 @@ pub fn view<Msg: Clone>(
         title,
         column(body).key(key_base + 6),
         answers,
+        focused,
         theme,
     )
 }
@@ -317,8 +319,20 @@ mod tests {
     }
 
     fn build(mode: Mode, st: &mut ChooserState) -> Element<Msg> {
-        view(mode, "/home", &rows(), st, 100, None, Msg::Row, Msg::Up, Msg::Accept, Msg::Cancel,
-             &Theme::default())
+        view(
+            mode,
+            "/home",
+            &rows(),
+            st,
+            100,
+            None,
+            Msg::Row,
+            Msg::Up,
+            Msg::Accept,
+            Msg::Cancel,
+            true,
+            &Theme::default(),
+        )
     }
 
     fn labels<M>(e: &Element<M>, out: &mut Vec<String>) {

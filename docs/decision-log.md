@@ -27136,15 +27136,34 @@ The terminal's would be its shell's working directory, which nothing can tell it
 **`button` is rounded and `pill` is new.** Rounding the button is what makes "an icon button is a
 24×24 of the same" true without a new widget: both applications' up-arrows are buttons with a
 glyph on them. The pill is the inverse of everything else on a surface — the accent as a ground,
-the window's paper as its ink — which is what makes one control read as *the* action. Its focus
-ring goes inside, in the paper colour, because a ring in the accent around a ground of the accent
-is not a ring.
+a light ink on it — which is what makes one control read as *the* action.
 
-**`chrome` in `xtask` now holds the tab metrics, and a test compares the whole table with
-`libui`'s source** — the generalisation of PR #318's finding, applied before the same drift could
-happen again. The gate keeps its copies on purpose (M11 decision 2); what is new is that they
-fail on the host when the toolkit moves. The guard fires when a constant stops being a literal,
-which is how such a check goes stale while passing.
+**Its focus ring was the ground drawn over the ground**, and this entry claimed otherwise before
+review: nought of 2400 pixels differed between an active pill and a resting one. It is a band of
+the label's colour now, between two of the ground. **And the label is not simply the window's
+paper**: in the dark scheme that is near-black on the accent. It is whichever of the surface's two
+inks stands further from the ground by weighted brightness — white in the light scheme at 4.6:1,
+the near-white text colour in the dark one at 3.9:1. That last figure is under WCAG's 4.5 and
+cannot be fixed in a widget: `accent` is one colour in both schemes, so a readable pill in the
+dark scheme is a question about the palette.
+
+**`chrome` in `xtask` now holds the tab metrics, and a test compares the whole table with the
+toolkit's own constants** — the generalisation of PR #318's finding, applied before the same
+drift could happen again. The gate keeps its copies on purpose (M11 decision 2); what is new is
+that they fail on the host when the toolkit moves. It read `widget.rs` with a small parser at
+first, which review pointed out was unnecessary: `xtask` links `libui` already, for the display
+gate's reference frames. Several comments repeating "this gate cannot link the crate" are
+corrected with it — the reason for the copies is decision 2, not a build constraint.
+
+**Review found three more places where the test was weaker than the claim**, all of the same
+kind as those below: a dialog was edged in the accent whatever its focus, because `dialog_frame`
+passed `true` and no test painted an unfocused one; a status bar's "both readings are drawn" was
+one count over the whole bar, which the left reading alone satisfied — so dropping the right slot,
+where the editor's line and column live, failed nothing; and the tab strip's whole *look* — the
+current tab as the window's ground, covering the rule, the others faceless and dim — had no test
+at all, so four separate breaks passed the suite. Each is painted and controlled now. The strip's
+left padding is in that test too: the routing test's presses sat twenty pixels inside a tab, so a
+six-pixel shift was invisible to it.
 
 **Three tests in this part first passed against their own controls**, and each needed the same
 correction: comparing two measurements rather than measuring against the value that distinguishes
