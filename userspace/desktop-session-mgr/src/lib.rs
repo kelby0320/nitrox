@@ -5,17 +5,21 @@
 //! its element tree need no world, and until the desktop refresh's Part D they were untested
 //! because there was nowhere to test them from. `init`, `service-mgr`, `nxterm`, `nxfiles`,
 //! `nxedit` and `desktop-shell` each grew a library for this reason; this is the same move, and
-//! it is what lets the size `check-login` writes down be measured rather than asserted.
+//! it is what lets the card's own size be measured rather than asserted.
 //!
 //! `#![no_std]` for the bare build; `std` under `cargo test` so the host harness works
 //! (`cargo xtask test` runs `cargo test -p desktop-session-mgr --lib`).
+//!
+//! **`GREETER_W`/`GREETER_H` are read by a test in `xtask`**, which keeps `check-login`'s
+//! deliberate copy of them equal to these — renaming either constant fails that test rather than
+//! quietly disabling it.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+use libdraw::framebuffer::{Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
 use libui::element::{
@@ -24,7 +28,7 @@ use libui::element::{
 };
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{POPUP_BORDER, TextFieldState, WidgetState, popup_frame, text_field};
+use libui::widget::{TextFieldState, WidgetState, popup_frame, text_field};
 
 /// The greeter window's size. Fixed rather than screen-relative: only its position follows the
 /// screen, centred on the size `/dev/draw/screen` reports since Phase 5 Part E (see `_start`).
@@ -52,6 +56,10 @@ const FIELD_H: u32 = 24;
 /// The label column beside each field. Fixed rather than measured: two labels that did not share
 /// an edge would read as two unrelated rows.
 const LABEL_W: u32 = 74;
+/// The username row's label and field, in that order — keys, so a test can locate the field.
+const USER_KEYS: (u64, u64) = (1, 2);
+/// The password row's, as [`USER_KEYS`].
+const PASSWORD_KEYS: (u64, u64) = (3, 4);
 /// The refusal's line, present whether or not there is one to say.
 const REFUSAL_H: u32 = 16;
 
@@ -69,7 +77,7 @@ pub fn greeter_theme() -> Theme {
 }
 
 /// Which field the keyboard is going to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     /// The username field.
     User,
@@ -125,13 +133,17 @@ impl Greeter {
         let field = |f: &TextFieldState, masked, which| {
             sized(Size::new(0, FIELD_H), text_field(f, masked, active(which), theme))
         };
-        let labelled = |label: &str, f: Element<()>| {
+        // **Keyed in pairs**: the label and the field beside it both carry one, because a
+        // container's children are all keyed or none are. The keys are what let a host test ask
+        // where a field actually landed rather than recompute where it ought to have.
+        let labelled = |label: &str, f: Element<()>, keys: (u64, u64)| {
             row(alloc::vec![
                 sized(
                     Size::new(LABEL_W, FIELD_H),
                     center_v(ink(theme.foreground_dim, text(label))),
-                ),
-                f.flex(1),
+                )
+                .key(keys.0),
+                f.flex(1).key(keys.1),
             ])
         };
         let mut rows = alloc::vec::Vec::with_capacity(4);
@@ -147,8 +159,9 @@ impl Greeter {
             Size::new(0, REFUSAL_H),
             center_v(ink(theme.deny, scaled(TextSize::Small, text(refusal)))),
         ));
-        rows.push(labelled("username", field(&self.user, false, Focus::User)));
-        rows.push(labelled("password", field(&self.password, true, Focus::Password)));
+        rows.push(labelled("username", field(&self.user, false, Focus::User), USER_KEYS));
+        let password = field(&self.password, true, Focus::Password);
+        rows.push(labelled("password", password, PASSWORD_KEYS));
         popup_frame(padding(Insets::all(CARD_PAD), with_spacing(column(rows), ROW_GAP)), theme)
     }
 
@@ -224,6 +237,14 @@ impl Greeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used by the tests alone: the trait that brings `clear` and `get_pixel` into scope.
+    use libdraw::framebuffer::Framebuffer;
+
+    /// The narrowest a field may be laid out and still be somewhere to type a name or a password.
+    const MIN_FIELD_W: u32 = 200;
+
+    /// `EV_KEY` for the `a` key — a keystroke that edits, as against one that navigates.
+    const KEY_A: u16 = 30;
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
     const BOLD: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans-Bold.ttf");
@@ -234,6 +255,54 @@ mod tests {
         Font::from_bytes(DEJAVU.to_vec())
             .expect("the vendored face parses")
             .with_bold(Font::from_bytes(BOLD.to_vec()).expect("its bold parses"))
+    }
+
+    /// Tab moves the caret between the two fields, and nothing else does.
+    ///
+    /// **The half of D.1's reason that had no test yet** (PR #318 review, optional 5). A field
+    /// that swallowed Tab could never be left, which is why this key is handled here and not by
+    /// `TextFieldState::apply` — and until now nothing said so in a way that runs.
+    #[test]
+    fn tab_moves_the_caret_between_the_fields() {
+        let mut g = Greeter::new();
+        assert_eq!(g.focus, Focus::User, "the caret starts where the typing does");
+        assert!(g.key(KEY_TAB, 0), "Tab changed something, so the greeter must redraw");
+        assert_eq!(g.focus, Focus::Password);
+        assert!(g.key(KEY_TAB, 0));
+        assert_eq!(g.focus, Focus::User, "and Tab cycles rather than stopping at the end");
+        // A letter goes to the field, not to the focus.
+        let before = g.focus;
+        assert!(g.key(KEY_A, 0));
+        assert_eq!(g.focus, before, "typing does not move the caret between fields");
+        assert_eq!(g.user.text(), "a", "…it goes into the field the caret is in");
+        assert_eq!(g.password.text(), "", "and only that one");
+    }
+
+    /// Typing clears a refusal; `reset` clears everything and puts the caret back.
+    ///
+    /// **A "login incorrect" that outlives the typing which answers it reads as a second
+    /// refusal** — the view's own comment says so, and this is what makes that true. `reset` is
+    /// the other half: the password must not still be in the greeter while a session is on
+    /// screen, and the next person to log in must not find the last one's name in the field.
+    #[test]
+    fn an_edit_clears_a_refusal_and_reset_clears_the_greeter() {
+        let mut g = Greeter::new();
+        g.denied = true;
+        assert!(g.key(KEY_A, 0), "the edit landed");
+        assert!(!g.denied, "and it took the refusal with it");
+        // A key that edits nothing leaves the refusal up: Tab is not an answer to it.
+        g.denied = true;
+        assert!(g.key(KEY_TAB, 0));
+        assert!(g.denied, "moving the caret is not an edit");
+        // `reset` empties both fields and returns the caret. The caret is in the password field
+        // here — the Tab above moved it — so one keystroke fills that one, and `user` already
+        // holds the letter typed at the top of this test.
+        assert_eq!(g.focus, Focus::Password);
+        assert!(g.key(KEY_A, 0));
+        assert_eq!((g.user.text(), g.password.text()), ("a", "a"), "both fields hold something");
+        g.reset();
+        assert_eq!((g.user.text(), g.password.text()), ("", ""), "nothing typed is left behind");
+        assert_eq!(g.focus, Focus::User, "and the caret is back where a login starts");
     }
 
     /// A refusal is drawn, and drawn in `deny` — not in the ink everything else uses.
@@ -281,8 +350,11 @@ mod tests {
     ///
     /// **This is the pair `check-login` writes down** (desktop refresh, Part D.4): the gate has
     /// its own copy of `GREETER_W`×`GREETER_H`, as every chrome metric in that file does (M11
-    /// decision 2), and this is what makes the copy safe to keep — the two cannot drift without
-    /// a host test failing first, which costs a second rather than a boot.
+    /// decision 2). **This test alone does not keep that copy honest** — it compares the card
+    /// with the constant below it, and the gate's copy is a third number neither of them reads
+    /// (PR #318 review, finding 1). `xtask`'s `the_gates_greeter_size_is_the_greeters_own` is the
+    /// other half: it reads this file and compares. Both are host tests, so between them a
+    /// restyle costs a second rather than a boot.
     #[test]
     fn the_card_is_exactly_the_window_it_is_drawn_in() {
         let f = faces();
@@ -303,10 +375,24 @@ mod tests {
         // caret as a message came and went.
         g.denied = true;
         assert_eq!(measure(&g).h, GREETER_H, "a refusal changes nothing about the card's height");
-        // And the width holds the label column and a field wide enough to be one.
-        let content = GREETER_W - 2 * (CARD_PAD + POPUP_BORDER);
-        assert!(content > LABEL_W, "the label column alone does not fill the card");
-        assert!(content - LABEL_W >= 200, "a field {} wide is too narrow", content - LABEL_W);
-        assert!(measure(&g).w <= GREETER_W, "the card's own width fits the window");
+        // **And the width holds a field, measured where it is drawn.** This asserted arithmetic
+        // on the constants until review pointed out that arithmetic cannot see the layout: an
+        // inset added to the card left the field 64 pixels wide and every assertion here passed
+        // (PR #318 review, finding 2). `measure` cannot answer it either — a flexing row measures
+        // at its natural width, not the width it is given — so this lays the card out at the
+        // window's real size and asks where the field landed.
+        let bounds = Rect::new(0, 0, GREETER_W, GREETER_H);
+        let e = g.view(&t);
+        let l = libui::layout::layout(&e, bounds, &m);
+        let field = libui::layout::locate(&e, &l, USER_KEYS.1).expect("the username field");
+        assert!(
+            field.size.w >= MIN_FIELD_W,
+            "a field laid out {} wide is too narrow to type in",
+            field.size.w
+        );
+        assert!(
+            field.origin.x + field.size.w as i32 <= (GREETER_W - CARD_PAD) as i32,
+            "the field runs past the card's padding: {field:?}"
+        );
     }
 }

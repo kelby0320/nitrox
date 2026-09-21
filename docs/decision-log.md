@@ -27051,9 +27051,12 @@ everywhere else, and fields with an edge of their own.
 flat fill of `track`; `track` is `--bg` in the light scheme, so the greeter's password box was a
 white rectangle on a white card — visible only once focused, when the accent ring appeared. It is
 now a well inside a one-pixel `border`, rounded to `CONTROL_RADIUS`, which is the design's own
-field. **Fixed in `libui` rather than in the greeter**, so the chooser's field, the browser's
-search and the shell's filter all get it; this is part of what Part H lists as "field, icon-button
-and accent-pill styles", and H keeps the rest. `CONTROL_RADIUS` and `POPUP_BORDER` are public now,
+field. **Fixed in `libui` rather than in the greeter**, so every field is the same shape; this is
+part of what Part H lists as "field, icon-button and accent-pill styles", and H keeps the rest.
+**The edge itself reaches only the greeter today**, and saying otherwise was this entry's first
+draft: every other caller — the chooser, the browser's search and name prompt, the shell's filter,
+the terminal's and the editor's — passes `active: true`, so none of them is ever drawn at rest
+(PR #318 review, optional 3). What they got is the rounding. `CONTROL_RADIUS` and `POPUP_BORDER` are public now,
 and the shell's bar gave up its own second copy of the 8.
 
 **Nothing had ever tested what a field looks like at rest**, which is how this shipped: the test
@@ -27069,10 +27072,23 @@ from is the theme the view is painted with.
 
 **The card is 340×141, and the height is measured rather than chosen.** It was 420×200, with the
 content stopping barely past the halfway line. A host test measures the view and asserts it is
-exactly `GREETER_H`, so `check-login`'s own copy of the pair — kept deliberately, as every chrome
-metric in that file is (M11 decision 2) — cannot drift from the greeter without failing on the
-host first, which costs a second instead of a boot. The width stays a choice, because the fields
-flex; the test asserts the label column and a usable field fit inside it.
+exactly `GREETER_H`.
+
+**That alone does not keep `check-login`'s copy of the pair honest, though this entry first said
+it did** (PR #318 review, finding 1). The gate writes the size down a second time on purpose, as
+every chrome metric in that file is written twice (M11 decision 2) — and the greeter's test
+compares the card against the *greeter's* constant, never against the gate's. Moving the view and
+its constant together, which is exactly what that test forces, would have left the gate behind
+until a boot failed. So the loop is closed at the other end too:
+`the_gates_greeter_size_is_the_greeters_own` reads the pair out of the greeter's source and
+compares it with `xtask`'s own, the way `abi-sync-check` keeps the kernel's constants and
+`libkern`'s equal, and it fails if the pattern stops matching rather than passing on nothing.
+**A deliberate copy still needs something that fails when it goes stale**, and a comment saying
+so is not that thing.
+
+The width stays a choice, because the fields flex — and the test for it asks the **layout** where
+the field landed rather than doing arithmetic on the constants, which review showed could not see
+an inset that left the field 64 pixels wide (finding 2).
 
 **A refusal's line is always in the card and empty until there is one.** It used to be pushed in
 when it happened, which moved both fields down as the message appeared and back up on the next

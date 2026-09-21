@@ -57,9 +57,10 @@ colour, radius or metric", which reverses a recorded decision without naming it)
 is that **chrome metrics are not themeable**, and `xtask` copies `BAR_H`, `INDICATOR_W`,
 `ENTRY_W`, `TITLE_BAR_H` and the greeter's size with a comment on each saying why: *"a gate
 that read the shell's layout to know where to aim could agree with a shell that had stopped
-drawing where it says"*. **A copy is not an excuse for an unmeasured number**: the greeter's
-`340×141` was `420×200`, and since Part D its height is what the card measures in a host test —
-the gate keeps its own copy, and the two drift only if something fails on the host first.
+drawing where it says"*. **A copy is not an excuse for an unmeasured number, and it needs a test
+of its own**: the greeter's `340×141` was `420×200`, and since Part D its height is what the card
+measures in a host test *and* `xtask`'s copy is compared against the greeter's source by a second
+one — the first without the second leaves exactly the drift the copy was supposed to survive.
 
 That is the same anti-tautology argument, reaching the opposite conclusion — because a *colour* is
 compared against a computed render, while a *metric* is where a gate aims a click. A gate that
@@ -373,7 +374,9 @@ expectation changes in the same commit as the code is the shape that needs a rea
       `CONTROL_RADIUS` — public now, and the shell's bar dropped its own second copy of the 8.
       Focus keeps its two-pixel accent ring, so a state still reads as a state.
       `a_resting_field_has_an_edge_against_the_ground_it_sits_on` fails against the flat fill it
-      replaced.
+      replaced. **Every field got the rounding; only the greeter's is ever drawn at rest** — every
+      other caller passes `active: true` (PR #318 review, optional 3). So the edge waits for the
+      first field that is not the focused one, which Part I's search is.
 - [x] **D.3 — the card.** A bold title, labels in `foreground_dim`, a refusal in `deny` rather
       than in body ink, the rhythm of spacing the design uses, and the one-pixel rounded edge
       every other surface in this system now has. **The copy does not change**: what a greeter
@@ -389,6 +392,10 @@ expectation changes in the same commit as the code is the shape that needs a rea
       **Built.** 420×200 became **340×141**, and the height is measured:
       `the_card_is_exactly_the_window_it_is_drawn_in` pins it, and asserts a refusal does not
       change it. `check-login` types and never clicks the greeter, so no aim moved with it.
+      **The gate's copy needed a test of its own**, which this box first thought it did not: the
+      greeter's test compares the card with the *greeter's* constant, so the two could still drift
+      (PR #318 review, finding 1). `the_gates_greeter_size_is_the_greeters_own` compares `xtask`'s
+      copy against the greeter's source, as `abi-sync-check` does for the ABI.
 
 ## Part E — the overview
 
