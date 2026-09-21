@@ -27171,3 +27171,54 @@ them. A subtitle in body ink was "dimmer than the title" by three units of antia
 bar's readings and a pill's label were counted by exact colour, which at the small step is almost
 no pixels at all. The fix each time was an absolute threshold — the ink itself — rather than a
 relative one.
+
+## 2026-09-21 — Desktop refresh Part I: the file browser's listing becomes a table
+
+**Columns are the toolkit's, not the browser's.** A `ListRow` carries trailing `cells` and an
+optional `swatch`; `list_view` takes the column widths and their alignment; `list_header` draws
+the headings from that same spec with the rows' own insets, so a heading cannot sit off the
+column under it. **A row with neither cells nor swatch is byte-for-byte what it was** — one
+padded label, no row wrapper — because every other list in the system is a name and nothing else,
+and a node per row in every window list would be the cost of a feature they do not use.
+
+**The name flexes and the columns are fixed**, which is `TAB_W`'s argument again: a long name is
+what gets cut short, never a size or a date, and columns that shared the width out would move
+under each other as a listing changed.
+
+**`Modified` needs to know what today is, so the binary reads the clock and the view is a
+function of it.** `HH:MM` for today and a date before that; the pure half cannot call the clock
+and stay host-testable, so `now_nanos` is read per listing — a browser repaints on every
+keystroke and the date does not change between them. Zero means the machine has no clock, and
+then every row shows a date rather than a fabricated 1970, which is the rule `modified_text`
+already followed.
+
+**Search filters or is absent, and it filters.** `Ctrl+F` opens a field in the toolbar; typing
+narrows the listing by the Applications menu's rule — case-insensitive, anywhere in the name —
+`Esc` closes it and `Enter` opens what is left. **A row keeps its index into the whole listing**,
+because its key is that index and opening, dragging, renaming and the marked set all resolve
+through it: a filter that renumbered its rows would leave every one of those acting on the wrong
+file. The test's control is exactly that renumbering.
+
+**The row it went into is the View menu, not File.** File's rows are indexed by `check-login`,
+and a row wedged into the middle of it moves a gate's aim for a reason that has nothing to do
+with the gate. Search belongs beside the orders anyway: what it changes is which rows are shown.
+
+**A zero-height box still paints its children.** The tab strip is left out of the dock when there
+is one tab — the design draws none — and sizing it to nothing left the tab and the `+` drawing
+over the chrome below. That is the third variant of "present but invisible" in three parts, and
+the first where the *absence* was the thing that did not happen. The screendump caught it; the
+test that now catches it counts ink in the band the strip would occupy rather than asserting a
+height.
+
+**The gate's copies of the browser's metrics are a table now, checked like the others.** Rows are
+25 and not 20, the sidebar's margin is nought, the tab strip is gone at one tab and a header sits
+above the rows — four changes to the same sum, which is how a gate comes to press one row high.
+`the_gates_browser_table_is_the_browsers` reads them out of `nxfiles`'s source, because `xtask`
+cannot link a bare-target program whose library half pulls `libsurface`; the toolkit's own
+metrics are imported rather than parsed, as PR #319's review established.
+
+**Left undone, and named.** The toolbar is not re-cut to the design's 39-pixel row: its three
+modes — the path, the location field, a rename — share a height, and changing that is a larger
+job than this part needs. A header click does not sort; the View menu's four orders are the
+answer until somebody asks for the other. The free-space readout still waits on a filesystem
+operation that reports free space.

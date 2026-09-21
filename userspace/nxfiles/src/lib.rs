@@ -33,13 +33,15 @@ use librsproto::surface::{
 use alloc::vec;
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, padding, row, sized, text,
+    Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text,
     with_spacing,
 };
 use libui::widget::{
-    DIALOG_GAP, GRIP_W, ColumnAlign, ListColumn, ListRow, STATUS_BAR_H, status_bar, status_separator, status_text, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
-    TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    popup_frame, resize_grip, TabExtras, tab_strip, text_field, title_bar, window_frame_with_grip,
+    ColumnAlign, DIALOG_GAP, GRIP_W, ListColumn, ListRow, ListState, STATUS_BAR_H, Swatch,
+    TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextFieldState, Theme as UiTheme, TitleButtons,
+    WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view, popup_frame, resize_grip,
+    status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
+    window_frame_with_grip,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -70,6 +72,12 @@ pub const HEADER_KEY: u64 = 21;
 /// **The listing keeps [`LIST_KEY`]**, which the gates and this crate's tests find it by; this
 /// names the pair, because the window's dock wants every child keyed and the pane is now a child.
 pub const LIST_PANE_KEY: u64 = 23;
+
+/// The element key on the search field, when it is open.
+pub const SEARCH_KEY: u64 = 24;
+
+/// How wide the search field is: the design's 120.
+pub const SEARCH_W: u32 = 120;
 
 /// The element key on the status bar at the window's foot.
 pub const STATUS_KEY: u64 = 22;
@@ -153,7 +161,7 @@ pub const TAB_KEY_BASE: u64 = 1 << 63;
 /// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
 /// its rows, and a width that followed the theme's text size would move under a gate that had to
 /// read a theme file to know where to click.
-pub const SIDEBAR_W: u32 = 148;
+pub const SIDEBAR_W: u32 = 132;
 
 /// How much space sits between the quick-access panel and everything around it.
 ///
@@ -161,7 +169,7 @@ pub const SIDEBAR_W: u32 = 148;
 /// makes it read as a *panel* rather than as part of the listing is the window showing through
 /// around it. Reported from running it — "add some margin around the quick access panel just to
 /// separate it from the rest".
-pub const SIDEBAR_PAD: u32 = 6;
+pub const SIDEBAR_PAD: u32 = 0;
 
 /// The element key on the sidebar.
 pub const SIDEBAR_KEY: u64 = 26;
@@ -227,6 +235,9 @@ pub const CLOSE_TAB_KEYCODE: u16 = 17;
 pub const HIDDEN_KEYCODE: u16 = 35;
 /// The key that opens the location bar: `l`, with Ctrl.
 pub const LOCATION_KEYCODE: u16 = 38;
+
+/// `Ctrl+F` opens the toolbar's search field.
+pub const SEARCH_KEYCODE: u16 = 33;
 /// The key that shows what is known about the selected entry: `i`, with Ctrl.
 pub const PROPERTIES_KEYCODE: u16 = 23;
 /// The key that cuts the selection: `x`, with Ctrl.
@@ -532,6 +543,13 @@ pub struct App {
     /// **On the window rather than the pane**, because only one can be open at a time and it acts
     /// on whichever tab is current — the same reason the name prompt is not per pane.
     location: Option<TextFieldState>,
+    /// The search field, when it is open — the toolbar's, which **filters the listing as it is
+    /// typed** (desktop refresh, Part I).
+    ///
+    /// **A filter, not a placeholder.** The design draws a Search field and does nothing with it;
+    /// a field that looked like search and did nothing is the defect every part of this refresh
+    /// has named, so this narrows the rows by the same rule the Applications menu uses.
+    search: Option<TextFieldState>,
     /// Counts runs of pointer presses, so a second click on a row can mean something else.
     ///
     /// **Fed by the binary**, which is the only half that can read a clock — see
@@ -760,6 +778,10 @@ pub enum Msg {
     CloseProperties,
     /// Open the location bar, seeded with where this tab is — `Ctrl+L`, or the File menu.
     OpenLocation,
+    /// Open the toolbar's search field, and filter the listing as it is typed.
+    OpenSearch,
+    /// Close it, and show the whole listing again.
+    SearchCancel,
     /// Go to what was typed there.
     LocationGo,
     /// Close it without going anywhere.
@@ -844,6 +866,7 @@ impl App {
             sidebar: ListState::default(),
             properties: None,
             location: None,
+            search: None,
             clicks: libui::click::Clicks::new(),
             scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
@@ -933,6 +956,32 @@ impl App {
     /// What it is showing.
     pub fn entries(&self) -> &[Entry] {
         &self.pane().entries
+    }
+
+    /// Which entries the listing shows, as indices into [`entries`](Self::entries).
+    ///
+    /// **Indices rather than entries**, because a row's key is `LIST_ROW_KEY + its index` and
+    /// everything downstream — opening, dragging, renaming, the marked set — resolves through
+    /// that. A filter that renumbered the rows would quietly make every one of those act on the
+    /// wrong file (desktop refresh, Part I).
+    ///
+    /// **Case-insensitive, and a substring rather than a prefix**: the Applications menu's rule,
+    /// because a person searching a directory for `notes` should not have to know whether the
+    /// file begins with it.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let query = self.search.as_ref().map(|f| f.text().to_lowercase()).unwrap_or_default();
+        self.pane()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| query.is_empty() || e.name.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// What the search field holds, if it is open — for the binary's receipts and for tests.
+    pub fn search_text(&self) -> Option<&str> {
+        self.search.as_ref().map(|f| f.text())
     }
 
     /// Replace the listing: `path` is now where we are, and `entries` is what is in it.
@@ -1184,8 +1233,18 @@ impl App {
             Msg::OpenLocation => {
                 self.prompt = None;
                 self.notice = None;
+                self.search = None;
                 self.location = Some(TextFieldState::with_text(&self.pane().path));
             }
+            // **Opened empty**, where the location bar is seeded: a search that began with the
+            // directory's name in it would start by matching nothing.
+            Msg::OpenSearch => {
+                self.prompt = None;
+                self.notice = None;
+                self.location = None;
+                self.search = Some(TextFieldState::new());
+            }
+            Msg::SearchCancel => self.search = None,
             Msg::Place(key) => {
                 if let Some(p) = place_of(key).and_then(|i| self.places().into_iter().nth(i)) {
                     self.goto = Some(p.path);
@@ -1452,6 +1511,35 @@ impl App {
         // reason below: `Backspace` correcting a typo must not also go up a directory. Before the
         // prompt check because the two are mutually exclusive — opening either closes the other —
         // so the order between them only decides which branch answers when neither is open.
+        // **And while a search is being typed they are the field's**, for the location bar's
+        // reason: `Backspace` correcting a query must not also go up a directory. `Enter` opens
+        // what is left, which is what a filter that has narrowed to one thing is for.
+        if self.search.is_some() {
+            match k.keycode {
+                libkern::abi::KEY_ESC => self.update(Msg::SearchCancel),
+                libkern::abi::KEY_ENTER => {
+                    if let Some(i) = self.visible_indices().first().copied() {
+                        self.search = None;
+                        self.update(Msg::Activate(LIST_ROW_KEY + i as u64));
+                    }
+                }
+                // Arrows still move the selection: a filter narrows the list, it does not take
+                // the list's keys away.
+                libkern::abi::KEY_DOWN => {
+                    let shown = self.visible_indices().len();
+                    self.pane_mut().list.down(shown);
+                }
+                libkern::abi::KEY_UP => {
+                    self.pane_mut().list.up();
+                }
+                _ => {
+                    if let Some(f) = self.search.as_mut() {
+                        f.apply(k.keycode, k.modifiers);
+                    }
+                }
+            }
+            return;
+        }
         if self.location.is_some() {
             match k.keycode {
                 libkern::abi::KEY_ESC => self.update(Msg::LocationCancel),
@@ -1903,6 +1991,7 @@ impl App {
                         Accel::ctrl(LOCATION_KEYCODE, "L"),
                         Msg::OpenLocation,
                     ),
+
                     Item::Separator,
                     Item::new(
                         "New Window",
@@ -1965,6 +2054,12 @@ impl App {
                         Msg::ToggleHidden,
                     )
                     .marked(self.pane().show_hidden),
+                    // **In View rather than in File**, where it was first written: this row
+                    // changes *which rows are shown*, which is what the rest of this menu does —
+                    // and the File menu's rows are indexed by `check-login`, so a row wedged
+                    // into the middle of it moves a gate's aim for a reason that has nothing to
+                    // do with the gate (desktop refresh, Part I).
+                    Item::new("Search\u{2026}", Accel::ctrl(SEARCH_KEYCODE, "F"), Msg::OpenSearch),
                 ],
             },
         ]
@@ -2317,17 +2412,24 @@ impl App {
                     .key(NOTICE_KEY),
                 ])
             }
+            // **The path as segments, with the separators drawn quieter than the names** — the
+            // design's breadcrumb (desktop refresh, Part I). One `Text` per segment rather than
+            // one string, because the `/` between them is the only part that is not a name and
+            // the whole point is that it reads as punctuation.
             None => row(alloc::vec![
-                padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.pane().path.clone()))
-                    .key(PATH_KEY),
                 padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    text(self.notice.clone().unwrap_or_default()),
+                    center_v(row(breadcrumb(self.pane().path.as_str(), &ui))),
+                )
+                .key(PATH_KEY),
+                padding(
+                    Insets { top: 4, right: 4, bottom: 4, left: 6 },
+                    center_v(text(self.notice.clone().unwrap_or_default())),
                 )
                 .key(NOTICE_KEY),
             ]),
         };
-        let strip = row(alloc::vec![
+        let mut strip_items = alloc::vec![
             button(
                 "^",
                 Msg::Up,
@@ -2336,7 +2438,24 @@ impl App {
             )
             .key(UP_KEY),
             middle.key(STRIP_INNER_KEY).flex(1),
-        ]);
+        ];
+        // **The search field only while it is open**, which is the honest version of the
+        // design's Search box: it filters the listing as it is typed, and a field that sat there
+        // doing nothing is the defect every part of this refresh has named. `Ctrl+F` opens it,
+        // `Esc` closes it, `Enter` opens what is left.
+        if let Some(f) = self.search.as_ref() {
+            strip_items.push(
+                sized(
+                    Size::new(SEARCH_W, 0),
+                    padding(Insets { top: 2, right: 6, bottom: 2, left: 0 }, {
+                        let state = WidgetState { active: true, ..Default::default() };
+                        text_field(f, false, state, &ui)
+                    }),
+                )
+                .key(SEARCH_KEY),
+            );
+        }
+        let strip = row(strip_items);
 
         // **The tab strip, between the menus and the path.** Above the path because a tab *is*
         // a path — the strip says which of several you are looking at, and the strip below says
@@ -2356,14 +2475,18 @@ impl App {
             &ui,
         );
 
-        let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
+        // **The rows the filter leaves**, by index into the whole listing: a row's key carries
+        // its original index, so opening, dragging and renaming resolve to the same file whether
+        // or not a search is narrowing what is on screen.
+        let shown = self.visible_indices();
+        let labels: Vec<String> =
+            shown.iter().map(|i| self.pane().entries[*i].label()).collect();
         // **The three facts beside each name** (desktop refresh, Part I), built as owned strings
         // first because a `ListRow` borrows its cells: one `Vec` of them, then a `Vec` of
         // borrows into it, which is the same two-step the labels above already take.
-        let facts: Vec<[String; 3]> = self
-            .pane()
-            .entries
+        let facts: Vec<[String; 3]> = shown
             .iter()
+            .map(|i| &self.pane().entries[*i])
             .map(|e| {
                 [
                     column_size(e.size),
@@ -2375,15 +2498,16 @@ impl App {
         let cells: Vec<[&str; 3]> =
             facts.iter().map(|f| [f[0].as_str(), f[1].as_str(), f[2].as_str()]).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
-        for (i, l) in labels.iter().enumerate() {
+        for (n, l) in labels.iter().enumerate() {
+            let i = shown[n];
             let entry = &self.pane().entries[i];
             rows.push(ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: l,
                 marked: self.marked.contains(&entry.name),
-                cells: &cells[i][..],
+                cells: &cells[n][..],
                 // **The design's mark**: a folder in the accent, a file in the line colour.
-                swatch: Some(if entry.is_dir { ui.accent } else { ui.border }),
+                swatch: Some(Swatch::block(if entry.is_dir { ui.accent } else { ui.border })),
             });
         }
         let h = self.list_h();
@@ -2409,7 +2533,17 @@ impl App {
         let side_rows: Vec<ListRow<'_>> = places
             .iter()
             .enumerate()
-            .map(|(i, p)| ListRow { key: SIDEBAR_ROW_KEY + i as u64, label: p.name, marked: false, ..Default::default() })
+            .map(|(i, p)| ListRow {
+                key: SIDEBAR_ROW_KEY + i as u64,
+                label: p.name,
+                marked: false,
+                cells: &[],
+                // **A dot per place, and `Root`'s is the deny colour** (desktop refresh,
+                // Part I): the design marks every place with one and makes that one different,
+                // which is the only warning a person gets before walking out of their own home
+                // directory into the system's.
+                swatch: Some(Swatch::dot(if p.path == "/" { ui.deny } else { ui.ok })),
+            })
             .collect();
         self.sidebar.selected = here;
         // **The panel is built for the height it will be drawn at**, which is the box minus the
@@ -2651,6 +2785,32 @@ impl App {
             ui,
         )
     }
+}
+
+/// A path as breadcrumb segments: the names in the body ink, the separators in the line colour.
+///
+/// **Not a styled string**: the design's path strip reads as a sequence of places with
+/// punctuation between them, and the only way to say that in this toolkit is one element per
+/// part. The root is a single `/`, which is a place rather than a separator.
+pub fn breadcrumb<Msg>(path: &str, theme: &UiTheme) -> Vec<Element<Msg>> {
+    let mut out: Vec<Element<Msg>> = Vec::new();
+    let sep = |theme: &UiTheme| ink(theme.border, text("/"));
+    let names: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if names.is_empty() {
+        out.push(sep(theme));
+        return out;
+    }
+    for (i, name) in names.iter().enumerate() {
+        out.push(sep(theme));
+        // The last segment is where you are; the ones before it are how you got here.
+        let last = i + 1 == names.len();
+        out.push(if last {
+            text(String::from(*name))
+        } else {
+            ink(theme.foreground_dim, text(String::from(*name)))
+        });
+    }
+    out
 }
 
 /// A byte count for the listing's `Size` column: the design's `848`, `11K`, `2.8M`.
@@ -3562,6 +3722,79 @@ mod tests {
                 to: "/home/x".into(),
                 dir: true
             })
+        );
+    }
+
+    /// Search narrows the listing, and a narrowed row still opens the file it names.
+    ///
+    /// **The second half is the one worth pinning** (desktop refresh, Part I): a filter that
+    /// renumbered its rows would leave every press, drag and rename acting on the wrong entry,
+    /// because a row's key is its index into the *whole* listing and everything downstream
+    /// resolves through that.
+    #[test]
+    fn search_filters_the_listing_and_keeps_each_rows_identity() {
+        // `libinput`'s table, as `KEY_X` above is: n, o, t, h.
+        const KEY_N: u16 = 49;
+        const KEY_O: u16 = 24;
+        const KEY_T: u16 = 20;
+        const KEY_H: u16 = 35;
+        let mut a = App::new("/home");
+        a.show(
+            "/home",
+            alloc::vec![
+                Entry::dir("Documents"),
+                Entry::file("Notes.txt"),
+                Entry::file("other.txt"),
+            ],
+        );
+        assert_eq!(a.visible_indices(), alloc::vec![0, 1, 2], "unfiltered, every row shows");
+        a.update(Msg::OpenSearch);
+        assert_eq!(a.search_text(), Some(""), "the field opens empty");
+        press_key(&mut a, KEY_N);
+        press_key(&mut a, KEY_O);
+        assert_eq!(a.search_text(), Some("no"));
+        // **One row left, and it is row 1 of the listing rather than row 0 of the filter** —
+        // and `Notes.txt` matched a lower-case query, which is the case-insensitivity.
+        assert_eq!(a.visible_indices(), alloc::vec![1]);
+        // A substring rather than a prefix: `th` is in the middle of `other.txt`.
+        a.update(Msg::SearchCancel);
+        a.update(Msg::OpenSearch);
+        press_key(&mut a, KEY_T);
+        press_key(&mut a, KEY_H);
+        assert_eq!(a.visible_indices(), alloc::vec![2], "matched in the middle of a name");
+        // Escape puts the whole listing back.
+        press_key(&mut a, libkern::abi::KEY_ESC);
+        assert_eq!(a.search_text(), None);
+        assert_eq!(a.visible_indices(), alloc::vec![0, 1, 2]);
+    }
+
+    /// A path reads as segments with the separators quieter than the names.
+    #[test]
+    fn a_breadcrumb_is_names_and_punctuation() {
+        let ui = UiTheme::default();
+        let parts = |p: &str| -> Vec<String> {
+            breadcrumb::<Msg>(p, &ui)
+                .iter()
+                .map(|e| {
+                    let mut out = String::new();
+                    fn walk<M>(e: &Element<M>, out: &mut String) {
+                        if let libui::element::Node::Text(t) = &e.node {
+                            out.push_str(t);
+                        }
+                        for c in e.children() {
+                            walk(c, out);
+                        }
+                    }
+                    walk(e, &mut out);
+                    out
+                })
+                .collect()
+        };
+        assert_eq!(parts("/"), alloc::vec!["/"], "the root is a place, not a separator");
+        assert_eq!(
+            parts("/home/alice"),
+            alloc::vec!["/", "home", "/", "alice"],
+            "each name is its own element, with punctuation between"
         );
     }
 

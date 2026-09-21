@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, and Part I gave a list columns, cells and row swatches), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -499,6 +499,7 @@ so they exist:
 | `pill` | A window's one primary action — the editor's `Save`. The accent as a ground, with whichever of the surface's two inks stands further from it by weighted brightness: the paper in the light scheme, the text colour in the dark one. The inverse of every other control here, which is what makes it read as *the* action (desktop refresh, Part H) |
 | `status_bar` | A window's foot: a ground, a rule on the edge that faces the content, and readings a step below the body in `foreground_dim`. A left slot and a right one (Part H) |
 | `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked. **Rounded, and edged at rest, since the desktop refresh's Part D** — it was a flat fill of `track`, which is the light scheme's own `--bg`, so a resting field on a window's ground was invisible; the greeter is where that showed, and today its field is the only one drawn at rest. Focused, the edge is the accent ring, rounded to the same curve |
+| `list_header` | The header over a list's columns, built from the same spec the rows are, with the rows' own insets — so a heading cannot drift off the column under it (desktop refresh, Part I) |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |
 
 **And the text area arrived in M10 Part C**, six milestones after this section first reserved a
@@ -1002,6 +1003,18 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   rule, so it runs into the content below; the others have no face at all and their labels are
   dim. A `+` follows the last tab, and a caller may put a window's own controls in a right-hand
   slot — both through `TabExtras`, which keeps two optional things out of the argument list.
+- **Columns in a list** — *here since the desktop refresh's Part I*, because the browser's
+  listing is a name and three facts about it where every other list in the system is a name. A
+  `ListRow` carries trailing `cells` and an optional `swatch`; `list_view` takes the column
+  widths and their alignment. **A row with neither is exactly what it was** — one padded label,
+  with no row wrapper around it — so a window list and a launcher's results pay nothing for a
+  feature they do not use.
+
+  **The name flexes and the columns are fixed**, which is the same argument `TAB_W` makes: a
+  long name is what gets cut short, never a size or a date, and columns that shared the width
+  out would move under each other as a listing changed. `list_header` draws the headings from
+  the same spec and with the rows' own insets, so the two cannot drift apart.
+
 - **Multi-window applications** — *here since M12 Part A*, for the windows an application opens
   **beside** its main one. The trigger fired exactly as written: `nxedit` asks before discarding
   an unsaved buffer, and it asks in a real `Role::Dialog` window rather than in a `stack` overlay.

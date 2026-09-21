@@ -2503,8 +2503,37 @@ pub struct ListRow<'a> {
     ///
     /// Fewer cells than columns is fine: the rest are blank. More are ignored.
     pub cells: &'a [&'a str],
-    /// A small square before the label — the browser's folder-or-file mark.
-    pub swatch: Option<Rgb>,
+    /// A small shape before the label — the browser's folder-or-file mark, or a place's dot.
+    pub swatch: Option<Swatch>,
+}
+
+/// The shape drawn before a row's label. See [`ListRow::swatch`].
+///
+/// **Two shapes, named rather than described at each call site**: the design marks a listing's
+/// rows with a small block and a sidebar's places with a dot, and a caller that spelled out
+/// widths and radii would be free to invent a third (desktop refresh, Part I).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Swatch {
+    /// What colour it is drawn in.
+    pub colour: Rgb,
+    /// How wide, in pixels.
+    pub width: u32,
+    /// How tall, in pixels.
+    pub height: u32,
+    /// The corner it is rounded to; half the height makes it round.
+    pub radius: u32,
+}
+
+impl Swatch {
+    /// The listing's mark: the design's 11×9 with the barest corner on it.
+    pub fn block(colour: Rgb) -> Self {
+        Self { colour, width: SWATCH_W, height: SWATCH_H, radius: 1 }
+    }
+
+    /// A place's dot in a sidebar: the design's 5, round.
+    pub fn dot(colour: Rgb) -> Self {
+        Self { colour, width: DOT_W, height: DOT_W, radius: DOT_W / 2 }
+    }
 }
 
 /// A trailing column in a list: how wide it is, and which end its text sits against.
@@ -2814,10 +2843,12 @@ pub fn list_view<Msg>(
             continue;
         }
         let mut cells = alloc::vec::Vec::with_capacity(columns.len() + 2);
-        if let Some(colour) = r.swatch {
+        if let Some(sw) = r.swatch {
+            // **The lead-in is the same width whatever the shape**, so a sidebar's dots and a
+            // listing's blocks both leave their labels on one edge.
             cells.push(center_v(sized(
-                Size::new(SWATCH_W, SWATCH_H),
-                rounded_fill(colour, SWATCH_RADIUS),
+                Size::new(SWATCH_W, sw.height),
+                center(sized(Size::new(sw.width, sw.height), rounded_fill(sw.colour, sw.radius))),
             )));
             cells.push(sized(Size::new(SWATCH_GAP, 0), text("")));
         }
@@ -2884,8 +2915,8 @@ pub fn list_view<Msg>(
 pub const SWATCH_W: u32 = 11;
 /// See [`SWATCH_W`].
 pub const SWATCH_H: u32 = 9;
-/// See [`SWATCH_W`].
-const SWATCH_RADIUS: u32 = 1;
+/// A place's dot in a sidebar: the design's 5.
+pub const DOT_W: u32 = 5;
 /// Between a swatch and the name beside it: the design's 8.
 const SWATCH_GAP: u32 = 8;
 /// The space after a right-aligned cell's text, so a column of sizes does not sit hard against
@@ -2981,7 +3012,7 @@ mod list_view_tests {
             label: "a-very-long-file-name-that-would-run-past-the-columns.txt",
             marked: false,
             cells: &["848", "toml"],
-            swatch: Some(mark),
+            swatch: Some(Swatch::block(mark)),
         };
         let mut st = ListState::default();
         let e: Element<u64> =
