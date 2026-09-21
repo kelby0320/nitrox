@@ -27005,3 +27005,37 @@ arrangement was new: it is Part C's, and it is why this was a change to review r
 **Corrected in passing.** The theme schema said a window bar was 24 pixels and shared the list
 row's 16-pixel bound; it has been 31 since Part B. The bound is the list row's alone, and the
 schema now says where the one step above the body is drawn.
+
+## 2026-09-21 — Part G, reviewed: the font floor, an asserted aim margin, and a half-made correction
+
+PR #316's review found no blocking fault in the mechanism — it broke each production line and
+confirmed every new test fails without it — and three documentation findings, two of which turned
+out to be about the code rather than about the prose.
+
+**The size steps now hold the font floor.** `MIN_FONT_PX` is 6 because "below this the glyph
+rasteriser produces shapes nobody can read", and `font_px = 6` is a legal file — so ⅞ of it set a
+menu's chord column and the editor's status line at 5.25, under the size the floor exists to
+forbid. `TextSize::px` clamps there now, and a test walks the whole legal range in hundredths.
+**The ceiling needs no clamp** and did not get one: `Large` is 17⅓ at `font_px = 16`, the only
+thing set at that step is the top bar's two words, and that bar is 30 pixels tall. Clamping it
+would flatten the scale at the top to protect a box that is not tight.
+
+**An aim's margin is asserted now rather than described.** `check-login`'s comment said both
+top-bar aims "sit in the middle of what the two sizes share", and its figures were the geometry
+from before Part G's own `Large` step: `Large` widens `Applications`, which pushes `Places` right
+by five pixels. Nothing failed — the press still landed — but the sentence the next person would
+re-derive an aim from was false, and the Places aim was 18 pixels from an edge at one size.
+`desktop_shell::panel`'s test now asserts each aim is 20 pixels inside its word at **both** sizes,
+and the aim moved to 141. **A property that fails when a word moves, where prose does not**: this
+is the same lesson as a comment that argues, one step further out — the figures were true when
+written and went stale in the very part that wrote them.
+
+**A correction made in one of two places is half a correction.** Part G's entry records fixing the
+theme schema's claim that a window bar is 24 pixels with 4+4 of button padding. Review found the
+same sentence in `MAX_FONT_PX`'s own doc comment — which is where the schema's copy came from, and
+the place a reader of the constant would meet it. Both say now that the list row is the tightest
+box alone.
+
+**And one that could no longer fire.** The font staging's `faces.dedup()` existed for a theme whose
+UI and mono faces are one file; `dedup` removes only *adjacent* equals, so inserting the bold face
+between the two silently retired it. It is a `contains` check now.

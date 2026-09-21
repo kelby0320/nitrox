@@ -42,6 +42,7 @@ use alloc::vec::Vec;
 
 use libdraw::format::Rgb;
 use libdraw::geom::Size;
+use libdraw::theme::MIN_FONT_PX;
 use librsproto::surface::{KeyEvent, PointerEvent};
 
 /// Which edge a docked child is pinned to.
@@ -135,12 +136,21 @@ impl TextSize {
     pub const LARGE: f32 = 13.0 / 12.0;
 
     /// This step's size in pixels, for a body size of `body`.
+    ///
+    /// **Never below [`MIN_FONT_PX`]**, which is the floor a theme's `font_px` is already held
+    /// to — "below this the glyph rasteriser produces shapes nobody can read". A step below the
+    /// body would otherwise walk under it: `font_px = 6` is a legal file, and ⅞ of it is 5.25,
+    /// so a menu's chord column and the editor's status line would be set below the size the
+    /// floor exists to forbid (PR #316 review, finding 3). At the ceiling there is nothing to
+    /// clamp: `Large` is 17⅓ at `font_px = 16`, and the only thing set at that step is the top
+    /// bar's two words, in a bar 30 pixels tall.
     pub fn px(self, body: f32) -> f32 {
-        match self {
+        let px = match self {
             TextSize::Small => body * Self::SMALL,
             TextSize::Body => body,
             TextSize::Large => body * Self::LARGE,
-        }
+        };
+        px.max(MIN_FONT_PX)
     }
 }
 
@@ -732,6 +742,32 @@ mod tests {
     /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
     use alloc::vec;
+
+    /// The steps hold the theme's own floor: no step sets text smaller than `MIN_FONT_PX`,
+    /// at any size a theme file can ask for (PR #316 review, finding 3).
+    #[test]
+    fn no_step_goes_under_the_font_floor() {
+        use libdraw::theme::{MAX_FONT_PX, MIN_FONT_PX};
+        // The smallest legal body size is where a step below it would break the floor: 7/8 of
+        // 6 is 5.25, and the clamp is the whole of the difference.
+        assert_eq!(TextSize::Small.px(MIN_FONT_PX), MIN_FONT_PX);
+        assert_eq!(TextSize::Body.px(MIN_FONT_PX), MIN_FONT_PX);
+        assert!(TextSize::Large.px(MIN_FONT_PX) > MIN_FONT_PX);
+        // Across the whole legal range, in hundredths as `font_px` is read.
+        let mut px = MIN_FONT_PX;
+        while px <= MAX_FONT_PX {
+            for step in [TextSize::Small, TextSize::Body, TextSize::Large] {
+                let at = step.px(px);
+                assert!(at >= MIN_FONT_PX, "{step:?} of {px} is {at}, under the floor");
+            }
+            px += 0.01;
+        }
+        // Above the floor the steps are themselves, and ordered — the clamp is not a flattening.
+        let small = TextSize::Small.px(12.0);
+        let (body, large) = (TextSize::Body.px(12.0), TextSize::Large.px(12.0));
+        assert!(small < body && body < large, "{small} {body} {large}");
+        assert_eq!(body, 12.0);
+    }
 
     #[test]
     fn builders_carry_key_and_flex_without_changing_the_node() {

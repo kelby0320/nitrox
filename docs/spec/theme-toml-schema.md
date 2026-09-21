@@ -198,7 +198,9 @@ and that is the decision to revisit, not this number.
 Part G): `TextSize::Small`, ⅞ of it, for a menu's shortcut column and the editor's status line;
 and `TextSize::Large`, 13⁄12 of it, for the top bar's two words. So the largest text on the screen
 is 17⅓ pixels at the ceiling, and it is only ever in the 30-pixel top bar. A window's title is
-bold rather than larger. The shipped default is 13; the staged file above sets 12, as the
+bold rather than larger. **At the floor the steps stop rather than follow**: ⅞ of the smallest
+legal 6 would be 5.25, under the size this range exists to forbid, so `TextSize::px` clamps at
+`MIN_FONT_PX` and a 6-pixel theme sets its hints at 6 too. The shipped default is 13; the staged file above sets 12, as the
 refresh chose, and the default differs so that a client reading the file is visible.
 
 **`bevel` is one number for every gradient in the system** — a title bar, a scrollbar's thumb, a

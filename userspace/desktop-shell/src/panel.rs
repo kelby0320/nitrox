@@ -634,6 +634,16 @@ mod tests {
     const FONT_SIZES: [f32; 2] = [12.0, 13.0];
 
     /// The light theme at each of [`FONT_SIZES`].
+    /// `check-login`'s presses on the two top-bar words, as it writes them.
+    const APPS_CLICK: i32 = 60;
+    const PLACES_CLICK: i32 = 141;
+
+    /// How far inside its word each of those presses must land, at either text size.
+    ///
+    /// Twenty rather than one: a word's face moves as the size does — five pixels between the
+    /// two — so an aim wants room for several such steps, not proof that it fits this pair.
+    const AIM_MARGIN: i32 = 20;
+
     fn themes() -> impl Iterator<Item = Theme> {
         FONT_SIZES.into_iter().map(|px| Theme { font_px: px, ..Theme::light() })
     }
@@ -665,6 +675,13 @@ mod tests {
     ///
     /// Written down in `xtask` a second time on purpose; pinned here so a change to the bar that
     /// moves a word under them fails a host test rather than a boot.
+    ///
+    /// **And the margin is asserted, not described** (PR #316 review, finding 1). A word's face
+    /// moves between the two text sizes — `Large` widened `Applications` by five pixels and
+    /// pushed `Places` right by the same — so an aim that merely lands today can be a pixel
+    /// inside an edge and nobody would know. The second half asserts each aim is
+    /// [`AIM_MARGIN`] inside its word at **both** sizes, which is the claim `check-login`'s
+    /// comment used to make in prose and get wrong.
     #[test]
     fn the_gates_aims_land_on_the_words_they_name() {
         let f = font();
@@ -673,11 +690,28 @@ mod tests {
             for width in [1024u32, 1280, 1360, 1920] {
                 let bounds = Rect::new(0, 0, width, BAR_H);
                 let bar = top_bar("12:34", None, None, &theme);
-                assert_eq!(click(&bar, bounds, &m, 60, 12), [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
-                let places = click(&bar, bounds, &m, 134, 12);
+                let apps = click(&bar, bounds, &m, APPS_CLICK, 12);
+                assert_eq!(apps, [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
+                let places = click(&bar, bounds, &m, PLACES_CLICK, 12);
                 assert_eq!(places, [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
                 // And the clock is not a control: a press on it is a press on the bar.
                 assert!(click(&bar, bounds, &m, width as i32 / 2, 12).is_empty(), "the clock at {width}");
+            }
+            // The press lands well inside the word, not against an edge of it.
+            let bar = top_bar("12:34", None, None, &theme);
+            let l = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
+            let aims =
+                [(APPS_CLICK, APPS_KEY, "APPS_CLICK"), (PLACES_CLICK, PLACES_KEY, "PLACES_CLICK")];
+            for (aim, key, what) in aims {
+                let w = locate(&bar, &l, key).expect("the word");
+                let (left, right) = (w.origin.x, w.origin.x + w.size.w as i32);
+                let margin = (aim - left).min(right - aim);
+                assert!(
+                    margin >= AIM_MARGIN,
+                    "{what} is {margin} px inside {left}..{right} at font_px {}, under \
+                     {AIM_MARGIN}",
+                    theme.font_px
+                );
             }
         }
     }

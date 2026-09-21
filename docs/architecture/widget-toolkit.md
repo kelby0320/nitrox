@@ -286,7 +286,7 @@ has to remember to set.
 
 **And `scaled` and `bold`, which change the text's size and weight the same way** (desktop
 refresh, Part G). The theme carries one size, `font_px`, and text is set at one of three steps
-derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12. Those are
+derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12, and no step goes under `MIN_FONT_PX`. Those are
 the design's proportions around its 11.5-pixel body: its status bar and secondary columns are
 10 to 10.5 pixels, and its top bar 12.5. `bold` sets text in the
 face's bold companion, `libdraw::text::Font::bold`, which `load_ui` attaches only to the built-in
