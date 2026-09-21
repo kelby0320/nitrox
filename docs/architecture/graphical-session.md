@@ -2,10 +2,12 @@
 
 ## Status
 
-**Built, and checked 2026-09-04** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2. One thing changed under it since: the session namespace also binds
-`/applications`, which is where the Applications menu's entries come from (M14 Part H); §3 records
-why an *application's* namespace deliberately does not.
+**Built, and checked 2026-09-21** — Milestone 7 (Parts A–F). Graduated from `design/` on
+2026-08-25, revision 2. Two things changed under it since: the session namespace also binds
+`/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
+records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
+restyled the greeter's card and moved its pure half — the state, the keys it acts on itself and
+the view — into a library beside the binary, so the host tests it.
 
 What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
 `/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,

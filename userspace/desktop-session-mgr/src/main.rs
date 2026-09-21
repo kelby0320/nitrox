@@ -21,19 +21,15 @@
 
 extern crate alloc;
 
-use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Geometry, MemFramebuffer};
-use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::Session;
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, column, padding, row, sized, text};
-use libui::layout::layout;
-use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{TextFieldState, WidgetState, text_field};
+use desktop_session_mgr::{
+    GREETER_H, GREETER_PITCH, GREETER_W, Greeter, KEY_ENTER, greeter_theme,
+};
 use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 
 /// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
@@ -41,14 +37,6 @@ use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The greeter window's size. Fixed rather than screen-relative: only its position follows the
-/// screen, centred on the size `/dev/draw/screen` reports since Phase 5 Part E (see `_start`).
-const GREETER_W: u32 = 420;
-/// See [`GREETER_W`].
-const GREETER_H: u32 = 200;
-/// Bytes per row. `WIDTH * 4` exactly: nothing here needs the padded pitch the reference UI
-/// uses to catch stride bugs, and an unpadded one keeps the buffer copy a memcpy.
-const GREETER_PITCH: usize = (GREETER_W as usize) * 4;
 /// How many buffers the greeter attaches.
 const BUFFERS: usize = 2;
 
@@ -73,144 +61,6 @@ fn fail(msg: &[u8]) -> ! {
     unsafe { syscall4(SYS_PROCESS_EXIT, 1, 0, 0, 0) };
     loop {
         core::hint::spin_loop();
-    }
-}
-
-/// Which field the keyboard is going to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    /// The username field.
-    User,
-    /// The password field.
-    Password,
-}
-
-/// Everything the greeter draws from.
-struct Greeter {
-    /// The username being typed.
-    user: TextFieldState,
-    /// The password being typed. Rendered masked.
-    password: TextFieldState,
-    /// Which field has the caret.
-    focus: Focus,
-    /// Whether the last attempt was refused.
-    denied: bool,
-}
-
-/// `EV_KEY` codes the greeter acts on itself. The fields claim everything else through
-/// [`TextFieldState::apply`], which declines exactly these three so they can reach here — the
-/// reason `Element::on_key` returns an `Option` at all.
-const KEY_TAB: u16 = 15;
-/// See [`KEY_TAB`].
-const KEY_ENTER: u16 = 28;
-
-impl Greeter {
-    /// An empty greeter, caret in the username field.
-    fn new() -> Self {
-        Self {
-            user: TextFieldState::new(),
-            password: TextFieldState::new(),
-            focus: Focus::User,
-            denied: false,
-        }
-    }
-
-    /// The element tree for the current state.
-    ///
-    /// Rebuilt per frame, which is the toolkit's model: `view(&state) -> Element`.
-    ///
-    /// **The theme comes from the caller**, because the caller is what paints this tree — with
-    /// the built-in theme, for the reason `render` gives. One frame built from one theme and
-    /// painted with another is the mistake one type makes easy and the old two-type split made
-    /// unwriteable (PR #262 review, optional 5).
-    fn view(&self, theme: &Theme) -> Element<()> {
-        let active = |f: Focus| WidgetState { active: self.focus == f, ..Default::default() };
-        let mut rows = alloc::vec::Vec::with_capacity(6);
-        rows.push(text("nitrox"));
-        if self.denied {
-            // Said once, above the fields, and cleared on the next keystroke. The serial
-            // column prints `login incorrect` for the same reason: a refusal a user cannot
-            // see is a login that appears to have done nothing.
-            rows.push(text("login incorrect"));
-        }
-        rows.push(row(alloc::vec![
-            sized(Size::new(90, 0), text("username")),
-            text_field(&self.user, false, active(Focus::User), theme).flex(1),
-        ]));
-        rows.push(row(alloc::vec![
-            sized(Size::new(90, 0), text("password")),
-            text_field(&self.password, true, active(Focus::Password), theme).flex(1),
-        ]));
-        padding(Insets::all(16), column(rows))
-    }
-
-    /// The field the caret is in.
-    fn active_field(&mut self) -> &mut TextFieldState {
-        match self.focus {
-            Focus::User => &mut self.user,
-            Focus::Password => &mut self.password,
-        }
-    }
-
-    /// Apply a key. `true` if anything changed and the greeter must be redrawn.
-    ///
-    /// **Tab and Enter are handled here, not by the field**, which is the split
-    /// `Element::on_key`'s `Option` return exists for: a field that swallowed Tab could never
-    /// be left, and one that swallowed Enter could never submit.
-    fn key(&mut self, keycode: u16, modifiers: u16) -> bool {
-        match keycode {
-            KEY_TAB => {
-                self.focus = match self.focus {
-                    Focus::User => Focus::Password,
-                    Focus::Password => Focus::User,
-                };
-                true
-            }
-            _ => {
-                // Any edit clears a previous refusal: a "login incorrect" that outlives the
-                // typing that answers it reads as a second failure.
-                let changed = self.active_field().apply(keycode, modifiers);
-                if changed && self.denied {
-                    self.denied = false;
-                }
-                changed
-            }
-        }
-    }
-
-    /// Clear both fields and put the caret back — after a session ends, and after a refusal.
-    ///
-    /// **The password leaves the screen the moment it has been read**, whichever way the
-    /// attempt went. A greeter outlives every session it starts, so one left in the field
-    /// would sit behind whatever the session drew.
-    ///
-    /// **Not a scrub.** `String::clear` sets the length to zero and leaves the bytes in the
-    /// allocation, so this is a claim about what is displayed and what a later attempt can
-    /// read back — not about this process's memory. The caller's stack copy is
-    /// volatile-zeroed after the session ends, which is the same distinction (PR #236 review,
-    /// finding 8).
-    fn reset(&mut self) {
-        self.user.clear();
-        self.password.clear();
-        self.focus = Focus::User;
-    }
-
-    /// Render the current state into a fresh framebuffer.
-    fn render(&self, font: &Font) -> MemFramebuffer {
-        let geometry = Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
-            .expect("the greeter pitch is wide enough for a row");
-        let mut fb = MemFramebuffer::new(geometry);
-        // **The built-in theme, and the greeter is the one surface that cannot have another.**
-        // A theme lives in a user's home (M11 Part C) and this runs *before* there is a user —
-        // asking who they are is what this window is for. Built once and used for both the tree
-        // and the paint, so one frame is never two themes.
-        let theme = Theme::default();
-        let ui = self.view(&theme);
-        let bounds = Rect::new(0, 0, GREETER_W, GREETER_H);
-        let metrics = FontMetrics::new(font, theme.font_px);
-        let l = layout(&ui, bounds, &metrics);
-        paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
-        fb
     }
 }
 
@@ -430,7 +280,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // The font, before the window: a greeter that cannot draw text has nothing to show, and
     // failing here reports the real cause rather than an empty window.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let theme = Theme::default();
+    let theme = greeter_theme();
     let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") }
     {
         Ok(loaded) => loaded,

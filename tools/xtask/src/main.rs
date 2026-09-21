@@ -103,6 +103,19 @@ const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
 
+/// The greeter's window, `GREETER_W`×`GREETER_H` — **this file's own copy** of
+/// `desktop-session-mgr`'s pair, as every chrome metric here is a copy (M11 decision 2).
+///
+/// **What keeps a copy honest is a test, not a comment.** Part D first claimed that the greeter's
+/// own host test — which measures the card against *its* `GREETER_H` — made this copy safe, and it
+/// did nothing of the kind: the two constants never met, so moving the card and its constant
+/// together left this one behind and the first thing to notice would have been a boot
+/// (PR #318 review, finding 1). `the_gates_greeter_size_is_the_greeters_own` reads them out of
+/// that crate's source and compares, the way `abi-sync-check` keeps the kernel's constants and
+/// `libkern`'s equal. So the loop is closed by two host tests: the card is as tall as the
+/// greeter's constant, and the greeter's constant is this one.
+const GREETER: (u32, u32) = (340, 141);
+
 /// The `font_px` the staged `theme.toml` carries — **deliberately not the built-in 13**.
 ///
 /// A gate asserting the default proves nothing: a client that never received the theme reports
@@ -3754,9 +3767,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     on a written-down 1280×800 until then, which on the laptop put it 43 px left and 16 px
     //     low of centre. Its size is `desktop-session-mgr`'s `GREETER_W`×`GREETER_H`, written down
     //     here a second time for the reason every chrome metric in this file is (M11 decision 2).
+    //     [`GREETER`] says what keeps this copy honest.
     //     **Before the first redraw**, because the greeter reads the screen before it opens its
     //     window, and `expect` consumes what it scans past.
-    const GREETER: (u32, u32) = (420, 200);
     session.expect(&format!(
         "desktop-session-mgr: greeter centred at {},{} on a {} screen",
         (size.w - GREETER.0) / 2,
@@ -10567,6 +10580,19 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
 
+    // `desktop-session-mgr`'s greeter — its state, the keys it acts on itself, and the window it
+    // draws, all of which are functions of values (desktop refresh, Part D). **The size this file
+    // writes down as `GREETER` is measured there**, so the gate's copy and the greeter's own
+    // cannot drift without a host test failing first.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("desktop-session-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
     // `tty-server`'s line discipline — the part with all the behaviour and none of the
     // syscalls. Line editing existed three times before this server and the copies
     // disagreed (the `alicepassword:` prompt bug), so the one implementation is tested
@@ -13840,6 +13866,50 @@ mod tests {
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(read.background, libdraw::theme::Theme::dark().background);
         assert_eq!((read.font_px, read.wallpaper), (shipped.font_px, shipped.wallpaper));
+    }
+
+    /// The gate's copy of the greeter's window is the greeter's own.
+    ///
+    /// **Two constants that must agree, kept by a test rather than by a comment** — the same
+    /// arrangement `abi-sync-check` uses for the kernel's constants and `libkern`'s, and for the
+    /// same reason: `xtask` writes chrome metrics down a second time on purpose (M11 decision 2),
+    /// and a deliberate copy still needs something that fails when it goes stale. Part D claimed
+    /// the greeter's own host test covered this; it measures the card against the *greeter's*
+    /// constant and never reads this one (PR #318 review, finding 1).
+    ///
+    /// The extraction is guarded: finding neither constant is a failure, not a pass, because a
+    /// pattern that has gone stale would otherwise silently agree with everything.
+    #[test]
+    fn the_gates_greeter_size_is_the_greeters_own() {
+        let path = repo_root().join("userspace/desktop-session-mgr/src/lib.rs");
+        let text = fs::read_to_string(&path).expect("the greeter's source is readable");
+        let mut found: Vec<(String, u32)> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub const GREETER_") else { continue };
+            let Some((name, tail)) = rest.split_once(':') else { continue };
+            let Some((ty, val)) = tail.split_once('=') else { continue };
+            if ty.trim() != "u32" {
+                continue;
+            }
+            if let Some(v) = val.trim().trim_end_matches(';').parse::<u32>().ok() {
+                found.push((name.trim().to_string(), v));
+            }
+        }
+        let get = |what: &str| {
+            found.iter().find(|(n, _)| n == what).map(|(_, v)| *v).unwrap_or_else(|| {
+                panic!(
+                    "no `pub const GREETER_{what}: u32` in {} — this checker's pattern has gone \
+                     stale, which silently stops comparing anything",
+                    path.display()
+                )
+            })
+        };
+        assert_eq!(
+            (get("W"), get("H")),
+            GREETER,
+            "the greeter's window and this file's copy of it have drifted"
+        );
     }
 
     /// The shipped UI face carries the glyph a marked menu row draws.

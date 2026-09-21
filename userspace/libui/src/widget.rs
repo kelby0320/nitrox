@@ -30,7 +30,7 @@ use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
     Edge, Element, IconKind, Insets, bevel, bold, center, center_v, column, dock, docked, fill,
-    icon, ink, outline, padding, row, sized, stack, text, wash,
+    icon, ink, outline, padding, rounded_fill, row, sized, stack, text, wash,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -130,7 +130,11 @@ pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
 }
 
 /// How thick a popup's border is.
-const POPUP_BORDER: u32 = 1;
+///
+/// **Public since the desktop refresh's Part D**, because the greeter builds its card from
+/// [`popup_frame`] and sizes its window to the content: the inset between the two is this, and a
+/// second 1 written down there would be a second number to keep equal.
+pub const POPUP_BORDER: u32 = 1;
 
 /// A window's own frame: an edge, and a margin between its content and that edge.
 ///
@@ -459,6 +463,14 @@ pub fn menu_item<Msg: Clone>(
 /// Wider than a button's, because a menu is a column of text rather than a control: the reading
 /// is horizontal and the eye needs the gutter.
 const MENU_ITEM_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
+
+/// The radius every small control on a surface is rounded to: the design's `--r`, 8 — the same
+/// curve a window and a popup are cut to.
+///
+/// **Public, so the shell's bar shares it** rather than keeping a second 8 of its own. A field in
+/// a window and a button on the bar being the same shape is the thing the design is consistent
+/// about (desktop refresh, Part D).
+pub const CONTROL_RADIUS: u32 = 8;
 
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
@@ -1117,13 +1129,22 @@ pub fn text_field<Msg>(
 
     // `track` is the recessed-channel colour the scrollbar uses, and a text field is the same
     // idea: a well the content sits in, rather than a face that stands out of the surface.
+    //
+    // **Rounded, and edged at rest since the desktop refresh's Part D.** It was a flat fill of
+    // `track` with no edge until focused — and `track` is `--bg` in the light scheme, so a
+    // resting field on a window's own ground was *invisible*: the greeter's password box was a
+    // white rectangle on a white card. The design draws every field as a ground inside a
+    // one-pixel `--line`, which is what makes it read as somewhere to type before it is typed in.
+    // The ring keeps its second pixel and its accent, so focus still reads as a state rather than
+    // as an edge.
+    let (edge, thickness) =
+        if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
     let mut layers = alloc::vec::Vec::with_capacity(3);
-    if state.active {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(RING), fill(theme.track)));
-    } else {
-        layers.push(fill(theme.track));
-    }
+    layers.push(rounded_fill(edge, CONTROL_RADIUS));
+    layers.push(padding(
+        Insets::all(thickness),
+        rounded_fill(theme.track, CONTROL_RADIUS.saturating_sub(thickness)),
+    ));
     layers.push(padding(FIELD_PAD, row(content)));
     stack(layers).focusable()
 }
@@ -3622,6 +3643,39 @@ mod tests {
         assert_eq!(fb.get_pixel(0, 0), Some(p.border), "a resting button has no edge at all");
         assert_ne!(p.border, p.face, "…and the edge is not the face");
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
+    }
+
+    /// A resting field has an edge, and on a white card that edge is the only thing that says
+    /// there is a field there at all.
+    ///
+    /// **The greeter is what found this** (desktop refresh, Part D): a field was a flat fill of
+    /// `track`, `track` is the same white as a window's own ground in the light scheme, and so a
+    /// password box at rest was invisible. Painted rather than inspected, because the ground is
+    /// drawn over the edge if the layers are the wrong way round and the tree still looks right.
+    #[test]
+    fn a_resting_field_has_an_edge_against_the_ground_it_sits_on() {
+        let p = Theme::default();
+        let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
+        fb.clear(p.background);
+        let state = TextFieldState::new();
+        let e: Element<Msg> = text_field(&state, false, WidgetState::default(), &p);
+        let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
+        let all = Rect::new(0, 0, 80, 40);
+        paint(&mut fb, &font(), &p, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        // Down the left edge, clear of the rounded corners.
+        let mid = l.rect.size.h / 2;
+        assert_eq!(fb.get_pixel(0, mid), Some(p.border), "a resting field has an edge");
+        assert_ne!(p.border, p.track, "…and it is not the colour of the well inside it");
+        assert_ne!(p.border, p.background, "…nor of the surface it sits on");
+        assert_eq!(fb.get_pixel(4, mid), Some(p.track), "the well is inside the edge");
+        // Focused, the edge is the accent instead — a state, not a second kind of edge.
+        let mut lit = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
+        lit.clear(p.background);
+        let f: Element<Msg> =
+            text_field(&state, false, WidgetState { active: true, ..Default::default() }, &p);
+        let fl = layout(&f, Rect::new(0, 0, 80, 40), &CELL);
+        paint(&mut lit, &font(), &p, &f, &fl, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        assert_eq!(lit.get_pixel(0, mid), Some(p.accent), "a focused field rings in the accent");
     }
 
     /// The label is in the middle of the button, not against its corner.

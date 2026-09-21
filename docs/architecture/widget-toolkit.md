@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, and Part D gave a field a rounded edge — the accent ring when focused, `border` at rest), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -487,7 +487,7 @@ so they exist:
 
 | Widget | Why it exists |
 |---|---|
-| `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked |
+| `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked. **Rounded, and edged at rest, since the desktop refresh's Part D** — it was a flat fill of `track`, which is the light scheme's own `--bg`, so a resting field on a window's ground was invisible; the greeter is where that showed, and today its field is the only one drawn at rest. Focused, the edge is the accent ring, rounded to the same curve |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |
 
 **And the text area arrived in M10 Part C**, six milestones after this section first reserved a
