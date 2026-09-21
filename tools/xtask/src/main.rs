@@ -6218,10 +6218,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     **Last, because it leaves a browser on screen** that nothing after it has to account
     //     for. Both aims are pinned against the bar's and the menu's layout by
     //     `desktop_shell::panel`'s own test at both text sizes, as `APPS_CLICK` and `ROW1` are.
-    //     In the staged 12 px the Places word is x 105 to 158 and the menu hangs at (113, 32)
-    //     with `Documents` its second row, y 62 to 86; at the built-in 13 they are 111 to 167,
-    //     (119, 32) and 64 to 90. Both aims sit in the middle of what the two sizes share.
-    const PLACES_CLICK: (i32, i32) = (134, 12);
+    //     In the staged 12 px the Places word is x 111 to 167 and the menu hangs at (119, 32)
+    //     with `Documents` its second row, y 62 to 86; at the built-in 13 they are 116 to 175,
+    //     (124, 32) and 64 to 90 — the word moves because `Large` widens `Applications` beside
+    //     it. **The margin is asserted rather than described**: the word aim sits at least
+    //     `AIM_MARGIN` inside the word at either size, which that test checks, because the
+    //     figures written here went a size-step stale the moment the top bar changed and the
+    //     sentence claiming a comfortable aim outlived them (PR #316 review, finding 1).
+    const PLACES_CLICK: (i32, i32) = (141, 12);
     const PLACE_DOCUMENTS: (i32, i32) = (180, 75);
     click_at(&mut qmp, &mut session, PLACES_CLICK.0, PLACES_CLICK.1)?;
     session.expect("desktop-shell: places menu open")?;
@@ -13585,12 +13589,20 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         let fonts = staging.join("system").join("fonts");
         fs::create_dir_all(&fonts)?;
         let theme = libdraw::theme::Theme::light();
-        let mut faces: Vec<PathBuf> = vec![
+        // **Distinct paths, however the theme names them.** A theme whose two faces are one file
+        // stages it once. This used to be `dedup`, which only removes *adjacent* equals and so
+        // stopped covering that case the moment the bold face was inserted between the two
+        // (PR #316 review, optional 4).
+        let mut faces: Vec<PathBuf> = Vec::with_capacity(4);
+        for face in [
             font_asset(theme.font_ui.as_str())?,
             font_asset(libdraw::text::UI_BOLD_FONT_PATH)?,
             font_asset(theme.font_mono.as_str())?,
-        ];
-        faces.dedup();
+        ] {
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
         faces.push(repo_root().join("assets/fonts").join("LICENSE-DejaVu.txt"));
         let mut total = 0u64;
         for from in &faces {

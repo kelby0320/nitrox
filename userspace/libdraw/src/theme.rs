@@ -967,14 +967,22 @@ pub const MAX_BEVEL: u8 = 64;
 ///
 /// Below this the glyph rasteriser produces shapes nobody can read, and a theme that could set it
 /// is a theme that can make the machine unusable from a text file.
+///
+/// **It bounds the toolkit's steps too, not only `font_px`** (desktop refresh, Part G):
+/// `libui::element::TextSize::px` clamps here, because ⅞ of a legal 6 is 5.25 and the sentence
+/// above would then be false of the text a menu's chord column is set in.
 pub const MIN_FONT_PX: f32 = 6.0;
 
 /// The largest, and it is **not a taste judgement — it is what the chrome holds**.
 ///
 /// `text_size().h` is exactly the em size, and the tightest fixed box in the system is a list
-/// row: `ROW_H` is 20 pixels with `ROW_PAD` taking 2 above and 2 below, leaving 16. The window
-/// bars are 24 with 4+4 of button padding, which lands on the same number. That is why the
-/// system's text has always been 16 and not a coincidence anybody chose.
+/// row: `ROW_H` is 20 pixels with `ROW_PAD` taking 2 above and 2 below, leaving 16. That is a
+/// bound the list row sets by itself, and not a coincidence anybody chose.
+///
+/// **The window bars are not the second half of that argument**, though this said they were:
+/// "24 with 4+4 of button padding, which lands on the same number". A title bar has been 31
+/// since the desktop refresh's Part B and `TITLE_PAD` takes nothing above or below (PR #316
+/// review, finding 2). The list row is the tightest box, alone.
 ///
 /// **So this knob shrinks and does not grow**, which is the honest consequence of M11's decision
 /// 2: colour and type are themeable, chrome metrics are not. Text larger than its box is clipped
