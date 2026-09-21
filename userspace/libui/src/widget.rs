@@ -29,8 +29,9 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, bold, center, center_v, column, dock, docked, fill,
-    icon, ink, outline, padding, rounded_fill, row, sized, stack, text, wash,
+    Edge, Element, IconKind, Insets, TextSize, bevel, bold, center, center_v, column, dock,
+    docked, fill, icon, ink, outline, padding, rounded_fill, row, scaled, sized, stack, text, wash,
+    with_spacing,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -89,14 +90,18 @@ pub fn button<Msg>(
     // invisible — the report was that buttons need "a different color background … so you know
     // it's a button". What actually says *button* is the edge, which is what every desktop
     // draws and what this toolkit had only around a focused control.
+    //
+    // **Rounded since the desktop refresh's Part H**, to `CONTROL_RADIUS` — the curve a window,
+    // a popup, a tab and a field all share. A square button beside a rounded field was the last
+    // right angle on these surfaces.
+    let (edge, thickness) =
+        if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
     let mut layers = alloc::vec::Vec::with_capacity(3);
-    if state.active {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(RING), fill(face)));
-    } else {
-        layers.push(fill(theme.border));
-        layers.push(padding(Insets::all(BORDER), fill(face)));
-    }
+    layers.push(rounded_fill(edge, CONTROL_RADIUS));
+    layers.push(padding(
+        Insets::all(thickness),
+        rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness)),
+    ));
     // **Centred, which is what a button's label is everywhere else in the world.** It was against
     // the top-left corner of the face: `padding` places a child at an inset from the origin, and
     // a face is usually much wider than the word on it, so every button in this toolkit read as
@@ -146,8 +151,13 @@ pub const POPUP_BORDER: u32 = 1;
 /// Takes the title and the rest separately rather than wrapping a finished tree, because those
 /// two are exactly the parts that are treated differently. An application that wants no frame
 /// simply does not call this; the greeter does not, having no title bar to be flush with.
-pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
-    frame_layers(title, content, None, theme)
+pub fn window_frame<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    focused: bool,
+    theme: &Theme,
+) -> Element<Msg> {
+    frame_layers(title, content, None, focused, theme)
 }
 
 /// [`window_frame`]'s layers, with an optional corner layer drawn before the border.
@@ -155,6 +165,7 @@ fn frame_layers<Msg>(
     title: Element<Msg>,
     content: Element<Msg>,
     corner: Option<Element<Msg>>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
@@ -176,7 +187,12 @@ fn frame_layers<Msg>(
     // an outline along the same curve, painted over the content it curves into.
     let mut layers = alloc::vec![fill(theme.face), padding(Insets::all(WINDOW_BORDER), inner)];
     layers.extend(corner);
-    layers.push(outline(theme.border, libdraw::corner::WINDOW_RADIUS));
+    // **The focused window's edge is the accent** (desktop refresh, Part H) — the design's own
+    // focus cue, and the one it uses instead of tinting a title bar. We keep the tinted bar as
+    // well (the plan's deliberate divergence), so this is additive: a client knows its own focus
+    // and draws its own edge, and nothing in the compositor has to say which window is which.
+    let edge = if focused { theme.accent } else { theme.border };
+    layers.push(outline(edge, libdraw::corner::WINDOW_RADIUS));
     stack(layers)
 }
 
@@ -198,10 +214,12 @@ pub fn window_frame_with_grip<Msg>(
     content: Element<Msg>,
     grip: Element<Msg>,
     window: Size,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let at = |len: u32| len.saturating_sub(WINDOW_BORDER + GRIP_W) as i32;
-    frame_layers(title, content, Some(crate::element::offset(at(window.w), at(window.h), grip)), theme)
+    let corner = crate::element::offset(at(window.w), at(window.h), grip);
+    frame_layers(title, content, Some(corner), focused, theme)
 }
 
 /// How thick the line around a window is.
@@ -285,9 +303,10 @@ pub fn dialog_frame<Msg>(
     title: Element<Msg>,
     question: Element<Msg>,
     buttons: Element<Msg>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
-    dialog_frame_sized(Size::new(DIALOG_W, DIALOG_H), title, question, buttons, theme)
+    dialog_frame_sized(Size::new(DIALOG_W, DIALOG_H), title, question, buttons, focused, theme)
 }
 
 /// The same face at a size the caller picks.
@@ -311,6 +330,7 @@ pub fn dialog_frame_sized<Msg>(
     title: Element<Msg>,
     question: Element<Msg>,
     buttons: Element<Msg>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let strip = sized(
@@ -330,17 +350,48 @@ pub fn dialog_frame_sized<Msg>(
         window_frame(
             title,
             dock(alloc::vec![docked(Edge::Bottom, strip)], padding(Insets::all(0), question)),
+            // **A dialog's focus is the caller's to report**, like any other window's. This
+            // passed `true`, on the reasoning that a dialog is up because something is waiting
+            // on it — but the state that matters is a dialog that has *lost* the keyboard to
+            // another window, which is a click away and which every caller already tracks for
+            // its own title bar. Two windows edged in the accent is exactly what those flags
+            // exist to prevent (PR #319 review, blocking 1).
+            focused,
             theme,
         ),
     )
 }
 
-/// How tall a tab strip is.
+/// How tall a tab strip is: the design's 30 since the refresh's Part H, where it was 24.
 ///
 /// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
 /// tabs, and one whose height followed the theme's text size would move under a gate that had to
 /// read a theme file to know where to click.
-pub const TAB_STRIP_H: u32 = 24;
+pub const TAB_STRIP_H: u32 = 30;
+
+/// How tall one tab is, inside that strip: the design's 24.
+pub const TAB_H: u32 = 24;
+
+/// The strip's padding above its tabs — the design's 5, which is what leaves a tab sitting on the
+/// strip rather than filling it.
+pub const TAB_TOP: u32 = 5;
+
+/// The strip's padding at its left end, before the first tab: the design's 6.
+pub const TAB_SIDE: u32 = 6;
+
+/// Between one tab and the next: the design's 1. Enough to separate two inactive tabs, which
+/// have no face of their own to separate them.
+pub const TAB_GAP: u32 = 1;
+
+/// From one tab's left edge to the next's — what a gate multiplies to find tab `n`.
+pub const TAB_PITCH: u32 = TAB_W + TAB_GAP;
+
+/// The corner a tab is rounded to, at the top only: a tab is a shape that runs into the content
+/// below it, so the bottom corners are square and the bottom edge is not there at all.
+pub const TAB_RADIUS: u32 = CONTROL_RADIUS;
+
+/// The `+` at the end of the strip: the design's 22×24.
+pub const NEW_TAB_W: u32 = 22;
 
 /// How wide one tab is.
 ///
@@ -352,13 +403,29 @@ pub const TAB_STRIP_H: u32 = 24;
 /// trigger is somebody opening more than a window's width of them.
 pub const TAB_W: u32 = 120;
 
+/// A tab's box inside the strip: the tab itself, plus the rule it covers when it is the current
+/// one.
+const TAB_BOX_H: u32 = TAB_H + TAB_RULE;
+
+/// The rule along the bottom of the strip.
+const TAB_RULE: u32 = 1;
+
+/// A tab label's inset from the tab's left edge: the design's 9.
+const TAB_LABEL_PAD: u32 = 9;
+
+/// Between a tab's label and its close box: the design's 8.
+const TAB_CLOSE_GAP: u32 = 8;
+
+/// The key the `+` carries, so the strip's children are all keyed as the diff requires.
+const NEW_TAB_KEY: u64 = u64::MAX;
+
 /// How wide the close box at a tab's right end is.
 pub const TAB_CLOSE_W: u32 = 20;
 
 /// The centre of a tab's close box, measured from that tab's left edge.
 ///
-/// Published for the same reason [`DIALOG_LEFT_CX`] is: `check-login` presses it and cannot link
-/// this crate.
+/// Published for the same reason [`DIALOG_LEFT_CX`] is: `check-login` presses it from a copy of
+/// its own, because a gate aims from its own numbers (M11 decision 2).
 pub const TAB_CLOSE_CX: i32 = (TAB_W - TAB_CLOSE_W / 2) as i32;
 
 /// One tab: what it is called, whether it is marked, and what identifies it across frames.
@@ -389,46 +456,278 @@ pub fn tab_strip<Msg: Clone>(
     hovered: Option<u64>,
     select: impl Fn(u64) -> Msg,
     close: impl Fn(u64) -> Msg,
+    extras: TabExtras<Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
-    let mut row_items = alloc::vec::Vec::with_capacity(tabs.len());
+    let mut row_items = alloc::vec::Vec::with_capacity(tabs.len() + 1);
     for t in tabs {
-        let face = if t.key == current {
-            theme.background
-        } else if hovered == Some(t.key) {
-            theme.face_hover
-        } else {
-            theme.face
-        };
+        let current = t.key == current;
         let mut label = String::new();
         if t.marked {
             label.push_str("* ");
         }
         label.push_str(t.label);
-        // **The current tab is the window's own ground**, so it reads as continuous with what is
-        // below it and the others as a strip above. That is what makes a row of boxes look like
-        // tabs rather than like buttons.
-        let inner = row(alloc::vec![
-            padding(Insets { top: 4, right: 2, bottom: 4, left: 8 }, text(label)).flex(1),
-            sized(
-                Size::new(TAB_CLOSE_W, TAB_STRIP_H),
-                stack(alloc::vec![icon(IconKind::Close)]).on_press(close(t.key)),
-            ),
-        ]);
-        row_items.push(
-            sized(
-                Size::new(TAB_W, TAB_STRIP_H),
-                stack(alloc::vec![fill(face), inner]).on_press(select(t.key)),
+        // **The current tab is the window's own ground and the others are the strip's**, which is
+        // what makes a row of boxes read as tabs rather than as buttons: the current one is a
+        // continuation of the content below, and the rest are a strip above it. An inactive tab
+        // has no face at all — the strip's is what shows through — so hover is a wash over it,
+        // the treatment every other momentary highlight in this toolkit gets.
+        let mut layers = alloc::vec::Vec::with_capacity(3);
+        if current {
+            layers.extend(tab_face(theme.background));
+        } else if hovered == Some(t.key) {
+            // **A face rather than a wash**, which every other momentary highlight here is: a
+            // wash cannot be rounded, and a square highlight behind a rounded tab reads as a
+            // second shape. One shade off the strip is enough to say "this one".
+            //
+            // **Stopping above the rule**, which the current tab covers and no other tab may:
+            // running the hover face down to the strip's bottom made an inactive tab read as
+            // open at the bottom for as long as the pointer was over it — the one cue that is
+            // supposed to mark the current tab alone (PR #319 review, optional 7).
+            layers.push(padding(
+                Insets { top: 0, right: 0, bottom: TAB_RULE, left: 0 },
+                stack(tab_face(theme.face)),
+            ));
+        }
+        let ink_colour = if current { theme.foreground } else { theme.foreground_dim };
+        layers.push(row(alloc::vec![
+            padding(
+                Insets { top: 0, right: TAB_CLOSE_GAP, bottom: 0, left: TAB_LABEL_PAD },
+                center_v(ink(ink_colour, text(label))),
             )
-            .key(t.key),
+            .flex(1),
+            // **The icon fills the box rather than being centred in it**: `Node::Icon` measures
+            // as nothing and draws into the rect it is given, so a `center` around one hands it
+            // a zero rect and the tab loses its close box while still clicking like one.
+            sized(
+                Size::new(TAB_CLOSE_W, TAB_BOX_H),
+                stack(alloc::vec![ink(theme.foreground_dim, icon(IconKind::Close))])
+                    .on_press(close(t.key)),
+            ),
+        ]));
+        row_items.push(
+            sized(Size::new(TAB_W, TAB_BOX_H), stack(layers).on_press(select(t.key)))
+                .key(t.key),
         );
     }
-    // A border under the strip, so an unselected tab has an edge where the current one does not.
+    // **The `+` is the last thing in the row**, where the design puts it: after the tabs rather
+    // than at the strip's right end, so it stays beside the tab that was opened last.
+    if let Some(new_tab) = extras.new_tab {
+        row_items.push(
+            sized(
+                Size::new(NEW_TAB_W, TAB_BOX_H),
+                stack(alloc::vec![center(ink(theme.foreground_dim, text("+")))])
+                    .on_press(new_tab),
+            )
+            .key(NEW_TAB_KEY),
+        );
+    }
+    let mut strip = alloc::vec::Vec::with_capacity(3);
+    // The strip's own face, and the rule that separates it from what is below. The current tab
+    // is drawn over that rule, which is what "its border is open at the bottom" means here.
+    strip.push(fill(theme.face_hover));
+    strip.push(dock(
+        alloc::vec![docked(Edge::Bottom, sized(Size::new(0, TAB_RULE), fill(theme.border)))],
+        text(""),
+    ));
+    let tabs_row = with_spacing(row(row_items), TAB_GAP);
+    strip.push(padding(
+        Insets { top: TAB_TOP, right: TAB_SIDE, bottom: 0, left: TAB_SIDE },
+        match extras.right {
+            // A right-hand slot for a window's own controls — the editor's byte count and its
+            // Save. `dock` gives the tabs the rest, so the slot is the size it asks for.
+            //
+            // **Both sides wrapped**, as `status_bar` wraps its slots and for the same reason:
+            // the tabs beside it are keyed, so a caller that keys its own control — and Part J's
+            // Save must, for its hover — made this dock `MixedKeying` and the window then drew
+            // nothing at all (PR #319 review, worth fixing 6).
+            Some(right) => dock(
+                alloc::vec![docked(Edge::Right, padding(Insets::all(0), right))],
+                padding(Insets::all(0), tabs_row),
+            ),
+            None => tabs_row,
+        },
+    ));
+    sized(Size::new(0, TAB_STRIP_H), stack(strip))
+}
+
+/// What a tab strip carries besides its tabs (desktop refresh, Part H).
+///
+/// **A struct rather than two more arguments**, because both are optional and an application
+/// that wants neither says so once: `TabExtras::none()`.
+pub struct TabExtras<Msg> {
+    /// What the `+` at the end of the tabs sends. `None` draws no `+`.
+    pub new_tab: Option<Msg>,
+    /// A window's own controls, at the strip's right end — the editor's byte count and Save.
+    pub right: Option<Element<Msg>>,
+}
+
+impl<Msg> TabExtras<Msg> {
+    /// Tabs and nothing else.
+    pub fn none() -> Self {
+        Self { new_tab: None, right: None }
+    }
+
+    /// Tabs and a `+`.
+    pub fn new_tab(msg: Msg) -> Self {
+        Self { new_tab: Some(msg), right: None }
+    }
+}
+
+/// A tab's face: rounded at the top, square where it meets the content.
+///
+/// **Two layers rather than a per-corner radius**, which the toolkit does not have: a rounded
+/// fill over the whole box, then a square one below the curve. The square layer is what covers
+/// the strip's rule under the current tab.
+fn tab_face<Msg>(colour: Rgb) -> alloc::vec::Vec<Element<Msg>> {
+    alloc::vec![
+        rounded_fill(colour, TAB_RADIUS),
+        padding(Insets { top: TAB_RADIUS, right: 0, bottom: 0, left: 0 }, fill(colour)),
+    ]
+}
+
+/// How tall a status bar is: the design's 25.
+pub const STATUS_BAR_H: u32 = 25;
+
+/// A status bar's inset at either end: the design's 11.
+const STATUS_PAD_X: u32 = 11;
+
+/// A window's status bar: what it is doing at one end, where it is at the other.
+///
+/// **The rule is on the edge that faces the content** — `Edge::Top` for a bar along the bottom of
+/// a window, which is where the design puts one and where the editor's is going (Part J), and
+/// `Edge::Bottom` for one that sits under the chrome, which is where the editor's is today. A bar
+/// with its rule on the wrong side reads as a lid rather than a floor.
+///
+/// **Not in the mono face, which the design uses.** A window is painted with one face, and the
+/// fixed-advance one belongs to a character grid; a status bar set in it would be the toolkit's
+/// first two-face surface for the sake of a byte count. It is [`TextSize::Small`] and
+/// `foreground_dim` instead — the design's hierarchy by size and ink, which is what carries the
+/// "read this second" (desktop refresh, Part H).
+pub fn status_bar<Msg>(
+    left: Element<Msg>,
+    right: Option<Element<Msg>>,
+    rule: Edge,
+    theme: &Theme,
+) -> Element<Msg> {
+    // **Both slots wrapped, and the zero-inset one is not decoration** — `frame_layers`'s rule,
+    // for its reason: the diff wants a container's children all keyed or none, and a caller that
+    // keys its readout would otherwise make this dock `MixedKeying` at the first frame. The
+    // wrapper puts the caller's keys one level down, where they still do their job.
+    let bare = |e: Element<Msg>| padding(Insets::all(0), e);
+    let inner = match right {
+        Some(right) => dock(alloc::vec![docked(Edge::Right, bare(right))], bare(left)),
+        None => left,
+    };
     sized(
-        Size::new(0, TAB_STRIP_H),
-        stack(alloc::vec![fill(theme.border), row(row_items)]),
+        Size::new(0, STATUS_BAR_H),
+        stack(alloc::vec![
+            fill(theme.face_hover),
+            dock(
+                alloc::vec![docked(rule, sized(Size::new(0, 1), fill(theme.border)))],
+                text(""),
+            ),
+            padding(
+                Insets { top: 0, right: STATUS_PAD_X, bottom: 0, left: STATUS_PAD_X },
+                center_v(inner),
+            ),
+        ]),
     )
 }
+
+/// One reading on a status bar: a step below the body, in the ink a second read gets.
+pub fn status_text<Msg>(s: impl Into<String>, theme: &Theme) -> Element<Msg> {
+    ink(theme.foreground_dim, scaled(TextSize::Small, text(s)))
+}
+
+/// The upright between two readings on a status bar — the design's `|`, in the line colour.
+pub fn status_separator<Msg>(theme: &Theme) -> Element<Msg> {
+    padding(
+        Insets { top: 0, right: STATUS_GAP, bottom: 0, left: STATUS_GAP },
+        ink(theme.border, scaled(TextSize::Small, text("|"))),
+    )
+}
+
+/// Between two readings on a status bar — either side of a separator, or between a control and
+/// the reading next to it. The design's 16 from one to the next, less the bar it draws between.
+pub const STATUS_GAP: u32 = 7;
+
+/// A primary action: the accent as a ground, with its label in the paper colour.
+///
+/// **The one button in a window that is the answer** — the design's `Save`, and the only place it
+/// fills a control with the accent rather than drawing with it. Everything else on a surface is a
+/// face with an edge, which is what makes this one read as the action rather than as an option
+/// (desktop refresh, Part H).
+///
+/// Hover and press shade the ground rather than swapping it, because an accent that changed hue
+/// under the pointer would read as a different control.
+pub fn pill<Msg>(
+    label: impl Into<String>,
+    msg: Msg,
+    state: WidgetState,
+    theme: &Theme,
+) -> Element<Msg> {
+    let ground = if state.pressed {
+        theme.accent.shade(-PILL_SHADE)
+    } else if state.hovered {
+        theme.accent.shade(PILL_SHADE)
+    } else {
+        theme.accent
+    };
+    // **The label is whichever of the surface's two inks stands furthest from the ground** — the
+    // window's paper in the light scheme, which is the design's white on the accent, and its
+    // text colour in the dark one, where the paper is near-black and would sit at 3.8:1 on the
+    // same accent (PR #319 review, optional 9). One rule, so a scheme cannot be picked that
+    // makes this control unreadable.
+    let ink_colour = furthest_from(ground, theme.background, theme.foreground);
+    let mut layers = alloc::vec::Vec::with_capacity(4);
+    layers.push(rounded_fill(ground, CONTROL_RADIUS));
+    if state.active {
+        // **A band of the label's colour, inside the edge** — and it has to be a *band*: this
+        // drew the ground inset by the ring over a ground of the same colour, which is the same
+        // colour on the same colour and put down not one different pixel (review, optional 4).
+        layers.push(padding(
+            Insets::all(PILL_RING_INSET),
+            rounded_fill(ink_colour, CONTROL_RADIUS - PILL_RING_INSET),
+        ));
+        layers.push(padding(
+            Insets::all(PILL_RING_INSET + RING),
+            rounded_fill(ground, CONTROL_RADIUS - PILL_RING_INSET - RING),
+        ));
+    }
+    layers.push(center(padding(PILL_PAD, ink(ink_colour, text(label)))));
+    stack(layers).on_press(msg).focusable()
+}
+
+/// How tall a pill is where a caller sizes one: the design's 21, which is a control sitting on a
+/// 24-pixel row rather than filling it.
+pub const PILL_H: u32 = 21;
+
+/// How far inside a pill's edge its focus ring is drawn.
+const PILL_RING_INSET: u32 = 1;
+
+/// Whichever of `a` and `b` stands further from `ground`, by weighted brightness.
+///
+/// **Weighted rather than a plain sum**, because green carries most of what an eye reads as
+/// light: `0.299r + 0.587g + 0.114b`, the usual integer form, which needs no `powf` — `libdraw`
+/// builds for a bare target and has no floating-point maths beyond arithmetic.
+///
+/// **It picks, and does not promise.** On the accent this system ships, it chooses white in the
+/// light scheme (4.6:1) and the near-white ink in the dark one (3.9:1, where the window's own
+/// paper would be 3.8:1). The dark figure is under WCAG's 4.5 and cannot be fixed here: `accent`
+/// is one colour in both schemes, so a readable pill in the dark scheme is a question about the
+/// palette, for whoever revisits it (PR #319 review, optional 9).
+fn furthest_from(ground: Rgb, a: Rgb, b: Rgb) -> Rgb {
+    let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
+    let (g, a_, b_) = (brightness(ground), brightness(a), brightness(b));
+    if (a_ - g).abs() >= (b_ - g).abs() { a } else { b }
+}
+
+/// A pill's sides: the design's 12.
+const PILL_PAD: Insets = Insets { top: 2, right: 12, bottom: 2, left: 12 };
+
+/// How far a pill's ground moves under the pointer, and the other way when pressed.
+const PILL_SHADE: i16 = 12;
 
 /// One row of a dropdown menu: a label that highlights under the pointer.
 ///
@@ -787,6 +1086,7 @@ pub const fn title_button_centre(window_w: u32, nth: u32) -> (i32, i32) {
 /// decorations and not a defect in this widget.
 pub fn title_bar<Msg: Clone>(
     title: impl Into<String>,
+    subtitle: Option<&str>,
     focused: bool,
     drag: Msg,
     buttons: TitleButtons<Msg>,
@@ -826,8 +1126,18 @@ pub fn title_bar<Msg: Clone>(
     // the design's semibold already, so a size step on top overshoots — measured on a screendump
     // against the menu's "File", the title is 1.62× its width at the body size and 1.75× a step
     // up, where the design's is 1.47×.
-    let title = bold(text(title));
-    controls.push(padding(TITLE_PAD, center_v(title)).flex(1));
+    //
+    // **And a dim subtitle beside it** (Part H): the design says *what* a window is showing next
+    // to what it is — a browser's directory, an editor's kind. It is the body size in the dim
+    // ink rather than a size below, which is what the design does and what keeps two words on
+    // one line from reading as a heading and a footnote.
+    let mut name = alloc::vec::Vec::with_capacity(2);
+    name.push(bold(text(title)));
+    if let Some(subtitle) = subtitle.filter(|s| !s.is_empty()) {
+        name.push(ink(theme.foreground_dim, text(subtitle)));
+    }
+    let title = center_v(with_spacing(row(name), TITLE_SUBTITLE_GAP));
+    controls.push(padding(TITLE_PAD, title).flex(1));
     controls.push(ink(
         theme.foreground_dim,
         crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),
@@ -920,8 +1230,11 @@ impl<Msg> Default for TitleButtons<Msg> {
 /// centred down the bar.
 const TITLE_PAD: Insets = Insets { top: 0, right: 6, bottom: 0, left: 11 };
 
+/// Between a window's title and the dim subtitle beside it: the design's 9.
+const TITLE_SUBTITLE_GAP: u32 = 9;
+
 /// Space between a text field's content and its edge.
-const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
+const FIELD_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 
 /// How wide the caret is, in pixels.
 const CARET: u32 = 2;
@@ -3589,9 +3902,13 @@ mod tests {
             let fills: vec::Vec<Rgb> = e
                 .children()
                 .filter_map(|c| match &c.node {
-                    crate::element::Node::Fill(c) => Some(*c),
+                    // A button's layers are rounded fills since Part H; a square `Fill` is still
+                    // matched so this reads whichever shape the widget is built from.
+                    crate::element::Node::Fill(c)
+                    | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                     crate::element::Node::Padding { child, .. } => match &child.node {
-                        crate::element::Node::Fill(c) => Some(*c),
+                        crate::element::Node::Fill(c)
+                        | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                         _ => None,
                     },
                     _ => None,
@@ -3620,7 +3937,9 @@ mod tests {
             button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.accent), "the ring is on the edge");
+        // **Down the left edge rather than at the corner**: the button is rounded to
+        // `CONTROL_RADIUS` since Part H, so `(0, 0)` is the ground the curve was cut out of.
+        assert_eq!(fb.get_pixel(0, 20), Some(p.accent), "the ring is on the edge");
         // **Inside the ring but away from the label**, which is centred since M15: the middle
         // of the button is where the word is, so a sample taken there is a glyph.
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
@@ -3640,7 +3959,7 @@ mod tests {
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.border), "a resting button has no edge at all");
+        assert_eq!(fb.get_pixel(0, 20), Some(p.border), "a resting button has no edge at all");
         assert_ne!(p.border, p.face, "…and the edge is not the face");
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
     }
@@ -3781,6 +4100,7 @@ mod tests {
         let p = Theme::default();
         let e = title_bar(
             "a terminal",
+            None,
             true,
             M::Drag,
             TitleButtons {
@@ -4843,6 +5163,7 @@ two");
         let p = Theme::default();
         let e = title_bar(
             "a terminal",
+            None,
             true,
             M::Drag,
             TitleButtons {
@@ -4948,24 +5269,29 @@ two");
 
     #[test]
     fn a_tab_selects_where_it_is_and_its_close_box_does_not_select_it() {
-        // **The two published metrics, and the shadowing rule between them.** `check-login`
-        // presses a tab at `TAB_W * i + something` and its close box at `TAB_CLOSE_CX`, and it
-        // cannot link this crate — so the numbers are asserted here against a tree that is
-        // actually built, the way the dialog's aim points are.
-        assert_eq!((TAB_W, TAB_STRIP_H, TAB_CLOSE_W), (120, 24, 20));
+        // **The published metrics, and the shadowing rule between them.** `check-login` presses
+        // a tab at `TAB_SIDE + i * TAB_PITCH + something` and its close box at `TAB_CLOSE_CX`
+        // from its own copies, because a gate that aimed from the toolkit could agree with a
+        // toolkit that had stopped drawing where it says (M11 decision 2) — so the numbers are
+        // asserted here against a tree that is actually built, the way the dialog's aim points
+        // are, and `xtask`'s `the_gates_chrome_table_is_the_toolkits` compares the two sets.
+        assert_eq!((TAB_W, TAB_STRIP_H, TAB_H, TAB_CLOSE_W), (120, 30, 24, 20));
+        assert_eq!((TAB_SIDE, TAB_TOP, TAB_GAP, TAB_PITCH), (6, 5, 1, 121));
         assert_eq!(TAB_CLOSE_CX, 110);
 
         #[derive(Clone, PartialEq, Eq, Debug)]
         enum M {
             Select(u64),
             Close(u64),
+            New,
         }
         let theme = Theme::default();
         let tabs = [
             Tab { key: 7, label: "one", marked: false },
             Tab { key: 9, label: "two", marked: true },
         ];
-        let ui: Element<M> = tab_strip(&tabs, 7, None, M::Select, M::Close, &theme);
+        let ui: Element<M> =
+            tab_strip(&tabs, 7, None, M::Select, M::Close, TabExtras::new_tab(M::New), &theme);
 
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&ui, Rect::new(0, 0, 400, TAB_STRIP_H), &cell);
@@ -4986,13 +5312,430 @@ two");
             r.pointer(&tree, &ui, &l, at(0, 0)).0
         };
 
+        // **Tab `i` begins at `TAB_SIDE + i * TAB_PITCH`** since the refresh's Part H: the strip
+        // has padding at its left end and a pixel between tabs, where it used to start hard
+        // against the content's edge with none.
+        let tab_x = |i: i32| TAB_SIDE as i32 + i * TAB_PITCH as i32;
         // The second tab's label area selects it, by **key** and not by position.
-        assert_eq!(click(&mut router, TAB_W as i32 + 20), alloc::vec![M::Select(9)]);
+        assert_eq!(click(&mut router, tab_x(1) + 20), alloc::vec![M::Select(9)]);
         // Its close box closes it and does *not* also select it: a nearer `on_press` shadows the
         // one on the tab, which is the same rule that lets a title bar carry buttons.
-        assert_eq!(click(&mut router, TAB_W as i32 + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
+        assert_eq!(click(&mut router, tab_x(1) + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
         // And the first tab is still where it was, which is what a fixed width buys.
-        assert_eq!(click(&mut router, 20), alloc::vec![M::Select(7)]);
+        assert_eq!(click(&mut router, tab_x(0) + 20), alloc::vec![M::Select(7)]);
+        // The `+` is after the last tab, and opens one rather than selecting anything.
+        assert_eq!(click(&mut router, tab_x(2) + (NEW_TAB_W / 2) as i32), alloc::vec![M::New]);
+    }
+
+    /// How far off an exact ink a glyph's darkest pixel may land. A stem covers a pixel almost
+    /// but not quite completely, so even body ink comes out a few units light.
+    const ANTIALIAS_SLACK: u32 = 12;
+
+    /// A focused pill shows a ring, and its label reads in either scheme.
+    ///
+    /// **Two failures in one control** (PR #319 review, optionals 4 and 9). The ring was the
+    /// ground drawn over the ground — nought pixels of the 2400 differed between an active pill
+    /// and a resting one — and the label was the window's paper, which in the dark scheme is
+    /// near-black on the accent. Painted, and compared *between states* rather than against a
+    /// colour, because "a ring is visible" is exactly the claim a same-colour ring passes.
+    #[test]
+    fn a_pill_rings_when_focused_and_its_label_reads_in_either_scheme() {
+        let (w, h) = (80, 30);
+        let draw = |t: &Theme, state: WidgetState| {
+            let e: Element<Msg> = pill("Save", (), state, t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.face);
+            paint(&mut fb, &font(), t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let t = Theme::default();
+        let resting = draw(&t, WidgetState::default());
+        let active = draw(&t, WidgetState { active: true, ..Default::default() });
+        let differing = (0..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter(|(x, y)| resting.get_pixel(*x, *y) != active.get_pixel(*x, *y))
+            .count();
+        assert!(differing > 40, "a focused pill looks no different: {differing} pixels");
+        // **The label is the better-contrasting of the surface's two inks, in each scheme** —
+        // asserted as the *choice* rather than as a distance, because a distance passes for the
+        // wrong ink too: the dark scheme's near-black paper is a long way from the accent by any
+        // arithmetic and still unreadable on it (review, optional 9). In the light scheme that
+        // is the paper, in the dark scheme the text colour.
+        let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
+        for t in [Theme::light(), Theme::dark()] {
+            let fb = draw(&t, WidgetState::default());
+            let ground = brightness(t.accent);
+            let (paper, text_ink) = (brightness(t.background), brightness(t.foreground));
+            let wanted =
+                if (paper - ground).abs() >= (text_ink - ground).abs() { paper } else { text_ink };
+            // The label's extreme pixel on the middle row is the ink it is drawn in.
+            let row: alloc::vec::Vec<i32> =
+                (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(brightness).collect();
+            let reached = if wanted > ground {
+                *row.iter().max().expect("pixels")
+            } else {
+                *row.iter().min().expect("pixels")
+            };
+            let got = (reached - wanted).abs();
+            let other = (reached - if wanted == paper { text_ink } else { paper }).abs();
+            assert!(
+                got < other,
+                "the label is not the better-contrasting ink: reached {reached}, wanted \
+                 {wanted}, the other is {}",
+                if wanted == paper { text_ink } else { paper }
+            );
+        }
+    }
+
+    /// What a tab strip *looks* like: the current tab is the window's ground and covers the rule,
+    /// the others have no face and their labels are dim, and a keyed right slot is drawable.
+    ///
+    /// **The description's central claim, and nothing tested it** (PR #319 review, worth fixing
+    /// 5): every one of these could be broken with all 80 of this module's tests still passing,
+    /// which is the same "present and invisible" lesson as the close box, one level up.
+    #[test]
+    fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let (w, h) = (300, TAB_STRIP_H);
+        let tabs = [
+            Tab { key: 1, label: "one", marked: false },
+            Tab { key: 2, label: "two", marked: false },
+        ];
+        let paint_strip = |extras: TabExtras<M>, hovered: Option<u64>| {
+            let ui: Element<M> = tab_strip(&tabs, 1, hovered, M::Select, M::Close, extras, &t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&ui, all, &CELL);
+            let mut tree = crate::diff::Tree::new();
+            let diffable = tree.update(&ui, &l).is_ok();
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            (fb, diffable)
+        };
+        let (fb, _) = paint_strip(TabExtras::none(), None);
+        // Down the middle of each tab, clear of its label and its close box.
+        let (first, second) = (TAB_SIDE + 4, TAB_SIDE + TAB_PITCH + 4);
+        assert_eq!(
+            fb.get_pixel(first, TAB_TOP + TAB_H / 2),
+            Some(t.background),
+            "the current tab is the window's own ground"
+        );
+        assert_eq!(
+            fb.get_pixel(first, TAB_STRIP_H - 1),
+            Some(t.background),
+            "…and it covers the rule, so it runs into the content below"
+        );
+        assert_eq!(
+            fb.get_pixel(second, TAB_TOP + TAB_H / 2),
+            Some(t.face_hover),
+            "another tab has no face of its own: the strip's shows through"
+        );
+        assert_eq!(
+            fb.get_pixel(second, TAB_STRIP_H - 1),
+            Some(t.border),
+            "…and the rule runs under it"
+        );
+        // The inactive label is dim, and the current one is not.
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .map(darkness)
+                .min()
+                .expect("pixels")
+        };
+        assert!(
+            darkest(TAB_SIDE, TAB_SIDE + TAB_W - TAB_CLOSE_W) <= darkness(t.foreground) + 12,
+            "the current tab's label is body ink"
+        );
+        assert!(
+            darkest(second, second + TAB_W - TAB_CLOSE_W - 4) >= darkness(t.foreground_dim),
+            "another tab's label is dim"
+        );
+        // Hovering one of the others must not open it at the bottom: the rule stays.
+        let (hover, _) = paint_strip(TabExtras::none(), Some(2));
+        assert_eq!(
+            hover.get_pixel(second, TAB_STRIP_H - 1),
+            Some(t.border),
+            "a hovered tab still has the rule under it"
+        );
+        assert_ne!(
+            hover.get_pixel(second, TAB_TOP + TAB_H / 2),
+            Some(t.face_hover),
+            "…and it does light up"
+        );
+        // A keyed right-hand slot is drawable: the diff refuses a half-keyed container.
+        let keyed = TabExtras {
+            new_tab: None,
+            right: Some(ink(t.foreground, text("848 bytes")).key(99)),
+        };
+        let (_, diffable) = paint_strip(keyed, None);
+        assert!(diffable, "a caller that keys its right-hand control makes the window undiffable");
+    }
+
+    /// A dialog's edge follows *its* window's focus, not the fact that it is up.
+    ///
+    /// **Two windows edged in the accent is the failure** (PR #319 review, blocking 1): a dialog
+    /// that has lost the keyboard to another window is a click away — the compositor raises any
+    /// listed window, and a dialog is listed — and every caller already tracks that flag for the
+    /// dialog's own title bar. This passed `true` unconditionally, so the edge said "the
+    /// keyboard is here" while the title bar beside it said otherwise.
+    #[test]
+    fn a_dialogs_edge_follows_its_own_focus() {
+        let t = Theme::default();
+        let edge = |focused: bool| {
+            let ui: Element<Msg> = dialog_frame(
+                sized(Size::new(0, TITLE_BAR_H), fill(t.face)).key(1),
+                padding(Insets::all(DIALOG_PAD), text("Really?")).key(2),
+                sized(Size::new(0, 20), text("")).key(5),
+                focused,
+                &t,
+            );
+            let all = Rect::new(0, 0, DIALOG_W, DIALOG_H);
+            let l = layout(&ui, all, &CELL);
+            let mut fb =
+                MemFramebuffer::new(Geometry::packed(DIALOG_W, DIALOG_H, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb.get_pixel(0, DIALOG_H / 2)
+        };
+        assert_eq!(edge(true), Some(t.accent), "a dialog holding the keyboard is edged in it");
+        assert_eq!(edge(false), Some(t.border), "and one that has lost it is not");
+    }
+
+    /// A pill is the accent filled in, with its label in the paper colour.
+    ///
+    /// **The inverse of every other control here**, which is the whole point of it: a button is a
+    /// face with an edge and ink on it, and this is the accent with the window's own ground as
+    /// ink. Painted, because "filled with the accent" is a statement about pixels, and because a
+    /// label drawn in `foreground` on an accent ground is the failure worth catching — it reads
+    /// as a smudge rather than as a word (desktop refresh, Part H).
+    #[test]
+    fn a_pill_is_the_accent_with_the_paper_as_its_ink() {
+        let t = Theme::default();
+        let (w, h) = (80, 30);
+        let e: Element<Msg> = pill("Save", (), WidgetState::default(), &t);
+        let all = Rect::new(0, 0, w, h);
+        let l = layout(&e, all, &CELL);
+        let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+        fb.clear(t.face);
+        paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        // The ground, sampled down the left edge and clear of the label in the middle.
+        assert_eq!(fb.get_pixel(2, h / 2), Some(t.accent), "a pill is filled with the accent");
+        // **Measured as lightness along the middle row**, where the pill is full width so its
+        // cut corners cannot be mistaken for the label. Counting pixels at exactly `background`
+        // counts almost none: a glyph at this size is mostly antialiased, which is the same
+        // thing the status bar's and the greeter's tests ran into.
+        let light = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let row: alloc::vec::Vec<u32> =
+            (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(light).collect();
+        let (lightest, darkest) = (
+            *row.iter().max().expect("pixels"),
+            *row.iter().min().expect("pixels"),
+        );
+        let (ground, paper) = (light(t.accent), light(t.background));
+        assert!(
+            lightest > ground + (paper - ground) / 2,
+            "the label is drawn toward the paper colour: {lightest} against a ground of {ground}"
+        );
+        assert!(
+            darkest >= ground - ANTIALIAS_SLACK,
+            "something on the pill is darker than its ground ({darkest} against {ground}) — a \
+             label in body ink on the accent reads as a smudge"
+        );
+        assert!(light(t.foreground) < ground - ANTIALIAS_SLACK, "and body ink would fail that");
+    }
+
+    /// A focused window's edge is the accent; an unfocused one's is the line colour.
+    ///
+    /// **The design's own focus cue** (desktop refresh, Part H), and painted rather than read off
+    /// the tree: the edge is the last layer over everything else, so a frame that drew it first
+    /// would have the right colour in the wrong place and the tree would look the same.
+    #[test]
+    fn a_focused_windows_edge_is_the_accent() {
+        let t = Theme::default();
+        let (w, h) = (120, 60);
+        let edge = |focused: bool| {
+            let e: Element<Msg> = window_frame(
+                sized(Size::new(0, TITLE_BAR_H), fill(t.face)).key(1),
+                sized(Size::new(0, 0), text("")).key(2),
+                focused,
+                &t,
+            );
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // Down the left edge, clear of the rounded corners.
+            fb.get_pixel(0, h / 2)
+        };
+        assert_eq!(edge(true), Some(t.accent), "the focused window is edged in the accent");
+        assert_eq!(edge(false), Some(t.border), "and an unfocused one in the line colour");
+        assert_ne!(t.accent, t.border);
+    }
+
+    /// A title bar's subtitle is beside the title, dimmer than it, and absent when there is none.
+    ///
+    /// **Painted, and in that order**: the pair is a bold name and a second word that must read
+    /// as secondary, so what this asserts is that the darkest ink in the subtitle's half of the
+    /// bar is lighter than the title's — not merely that two strings are in the tree (desktop
+    /// refresh, Part H).
+    #[test]
+    fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
+        let t = Theme::default();
+        let (w, h) = (300, TITLE_BAR_H);
+        let draw = |subtitle: Option<&str>| {
+            let e: Element<Msg> =
+                title_bar("Files", subtitle, true, (), TitleButtons::default(), &t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = |fb: &MemFramebuffer, x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .map(darkness)
+                .min()
+                .expect("pixels")
+        };
+        // Where each word falls: the title starts at `TITLE_PAD`, and "Files" in the bold face
+        // is comfortably inside 60 pixels at the default size.
+        let (title_half, sub_half) = (60, 200);
+        let with = draw(Some("/home"));
+        let without = draw(None);
+        assert!(
+            darkest(&with, title_half, sub_half) < darkest(&without, title_half, sub_half),
+            "the subtitle draws where there was nothing"
+        );
+        // **Against the dim ink itself, not merely against the title.** A first version compared
+        // the two halves and passed with the subtitle in *body* ink: antialiasing left it three
+        // units lighter than the title, and "darker than" was true of a difference nobody could
+        // see. What matters is which ink it is, so the threshold is that ink.
+        let (title_ink, sub_ink) =
+            (darkest(&with, 0, title_half), darkest(&with, title_half, sub_half));
+        assert!(
+            sub_ink >= darkness(t.foreground_dim),
+            "the subtitle is {sub_ink}, darker than `foreground_dim` — it is not a second read"
+        );
+        assert!(
+            title_ink <= darkness(t.foreground) + ANTIALIAS_SLACK,
+            "and the title is body ink at {title_ink}"
+        );
+    }
+
+    /// A status bar is a ground, a rule on the edge that faces the content, and dim readings.
+    ///
+    /// **Painted**, because every part of this is a colour in a place: a bar whose rule is on the
+    /// wrong edge reads as a lid rather than a floor, and a reading in body ink is not a second
+    /// read (desktop refresh, Part H).
+    #[test]
+    fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
+        let t = Theme::default();
+        let (w, h) = (200, STATUS_BAR_H);
+        let draw = |rule: Edge| {
+            let ui: Element<Msg> = status_bar(
+                status_text("opened", &t),
+                Some(status_text("ln 6", &t)),
+                rule,
+                &t,
+            );
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&ui, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let top = draw(Edge::Top);
+        assert_eq!(top.get_pixel(w / 2, 0), Some(t.border), "the rule is along the top edge");
+        assert_eq!(top.get_pixel(w / 2, h - 1), Some(t.face_hover), "and the other edge is ground");
+        let bottom = draw(Edge::Bottom);
+        assert_eq!(bottom.get_pixel(w / 2, h - 1), Some(t.border), "or along the bottom");
+        assert_eq!(bottom.get_pixel(w / 2, 0), Some(t.face_hover), "…and then the top is ground");
+        // **Both readings are there, and neither is body ink — measured by darkness, not by the
+        // exact colour.** At the small step a glyph is mostly antialiased, so counting pixels
+        // equal to `foreground_dim` counts almost nothing; what separates the two inks is how
+        // dark the darkest pixel gets. Dim is 91/103/102 and body is 22/32/31, so nothing drawn
+        // in dim reaches the threshold and anything drawn in body sails past it.
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = (0..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter_map(|(x, y)| top.get_pixel(x, y))
+            .map(darkness)
+            .min()
+            .expect("the bar has pixels");
+        // **Each end counted separately** (PR #319 review, blocking 2). One count over the whole
+        // bar passes on the left reading alone, so dropping the right slot — which is where the
+        // editor's line and column live — failed nothing. Each half must have ink of its own.
+        let ink_between = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter(|(x, y)| {
+                    let c = top.get_pixel(*x, *y);
+                    c != Some(t.face_hover) && c != Some(t.border)
+                })
+                .count()
+        };
+        let (left_ink, right_ink) = (ink_between(0, w / 2), ink_between(w / 2, w));
+        assert!(left_ink > 20, "the left reading is drawn: {left_ink} pixels");
+        assert!(right_ink > 20, "the right reading is drawn: {right_ink} pixels");
+        let floor = darkness(t.foreground_dim);
+        assert!(
+            darkest >= floor,
+            "something is darker than `foreground_dim` ({darkest} against {floor}) — a reading \
+             on a status bar is a second read, not body ink"
+        );
+        assert!(darkness(t.foreground) < floor, "and body ink would fail that");
+    }
+
+    /// A tab's close box is drawn, not merely clickable.
+    ///
+    /// **`Node::Icon` measures as nothing** and paints into the rect it is handed, so any wrapper
+    /// that sizes to its child's measurement — `center`, and it was a `center` — gives the glyph
+    /// a zero rect. The tab then still *clicks* like a tab with a close box, which is why the
+    /// routing test above passed while the × was missing from a screendump (desktop refresh,
+    /// Part H). Painted, because that is the only place the difference exists.
+    #[test]
+    fn a_tabs_close_box_puts_ink_on_the_screen() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let tabs = [Tab { key: 1, label: "one", marked: false }];
+        let ui: Element<M> =
+            tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
+        let all = Rect::new(0, 0, 200, TAB_STRIP_H);
+        let l = layout(&ui, all, &CELL);
+        let mut fb = MemFramebuffer::new(Geometry::packed(200, TAB_STRIP_H, PixelFormat::XRGB8888));
+        fb.clear(t.background);
+        paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        // The close box is the last `TAB_CLOSE_W` of the first tab.
+        let (from, to) = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
+        let inked = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..TAB_STRIP_H).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(t.foreground_dim))
+                .count()
+        };
+        assert!(inked(from, to) > 8, "the close box drew nothing");
+        // And the ink is the box's, not the label's spilling into it.
+        assert!(inked(to, to + TAB_GAP + 4) == 0, "and it stays inside the tab");
     }
 
     #[test]
@@ -5008,8 +5751,9 @@ two");
         let theme = Theme::default();
         let quiet = [Tab { key: 1, label: "notes", marked: false }];
         let dirty = [Tab { key: 1, label: "notes", marked: true }];
-        let a: Element<M> = tab_strip(&quiet, 1, None, M::Select, M::Close, &theme);
-        let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, &theme);
+        let extras = || TabExtras::none();
+        let a: Element<M> = tab_strip(&quiet, 1, None, M::Select, M::Close, extras(), &theme);
+        let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, extras(), &theme);
         assert_eq!(all_text(&a), "notes");
         assert_eq!(all_text(&b), "* notes");
     }
@@ -5036,13 +5780,15 @@ two");
         let theme = Theme::default();
         let bar = title_bar(
             "a window",
+            None,
             true,
             M::Drag,
             TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
             &theme,
         )
         .key(1);
-        let e: Element<M> = window_frame(bar, sized(Size::new(0, 0), text("")).key(2), &theme);
+        let e: Element<M> =
+            window_frame(bar, sized(Size::new(0, 0), text("")).key(2), true, &theme);
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&e, Rect::new(0, 0, 400, 200), &cell);
         let mut tree = crate::diff::Tree::new();
@@ -5087,6 +5833,7 @@ two");
             content,
             resize_grip(M::Grip, &theme).key(3),
             window,
+            true,
             &theme,
         );
         let crate::element::Node::Stack(layers) = &e.node else { panic!("the frame is a stack") };
@@ -5153,6 +5900,7 @@ two");
         let ui: Element<M> = dialog_frame(
             title_bar(
                 "Question",
+                None,
                 true,
                 M::Drag,
                 TitleButtons { minimise: None, maximise: None, close: None },
@@ -5165,6 +5913,7 @@ two");
                 DIALOG_GAP,
             )
             .key(5),
+            true,
             &theme,
         );
 

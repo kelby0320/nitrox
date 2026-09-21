@@ -1384,6 +1384,7 @@ impl App {
                 hovered,
                 Msg::SelectTab,
                 Msg::CloseTab,
+                libui::widget::TabExtras::new_tab(Msg::NewTab),
                 &ui,
             ),
         };
@@ -1393,6 +1394,9 @@ impl App {
         // client's own answer.
         let title = title_bar(
             TITLE,
+            // The design shows the shell's working directory here; nothing tells a terminal
+            // where its shell is, which is the refresh's Part K.
+            None,
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -1474,6 +1478,7 @@ impl App {
             .on_wheel(Msg::Wheel),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
+            self.focused,
             &ui,
         );
 

@@ -27096,3 +27096,78 @@ keystroke — in a window whose size is fixed at creation, that is content jumpi
 The refusal is drawn in `deny`, and the test for it counts a red cast rather than the exact
 colour: at the small step, antialiasing leaves only fifteen pixels at `deny` itself, and nothing
 else on this card leans red.
+
+## 2026-09-21 — Desktop refresh Part H: the parts of a window, built once in the toolkit
+
+Five pieces the three applications share, so each is built and restyled in one place.
+
+**The tab strip is the design's.** 30 pixels on `face_hover` with a rule along the bottom; tabs 24
+tall, inset 6 from the left and a pixel apart, rounded at the **top only** — two layers, a rounded
+fill and a square one below the curve, because the toolkit has no per-corner radius and inventing
+one for a tab would be a node kind nothing else wants. The current tab is the window's own ground
+drawn *over* that rule, which is what makes a row of boxes read as tabs rather than as buttons.
+A `+` follows the last tab, wired to the new-tab message all three applications already had, and
+`TabExtras` carries it and an optional right-hand slot so two optional things stay out of the
+argument list.
+
+**A widget can be present, routable and invisible, and this is the second time in three days.**
+The close `×` was wrapped in `center`, and `Node::Icon` measures as nothing and paints into the
+rect it is handed — so the glyph got a zero rect while the tab went on clicking exactly like a
+tab with a close box. Part D's invisible resting field was the same shape of bug. Both are now
+pinned by tests that **paint and count ink**, which is the only place the difference exists; the
+routing test passed throughout.
+
+**A status bar, and not in the mono face.** The design sets its status bars in 10.5 px mono; a
+window here is painted with one face and the fixed-advance one belongs to a character grid, so a
+mono status bar would be the toolkit's first two-face surface for the sake of a byte count. The
+hierarchy comes from the size step and `foreground_dim` instead. The rule goes on the edge that
+faces the content — a bar with it on the wrong side reads as a lid rather than a floor — which is
+what lets the editor keep its strip under the chrome until Part J moves it to the foot.
+
+**A focused window is edged in the accent**, which is the design's cue: its editor is edged in
+`accent` and the two windows behind it in the line colour. The client draws it, because a client
+knows its own focus and the compositor draws no chrome (M9 decision 1). Additive — the tinted
+title bar stays, which is the refresh's one deliberate divergence.
+
+**A title says what a window is showing beside what it is**: an optional subtitle in
+`foreground_dim` at the body size. The browser's is its directory, the editor's is `Text Editor`.
+The terminal's would be its shell's working directory, which nothing can tell it — Part K.
+
+**`button` is rounded and `pill` is new.** Rounding the button is what makes "an icon button is a
+24×24 of the same" true without a new widget: both applications' up-arrows are buttons with a
+glyph on them. The pill is the inverse of everything else on a surface — the accent as a ground,
+a light ink on it — which is what makes one control read as *the* action.
+
+**Its focus ring was the ground drawn over the ground**, and this entry claimed otherwise before
+review: nought of 2400 pixels differed between an active pill and a resting one. It is a band of
+the label's colour now, between two of the ground. **And the label is not simply the window's
+paper**: in the dark scheme that is near-black on the accent. It is whichever of the surface's two
+inks stands further from the ground by weighted brightness — white in the light scheme at 4.6:1,
+the near-white text colour in the dark one at 3.9:1. That last figure is under WCAG's 4.5 and
+cannot be fixed in a widget: `accent` is one colour in both schemes, so a readable pill in the
+dark scheme is a question about the palette.
+
+**`chrome` in `xtask` now holds the tab metrics, and a test compares the whole table with the
+toolkit's own constants** — the generalisation of PR #318's finding, applied before the same
+drift could happen again. The gate keeps its copies on purpose (M11 decision 2); what is new is
+that they fail on the host when the toolkit moves. It read `widget.rs` with a small parser at
+first, which review pointed out was unnecessary: `xtask` links `libui` already, for the display
+gate's reference frames. Several comments repeating "this gate cannot link the crate" are
+corrected with it — the reason for the copies is decision 2, not a build constraint.
+
+**Review found three more places where the test was weaker than the claim**, all of the same
+kind as those below: a dialog was edged in the accent whatever its focus, because `dialog_frame`
+passed `true` and no test painted an unfocused one; a status bar's "both readings are drawn" was
+one count over the whole bar, which the left reading alone satisfied — so dropping the right slot,
+where the editor's line and column live, failed nothing; and the tab strip's whole *look* — the
+current tab as the window's ground, covering the rule, the others faceless and dim — had no test
+at all, so four separate breaks passed the suite. Each is painted and controlled now. The strip's
+left padding is in that test too: the routing test's presses sat twenty pixels inside a tab, so a
+six-pixel shift was invisible to it.
+
+**Three tests in this part first passed against their own controls**, and each needed the same
+correction: comparing two measurements rather than measuring against the value that distinguishes
+them. A subtitle in body ink was "dimmer than the title" by three units of antialiasing; a status
+bar's readings and a pill's label were counted by exact colour, which at the small step is almost
+no pixels at all. The fix each time was an absolute threshold — the ink itself — rather than a
+relative one.

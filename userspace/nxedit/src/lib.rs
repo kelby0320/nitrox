@@ -39,18 +39,24 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, TextSize, center_v, column, dock, docked, padding, row, scaled, sized,
-    text, with_spacing,
+    Edge, Element, Insets, column, dock, docked, padding, row, sized, text, with_spacing,
 };
 use libui::widget::{
-    GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
-    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
-    tab_strip,
-    text_area, text_field, title_bar, window_frame_with_grip,
+    GRIP_W, InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
+    TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
+    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_text, tab_strip, text_area,
+    text_field, title_bar, window_frame_with_grip,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
-pub const STATUS_H: u32 = 24;
+///
+/// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
+/// so its height is that widget's and a second 24 here would have clamped it.
+pub const STATUS_H: u32 = libui::widget::STATUS_BAR_H;
+
+/// What kind of window this is, beside the name of the file in it — the design's
+/// `theme.toml — Text Editor`, as a title and the dim subtitle after it.
+pub const EDITOR_KIND: &str = "Text Editor";
 
 /// The element key on the strip's line-and-column readout.
 pub const POSITION_KEY: u64 = 16;
@@ -438,6 +444,10 @@ pub struct App {
     /// from its parent sends both halves down one channel, and a title bar drawn from the wrong
     /// one would show two active windows or none.
     pub confirm_focused: bool,
+    /// Whether the **chooser's** window holds the keyboard, for the same reason and read the
+    /// same way: its frame is edged in the accent only while it does (desktop refresh, Part H,
+    /// PR #319 review).
+    pub chooser_focused: bool,
     /// The dialog's title bar was dragged, and the binary owes the compositor a `StartMove` **on
     /// the dialog's window**.
     ///
@@ -797,6 +807,7 @@ impl App {
             closing: false,
             confirming: None,
             confirm_focused: true,
+            chooser_focused: true,
             confirm_move_requested: false,
         }
     }
@@ -1706,6 +1717,7 @@ impl App {
             Msg::ChooserUp,
             Msg::ChooserAccept,
             Msg::ChooserCancel,
+            self.chooser_focused,
             ui,
         )
         // **The whole dialog takes the wheel** (M14 Part I), from outside the widget rather than
@@ -2137,6 +2149,8 @@ impl App {
 
         let title = title_bar(
             &self.title(),
+            // The design names the kind of window beside the file it holds.
+            Some(EDITOR_KIND),
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -2153,32 +2167,43 @@ impl App {
         .key(TITLE_KEY);
 
         // The status strip: the one control, and what the last thing that happened was.
-        let strip = row(alloc::vec![
-            button(
-                "save",
-                Msg::Save,
-                WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                &ui,
-            )
-            .key(SAVE_KEY),
+        //
+        // **`libui`'s status bar since the desktop refresh's Part H** — the ground, the rule and
+        // the dim step come from there now, so this window's foot and the browser's agree. Its
+        // rule is on the *bottom* because this strip is still under the chrome rather than along
+        // the window's foot, which is where Part J puts it.
+        let reading = match self.field.as_ref() {
             // **The field replaces the status, it does not sit beside it.** The strip is one row
             // of chrome and a name being typed *is* what last happened — showing both would make
             // a person read two things to find out which one is asking for an answer.
-            match self.field.as_ref() {
-                Some((_, f)) => padding(
-                    Insets { top: 2, right: 6, bottom: 2, left: 6 },
-                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+            Some((_, f)) => padding(
+                Insets { top: 2, right: 6, bottom: 2, left: 0 },
+                text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+            ),
+            None => status_text(self.status.clone(), &ui),
+        };
+        let strip = status_bar(
+            row(alloc::vec![
+                // **The one action in this window, so it is the accent pill** (desktop refresh,
+                // Part H) — the design's `Save`, which is the only control it fills with the
+                // accent. Part J moves it to the tab strip, where the design puts it.
+                // **Sized to the design's 21**, so the control sits *on* the bar rather than
+                // filling it: a pill as tall as the strip it is in reads as a coloured end to
+                // the strip.
+                sized(
+                    Size::new(0, PILL_H),
+                    pill(
+                        "Save",
+                        Msg::Save,
+                        WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                        &ui,
+                    ),
                 )
-                .key(STATUS_KEY)
-                .flex(1),
-                // A step below the body (Part G): the design's status text is metadata.
-                None => padding(
-                    Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    center_v(scaled(TextSize::Small, text(self.status.clone()))),
-                )
-                .key(STATUS_KEY)
-                .flex(1),
-            },
+                .key(SAVE_KEY),
+                padding(Insets { top: 0, right: 0, bottom: 0, left: STATUS_GAP }, reading)
+                    .key(STATUS_KEY)
+                    .flex(1),
+            ]),
             // **Line and column, at the right of the strip this window already has** (M14 Part E).
             // A second bar along the bottom is where a status bar conventionally goes and would
             // have moved every gate coordinate in the text area for a number; the strip is
@@ -2187,12 +2212,10 @@ impl App {
             // **Counted from one**, because that is what every editor's "line 3" means and what a
             // person comparing against a compiler's error message needs it to mean; the buffer
             // counts from zero and the conversion belongs at the one place it is displayed.
-            padding(
-                Insets { top: 4, right: 8, bottom: 4, left: 4 },
-                center_v(scaled(TextSize::Small, text(self.position_text()))),
-            )
-            .key(POSITION_KEY),
-        ]);
+            Some(status_text(self.position_text(), &ui).key(POSITION_KEY)),
+            Edge::Bottom,
+            &ui,
+        );
 
         // **The tab strip, drawn whatever the count.** A strip that appeared with the second
         // tab would move everything below it the moment a file was dropped in — the window's
@@ -2212,6 +2235,7 @@ impl App {
             hovered,
             Msg::SelectTab,
             Msg::CloseTab,
+            TabExtras::new_tab(Msg::NewTab),
             &ui,
         );
 
@@ -2290,6 +2314,7 @@ impl App {
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
+            self.focused,
             &ui,
         )
     }
@@ -2309,6 +2334,7 @@ impl App {
     pub fn confirm_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let title = title_bar(
             "Unsaved changes",
+            None,
             self.confirm_focused,
             Msg::DragConfirm,
             // **One button, and it is the cautious answer.** Minimise and maximise are absent
@@ -2369,7 +2395,7 @@ impl App {
             ]),
             libui::widget::DIALOG_GAP,
         );
-        dialog_frame(title, question, buttons, ui)
+        dialog_frame(title, question, buttons, self.confirm_focused, ui)
     }
 }
 

@@ -39,7 +39,7 @@ use libui::element::{
 use libui::widget::{
     DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
     TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame_with_grip,
+    popup_frame, resize_grip, TabExtras, tab_strip, text_field, title_bar, window_frame_with_grip,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -2165,6 +2165,8 @@ impl App {
 
         let title = title_bar(
             TITLE,
+            // **What this window is showing**, which for a browser is where it is looking.
+            Some(self.pane().path.as_str()),
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -2279,7 +2281,15 @@ impl App {
             .iter()
             .map(|(k, label)| libui::widget::Tab { key: *k, label: label.as_str(), marked: false })
             .collect();
-        let tabs = tab_strip(&items, self.current, hovered, Msg::SelectTab, Msg::CloseTab, &ui);
+        let tabs = tab_strip(
+            &items,
+            self.current,
+            hovered,
+            Msg::SelectTab,
+            Msg::CloseTab,
+            TabExtras::new_tab(Msg::NewTab),
+            &ui,
+        );
 
         let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
@@ -2386,6 +2396,7 @@ impl App {
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
+            self.focused,
             &ui,
         )
     }
@@ -2431,6 +2442,7 @@ impl App {
         };
         let title = title_bar(
             "Delete",
+            None,
             self.dialog_focused,
             Msg::DragConfirm,
             // One button, and it is the cautious answer: closing a question must not perform it.
@@ -2460,7 +2472,7 @@ impl App {
             ]),
             DIALOG_GAP,
         );
-        dialog_frame(title, question, buttons, ui)
+        dialog_frame(title, question, buttons, self.dialog_focused, ui)
     }
 
     /// What is known about one entry: where it is, what it is, how big, when it changed.
@@ -2473,6 +2485,7 @@ impl App {
         };
         let title = title_bar(
             "Properties",
+            None,
             self.dialog_focused,
             Msg::DragConfirm,
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::CloseProperties) },
@@ -2513,7 +2526,14 @@ impl App {
             )
             .key(PROPS_KEY + 31),
         ]);
-        libui::widget::dialog_frame_sized(Size::new(PROPS_W, PROPS_H), title, body, buttons, ui)
+        libui::widget::dialog_frame_sized(
+            Size::new(PROPS_W, PROPS_H),
+            title,
+            body,
+            buttons,
+            self.dialog_focused,
+            ui,
+        )
     }
 }
 

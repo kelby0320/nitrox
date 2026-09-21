@@ -539,22 +539,48 @@ License and would ship as freely — and not taken, to keep the image and the bu
 
 Toolkit pieces the three applications share, so each is built once and restyled once.
 
-- [ ] **Title and subtitle**: the title — bold if Part G adds the face — then a dim subtitle:
+- [x] **Title and subtitle**: the title — bold if Part G adds the face — then a dim subtitle:
       the directory for Files, the working directory for a terminal (which needs the shell to
       tell its terminal where it is), and for the editor the design's single
       `theme.toml — Text Editor`.
-- [ ] **The focused window's border in the accent**, the design's own focus cue. We keep the
+      **Built.** `title_bar` takes an optional subtitle, set in `foreground_dim` beside the bold
+      title. The browser shows its directory and the editor `Text Editor` after the file's name,
+      which is the design's `theme.toml — Text Editor` in two parts. The terminal's would be its
+      shell's working directory and nothing can tell it that yet, so it passes `None` and Part K
+      keeps the box.
+- [x] **The focused window's border in the accent**, the design's own focus cue. We keep the
       tinted title bar as well (the deliberate divergence above); this is additive and cheap,
       since a client knows its own focus and draws its own `Outline`.
-- [ ] **The tab strip**: 30 px on `face_hover`, a `border` rule beneath, padding 5/6/0, tabs 24 px
+      **Built.** `window_frame` and `window_frame_with_grip` take `focused`, and the edge is
+      `accent` when it is set and `border` when it is not — the design draws exactly this, its
+      editor edged in the accent and the two windows behind it in the line colour. Additive, as
+      planned: the tinted title bar stays.
+- [x] **The tab strip**: 30 px on `face_hover`, a `border` rule beneath, padding 5/6/0, tabs 24 px
       with 8 px top corners, 9 px sides, 8 px from label to `×`, 1 px between tabs; the active tab
       on the window's ground with its border open at the bottom, inactive tabs dim and flat; a
       22×24 `+`; a right-hand slot for a window's own controls.
-- [ ] **The status bar**: 25 px on `face_hover`, a `--lineSoft` rule above, 10.5 px mono in
+      **Built**, to those numbers, with the tabs rounded at the top by two layers because the
+      toolkit has no per-corner radius. The `+` is wired to the new-tab message all three
+      applications already had. The right-hand slot exists and is empty until Part J puts the
+      editor's byte count and Save in it.
+- [x] **The status bar**: 25 px on `face_hover`, a `--lineSoft` rule above, 10.5 px mono in
       `foreground_dim`, 11 px sides, a left and a right slot, separators in `border`.
-- [ ] **Field, icon button and pill.** A field is 24 px with 8 px corners, a `border` line and 8 px
+      **Built** as `status_bar`, with `status_text` and `status_separator` beside it. **Not in the
+      mono face**: a window is painted with one face, and the fixed-advance one belongs to a
+      character grid — the hierarchy comes from the size step and the dim ink instead. The
+      editor's strip is this widget now, still under the chrome; Part J moves it to the foot,
+      which is what the `rule` argument is for.
+- [x] **Field, icon button and pill.** A field is 24 px with 8 px corners, a `border` line and 8 px
       sides, on the window's ground or on `face_hover`; an icon button is a 24×24 of the same; a
       primary action is an accent pill — accent ground, white 500-weight label, 12 px sides.
+
+      **Built.** The field's sides are the design's 8, `button` is rounded to `CONTROL_RADIUS` —
+      which is what makes an icon button a 24×24 of the same, since both applications' up-arrows
+      are buttons with a glyph on them — and `pill` is new: the accent as a ground with a light
+      ink on it, which the editor's `Save` is now. **Its ink is chosen rather than fixed** — the
+      further of the surface's two by weighted brightness, since the dark scheme's paper is
+      near-black on that accent — and its focus ring is a band of that ink, where the first
+      version drew the ground over the ground and put down no different pixel (PR #319 review).
 
 ## Part I — the file browser
 

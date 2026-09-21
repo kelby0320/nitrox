@@ -97,6 +97,20 @@ mod chrome {
     pub const MINIMISE_X: i32 = 82;
     /// How far right of a window's left edge its content starts: the border, and no frame.
     pub const CONTENT_X: i32 = 1;
+    /// A tab strip's height (`libui::widget::TAB_STRIP_H`) — 30 since the refresh's Part H, where
+    /// it was 24 and a tab filled it.
+    pub const TAB_STRIP_H: i32 = 30;
+    /// One tab's height inside that strip (`TAB_H`), and [`TAB_TOP`] the strip's padding above it.
+    pub const TAB_H: i32 = 24;
+    /// See [`TAB_H`].
+    pub const TAB_TOP: i32 = 5;
+    /// One tab's width (`TAB_W`). **Fixed rather than shared out**, which is what lets a gate aim
+    /// at tab `n`: a tab does not move when another opens.
+    pub const TAB_W: i32 = 120;
+    /// The strip's padding before its first tab (`TAB_SIDE`), new in Part H.
+    pub const TAB_SIDE: i32 = 6;
+    /// From one tab's left edge to the next's (`TAB_PITCH`): a tab and the pixel between them.
+    pub const TAB_PITCH: i32 = 121;
 }
 
 const DEMO_USER: &str = "alice";
@@ -5112,7 +5126,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // missed the change would press one row high and drag the wrong file.
     const MENU_BAR_H: i32 = 24;
     let row_y = |row: i32| {
-        files_win.2 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
+        files_win.2 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
     };
     // **A sidebar row is `SIDEBAR_PAD` lower than the listing row beside it**, since M15 Part E
     // put a margin around the panel. Aiming at a listing row still landed inside the sidebar row
@@ -5420,7 +5434,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         &mut qmp,
         &mut session,
         fx + 120,
-        fy + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H / 2,
+        fy + 1 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H / 2,
     )?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
@@ -5463,7 +5477,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
     // and the path strip — plus half a row.
     let row1 =
-        (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
+        (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -5522,25 +5536,33 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     }
 
     // **The tabs are where the fixed width says they are**, which is what a fixed width buys: a
-    // tab does not move when another opens. `libui::widget::TAB_W` and `TAB_STRIP_H` are the
-    // source, pinned to a real tree by `a_tab_selects_where_it_is_and_its_close_box_does_not_
-    // select_it` — this gate cannot link the crate, so it hardcodes them as it does every other
-    // chrome metric.
-    const TAB_W: i32 = 120;
+    // tab does not move when another opens. `libui::widget`'s constants are the source, pinned to
+    // a real tree by `a_tab_selects_where_it_is_and_its_close_box_does_not_select_it`; this gate
+    // aims from `chrome`'s copies rather than from the toolkit (M11 decision 2), and
+    // `the_gates_chrome_table_is_the_toolkits` is what keeps those copies equal to it.
+    //
     // **A tab strip in both applications** (M12 Part D): above the editor's text and below the
     // browser's menus, which moved every one of the browser's rows down again.
     // `nxfiles::list_top` is that application's own version of the same sum.
-    const TAB_STRIP_H: i32 = 24;
+    //
     // The editor is the work area's right half after the snap above.
     let ed = (work.0 + (work.2 / 2) as i32, work.1);
-    // Tab `i`'s label area: `chrome::CONTENT_X`, `TAB_W` per tab, and 40 into the label —
-    // clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
+    // Tab `i`'s label area: the strip's own left padding, `TAB_PITCH` per tab, and a third of a
+    // tab into the label — clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
+    //
+    // **Down the tab rather than down the strip** since Part H: the strip is 30 and a tab is the
+    // 24 below its 5 of padding, so half the strip is still inside a tab but half a tab is the
+    // honest aim.
+    //
     // **Below the editor's menu bar since M14 Part A**, which put one above the strip to match
     // the browser. The strip did not move relative to anything it contains; the whole of it moved
     // down by a bar, and a gate that aimed at the old y clicked the menus instead — which is how
     // this failed, silently, as a tab that never became current.
     let tab = |i: i32| {
-        (ed.0 + chrome::CONTENT_X + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
+        (
+            ed.0 + chrome::CONTENT_X + chrome::TAB_SIDE + chrome::TAB_PITCH * i + chrome::TAB_W / 3,
+            ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_TOP + chrome::TAB_H / 2,
+        )
     };
     let tab0 = tab(0);
     click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
@@ -6020,8 +6042,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     with somewhere to put a question would ask it, and this one has no dialog to ask in".
     //
     //     **The dialog's geometry is hardcoded here**, the way this gate already hardcodes a
-    //     title bar's height and a list's row height, because it cannot link the crate that
-    //     defines them. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
+    //     title bar's height and a list's row height — not because the crate cannot be linked
+    //     (it is, for the display gate's reference frames) but because a gate that *aimed* from
+    //     the toolkit could agree with a toolkit that had stopped drawing where it says (M11
+    //     decision 2). A host test compares the two sets of numbers; a gate reads only its own. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
     //     were `nxedit`'s until M12 Part B moved them down beside `dialog_frame`, when a second
     //     confirmation would otherwise have given this gate two tables to keep in step — and
     //     `libui::widget::tests::dialog_buttons_land_where_the_constants_say` is the host test
@@ -13866,6 +13890,39 @@ mod tests {
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(read.background, libdraw::theme::Theme::dark().background);
         assert_eq!((read.font_px, read.wallpaper), (shipped.font_px, shipped.wallpaper));
+    }
+
+    /// Every metric `chrome` copies from `libui::widget` still equals the toolkit's.
+    ///
+    /// **The generalisation of the greeter's pair** (PR #318 review, finding 1, applied to the
+    /// rest): `chrome` exists because a gate that read the toolkit to know where to click could
+    /// agree with a toolkit that had stopped drawing where it says (M11 decision 2) — and a
+    /// deliberate copy still needs something that fails when it goes stale. `libui`'s own tests
+    /// pin the other side, pressing these literals on trees that are actually built.
+    ///
+    /// **Imported rather than parsed.** This read the constants out of `widget.rs` with a little
+    /// parser and a guard against the pattern going stale; `xtask` links `libui` already — it
+    /// renders the display gate's reference frames with it — so the comparison is just a
+    /// comparison (PR #319 review, optional 8). Nothing about M11 decision 2 is weakened: a
+    /// *gate* still aims from `chrome`, and only this test sees both sides.
+    ///
+    /// **Only the direct copies.** `TITLE_Y`, `CLOSE_X`, `MAXIMISE_X`, `MINIMISE_X` and
+    /// `CONTENT_X` are sums over the toolkit's constants rather than any one of them, and
+    /// `the_title_buttons_land_where_the_gates_aim` is what pins those.
+    #[test]
+    fn the_gates_chrome_table_is_the_toolkits() {
+        use libui::widget as w;
+        for (what, gate, toolkit) in [
+            ("TITLE_BAR_H", chrome::TITLE_BAR_H, w::TITLE_BAR_H as i32),
+            ("TAB_STRIP_H", chrome::TAB_STRIP_H, w::TAB_STRIP_H as i32),
+            ("TAB_H", chrome::TAB_H, w::TAB_H as i32),
+            ("TAB_TOP", chrome::TAB_TOP, w::TAB_TOP as i32),
+            ("TAB_W", chrome::TAB_W, w::TAB_W as i32),
+            ("TAB_SIDE", chrome::TAB_SIDE, w::TAB_SIDE as i32),
+            ("TAB_PITCH", chrome::TAB_PITCH, w::TAB_PITCH as i32),
+        ] {
+            assert_eq!(gate, toolkit, "`chrome::{what}` is {gate}, the toolkit's is {toolkit}");
+        }
     }
 
     /// The gate's copy of the greeter's window is the greeter's own.

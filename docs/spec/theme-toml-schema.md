@@ -61,13 +61,13 @@ once did, because it still showed the dark theme M11 Part E replaced (PR #265 re
 | Key | Type | What it colours | Design token |
 |---|---|---|---|
 | `scheme` | `"light"` or `"dark"` | Nothing itself: which palette every other key adjusts — see below | the page's `theme` |
-| `background` | `"#RRGGBB"` | A window's ground (**not** the space between windows — see below) | `--bg` |
+| `background` | `"#RRGGBB"` | A window's ground (**not** the space between windows — see below), the current tab's face, and the ink on an accent pill | `--bg` |
 | `foreground` | `"#RRGGBB"` | Text and other ink | `--fg` |
 | `foreground_dim` | `"#RRGGBB"` | Ink read second: section headers, a path beside a name, a size | `--fgdim` |
 | `face` | `"#RRGGBB"` | A button at rest | `--face` |
-| `face_hover` | `"#RRGGBB"` | A button under the pointer, and every application's menu bar (desktop refresh, Part B) | `--faceHi` |
+| `face_hover` | `"#RRGGBB"` | A button under the pointer, every application's menu bar (desktop refresh, Part B), and the ground of a tab strip and a status bar (Part H) | `--faceHi` |
 | `face_pressed` | `"#RRGGBB"` | A button being held | `--faceLo` |
-| `accent` | `"#RRGGBB"` | The focus ring and caret, and what the selection is made from | `--accent` |
+| `accent` | `"#RRGGBB"` | The focus ring and caret, what the selection is made from, **the edge of the focused window** and the ground of a primary action's pill (desktop refresh, Part H) | `--accent` |
 | `track` | `"#RRGGBB"` | A list's ground | `--bg` |
 | `groove` | `"#RRGGBB"` | A scrollbar's channel — **darker than `track`**, or the bar is invisible | `--faceLo` |
 | `sidebar` | `"#RRGGBB"` | A panel beside content, such as the file browser's | `--sidebar` |
@@ -86,7 +86,7 @@ once did, because it still showed the dark theme M11 Part E replaced (PR #265 re
 | `cursor_body` | `"#RRGGBB"` | The pointer's fill | — |
 | `cursor_outline` | `"#RRGGBB"` | The pointer's outline | — |
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target | — |
-| `border` | `"#RRGGBB"` | The line around a window, a menu, or anything with an edge | `--line` |
+| `border` | `"#RRGGBB"` | The line around an **unfocused** window (a focused one's is `accent`), a menu, or anything with an edge | `--line` |
 | `desktop` | `"#RRGGBB"` | The ground between windows | the `reef` wallpaper |
 | `font_px` | number, `6`–`16` | The body text size in pixels per em, read to the nearest hundredth; `13` if absent | |
 | `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens | flat: `0` |

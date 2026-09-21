@@ -1120,6 +1120,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         }
                     }
                     WindowEvent::CloseRequested => msgs.push(Msg::ChooserCancel),
+                    // Its own window's focus, like the confirmation dialog's below: the frame is
+                    // edged in the accent only while this window holds the keyboard.
+                    WindowEvent::Focus(f) => app.chooser_focused = f,
                     _ => {}
                 }
                 for m in msgs {
