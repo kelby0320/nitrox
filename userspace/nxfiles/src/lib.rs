@@ -37,7 +37,7 @@ use libui::element::{
     with_spacing,
 };
 use libui::widget::{
-    DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
+    DIALOG_GAP, GRIP_W, ColumnAlign, ListColumn, ListRow, STATUS_BAR_H, status_bar, status_separator, status_text, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
     TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
     popup_frame, resize_grip, TabExtras, tab_strip, text_field, title_bar, window_frame_with_grip,
 };
@@ -48,8 +48,34 @@ pub const TITLE: &str = "Files";
 /// The path strip's height in pixels — one row of chrome under the title bar.
 pub const PATH_H: u32 = 24;
 
-/// A listing row's height in pixels.
-pub const ROW_H: u32 = 20;
+/// The listing's trailing columns: the design's `Size`, `Kind` and `Modified` at 70, 60 and 96,
+/// with a size read right-aligned so the digits line up (desktop refresh, Part I).
+pub const LIST_COLUMNS: &[ListColumn] = &[
+    ListColumn { width: 70, align: ColumnAlign::Right },
+    ListColumn { width: 60, align: ColumnAlign::Left },
+    ListColumn { width: 96, align: ColumnAlign::Left },
+];
+
+/// What each of those columns is called, for the header above them.
+pub const LIST_HEADINGS: [&str; 3] = ["Size", "Kind", "Modified"];
+
+/// The column header's height in pixels — the toolkit's, which draws it.
+pub const HEADER_H: u32 = libui::widget::LIST_HEADER_H;
+
+/// The element key on the column header.
+pub const HEADER_KEY: u64 = 21;
+
+/// The element key on the pane holding the header and the listing under it.
+///
+/// **The listing keeps [`LIST_KEY`]**, which the gates and this crate's tests find it by; this
+/// names the pair, because the window's dock wants every child keyed and the pane is now a child.
+pub const LIST_PANE_KEY: u64 = 23;
+
+/// The element key on the status bar at the window's foot.
+pub const STATUS_KEY: u64 = 22;
+
+/// A listing row's height in pixels: the design's 25, where it was 20.
+pub const ROW_H: u32 = 25;
 
 /// The element key on the listing, so a test can find it without walking the tree.
 pub const LIST_KEY: u64 = 1;
@@ -606,6 +632,13 @@ pub struct App {
     confirm: Option<Target>,
     /// Whether the *dialog* holds the keyboard, which its own title bar shows.
     pub dialog_focused: bool,
+    /// What the wall clock said when this listing was read, in nanoseconds since the epoch.
+    ///
+    /// **The binary reads it and the view is a function of it** (desktop refresh, Part I): the
+    /// `Modified` column says `HH:MM` for today and a date before that, which needs to know what
+    /// today is — and a `view` that called the clock would be a view that could not be tested on
+    /// the host. Zero means "not read", and then every row shows a date.
+    pub now_nanos: u64,
     /// The dialog's title bar was dragged, and the binary owes a `StartMove` **on its window**.
     confirm_move_requested: bool,
     /// Filesystem work the binary owes, in the order it was asked for.
@@ -837,6 +870,7 @@ impl App {
             prompt: None,
             confirm: None,
             dialog_focused: true,
+            now_nanos: 0,
             confirm_move_requested: false,
             ops: Vec::new(),
             over: None,
@@ -1645,8 +1679,7 @@ impl App {
             .map(|(i, e)| libui::widget::ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: e.name.as_str(),
-                marked: self.marked.contains(&e.name),
-            })
+                marked: self.marked.contains(&e.name), ..Default::default() })
             .collect()
     }
 
@@ -2143,8 +2176,40 @@ impl App {
         // shorter — one row of arithmetic off, which this method's own reason for existing is to
         // prevent.
         self.window.h.saturating_sub(
-            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + GRIP_W + WINDOW_FRAME_H,
+            TITLE_BAR_H
+                + MENU_BAR_H
+                + self.tab_strip_h()
+                + PATH_H
+                + HEADER_H
+                + STATUS_BAR_H
+                + GRIP_W
+                + WINDOW_FRAME_H,
         )
+    }
+
+    /// How tall the tab strip is in this window — the widget's height, or nothing at all.
+    ///
+    /// **One tab is no strip** (desktop refresh, Part I): the design draws none, tabs are ours,
+    /// and a strip that can only say where you already are is chrome for its own sake. Every sum
+    /// over the window's chrome goes through here, so the listing's height and the gate's row
+    /// arithmetic cannot disagree about whether it is there.
+    pub fn tab_strip_h(&self) -> u32 {
+        if self.tabs().len() > 1 { TAB_STRIP_H } else { 0 }
+    }
+
+    /// The window's foot: how many entries are in this directory, and what is picked.
+    fn status_bar(&self, ui: &UiTheme) -> Element<Msg> {
+        let entries = self.pane().entries.len();
+        let count = alloc::format!("{entries} items");
+        let mut left = alloc::vec![status_text(count, ui)];
+        // **What is selected, after a separator** — the design's `6 items | Documents/ selected`.
+        if let Some(i) = self.pane().list.selected
+            && let Some(e) = self.pane().entries.get(i)
+        {
+            left.push(status_separator(ui));
+            left.push(status_text(alloc::format!("{} selected", e.label()), ui));
+        }
+        status_bar(row(left), None, Edge::Top, ui)
     }
 
     /// The element tree for the current state.
@@ -2292,12 +2357,33 @@ impl App {
         );
 
         let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
+        // **The three facts beside each name** (desktop refresh, Part I), built as owned strings
+        // first because a `ListRow` borrows its cells: one `Vec` of them, then a `Vec` of
+        // borrows into it, which is the same two-step the labels above already take.
+        let facts: Vec<[String; 3]> = self
+            .pane()
+            .entries
+            .iter()
+            .map(|e| {
+                [
+                    column_size(e.size),
+                    column_kind(e.name.as_str(), e.is_dir),
+                    column_modified(e.mtime, self.now_nanos),
+                ]
+            })
+            .collect();
+        let cells: Vec<[&str; 3]> =
+            facts.iter().map(|f| [f[0].as_str(), f[1].as_str(), f[2].as_str()]).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (i, l) in labels.iter().enumerate() {
+            let entry = &self.pane().entries[i];
             rows.push(ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: l,
-                marked: self.marked.contains(&self.pane().entries[i].name),
+                marked: self.marked.contains(&entry.name),
+                cells: &cells[i][..],
+                // **The design's mark**: a folder in the accent, a file in the line colour.
+                swatch: Some(if entry.is_dir { ui.accent } else { ui.border }),
             });
         }
         let h = self.list_h();
@@ -2323,7 +2409,7 @@ impl App {
         let side_rows: Vec<ListRow<'_>> = places
             .iter()
             .enumerate()
-            .map(|(i, p)| ListRow { key: SIDEBAR_ROW_KEY + i as u64, label: p.name, marked: false })
+            .map(|(i, p)| ListRow { key: SIDEBAR_ROW_KEY + i as u64, label: p.name, marked: false, ..Default::default() })
             .collect();
         self.sidebar.selected = here;
         // **The panel is built for the height it will be drawn at**, which is the box minus the
@@ -2332,6 +2418,8 @@ impl App {
         let side_h = h.saturating_sub(2 * SIDEBAR_PAD);
         let sidebar = list_view(
             &side_rows,
+            // The places have a name and a dot and nothing else to line up.
+            &[],
             &mut self.sidebar,
             side_h,
             ROW_H,
@@ -2348,6 +2436,7 @@ impl App {
 
         let list = list_view(
             &rows,
+            LIST_COLUMNS,
             &mut self.pane_mut().list,
             h,
             ROW_H,
@@ -2364,35 +2453,62 @@ impl App {
         // needs to know nothing about it (M14 Part I).
         .on_wheel(Msg::Wheel);
 
+        // **The strip is left out, not sized to nothing** (desktop refresh, Part I). The design
+        // draws no tab strip at all; tabs are ours, and a strip holding one tab can only say
+        // where you already are. A zero-height box still paints its children — the tab and the
+        // `+` drew over the chrome below it — so the edge has to be absent from the dock.
+        let mut edges = alloc::vec![
+            docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
+        ];
+        if self.tab_strip_h() > 0 {
+            edges.push(docked(
+                Edge::Top,
+                sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
+            ));
+        }
+        edges.extend(alloc::vec![
+            docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
+            // **The foot: what is in this directory, and what is picked** (Part I). Docked to
+            // the bottom before the sidebar takes its column, so it spans the whole window as
+            // the design draws it rather than stopping at the listing.
+            docked(Edge::Bottom, self.status_bar(&ui).key(STATUS_KEY)),
+            // **Docked after the strips, so it starts below them** — a dock takes its edges in
+            // order, and each one divides what the last left. The path strip spans the full
+            // width above both panes, which is what makes it read as the window's location
+            // rather than the listing's.
+            docked(
+                Edge::Left,
+                sized(
+                    Size::new(SIDEBAR_W + 2 * SIDEBAR_PAD, h),
+                    padding(Insets::all(SIDEBAR_PAD), sidebar),
+                )
+                .key(SIDEBAR_KEY),
+            ),
+        ]);
         window_frame_with_grip(
             title,
             dock(
-                alloc::vec![
-                    docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
-                    docked(
-                        Edge::Top,
-                        sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
-                    ),
-                    docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
-                    // **Docked after the three strips, so it starts below them** — a dock takes
-                    // its edges in order, and each one divides what the last left. The path strip
-                    // spans the full width above both panes, which is what makes it read as the
-                    // window's location rather than the listing's.
-                    docked(
-                        Edge::Left,
-                        sized(
-                            Size::new(SIDEBAR_W + 2 * SIDEBAR_PAD, h),
-                            padding(Insets::all(SIDEBAR_PAD), sidebar),
-                        )
-                        .key(SIDEBAR_KEY),
-                    ),
-                ],
+                edges,
             // **Sized to the height it was built for.** `list_view` does not size itself, and
             // the dock's flex child otherwise gets everything left over — so the widget would
             // build rows for one height and be drawn at another, leaving `visible` off by one
             // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
             // wrapper as the reliable way to keep the two in step.
-                sized(Size::new(0, h), list).key(LIST_KEY),
+                dock(
+                    alloc::vec![docked(
+                        Edge::Top,
+                        libui::widget::list_header(
+                            "Name",
+                            &LIST_HEADINGS,
+                            LIST_COLUMNS,
+                            true,
+                            &ui,
+                        )
+                        .key(HEADER_KEY),
+                    )],
+                    sized(Size::new(0, h), list).key(LIST_KEY),
+                )
+                .key(LIST_PANE_KEY),
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
@@ -2534,6 +2650,70 @@ impl App {
             self.dialog_focused,
             ui,
         )
+    }
+}
+
+/// A byte count for the listing's `Size` column: the design's `848`, `11K`, `2.8M`.
+///
+/// **Short, where [`size_text`] is exact.** A column is read down rather than across: what it
+/// answers is "which of these is the big one", and the Properties dialog is where the exact
+/// count lives. Nothing here rounds below 10 KiB, because a four-digit number is as easy to read
+/// as `4K` and says more (desktop refresh, Part I).
+pub fn column_size(bytes: u64) -> String {
+    const K: u64 = 1024;
+    if bytes < 10 * K {
+        return alloc::format!("{bytes}");
+    }
+    let (unit, suffix) = match bytes {
+        b if b >= K * K * K => (K * K * K, "G"),
+        b if b >= K * K => (K * K, "M"),
+        _ => (K, "K"),
+    };
+    let tenths = (bytes * 10 + unit / 2) / unit;
+    // One decimal while the number is small enough for it to mean something: `2.8M`, then `24M`.
+    if tenths < 100 {
+        alloc::format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+    } else {
+        alloc::format!("{}{suffix}", tenths / 10)
+    }
+}
+
+/// What kind of thing a row is, for the `Kind` column: `dir`, or the name's extension.
+///
+/// **The extension, not a guessed type.** This system has no content sniffing and no type
+/// database; what it knows about `theme.toml` is the four letters after the dot. A name with no
+/// dot, or one whose dot starts it, is a `file`.
+pub fn column_kind(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return String::from("dir");
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => String::from(ext),
+        _ => String::from("file"),
+    }
+}
+
+/// A modification time for the `Modified` column: `HH:MM` today, `YYYY-MM-DD` before that.
+///
+/// **Both arguments are times, and neither is read from the world here**: `now` comes from the
+/// binary, which reads the clock when it loads a listing, so this stays a function of values and
+/// the host can test the boundary between the two forms.
+///
+/// `0` is "unreported" rather than 1970 — [`modified_text`] carries the reasoning — and shows as
+/// nothing at all, because a column of `unknown` is a column of noise.
+pub fn column_modified(mtime: i64, now_nanos: u64) -> String {
+    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000))
+    else {
+        return String::new();
+    };
+    let when = libtime::civil_from_unix(nanos);
+    let today = libtime::civil_from_unix(now_nanos);
+    let full = libtime::format_civil(&when);
+    if (when.year, when.month, when.day) == (today.year, today.month, today.day) {
+        // `YYYY-MM-DD HH:MM:SS`, of which the clock is five characters at offset 11.
+        String::from(full.get(11..16).unwrap_or(""))
+    } else {
+        String::from(full.get(..10).unwrap_or(full.as_str()))
     }
 }
 
@@ -3383,6 +3563,46 @@ mod tests {
                 dir: true
             })
         );
+    }
+
+    /// One tab is no strip, and two are: the strip's height and what it *draws* agree.
+    ///
+    /// **Painted, because a zero-height box still has children** (desktop refresh, Part I): the
+    /// strip was sized to nothing and went on drawing a tab and a `+` over the chrome below it,
+    /// which a height assertion alone would have called a pass. The screendump caught it; this
+    /// is what would have.
+    #[test]
+    fn a_single_tab_draws_no_strip_at_all() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
+        let ui = UiTheme::default();
+        let (w, h) = (500u32, 300u32);
+        let ink_in_strip = |a: &mut App| {
+            let e = a.view(&ui, None);
+            let all = Rect::new(0, 0, w, h);
+            let m = libui::paint::FontMetrics::new(&font, ui.font_px);
+            let l = libui::layout::layout(&e, all, &m);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(ui.background);
+            libui::paint::paint(&mut fb, &font, &ui, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // The band the strip would occupy: below the menu bar, one strip tall.
+            let top = TITLE_BAR_H + MENU_BAR_H;
+            (top..top + TAB_STRIP_H)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(ui.foreground_dim))
+                .count()
+        };
+        let mut one = App::new("/home");
+        one.show("/home", alloc::vec![Entry::dir("Documents")]);
+        assert_eq!(one.tab_strip_h(), 0, "one tab is no strip");
+        assert_eq!(ink_in_strip(&mut one), 0, "…and it draws nothing where a strip would be");
+        let mut two = App::new("/home");
+        two.show("/home", alloc::vec![Entry::dir("Documents")]);
+        two.update(Msg::NewTab);
+        assert_eq!(two.tab_strip_h(), TAB_STRIP_H, "two tabs are a strip");
+        assert!(ink_in_strip(&mut two) > 0, "…and it draws one");
     }
 
     #[test]

@@ -2468,6 +2468,7 @@ pub fn text_area<Msg>(
 /// row widgets to reconcile by hand — which is the hand-rolled diffing `desktop-shell.md` §5
 /// says a list widget exists to avoid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub struct ListRow<'a> {
     /// Identity across frames.
     ///
@@ -2494,6 +2495,41 @@ pub struct ListRow<'a> {
     /// Drawn exactly as `selected` is, because to a person they are the same thing: the rows an
     /// action will act on.
     pub marked: bool,
+    /// The trailing cells, one per column the list declares (desktop refresh, Part I).
+    ///
+    /// **Empty for every list but one.** A browser's listing is a name and three facts about it;
+    /// a window list, a launcher's results and a chooser's rows are a name and nothing else, and
+    /// they say so by leaving this `&[]` — which is what `Default` gives them.
+    ///
+    /// Fewer cells than columns is fine: the rest are blank. More are ignored.
+    pub cells: &'a [&'a str],
+    /// A small square before the label — the browser's folder-or-file mark.
+    pub swatch: Option<Rgb>,
+}
+
+/// A trailing column in a list: how wide it is, and which end its text sits against.
+///
+/// **Fixed widths, and the label takes the rest.** The design's browser is `Name` flexible with
+/// `Size`, `Kind` and `Modified` at 70, 60 and 96 — columns that shared the width out would move
+/// under each other as a listing changed, which is the argument `TAB_W` already makes for tabs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ListColumn {
+    /// How wide, in pixels.
+    pub width: u32,
+    /// Whether the text sits against the column's left edge or its right.
+    ///
+    /// **A size reads right-aligned** — the digits line up and the eye compares them — and
+    /// everything else reads left.
+    pub align: ColumnAlign,
+}
+
+/// Which end of a column its text sits against. See [`ListColumn::align`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColumnAlign {
+    /// Against the left edge.
+    Left,
+    /// Against the right edge.
+    Right,
 }
 
 /// Which row is selected, and how far the list is scrolled.
@@ -2693,6 +2729,7 @@ impl ListState {
 /// caller may genuinely decline it. There is no correct program that ignores a scroll offset.
 pub fn list_view<Msg>(
     rows: &[ListRow<'_>],
+    columns: &[ListColumn],
     state: &mut ListState,
     height: u32,
     row_height: u32,
@@ -2756,7 +2793,52 @@ pub fn list_view<Msg>(
         } else if hovered == Some(r.key) {
             layers.push(wash(theme.accent, hover));
         }
-        layers.push(padding(ROW_PAD, text(r.label)));
+        // **The label, then whatever trailing cells the list declares** (desktop refresh,
+        // Part I). A row with no columns is what it always was: one padded label. With them,
+        // the label takes the space the columns leave — so a long name is what gets cut short,
+        // never a size or a date, which are the same width in every row and are read as a
+        // column rather than as text.
+        // **A plain row stays exactly what it was**: one padded label, with no row wrapper around
+        // it. Every list in the system but the browser's has no columns and no swatch, and
+        // wrapping those in a `Row` would put a node per row in every window list and launcher
+        // result for nothing.
+        if columns.is_empty() && r.swatch.is_none() {
+            layers.push(padding(ROW_PAD, text(r.label)));
+            let row_el = stack(layers);
+            let mut item =
+                sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
+            if let Some(f) = grab {
+                item = item.on_press_down(f(r.key));
+            }
+            items.push(item);
+            continue;
+        }
+        let mut cells = alloc::vec::Vec::with_capacity(columns.len() + 2);
+        if let Some(colour) = r.swatch {
+            cells.push(center_v(sized(
+                Size::new(SWATCH_W, SWATCH_H),
+                rounded_fill(colour, SWATCH_RADIUS),
+            )));
+            cells.push(sized(Size::new(SWATCH_GAP, 0), text("")));
+        }
+        cells.push(center_v(text(r.label)).flex(1));
+        for (i, c) in columns.iter().enumerate() {
+            let cell = r.cells.get(i).copied().unwrap_or("");
+            let text_el = center_v(ink(theme.foreground_dim, scaled(TextSize::Small, text(cell))));
+            cells.push(sized(
+                Size::new(c.width, 0),
+                match c.align {
+                    ColumnAlign::Left => text_el,
+                    // **Pushed rather than aligned**: a `Row` lays its children out left to
+                    // right, so the way to put text against the right edge is to give the space
+                    // before it to something that takes what is left.
+                    ColumnAlign::Right => {
+                        row(alloc::vec![text("").flex(1), text_el, sized(Size::new(CELL_PAD, 0), text(""))])
+                    }
+                },
+            ));
+        }
+        layers.push(padding(ROW_PAD, row(cells)));
         let row_el = stack(layers);
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -2798,6 +2880,69 @@ pub fn list_view<Msg>(
     stack(alloc::vec![fill(ground), body]).focusable()
 }
 
+/// A row swatch: the design's 11×9, with the barest corner on it.
+pub const SWATCH_W: u32 = 11;
+/// See [`SWATCH_W`].
+pub const SWATCH_H: u32 = 9;
+/// See [`SWATCH_W`].
+const SWATCH_RADIUS: u32 = 1;
+/// Between a swatch and the name beside it: the design's 8.
+const SWATCH_GAP: u32 = 8;
+/// The space after a right-aligned cell's text, so a column of sizes does not sit hard against
+/// the next column's edge.
+const CELL_PAD: u32 = 6;
+
+/// How tall a list's column header is: the design's 25.
+pub const LIST_HEADER_H: u32 = 25;
+
+/// The header over a list's columns: the primary heading, then one per column.
+///
+/// **Here rather than in the application**, because a heading that did not sit exactly over its
+/// column would be worse than none — and the insets that put it there are this module's: a row's
+/// padding, a swatch's width and the gap after it. One source, two readers, which is the
+/// arrangement every pair of numbers in this refresh ended up with (desktop refresh, Part I).
+///
+/// The headings are `Small` and dim, like the cells under them, on the `face_hover` ground every
+/// strip of chrome in a window uses.
+pub fn list_header<Msg>(
+    primary: &str,
+    headings: &[&str],
+    columns: &[ListColumn],
+    swatched: bool,
+    theme: &Theme,
+) -> Element<Msg> {
+    let heading = |s: &str| center_v(ink(theme.foreground_dim, scaled(TextSize::Small, text(s))));
+    let mut cells = alloc::vec::Vec::with_capacity(columns.len() + 2);
+    // The same lead-in the rows have, so `Name` starts where a name does.
+    if swatched {
+        cells.push(sized(Size::new(SWATCH_W + SWATCH_GAP, 0), text("")));
+    }
+    cells.push(heading(primary).flex(1));
+    for (i, c) in columns.iter().enumerate() {
+        let label = heading(headings.get(i).copied().unwrap_or(""));
+        cells.push(sized(
+            Size::new(c.width, 0),
+            match c.align {
+                ColumnAlign::Left => label,
+                ColumnAlign::Right => {
+                    row(alloc::vec![text("").flex(1), label, sized(Size::new(CELL_PAD, 0), text(""))])
+                }
+            },
+        ));
+    }
+    sized(
+        Size::new(0, LIST_HEADER_H),
+        stack(alloc::vec![
+            fill(theme.face_hover),
+            dock(
+                alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))],
+                text(""),
+            ),
+            padding(ROW_PAD, row(cells)),
+        ]),
+    )
+}
+
 /// How wide a list's scrollbar is, in pixels.
 const SCROLLBAR_W: u32 = 12;
 
@@ -2808,7 +2953,83 @@ mod list_view_tests {
     use crate::element::Node;
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
-        labels.iter().map(|&(key, label)| ListRow { key, label, marked: false }).collect()
+        labels.iter().map(|&(key, label)| ListRow { key, label, marked: false, ..Default::default() }).collect()
+    }
+
+    /// A row's columns are where the list declares them, and its swatch is drawn.
+    ///
+    /// **Painted, and written before the screendump this time.** Three parts running have shipped
+    /// a widget that was in the tree, routed correctly and drew nothing — so what this asserts is
+    /// ink: a swatch's colour at the row's left end, a right-aligned cell's text inside its own
+    /// column and not the one beside it, and the name giving way to the columns rather than the
+    /// other way round (desktop refresh, Part I).
+    #[test]
+    fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        use libdraw::format::PixelFormat;
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
+        let t = Theme::default();
+        let (w, h) = (400u32, 25u32);
+        let columns = [
+            ListColumn { width: 70, align: ColumnAlign::Right },
+            ListColumn { width: 60, align: ColumnAlign::Left },
+        ];
+        let mark = t.accent;
+        let row = ListRow {
+            key: 1,
+            label: "a-very-long-file-name-that-would-run-past-the-columns.txt",
+            marked: false,
+            cells: &["848", "toml"],
+            swatch: Some(mark),
+        };
+        let mut st = ListState::default();
+        let e: Element<u64> =
+            list_view(&[row], &columns, &mut st, h, h, |k| k, None, None, None, None, &t);
+        let all = libdraw::geom::Rect::new(0, 0, w, h);
+        let l = crate::layout::layout(&e, all, &crate::paint::FontMetrics::new(&font, t.font_px));
+        let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+        fb.clear(t.background);
+        crate::paint::paint(&mut fb, &font, &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        let count = |x0: u32, x1: u32, c: Rgb| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
+                .count()
+        };
+        // The swatch, at the row's left end and in its colour.
+        assert!(count(0, ROW_PAD.left + SWATCH_W + 2, mark) >= (SWATCH_W * SWATCH_H / 2) as usize,
+            "the swatch is drawn where the row starts");
+        assert_eq!(count(120, w, mark), 0, "and nowhere else");
+        // Ink in each column's own band. The columns are the last 130 pixels: 70 then 60.
+        let (size_from, kind_from) = (w - ROW_PAD.right - 130, w - ROW_PAD.right - 60);
+        let ink_in = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter(|(x, y)| {
+                    let c = fb.get_pixel(*x, *y);
+                    c != Some(t.background) && c != Some(mark)
+                })
+                .count()
+        };
+        assert!(ink_in(size_from, kind_from) > 10, "the size cell is drawn in its column");
+        assert!(ink_in(kind_from, w - ROW_PAD.right) > 10, "and the kind cell in its own");
+        // **The name gives way, not the columns.** A long name is clipped at the column's edge
+        // rather than pushing it along — asserted by *which ink* is in the columns' band, since
+        // the name is body ink and a cell is the dim step: the darkest pixel there must be no
+        // darker than `foreground_dim`. (A first version asserted a blank gap before the
+        // columns, which a name is entitled to fill.)
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = (size_from..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter_map(|(x, y)| fb.get_pixel(x, y))
+            .map(darkness)
+            .min()
+            .expect("pixels");
+        assert!(
+            darkest >= darkness(t.foreground_dim),
+            "something in the columns is body ink at {darkest}: the name has run into them"
+        );
     }
 
     /// The wheel moves the offset by whole rows, and stops at the top.
@@ -2862,7 +3083,7 @@ mod list_view_tests {
         let rows_of = |ground: Option<Rgb>, hovered: Option<u64>| {
             let mut st = ListState::at(Some(0), 0);
             let e: Element<u64> =
-                list_view(&rows(&data), &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
+                list_view(&rows(&data), &[], &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
             let mut out: Vec<(Option<Rgb>, Option<(Rgb, u8)>)> = Vec::new();
             walk(&e, &mut |n| {
                 if n.key.is_none() {
@@ -2913,7 +3134,7 @@ mod list_view_tests {
             let mut r = rows(&label);
             r[1].marked = marked;
             let mut st = ListState { selected, offset: 0, ..Default::default() };
-            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, None, &Theme::default()))
+            nodes(&list_view(&r, &[], &mut st, 100, 20, |k| k, None, None, None, None, &Theme::default()))
         };
         let plain = build(false, None);
         let marked = build(true, None);
@@ -2928,7 +3149,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&r, &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -2938,7 +3159,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -2948,9 +3169,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&before), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&after), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -2962,11 +3183,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState::at(Some(19), 0);
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&long), &[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&short), &[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -2992,7 +3213,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState::at(Some(3), 2);
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&[], &[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -3157,6 +3378,7 @@ mod list_view_tests {
         };
         let with: Element<u64> = list_view(
             &rows(&many),
+            &[],
             &mut ListState::default(),
             100,
             20,
@@ -3169,7 +3391,7 @@ mod list_view_tests {
         );
         assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
         let without: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
+            list_view(&rows(&many), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
     }
 
@@ -3338,7 +3560,7 @@ mod list_view_tests {
         let p = Theme::default();
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
+            list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
         // The primary highlight is the selection's wash, not the quieter hover's.
         let sel = Some((p.accent, libdraw::theme::SELECTION_COVERAGE));
         assert_eq!(row_washes(&e)[1], sel, "the hovered row is not the primary highlight");
@@ -3354,6 +3576,7 @@ mod list_view_tests {
         // same weight — two answers to "what happens if I act now" is one too many.
         let e: Element<u64> = list_view(
             &rows(&data),
+            &[],
             &mut ListState::at(Some(1), 0),
             100,
             20,
@@ -3374,6 +3597,7 @@ mod list_view_tests {
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
             &rows(&data),
+            &[],
             &mut ListState::at(Some(1), 0),
             100,
             20,
@@ -3397,7 +3621,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
+            list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
         // **The ground and a wash over it** (desktop refresh, Part B): both rows rest on the
         // list's ground, and the selected one carries the accent at the selection's 20%. It was a
         // one-pixel accent border and the selection bevelled inside it (M11 Part E, batch 2); the
@@ -3416,11 +3640,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
+            list_view(&rows(&few), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
+            list_view(&rows(&many), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -3429,7 +3653,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -3438,7 +3662,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, None, &Theme::default());
+            list_view(&rows(&data), &[], &mut ListState::default(), 100, 0, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 

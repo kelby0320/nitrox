@@ -180,7 +180,7 @@ pub fn view<Msg: Clone>(
     // blocking 1).
     let rows = sized(
         Size::new(0, ROWS_H),
-        list_view(entries, &mut state.list, ROWS_H, ROW_H, on_row, None, None, hovered, None, theme),
+        list_view(entries, &[], &mut state.list, ROWS_H, ROW_H, on_row, None, None, hovered, None, theme),
     )
     .key(key_base);
     // **Active, because in `Save` this field is the only thing taking characters.** The chooser's
@@ -302,8 +302,8 @@ mod tests {
     /// entirely (PR #284 review, blocking 3).
     fn rows() -> Vec<ListRow<'static>> {
         alloc::vec![
-            ListRow { key: 1, label: "papers", marked: false },
-            ListRow { key: 2, label: "notes.txt", marked: false },
+            ListRow { key: 1, label: "papers", marked: false, ..Default::default() },
+            ListRow { key: 2, label: "notes.txt", marked: false, ..Default::default() },
         ]
     }
 

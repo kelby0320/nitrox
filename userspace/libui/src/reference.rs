@@ -116,12 +116,12 @@ pub enum Msg {
 /// that keyed by index would still look right here and a *diff* test elsewhere would catch it;
 /// this gate is about pixels.
 const ROWS: [ListRow<'static>; 6] = [
-    ListRow { key: 41, label: "alpha", marked: false },
-    ListRow { key: 42, label: "beta", marked: false },
-    ListRow { key: 43, label: "gamma", marked: false },
-    ListRow { key: 44, label: "delta", marked: false },
-    ListRow { key: 45, label: "epsilon", marked: false },
-    ListRow { key: 46, label: "zeta", marked: false },
+    ListRow { key: 41, label: "alpha", marked: false, cells: &[], swatch: None },
+    ListRow { key: 42, label: "beta", marked: false, cells: &[], swatch: None },
+    ListRow { key: 43, label: "gamma", marked: false, cells: &[], swatch: None },
+    ListRow { key: 44, label: "delta", marked: false, cells: &[], swatch: None },
+    ListRow { key: 45, label: "epsilon", marked: false, cells: &[], swatch: None },
+    ListRow { key: 46, label: "zeta", marked: false, cells: &[], swatch: None },
 ];
 
 /// How tall each list row is, and how tall the list is — three rows of six visible.
@@ -220,7 +220,7 @@ fn reference_field() -> TextFieldState {
 /// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
 fn reference_list(theme: &Theme) -> Element<Msg> {
     let mut state = ListState::at(Some(1), 0);
-    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, None, None, None, theme);
+    let e = list_view(&ROWS, &[], &mut state, LIST_H, ROW_H, Msg::Row, None, None, None, None, theme);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)
