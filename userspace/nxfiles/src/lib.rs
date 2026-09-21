@@ -39,7 +39,7 @@ use libui::element::{
 use libui::widget::{
     DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
     TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame_with_grip,
+    popup_frame, resize_grip, TabExtras, tab_strip, text_field, title_bar, window_frame_with_grip,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -2279,7 +2279,15 @@ impl App {
             .iter()
             .map(|(k, label)| libui::widget::Tab { key: *k, label: label.as_str(), marked: false })
             .collect();
-        let tabs = tab_strip(&items, self.current, hovered, Msg::SelectTab, Msg::CloseTab, &ui);
+        let tabs = tab_strip(
+            &items,
+            self.current,
+            hovered,
+            Msg::SelectTab,
+            Msg::CloseTab,
+            TabExtras::new_tab(Msg::NewTab),
+            &ui,
+        );
 
         let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());

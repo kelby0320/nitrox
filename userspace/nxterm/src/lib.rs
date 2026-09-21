@@ -1384,6 +1384,7 @@ impl App {
                 hovered,
                 Msg::SelectTab,
                 Msg::CloseTab,
+                libui::widget::TabExtras::new_tab(Msg::NewTab),
                 &ui,
             ),
         };

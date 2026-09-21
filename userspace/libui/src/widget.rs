@@ -30,7 +30,7 @@ use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
     Edge, Element, IconKind, Insets, bevel, bold, center, center_v, column, dock, docked, fill,
-    icon, ink, outline, padding, rounded_fill, row, sized, stack, text, wash,
+    icon, ink, outline, padding, rounded_fill, row, sized, stack, text, wash, with_spacing,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -335,12 +335,36 @@ pub fn dialog_frame_sized<Msg>(
     )
 }
 
-/// How tall a tab strip is.
+/// How tall a tab strip is: the design's 30 since the refresh's Part H, where it was 24.
 ///
 /// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
 /// tabs, and one whose height followed the theme's text size would move under a gate that had to
 /// read a theme file to know where to click.
-pub const TAB_STRIP_H: u32 = 24;
+pub const TAB_STRIP_H: u32 = 30;
+
+/// How tall one tab is, inside that strip: the design's 24.
+pub const TAB_H: u32 = 24;
+
+/// The strip's padding above its tabs — the design's 5, which is what leaves a tab sitting on the
+/// strip rather than filling it.
+pub const TAB_TOP: u32 = 5;
+
+/// The strip's padding at its left end, before the first tab: the design's 6.
+pub const TAB_SIDE: u32 = 6;
+
+/// Between one tab and the next: the design's 1. Enough to separate two inactive tabs, which
+/// have no face of their own to separate them.
+pub const TAB_GAP: u32 = 1;
+
+/// From one tab's left edge to the next's — what a gate multiplies to find tab `n`.
+pub const TAB_PITCH: u32 = TAB_W + TAB_GAP;
+
+/// The corner a tab is rounded to, at the top only: a tab is a shape that runs into the content
+/// below it, so the bottom corners are square and the bottom edge is not there at all.
+pub const TAB_RADIUS: u32 = CONTROL_RADIUS;
+
+/// The `+` at the end of the strip: the design's 22×24.
+pub const NEW_TAB_W: u32 = 22;
 
 /// How wide one tab is.
 ///
@@ -351,6 +375,22 @@ pub const TAB_STRIP_H: u32 = 24;
 /// them run off the end: `TODO(tab-overflow)` names the scrolling that would fix it, and the
 /// trigger is somebody opening more than a window's width of them.
 pub const TAB_W: u32 = 120;
+
+/// A tab's box inside the strip: the tab itself, plus the rule it covers when it is the current
+/// one.
+const TAB_BOX_H: u32 = TAB_H + TAB_RULE;
+
+/// The rule along the bottom of the strip.
+const TAB_RULE: u32 = 1;
+
+/// A tab label's inset from the tab's left edge: the design's 9.
+const TAB_LABEL_PAD: u32 = 9;
+
+/// Between a tab's label and its close box: the design's 8.
+const TAB_CLOSE_GAP: u32 = 8;
+
+/// The key the `+` carries, so the strip's children are all keyed as the diff requires.
+const NEW_TAB_KEY: u64 = u64::MAX;
 
 /// How wide the close box at a tab's right end is.
 pub const TAB_CLOSE_W: u32 = 20;
@@ -389,45 +429,118 @@ pub fn tab_strip<Msg: Clone>(
     hovered: Option<u64>,
     select: impl Fn(u64) -> Msg,
     close: impl Fn(u64) -> Msg,
+    extras: TabExtras<Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
-    let mut row_items = alloc::vec::Vec::with_capacity(tabs.len());
+    let mut row_items = alloc::vec::Vec::with_capacity(tabs.len() + 1);
     for t in tabs {
-        let face = if t.key == current {
-            theme.background
-        } else if hovered == Some(t.key) {
-            theme.face_hover
-        } else {
-            theme.face
-        };
+        let current = t.key == current;
         let mut label = String::new();
         if t.marked {
             label.push_str("* ");
         }
         label.push_str(t.label);
-        // **The current tab is the window's own ground**, so it reads as continuous with what is
-        // below it and the others as a strip above. That is what makes a row of boxes look like
-        // tabs rather than like buttons.
-        let inner = row(alloc::vec![
-            padding(Insets { top: 4, right: 2, bottom: 4, left: 8 }, text(label)).flex(1),
-            sized(
-                Size::new(TAB_CLOSE_W, TAB_STRIP_H),
-                stack(alloc::vec![icon(IconKind::Close)]).on_press(close(t.key)),
-            ),
-        ]);
-        row_items.push(
-            sized(
-                Size::new(TAB_W, TAB_STRIP_H),
-                stack(alloc::vec![fill(face), inner]).on_press(select(t.key)),
+        // **The current tab is the window's own ground and the others are the strip's**, which is
+        // what makes a row of boxes read as tabs rather than as buttons: the current one is a
+        // continuation of the content below, and the rest are a strip above it. An inactive tab
+        // has no face at all — the strip's is what shows through — so hover is a wash over it,
+        // the treatment every other momentary highlight in this toolkit gets.
+        let mut layers = alloc::vec::Vec::with_capacity(3);
+        if current {
+            layers.extend(tab_face(theme.background));
+        } else if hovered == Some(t.key) {
+            // **A face rather than a wash**, which every other momentary highlight here is: a
+            // wash cannot be rounded, and a square highlight behind a rounded tab reads as a
+            // second shape. One shade off the strip is enough to say "this one".
+            layers.extend(tab_face(theme.face));
+        }
+        let ink_colour = if current { theme.foreground } else { theme.foreground_dim };
+        layers.push(row(alloc::vec![
+            padding(
+                Insets { top: 0, right: TAB_CLOSE_GAP, bottom: 0, left: TAB_LABEL_PAD },
+                center_v(ink(ink_colour, text(label))),
             )
-            .key(t.key),
+            .flex(1),
+            // **The icon fills the box rather than being centred in it**: `Node::Icon` measures
+            // as nothing and draws into the rect it is given, so a `center` around one hands it
+            // a zero rect and the tab loses its close box while still clicking like one.
+            sized(
+                Size::new(TAB_CLOSE_W, TAB_BOX_H),
+                stack(alloc::vec![ink(theme.foreground_dim, icon(IconKind::Close))])
+                    .on_press(close(t.key)),
+            ),
+        ]));
+        row_items.push(
+            sized(Size::new(TAB_W, TAB_BOX_H), stack(layers).on_press(select(t.key)))
+                .key(t.key),
         );
     }
-    // A border under the strip, so an unselected tab has an edge where the current one does not.
-    sized(
-        Size::new(0, TAB_STRIP_H),
-        stack(alloc::vec![fill(theme.border), row(row_items)]),
-    )
+    // **The `+` is the last thing in the row**, where the design puts it: after the tabs rather
+    // than at the strip's right end, so it stays beside the tab that was opened last.
+    if let Some(new_tab) = extras.new_tab {
+        row_items.push(
+            sized(
+                Size::new(NEW_TAB_W, TAB_BOX_H),
+                stack(alloc::vec![center(ink(theme.foreground_dim, text("+")))])
+                    .on_press(new_tab),
+            )
+            .key(NEW_TAB_KEY),
+        );
+    }
+    let mut strip = alloc::vec::Vec::with_capacity(3);
+    // The strip's own face, and the rule that separates it from what is below. The current tab
+    // is drawn over that rule, which is what "its border is open at the bottom" means here.
+    strip.push(fill(theme.face_hover));
+    strip.push(dock(
+        alloc::vec![docked(Edge::Bottom, sized(Size::new(0, TAB_RULE), fill(theme.border)))],
+        text(""),
+    ));
+    let tabs_row = with_spacing(row(row_items), TAB_GAP);
+    strip.push(padding(
+        Insets { top: TAB_TOP, right: TAB_SIDE, bottom: 0, left: TAB_SIDE },
+        match extras.right {
+            // A right-hand slot for a window's own controls — the editor's byte count and its
+            // Save. `dock` gives the tabs the rest, so the slot is the size it asks for.
+            Some(right) => dock(alloc::vec![docked(Edge::Right, right)], tabs_row),
+            None => tabs_row,
+        },
+    ));
+    sized(Size::new(0, TAB_STRIP_H), stack(strip))
+}
+
+/// What a tab strip carries besides its tabs (desktop refresh, Part H).
+///
+/// **A struct rather than two more arguments**, because both are optional and an application
+/// that wants neither says so once: `TabExtras::none()`.
+pub struct TabExtras<Msg> {
+    /// What the `+` at the end of the tabs sends. `None` draws no `+`.
+    pub new_tab: Option<Msg>,
+    /// A window's own controls, at the strip's right end — the editor's byte count and Save.
+    pub right: Option<Element<Msg>>,
+}
+
+impl<Msg> TabExtras<Msg> {
+    /// Tabs and nothing else.
+    pub fn none() -> Self {
+        Self { new_tab: None, right: None }
+    }
+
+    /// Tabs and a `+`.
+    pub fn new_tab(msg: Msg) -> Self {
+        Self { new_tab: Some(msg), right: None }
+    }
+}
+
+/// A tab's face: rounded at the top, square where it meets the content.
+///
+/// **Two layers rather than a per-corner radius**, which the toolkit does not have: a rounded
+/// fill over the whole box, then a square one below the curve. The square layer is what covers
+/// the strip's rule under the current tab.
+fn tab_face<Msg>(colour: Rgb) -> alloc::vec::Vec<Element<Msg>> {
+    alloc::vec![
+        rounded_fill(colour, TAB_RADIUS),
+        padding(Insets { top: TAB_RADIUS, right: 0, bottom: 0, left: 0 }, fill(colour)),
+    ]
 }
 
 /// One row of a dropdown menu: a label that highlights under the pointer.
@@ -4952,20 +5065,23 @@ two");
         // presses a tab at `TAB_W * i + something` and its close box at `TAB_CLOSE_CX`, and it
         // cannot link this crate — so the numbers are asserted here against a tree that is
         // actually built, the way the dialog's aim points are.
-        assert_eq!((TAB_W, TAB_STRIP_H, TAB_CLOSE_W), (120, 24, 20));
+        assert_eq!((TAB_W, TAB_STRIP_H, TAB_H, TAB_CLOSE_W), (120, 30, 24, 20));
+        assert_eq!((TAB_SIDE, TAB_TOP, TAB_GAP, TAB_PITCH), (6, 5, 1, 121));
         assert_eq!(TAB_CLOSE_CX, 110);
 
         #[derive(Clone, PartialEq, Eq, Debug)]
         enum M {
             Select(u64),
             Close(u64),
+            New,
         }
         let theme = Theme::default();
         let tabs = [
             Tab { key: 7, label: "one", marked: false },
             Tab { key: 9, label: "two", marked: true },
         ];
-        let ui: Element<M> = tab_strip(&tabs, 7, None, M::Select, M::Close, &theme);
+        let ui: Element<M> =
+            tab_strip(&tabs, 7, None, M::Select, M::Close, TabExtras::new_tab(M::New), &theme);
 
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&ui, Rect::new(0, 0, 400, TAB_STRIP_H), &cell);
@@ -4986,13 +5102,55 @@ two");
             r.pointer(&tree, &ui, &l, at(0, 0)).0
         };
 
+        // **Tab `i` begins at `TAB_SIDE + i * TAB_PITCH`** since the refresh's Part H: the strip
+        // has padding at its left end and a pixel between tabs, where it used to start hard
+        // against the content's edge with none.
+        let tab_x = |i: i32| TAB_SIDE as i32 + i * TAB_PITCH as i32;
         // The second tab's label area selects it, by **key** and not by position.
-        assert_eq!(click(&mut router, TAB_W as i32 + 20), alloc::vec![M::Select(9)]);
+        assert_eq!(click(&mut router, tab_x(1) + 20), alloc::vec![M::Select(9)]);
         // Its close box closes it and does *not* also select it: a nearer `on_press` shadows the
         // one on the tab, which is the same rule that lets a title bar carry buttons.
-        assert_eq!(click(&mut router, TAB_W as i32 + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
+        assert_eq!(click(&mut router, tab_x(1) + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
         // And the first tab is still where it was, which is what a fixed width buys.
-        assert_eq!(click(&mut router, 20), alloc::vec![M::Select(7)]);
+        assert_eq!(click(&mut router, tab_x(0) + 20), alloc::vec![M::Select(7)]);
+        // The `+` is after the last tab, and opens one rather than selecting anything.
+        assert_eq!(click(&mut router, tab_x(2) + (NEW_TAB_W / 2) as i32), alloc::vec![M::New]);
+    }
+
+    /// A tab's close box is drawn, not merely clickable.
+    ///
+    /// **`Node::Icon` measures as nothing** and paints into the rect it is handed, so any wrapper
+    /// that sizes to its child's measurement — `center`, and it was a `center` — gives the glyph
+    /// a zero rect. The tab then still *clicks* like a tab with a close box, which is why the
+    /// routing test above passed while the × was missing from a screendump (desktop refresh,
+    /// Part H). Painted, because that is the only place the difference exists.
+    #[test]
+    fn a_tabs_close_box_puts_ink_on_the_screen() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let tabs = [Tab { key: 1, label: "one", marked: false }];
+        let ui: Element<M> =
+            tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
+        let all = Rect::new(0, 0, 200, TAB_STRIP_H);
+        let l = layout(&ui, all, &CELL);
+        let mut fb = MemFramebuffer::new(Geometry::packed(200, TAB_STRIP_H, PixelFormat::XRGB8888));
+        fb.clear(t.background);
+        paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        // The close box is the last `TAB_CLOSE_W` of the first tab.
+        let (from, to) = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
+        let inked = |x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..TAB_STRIP_H).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(t.foreground_dim))
+                .count()
+        };
+        assert!(inked(from, to) > 8, "the close box drew nothing");
+        // And the ink is the box's, not the label's spilling into it.
+        assert!(inked(to, to + TAB_GAP + 4) == 0, "and it stays inside the tab");
     }
 
     #[test]
@@ -5008,8 +5166,9 @@ two");
         let theme = Theme::default();
         let quiet = [Tab { key: 1, label: "notes", marked: false }];
         let dirty = [Tab { key: 1, label: "notes", marked: true }];
-        let a: Element<M> = tab_strip(&quiet, 1, None, M::Select, M::Close, &theme);
-        let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, &theme);
+        let extras = || TabExtras::none();
+        let a: Element<M> = tab_strip(&quiet, 1, None, M::Select, M::Close, extras(), &theme);
+        let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, extras(), &theme);
         assert_eq!(all_text(&a), "notes");
         assert_eq!(all_text(&b), "* notes");
     }

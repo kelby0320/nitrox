@@ -45,7 +45,7 @@ use libui::element::{
 use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
     TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
-    tab_strip,
+    TabExtras, tab_strip,
     text_area, text_field, title_bar, window_frame_with_grip,
 };
 
@@ -2212,6 +2212,7 @@ impl App {
             hovered,
             Msg::SelectTab,
             Msg::CloseTab,
+            TabExtras::new_tab(Msg::NewTab),
             &ui,
         );
 
