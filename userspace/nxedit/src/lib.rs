@@ -39,15 +39,13 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, TextSize, center_v, column, dock, docked, padding, row, scaled, sized,
-    text, with_spacing,
+    Edge, Element, Insets, column, dock, docked, padding, row, sized, text, with_spacing,
 };
 use libui::widget::{
-    GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
-    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
-    TabExtras, tab_strip,
-    text_area, text_field, title_bar, window_frame_with_grip, STATUS_GAP, status_bar,
-    status_text,
+    GRIP_W, InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
+    TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
+    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_text, tab_strip, text_area,
+    text_field, title_bar, window_frame_with_grip,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -55,6 +53,10 @@ use libui::widget::{
 /// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
 /// so its height is that widget's and a second 24 here would have clamped it.
 pub const STATUS_H: u32 = libui::widget::STATUS_BAR_H;
+
+/// What kind of window this is, beside the name of the file in it — the design's
+/// `theme.toml — Text Editor`, as a title and the dim subtitle after it.
+pub const EDITOR_KIND: &str = "Text Editor";
 
 /// The element key on the strip's line-and-column readout.
 pub const POSITION_KEY: u64 = 16;
@@ -2141,6 +2143,8 @@ impl App {
 
         let title = title_bar(
             &self.title(),
+            // The design names the kind of window beside the file it holds.
+            Some(EDITOR_KIND),
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -2174,11 +2178,20 @@ impl App {
         };
         let strip = status_bar(
             row(alloc::vec![
-                button(
-                    "save",
-                    Msg::Save,
-                    WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                    &ui,
+                // **The one action in this window, so it is the accent pill** (desktop refresh,
+                // Part H) — the design's `Save`, which is the only control it fills with the
+                // accent. Part J moves it to the tab strip, where the design puts it.
+                // **Sized to the design's 21**, so the control sits *on* the bar rather than
+                // filling it: a pill as tall as the strip it is in reads as a coloured end to
+                // the strip.
+                sized(
+                    Size::new(0, PILL_H),
+                    pill(
+                        "Save",
+                        Msg::Save,
+                        WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                        &ui,
+                    ),
                 )
                 .key(SAVE_KEY),
                 padding(Insets { top: 0, right: 0, bottom: 0, left: STATUS_GAP }, reading)
@@ -2295,6 +2308,7 @@ impl App {
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
+            self.focused,
             &ui,
         )
     }
@@ -2314,6 +2328,7 @@ impl App {
     pub fn confirm_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let title = title_bar(
             "Unsaved changes",
+            None,
             self.confirm_focused,
             Msg::DragConfirm,
             // **One button, and it is the cautious answer.** Minimise and maximise are absent

@@ -2165,6 +2165,8 @@ impl App {
 
         let title = title_bar(
             TITLE,
+            // **What this window is showing**, which for a browser is where it is looking.
+            Some(self.pane().path.as_str()),
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -2394,6 +2396,7 @@ impl App {
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
+            self.focused,
             &ui,
         )
     }
@@ -2439,6 +2442,7 @@ impl App {
         };
         let title = title_bar(
             "Delete",
+            None,
             self.dialog_focused,
             Msg::DragConfirm,
             // One button, and it is the cautious answer: closing a question must not perform it.
@@ -2481,6 +2485,7 @@ impl App {
         };
         let title = title_bar(
             "Properties",
+            None,
             self.dialog_focused,
             Msg::DragConfirm,
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::CloseProperties) },

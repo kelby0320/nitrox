@@ -5547,8 +5547,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //
     // The editor is the work area's right half after the snap above.
     let ed = (work.0 + (work.2 / 2) as i32, work.1);
-    // Tab `i`'s label area: the strip's own left padding, `TAB_PITCH` per tab, and 40 into the
-    // label — clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
+    // Tab `i`'s label area: the strip's own left padding, `TAB_PITCH` per tab, and a third of a
+    // tab into the label — clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
     //
     // **Down the tab rather than down the strip** since Part H: the strip is 30 and a tab is the
     // 24 below its 5 of padding, so half the strip is still inside a tab but half a tab is the
@@ -5560,7 +5560,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // this failed, silently, as a tab that never became current.
     let tab = |i: i32| {
         (
-            ed.0 + chrome::CONTENT_X + chrome::TAB_SIDE + chrome::TAB_PITCH * i + 40,
+            ed.0 + chrome::CONTENT_X + chrome::TAB_SIDE + chrome::TAB_PITCH * i + chrome::TAB_W / 3,
             ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_TOP + chrome::TAB_H / 2,
         )
     };

@@ -27096,3 +27096,59 @@ keystroke — in a window whose size is fixed at creation, that is content jumpi
 The refusal is drawn in `deny`, and the test for it counts a red cast rather than the exact
 colour: at the small step, antialiasing leaves only fifteen pixels at `deny` itself, and nothing
 else on this card leans red.
+
+## 2026-09-21 — Desktop refresh Part H: the parts of a window, built once in the toolkit
+
+Five pieces the three applications share, so each is built and restyled in one place.
+
+**The tab strip is the design's.** 30 pixels on `face_hover` with a rule along the bottom; tabs 24
+tall, inset 6 from the left and a pixel apart, rounded at the **top only** — two layers, a rounded
+fill and a square one below the curve, because the toolkit has no per-corner radius and inventing
+one for a tab would be a node kind nothing else wants. The current tab is the window's own ground
+drawn *over* that rule, which is what makes a row of boxes read as tabs rather than as buttons.
+A `+` follows the last tab, wired to the new-tab message all three applications already had, and
+`TabExtras` carries it and an optional right-hand slot so two optional things stay out of the
+argument list.
+
+**A widget can be present, routable and invisible, and this is the second time in three days.**
+The close `×` was wrapped in `center`, and `Node::Icon` measures as nothing and paints into the
+rect it is handed — so the glyph got a zero rect while the tab went on clicking exactly like a
+tab with a close box. Part D's invisible resting field was the same shape of bug. Both are now
+pinned by tests that **paint and count ink**, which is the only place the difference exists; the
+routing test passed throughout.
+
+**A status bar, and not in the mono face.** The design sets its status bars in 10.5 px mono; a
+window here is painted with one face and the fixed-advance one belongs to a character grid, so a
+mono status bar would be the toolkit's first two-face surface for the sake of a byte count. The
+hierarchy comes from the size step and `foreground_dim` instead. The rule goes on the edge that
+faces the content — a bar with it on the wrong side reads as a lid rather than a floor — which is
+what lets the editor keep its strip under the chrome until Part J moves it to the foot.
+
+**A focused window is edged in the accent**, which is the design's cue: its editor is edged in
+`accent` and the two windows behind it in the line colour. The client draws it, because a client
+knows its own focus and the compositor draws no chrome (M9 decision 1). Additive — the tinted
+title bar stays, which is the refresh's one deliberate divergence.
+
+**A title says what a window is showing beside what it is**: an optional subtitle in
+`foreground_dim` at the body size. The browser's is its directory, the editor's is `Text Editor`.
+The terminal's would be its shell's working directory, which nothing can tell it — Part K.
+
+**`button` is rounded and `pill` is new.** Rounding the button is what makes "an icon button is a
+24×24 of the same" true without a new widget: both applications' up-arrows are buttons with a
+glyph on them. The pill is the inverse of everything else on a surface — the accent as a ground,
+the window's paper as its ink — which is what makes one control read as *the* action. Its focus
+ring goes inside, in the paper colour, because a ring in the accent around a ground of the accent
+is not a ring.
+
+**`chrome` in `xtask` now holds the tab metrics, and a test compares the whole table with
+`libui`'s source** — the generalisation of PR #318's finding, applied before the same drift could
+happen again. The gate keeps its copies on purpose (M11 decision 2); what is new is that they
+fail on the host when the toolkit moves. The guard fires when a constant stops being a literal,
+which is how such a check goes stale while passing.
+
+**Three tests in this part first passed against their own controls**, and each needed the same
+correction: comparing two measurements rather than measuring against the value that distinguishes
+them. A subtitle in body ink was "dimmer than the title" by three units of antialiasing; a status
+bar's readings and a pill's label were counted by exact colour, which at the small step is almost
+no pixels at all. The fix each time was an absolute threshold — the ink itself — rather than a
+relative one.

@@ -90,14 +90,18 @@ pub fn button<Msg>(
     // invisible — the report was that buttons need "a different color background … so you know
     // it's a button". What actually says *button* is the edge, which is what every desktop
     // draws and what this toolkit had only around a focused control.
+    //
+    // **Rounded since the desktop refresh's Part H**, to `CONTROL_RADIUS` — the curve a window,
+    // a popup, a tab and a field all share. A square button beside a rounded field was the last
+    // right angle on these surfaces.
+    let (edge, thickness) =
+        if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
     let mut layers = alloc::vec::Vec::with_capacity(3);
-    if state.active {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(RING), fill(face)));
-    } else {
-        layers.push(fill(theme.border));
-        layers.push(padding(Insets::all(BORDER), fill(face)));
-    }
+    layers.push(rounded_fill(edge, CONTROL_RADIUS));
+    layers.push(padding(
+        Insets::all(thickness),
+        rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness)),
+    ));
     // **Centred, which is what a button's label is everywhere else in the world.** It was against
     // the top-left corner of the face: `padding` places a child at an inset from the origin, and
     // a face is usually much wider than the word on it, so every button in this toolkit read as
@@ -147,8 +151,13 @@ pub const POPUP_BORDER: u32 = 1;
 /// Takes the title and the rest separately rather than wrapping a finished tree, because those
 /// two are exactly the parts that are treated differently. An application that wants no frame
 /// simply does not call this; the greeter does not, having no title bar to be flush with.
-pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
-    frame_layers(title, content, None, theme)
+pub fn window_frame<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    focused: bool,
+    theme: &Theme,
+) -> Element<Msg> {
+    frame_layers(title, content, None, focused, theme)
 }
 
 /// [`window_frame`]'s layers, with an optional corner layer drawn before the border.
@@ -156,6 +165,7 @@ fn frame_layers<Msg>(
     title: Element<Msg>,
     content: Element<Msg>,
     corner: Option<Element<Msg>>,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
@@ -177,7 +187,12 @@ fn frame_layers<Msg>(
     // an outline along the same curve, painted over the content it curves into.
     let mut layers = alloc::vec![fill(theme.face), padding(Insets::all(WINDOW_BORDER), inner)];
     layers.extend(corner);
-    layers.push(outline(theme.border, libdraw::corner::WINDOW_RADIUS));
+    // **The focused window's edge is the accent** (desktop refresh, Part H) — the design's own
+    // focus cue, and the one it uses instead of tinting a title bar. We keep the tinted bar as
+    // well (the plan's deliberate divergence), so this is additive: a client knows its own focus
+    // and draws its own edge, and nothing in the compositor has to say which window is which.
+    let edge = if focused { theme.accent } else { theme.border };
+    layers.push(outline(edge, libdraw::corner::WINDOW_RADIUS));
     stack(layers)
 }
 
@@ -199,10 +214,12 @@ pub fn window_frame_with_grip<Msg>(
     content: Element<Msg>,
     grip: Element<Msg>,
     window: Size,
+    focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let at = |len: u32| len.saturating_sub(WINDOW_BORDER + GRIP_W) as i32;
-    frame_layers(title, content, Some(crate::element::offset(at(window.w), at(window.h), grip)), theme)
+    let corner = crate::element::offset(at(window.w), at(window.h), grip);
+    frame_layers(title, content, Some(corner), focused, theme)
 }
 
 /// How thick the line around a window is.
@@ -331,6 +348,10 @@ pub fn dialog_frame_sized<Msg>(
         window_frame(
             title,
             dock(alloc::vec![docked(Edge::Bottom, strip)], padding(Insets::all(0), question)),
+            // **A dialog draws itself focused.** It is a window of its own and it is up because
+            // something is waiting on it, so the accent edge is telling the truth about where
+            // the keyboard is going; a dialog behind its parent is not a state this has.
+            true,
             theme,
         ),
     )
@@ -609,6 +630,49 @@ pub fn status_separator<Msg>(theme: &Theme) -> Element<Msg> {
 /// Between two readings on a status bar — either side of a separator, or between a control and
 /// the reading next to it. The design's 16 from one to the next, less the bar it draws between.
 pub const STATUS_GAP: u32 = 7;
+
+/// A primary action: the accent as a ground, with its label in the paper colour.
+///
+/// **The one button in a window that is the answer** — the design's `Save`, and the only place it
+/// fills a control with the accent rather than drawing with it. Everything else on a surface is a
+/// face with an edge, which is what makes this one read as the action rather than as an option
+/// (desktop refresh, Part H).
+///
+/// Hover and press shade the ground rather than swapping it, because an accent that changed hue
+/// under the pointer would read as a different control.
+pub fn pill<Msg>(
+    label: impl Into<String>,
+    msg: Msg,
+    state: WidgetState,
+    theme: &Theme,
+) -> Element<Msg> {
+    let ground = if state.pressed {
+        theme.accent.shade(-PILL_SHADE)
+    } else if state.hovered {
+        theme.accent.shade(PILL_SHADE)
+    } else {
+        theme.accent
+    };
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    layers.push(rounded_fill(ground, CONTROL_RADIUS));
+    if state.active {
+        // The focus ring goes *inside* a filled control, in the paper colour: a ring in the
+        // accent around a ground of the accent is not a ring.
+        layers.push(padding(Insets::all(RING), rounded_fill(ground, CONTROL_RADIUS - RING)));
+    }
+    layers.push(center(padding(PILL_PAD, ink(theme.background, text(label)))));
+    stack(layers).on_press(msg).focusable()
+}
+
+/// How tall a pill is where a caller sizes one: the design's 21, which is a control sitting on a
+/// 24-pixel row rather than filling it.
+pub const PILL_H: u32 = 21;
+
+/// A pill's sides: the design's 12.
+const PILL_PAD: Insets = Insets { top: 2, right: 12, bottom: 2, left: 12 };
+
+/// How far a pill's ground moves under the pointer, and the other way when pressed.
+const PILL_SHADE: i16 = 12;
 
 /// One row of a dropdown menu: a label that highlights under the pointer.
 ///
@@ -967,6 +1031,7 @@ pub const fn title_button_centre(window_w: u32, nth: u32) -> (i32, i32) {
 /// decorations and not a defect in this widget.
 pub fn title_bar<Msg: Clone>(
     title: impl Into<String>,
+    subtitle: Option<&str>,
     focused: bool,
     drag: Msg,
     buttons: TitleButtons<Msg>,
@@ -1006,8 +1071,18 @@ pub fn title_bar<Msg: Clone>(
     // the design's semibold already, so a size step on top overshoots — measured on a screendump
     // against the menu's "File", the title is 1.62× its width at the body size and 1.75× a step
     // up, where the design's is 1.47×.
-    let title = bold(text(title));
-    controls.push(padding(TITLE_PAD, center_v(title)).flex(1));
+    //
+    // **And a dim subtitle beside it** (Part H): the design says *what* a window is showing next
+    // to what it is — a browser's directory, an editor's kind. It is the body size in the dim
+    // ink rather than a size below, which is what the design does and what keeps two words on
+    // one line from reading as a heading and a footnote.
+    let mut name = alloc::vec::Vec::with_capacity(2);
+    name.push(bold(text(title)));
+    if let Some(subtitle) = subtitle.filter(|s| !s.is_empty()) {
+        name.push(ink(theme.foreground_dim, text(subtitle)));
+    }
+    let title = center_v(with_spacing(row(name), TITLE_SUBTITLE_GAP));
+    controls.push(padding(TITLE_PAD, title).flex(1));
     controls.push(ink(
         theme.foreground_dim,
         crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),
@@ -1100,8 +1175,11 @@ impl<Msg> Default for TitleButtons<Msg> {
 /// centred down the bar.
 const TITLE_PAD: Insets = Insets { top: 0, right: 6, bottom: 0, left: 11 };
 
+/// Between a window's title and the dim subtitle beside it: the design's 9.
+const TITLE_SUBTITLE_GAP: u32 = 9;
+
 /// Space between a text field's content and its edge.
-const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
+const FIELD_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 
 /// How wide the caret is, in pixels.
 const CARET: u32 = 2;
@@ -3769,9 +3847,13 @@ mod tests {
             let fills: vec::Vec<Rgb> = e
                 .children()
                 .filter_map(|c| match &c.node {
-                    crate::element::Node::Fill(c) => Some(*c),
+                    // A button's layers are rounded fills since Part H; a square `Fill` is still
+                    // matched so this reads whichever shape the widget is built from.
+                    crate::element::Node::Fill(c)
+                    | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                     crate::element::Node::Padding { child, .. } => match &child.node {
-                        crate::element::Node::Fill(c) => Some(*c),
+                        crate::element::Node::Fill(c)
+                        | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                         _ => None,
                     },
                     _ => None,
@@ -3800,7 +3882,9 @@ mod tests {
             button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.accent), "the ring is on the edge");
+        // **Down the left edge rather than at the corner**: the button is rounded to
+        // `CONTROL_RADIUS` since Part H, so `(0, 0)` is the ground the curve was cut out of.
+        assert_eq!(fb.get_pixel(0, 20), Some(p.accent), "the ring is on the edge");
         // **Inside the ring but away from the label**, which is centred since M15: the middle
         // of the button is where the word is, so a sample taken there is a glyph.
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
@@ -3820,7 +3904,7 @@ mod tests {
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.border), "a resting button has no edge at all");
+        assert_eq!(fb.get_pixel(0, 20), Some(p.border), "a resting button has no edge at all");
         assert_ne!(p.border, p.face, "…and the edge is not the face");
         assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
     }
@@ -3961,6 +4045,7 @@ mod tests {
         let p = Theme::default();
         let e = title_bar(
             "a terminal",
+            None,
             true,
             M::Drag,
             TitleButtons {
@@ -5023,6 +5108,7 @@ two");
         let p = Theme::default();
         let e = title_bar(
             "a terminal",
+            None,
             true,
             M::Drag,
             TitleButtons {
@@ -5184,6 +5270,136 @@ two");
         assert_eq!(click(&mut router, tab_x(2) + (NEW_TAB_W / 2) as i32), alloc::vec![M::New]);
     }
 
+    /// How far off an exact ink a glyph's darkest pixel may land. A stem covers a pixel almost
+    /// but not quite completely, so even body ink comes out a few units light.
+    const ANTIALIAS_SLACK: u32 = 12;
+
+    /// A pill is the accent filled in, with its label in the paper colour.
+    ///
+    /// **The inverse of every other control here**, which is the whole point of it: a button is a
+    /// face with an edge and ink on it, and this is the accent with the window's own ground as
+    /// ink. Painted, because "filled with the accent" is a statement about pixels, and because a
+    /// label drawn in `foreground` on an accent ground is the failure worth catching — it reads
+    /// as a smudge rather than as a word (desktop refresh, Part H).
+    #[test]
+    fn a_pill_is_the_accent_with_the_paper_as_its_ink() {
+        let t = Theme::default();
+        let (w, h) = (80, 30);
+        let e: Element<Msg> = pill("Save", (), WidgetState::default(), &t);
+        let all = Rect::new(0, 0, w, h);
+        let l = layout(&e, all, &CELL);
+        let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+        fb.clear(t.face);
+        paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        // The ground, sampled down the left edge and clear of the label in the middle.
+        assert_eq!(fb.get_pixel(2, h / 2), Some(t.accent), "a pill is filled with the accent");
+        // **Measured as lightness along the middle row**, where the pill is full width so its
+        // cut corners cannot be mistaken for the label. Counting pixels at exactly `background`
+        // counts almost none: a glyph at this size is mostly antialiased, which is the same
+        // thing the status bar's and the greeter's tests ran into.
+        let light = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let row: alloc::vec::Vec<u32> =
+            (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(light).collect();
+        let (lightest, darkest) = (
+            *row.iter().max().expect("pixels"),
+            *row.iter().min().expect("pixels"),
+        );
+        let (ground, paper) = (light(t.accent), light(t.background));
+        assert!(
+            lightest > ground + (paper - ground) / 2,
+            "the label is drawn toward the paper colour: {lightest} against a ground of {ground}"
+        );
+        assert!(
+            darkest >= ground - ANTIALIAS_SLACK,
+            "something on the pill is darker than its ground ({darkest} against {ground}) — a \
+             label in body ink on the accent reads as a smudge"
+        );
+        assert!(light(t.foreground) < ground - ANTIALIAS_SLACK, "and body ink would fail that");
+    }
+
+    /// A focused window's edge is the accent; an unfocused one's is the line colour.
+    ///
+    /// **The design's own focus cue** (desktop refresh, Part H), and painted rather than read off
+    /// the tree: the edge is the last layer over everything else, so a frame that drew it first
+    /// would have the right colour in the wrong place and the tree would look the same.
+    #[test]
+    fn a_focused_windows_edge_is_the_accent() {
+        let t = Theme::default();
+        let (w, h) = (120, 60);
+        let edge = |focused: bool| {
+            let e: Element<Msg> = window_frame(
+                sized(Size::new(0, TITLE_BAR_H), fill(t.face)).key(1),
+                sized(Size::new(0, 0), text("")).key(2),
+                focused,
+                &t,
+            );
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // Down the left edge, clear of the rounded corners.
+            fb.get_pixel(0, h / 2)
+        };
+        assert_eq!(edge(true), Some(t.accent), "the focused window is edged in the accent");
+        assert_eq!(edge(false), Some(t.border), "and an unfocused one in the line colour");
+        assert_ne!(t.accent, t.border);
+    }
+
+    /// A title bar's subtitle is beside the title, dimmer than it, and absent when there is none.
+    ///
+    /// **Painted, and in that order**: the pair is a bold name and a second word that must read
+    /// as secondary, so what this asserts is that the darkest ink in the subtitle's half of the
+    /// bar is lighter than the title's — not merely that two strings are in the tree (desktop
+    /// refresh, Part H).
+    #[test]
+    fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
+        let t = Theme::default();
+        let (w, h) = (300, TITLE_BAR_H);
+        let draw = |subtitle: Option<&str>| {
+            let e: Element<Msg> =
+                title_bar("Files", subtitle, true, (), TitleButtons::default(), &t);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = |fb: &MemFramebuffer, x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .map(darkness)
+                .min()
+                .expect("pixels")
+        };
+        // Where each word falls: the title starts at `TITLE_PAD`, and "Files" in the bold face
+        // is comfortably inside 60 pixels at the default size.
+        let (title_half, sub_half) = (60, 200);
+        let with = draw(Some("/home"));
+        let without = draw(None);
+        assert!(
+            darkest(&with, title_half, sub_half) < darkest(&without, title_half, sub_half),
+            "the subtitle draws where there was nothing"
+        );
+        // **Against the dim ink itself, not merely against the title.** A first version compared
+        // the two halves and passed with the subtitle in *body* ink: antialiasing left it three
+        // units lighter than the title, and "darker than" was true of a difference nobody could
+        // see. What matters is which ink it is, so the threshold is that ink.
+        let (title_ink, sub_ink) =
+            (darkest(&with, 0, title_half), darkest(&with, title_half, sub_half));
+        assert!(
+            sub_ink >= darkness(t.foreground_dim),
+            "the subtitle is {sub_ink}, darker than `foreground_dim` — it is not a second read"
+        );
+        assert!(
+            title_ink <= darkness(t.foreground) + ANTIALIAS_SLACK,
+            "and the title is body ink at {title_ink}"
+        );
+    }
+
     /// A status bar is a ground, a rule on the edge that faces the content, and dim readings.
     ///
     /// **Painted**, because every part of this is a colour in a place: a bar whose rule is on the
@@ -5320,13 +5536,15 @@ two");
         let theme = Theme::default();
         let bar = title_bar(
             "a window",
+            None,
             true,
             M::Drag,
             TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
             &theme,
         )
         .key(1);
-        let e: Element<M> = window_frame(bar, sized(Size::new(0, 0), text("")).key(2), &theme);
+        let e: Element<M> =
+            window_frame(bar, sized(Size::new(0, 0), text("")).key(2), true, &theme);
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&e, Rect::new(0, 0, 400, 200), &cell);
         let mut tree = crate::diff::Tree::new();
@@ -5371,6 +5589,7 @@ two");
             content,
             resize_grip(M::Grip, &theme).key(3),
             window,
+            true,
             &theme,
         );
         let crate::element::Node::Stack(layers) = &e.node else { panic!("the frame is a stack") };
@@ -5437,6 +5656,7 @@ two");
         let ui: Element<M> = dialog_frame(
             title_bar(
                 "Question",
+                None,
                 true,
                 M::Drag,
                 TitleButtons { minimise: None, maximise: None, close: None },

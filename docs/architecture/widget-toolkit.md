@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, and Part D gave a field a rounded edge — the accent ring when focused, `border` at rest), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -284,6 +284,15 @@ is *inherited*: a coloured run is usually several nodes — a highlighted keywor
 is a `stack` of a fill and a text — and the alternative is every leaf carrying a colour its parent
 has to remember to set.
 
+**A window says what it is showing beside what it is** (Part H). `title_bar` takes an optional
+subtitle and sets it in `foreground_dim` at the body size, beside the bold title: the browser's
+directory, the editor's kind. The terminal's would be its shell's working directory, which
+nothing can tell it yet — that is Part K.
+
+**A focused window is edged in the accent** (Part H), which is the design's own focus cue. The
+client draws it, because a client knows its own focus and the compositor draws no chrome; we keep
+the tinted title bar as well, which is the refresh's one deliberate divergence from the design.
+
 **And `scaled` and `bold`, which change the text's size and weight the same way** (desktop
 refresh, Part G). The theme carries one size, `font_px`, and text is set at one of three steps
 derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12, and no step goes under `MIN_FONT_PX`. Those are
@@ -487,6 +496,8 @@ so they exist:
 
 | Widget | Why it exists |
 |---|---|
+| `pill` | A window's one primary action — the editor's `Save`. The accent as a ground with the window's paper as its ink, which is the inverse of every other control here and what makes it read as *the* action (desktop refresh, Part H) |
+| `status_bar` | A window's foot: a ground, a rule on the edge that faces the content, and readings a step below the body in `foreground_dim`. A left slot and a right one (Part H) |
 | `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked. **Rounded, and edged at rest, since the desktop refresh's Part D** — it was a flat fill of `track`, which is the light scheme's own `--bg`, so a resting field on a window's ground was invisible; the greeter is where that showed, and today its field is the only one drawn at rest. Focused, the edge is the accent ring, rounded to the same curve |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |
 
@@ -983,6 +994,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   **A tab's key is an element key**, and that matters: `Router::hovered_key` reports the nearest
   keyed ancestor across the whole window, so applications number their tabs from a base above
   their chrome's keys rather than colliding with them.
+
+  **The strip is the design's since the refresh's Part H**: 30 pixels on `face_hover` with a rule
+  along the bottom, tabs 24 tall inset 6 from the left and 1 apart, rounded at the *top* only —
+  two layers, a rounded fill and a square one below the curve, because the toolkit has no
+  per-corner radius. The current tab is filled with the window's own ground and drawn over that
+  rule, so it runs into the content below; the others have no face at all and their labels are
+  dim. A `+` follows the last tab, and a caller may put a window's own controls in a right-hand
+  slot — both through `TabExtras`, which keeps two optional things out of the argument list.
 - **Multi-window applications** — *here since M12 Part A*, for the windows an application opens
   **beside** its main one. The trigger fired exactly as written: `nxedit` asks before discarding
   an unsaved buffer, and it asks in a real `Role::Dialog` window rather than in a `stack` overlay.
