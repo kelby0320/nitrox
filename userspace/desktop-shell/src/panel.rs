@@ -27,7 +27,7 @@ use libui::element::{
 };
 use libui::layout::{Constraints, Metrics, measure};
 use libui::menu::{Item, Menu, MenuState, popup, popup_headed};
-use libui::widget::{TextFieldState, Theme, WidgetState, popup_frame, text_field};
+use libui::widget::{CONTROL_RADIUS, TextFieldState, Theme, WidgetState, popup_frame, text_field};
 
 use crate::{Application, BAR_H, matches_app};
 
@@ -356,8 +356,9 @@ pub const BAR_GAP: u32 = 4;
 pub const SHOW_W: u32 = 26;
 /// Every control's height on the bar: `22px`.
 const CONTROL_H: u32 = 22;
-/// The design's `--r`, which buttons on the bar share with windows.
-const CONTROL_RADIUS: u32 = 8;
+// The design's `--r` — which buttons on the bar share with windows and, since the refresh's
+// Part D, with a field inside one — is `libui::widget::CONTROL_RADIUS`, imported above. There
+// was a second 8 here until a field needed the same curve.
 /// The rule after the show-desktop button: one pixel with `margin: 0 3px`.
 const RULE_W: u32 = 1 + 2 * 3;
 /// A task button's width: `186px`.

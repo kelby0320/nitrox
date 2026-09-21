@@ -3753,10 +3753,13 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // 0b. **The greeter is centred on the screen this gate booted** (Phase 5 Part E). It centred
     //     on a written-down 1280×800 until then, which on the laptop put it 43 px left and 16 px
     //     low of centre. Its size is `desktop-session-mgr`'s `GREETER_W`×`GREETER_H`, written down
-    //     here a second time for the reason every chrome metric in this file is (M11 decision 2).
+    //     here a second time for the reason every chrome metric in this file is (M11 decision 2)
+    //     — and since the refresh's Part D the greeter's own height is *measured* by a host test
+    //     (`the_card_is_exactly_the_window_it_is_drawn_in`), so this copy drifting from it costs
+    //     a second on the host rather than a boot here.
     //     **Before the first redraw**, because the greeter reads the screen before it opens its
     //     window, and `expect` consumes what it scans past.
-    const GREETER: (u32, u32) = (420, 200);
+    const GREETER: (u32, u32) = (340, 141);
     session.expect(&format!(
         "desktop-session-mgr: greeter centred at {},{} on a {} screen",
         (size.w - GREETER.0) / 2,
@@ -10562,6 +10565,19 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("desktop-shell")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    // `desktop-session-mgr`'s greeter — its state, the keys it acts on itself, and the window it
+    // draws, all of which are functions of values (desktop refresh, Part D). **The size this file
+    // writes down as `GREETER` is measured there**, so the gate's copy and the greeter's own
+    // cannot drift without a host test failing first.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("desktop-session-mgr")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

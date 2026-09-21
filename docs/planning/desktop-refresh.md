@@ -55,9 +55,11 @@ The design makes this easy, because it contains its own theme file: the mock edi
 **This rule is about colour and stops there** (corrected after review; the first draft said "no
 colour, radius or metric", which reverses a recorded decision without naming it). M11 decision 2
 is that **chrome metrics are not themeable**, and `xtask` copies `BAR_H`, `INDICATOR_W`,
-`ENTRY_W`, `TITLE_BAR_H` and the greeter's `420×200` with a comment on each saying why: *"a gate
+`ENTRY_W`, `TITLE_BAR_H` and the greeter's size with a comment on each saying why: *"a gate
 that read the shell's layout to know where to aim could agree with a shell that had stopped
-drawing where it says"*.
+drawing where it says"*. **A copy is not an excuse for an unmeasured number**: the greeter's
+`340×141` was `420×200`, and since Part D its height is what the card measures in a host test —
+the gate keeps its own copy, and the two drift only if something fails on the host first.
 
 That is the same anti-tautology argument, reaching the opposite conclusion — because a *colour* is
 compared against a computed render, while a *metric* is where a gate aims a click. A gate that
@@ -346,11 +348,47 @@ for a different reason.
 
 ## Part D — the greeter
 
-- [ ] **The greeter matches**, which the design does not cover because it was never drawn. It is
-      `desktop-session-mgr`'s own window, and `check-login` asserts its size and where it centres
-      — so those numbers move with the restyle and the gate moves with them. Named because a gate
-      whose expectation changes in the same commit as the code is the shape that needs a reason
-      in the message.
+**The design never drew one**, so this part reads the design's *language* off the surfaces it did
+draw — the card, the field, the dim second line — rather than transcribing a picture. The greeter
+is `desktop-session-mgr`'s own window, and `check-login` asserts its size and where it centres, so
+those numbers move with the restyle and the gate moves with them. Named because a gate whose
+expectation changes in the same commit as the code is the shape that needs a reason in the message.
+
+- [x] **D.1 — a library beside the binary.** `desktop-session-mgr` is the last of the six to be
+      one file: `init`, `service-mgr`, `nxterm`, `nxfiles`, `nxedit` and `desktop-shell` all keep
+      their pure half in a lib so the host can test it. The greeter's state, its key handling and
+      its view are pure and today are untested, and the size `check-login` writes down is a
+      literal nothing checks. A `#![cfg_attr(not(test), no_std)]` lib fixes both.
+      **Built.** `desktop-session-mgr` now has a lib beside its binary, holding `Greeter`, its
+      keys, `view` and `render`, plus `greeter_theme()` — one function, so the theme the binary
+      resolves a font from and the theme the view is painted with cannot differ. `cargo xtask
+      test` runs its tests.
+- [x] **D.2 — a field with an edge.** The design's field is a white ground inside a one-pixel
+      `border` rounded to the control radius. Ours is a flat fill of `track`, which is `--bg` in
+      the light scheme — so on the greeter's white card **an unfocused field is invisible**, and
+      that is what the refresh's own smaller type made plain. In `libui::widget::text_field`, so
+      every field follows: the chooser's, the browser's search and the shell's filter. This is
+      part of what Part H lists as "field, icon-button and accent-pill styles"; H keeps the rest.
+      **Built.** A resting field is the design's: the well inside a one-pixel `border`, rounded to
+      `CONTROL_RADIUS` — public now, and the shell's bar dropped its own second copy of the 8.
+      Focus keeps its two-pixel accent ring, so a state still reads as a state.
+      `a_resting_field_has_an_edge_against_the_ground_it_sits_on` fails against the flat fill it
+      replaced.
+- [x] **D.3 — the card.** A bold title, labels in `foreground_dim`, a refusal in `deny` rather
+      than in body ink, the rhythm of spacing the design uses, and the one-pixel rounded edge
+      every other surface in this system now has. **The copy does not change**: what a greeter
+      should say is not a question this part is answering.
+      **Built.** The card is `popup_frame` — the same edge and curve as a menu — with the heading
+      bold a step up, labels in `foreground_dim`, and a refusal in `deny`. **The refusal's line is
+      always there and empty until there is one**: pushed in when it happened, it moved both
+      fields down the card as it appeared and back on the next keystroke.
+- [x] **D.4 — the gate follows, and a host test goes first.** The card is sized to its content,
+      so `GREETER_W`×`GREETER_H` moves and `check-login`'s copy of it moves too. D.1's lib is what
+      makes that safe: the size is measured in a host test, so the two numbers cannot drift
+      without something failing on the host first.
+      **Built.** 420×200 became **340×141**, and the height is measured:
+      `the_card_is_exactly_the_window_it_is_drawn_in` pins it, and asserts a refusal does not
+      change it. `check-login` types and never clicks the greeter, so no aim moved with it.
 
 ## Part E — the overview
 

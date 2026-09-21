@@ -24,6 +24,13 @@ libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }
 libinput = { path = "../libinput" }
 
+# The pure half — the greeter's state, its key handling and the window it draws — so the host
+# can test it. Same split as `init`, `service-mgr`, `nxterm`, `nxfiles`, `nxedit` and
+# `desktop-shell` (desktop refresh, Part D).
+[lib]
+name = "desktop_session_mgr"
+path = "src/lib.rs"
+
 [[bin]]
 name = "desktop-session-mgr"
 path = "src/main.rs"
