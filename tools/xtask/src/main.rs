@@ -119,6 +119,12 @@ mod chrome {
     pub const CONTENT_X: i32 = 1;
     /// A tab strip's height (`libui::widget::TAB_STRIP_H`) — 30 since the refresh's Part H, where
     /// it was 24 and a tab filled it.
+    ///
+    /// **Kept though no aim reads it today**: the browser stopped drawing a strip for a single
+    /// tab in Part I, and the two aims that counted one are the reason that part's CI run
+    /// failed. It stays because `the_gates_chrome_table_is_the_toolkits` compares it, so the
+    /// next aim that needs a strip's height starts from a number something checks.
+    #[allow(dead_code)]
     pub const TAB_STRIP_H: i32 = 30;
     /// One tab's height inside that strip (`TAB_H`), and [`TAB_TOP`] the strip's padding above it.
     pub const TAB_H: i32 = 24;
@@ -5452,15 +5458,24 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // click would work and the window would not move, but the gate would be asserting against a
     // gesture it did not mean to make. The path text carries no handler and still raises the
     // window, because click-to-focus is the compositor's and not the toolkit's.
-    // **On the path strip**, which is now three strips down: a title bar, the menus, and the
-    // tabs. `fy + 38` used to be the path and is the *menu bar* since M12 Parts B and D — it
-    // still raised the window, because click-to-focus is the compositor's and the bar's own
-    // background carries no handler, so this went on passing while meaning something else.
+    // **On the path strip**, which is two strips down: a title bar and the menus. It was three
+    // until the refresh's Part I, when the browser stopped drawing a tab strip for a single tab
+    // — and an aim that still counted one landed on the *sidebar's* first place, so the "inert"
+    // click navigated to `/home` and the `Backspace` after it went up to `/`. **This gate passed
+    // locally anyway**, because that Backspace was lost on the way; CI's landed, and the step
+    // walked into the wrong directory. `fy + 38` used to be the path and is the *menu bar* since
+    // M12 Parts B and D — it still raised the window, because click-to-focus is the compositor's
+    // and the bar's own background carries no handler, so this went on passing while meaning
+    // something else. The same shape of mistake twice, which is why the sum lives in `browser`.
+    // **And clear of the sidebar**, which is what turned a slip into a navigation: over the
+    // places, a press one strip out goes somewhere; over the listing, the worst a slip can do is
+    // select a row, because descending takes a second click. An inert click should be inert
+    // under a mistake as well as under a correct sum.
     click_at(
         &mut qmp,
         &mut session,
-        fx + 120,
-        fy + 1 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H / 2,
+        fx + SIDEBAR_W + 60,
+        fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2,
     )?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
@@ -5500,10 +5515,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: and hid it again, leaving the directory as the rest of this gate expects");
 
     // Row 1 is `other.txt`: the listing sorts directories first and then by name, and `notes`
-    // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
-    // and the path strip — plus half a row.
-    let row1 =
-        (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
+    // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar,
+    // the menus, the path strip and the column header — plus a row and a half. **No tab strip**,
+    // which the browser leaves out for a single tab (desktop refresh, Part I), and **a header**,
+    // which it gained in the same part.
+    let row1 = (
+        fx + SIDEBAR_W + 120,
+        fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + browser::HEADER_H + ROW_H + ROW_H / 2,
+    );
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
