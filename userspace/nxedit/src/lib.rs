@@ -39,8 +39,8 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, padding, row, sized, text,
-    with_spacing,
+    Edge, Element, Insets, TextSize, center_v, column, dock, docked, padding, row, scaled, sized,
+    text, with_spacing,
 };
 use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
@@ -2171,9 +2171,10 @@ impl App {
                 )
                 .key(STATUS_KEY)
                 .flex(1),
+                // A step below the body (Part G): the design's status text is metadata.
                 None => padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    text(self.status.clone()),
+                    center_v(scaled(TextSize::Small, text(self.status.clone()))),
                 )
                 .key(STATUS_KEY)
                 .flex(1),
@@ -2188,7 +2189,7 @@ impl App {
             // counts from zero and the conversion belongs at the one place it is displayed.
             padding(
                 Insets { top: 4, right: 8, bottom: 4, left: 4 },
-                text(self.position_text()),
+                center_v(scaled(TextSize::Small, text(self.position_text()))),
             )
             .key(POSITION_KEY),
         ]);

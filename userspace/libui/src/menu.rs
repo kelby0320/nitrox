@@ -30,7 +30,8 @@ use libdraw::format::Rgb;
 use libdraw::geom::{Rect, Size};
 
 use crate::element::{
-    Element, Insets, center_v, column, fill, ink, padding, rounded_fill, row, sized, stack, text, wash,
+    Element, Insets, TextSize, center_v, column, fill, ink, padding, rounded_fill, row, scaled,
+    sized, stack, text, wash,
 };
 use crate::widget::{Theme, menu_bar, menu_item, popup_frame};
 
@@ -541,7 +542,12 @@ fn rows<Msg: Clone>(
                         lead,
                         text(label.as_ref()),
                         text("").flex(1),
-                        padding(ACCEL_PAD, ink(theme.foreground_dim, text(r))),
+                        // Small as well as dim (Part G): the design sets its hints a step below
+                        // the row, and centring it down the row keeps it on the label's line.
+                        padding(
+                            ACCEL_PAD,
+                            center_v(scaled(TextSize::Small, ink(theme.foreground_dim, text(r)))),
+                        ),
                     ]),
                     None => row(alloc::vec![lead, text(label.as_ref()), text("").flex(1)]),
                 };

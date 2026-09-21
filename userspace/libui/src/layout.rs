@@ -19,15 +19,25 @@ use alloc::vec::Vec;
 
 use libdraw::geom::{Point, Rect, Size};
 
-use crate::element::{Edge, Element, Node};
+use crate::element::{Edge, Element, Node, TextStyle};
 
 /// How big a run of text is.
 ///
 /// A trait rather than a font because `libdraw` has no glyphs until Milestone 5 Part A, and
 /// because a terminal, a menu and a status line may not measure the same way forever.
 pub trait Metrics {
-    /// The size `s` occupies when drawn.
+    /// The size `s` occupies when drawn at the body size.
     fn text_size(&self, s: &str) -> Size;
+
+    /// The size `s` occupies when set in `style` — a step on the scale ([`TextSize`]) and a
+    /// weight.
+    ///
+    /// **Defaulted to the body size**, which is right for a metric with one cell and no scale —
+    /// [`FixedCell`], the structural tests' — and wrong for a real face, which overrides it.
+    fn text_size_as(&self, s: &str, style: TextStyle) -> Size {
+        let _ = style;
+        self.text_size(s)
+    }
 }
 
 /// A fixed-cell metric: every character the same box.
@@ -111,8 +121,21 @@ impl Layout {
 
 /// The size `e` wants, within `c`.
 pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M) -> Size {
+    measure_in(e, c, m, TextStyle::default())
+}
+
+/// [`measure`], in the text style the enclosing [`Node::Scale`] and [`Node::Bold`] set.
+fn measure_in<M: Metrics + ?Sized, Msg>(
+    e: &Element<Msg>,
+    c: Constraints,
+    m: &M,
+    at: TextStyle,
+) -> Size {
     let size = match &e.node {
-        Node::Text(s) => m.text_size(s),
+        Node::Text(s) => m.text_size_as(s, at),
+        // Scale and bold change no geometry of their own: their child measures in the new style.
+        Node::Scale { size, child } => measure_in(child, c, m, TextStyle { size: *size, ..at }),
+        Node::Bold { child } => measure_in(child, c, m, TextStyle { bold: true, ..at }),
         // A colour has no natural size, and a caller wanting a particular one wraps it in
         // `sized` or gives it `flex`.
         //
@@ -138,7 +161,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         // the *parent* sees is the child's size plus the shift, so a `Stack` that sized itself
         // to its layers would still contain the popup.
         Node::Offset { dx, dy, child } => {
-            let inner = measure(child, c, m);
+            let inner = measure_in(child, c, m, at);
             Size::new(
                 inner.w.saturating_add((*dx).max(0) as u32),
                 inner.h.saturating_add((*dy).max(0) as u32),
@@ -146,19 +169,19 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         }
         Node::Sized { size, child } => {
             // Zero means unconstrained, so the child's own measure stands on that axis.
-            let inner = measure(child, c, m);
+            let inner = measure_in(child, c, m, at);
             Size::new(
                 if size.w == 0 { inner.w } else { size.w },
                 if size.h == 0 { inner.h } else { size.h },
             )
         }
         // Ink changes no geometry, so it measures as its child does.
-        Node::Ink { child, .. } => measure(child, c, m),
+        Node::Ink { child, .. } => measure_in(child, c, m, at),
         // **A centred child asks for what it needs**, which is what makes `center` composable:
         // a button's face is sized by the caller, and the label inside it takes its own width.
-        Node::Center { child, .. } => measure(child, c, m),
+        Node::Center { child, .. } => measure_in(child, c, m, at),
         Node::Padding { insets, child } => {
-            let inner = measure(child, c.shrink(insets.horizontal(), insets.vertical()), m);
+            let inner = measure_in(child, c.shrink(insets.horizontal(), insets.vertical()), m, at);
             Size::new(
                 inner.w.saturating_add(insets.horizontal()),
                 inner.h.saturating_add(insets.vertical()),
@@ -169,7 +192,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
             let mut w = 0;
             let mut h = gaps;
             for ch in children {
-                let s = measure(ch, c.shrink(0, h.min(c.max.h)), m);
+                let s = measure_in(ch, c.shrink(0, h.min(c.max.h)), m, at);
                 w = w.max(s.w);
                 h = h.saturating_add(s.h);
             }
@@ -180,7 +203,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
             let mut w = gaps;
             let mut h = 0;
             for ch in children {
-                let s = measure(ch, c.shrink(w.min(c.max.w), 0), m);
+                let s = measure_in(ch, c.shrink(w.min(c.max.w), 0), m, at);
                 w = w.saturating_add(s.w);
                 h = h.max(s.h);
             }
@@ -190,7 +213,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
             // The union: an overlay is as big as its largest layer.
             let mut size = Size::new(0, 0);
             for ch in children {
-                let s = measure(ch, c, m);
+                let s = measure_in(ch, c, m, at);
                 size = Size::new(size.w.max(s.w), size.h.max(s.h));
             }
             size
@@ -204,6 +227,16 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
 
 /// Place `e` at `rect` and everything inside it.
 pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) -> Layout {
+    arrange_in(e, rect, m, TextStyle::default())
+}
+
+/// [`arrange`], in the text style the enclosing [`Node::Scale`] and [`Node::Bold`] set.
+fn arrange_in<M: Metrics + ?Sized, Msg>(
+    e: &Element<Msg>,
+    rect: Rect,
+    m: &M,
+    at: TextStyle,
+) -> Layout {
     // `Sized` and `Offset` are the two nodes that change their *own* rectangle rather than
     // only their children's. They have to: hit-testing and damage both read a node's rect, so
     // constraining only the child would leave a 12-pixel scrollbar claiming the whole overlay
@@ -221,7 +254,7 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
             // The child takes the size it *measures*, not the space it is offered — that is
             // what distinguishes this from `Padding`, which shrinks a child into the
             // remainder. A popup is as big as its contents wherever it lands.
-            let want = measure(child, Constraints::loose(rect.size), m);
+            let want = measure_in(child, Constraints::loose(rect.size), m, at);
             let placed = Rect::new(
                 rect.origin.x.saturating_add(*dx),
                 rect.origin.y.saturating_add(*dy),
@@ -260,54 +293,61 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
                 rect.size.w.saturating_sub(insets.horizontal()),
                 rect.size.h.saturating_sub(insets.vertical()),
             );
-            alloc::vec![arrange(child, inner, m)]
+            alloc::vec![arrange_in(child, inner, m, at)]
         }
 
         // `rect` is already the constrained one, computed above.
-        Node::Sized { child, .. } => alloc::vec![arrange(child, rect, m)],
+        Node::Sized { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
         // The child takes the whole rect: an ink wrapper is transparent to layout.
-        Node::Ink { child, .. } => alloc::vec![arrange(child, rect, m)],
+        Node::Ink { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
+        // So is a scale, except that everything inside it is text of a different size.
+        Node::Scale { size, child } => {
+            alloc::vec![arrange_in(child, rect, m, TextStyle { size: *size, ..at })]
+        }
+        Node::Bold { child } => {
+            alloc::vec![arrange_in(child, rect, m, TextStyle { bold: true, ..at })]
+        }
         // **The child at its measured size, placed in the middle** — the one wrapper that moves
         // its child rather than merely passing the rectangle through. Rounding leaves the extra
         // pixel on the right and the bottom, which is what every layout engine does and what
         // keeps a one-pixel-narrow label from drifting left of centre.
         Node::Center { across, child } => {
-            let want = measure(child, Constraints::loose(rect.size), m);
+            let want = measure_in(child, Constraints::loose(rect.size), m, at);
             let x = match across {
                 true => rect.origin.x + (rect.size.w.saturating_sub(want.w) / 2) as i32,
                 false => rect.origin.x,
             };
             let y = rect.origin.y + (rect.size.h.saturating_sub(want.h) / 2) as i32;
             let placed = Rect::new(x, y, want.w.min(rect.size.w), want.h.min(rect.size.h));
-            alloc::vec![arrange(child, placed, m)]
+            alloc::vec![arrange_in(child, placed, m, at)]
         }
 
         // `rect` is already the offset one, computed above.
-        Node::Offset { child, .. } => alloc::vec![arrange(child, rect, m)],
+        Node::Offset { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
 
         Node::Stack(children) => {
             // Every layer gets the whole area. Overlays that want to be smaller wrap
             // themselves in a `Sized` or a `Padding`, which keeps this node one rule.
-            children.iter().map(|ch| arrange(ch, rect, m)).collect()
+            children.iter().map(|ch| arrange_in(ch, rect, m, at)).collect()
         }
 
         Node::Column { spacing, children } => {
-            arrange_linear(children, *spacing, rect, m, Axis::Vertical)
+            arrange_linear(children, *spacing, rect, m, Axis::Vertical, at)
         }
         Node::Row { spacing, children } => {
-            arrange_linear(children, *spacing, rect, m, Axis::Horizontal)
+            arrange_linear(children, *spacing, rect, m, Axis::Horizontal, at)
         }
 
         Node::Dock { edges, fill } => {
             let mut remaining = rect;
             let mut out = Vec::with_capacity(edges.len() + 1);
             for d in edges {
-                let want = measure(&d.element, Constraints::loose(remaining.size), m);
+                let want = measure_in(&d.element, Constraints::loose(remaining.size), m, at);
                 let (slot, rest) = split(remaining, d.edge, want);
-                out.push(arrange(&d.element, slot, m));
+                out.push(arrange_in(&d.element, slot, m, at));
                 remaining = rest;
             }
-            out.push(arrange(fill, remaining, m));
+            out.push(arrange_in(fill, remaining, m, at));
             out
         }
     };
@@ -335,6 +375,7 @@ fn arrange_linear<M: Metrics + ?Sized, Msg>(
     rect: Rect,
     m: &M,
     axis: Axis,
+    at: TextStyle,
 ) -> Vec<Layout> {
     let extent = |s: Size| if axis == Axis::Horizontal { s.w } else { s.h };
     let gaps = spacing.saturating_mul(children.len().saturating_sub(1) as u32);
@@ -350,7 +391,7 @@ fn arrange_linear<M: Metrics + ?Sized, Msg>(
                 Axis::Horizontal => Constraints::loose(Size::new(avail, rect.size.h)),
                 Axis::Vertical => Constraints::loose(Size::new(rect.size.w, avail)),
             };
-            let s = extent(measure(ch, c, m));
+            let s = extent(measure_in(ch, c, m, at));
             used = used.saturating_add(s);
             sizes.push(s);
         } else {
@@ -390,7 +431,7 @@ fn arrange_linear<M: Metrics + ?Sized, Msg>(
             Axis::Horizontal => Rect::new(cursor, rect.origin.y, s, rect.size.h),
             Axis::Vertical => Rect::new(rect.origin.x, cursor, rect.size.w, s),
         };
-        out.push(arrange(ch, slot, m));
+        out.push(arrange_in(ch, slot, m, at));
         cursor = cursor.saturating_add(s as i32).saturating_add(spacing as i32);
     }
     out

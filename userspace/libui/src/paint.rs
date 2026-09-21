@@ -26,7 +26,7 @@ use libdraw::framebuffer::Framebuffer;
 use libdraw::geom::{Point, Rect};
 use libdraw::text::Font;
 
-use crate::element::{Element, IconKind, Node};
+use crate::element::{Element, IconKind, Node, TextStyle};
 use crate::layout::{Layout, Metrics};
 
 /// The theme everything is drawn from — **`libdraw`'s, since M11 Part B**.
@@ -62,6 +62,11 @@ impl Metrics for FontMetrics<'_> {
     fn text_size(&self, s: &str) -> libdraw::geom::Size {
         self.font.measure(s, self.px)
     }
+
+    fn text_size_as(&self, s: &str, style: TextStyle) -> libdraw::geom::Size {
+        let face = if style.bold { self.font.bold() } else { self.font };
+        face.measure(s, style.size.px(self.px))
+    }
 }
 
 /// Draw `element` into `fb`, repainting only what `damage` covers.
@@ -88,7 +93,7 @@ pub fn paint<F, Msg, C>(
     // recomputes the geometry and the offset per pixel, and `paint` clears the whole damage
     // rectangle on every frame (PR #185 review, finding 6).
     fb.fill_rect(damage, theme.background);
-    draw(fb, font, theme, element, layout, damage, theme.foreground, custom);
+    draw(fb, font, theme, element, layout, damage, theme.foreground, TextStyle::default(), custom);
 }
 
 /// [`paint`], **without clearing to the theme's ground first**.
@@ -113,7 +118,7 @@ pub fn paint_over<F, Msg, C>(
     F: Framebuffer + ?Sized,
     C: FnMut(u32, Rect, Rect, &mut F),
 {
-    draw(fb, font, theme, element, layout, damage, theme.foreground, custom);
+    draw(fb, font, theme, element, layout, damage, theme.foreground, TextStyle::default(), custom);
 }
 
 /// Draw a window control inside `rect`, clipped to `clip`.
@@ -178,6 +183,7 @@ fn draw<F, Msg, C>(
     l: &Layout,
     damage: Rect,
     ink: Rgb,
+    at: TextStyle,
     custom: &mut C,
 ) where
     F: Framebuffer + ?Sized,
@@ -196,16 +202,13 @@ fn draw<F, Msg, C>(
             // Positioned by the baseline, which is `ascent` below the box's top: a font's
             // metrics are expressed against the baseline and two runs of different heights
             // line up on it, not on their tops.
-            let v = font.v_metrics(theme.font_px);
+            // At the step the enclosing `Scale` set — the size layout measured this run at, which
+            // is what keeps the glyphs inside the box they were given.
+            let px = at.size.px(theme.font_px);
+            let face = if at.bold { font.bold() } else { font };
+            let v = face.v_metrics(px);
             let baseline = l.rect.origin.y + libm::ceilf(v.ascent) as i32;
-            font.draw_str(
-                fb,
-                Point::new(l.rect.origin.x, baseline),
-                s,
-                theme.font_px,
-                ink,
-                clip,
-            );
+            face.draw_str(fb, Point::new(l.rect.origin.x, baseline), s, px, ink, clip);
         }
         Node::Fill(colour) => fb.fill_rect(clip, *colour),
         // **The node's own rect, not the clip.** The ramp is a property of the shape being
@@ -223,7 +226,20 @@ fn draw<F, Msg, C>(
         // container arm below paints it at the rectangle `arrange` gave it.
         Node::Ink { colour, child } => {
             if let Some(cl) = l.children.first() {
-                draw(fb, font, theme, child, cl, damage, *colour, custom);
+                draw(fb, font, theme, child, cl, damage, *colour, at, custom);
+            }
+        }
+        // The same shape as `Ink`: the step is threaded to the text inside, not drawn.
+        Node::Scale { size, child } => {
+            if let Some(cl) = l.children.first() {
+                let at = TextStyle { size: *size, ..at };
+                draw(fb, font, theme, child, cl, damage, ink, at, custom);
+            }
+        }
+        Node::Bold { child } => {
+            if let Some(cl) = l.children.first() {
+                let at = TextStyle { bold: true, ..at };
+                draw(fb, font, theme, child, cl, damage, ink, at, custom);
             }
         }
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
@@ -233,7 +249,7 @@ fn draw<F, Msg, C>(
         // can click.
         _ => {
             for (ce, cl) in e.children().zip(l.children.iter()) {
-                draw(fb, font, theme, ce, cl, damage, ink, custom);
+                draw(fb, font, theme, ce, cl, damage, ink, at, custom);
             }
         }
     }
@@ -306,6 +322,117 @@ mod tests {
 
     fn fb_has_ink(b: &MemFramebuffer, t: &Theme, x: u32, y: u32) -> bool {
         b.get_pixel(x, y) != Some(t.background)
+    }
+
+    /// Text inside a `Scale` measures and draws at its step, and nesting is innermost-wins
+    /// (desktop refresh, Part G). The ink is measured, not assumed: what `draw_str` put down must
+    /// fit in the box layout gave the run, which is what breaks if paint and layout disagree about
+    /// the size.
+    #[test]
+    fn scaled_text_measures_and_draws_at_its_step() {
+        use crate::element::{TextSize, scaled};
+        let (f, t) = (font(), Theme::default());
+        let m = FontMetrics::new(&f, t.font_px);
+        // What the element asks for: a column arranges its children across its whole width, so
+        // a laid-out rectangle would compare the column's width rather than the text's.
+        let at = |e: &Element<Msg>| {
+            crate::layout::measure(e, crate::layout::Constraints::loose(Size::new(W, H)), &m)
+        };
+        let body = at(&column(vec![text("Hello")]));
+        let small = at(&column(vec![scaled(TextSize::Small, text("Hello"))]));
+        let large = at(&column(vec![scaled(TextSize::Large, text("Hello"))]));
+        assert!(small.w < body.w && small.h < body.h, "small {small:?} against body {body:?}");
+        assert!(large.w > body.w && large.h > body.h, "large {large:?} against body {body:?}");
+        assert_eq!(small, f.measure("Hello", TextSize::Small.px(t.font_px)));
+        // Innermost wins: a Small inside a Large is small.
+        let inner = scaled(TextSize::Small, text("Hello"));
+        let nested = at(&column(vec![scaled(TextSize::Large, inner)]));
+        assert_eq!(nested, small);
+
+        // **What is drawn is drawn at the step**, read off the ink. In a box far wider than the
+        // text, so the paint's clip cannot be what limits it: the first version of this checked
+        // that the ink stayed inside its box, which a clip guarantees whatever size the glyphs are
+        // drawn at, and a paint that ignored the step passed it.
+        let mut widths = Vec::new();
+        for step in [TextSize::Small, TextSize::Body, TextSize::Large] {
+            let e: Element<Msg> = sized(Size::new(W, 40), scaled(step, text("Hello")));
+            let mut b = fb();
+            b.clear(t.background);
+            go(&mut b, &f, &t, &e, Rect::new(0, 0, W, H));
+            let (mut left, mut right) = (u32::MAX, 0);
+            for y in 0..H {
+                for x in 0..W {
+                    if fb_has_ink(&b, &t, x, y) {
+                        left = left.min(x);
+                        right = right.max(x);
+                    }
+                }
+            }
+            widths.push(right + 1 - left);
+        }
+        // Ordered, and in proportion. Ink excludes a run's side bearings, so it is compared with
+        // ink rather than with a measured advance, which it undershoots by a few pixels.
+        let ordered = widths[0] < widths[1] && widths[1] < widths[2];
+        assert!(ordered, "the steps draw at one size: {widths:?}");
+        let ratio = widths[0] as f32 / widths[1] as f32;
+        let want = TextSize::SMALL;
+        assert!((ratio - want).abs() < 0.08, "small is {ratio} of body, not {want}");
+    }
+
+    /// Bold text is set in the face's bold companion — wider, and heavier on the page — and in the
+    /// regular face when there is none (desktop refresh, Part G).
+    #[test]
+    fn bold_text_uses_the_companion_face_and_falls_back_without_one() {
+        use crate::element::bold;
+        const BOLD: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans-Bold.ttf");
+        let t = Theme::default();
+        let plain = font();
+        let paired = font().with_bold(Font::from_bytes(BOLD.to_vec()).expect("the bold face"));
+        // Measured bare, so the width is the text's; drawn in a box wide enough not to clip it.
+        let words = || -> Element<Msg> { text("Files") };
+        let measured = |f: &Font, e: &Element<Msg>| {
+            let loose = crate::layout::Constraints::loose(Size::new(W, H));
+            crate::layout::measure(e, loose, &FontMetrics::new(f, t.font_px)).w
+        };
+        let inked = |f: &Font, e: Element<Msg>| {
+            let mut b = fb();
+            b.clear(t.background);
+            go(&mut b, f, &t, &sized(Size::new(W, 40), e), Rect::new(0, 0, W, H));
+            ink(&b, &t)
+        };
+        // With a companion: wider, and more ink.
+        let (heavy, regular) = (measured(&paired, &bold(words())), measured(&paired, &words()));
+        assert!(heavy > regular, "bold measures wider");
+        assert!(inked(&paired, bold(words())) > inked(&paired, words()), "bold puts down more ink");
+        // Without one: exactly the regular weight, measured and drawn.
+        assert_eq!(measured(&plain, &bold(words())), measured(&plain, &words()));
+        assert_eq!(inked(&plain, bold(words())), inked(&plain, words()));
+    }
+
+    /// A change of step or weight alone repaints: the text is the same and, inside a fixed box, so
+    /// is every rectangle — only the fingerprint can say the picture changed.
+    #[test]
+    fn a_change_of_step_or_weight_alone_repaints() {
+        use crate::diff::Tree;
+        use crate::element::{TextSize, scaled};
+        let (f, t) = (font(), Theme::default());
+        let m = FontMetrics::new(&f, t.font_px);
+        let view = |step| -> Element<Msg> {
+            sized(Size::new(120, 30), scaled(step, text("status")))
+        };
+        let mut tree = Tree::new();
+        let a = view(TextSize::Body);
+        let _ = tree.update(&a, &layout(&a, Rect::new(0, 0, W, H), &m));
+        let b = view(TextSize::Small);
+        let damage = tree.update(&b, &layout(&b, Rect::new(0, 0, W, H), &m)).expect("diffs");
+        assert!(damage.is_some(), "a smaller status line must be redrawn");
+        // And a change of weight alone: the same shape of tree, one node setting the body step and
+        // then the bold weight, so nothing but the fingerprint of that node differs.
+        let c = view(TextSize::Body);
+        let _ = tree.update(&c, &layout(&c, Rect::new(0, 0, W, H), &m));
+        let d: Element<Msg> = sized(Size::new(120, 30), crate::element::bold(text("status")));
+        let damage = tree.update(&d, &layout(&d, Rect::new(0, 0, W, H), &m)).expect("diffs");
+        assert!(damage.is_some(), "a bold status line must be redrawn");
     }
 
     /// A rounded fill is rounded at its **own** corners — not at a partial repaint's.

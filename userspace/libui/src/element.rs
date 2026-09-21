@@ -107,6 +107,53 @@ pub enum IconKind {
     Close,
 }
 
+/// A step on the text-size scale, relative to the theme's one `font_px` (desktop refresh,
+/// Part G).
+///
+/// **One number in the theme, three sizes on the screen.** The design sets its top bar at 12.5 px,
+/// its rows at 11.5 and its status bars and hints at 10.5 — a hierarchy carried by size, since it
+/// has no other way to say "read this second". A theme still sets one value; the steps between
+/// the sizes are the toolkit's, so a person who makes the body bigger makes everything bigger in
+/// proportion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TextSize {
+    /// Metadata read second: a status bar, a column header, a chord or a path beside a menu row.
+    Small,
+    /// Everything else — `font_px` itself.
+    #[default]
+    Body,
+    /// The one line that heads a surface: the top bar's words.
+    Large,
+}
+
+impl TextSize {
+    /// How much smaller [`Small`](Self::Small) is than the body: 10.5 at the staged 12, the
+    /// design's own step from its 11.5.
+    pub const SMALL: f32 = 0.875;
+    /// How much larger [`Large`](Self::Large) is: 13 at the staged 12, the design's step from
+    /// 11.5 to its top bar's 12.5.
+    pub const LARGE: f32 = 13.0 / 12.0;
+
+    /// This step's size in pixels, for a body size of `body`.
+    pub fn px(self, body: f32) -> f32 {
+        match self {
+            TextSize::Small => body * Self::SMALL,
+            TextSize::Body => body,
+            TextSize::Large => body * Self::LARGE,
+        }
+    }
+}
+
+/// How a run of text is set: its step on the size scale, and whether it is bold — what
+/// [`Node::Scale`] and [`Node::Bold`] set for everything inside them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TextStyle {
+    /// The step on the size scale.
+    pub size: TextSize,
+    /// Drawn in the face's bold companion, if it has one — `libdraw::text::Font::bold`.
+    pub bold: bool,
+}
+
 /// What an element *is*.
 ///
 /// Deliberately short. `docs/architecture/widget-toolkit.md` §1's rule is that anything Milestone
@@ -208,6 +255,28 @@ pub enum Node<Msg> {
     Ink {
         /// The colour text and icons inside are drawn in.
         colour: Rgb,
+        /// The child.
+        child: Box<Element<Msg>>,
+    },
+    /// A child whose text is drawn at another step of the size scale — see [`TextSize`].
+    ///
+    /// **A wrapper rather than a size on [`Text`](Self::Text)**, for [`Ink`](Self::Ink)'s reason: a
+    /// status bar or a column of hints is several nodes that share a size, and the alternative is
+    /// every leaf carrying one its parent has to remember to set. Layout and paint thread the step
+    /// down the subtree; nesting is innermost-wins. Unlike `Ink` it *does* change geometry — text
+    /// inside measures at its own size — but nothing else.
+    Scale {
+        /// The step everything inside is set at.
+        size: TextSize,
+        /// The child.
+        child: Box<Element<Msg>>,
+    },
+    /// A child whose text is bold — a window's title (desktop refresh, Part G).
+    ///
+    /// A wrapper for [`Scale`](Self::Scale)'s reason, and threaded the same way. Text inside
+    /// measures in the bold face, which is wider, so this changes geometry exactly as a size
+    /// does. A face with no bold companion draws it in its regular weight.
+    Bold {
         /// The child.
         child: Box<Element<Msg>>,
     },
@@ -508,6 +577,8 @@ impl<Msg> Element<Msg> {
             | Node::Sized { child, .. }
             | Node::Offset { child, .. }
             | Node::Ink { child, .. }
+            | Node::Scale { child, .. }
+            | Node::Bold { child }
             | Node::Center { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
@@ -593,6 +664,21 @@ pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
 /// drawn centred in whatever box it lands in.
 pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
     Element::new(Node::Icon(kind))
+}
+
+/// Text at another step of the size scale — see [`Node::Scale`].
+pub fn scaled<Msg>(size: TextSize, child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Scale {
+        size,
+        child: Box::new(child),
+    })
+}
+
+/// Bold text — see [`Node::Bold`].
+pub fn bold<Msg>(child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Bold {
+        child: Box::new(child),
+    })
 }
 
 /// A child in the middle of its parent's rectangle — see [`Node::Center`].

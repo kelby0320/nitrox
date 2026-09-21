@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -283,6 +283,20 @@ the innermost winning. Before it, every glyph in this toolkit was `theme.foregro
 is *inherited*: a coloured run is usually several nodes — a highlighted keyword under a selection
 is a `stack` of a fill and a text — and the alternative is every leaf carrying a colour its parent
 has to remember to set.
+
+**And `scaled` and `bold`, which change the text's size and weight the same way** (desktop
+refresh, Part G). The theme carries one size, `font_px`, and text is set at one of three steps
+derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12. Those are
+the design's proportions around its 11.5-pixel body: its status bar and secondary columns are
+10 to 10.5 pixels, and its top bar 12.5. `bold` sets text in the
+face's bold companion, `libdraw::text::Font::bold`, which `load_ui` attaches only to the built-in
+face; a face with no companion draws "bold" at its regular weight. Both are inherited like `ink`,
+with the innermost winning. **Unlike `ink`, both change geometry**, because they change what the
+text inside measures. So `measure` and `arrange` carry a `TextStyle` down the tree beside the
+constraints, and `Metrics::text_size_as` answers in it. Each is a distinct `Fingerprint`, so
+changing a step or a weight alone repaints even where every rectangle stays put. Three steps
+rather than a free size, because a second number in the tree would be a second theme: the steps
+move together when a person changes `font_px`, and a hard-coded 14 would not.
 
 **Not a CSS box model.** Margins-collapsing, floats, and inline flow are an enormous surface
 for a system whose first application is a rectangle with a bar on top.

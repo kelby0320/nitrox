@@ -79,6 +79,11 @@ pub enum Fingerprint {
     Offset,
     /// [`Node::Ink`], with its colour — a recolour repaints, like a fill's.
     Ink(libdraw::format::Rgb),
+    /// [`Node::Scale`], with its step — text redrawn at another size repaints even where the
+    /// rectangle happens not to move.
+    Scale(crate::element::TextSize),
+    /// [`Node::Bold`] — a different face repaints, like a different size.
+    Bold,
     /// [`Node::Center`]. Like `Offset`, it carries nothing — not even which axes it centres
     /// on: what it changes is a rect, and a rect change is already what `reconcile` damages on.
     Center,
@@ -108,6 +113,8 @@ impl Fingerprint {
             // ink change moves nothing, so a fingerprint without it would leave a recoloured
             // subtree undamaged and the old colour on screen.
             Node::Ink { colour, .. } => Fingerprint::Ink(*colour),
+            Node::Scale { size, .. } => Fingerprint::Scale(*size),
+            Node::Bold { .. } => Fingerprint::Bold,
             Node::Center { .. } => Fingerprint::Center,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }

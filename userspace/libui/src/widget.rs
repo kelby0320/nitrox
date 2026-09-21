@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, center, center_v, column, dock, docked, fill, icon,
-    ink, outline, padding, row, sized, stack, text, wash,
+    Edge, Element, IconKind, Insets, bevel, bold, center, center_v, column, dock, docked, fill,
+    icon, ink, outline, padding, row, sized, stack, text, wash,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -809,7 +809,13 @@ pub fn title_bar<Msg: Clone>(
         glyphs.push(btn(IconKind::Close, m));
     }
     let mut controls = alloc::vec::Vec::with_capacity(3);
-    controls.push(padding(TITLE_PAD, center_v(text(title))).flex(1));
+    // **Bold, at the body's size** (desktop refresh, Part G): the design heads a window with its
+    // title at the size of the text inside it and a heavier weight. DejaVu's bold is heavier than
+    // the design's semibold already, so a size step on top overshoots — measured on a screendump
+    // against the menu's "File", the title is 1.62× its width at the body size and 1.75× a step
+    // up, where the design's is 1.47×.
+    let title = bold(text(title));
+    controls.push(padding(TITLE_PAD, center_v(title)).flex(1));
     controls.push(ink(
         theme.foreground_dim,
         crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),

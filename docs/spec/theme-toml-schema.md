@@ -42,7 +42,7 @@ scheme = "light"
 # foreground = "#16201F"
 # foreground_dim = "#5B6766"
 …
-font_px = 14
+font_px = 12
 # bevel = 0
 …
 wallpaper = "/home/wallpaper.png"
@@ -88,7 +88,7 @@ once did, because it still showed the dark theme M11 Part E replaced (PR #265 re
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target | — |
 | `border` | `"#RRGGBB"` | The line around a window, a menu, or anything with an edge | `--line` |
 | `desktop` | `"#RRGGBB"` | The ground between windows | the `reef` wallpaper |
-| `font_px` | number, `6`–`16` | Text size in pixels per em, read to the nearest hundredth | |
+| `font_px` | number, `6`–`16` | The body text size in pixels per em, read to the nearest hundredth; `13` if absent | |
 | `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens | flat: `0` |
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional | |
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance | |
@@ -189,11 +189,17 @@ a size the two sides can disagree about, and the gate would blame the font. Roun
 
 **`font_px` shrinks and does not grow, and 16 is not an arbitrary ceiling.** Text measures
 exactly its em size, and the tightest fixed box in the system is a list row: 20 pixels with 2
-above and 2 below, leaving 16. The window bars are 24 with 4+4 of button padding, which lands on
-the same number. Larger text is clipped by the painter and overlapped by its neighbours, because
-**chrome metrics are not themeable** (M11's decision 2) — which is also why the gates can click a
-title bar at a fixed offset. Raising this means metrics that follow type, and that is the
-decision to revisit, not this number.
+above and 2 below, leaving 16. Larger text is clipped by the painter and overlapped by its
+neighbours, because **chrome metrics are not themeable** (M11's decision 2) — which is also why
+the gates can click a title bar at a fixed offset. Raising this means metrics that follow type,
+and that is the decision to revisit, not this number.
+
+**`font_px` is the body size, and the toolkit's two other steps follow it** (desktop refresh,
+Part G): `TextSize::Small`, ⅞ of it, for a menu's shortcut column and the editor's status line;
+and `TextSize::Large`, 13⁄12 of it, for the top bar's two words. So the largest text on the screen
+is 17⅓ pixels at the ceiling, and it is only ever in the 30-pixel top bar. A window's title is
+bold rather than larger. The shipped default is 13; the staged file above sets 12, as the
+refresh chose, and the default differs so that a client reading the file is visible.
 
 **`bevel` is one number for every gradient in the system** — a title bar, a scrollbar's thumb, a
 selected row. The reference desktop's own gradients span ±10 and ±14 around their midpoints, so
