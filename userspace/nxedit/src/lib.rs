@@ -46,11 +46,15 @@ use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
     TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
     TabExtras, tab_strip,
-    text_area, text_field, title_bar, window_frame_with_grip,
+    text_area, text_field, title_bar, window_frame_with_grip, STATUS_GAP, status_bar,
+    status_text,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
-pub const STATUS_H: u32 = 24;
+///
+/// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
+/// so its height is that widget's and a second 24 here would have clamped it.
+pub const STATUS_H: u32 = libui::widget::STATUS_BAR_H;
 
 /// The element key on the strip's line-and-column readout.
 pub const POSITION_KEY: u64 = 16;
@@ -2153,32 +2157,34 @@ impl App {
         .key(TITLE_KEY);
 
         // The status strip: the one control, and what the last thing that happened was.
-        let strip = row(alloc::vec![
-            button(
-                "save",
-                Msg::Save,
-                WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                &ui,
-            )
-            .key(SAVE_KEY),
+        //
+        // **`libui`'s status bar since the desktop refresh's Part H** — the ground, the rule and
+        // the dim step come from there now, so this window's foot and the browser's agree. Its
+        // rule is on the *bottom* because this strip is still under the chrome rather than along
+        // the window's foot, which is where Part J puts it.
+        let reading = match self.field.as_ref() {
             // **The field replaces the status, it does not sit beside it.** The strip is one row
             // of chrome and a name being typed *is* what last happened — showing both would make
             // a person read two things to find out which one is asking for an answer.
-            match self.field.as_ref() {
-                Some((_, f)) => padding(
-                    Insets { top: 2, right: 6, bottom: 2, left: 6 },
-                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+            Some((_, f)) => padding(
+                Insets { top: 2, right: 6, bottom: 2, left: 0 },
+                text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+            ),
+            None => status_text(self.status.clone(), &ui),
+        };
+        let strip = status_bar(
+            row(alloc::vec![
+                button(
+                    "save",
+                    Msg::Save,
+                    WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                    &ui,
                 )
-                .key(STATUS_KEY)
-                .flex(1),
-                // A step below the body (Part G): the design's status text is metadata.
-                None => padding(
-                    Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    center_v(scaled(TextSize::Small, text(self.status.clone()))),
-                )
-                .key(STATUS_KEY)
-                .flex(1),
-            },
+                .key(SAVE_KEY),
+                padding(Insets { top: 0, right: 0, bottom: 0, left: STATUS_GAP }, reading)
+                    .key(STATUS_KEY)
+                    .flex(1),
+            ]),
             // **Line and column, at the right of the strip this window already has** (M14 Part E).
             // A second bar along the bottom is where a status bar conventionally goes and would
             // have moved every gate coordinate in the text area for a number; the strip is
@@ -2187,12 +2193,10 @@ impl App {
             // **Counted from one**, because that is what every editor's "line 3" means and what a
             // person comparing against a compiler's error message needs it to mean; the buffer
             // counts from zero and the conversion belongs at the one place it is displayed.
-            padding(
-                Insets { top: 4, right: 8, bottom: 4, left: 4 },
-                center_v(scaled(TextSize::Small, text(self.position_text()))),
-            )
-            .key(POSITION_KEY),
-        ]);
+            Some(status_text(self.position_text(), &ui).key(POSITION_KEY)),
+            Edge::Bottom,
+            &ui,
+        );
 
         // **The tab strip, drawn whatever the count.** A strip that appeared with the second
         // tab would move everything below it the moment a file was dropped in — the window's

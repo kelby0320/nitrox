@@ -29,8 +29,9 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, bold, center, center_v, column, dock, docked, fill,
-    icon, ink, outline, padding, rounded_fill, row, sized, stack, text, wash, with_spacing,
+    Edge, Element, IconKind, Insets, TextSize, bevel, bold, center, center_v, column, dock,
+    docked, fill, icon, ink, outline, padding, rounded_fill, row, scaled, sized, stack, text, wash,
+    with_spacing,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -542,6 +543,72 @@ fn tab_face<Msg>(colour: Rgb) -> alloc::vec::Vec<Element<Msg>> {
         padding(Insets { top: TAB_RADIUS, right: 0, bottom: 0, left: 0 }, fill(colour)),
     ]
 }
+
+/// How tall a status bar is: the design's 25.
+pub const STATUS_BAR_H: u32 = 25;
+
+/// A status bar's inset at either end: the design's 11.
+const STATUS_PAD_X: u32 = 11;
+
+/// A window's status bar: what it is doing at one end, where it is at the other.
+///
+/// **The rule is on the edge that faces the content** — `Edge::Top` for a bar along the bottom of
+/// a window, which is where the design puts one and where the editor's is going (Part J), and
+/// `Edge::Bottom` for one that sits under the chrome, which is where the editor's is today. A bar
+/// with its rule on the wrong side reads as a lid rather than a floor.
+///
+/// **Not in the mono face, which the design uses.** A window is painted with one face, and the
+/// fixed-advance one belongs to a character grid; a status bar set in it would be the toolkit's
+/// first two-face surface for the sake of a byte count. It is [`TextSize::Small`] and
+/// `foreground_dim` instead — the design's hierarchy by size and ink, which is what carries the
+/// "read this second" (desktop refresh, Part H).
+pub fn status_bar<Msg>(
+    left: Element<Msg>,
+    right: Option<Element<Msg>>,
+    rule: Edge,
+    theme: &Theme,
+) -> Element<Msg> {
+    // **Both slots wrapped, and the zero-inset one is not decoration** — `frame_layers`'s rule,
+    // for its reason: the diff wants a container's children all keyed or none, and a caller that
+    // keys its readout would otherwise make this dock `MixedKeying` at the first frame. The
+    // wrapper puts the caller's keys one level down, where they still do their job.
+    let bare = |e: Element<Msg>| padding(Insets::all(0), e);
+    let inner = match right {
+        Some(right) => dock(alloc::vec![docked(Edge::Right, bare(right))], bare(left)),
+        None => left,
+    };
+    sized(
+        Size::new(0, STATUS_BAR_H),
+        stack(alloc::vec![
+            fill(theme.face_hover),
+            dock(
+                alloc::vec![docked(rule, sized(Size::new(0, 1), fill(theme.border)))],
+                text(""),
+            ),
+            padding(
+                Insets { top: 0, right: STATUS_PAD_X, bottom: 0, left: STATUS_PAD_X },
+                center_v(inner),
+            ),
+        ]),
+    )
+}
+
+/// One reading on a status bar: a step below the body, in the ink a second read gets.
+pub fn status_text<Msg>(s: impl Into<String>, theme: &Theme) -> Element<Msg> {
+    ink(theme.foreground_dim, scaled(TextSize::Small, text(s)))
+}
+
+/// The upright between two readings on a status bar — the design's `|`, in the line colour.
+pub fn status_separator<Msg>(theme: &Theme) -> Element<Msg> {
+    padding(
+        Insets { top: 0, right: STATUS_GAP, bottom: 0, left: STATUS_GAP },
+        ink(theme.border, scaled(TextSize::Small, text("|"))),
+    )
+}
+
+/// Between two readings on a status bar — either side of a separator, or between a control and
+/// the reading next to it. The design's 16 from one to the next, less the bar it draws between.
+pub const STATUS_GAP: u32 = 7;
 
 /// One row of a dropdown menu: a label that highlights under the pointer.
 ///
@@ -5115,6 +5182,64 @@ two");
         assert_eq!(click(&mut router, tab_x(0) + 20), alloc::vec![M::Select(7)]);
         // The `+` is after the last tab, and opens one rather than selecting anything.
         assert_eq!(click(&mut router, tab_x(2) + (NEW_TAB_W / 2) as i32), alloc::vec![M::New]);
+    }
+
+    /// A status bar is a ground, a rule on the edge that faces the content, and dim readings.
+    ///
+    /// **Painted**, because every part of this is a colour in a place: a bar whose rule is on the
+    /// wrong edge reads as a lid rather than a floor, and a reading in body ink is not a second
+    /// read (desktop refresh, Part H).
+    #[test]
+    fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
+        let t = Theme::default();
+        let (w, h) = (200, STATUS_BAR_H);
+        let draw = |rule: Edge| {
+            let ui: Element<Msg> = status_bar(
+                status_text("opened", &t),
+                Some(status_text("ln 6", &t)),
+                rule,
+                &t,
+            );
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&ui, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let top = draw(Edge::Top);
+        assert_eq!(top.get_pixel(w / 2, 0), Some(t.border), "the rule is along the top edge");
+        assert_eq!(top.get_pixel(w / 2, h - 1), Some(t.face_hover), "and the other edge is ground");
+        let bottom = draw(Edge::Bottom);
+        assert_eq!(bottom.get_pixel(w / 2, h - 1), Some(t.border), "or along the bottom");
+        assert_eq!(bottom.get_pixel(w / 2, 0), Some(t.face_hover), "…and then the top is ground");
+        // **Both readings are there, and neither is body ink — measured by darkness, not by the
+        // exact colour.** At the small step a glyph is mostly antialiased, so counting pixels
+        // equal to `foreground_dim` counts almost nothing; what separates the two inks is how
+        // dark the darkest pixel gets. Dim is 91/103/102 and body is 22/32/31, so nothing drawn
+        // in dim reaches the threshold and anything drawn in body sails past it.
+        let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
+        let darkest = (0..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter_map(|(x, y)| top.get_pixel(x, y))
+            .map(darkness)
+            .min()
+            .expect("the bar has pixels");
+        let ink_pixels = (0..w)
+            .flat_map(|x| (0..h).map(move |y| (x, y)))
+            .filter(|(x, y)| {
+                let c = top.get_pixel(*x, *y);
+                c != Some(t.face_hover) && c != Some(t.border)
+            })
+            .count();
+        assert!(ink_pixels > 20, "the readings are drawn: {ink_pixels} pixels");
+        let floor = darkness(t.foreground_dim);
+        assert!(
+            darkest >= floor,
+            "something is darker than `foreground_dim` ({darkest} against {floor}) — a reading \
+             on a status bar is a second read, not body ink"
+        );
+        assert!(darkness(t.foreground) < floor, "and body ink would fail that");
     }
 
     /// A tab's close box is drawn, not merely clickable.
