@@ -932,7 +932,17 @@ mod tests {
         assert_eq!(p.directory(), Some("/start"), "an overrun payload was acted on");
         // And the sequence is still swallowed whole, overrun or not.
         assert_eq!(printed(&run(&alloc::format!("a\x1b]7;{long}\x07Z"))), "aZ");
-        // A payload that exactly fits is not an overrun.
+
+        // **The limit itself, from both sides.** A payload that is merely *large* says nothing
+        // about where the bound is: with `>=` loosened to `>` in `push_osc` the two assertions
+        // above and the one below all still pass, and the parser then takes a payload one byte
+        // past the `MAX_OSC` its own doc comment states (PR #322 review, optional 1).
+        //
+        // `7;` is two of the payload's bytes, so a path of `MAX_OSC - 2` makes it exactly one
+        // too long — and the same path a byte shorter makes it exactly full.
+        let over = alloc::format!("/{}", "x".repeat(MAX_OSC - 2));
+        let p = parse(&alloc::format!("\x1b]7;/start\x07\x1b]7;{over}\x07"));
+        assert_eq!(p.directory(), Some("/start"), "a payload one byte past the bound was taken");
         let fits = alloc::format!("/{}", "x".repeat(MAX_OSC - 3));
         assert_eq!(parse(&alloc::format!("\x1b]7;{fits}\x07")).directory(), Some(fits.as_str()));
     }

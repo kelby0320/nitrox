@@ -27400,3 +27400,17 @@ never printed. Found by asking where else the new bytes would land, not by a fai
 asserts the round trip in a boot — the announcement at the first prompt, and that it follows a
 `cd`. That it is one line per `cd` rather than one per prompt is a host test in `nxterm`, because
 `expect` scans forward past what it does not match and a gate cannot assert a line's absence.
+
+## 2026-09-22 — Part K, reviewed: a bound tested with a large value is not tested
+
+PR #322's review found nothing blocking and one thing worth keeping.
+
+**`MAX_OSC` was tested with a payload three bytes too long and one that exactly fits, and never
+with one byte too many** — so loosening `push_osc`'s `>=` to `>` left every `osc` test green while
+the parser took a payload past the limit its own doc comment states. A *large* value says nothing
+about where a bound is; only the byte on each side of it does. The test now carries both, and both
+directions of the off-by-one fail it.
+
+This is the same shape as the part's own finding one layer down — `cell_h` was central and
+unpinned — and the general form is worth saying once: **a constant is tested when a test fails for
+the value next to it**, not when a test exercises a value far from it.
