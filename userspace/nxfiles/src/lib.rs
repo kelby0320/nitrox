@@ -33,13 +33,15 @@ use librsproto::surface::{
 use alloc::vec;
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, padding, row, sized, text,
+    Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text,
     with_spacing,
 };
 use libui::widget::{
-    DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
-    TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    popup_frame, resize_grip, TabExtras, tab_strip, text_field, title_bar, window_frame_with_grip,
+    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, STATUS_BAR_H, Swatch,
+    TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextFieldState, Theme as UiTheme, TitleButtons,
+    WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view, popup_frame, resize_grip,
+    status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
+    window_frame_with_grip,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -48,8 +50,40 @@ pub const TITLE: &str = "Files";
 /// The path strip's height in pixels — one row of chrome under the title bar.
 pub const PATH_H: u32 = 24;
 
-/// A listing row's height in pixels.
-pub const ROW_H: u32 = 20;
+/// The listing's trailing columns: the design's `Size`, `Kind` and `Modified` at 70, 60 and 96,
+/// with a size read right-aligned so the digits line up (desktop refresh, Part I).
+pub const LIST_COLUMNS: &[ListColumn] = &[
+    ListColumn { width: 70, align: ColumnAlign::Right },
+    ListColumn { width: 60, align: ColumnAlign::Left },
+    ListColumn { width: 96, align: ColumnAlign::Left },
+];
+
+/// What each of those columns is called, for the header above them.
+pub const LIST_HEADINGS: [&str; 3] = ["Size", "Kind", "Modified"];
+
+/// The column header's height in pixels — the toolkit's, which draws it.
+pub const HEADER_H: u32 = libui::widget::LIST_HEADER_H;
+
+/// The element key on the column header.
+pub const HEADER_KEY: u64 = 21;
+
+/// The element key on the pane holding the header and the listing under it.
+///
+/// **The listing keeps [`LIST_KEY`]**, which the gates and this crate's tests find it by; this
+/// names the pair, because the window's dock wants every child keyed and the pane is now a child.
+pub const LIST_PANE_KEY: u64 = 23;
+
+/// The element key on the search field, when it is open.
+pub const SEARCH_KEY: u64 = 24;
+
+/// How wide the search field is: the design's 120.
+pub const SEARCH_W: u32 = 120;
+
+/// The element key on the status bar at the window's foot.
+pub const STATUS_KEY: u64 = 22;
+
+/// A listing row's height in pixels: the design's 25, where it was 20.
+pub const ROW_H: u32 = 25;
 
 /// The element key on the listing, so a test can find it without walking the tree.
 pub const LIST_KEY: u64 = 1;
@@ -127,15 +161,18 @@ pub const TAB_KEY_BASE: u64 = 1 << 63;
 /// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
 /// its rows, and a width that followed the theme's text size would move under a gate that had to
 /// read a theme file to know where to click.
-pub const SIDEBAR_W: u32 = 148;
+pub const SIDEBAR_W: u32 = 132;
 
-/// How much space sits between the quick-access panel and everything around it.
+/// How much space sits between the quick-access panel and everything around it: none.
 ///
-/// **A margin rather than an edge** (M15 Part E): the panel has a ground of its own now, and what
-/// makes it read as a *panel* rather than as part of the listing is the window showing through
-/// around it. Reported from running it — "add some margin around the quick access panel just to
-/// separate it from the rest".
-pub const SIDEBAR_PAD: u32 = 6;
+/// **A margin until the desktop refresh's Part I, and an edge since.** M15 Part E put six pixels
+/// around the panel so that the window showing through would make it read as a *panel* rather
+/// than as part of the listing — reported from running it, "add some margin around the quick
+/// access panel just to separate it from the rest". The design answers that differently: the
+/// sidebar runs to the window's edge and its own ground is what separates it, which is what this
+/// is now. **Kept as a named zero** rather than deleted, because the sums that place a sidebar
+/// row read it and a gate writes it down (PR #320 review, worth fixing 8).
+pub const SIDEBAR_PAD: u32 = 0;
 
 /// The element key on the sidebar.
 pub const SIDEBAR_KEY: u64 = 26;
@@ -201,6 +238,9 @@ pub const CLOSE_TAB_KEYCODE: u16 = 17;
 pub const HIDDEN_KEYCODE: u16 = 35;
 /// The key that opens the location bar: `l`, with Ctrl.
 pub const LOCATION_KEYCODE: u16 = 38;
+
+/// `Ctrl+F` opens the toolbar's search field.
+pub const SEARCH_KEYCODE: u16 = 33;
 /// The key that shows what is known about the selected entry: `i`, with Ctrl.
 pub const PROPERTIES_KEYCODE: u16 = 23;
 /// The key that cuts the selection: `x`, with Ctrl.
@@ -506,6 +546,13 @@ pub struct App {
     /// **On the window rather than the pane**, because only one can be open at a time and it acts
     /// on whichever tab is current — the same reason the name prompt is not per pane.
     location: Option<TextFieldState>,
+    /// The search field, when it is open — the toolbar's, which **filters the listing as it is
+    /// typed** (desktop refresh, Part I).
+    ///
+    /// **A filter, not a placeholder.** The design draws a Search field and does nothing with it;
+    /// a field that looked like search and did nothing is the defect every part of this refresh
+    /// has named, so this narrows the rows by the same rule the Applications menu uses.
+    search: Option<TextFieldState>,
     /// Counts runs of pointer presses, so a second click on a row can mean something else.
     ///
     /// **Fed by the binary**, which is the only half that can read a clock — see
@@ -606,6 +653,13 @@ pub struct App {
     confirm: Option<Target>,
     /// Whether the *dialog* holds the keyboard, which its own title bar shows.
     pub dialog_focused: bool,
+    /// What the wall clock said when this listing was read, in nanoseconds since the epoch.
+    ///
+    /// **The binary reads it and the view is a function of it** (desktop refresh, Part I): the
+    /// `Modified` column says `HH:MM` for today and a date before that, which needs to know what
+    /// today is — and a `view` that called the clock would be a view that could not be tested on
+    /// the host. Zero means "not read", and then every row shows a date.
+    pub now_nanos: u64,
     /// The dialog's title bar was dragged, and the binary owes a `StartMove` **on its window**.
     confirm_move_requested: bool,
     /// Filesystem work the binary owes, in the order it was asked for.
@@ -727,6 +781,10 @@ pub enum Msg {
     CloseProperties,
     /// Open the location bar, seeded with where this tab is — `Ctrl+L`, or the File menu.
     OpenLocation,
+    /// Open the toolbar's search field, and filter the listing as it is typed.
+    OpenSearch,
+    /// Close it, and show the whole listing again.
+    SearchCancel,
     /// Go to what was typed there.
     LocationGo,
     /// Close it without going anywhere.
@@ -811,6 +869,7 @@ impl App {
             sidebar: ListState::default(),
             properties: None,
             location: None,
+            search: None,
             clicks: libui::click::Clicks::new(),
             scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
@@ -837,6 +896,7 @@ impl App {
             prompt: None,
             confirm: None,
             dialog_focused: true,
+            now_nanos: 0,
             confirm_move_requested: false,
             ops: Vec::new(),
             over: None,
@@ -899,6 +959,67 @@ impl App {
     /// What it is showing.
     pub fn entries(&self) -> &[Entry] {
         &self.pane().entries
+    }
+
+    /// The entry a row position names, if that row is drawn.
+    ///
+    /// **`ListState::selected` is a row position and this browser's index is an entries index**,
+    /// and until a filter existed they were the same number. They are not while a search narrows
+    /// the listing, and the widget clamps what it is given against the rows it drew — so a
+    /// stored index of 2 became row 0, and the file the screen highlighted stopped being the
+    /// file `Delete` acted on (PR #320 review, blocking 1).
+    ///
+    /// The pane keeps the **entries index**, because every reader in this file means that. This
+    /// and the translation around `list_view` in `view` are the only places the two spaces meet.
+    fn entry_of_row(&self, row: usize) -> Option<usize> {
+        self.visible_indices().get(row).copied()
+    }
+
+    /// Move the selection one row down (`1`) or up (`-1`), **through the rows that are shown**.
+    ///
+    /// **One implementation for both key paths**: the listing's arrows and the search field's
+    /// were separate branches, and the filtered one moved a row position into a field that holds
+    /// an entries index (PR #320 review, blocking 1).
+    fn step_selection(&mut self, by: i32) {
+        let shown = self.visible_indices();
+        if shown.is_empty() {
+            return;
+        }
+        let here = self.pane().list.selected.and_then(|e| shown.iter().position(|&i| i == e));
+        let next = match (here, by) {
+            (Some(p), 1) => (p + 1).min(shown.len() - 1),
+            (Some(p), _) => p.saturating_sub(1),
+            // Nothing picked yet: down takes the first row, up takes the last.
+            (None, 1) => 0,
+            (None, _) => shown.len() - 1,
+        };
+        self.pane_mut().list.selected = Some(shown[next]);
+    }
+
+    /// Which entries the listing shows, as indices into [`entries`](Self::entries).
+    ///
+    /// **Indices rather than entries**, because a row's key is `LIST_ROW_KEY + its index` and
+    /// everything downstream — opening, dragging, renaming, the marked set — resolves through
+    /// that. A filter that renumbered the rows would quietly make every one of those act on the
+    /// wrong file (desktop refresh, Part I).
+    ///
+    /// **Case-insensitive, and a substring rather than a prefix**: the Applications menu's rule,
+    /// because a person searching a directory for `notes` should not have to know whether the
+    /// file begins with it.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let query = self.search.as_ref().map(|f| f.text().to_lowercase()).unwrap_or_default();
+        self.pane()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| query.is_empty() || e.name.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// What the search field holds, if it is open — for the binary's receipts and for tests.
+    pub fn search_text(&self) -> Option<&str> {
+        self.search.as_ref().map(|f| f.text())
     }
 
     /// Replace the listing: `path` is now where we are, and `entries` is what is in it.
@@ -1068,7 +1189,7 @@ impl App {
             // cannot disagree about where a thumb points (M11 Part E batch 6), nor about what
             // taking hold of one means (M14 Part I).
             Msg::Scroll(p) => {
-                let (h, total) = (self.list_h(), self.pane().entries.len());
+                let (h, total) = (self.list_h(), self.visible_indices().len());
                 let bar = self.pane().list.bar(h, ROW_H, total);
                 if let Some(offset) = self.scroll_grab.apply(bar, h, p) {
                     self.pane_mut().list.offset = offset as usize;
@@ -1150,8 +1271,18 @@ impl App {
             Msg::OpenLocation => {
                 self.prompt = None;
                 self.notice = None;
+                self.search = None;
                 self.location = Some(TextFieldState::with_text(&self.pane().path));
             }
+            // **Opened empty**, where the location bar is seeded: a search that began with the
+            // directory's name in it would start by matching nothing.
+            Msg::OpenSearch => {
+                self.prompt = None;
+                self.notice = None;
+                self.location = None;
+                self.search = Some(TextFieldState::new());
+            }
+            Msg::SearchCancel => self.search = None,
             Msg::Place(key) => {
                 if let Some(p) = place_of(key).and_then(|i| self.places().into_iter().nth(i)) {
                     self.goto = Some(p.path);
@@ -1355,7 +1486,17 @@ impl App {
     /// above the list and an internal drag has to turn a `y` back into a row; deriving that
     /// arithmetic twice is how a drop lands one row off the thing it was released over.
     pub fn list_top(&self) -> u32 {
-        libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H
+        // **The same sum `list_h` subtracts, and it stopped being that** (PR #320 review,
+        // blocking 3): Part I made the tab strip conditional and added a column header, and this
+        // — the function whose whole reason is that "two would disagree" — kept the old chrome.
+        // A drop then resolved to the row above the one it was released over, and with two tabs
+        // to the row below; the drag tests aim *through* this function, so they agreed with it.
+        libui::widget::WINDOW_CONTENT_Y
+            + TITLE_BAR_H
+            + MENU_BAR_H
+            + self.tab_strip_h()
+            + PATH_H
+            + HEADER_H
     }
 
     /// How many rows the list actually draws — what `list_view` builds from the height it is
@@ -1376,8 +1517,10 @@ impl App {
         if y < top || y >= top + (self.visible_rows() as u32 * ROW_H) as i32 {
             return None;
         }
-        let i = self.pane().list.offset + ((y - top) as u32 / ROW_H) as usize;
-        (i < self.pane().entries.len()).then_some(i)
+        let row = self.pane().list.offset + ((y - top) as u32 / ROW_H) as usize;
+        // **Through the rows that are drawn**, which is not the entries list while a search is
+        // narrowing it: a `y` names a row, and the caller wants the entry under it.
+        self.entry_of_row(row)
     }
 
     /// Whether a window-local point is inside this window at all.
@@ -1414,8 +1557,44 @@ impl App {
             }
             return;
         }
+        // **And while a search is being typed they are the field's**, for the location bar's
+        // reason: `Backspace` correcting a query must not also go up a directory. `Enter` opens
+        // what is left, which is what a filter that has narrowed to one thing is for.
+        if self.search.is_some() {
+            match k.keycode {
+                libkern::abi::KEY_ESC => self.update(Msg::SearchCancel),
+                // **`Activate` takes an entries index**, which is what `Press` and the plain
+                // `Enter` below send it; this sent a *key* and so opened nothing at all
+                // (PR #320 review, blocking 2). And it opens **what is selected**, falling back
+                // to the first match — arrows move the selection while a search is up, so
+                // opening the first row would ignore where the person had arrowed to.
+                libkern::abi::KEY_ENTER => {
+                    let pick = self
+                        .pane()
+                        .list
+                        .selected
+                        .filter(|e| self.visible_indices().contains(e))
+                        .or_else(|| self.visible_indices().first().copied());
+                    if let Some(i) = pick {
+                        self.search = None;
+                        self.update(Msg::Activate(i as u64));
+                    }
+                }
+                // Arrows still move the selection: a filter narrows the list, it does not take
+                // the list's keys away — and they move it **through what is shown**, which is
+                // what keeps the highlight and the file an action acts on the same file.
+                libkern::abi::KEY_DOWN => self.step_selection(1),
+                libkern::abi::KEY_UP => self.step_selection(-1),
+                _ => {
+                    if let Some(f) = self.search.as_mut() {
+                        f.apply(k.keycode, k.modifiers);
+                    }
+                }
+            }
+            return;
+        }
         // **And while a path is being typed they are the location bar's**, for exactly the
-        // reason below: `Backspace` correcting a typo must not also go up a directory. Before the
+        // reason above: `Backspace` correcting a typo must not also go up a directory. Before the
         // prompt check because the two are mutually exclusive — opening either closes the other —
         // so the order between them only decides which branch answers when neither is open.
         if self.location.is_some() {
@@ -1449,14 +1628,9 @@ impl App {
             }
             return;
         }
-        let len = self.pane().entries.len();
         match k.keycode {
-            libkern::abi::KEY_DOWN => {
-                self.pane_mut().list.down(len);
-            }
-            libkern::abi::KEY_UP => {
-                self.pane_mut().list.up();
-            }
+            libkern::abi::KEY_DOWN => self.step_selection(1),
+            libkern::abi::KEY_UP => self.step_selection(-1),
             libkern::abi::KEY_ENTER => {
                 if let Some(i) = self.pane().list.selected {
                     self.update(Msg::Activate(i as u64));
@@ -1604,9 +1778,20 @@ impl App {
     /// Pick every row between the anchor and `i`, inclusive.
     fn mark_range_to(&mut self, i: usize) {
         let from = self.anchor.or(self.pane().list.selected).unwrap_or(i);
-        let (lo, hi) = if from <= i { (from, i) } else { (i, from) };
-        let names: Vec<String> = self.pane().entries[lo..=hi.min(self.pane().entries.len() - 1)]
+        // **Between the two rows, not between the two entries** (PR #320 review): with a filter
+        // up, the entries between them include files the listing is not showing, and a sweep
+        // that picked those would act on what nobody can see.
+        let shown = self.visible_indices();
+        let (Some(a), Some(b)) = (
+            shown.iter().position(|&x| x == from),
+            shown.iter().position(|&x| x == i),
+        ) else {
+            return;
+        };
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let names: Vec<String> = shown[lo..=hi]
             .iter()
+            .filter_map(|&e| self.pane().entries.get(e))
             .map(|e| e.name.clone())
             .collect();
         self.pane_mut().list.selected = Some(from);
@@ -1645,8 +1830,7 @@ impl App {
             .map(|(i, e)| libui::widget::ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: e.name.as_str(),
-                marked: self.marked.contains(&e.name),
-            })
+                marked: self.marked.contains(&e.name), ..Default::default() })
             .collect()
     }
 
@@ -1932,6 +2116,12 @@ impl App {
                         Msg::ToggleHidden,
                     )
                     .marked(self.pane().show_hidden),
+                    // **In View rather than in File**, where it was first written: this row
+                    // changes *which rows are shown*, which is what the rest of this menu does —
+                    // and the File menu's rows are indexed by `check-login`, so a row wedged
+                    // into the middle of it moves a gate's aim for a reason that has nothing to
+                    // do with the gate (desktop refresh, Part I).
+                    Item::new("Search\u{2026}", Accel::ctrl(SEARCH_KEYCODE, "F"), Msg::OpenSearch),
                 ],
             },
         ]
@@ -2143,8 +2333,47 @@ impl App {
         // shorter — one row of arithmetic off, which this method's own reason for existing is to
         // prevent.
         self.window.h.saturating_sub(
-            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + GRIP_W + WINDOW_FRAME_H,
+            TITLE_BAR_H
+                + MENU_BAR_H
+                + self.tab_strip_h()
+                + PATH_H
+                + HEADER_H
+                + STATUS_BAR_H
+                + WINDOW_FRAME_H,
         )
+    }
+
+    /// How tall the tab strip is in this window — the widget's height, or nothing at all.
+    ///
+    /// **One tab is no strip** (desktop refresh, Part I): the design draws none, tabs are ours,
+    /// and a strip that can only say where you already are is chrome for its own sake. Every sum
+    /// over the window's chrome goes through here, so the listing's height and the gate's row
+    /// arithmetic cannot disagree about whether it is there.
+    pub fn tab_strip_h(&self) -> u32 {
+        if self.tabs().len() > 1 { TAB_STRIP_H } else { 0 }
+    }
+
+    /// The window's foot: how many entries are in this directory, and what is picked.
+    fn status_bar(&self, ui: &UiTheme) -> Element<Msg> {
+        // **What is shown, not what is there** (PR #320 review, optional 11): a filter narrowing
+        // eighty entries to one used to read `82 items` beside a single row. When a search is
+        // narrowing, both numbers are said, because "3 items" alone hides that there are more.
+        let shown = self.visible_indices().len();
+        let total = self.pane().entries.len();
+        let count = match (self.search.is_some(), shown) {
+            (true, n) => alloc::format!("{n} of {total} items"),
+            (false, 1) => String::from("1 item"),
+            (false, n) => alloc::format!("{n} items"),
+        };
+        let mut left = alloc::vec![status_text(count, ui)];
+        // **What is selected, after a separator** — the design's `6 items | Documents/ selected`.
+        if let Some(i) = self.pane().list.selected
+            && let Some(e) = self.pane().entries.get(i)
+        {
+            left.push(status_separator(ui));
+            left.push(status_text(alloc::format!("{} selected", e.label()), ui));
+        }
+        status_bar(row(left), None, Edge::Top, ui)
     }
 
     /// The element tree for the current state.
@@ -2252,17 +2481,24 @@ impl App {
                     .key(NOTICE_KEY),
                 ])
             }
+            // **The path as segments, with the separators drawn quieter than the names** — the
+            // design's breadcrumb (desktop refresh, Part I). One `Text` per segment rather than
+            // one string, because the `/` between them is the only part that is not a name and
+            // the whole point is that it reads as punctuation.
             None => row(alloc::vec![
-                padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.pane().path.clone()))
-                    .key(PATH_KEY),
                 padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    text(self.notice.clone().unwrap_or_default()),
+                    center_v(row(breadcrumb(self.pane().path.as_str(), &ui))),
+                )
+                .key(PATH_KEY),
+                padding(
+                    Insets { top: 4, right: 4, bottom: 4, left: 6 },
+                    center_v(text(self.notice.clone().unwrap_or_default())),
                 )
                 .key(NOTICE_KEY),
             ]),
         };
-        let strip = row(alloc::vec![
+        let mut strip_items = alloc::vec![
             button(
                 "^",
                 Msg::Up,
@@ -2271,7 +2507,24 @@ impl App {
             )
             .key(UP_KEY),
             middle.key(STRIP_INNER_KEY).flex(1),
-        ]);
+        ];
+        // **The search field only while it is open**, which is the honest version of the
+        // design's Search box: it filters the listing as it is typed, and a field that sat there
+        // doing nothing is the defect every part of this refresh has named. `Ctrl+F` opens it,
+        // `Esc` closes it, `Enter` opens what is left.
+        if let Some(f) = self.search.as_ref() {
+            strip_items.push(
+                sized(
+                    Size::new(SEARCH_W, 0),
+                    padding(Insets { top: 2, right: 6, bottom: 2, left: 0 }, {
+                        let state = WidgetState { active: true, ..Default::default() };
+                        text_field(f, false, state, &ui)
+                    }),
+                )
+                .key(SEARCH_KEY),
+            );
+        }
+        let strip = row(strip_items);
 
         // **The tab strip, between the menus and the path.** Above the path because a tab *is*
         // a path — the strip says which of several you are looking at, and the strip below says
@@ -2291,13 +2544,39 @@ impl App {
             &ui,
         );
 
-        let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
+        // **The rows the filter leaves**, by index into the whole listing: a row's key carries
+        // its original index, so opening, dragging and renaming resolve to the same file whether
+        // or not a search is narrowing what is on screen.
+        let shown = self.visible_indices();
+        let labels: Vec<String> =
+            shown.iter().map(|i| self.pane().entries[*i].label()).collect();
+        // **The three facts beside each name** (desktop refresh, Part I), built as owned strings
+        // first because a `ListRow` borrows its cells: one `Vec` of them, then a `Vec` of
+        // borrows into it, which is the same two-step the labels above already take.
+        let facts: Vec<[String; 3]> = shown
+            .iter()
+            .map(|i| &self.pane().entries[*i])
+            .map(|e| {
+                [
+                    column_size(e.size),
+                    column_kind(e.name.as_str(), e.is_dir),
+                    column_modified(e.mtime, self.now_nanos),
+                ]
+            })
+            .collect();
+        let cells: Vec<[&str; 3]> =
+            facts.iter().map(|f| [f[0].as_str(), f[1].as_str(), f[2].as_str()]).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
-        for (i, l) in labels.iter().enumerate() {
+        for (n, l) in labels.iter().enumerate() {
+            let i = shown[n];
+            let entry = &self.pane().entries[i];
             rows.push(ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: l,
-                marked: self.marked.contains(&self.pane().entries[i].name),
+                marked: self.marked.contains(&entry.name),
+                cells: &cells[n][..],
+                // **The design's mark**: a folder in the accent, a file in the line colour.
+                swatch: Some(Swatch::block(if entry.is_dir { ui.accent } else { ui.border })),
             });
         }
         let h = self.list_h();
@@ -2323,15 +2602,27 @@ impl App {
         let side_rows: Vec<ListRow<'_>> = places
             .iter()
             .enumerate()
-            .map(|(i, p)| ListRow { key: SIDEBAR_ROW_KEY + i as u64, label: p.name, marked: false })
+            .map(|(i, p)| ListRow {
+                key: SIDEBAR_ROW_KEY + i as u64,
+                label: p.name,
+                marked: false,
+                cells: &[],
+                // **A dot per place, and `Root`'s is the deny colour** (desktop refresh,
+                // Part I): the design marks every place with one and makes that one different,
+                // which is the only warning a person gets before walking out of their own home
+                // directory into the system's.
+                swatch: Some(Swatch::dot(if p.path == "/" { ui.deny } else { ui.ok })),
+            })
             .collect();
         self.sidebar.selected = here;
         // **The panel is built for the height it will be drawn at**, which is the box minus the
         // margin on each side — the obligation `list_view` states, and the one thing a margin
         // around a scrolling widget is easy to get wrong.
-        let side_h = h.saturating_sub(2 * SIDEBAR_PAD);
+        let side_h = (h + HEADER_H).saturating_sub(2 * SIDEBAR_PAD);
         let sidebar = list_view(
             &side_rows,
+            // The places have a name and a dot and nothing else to line up.
+            &[],
             &mut self.sidebar,
             side_h,
             ROW_H,
@@ -2346,8 +2637,16 @@ impl App {
             &ui,
         );
 
+        // **Into the widget's space, and back out again** (PR #320 review, blocking 1). The pane
+        // holds an entries index; `list_view` means a row position by `selected`, highlights by
+        // position and clamps against the rows it was given. Handing it the entries index made
+        // the highlight and the acted-on file different files as soon as a filter was up.
+        let stored = self.pane().list.selected;
+        let position = stored.and_then(|e| shown.iter().position(|&i| i == e));
+        self.pane_mut().list.selected = position;
         let list = list_view(
             &rows,
+            LIST_COLUMNS,
             &mut self.pane_mut().list,
             h,
             ROW_H,
@@ -2363,36 +2662,78 @@ impl App {
         // the region a person means by "over the list" — rows and scrollbar both. The widget
         // needs to know nothing about it (M14 Part I).
         .on_wheel(Msg::Wheel);
+        // **Back to an entries index.** `list_view` may have clamped the position or scrolled to
+        // follow it. A selection the filter is *hiding* has no position at all, and keeps its
+        // stored index rather than being forgotten — so closing the search puts the highlight
+        // back on the file it was on.
+        let after = self.pane().list.selected;
+        self.pane_mut().list.selected = match (position, after) {
+            (None, _) => stored,
+            (Some(_), Some(p)) => shown.get(p).copied(),
+            (Some(_), None) => None,
+        };
 
+        // **The strip is left out, not sized to nothing** (desktop refresh, Part I). The design
+        // draws no tab strip at all; tabs are ours, and a strip holding one tab can only say
+        // where you already are. A zero-height box still paints its children — the tab and the
+        // `+` drew over the chrome below it — so the edge has to be absent from the dock.
+        let mut edges = alloc::vec![
+            docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
+        ];
+        if self.tab_strip_h() > 0 {
+            edges.push(docked(
+                Edge::Top,
+                sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
+            ));
+        }
+        edges.extend(alloc::vec![
+            docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
+            // **The foot: what is in this directory, and what is picked** (Part I). Docked to
+            // the bottom before the sidebar takes its column, so it spans the whole window as
+            // the design draws it rather than stopping at the listing.
+            docked(Edge::Bottom, self.status_bar(&ui).key(STATUS_KEY)),
+            // **Docked after the strips, so it starts below them** — a dock takes its edges in
+            // order, and each one divides what the last left. The path strip spans the full
+            // width above both panes, which is what makes it read as the window's location
+            // rather than the listing's.
+            docked(
+                Edge::Left,
+                sized(
+                    // **The whole column, header included** (PR #320 review, worth fixing 7):
+                    // the sidebar was sized to the *listing's* height while its column is that
+                    // plus the header, so its ground stopped short of the status bar and the
+                    // window showed through underneath it.
+                    Size::new(SIDEBAR_W + 2 * SIDEBAR_PAD, h + HEADER_H),
+                    padding(Insets::all(SIDEBAR_PAD), sidebar),
+                )
+                .key(SIDEBAR_KEY),
+            ),
+        ]);
         window_frame_with_grip(
             title,
             dock(
-                alloc::vec![
-                    docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
-                    docked(
-                        Edge::Top,
-                        sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
-                    ),
-                    docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
-                    // **Docked after the three strips, so it starts below them** — a dock takes
-                    // its edges in order, and each one divides what the last left. The path strip
-                    // spans the full width above both panes, which is what makes it read as the
-                    // window's location rather than the listing's.
-                    docked(
-                        Edge::Left,
-                        sized(
-                            Size::new(SIDEBAR_W + 2 * SIDEBAR_PAD, h),
-                            padding(Insets::all(SIDEBAR_PAD), sidebar),
-                        )
-                        .key(SIDEBAR_KEY),
-                    ),
-                ],
+                edges,
             // **Sized to the height it was built for.** `list_view` does not size itself, and
             // the dock's flex child otherwise gets everything left over — so the widget would
             // build rows for one height and be drawn at another, leaving `visible` off by one
             // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
             // wrapper as the reliable way to keep the two in step.
-                sized(Size::new(0, h), list).key(LIST_KEY),
+                dock(
+                    alloc::vec![docked(
+                        Edge::Top,
+                        libui::widget::list_header(
+                            "Name",
+                            &LIST_HEADINGS,
+                            LIST_COLUMNS,
+                            true,
+                            libui::widget::list_scrolls(shown.len(), h, ROW_H),
+                            &ui,
+                        )
+                        .key(HEADER_KEY),
+                    )],
+                    sized(Size::new(0, h), list).key(LIST_KEY),
+                )
+                .key(LIST_PANE_KEY),
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
             self.window,
@@ -2534,6 +2875,96 @@ impl App {
             self.dialog_focused,
             ui,
         )
+    }
+}
+
+/// A path as breadcrumb segments: the names in the body ink, the separators in the line colour.
+///
+/// **Not a styled string**: the design's path strip reads as a sequence of places with
+/// punctuation between them, and the only way to say that in this toolkit is one element per
+/// part. The root is a single `/`, which is a place rather than a separator.
+pub fn breadcrumb<Msg>(path: &str, theme: &UiTheme) -> Vec<Element<Msg>> {
+    let mut out: Vec<Element<Msg>> = Vec::new();
+    let sep = |theme: &UiTheme| ink(theme.border, text("/"));
+    let names: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if names.is_empty() {
+        out.push(sep(theme));
+        return out;
+    }
+    for (i, name) in names.iter().enumerate() {
+        out.push(sep(theme));
+        // The last segment is where you are; the ones before it are how you got here.
+        let last = i + 1 == names.len();
+        out.push(if last {
+            text(String::from(*name))
+        } else {
+            ink(theme.foreground_dim, text(String::from(*name)))
+        });
+    }
+    out
+}
+
+/// A byte count for the listing's `Size` column: the design's `848`, `11K`, `2.8M`.
+///
+/// **Short, where [`size_text`] is exact.** A column is read down rather than across: what it
+/// answers is "which of these is the big one", and the Properties dialog is where the exact
+/// count lives. Nothing here rounds below 10 KiB, because a four-digit number is as easy to read
+/// as `4K` and says more (desktop refresh, Part I).
+pub fn column_size(bytes: u64) -> String {
+    const K: u64 = 1024;
+    if bytes < 10 * K {
+        return alloc::format!("{bytes}");
+    }
+    let (unit, suffix) = match bytes {
+        b if b >= K * K * K => (K * K * K, "G"),
+        b if b >= K * K => (K * K, "M"),
+        _ => (K, "K"),
+    };
+    let tenths = (bytes * 10 + unit / 2) / unit;
+    // One decimal while the number is small enough for it to mean something: `2.8M`, then `24M`.
+    if tenths < 100 {
+        alloc::format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+    } else {
+        alloc::format!("{}{suffix}", tenths / 10)
+    }
+}
+
+/// What kind of thing a row is, for the `Kind` column: `dir`, or the name's extension.
+///
+/// **The extension, not a guessed type.** This system has no content sniffing and no type
+/// database; what it knows about `theme.toml` is the four letters after the dot. A name with no
+/// dot, or one whose dot starts it, is a `file`.
+pub fn column_kind(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return String::from("dir");
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => String::from(ext),
+        _ => String::from("file"),
+    }
+}
+
+/// A modification time for the `Modified` column: `HH:MM` today, `YYYY-MM-DD` before that.
+///
+/// **Both arguments are times, and neither is read from the world here**: `now` comes from the
+/// binary, which reads the clock when it loads a listing, so this stays a function of values and
+/// the host can test the boundary between the two forms.
+///
+/// `0` is "unreported" rather than 1970 — [`modified_text`] carries the reasoning — and shows as
+/// nothing at all, because a column of `unknown` is a column of noise.
+pub fn column_modified(mtime: i64, now_nanos: u64) -> String {
+    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000))
+    else {
+        return String::new();
+    };
+    let when = libtime::civil_from_unix(nanos);
+    let today = libtime::civil_from_unix(now_nanos);
+    let full = libtime::format_civil(&when);
+    if (when.year, when.month, when.day) == (today.year, today.month, today.day) {
+        // `YYYY-MM-DD HH:MM:SS`, of which the clock is five characters at offset 11.
+        String::from(full.get(11..16).unwrap_or(""))
+    } else {
+        String::from(full.get(..10).unwrap_or(full.as_str()))
     }
 }
 
@@ -3383,6 +3814,347 @@ mod tests {
                 dir: true
             })
         );
+    }
+
+    /// The keys of the listing rows drawn with a selection wash over them.
+    ///
+    /// **What the screen highlights**, read off the tree the window builds: `list_view` washes a
+    /// selected row, so a row whose subtree carries one is a row a person sees as picked.
+    fn washed_rows<M>(view: &Element<M>) -> Vec<u64> {
+        fn washed<M>(e: &Element<M>) -> bool {
+            if matches!(e.node, libui::element::Node::Wash { .. }) {
+                return true;
+            }
+            e.children().any(washed)
+        }
+        fn walk<M>(e: &Element<M>, out: &mut Vec<u64>) {
+            if let Some(k) = e.key
+                && (LIST_ROW_KEY..LIST_ROW_KEY + 1000).contains(&k)
+                && washed(e)
+            {
+                out.push(k);
+            }
+            for c in e.children() {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(view, &mut out);
+        out
+    }
+
+    /// **Through the built view, with a filter up**: the row the screen highlights is the file
+    /// an action acts on, and `Enter` opens it.
+    ///
+    /// **This is the test the last one should have been** (PR #320 review, blocking 4). That one
+    /// pinned `visible_indices` against itself: its control renumbered inside that helper, which
+    /// is not the path anything uses. Renumbering the *rows* — keying them by position, which is
+    /// exactly the mistake the entry says would "leave every one of those acting on the wrong
+    /// file" — passed it and all 94 tests in this crate.
+    ///
+    /// So this presses a row through the real tree, asks the Edit menu what it would act on, and
+    /// presses `Enter`. Blocking 1 and blocking 2 are both here.
+    #[test]
+    fn a_filtered_row_is_the_row_that_is_acted_on() {
+        // `libinput`'s codes for t and h, as the filter test above uses.
+        const KEY_T: u16 = 20;
+        const KEY_H: u16 = 35;
+        let mut a = App::new("/home");
+        a.show(
+            "/home",
+            alloc::vec![
+                Entry::dir("Documents"),
+                Entry::file("Notes.txt"),
+                Entry::file("other.txt"),
+            ],
+        );
+        a.update(Msg::OpenSearch);
+        press_key(&mut a, KEY_T);
+        press_key(&mut a, KEY_H);
+        assert_eq!(a.visible_indices(), alloc::vec![2], "one row left: other.txt");
+
+        // Press that row where it is drawn, through the tree the window actually builds.
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&view, &l).expect("the view is diffable");
+        let mut router = libui::route::Router::new();
+        let at = |flags: u16, buttons: u16, y: i32| librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons,
+            flags,
+            x: (SIDEBAR_W + 60) as i32,
+            y,
+            ..Default::default()
+        };
+        let row_y = (a.list_top() + ROW_H / 2) as i32;
+        for ev in [at(librsproto::surface::POINTER_PRESSED, 1, row_y), at(0, 0, row_y)] {
+            for m in router.pointer(&tree, &view, &l, ev).0 {
+                a.update(m);
+            }
+        }
+        // **What the screen says and what the Edit menu would do are the same file.**
+        assert_eq!(a.selected_name(), Some("other.txt"), "the press picked the row it landed on");
+        assert_eq!(
+            a.selection().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            alloc::vec!["other.txt"],
+            "and the selection the menus act on is that row"
+        );
+        a.update(Msg::Choose(Action::Delete));
+        assert_eq!(a.confirming(), Some("other.txt"), "Delete asks about the row on screen");
+        a.update(Msg::ConfirmDelete);
+        assert_eq!(
+            a.take_op(),
+            Some(FileOp::Delete { path: "/home/other.txt".into(), dir: false }),
+            "…and deletes that one"
+        );
+
+        // **`Enter` opens what is left**, which the plan and the log both claim and which sent a
+        // key where an entries index belongs, so it opened nothing.
+        let mut b = App::new("/home");
+        b.show("/home", alloc::vec![Entry::dir("Documents"), Entry::dir("theatre")]);
+        b.update(Msg::OpenSearch);
+        press_key(&mut b, KEY_T);
+        press_key(&mut b, KEY_H);
+        assert_eq!(b.visible_indices(), alloc::vec![1], "theatre is the only match");
+        press_key(&mut b, libkern::abi::KEY_ENTER);
+        assert_eq!(b.take_goto().as_deref(), Some("/home/theatre"), "Enter descended into it");
+
+        // **A selection the filter hides keeps its place.** This is the half the translation
+        // *into* the widget is for: with the entries index handed straight to `list_view`, a
+        // hidden selection is read as a row position, highlights whatever row that is, and comes
+        // back as a different file — the selection moving on its own while a search is typed.
+        let mut c = App::new("/home");
+        c.show("/home", alloc::vec![Entry::dir("Documents"), Entry::dir("theatre")]);
+        let theme = UiTheme::default();
+        let size = c.window_size();
+        c.update(Msg::Press(LIST_ROW_KEY));
+        assert_eq!(c.selected_name(), Some("Documents"));
+        c.update(Msg::OpenSearch);
+        press_key(&mut c, KEY_T);
+        press_key(&mut c, KEY_H);
+        assert_eq!(c.visible_indices(), alloc::vec![1], "Documents is hidden");
+        // **Nothing is highlighted while the selection is hidden**, which is what the
+        // translation *into* the widget is for: handed an entries index, `list_view` reads it as
+        // a row position and lights up whichever row that is — here the one remaining row, a
+        // file the person did not pick. The selection survives either way, thanks to the
+        // translation back; the *highlight* is the half that needs both.
+        let framed = c.view(&theme, None);
+        let _ = libui::layout::layout(
+            &framed,
+            Rect::new(0, 0, size.w, size.h),
+            &libui::layout::FixedCell { w: 8, h: 16 },
+        );
+        assert_eq!(washed_rows(&framed), Vec::<u64>::new(), "no row is lit while none is shown");
+        press_key(&mut c, libkern::abi::KEY_ESC);
+        assert_eq!(
+            c.selected_name(),
+            Some("Documents"),
+            "the selection survived a search that hid it"
+        );
+    }
+
+    /// `list_top` is where the first row is actually drawn — asked of the laid-out tree.
+    ///
+    /// **The function's whole reason is that "two would disagree"**, and they did: Part I made
+    /// the tab strip conditional and added a column header, `list_h` followed and this did not,
+    /// so a drop landed on the row above the one it was released over (PR #320 review, blocking
+    /// 3). The drag tests aim *through* `list_top`, so they agreed with it and passed.
+    #[test]
+    fn list_top_is_where_the_first_row_is_drawn() {
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let drawn_top = |a: &mut App| {
+            let size = a.window_size();
+            let view = a.view(&UiTheme::default(), None);
+            let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+            libui::layout::locate(&view, &l, LIST_ROW_KEY).expect("row 0 is in the tree").origin.y
+        };
+        let mut one = app();
+        assert_eq!(one.list_top() as i32, drawn_top(&mut one), "with one tab");
+        let mut two = app();
+        two.update(Msg::NewTab);
+        two.show("/home", alloc::vec![Entry::dir("work"), Entry::file("a.txt")]);
+        assert_eq!(two.list_top() as i32, drawn_top(&mut two), "and with a tab strip");
+    }
+
+    /// Search narrows the listing, and a narrowed row still opens the file it names.
+    ///
+    /// **The second half is the one worth pinning** (desktop refresh, Part I): a filter that
+    /// renumbered its rows would leave every press, drag and rename acting on the wrong entry,
+    /// because a row's key is its index into the *whole* listing and everything downstream
+    /// resolves through that.
+    #[test]
+    fn search_filters_the_listing_and_keeps_each_rows_identity() {
+        // `libinput`'s table, as `KEY_X` above is: n, o, t, h.
+        const KEY_N: u16 = 49;
+        const KEY_O: u16 = 24;
+        const KEY_T: u16 = 20;
+        const KEY_H: u16 = 35;
+        let mut a = App::new("/home");
+        a.show(
+            "/home",
+            alloc::vec![
+                Entry::dir("Documents"),
+                Entry::file("Notes.txt"),
+                Entry::file("other.txt"),
+            ],
+        );
+        assert_eq!(a.visible_indices(), alloc::vec![0, 1, 2], "unfiltered, every row shows");
+        a.update(Msg::OpenSearch);
+        assert_eq!(a.search_text(), Some(""), "the field opens empty");
+        press_key(&mut a, KEY_N);
+        press_key(&mut a, KEY_O);
+        assert_eq!(a.search_text(), Some("no"));
+        // **One row left, and it is row 1 of the listing rather than row 0 of the filter** —
+        // and `Notes.txt` matched a lower-case query, which is the case-insensitivity.
+        assert_eq!(a.visible_indices(), alloc::vec![1]);
+        // A substring rather than a prefix: `th` is in the middle of `other.txt`.
+        a.update(Msg::SearchCancel);
+        a.update(Msg::OpenSearch);
+        press_key(&mut a, KEY_T);
+        press_key(&mut a, KEY_H);
+        assert_eq!(a.visible_indices(), alloc::vec![2], "matched in the middle of a name");
+        // Escape puts the whole listing back.
+        press_key(&mut a, libkern::abi::KEY_ESC);
+        assert_eq!(a.search_text(), None);
+        assert_eq!(a.visible_indices(), alloc::vec![0, 1, 2]);
+    }
+
+    /// The three column formatters, at the boundaries each of them has.
+    ///
+    /// **They had no tests at all** (PR #320 review, worth fixing 10), and `column_modified`'s
+    /// own doc claimed it was pure "so the host can test the boundary between the two forms".
+    #[test]
+    fn the_columns_say_what_they_mean() {
+        // Sizes: exact while a number is short, then one decimal, then none.
+        assert_eq!(column_size(0), "0");
+        assert_eq!(column_size(848), "848");
+        assert_eq!(column_size(4096), "4096");
+        assert_eq!(column_size(10 * 1024 - 1), "10239", "the last exact one");
+        // **Ten units is where the decimal stops meaning anything**, so `10K` rather than
+        // `10.0K` — which is also what the design draws beside an 11 KiB file.
+        assert_eq!(column_size(10 * 1024), "10K", "and the first rounded");
+        assert_eq!(column_size(11 * 1024), "11K");
+        assert_eq!(column_size(5 * 1024 * 1024 / 2), "2.5M", "under ten units keeps its tenth");
+        assert_eq!(column_size(2936012), "2.8M");
+        assert_eq!(column_size(100 * 1024 * 1024), "100M", "past ten units the decimal goes");
+        assert_eq!(column_size(3 * 1024 * 1024 * 1024), "3.0G");
+
+        // Kinds: a directory, an extension, or neither.
+        assert_eq!(column_kind("work", true), "dir");
+        assert_eq!(column_kind("theme.toml", false), "toml");
+        assert_eq!(column_kind("notes", false), "file", "no dot is no extension");
+        assert_eq!(column_kind(".quiet", false), "file", "a leading dot is not one either");
+        assert_eq!(column_kind("archive.tar.gz", false), "gz", "the last one wins");
+
+        // Modified: `HH:MM` today, a date before that, nothing when unreported.
+        // 2026-09-22 12:34:56 UTC, and the same clock at 00:00:01 the next day.
+        const NOON: i64 = 1_790_685_296;
+        let now = NOON as u64 * 1_000_000_000;
+        let today = column_modified(NOON, now);
+        assert_eq!(today.len(), 5, "today is a clock: {today:?}");
+        let yesterday = NOON - 24 * 60 * 60;
+        let then = column_modified(yesterday, now);
+        assert_eq!(then.len(), 10, "another day is a date: {then:?}");
+        assert!(then.starts_with("2026-"), "{then:?}");
+        assert_eq!(column_modified(0, now), "", "unreported says nothing");
+        assert_eq!(column_modified(-1, now), "", "and so does a negative");
+        // **With no clock, every row is a date** rather than everything looking like today.
+        assert_eq!(column_modified(NOON, 0).len(), 10, "no today to compare against");
+    }
+
+    /// A path reads as segments with the separators quieter than the names.
+    #[test]
+    fn a_breadcrumb_is_names_and_punctuation() {
+        let ui = UiTheme::default();
+        let parts = |p: &str| -> Vec<String> {
+            breadcrumb::<Msg>(p, &ui)
+                .iter()
+                .map(|e| {
+                    let mut out = String::new();
+                    fn walk<M>(e: &Element<M>, out: &mut String) {
+                        if let libui::element::Node::Text(t) = &e.node {
+                            out.push_str(t);
+                        }
+                        for c in e.children() {
+                            walk(c, out);
+                        }
+                    }
+                    walk(e, &mut out);
+                    out
+                })
+                .collect()
+        };
+        assert_eq!(parts("/"), alloc::vec!["/"], "the root is a place, not a separator");
+        assert_eq!(
+            parts("/home/alice"),
+            alloc::vec!["/", "home", "/", "alice"],
+            "each name is its own element, with punctuation between"
+        );
+        // **And the separators are drawn quieter than the names**, which this claimed in its
+        // title and did not check: it passed with every `ink` removed (PR #320 review, 10).
+        let inks = |p: &str| -> Vec<Option<libdraw::format::Rgb>> {
+            fn colour<M>(e: &Element<M>) -> Option<libdraw::format::Rgb> {
+                if let libui::element::Node::Ink { colour, .. } = &e.node {
+                    return Some(*colour);
+                }
+                e.children().find_map(colour)
+            }
+            breadcrumb::<Msg>(p, &ui).iter().map(colour).collect()
+        };
+        assert_eq!(
+            inks("/home/alice"),
+            alloc::vec![
+                Some(ui.border),
+                Some(ui.foreground_dim),
+                Some(ui.border),
+                None,
+            ],
+            "separators in the line colour, the parent dim, and where you are in the body ink"
+        );
+    }
+
+    /// One tab is no strip, and two are: the strip's height and what it *draws* agree.
+    ///
+    /// **Painted, because a zero-height box still has children** (desktop refresh, Part I): the
+    /// strip was sized to nothing and went on drawing a tab and a `+` over the chrome below it,
+    /// which a height assertion alone would have called a pass. The screendump caught it; this
+    /// is what would have.
+    #[test]
+    fn a_single_tab_draws_no_strip_at_all() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
+        let ui = UiTheme::default();
+        let (w, h) = (500u32, 300u32);
+        let ink_in_strip = |a: &mut App| {
+            let e = a.view(&ui, None);
+            let all = Rect::new(0, 0, w, h);
+            let m = libui::paint::FontMetrics::new(&font, ui.font_px);
+            let l = libui::layout::layout(&e, all, &m);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(ui.background);
+            libui::paint::paint(&mut fb, &font, &ui, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // The band the strip would occupy: below the menu bar, one strip tall.
+            let top = TITLE_BAR_H + MENU_BAR_H;
+            (top..top + TAB_STRIP_H)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(ui.foreground_dim))
+                .count()
+        };
+        let mut one = App::new("/home");
+        one.show("/home", alloc::vec![Entry::dir("Documents")]);
+        assert_eq!(one.tab_strip_h(), 0, "one tab is no strip");
+        assert_eq!(ink_in_strip(&mut one), 0, "…and it draws nothing where a strip would be");
+        let mut two = App::new("/home");
+        two.show("/home", alloc::vec![Entry::dir("Documents")]);
+        two.update(Msg::NewTab);
+        assert_eq!(two.tab_strip_h(), TAB_STRIP_H, "two tabs are a strip");
+        assert!(ink_in_strip(&mut two) > 0, "…and it draws one");
     }
 
     #[test]
@@ -4562,14 +5334,20 @@ mod tests {
         }
     }
 
-    /// The quick-access panel is inset from everything around it.
+    /// The quick-access panel sits where [`SIDEBAR_PAD`] says, and reaches the status bar.
     ///
-    /// **A margin is what makes it read as a panel** (M15 Part E). It has a ground of its own
-    /// since Part A; what separates it from the listing and the window's edge is the window
-    /// showing through around it, and the number is easy to lose the next time this dock is
-    /// rearranged.
+    /// **It was a margin and is an edge** (desktop refresh, Part I): M15 Part E put six pixels
+    /// around the panel so the window would show through and make it read as a panel; the design
+    /// runs it to the window's edge instead and lets its own ground do that work. The assertion
+    /// is the same either way — the rows sit `SIDEBAR_PAD` inside the panel's box — which is why
+    /// it kept passing at nought and needed its name changed rather than its arithmetic
+    /// (PR #320 review, worth fixing 8).
+    ///
+    /// **And it fills its column**, which it did not: sized to the listing's height while the
+    /// column is that plus the header, it stopped short of the status bar and the window showed
+    /// through below it.
     #[test]
-    fn the_quick_access_panel_has_a_margin_around_it() {
+    fn the_quick_access_panel_sits_where_the_metric_says_and_fills_its_column() {
         let mut a = app();
         let cell = libui::layout::FixedCell { w: 8, h: 16 };
         let size = a.window_size();
@@ -4586,6 +5364,20 @@ mod tests {
             (box_.origin.x + box_.size.w as i32) - (row.origin.x + row.size.w as i32),
             SIDEBAR_PAD as i32,
             "the panel is flush with the listing"
+        );
+        // **Down to the status bar**, with no window showing through beneath it.
+        let status = libui::layout::locate(&e, &l, STATUS_KEY).expect("the status bar is keyed");
+        assert_eq!(
+            box_.origin.y + box_.size.h as i32,
+            status.origin.y,
+            "the panel stops short of the status bar, leaving the window showing through"
+        );
+        // And the listing's own pane reaches it too.
+        let pane = libui::layout::locate(&e, &l, LIST_PANE_KEY).expect("the pane is keyed");
+        assert_eq!(
+            pane.origin.y + pane.size.h as i32,
+            status.origin.y,
+            "the listing stops short of the status bar"
         );
     }
 

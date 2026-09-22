@@ -1703,6 +1703,7 @@ impl App {
                 key: CHOOSER_ROW_KEY + i as u64,
                 label: name,
                 marked: false,
+                ..Default::default()
             })
             .collect();
         let dir = c.dir.clone();

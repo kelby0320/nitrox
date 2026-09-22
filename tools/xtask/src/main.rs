@@ -82,6 +82,9 @@ const FAT32_MIN_MIB: u64 = 33;
 /// grew from 26 to 31, its buttons went from contiguous 26-pixel slots to the design's 23 with 9
 /// between, and a window's content lost its 3-pixel frame. They were a dozen inline numbers —
 /// `+ 13`, `- 39`, `- 65`, `+ 4` — and a change to the chrome was a search for all of them.
+///
+/// **The browser's own metrics are [`browser`] below**, a separate table because they come from a
+/// separate crate and are checked a different way: `xtask` links `libui` and parses `nxfiles`.
 mod chrome {
     /// A title bar's height, its bottom rule included (`libui::widget::TITLE_BAR_H`).
     pub const TITLE_BAR_H: i32 = 31;
@@ -99,6 +102,12 @@ mod chrome {
     pub const CONTENT_X: i32 = 1;
     /// A tab strip's height (`libui::widget::TAB_STRIP_H`) — 30 since the refresh's Part H, where
     /// it was 24 and a tab filled it.
+    ///
+    /// **Kept though no aim reads it today**: the browser stopped drawing a strip for a single
+    /// tab in Part I, and the two aims that counted one are the reason that part's CI run
+    /// failed. It stays because `the_gates_chrome_table_is_the_toolkits` compares it, so the
+    /// next aim that needs a strip's height starts from a number something checks.
+    #[allow(dead_code)]
     pub const TAB_STRIP_H: i32 = 30;
     /// One tab's height inside that strip (`TAB_H`), and [`TAB_TOP`] the strip's padding above it.
     pub const TAB_H: i32 = 24;
@@ -111,6 +120,25 @@ mod chrome {
     pub const TAB_SIDE: i32 = 6;
     /// From one tab's left edge to the next's (`TAB_PITCH`): a tab and the pixel between them.
     pub const TAB_PITCH: i32 = 121;
+}
+
+/// **The file browser's own chrome, as the gates aim at it** — `nxfiles`'s metrics, copied on
+/// purpose for [`chrome`]'s reason (M11 decision 2). `xtask` cannot link that crate: it is a
+/// bare-target program, and its library half pulls `libsurface` with it, so
+/// `the_gates_browser_table_is_the_browsers` reads them out of its source and compares — the way
+/// the greeter's pair is kept honest (PR #318 review, finding 1).
+mod browser {
+    /// The sidebar's width (`nxfiles::SIDEBAR_W`): the design's 132 since the refresh's Part I.
+    pub const SIDEBAR_W: i32 = 132;
+    /// The margin around it (`nxfiles::SIDEBAR_PAD`) — nought since Part I, where it was 6: the
+    /// design's sidebar runs to the window's edge.
+    pub const SIDEBAR_PAD: i32 = 0;
+    /// The path strip's height (`nxfiles::PATH_H`).
+    pub const PATH_H: i32 = 24;
+    /// A listing row's height (`nxfiles::ROW_H`): the design's 25 since Part I, where it was 20.
+    pub const ROW_H: i32 = 25;
+    /// The column header above the rows (`nxfiles::HEADER_H`), new in Part I.
+    pub const HEADER_H: i32 = 25;
 }
 
 const DEMO_USER: &str = "alice";
@@ -5114,25 +5142,31 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **The sidebar takes the left of the content** (M14 Part D), so every aim at a *listing* row
     // starts past it while the strips above still span the full width. `nxfiles::SIDEBAR_W` is
     // the browser's own version of this number.
-    const SIDEBAR_W: i32 = 148;
+    const SIDEBAR_W: i32 = browser::SIDEBAR_W;
     // **And the margin around it** (M15 Part E), which moved every sidebar row down by its height
-    // without moving a listing row at all. `nxfiles::SIDEBAR_PAD` is the browser's own version.
-    const SIDEBAR_PAD: i32 = 6;
+    // without moving a listing row at all. The design's sidebar runs to the window's edge, so
+    // since the refresh's Part I that margin is nought.
+    const SIDEBAR_PAD: i32 = browser::SIDEBAR_PAD;
     const TITLE_BAR_H: i32 = chrome::TITLE_BAR_H;
-    const PATH_H: i32 = 24;
-    const ROW_H: i32 = 20;
+    const PATH_H: i32 = browser::PATH_H;
+    const ROW_H: i32 = browser::ROW_H;
     // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
     // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
     // missed the change would press one row high and drag the wrong file.
     const MENU_BAR_H: i32 = 24;
-    let row_y = |row: i32| {
-        files_win.2 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
-    };
-    // **A sidebar row is `SIDEBAR_PAD` lower than the listing row beside it**, since M15 Part E
-    // put a margin around the panel. Aiming at a listing row still landed inside the sidebar row
-    // of the same index — 4px into a 20px row rather than at its middle — so the gate passed and
-    // said nothing about having lost most of its margin (PR #290 review, 6).
-    let side_y = |row: i32| row_y(row) + SIDEBAR_PAD;
+    // **No tab strip while there is one tab** (desktop refresh, Part I): the browser leaves it
+    // out rather than drawing an empty one, so every row moved up by its height — and **a column
+    // header sits above the rows now**, so they moved back down by its. `nxfiles::list_top` is
+    // the browser's own version of this sum.
+    // Where the window's content begins, below the chrome that spans its whole width.
+    let content_top = files_win.2 + TITLE_BAR_H + MENU_BAR_H + PATH_H;
+    let row_y = |row: i32| content_top + browser::HEADER_H + row * ROW_H + ROW_H / 2;
+    // **A sidebar row is not a listing row's neighbour any more** (desktop refresh, Part I): the
+    // column header sits above the *listing* and the sidebar starts at the content's top, so the
+    // two are a header apart. This was `row_y(row) + SIDEBAR_PAD`, which after the header landed
+    // a whole row low — the gate pressed `Downloads` while asking for `Documents`, and said so.
+    // `SIDEBAR_PAD` is nought since the same part, the design's sidebar running to the edge.
+    let side_y = |row: i32| content_top + SIDEBAR_PAD + row * ROW_H + ROW_H / 2;
 
     // **The sidebar** (M14 Part D). One press on *Documents* goes there — one, not two: a sidebar
     // row has nothing to select and no second verb, so the listing's double click would be a rule
@@ -5426,15 +5460,24 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // click would work and the window would not move, but the gate would be asserting against a
     // gesture it did not mean to make. The path text carries no handler and still raises the
     // window, because click-to-focus is the compositor's and not the toolkit's.
-    // **On the path strip**, which is now three strips down: a title bar, the menus, and the
-    // tabs. `fy + 38` used to be the path and is the *menu bar* since M12 Parts B and D — it
-    // still raised the window, because click-to-focus is the compositor's and the bar's own
-    // background carries no handler, so this went on passing while meaning something else.
+    // **On the path strip**, which is two strips down: a title bar and the menus. It was three
+    // until the refresh's Part I, when the browser stopped drawing a tab strip for a single tab
+    // — and an aim that still counted one landed on the *sidebar's* first place, so the "inert"
+    // click navigated to `/home` and the `Backspace` after it went up to `/`. **This gate passed
+    // locally anyway**, because that Backspace was lost on the way; CI's landed, and the step
+    // walked into the wrong directory. `fy + 38` used to be the path and is the *menu bar* since
+    // M12 Parts B and D — it still raised the window, because click-to-focus is the compositor's
+    // and the bar's own background carries no handler, so this went on passing while meaning
+    // something else. The same shape of mistake twice, which is why the sum lives in `browser`.
+    // **And clear of the sidebar**, which is what turned a slip into a navigation: over the
+    // places, a press one strip out goes somewhere; over the listing, the worst a slip can do is
+    // select a row, because descending takes a second click. An inert click should be inert
+    // under a mistake as well as under a correct sum.
     click_at(
         &mut qmp,
         &mut session,
-        fx + 120,
-        fy + 1 + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H / 2,
+        fx + SIDEBAR_W + 60,
+        fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2,
     )?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
@@ -5474,10 +5517,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: and hid it again, leaving the directory as the rest of this gate expects");
 
     // Row 1 is `other.txt`: the listing sorts directories first and then by name, and `notes`
-    // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
-    // and the path strip — plus half a row.
-    let row1 =
-        (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + chrome::TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
+    // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar,
+    // the menus, the path strip and the column header — plus a row and a half. **No tab strip**,
+    // which the browser leaves out for a single tab (desktop refresh, Part I), and **a header**,
+    // which it gained in the same part.
+    let row1 = (
+        fx + SIDEBAR_W + 120,
+        fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + browser::HEADER_H + ROW_H + ROW_H / 2,
+    );
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -13923,6 +13970,53 @@ mod tests {
         ] {
             assert_eq!(gate, toolkit, "`chrome::{what}` is {gate}, the toolkit's is {toolkit}");
         }
+    }
+
+    /// Every metric `browser` copies from `nxfiles` still equals the browser's.
+    ///
+    /// **Read out of the source, because this crate cannot link that one** — `nxfiles` is a
+    /// bare-target program and its library half pulls `libsurface` with it, which is the same
+    /// reason the greeter's pair is parsed rather than imported. The toolkit's own metrics are
+    /// imported instead; see `the_gates_chrome_table_is_the_toolkits`.
+    ///
+    /// The extraction is guarded: a constant that stops being a literal fails here rather than
+    /// quietly comparing nothing.
+    #[test]
+    fn the_gates_browser_table_is_the_browsers() {
+        let path = repo_root().join("userspace/nxfiles/src/lib.rs");
+        let text = fs::read_to_string(&path).expect("the browser's source is readable");
+        let mut found: BTreeMap<String, i32> = BTreeMap::new();
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub const ") else { continue };
+            let Some((name, tail)) = rest.split_once(':') else { continue };
+            let Some((ty, val)) = tail.split_once('=') else { continue };
+            if ty.trim() != "u32" {
+                continue;
+            }
+            if let Ok(v) = val.trim().trim_end_matches(';').parse::<i32>() {
+                found.insert(name.trim().to_string(), v);
+            }
+        }
+        let get = |what: &str| {
+            *found.get(what).unwrap_or_else(|| {
+                panic!(
+                    "no `pub const {what}: u32` in {} — this checker's pattern has gone stale, \
+                     which silently stops comparing anything",
+                    path.display()
+                )
+            })
+        };
+        for (what, gate, app) in [
+            ("SIDEBAR_W", browser::SIDEBAR_W, get("SIDEBAR_W")),
+            ("SIDEBAR_PAD", browser::SIDEBAR_PAD, get("SIDEBAR_PAD")),
+            ("PATH_H", browser::PATH_H, get("PATH_H")),
+            ("ROW_H", browser::ROW_H, get("ROW_H")),
+        ] {
+            assert_eq!(gate, app, "`browser::{what}` is {gate}, the browser's is {app}");
+        }
+        // `HEADER_H` is the toolkit's, which the browser re-exports rather than spelling.
+        assert_eq!(browser::HEADER_H, libui::widget::LIST_HEADER_H as i32);
     }
 
     /// The gate's copy of the greeter's window is the greeter's own.

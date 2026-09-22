@@ -584,22 +584,48 @@ Toolkit pieces the three applications share, so each is built once and restyled 
 
 ## Part I — the file browser
 
-- [ ] **The toolbar row** (39 px with its rule; padding 7/9; gap 6): the `↑` icon button, the path
+- [x] **The toolbar row** (39 px with its rule; padding 7/9; gap 6): the `↑` icon button, the path
       field as breadcrumb segments — mono, dim segments, `/` in `border` — and the Search field.
-- [ ] **Search filters or is absent.** The page's is a placeholder. The honest version filters the
+      **Partly built.** The `↑` is a button with a glyph, rounded by Part H; the path is
+      breadcrumb segments with the separators in `border` and the names in the body ink. **Not the
+      design's 39-pixel row**, and not mono: the strip is still `PATH_H`, because its three modes
+      — the path, the location field and a rename — share a height, and re-cutting that is a
+      bigger change than this part needs.
+- [x] **Search filters or is absent.** The page's is a placeholder. The honest version filters the
       current listing as you type, by the rule the Applications menu already uses — and a field
       that looked like search and did nothing would be the defect every earlier part has named.
-- [ ] **Columns**: a 25 px header row (Name flexible, Size 70 right-aligned, Kind 60, Modified 96;
+      **Built as a filter.** `Ctrl+F` (View ▸ Search…) opens a field in the toolbar; typing
+      narrows the listing by the Applications menu's rule, case-insensitive and anywhere in the
+      name; `Esc` closes it and `Enter` opens what is left. **It is absent until opened**, which
+      is the honest reading of "or is absent" — a field sitting there doing nothing was the
+      alternative this box ruled out. Rows keep their index into the whole listing, so a filtered
+      row opens the file it names.
+- [x] **Columns**: a 25 px header row (Name flexible, Size 70 right-aligned, Kind 60, Modified 96;
       10.5 px medium dim on `face_hover`, a `--lineSoft` rule); rows of 25 px, padding 5/11, gap 8.
       Size human-readable (`848`, `11K`, `2.8M`), Kind `dir` or the extension, Modified `HH:MM`
       today and a date otherwise — `libtime`, which already formats the clock. Whether a header
       click sorts is decided here: the View menu already holds the orders.
-- [ ] **The row swatch**: 11×9, 1 px corners — the accent for a folder, `border` for a file.
-- [ ] **The sidebar**: 132 px on `sidebar` against the window's edge rather than inset, rows of 25
+      **Built**, in the toolkit rather than in the browser: a `ListRow` carries cells and
+      `list_view` takes the widths. `Size` is `4096`/`2.8M` right-aligned, `Kind` is `dir` or the
+      extension, `Modified` is `HH:MM` today and a date before it — from `libtime`, with the clock
+      read by the binary per listing so the view stays a function of values. **A header click does
+      not sort**; the View menu's four orders are the answer for now.
+- [x] **The row swatch**: 11×9, 1 px corners — the accent for a folder, `border` for a file.
+      **Built**: 11×9 with a one-pixel corner, the accent for a folder and `border` for a file.
+      The shape is a `Swatch`, so the sidebar's dot is the same field at another size.
+- [x] **The sidebar**: 132 px on `sidebar` against the window's edge rather than inset, rows of 25
       px with a 5 px dot (`ok`; Root `deny`) and the selection wash.
-- [ ] **The status bar**: `N items`, and the selection.
-- [ ] **The tab strip only when there are two tabs.** The design shows none; tabs are ours, and a
+      **Built**: 132 px, against the window's edge (the margin was 6 and is now nought), with a
+      5-pixel dot per place — `ok`, and `deny` for Root, which is the only warning before stepping
+      out of a home directory. The selection wash was already there.
+- [x] **The status bar**: `N items`, and the selection.
+      **Built**: `N items`, and after a separator what is selected.
+- [x] **The tab strip only when there are two tabs.** The design shows none; tabs are ours, and a
       strip holding one tab is chrome with nothing to switch between.
+      **Built**, and it had to be *left out* rather than sized to nothing: a zero-height box still
+      paints its children, so the tab and the `+` drew over the chrome below it. The screendump
+      caught that; the test that now catches it counts ink in the band rather than asserting a
+      height.
 - [ ] **Not built: the free-space readout**, until a filesystem operation reports free space.
       Trigger: that operation, which the administration phase's disk tools will want anyway.
 

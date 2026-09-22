@@ -27171,3 +27171,92 @@ them. A subtitle in body ink was "dimmer than the title" by three units of antia
 bar's readings and a pill's label were counted by exact colour, which at the small step is almost
 no pixels at all. The fix each time was an absolute threshold — the ink itself — rather than a
 relative one.
+
+## 2026-09-21 — Desktop refresh Part I: the file browser's listing becomes a table
+
+**Columns are the toolkit's, not the browser's.** A `ListRow` carries trailing `cells` and an
+optional `swatch`; `list_view` takes the column widths and their alignment; `list_header` draws
+the headings from that same spec with the rows' own insets, so a heading cannot sit off the
+column under it. **A row with neither cells nor swatch is byte-for-byte what it was** — one
+padded label, no row wrapper — because every other list in the system is a name and nothing else,
+and a node per row in every window list would be the cost of a feature they do not use.
+
+**The name flexes and the columns are fixed**, which is `TAB_W`'s argument again: a long name is
+what gets cut short, never a size or a date, and columns that shared the width out would move
+under each other as a listing changed.
+
+**`Modified` needs to know what today is, so the binary reads the clock and the view is a
+function of it.** `HH:MM` for today and a date before that; the pure half cannot call the clock
+and stay host-testable, so `now_nanos` is read per listing — a browser repaints on every
+keystroke and the date does not change between them. Zero means the machine has no clock, and
+then every row shows a date rather than a fabricated 1970, which is the rule `modified_text`
+already followed.
+
+**Search filters or is absent, and it filters.** `Ctrl+F` opens a field in the toolbar; typing
+narrows the listing by the Applications menu's rule — case-insensitive, anywhere in the name —
+`Esc` closes it and `Enter` opens what is left. **A row keeps its index into the whole listing**,
+because its key is that index and opening, dragging, renaming and the marked set all resolve
+through it: a filter that renumbered its rows would leave every one of those acting on the wrong
+file. The test's control is exactly that renumbering.
+
+**The row it went into is the View menu, not File.** File's rows are indexed by `check-login`,
+and a row wedged into the middle of it moves a gate's aim for a reason that has nothing to do
+with the gate. Search belongs beside the orders anyway: what it changes is which rows are shown.
+
+**A zero-height box still paints its children.** The tab strip is left out of the dock when there
+is one tab — the design draws none — and sizing it to nothing left the tab and the `+` drawing
+over the chrome below. That is the third variant of "present but invisible" in three parts, and
+the first where the *absence* was the thing that did not happen. The screendump caught it; the
+test that now catches it counts ink in the band the strip would occupy rather than asserting a
+height.
+
+**The gate's copies of the browser's metrics are a table now, checked like the others.** Rows are
+25 and not 20, the sidebar's margin is nought, the tab strip is gone at one tab and a header sits
+above the rows — four changes to the same sum, which is how a gate comes to press one row high.
+`the_gates_browser_table_is_the_browsers` reads them out of `nxfiles`'s source, because `xtask`
+cannot link a bare-target program whose library half pulls `libsurface`; the toolkit's own
+metrics are imported rather than parsed, as PR #319's review established.
+
+**Left undone, and named.** The toolbar is not re-cut to the design's 39-pixel row: its three
+modes — the path, the location field, a rename — share a height, and changing that is a larger
+job than this part needs. A header click does not sort; the View menu's four orders are the
+answer until somebody asks for the other. The free-space readout still waits on a filesystem
+operation that reports free space.
+
+## 2026-09-22 — Part I, reviewed: a filter made "which row" and "which file" two questions
+
+PR #320's review found four blocking faults. Three are one mistake seen from three sides, and the
+fourth is why the other three got through.
+
+**`ListState::selected` is a row position; this browser's index is an entries index.** Until a
+filter existed those were the same number, and every reader in `nxfiles` means the second. With a
+search narrowing the listing they are different numbers, and `list_view` clamps what it is given
+against the rows it drew — so the screen highlighted one file while `Delete`, `Cut` and the status
+bar named another. The pane keeps the entries index, because that is what its readers mean, and
+`view` translates into the widget's space and back around the call. Arrows, a drop's `y`, a
+scrollbar drag and a range selection all move through the rows that are *shown*.
+
+**`Enter` in the search field sent a key where an entries index belongs**, so the feature this
+part's own plan box and log entry describe — "Enter opens what is left" — did nothing at all. It
+opens the selection now, falling back to the first match, because arrows move the selection while
+a search is up.
+
+**`list_top` was not updated when `list_h` was**, which is precisely what that function exists to
+prevent: its doc says "one place, because two would disagree". A drop landed on the row above the
+one it was released over, and with two tabs on the row below. The drag tests aim *through*
+`list_top`, so they agreed with it and passed.
+
+**The test that was supposed to catch all of this pinned a helper instead of the path that uses
+it.** Its control renumbered inside `visible_indices`; the reviewer renumbered the *rows* — the
+mistake the entry called out by name — and every test in the crate passed. The replacement presses
+a row through the built tree with a filter up, asks the Edit menu what it would act on, and presses
+Enter. **A test that names a property has to act through the thing that has it**, which is the
+same lesson as PR #318's greeter size, one layer further in: there the test pinned the constant
+beside it rather than the gate's copy.
+
+**Two more of the same kind.** A list that overflows gives its rows the scrollbar's width, and the
+header did not, so every column sat twelve pixels left of its heading in any directory long enough
+to scroll — the doc claimed "the two cannot drift apart" while they were drifting. And the listing
+and the sidebar both stopped short of the new status bar: the listing still subtracted a resize
+grip the status bar now covers, and the sidebar was sized to the listing's height while its column
+is that plus the header.

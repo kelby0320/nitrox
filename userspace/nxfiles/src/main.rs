@@ -163,6 +163,25 @@ fn fail(msg: &[u8]) -> ! {
 }
 
 
+/// The wall clock in nanoseconds since the epoch, or `0` when the machine has none.
+///
+/// **Zero rather than a fabricated epoch**: the kernel answers `Unsupported` on a machine whose
+/// RTC could not be read, and a listing whose dates were all 1970 would be stating something
+/// false rather than admitting it knows nothing. `column_modified` shows a date rather than a
+/// time when it has no today to compare against.
+fn clock_now() -> u64 {
+    let mut nanos = 0u64;
+    // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
+    let r = unsafe {
+        libkern::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
+    };
+    if r < 0 { 0 } else { nanos }
+}
+
 /// Read `path` and hand the listing to `app`.
 ///
 /// **A failed listing leaves the browser where it was**, saying so on the debug console rather
@@ -175,6 +194,12 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
         Ok(entries) => {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
             let read = rows.len();
+            // **What the clock says, read here and handed to a view that is a function of it**
+            // (desktop refresh, Part I): the `Modified` column shows `HH:MM` for today and a
+            // date before that, and "today" is a fact about the world that the pure half cannot
+            // fetch for itself. Read per listing rather than per frame — a browser repaints on
+            // every keystroke, and the date does not change between them.
+            app.now_nanos = clock_now();
             app.show(path, rows);
             // **Counted after `show`, because `show` is what decides which of them the tab
             // holds.** The count used to be `rows.len()` — what the directory *read* returned —
