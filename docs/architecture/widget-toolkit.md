@@ -1013,7 +1013,16 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   **The name flexes and the columns are fixed**, which is the same argument `TAB_W` makes: a
   long name is what gets cut short, never a size or a date, and columns that shared the width
   out would move under each other as a listing changed. `list_header` draws the headings from
-  the same spec and with the rows' own insets, so the two cannot drift apart.
+  the same spec and with the rows' own insets — **and gives up the scrollbar's width when the
+  list scrolls**, which a caller asks `list_scrolls`. Without that the two *did* drift: a list
+  long enough to overflow put its rows beside a bar and every column sat twelve pixels left of
+  its heading, which is most real directories (PR #320 review).
+
+  **`ListState::selected` is a row position**, and an application that keeps an index into
+  something else — the browser keeps one into its unfiltered listing — has to translate at this
+  boundary. `list_view` highlights by position and clamps against the rows it was given, so an
+  index from another space is read as a position and the highlight stops naming the thing the
+  application thinks is selected.
 
 - **Multi-window applications** — *here since M12 Part A*, for the windows an application opens
   **beside** its main one. The trigger fired exactly as written: `nxedit` asks before discarding

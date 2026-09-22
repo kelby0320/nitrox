@@ -27222,3 +27222,41 @@ modes — the path, the location field, a rename — share a height, and changin
 job than this part needs. A header click does not sort; the View menu's four orders are the
 answer until somebody asks for the other. The free-space readout still waits on a filesystem
 operation that reports free space.
+
+## 2026-09-22 — Part I, reviewed: a filter made "which row" and "which file" two questions
+
+PR #320's review found four blocking faults. Three are one mistake seen from three sides, and the
+fourth is why the other three got through.
+
+**`ListState::selected` is a row position; this browser's index is an entries index.** Until a
+filter existed those were the same number, and every reader in `nxfiles` means the second. With a
+search narrowing the listing they are different numbers, and `list_view` clamps what it is given
+against the rows it drew — so the screen highlighted one file while `Delete`, `Cut` and the status
+bar named another. The pane keeps the entries index, because that is what its readers mean, and
+`view` translates into the widget's space and back around the call. Arrows, a drop's `y`, a
+scrollbar drag and a range selection all move through the rows that are *shown*.
+
+**`Enter` in the search field sent a key where an entries index belongs**, so the feature this
+part's own plan box and log entry describe — "Enter opens what is left" — did nothing at all. It
+opens the selection now, falling back to the first match, because arrows move the selection while
+a search is up.
+
+**`list_top` was not updated when `list_h` was**, which is precisely what that function exists to
+prevent: its doc says "one place, because two would disagree". A drop landed on the row above the
+one it was released over, and with two tabs on the row below. The drag tests aim *through*
+`list_top`, so they agreed with it and passed.
+
+**The test that was supposed to catch all of this pinned a helper instead of the path that uses
+it.** Its control renumbered inside `visible_indices`; the reviewer renumbered the *rows* — the
+mistake the entry called out by name — and every test in the crate passed. The replacement presses
+a row through the built tree with a filter up, asks the Edit menu what it would act on, and presses
+Enter. **A test that names a property has to act through the thing that has it**, which is the
+same lesson as PR #318's greeter size, one layer further in: there the test pinned the constant
+beside it rather than the gate's copy.
+
+**Two more of the same kind.** A list that overflows gives its rows the scrollbar's width, and the
+header did not, so every column sat twelve pixels left of its heading in any directory long enough
+to scroll — the doc claimed "the two cannot drift apart" while they were drifting. And the listing
+and the sidebar both stopped short of the new status bar: the listing still subtracted a resize
+grip the status bar now covers, and the sidebar was sized to the listing's height while its column
+is that plus the header.

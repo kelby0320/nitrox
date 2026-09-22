@@ -163,13 +163,6 @@ fn fail(msg: &[u8]) -> ! {
 }
 
 
-/// Read `path` and hand the listing to `app`.
-///
-/// **A failed listing leaves the browser where it was**, saying so on the debug console rather
-/// than clearing the window: a directory that cannot be read is a thing that happens — a
-/// permission a namespace does not carry, a path that went away between the press and the read
-/// — and a browser that emptied itself in response would lose the one thing the user could
-/// still act on, which is the listing they came from.
 /// The wall clock in nanoseconds since the epoch, or `0` when the machine has none.
 ///
 /// **Zero rather than a fabricated epoch**: the kernel answers `Unsupported` on a machine whose
@@ -189,6 +182,13 @@ fn clock_now() -> u64 {
     if r < 0 { 0 } else { nanos }
 }
 
+/// Read `path` and hand the listing to `app`.
+///
+/// **A failed listing leaves the browser where it was**, saying so on the debug console rather
+/// than clearing the window: a directory that cannot be read is a thing that happens — a
+/// permission a namespace does not carry, a path that went away between the press and the read
+/// — and a browser that emptied itself in response would lose the one thing the user could
+/// still act on, which is the listing they came from.
 fn navigate(app: &mut App, ns: u64, path: &str) {
     match libfs::list_dir(ns, path.as_bytes()) {
         Ok(entries) => {

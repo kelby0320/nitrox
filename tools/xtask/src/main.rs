@@ -82,26 +82,9 @@ const FAT32_MIN_MIB: u64 = 33;
 /// grew from 26 to 31, its buttons went from contiguous 26-pixel slots to the design's 23 with 9
 /// between, and a window's content lost its 3-pixel frame. They were a dozen inline numbers —
 /// `+ 13`, `- 39`, `- 65`, `+ 4` — and a change to the chrome was a search for all of them.
-/// **The file browser's own chrome, as the gates aim at it** — `nxfiles`'s metrics, copied on
-/// purpose for `chrome`'s reason (M11 decision 2). `xtask` cannot link that crate: it is a
-/// bare-target program, and its library half pulls `libsurface` with it.
 ///
-/// `the_gates_browser_table_is_the_browsers` reads them out of its source and compares, the way
-/// the greeter's pair is kept honest (PR #318 review, finding 1).
-mod browser {
-    /// The sidebar's width (`nxfiles::SIDEBAR_W`): the design's 132 since the refresh's Part I.
-    pub const SIDEBAR_W: i32 = 132;
-    /// The margin around it (`nxfiles::SIDEBAR_PAD`) — nought since Part I, where it was 6: the
-    /// design's sidebar runs to the window's edge.
-    pub const SIDEBAR_PAD: i32 = 0;
-    /// The path strip's height (`nxfiles::PATH_H`).
-    pub const PATH_H: i32 = 24;
-    /// A listing row's height (`nxfiles::ROW_H`): the design's 25 since Part I, where it was 20.
-    pub const ROW_H: i32 = 25;
-    /// The column header above the rows (`nxfiles::HEADER_H`), new in Part I.
-    pub const HEADER_H: i32 = 25;
-}
-
+/// **The browser's own metrics are [`browser`] below**, a separate table because they come from a
+/// separate crate and are checked a different way: `xtask` links `libui` and parses `nxfiles`.
 mod chrome {
     /// A title bar's height, its bottom rule included (`libui::widget::TITLE_BAR_H`).
     pub const TITLE_BAR_H: i32 = 31;
@@ -137,6 +120,25 @@ mod chrome {
     pub const TAB_SIDE: i32 = 6;
     /// From one tab's left edge to the next's (`TAB_PITCH`): a tab and the pixel between them.
     pub const TAB_PITCH: i32 = 121;
+}
+
+/// **The file browser's own chrome, as the gates aim at it** — `nxfiles`'s metrics, copied on
+/// purpose for [`chrome`]'s reason (M11 decision 2). `xtask` cannot link that crate: it is a
+/// bare-target program, and its library half pulls `libsurface` with it, so
+/// `the_gates_browser_table_is_the_browsers` reads them out of its source and compares — the way
+/// the greeter's pair is kept honest (PR #318 review, finding 1).
+mod browser {
+    /// The sidebar's width (`nxfiles::SIDEBAR_W`): the design's 132 since the refresh's Part I.
+    pub const SIDEBAR_W: i32 = 132;
+    /// The margin around it (`nxfiles::SIDEBAR_PAD`) — nought since Part I, where it was 6: the
+    /// design's sidebar runs to the window's edge.
+    pub const SIDEBAR_PAD: i32 = 0;
+    /// The path strip's height (`nxfiles::PATH_H`).
+    pub const PATH_H: i32 = 24;
+    /// A listing row's height (`nxfiles::ROW_H`): the design's 25 since Part I, where it was 20.
+    pub const ROW_H: i32 = 25;
+    /// The column header above the rows (`nxfiles::HEADER_H`), new in Part I.
+    pub const HEADER_H: i32 = 25;
 }
 
 const DEMO_USER: &str = "alice";

@@ -2940,6 +2940,7 @@ pub fn list_header<Msg>(
     headings: &[&str],
     columns: &[ListColumn],
     swatched: bool,
+    scrolling: bool,
     theme: &Theme,
 ) -> Element<Msg> {
     let heading = |s: &str| center_v(ink(theme.foreground_dim, scaled(TextSize::Small, text(s))));
@@ -2969,9 +2970,25 @@ pub fn list_header<Msg>(
                 alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))],
                 text(""),
             ),
-            padding(ROW_PAD, row(cells)),
+            padding(
+            // **The scrollbar's width, when there is one** (PR #320 review, worth fixing 5): a
+            // list that overflows puts its rows beside a scrollbar and they lose that width,
+            // while this spans the whole strip — so every column sat twelve pixels left of its
+            // heading in any directory long enough to scroll, which is most of them.
+            Insets { right: ROW_PAD.right + if scrolling { SCROLLBAR_W } else { 0 }, ..ROW_PAD },
+            row(cells),
+        ),
         ]),
     )
+}
+
+/// Whether a list of `rows` at `row_height` overflows `height` — and so draws a scrollbar.
+///
+/// **The rule `list_view` uses, published**, because a caller drawing a header above one needs
+/// the same answer and computing it twice is how the two come to disagree.
+pub fn list_scrolls(rows: usize, height: u32, row_height: u32) -> bool {
+    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    rows > visible
 }
 
 /// How wide a list's scrollbar is, in pixels.
@@ -2985,6 +3002,87 @@ mod list_view_tests {
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
         labels.iter().map(|&(key, label)| ListRow { key, label, marked: false, ..Default::default() }).collect()
+    }
+
+    /// A heading sits over its column whether or not the list scrolls.
+    ///
+    /// **The doc says "the two cannot drift apart" and they did** (PR #320 review, worth fixing
+    /// 5): a list that overflows puts its rows beside a scrollbar, so every column moved twelve
+    /// pixels left of its heading — in any directory long enough to scroll, which is most.
+    /// Measured as the right edge of each, which is what has to agree.
+    #[test]
+    fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        let t = Theme::default();
+        let (w, h, row_h) = (400u32, 100u32, 25u32);
+        let columns = [ListColumn { width: 70, align: ColumnAlign::Right }];
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
+        // **Where the ink lands, not where the box is**: the reservation moves a cell *inside*
+        // the strip, so an outer rect is the same either way — a first version of this test
+        // compared those and passed against the bug.
+        let rightmost_ink = |e: &Element<u64>| {
+            let all = libdraw::geom::Rect::new(0, 0, w, 25);
+            let m = crate::paint::FontMetrics::new(&font, t.font_px);
+            let l = crate::layout::layout(e, all, &m);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, 25, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            let mut custom =
+                |_: u32, _: libdraw::geom::Rect, _: libdraw::geom::Rect, _: &mut MemFramebuffer| {};
+            crate::paint::paint(&mut fb, &font, &t, e, &l, all, &mut custom);
+            // **Text only**: a scrolling list draws its bar at the right edge, and the bar is
+            // ink too — what has to line up is the cell's glyphs against the heading's.
+            (0..w)
+                .rev()
+                .find(|x| {
+                    (0..25).any(|y| {
+                        let c = fb.get_pixel(*x, y);
+                        c != Some(t.background)
+                            && c != Some(t.face_hover)
+                            && c != Some(t.border)
+                            && c != Some(t.groove)
+                            && c != Some(t.thumb)
+                    })
+                })
+                .expect("something is drawn")
+        };
+        let right_edges = |count: usize| {
+            let labels: alloc::vec::Vec<(u64, &str)> =
+                (0..count as u64).map(|i| (i, "entry")).collect();
+            let rows: alloc::vec::Vec<ListRow<'_>> = labels
+                .iter()
+                .map(|&(key, label)| ListRow {
+                    key,
+                    label,
+                    marked: false,
+                    cells: &["848"],
+                    swatch: None,
+                })
+                .collect();
+            let scrolls = list_scrolls(rows.len(), h, row_h);
+            let mut st = ListState::default();
+            let list: Element<u64> =
+                list_view(&rows, &columns, &mut st, h, row_h, |k| k, None, None, None, None, &t);
+            let header: Element<u64> =
+                list_header("Name", &["Size"], &columns, false, scrolls, &t);
+            (rightmost_ink(&list), rightmost_ink(&header), scrolls)
+        };
+        // **`848` under `Size`, both right-aligned, so their ink ends at the same x** — within a
+        // pixel, since the two strings are different glyphs.
+        let (short_row, short_head, short_scrolls) = right_edges(2);
+        assert!(!short_scrolls, "two rows do not overflow");
+        assert!(
+            short_row.abs_diff(short_head) <= 1,
+            "with no scrollbar: row ends at {short_row}, heading at {short_head}"
+        );
+        let (long_row, long_head, long_scrolls) = right_edges(40);
+        assert!(long_scrolls, "forty rows overflow");
+        assert!(
+            long_row.abs_diff(long_head) <= 1,
+            "scrolling: row ends at {long_row}, heading at {long_head}"
+        );
+        assert!(long_row < short_row, "and a scrolling list gave up the scrollbar's width");
     }
 
     /// A row's columns are where the list declares them, and its swatch is drawn.
@@ -3045,6 +3143,20 @@ mod list_view_tests {
         };
         assert!(ink_in(size_from, kind_from) > 10, "the size cell is drawn in its column");
         assert!(ink_in(kind_from, w - ROW_PAD.right) > 10, "and the kind cell in its own");
+        // **Right-aligned means against the right edge**, which nothing pinned: making
+        // `ColumnAlign::Right` behave as `Left` passed this test (PR #320 review, 10). The size
+        // column's ink sits in its second half, and the kind column's — left-aligned — in its
+        // first.
+        let half = |x0: u32, x1: u32| (x0 + x1) / 2;
+        assert_eq!(
+            ink_in(size_from, half(size_from, kind_from)),
+            0,
+            "a right-aligned cell puts nothing in the left half of its column"
+        );
+        assert!(
+            ink_in(kind_from, half(kind_from, w - ROW_PAD.right)) > 0,
+            "…and a left-aligned one does"
+        );
         // **The name gives way, not the columns.** A long name is clipped at the column's edge
         // rather than pushing it along — asserted by *which ink* is in the columns' band, since
         // the name is body ink and a cell is the dim step: the darkest pixel there must be no
