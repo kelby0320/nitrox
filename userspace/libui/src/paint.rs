@@ -64,7 +64,11 @@ impl Metrics for FontMetrics<'_> {
     }
 
     fn text_size_as(&self, s: &str, style: TextStyle) -> libdraw::geom::Size {
-        let face = if style.bold { self.font.bold() } else { self.font };
+        // **Fixed-advance first, then weight within it** (desktop refresh, Part J): a buffer set
+        // in the mono face and a bold word inside it want the mono face's bold, and a mono face
+        // with no bold companion answers with itself.
+        let base = if style.mono { self.font.mono() } else { self.font };
+        let face = if style.bold { base.bold() } else { base };
         face.measure(s, style.size.px(self.px))
     }
 }
@@ -205,7 +209,8 @@ fn draw<F, Msg, C>(
             // At the step the enclosing `Scale` set — the size layout measured this run at, which
             // is what keeps the glyphs inside the box they were given.
             let px = at.size.px(theme.font_px);
-            let face = if at.bold { font.bold() } else { font };
+            let base = if at.mono { font.mono() } else { font };
+            let face = if at.bold { base.bold() } else { base };
             let v = face.v_metrics(px);
             let baseline = l.rect.origin.y + libm::ceilf(v.ascent) as i32;
             face.draw_str(fb, Point::new(l.rect.origin.x, baseline), s, px, ink, clip);
@@ -239,6 +244,12 @@ fn draw<F, Msg, C>(
         Node::Bold { child } => {
             if let Some(cl) = l.children.first() {
                 let at = TextStyle { bold: true, ..at };
+                draw(fb, font, theme, child, cl, damage, ink, at, custom);
+            }
+        }
+        Node::Mono { child } => {
+            if let Some(cl) = l.children.first() {
+                let at = TextStyle { mono: true, ..at };
                 draw(fb, font, theme, child, cl, damage, ink, at, custom);
             }
         }
@@ -377,6 +388,42 @@ mod tests {
         let ratio = widths[0] as f32 / widths[1] as f32;
         let want = TextSize::SMALL;
         assert!((ratio - want).abs() < 0.08, "small is {ratio} of body, not {want}");
+    }
+
+    /// Fixed-advance text is set in the face's mono companion — every glyph the same width —
+    /// and in the proportional face when there is none.
+    ///
+    /// **Measured as advance rather than as ink** (desktop refresh, Part J): what makes a face
+    /// fixed is that `i` and `m` take the same room, which a width comparison of two strings of
+    /// the same length says exactly.
+    #[test]
+    fn mono_text_uses_the_companion_face_and_falls_back_without_one() {
+        use crate::element::mono;
+        const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+        let t = Theme::default();
+        let plain = font();
+        let paired = font().with_mono(Font::from_bytes(MONO.to_vec()).expect("the mono face"));
+        let measured = |f: &Font, e: &Element<Msg>| {
+            let loose = crate::layout::Constraints::loose(Size::new(W * 4, H));
+            crate::layout::measure(e, loose, &FontMetrics::new(f, t.font_px)).w
+        };
+        // `iiii` and `mmmm` are the same width in a fixed-advance face and nothing like it in a
+        // proportional one.
+        let narrow = || -> Element<Msg> { mono(text("iiii")) };
+        let wide = || -> Element<Msg> { mono(text("mmmm")) };
+        assert_eq!(
+            measured(&paired, &narrow()),
+            measured(&paired, &wide()),
+            "every glyph takes the same room in the companion"
+        );
+        // Without a companion, the proportional face draws it and the two differ.
+        assert!(
+            measured(&plain, &narrow()) < measured(&plain, &wide()),
+            "with no companion it is the proportional face"
+        );
+        // And the wrapper is what does it: the same strings unwrapped differ even when paired.
+        let bare = |s: &'static str| -> Element<Msg> { text(s) };
+        assert!(measured(&paired, &bare("iiii")) < measured(&paired, &bare("mmmm")));
     }
 
     /// Bold text is set in the face's bold companion — wider, and heavier on the page — and in the

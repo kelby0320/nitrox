@@ -162,6 +162,9 @@ pub struct TextStyle {
     pub size: TextSize,
     /// Drawn in the face's bold companion, if it has one — `libdraw::text::Font::bold`.
     pub bold: bool,
+    /// Whether it is set in the face's fixed-advance companion — an editor's buffer, a byte
+    /// count, a line-and-column readout (desktop refresh, Part J).
+    pub mono: bool,
 }
 
 /// What an element *is*.
@@ -279,6 +282,15 @@ pub enum Node<Msg> {
         /// The step everything inside is set at.
         size: TextSize,
         /// The child.
+        child: Box<Element<Msg>>,
+    },
+    /// A child whose text is set in the fixed-advance face (desktop refresh, Part J).
+    ///
+    /// **Threaded exactly as [`Bold`](Self::Bold) is**, and for its reason: the face changes what
+    /// the text inside measures, so this changes geometry. A face with no fixed-advance
+    /// companion draws it in the proportional one.
+    Mono {
+        /// What is set in it.
         child: Box<Element<Msg>>,
     },
     /// A child whose text is bold — a window's title (desktop refresh, Part G).
@@ -589,6 +601,7 @@ impl<Msg> Element<Msg> {
             | Node::Ink { child, .. }
             | Node::Scale { child, .. }
             | Node::Bold { child }
+            | Node::Mono { child }
             | Node::Center { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
@@ -684,7 +697,12 @@ pub fn scaled<Msg>(size: TextSize, child: Element<Msg>) -> Element<Msg> {
     })
 }
 
-/// Bold text — see [`Node::Bold`].
+/// Text in the fixed-advance face — see [`Node::Mono`].
+pub fn mono<Msg>(child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Mono { child: Box::new(child) })
+}
+
+/// Text inside `child`, in the face's bold. See [`Node::Bold`].
 pub fn bold<Msg>(child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Bold {
         child: Box::new(child),

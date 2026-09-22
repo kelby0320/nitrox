@@ -39,7 +39,7 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, padding, row, sized, text, with_spacing,
+    Edge, Element, Insets, column, dock, docked, mono, padding, row, sized, text, with_spacing,
 };
 use libui::widget::{
     GRIP_W, InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
@@ -66,6 +66,19 @@ pub const ROW_H: u32 = 20;
 
 /// The element key on the text area.
 pub const AREA_KEY: u64 = 1;
+
+/// The text style the buffer is drawn in — and so the one anything measuring it must use.
+///
+/// **One constant, two readers** (desktop refresh, Part J): the view wraps the document in
+/// `mono` and the binary turns a pointer's `x` into a column by measuring with a style. Those
+/// being different faces is a caret that lands further from the pointer the further into the
+/// line it goes, and nothing about the press looks wrong — so the pair is named here and
+/// `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` pins that the view agrees.
+pub const BUFFER_STYLE: libui::element::TextStyle = libui::element::TextStyle {
+    size: libui::element::TextSize::Body,
+    bold: false,
+    mono: true,
+};
 
 /// The document's own key inside the area's dock — see [`AREA_KEY`].
 ///
@@ -2255,17 +2268,24 @@ impl App {
         let focused = self.focused;
         let visible = (h / ROW_H) as usize;
         let bar = self.buf().text.bar(visible);
-        let area = text_area(
-            &mut self.buf_mut().text,
-            h,
-            ROW_H,
-            focused,
-            &ink,
-            Some(Msg::AreaPointer),
-            &ui,
-        )
-        .on_drop(Msg::Dropped)
-        .on_wheel(Msg::AreaWheel);
+        // **The buffer is set in the fixed-advance face** (desktop refresh, Part J): code in a
+        // proportional face was the largest single difference between this window and the
+        // design, and it is the difference between columns that line up and columns that do not.
+        // The chrome around it stays proportional — `mono` wraps what is inside it and nothing
+        // else, which is how a window comes to be painted in two faces at once.
+        let area = mono(
+            text_area(
+                &mut self.buf_mut().text,
+                h,
+                ROW_H,
+                focused,
+                &ink,
+                Some(Msg::AreaPointer),
+                &ui,
+            )
+            .on_drop(Msg::Dropped)
+            .on_wheel(Msg::AreaWheel),
+        );
         // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
         // its own doc says so, and says it is the application's to compose, which `nxterm` does
         // for its grid and this window did not. Without it a document longer than the window had
@@ -2510,6 +2530,103 @@ mod tests {
     /// Eight pixels a character, which is what `CELL` gives these tests.
     fn width(s: &str) -> u32 {
         (s.chars().count() * 8) as u32
+    }
+
+    /// The view draws the buffer in the style [`BUFFER_STYLE`] names.
+    ///
+    /// **The link between the two readers** (desktop refresh, Part J): the binary measures a
+    /// pointer's `x` with that constant, and this asserts the tree wraps the document to match.
+    /// Without it the pair can drift with nothing failing — the caret simply lands in the wrong
+    /// column, further off the further into a line it goes.
+    #[test]
+    fn the_buffer_is_drawn_in_the_style_the_caret_is_measured_in() {
+        assert!(BUFFER_STYLE.mono, "the buffer is fixed-advance");
+        let mut a = app();
+        let e = a.view(&UiTheme::default(), None);
+        // **The wrapper is inside the keyed element**, not above it: the key goes on the sized
+        // box the dock places, and `mono` wraps the widget within it.
+        fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
+            if e.key == Some(key) {
+                return Some(e);
+            }
+            e.children().find_map(|c| keyed(c, key))
+        }
+        fn has_mono<M>(e: &Element<M>) -> bool {
+            matches!(e.node, libui::element::Node::Mono { .. }) || e.children().any(has_mono)
+        }
+        let area = keyed(&e, AREA_KEY).expect("the document is keyed");
+        assert!(
+            has_mono(area),
+            "the document is not drawn in the face the caret is measured in"
+        );
+    }
+
+    /// A press in the buffer lands on the column the **drawn** face puts there.
+    ///
+    /// **The other tests here cannot tell the two faces apart**: they lay out with a `FixedCell`
+    /// of eight pixels and measure with eight-per-character, so a proportional face and a
+    /// fixed-advance one are the same to them. This one uses the real faces, which is the only
+    /// way to catch a caret measured in one and drawn in the other — the pointer would land
+    /// further from the column the further into the line it went (desktop refresh, Part J).
+    #[test]
+    fn a_press_in_the_buffer_lands_where_the_mono_face_draws() {
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+        let face = libdraw::text::Font::from_bytes(DEJAVU.to_vec())
+            .expect("the vendored face")
+            .with_mono(libdraw::text::Font::from_bytes(MONO.to_vec()).expect("its mono"));
+        let theme = UiTheme::default();
+        use libui::layout::Metrics as _;
+        let m = libui::paint::FontMetrics::new(&face, theme.font_px);
+        let in_buffer = libui::element::TextStyle {
+            mono: true,
+            ..libui::element::TextStyle::default()
+        };
+        // A line of `i`s and `m`s: in the fixed-advance face they are the same width, and in the
+        // proportional one an `m` is more than twice an `i`. Pressing past the `i`s is what
+        // separates the two.
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("iiiimmmm", b"iiiimmmm\n");
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &m);
+        let area = libui::layout::locate(&e, &l, AREA_KEY).expect("the document is keyed");
+        // **The prefix's width, not six times one glyph**: the widget walks boundaries by
+        // measuring prefixes, and in integer pixels those are not the same number.
+        let prefix = m.text_size_as("iiiimm", in_buffer).w as i32;
+        let inset = libui::widget::TEXT_AREA_PAD;
+        let x = area.origin.x + inset.left as i32 + prefix;
+        let y = area.origin.y + inset.top as i32 + (ROW_H / 2) as i32;
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+        let p = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x,
+            y,
+            ..Default::default()
+        };
+        for msg in r.pointer(&tree, &e, &l, p).0 {
+            a.update(msg);
+        }
+        a.take_area_pointer(|s| m.text_size_as(s, in_buffer).w);
+        assert_eq!(a.buf().text.cursor(), (0, 6), "the caret is in the column pressed");
+        // **The control, run here rather than by hand**: the same press measured in the
+        // proportional face lands somewhere else entirely.
+        let mut b = App::new("/home/notes.txt", "/home");
+        b.loaded("iiiimmmm", b"iiiimmmm\n");
+        for msg in r.pointer(&tree, &e, &l, p).0 {
+            b.update(msg);
+        }
+        b.take_area_pointer(|s| m.text_size(s).w);
+        assert_ne!(
+            b.buf().text.cursor(),
+            (0, 6),
+            "measuring the face the buffer is *not* drawn in would have to be wrong"
+        );
     }
 
     /// A pointer event over the document, routed through the real tree.

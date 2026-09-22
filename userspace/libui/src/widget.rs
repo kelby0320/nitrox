@@ -1236,6 +1236,10 @@ const TITLE_SUBTITLE_GAP: u32 = 9;
 /// Space between a text field's content and its edge.
 const FIELD_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 
+/// The same inset, for a caller that must aim inside a text area — the editor's tests, which
+/// press at a column and need to know where column nought begins.
+pub const TEXT_AREA_PAD: Insets = FIELD_PAD;
+
 /// How wide the caret is, in pixels.
 const CARET: u32 = 2;
 

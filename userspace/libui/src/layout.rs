@@ -136,6 +136,7 @@ fn measure_in<M: Metrics + ?Sized, Msg>(
         // Scale and bold change no geometry of their own: their child measures in the new style.
         Node::Scale { size, child } => measure_in(child, c, m, TextStyle { size: *size, ..at }),
         Node::Bold { child } => measure_in(child, c, m, TextStyle { bold: true, ..at }),
+        Node::Mono { child } => measure_in(child, c, m, TextStyle { mono: true, ..at }),
         // A colour has no natural size, and a caller wanting a particular one wraps it in
         // `sized` or gives it `flex`.
         //
@@ -306,6 +307,9 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(
         }
         Node::Bold { child } => {
             alloc::vec![arrange_in(child, rect, m, TextStyle { bold: true, ..at })]
+        }
+        Node::Mono { child } => {
+            alloc::vec![arrange_in(child, rect, m, TextStyle { mono: true, ..at })]
         }
         // **The child at its measured size, placed in the middle** — the one wrapper that moves
         // its child rather than merely passing the rectangle through. Rounding leaves the extra

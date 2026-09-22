@@ -84,6 +84,8 @@ pub enum Fingerprint {
     Scale(crate::element::TextSize),
     /// [`Node::Bold`] — a different face repaints, like a different size.
     Bold,
+    /// [`Node::Mono`] — as [`Bold`](Self::Bold), a different face.
+    Mono,
     /// [`Node::Center`]. Like `Offset`, it carries nothing — not even which axes it centres
     /// on: what it changes is a rect, and a rect change is already what `reconcile` damages on.
     Center,
@@ -115,6 +117,7 @@ impl Fingerprint {
             Node::Ink { colour, .. } => Fingerprint::Ink(*colour),
             Node::Scale { size, .. } => Fingerprint::Scale(*size),
             Node::Bold { .. } => Fingerprint::Bold,
+            Node::Mono { .. } => Fingerprint::Mono,
             Node::Center { .. } => Fingerprint::Center,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
