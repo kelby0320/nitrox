@@ -8022,8 +8022,9 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
 /// mistaken for a design opinion.
 fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
-    const MOMENTS: [&str; 8] =
-        ["greeter", "desktop", "apps", "windows", "terminal", "files", "editor", "overview"];
+    const MOMENTS: [&str; 9] = [
+        "greeter", "desktop", "apps", "windows", "terminal", "hover", "files", "editor", "overview",
+    ];
     if what != "all" && !MOMENTS.contains(&what) {
         return Err(format!(
             "no shot called {what:?} — try `all` or one of: {}",
@@ -8103,7 +8104,7 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: applications menu open")?;
     // And drawn, before a keystroke is aimed at it.
     let _ = settle_and_capture(&mut qmp, &dump)?;
-    launch_from_menu(&mut qmp, &mut session, "nxterm")?;
+    let term = launch_from_menu(&mut qmp, &mut session, "nxterm")?;
     // The shell cascades what it places, so the two land offset rather than stacked.
     //
     // **No wait here**: `launch_from_menu` already waited for the shell to place the window,
@@ -8120,6 +8121,14 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     //    The terminal holds the keyboard — it was launched last.
     type_at_terminal(&mut qmp, "list")?;
     capture!("terminal");
+
+    //    **The pointer resting on the terminal's close button** (desktop refresh, after Part K):
+    //    the one state a host render cannot vouch for. `libui`'s tests paint a hovered button and
+    //    route a pointer to its key, but only a live window shows that the application *repaints*
+    //    when the pointer crosses onto it — and a hover nobody can see in the product is the
+    //    defect Part H's close box was. Aimed with the gates' own copy of where close sits.
+    move_pointer_to(&mut qmp, term.0 + term.2 as i32 - chrome::CLOSE_X, term.1 + chrome::TITLE_Y)?;
+    capture!("hover");
 
     //    The browser, raised by its title bar — which the terminal, placed a cascade step lower,
     //    leaves showing.

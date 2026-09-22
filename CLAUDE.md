@@ -200,9 +200,9 @@ hand, from time to time, not in CI**: twenty boots is what confirming resolution
 costs, and no PR should pay it.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
-release image and driving it to eight moments — the greeter, the bare desktop, the Applications
-menu, two real windows, then the terminal, the file browser and the editor each in the state the
-design draws it in, and the overview — then writing what QEMU says is on the display to
+release image and driving it to nine moments — the greeter, the bare desktop, the Applications
+menu, two real windows, then the terminal, the pointer resting on its close button, the file
+browser and the editor each in the state the design draws it in, and the overview — then writing what QEMU says is on the display to
 `tools/build-cache/shot-*.png`. It costs a boot, and it is the only way to see the things
 `preview` cannot: the cursor, the window frames, the ground between windows, and how two windows
 sit next to each other. A tool rather than a gate — it asserts only enough to know the picture is

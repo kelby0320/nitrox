@@ -27598,3 +27598,47 @@ the *same trap* `silent-probe-validity` already records about this exact file, a
 not fire because the probe was "grep a log" rather than "add a probe". **A stale artifact is a
 probe that cannot fire.** Checking the file's mtime against the clock is what turned it around;
 `check-login` writes its transcript unconditionally and was the instrument that worked.
+
+## 2026-09-22 — After Part K: an outlined tab, and hover on the controls that had none
+
+Two things the maintainer noticed once the refresh's eleven parts had merged. Both are small, and
+the second needed a decision about keys that is worth keeping.
+
+**The current tab had no edge.** The design outlines its active tab in `--line` on three sides and
+leaves the bottom open into the content; ours was the window's white on a strip one shade off
+white. It is now two faces rather than a stroked outline — the toolkit's `Outline` is square and
+this must follow a rounded top — and the test that pins it reads back each edge from a painted
+strip, including that the bottom stays open and that an inactive tab stays unoutlined, since an
+outline on every tab marks none.
+
+**The title-bar buttons and a tab's `×` lit on nothing.** The design gives minimise and maximise a
+`--faceLo` face with the glyph in full ink, and close a `--deny` one with a white glyph; those
+shipped as drawn, the white taken as the further of the scheme's two inks from the red (the
+`pill`'s reasoning, since the dark scheme's paper is near-black). The design gives a tab's `×` no
+hover at all, so that one is ours: the neutral `face_pressed`, **not** close's red — closing a tab
+loses one view, closing a window ends a program, and every browser draws that difference.
+
+**Hover in this toolkit is by key, so the controls needed keys.** The title-bar buttons take three
+from the top of the key space, beside the `+`'s `u64::MAX`, far from an application's small
+element keys and its tab keys at `1 << 62` or `1 << 63`. A tab's `×` needs one *per tab*, so it
+is derived: the tab's key with bit 60 set. That is a contract with every application's tab
+numbering, and each of the three now tests it against the toolkit's constant rather than a copy.
+
+**And the label beside the `×` carries its tab's own key.** The diff wants a container's children
+all keyed or none, so keying the `×` meant keying the label too — and keying it with the tab's own
+key keeps "the pointer is over this tab" meaning what it did, while `locate` and `find_by_key`
+walk outside-in and still find the whole tab first. A key repeated at a different depth is legal;
+the diff forbids duplicates only among siblings. Both halves are tested through the real router
+rather than by handing `hovered` in, because a key no pointer could produce passes every painted
+test.
+
+**One control did not apply, and it looked like a failure.** Moving the close bit onto bit 63 to
+check the applications' tests, nxterm's passed — correctly, since its tab keys start at bit 62 and
+never touch 63. The control was aimed at the other two; nxterm needed its own, on the bit its keys
+do use, and that one failed as it should.
+
+**`shot` gained a ninth moment**: the pointer resting on the terminal's close button. The host
+tests paint a hovered button and route a pointer to its key, but only a live window shows that the
+application *repaints* when the pointer crosses onto a new key — and a highlight nobody can see in
+the product is exactly the defect Part H's invisible close box was. The screendump shows 386
+`deny` pixels in the design's 23×21.

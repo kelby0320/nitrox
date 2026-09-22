@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons and a tab's `×` a hover), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -695,7 +695,7 @@ needed them, so they exist:
 
 | Widget | Why it exists |
 |---|---|
-| `title_bar` | Client-side decorations. A `Stack` carrying the window's title, an `on_press_down` for the drag, and a `TitleButtons` set at its right end — minimise, maximise, close, each `TITLE_BUTTON_W` wide, in that order from the left. Every button is an `Option<Msg>`: an absent one draws nothing rather than a disabled square, so an application that cannot be maximised has a bar with two buttons and no gap |
+| `title_bar` | Client-side decorations. A `Stack` carrying the window's title, an `on_press_down` for the drag, and a `TitleButtons` set at its right end — minimise, maximise, close, each `TITLE_BUTTON_W` wide, in that order from the left. Every button is an `Option<Msg>`: an absent one draws nothing rather than a disabled square, so an application that cannot be maximised has a bar with two buttons and no gap. **Each lights on hover** (after Part K), keyed `TITLE_MINIMISE_KEY`, `TITLE_MAXIMISE_KEY` and `TITLE_CLOSE_KEY` from the top of the key space, so a caller passes its `hovered` in: minimise and maximise on `face_pressed` with the glyph in full ink, close on `deny` with the further of the scheme's two inks — red for the one button that ends something |
 | `resize_grip` | The other end of the same idea (Part E): a `GRIP_W` square of nested corner bands with an `on_press_down`, which an application stacks over its own bottom-right. Positioned by its caller, because where a window's corner is is the one thing this widget cannot work out for itself — and stacked rather than docked, so it costs no row of the content under it |
 
 **Both ask and neither acts**, which is not the toolkit's rule but the protocol's:
@@ -1014,6 +1014,23 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   rule, so it runs into the content below; the others have no face at all and their labels are
   dim. A `+` follows the last tab, and a caller may put a window's own controls in a right-hand
   slot — both through `TabExtras`, which keeps two optional things out of the argument list.
+
+  **The current tab is outlined in `border` on three sides and open on the fourth** (added after
+  Part K), the design's `1px solid var(--line)` with its bottom edge in the ground. Without it
+  the current tab was the window's white on a strip one shade off white — the one tab a person
+  most needs to find was the hardest to see. Two faces again rather than a stroked outline,
+  since `Outline` is square: the tab's shape in `border`, then in the ground inset a pixel on
+  three sides with a curve a pixel tighter, as a CSS border's is.
+
+  **A tab's `×` has a key of its own** — `tab_close_key(tab)`, the tab's key with
+  `TAB_CLOSE_BIT` (bit 60) set — so hover can tell it apart from the tab around it, and it lights
+  on a `face_pressed` square with its glyph in full ink. **The label carries its tab's key**:
+  the diff wants a container's children all keyed or none, and giving the label the tab's own
+  key keeps "the pointer is over this tab" meaning what it did, while `locate` and `find_by_key`
+  walk outside-in and still find the whole tab first. A key repeated at a different depth is
+  legal — the diff forbids duplicates only among siblings — and both halves are tested through
+  the real router. **A caller's tab keys must leave bit 60 clear**; every application numbers
+  from `1 << 62` or `1 << 63` and has a test saying so against the toolkit's constant.
 - **Columns in a list** — *here since the desktop refresh's Part I*, because the browser's
   listing is a name and three facts about it where every other list in the system is a name. A
   `ListRow` carries trailing `cells` and an optional `swatch`; `list_view` takes the column

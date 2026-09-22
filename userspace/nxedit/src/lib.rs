@@ -2218,6 +2218,7 @@ impl App {
                 })),
                 close: Some(Msg::Close),
             },
+            hovered,
             &ui,
         )
         .key(TITLE_KEY);
@@ -2470,6 +2471,7 @@ impl App {
                 maximise: None,
                 close: Some(Msg::KeepEditing),
             },
+            hovered,
             ui,
         )
         .key(CONFIRM_TITLE_KEY);
@@ -2625,8 +2627,23 @@ mod tests {
             AREA_PANE_KEY,
             BYTES_KEY,
             BYTES_GAP_KEY,
+            // **The toolkit's own keys, which live in this window too** — its title bar's three
+            // buttons and a tab's `×` (desktop refresh, after Part K). They are numbered from the
+            // top of the key space and from the tab key with `TAB_CLOSE_BIT` set, far from
+            // anything above; listed so that "far" is checked rather than assumed.
+            libui::widget::TITLE_MINIMISE_KEY,
+            libui::widget::TITLE_MAXIMISE_KEY,
+            libui::widget::TITLE_CLOSE_KEY,
+            TAB_KEY_BASE,
+            libui::widget::tab_close_key(TAB_KEY_BASE),
         ];
         keys.extend(MENU_BAR_KEY..MENU_BAR_KEY + menus);
+        // **A tab's `×` is its tab's key with `TAB_CLOSE_BIT` set, which relies on the tab keys
+        // leaving it clear.** They are numbered upward from the base; four billion tabs later
+        // they still do.
+        for k in [TAB_KEY_BASE, TAB_KEY_BASE + (1 << 32)] {
+            assert_eq!(k & libui::widget::TAB_CLOSE_BIT, 0, "tab key {k:#x} sets the close bit");
+        }
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();

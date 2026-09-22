@@ -1446,6 +1446,7 @@ impl App {
                 // is the shell's to reach for (M9 Part C).
                 close: Some(Msg::Close),
             },
+            hovered,
             &ui,
         )
         .key(TITLE_KEY);
@@ -3187,6 +3188,27 @@ mod tests {
     /// a strip over one grid look right until you type in the second one and the first scrolls;
     /// the plan names it exactly — "getting it wrong is how a second tab inherits the first's
     /// scrollback".
+    /// A tab's `×` can have a key of its own, because no tab key sets the bit it uses.
+    ///
+    /// **The toolkit's half of a contract with this crate** (desktop refresh, after Part K):
+    /// `libui` keys a tab's close box as the tab's key with `TAB_CLOSE_BIT` set, so hover can tell
+    /// the `×` from the tab around it. That works only while this terminal's tab keys — numbered
+    /// from `TAB_KEY_BASE`, at most `MAX_TABS` of them live, and never reused — leave the bit
+    /// clear. Tested against the toolkit's constant rather than a copy of it.
+    #[test]
+    fn a_tabs_close_box_can_have_a_key_of_its_own() {
+        let mut a = app();
+        for _ in 0..3 {
+            a.update(Msg::NewTab);
+        }
+        for t in a.tabs() {
+            assert_eq!(t.key() & libui::widget::TAB_CLOSE_BIT, 0, "tab key {:#x} sets the close bit", t.key());
+            assert_ne!(libui::widget::tab_close_key(t.key()), t.key());
+        }
+        // Keys are never reused, so the bound that matters is how many a session could open.
+        assert_eq!((TAB_KEY_BASE + (1 << 32)) & libui::widget::TAB_CLOSE_BIT, 0);
+    }
+
     #[test]
     fn a_second_tab_shares_nothing_with_the_first() {
         let mut a = app();
