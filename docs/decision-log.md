@@ -27260,3 +27260,50 @@ to scroll — the doc claimed "the two cannot drift apart" while they were drift
 and the sidebar both stopped short of the new status bar: the listing still subtracted a resize
 grip the status bar now covers, and the sidebar was sized to the listing's height while its column
 is that plus the header.
+
+## 2026-09-22 — Desktop refresh Part J: the editor, and a second face in the toolkit
+
+**A window is painted with one face, and the editor needs two.** Code set in a proportional face
+was the largest single difference between this window and the design. `libdraw::text::Font`
+carries a fixed-advance companion beside the bold one Part G added, `Node::Mono` threads
+`TextStyle.mono` through measure, arrange, diff and paint, and the face is chosen fixed-advance
+first with the weight within it. The theme names this one — `font_mono`, which a theme may point
+anywhere — so a client loads it and attaches it, where `load_ui` attaches the bold itself.
+
+**Changing the drawn face silently moves the caret, and that is the part worth remembering.**
+Turning a pointer's `x` into a column means measuring text, and the editor's closure still
+measured the proportional face: the caret would land further from the pointer the further into a
+line it went, with nothing about the press looking wrong. The same shape as Part I's blocking
+finding — two spaces that agreed until something made them differ. `nxedit::BUFFER_STYLE` names
+the pair now, the binary measures with it, and a test asserts the view wraps the document to
+match.
+
+**The tests that existed could not have caught it**: they lay out with an eight-pixel `FixedCell`
+and measure eight per character, so a proportional face and a fixed-advance one are the same
+thing to them. The new one uses the real faces and a line of `i`s and `m`s, which are the same
+width in one and nothing like it in the other.
+
+**The gutter is a sibling of the document, not a wrapper round it.** The router hands a widget
+pointer events in its *own* coordinates, so a gutter beside the area leaves the caret's
+arithmetic alone; inside it, every column would have shifted by 36 pixels. `AREA_INNER_KEY` stays
+on the document for the same reason — it is what the tests and gates aim from, and moving it to
+the pair would have moved every press a gutter to the left.
+
+**The byte count and `Save` moved to the tab strip's right-hand slot**, which Part H built for
+them, and the status bar moved to the foot with its rule facing the content. The separate save
+row is gone.
+
+**The scanner gained a `Key` kind, and the palette did not move.** The design colours a TOML key
+distinctly and this system had no kind for it — Part A recorded that. The rule is a character in
+the language table (`assignment`, `=` for TOML and `None` wherever `=` is an operator) and the
+plain name at the head of a line before it. **A key takes the variable colour, not the accent**:
+ours is the focus ring and what a selection is made from, and a third meaning for one colour is
+how a person stops being able to read either. Whether the six syntax colours become the design's
+is the palette decision Part A left open, and this part does not settle it.
+
+**Two guards for one invariant, kept deliberately and said so.** A commented line is excluded
+from the key rule twice over — by a check against the language's comment markers, and by `#` not
+being a character a name may contain. A test cannot tell them apart today; the pair is kept
+because the spelling rule is about *names* and would reasonably be widened one day, at which
+point the comment would stop being protected by an accident. The comment says exactly that,
+rather than implying the check is load-bearing.

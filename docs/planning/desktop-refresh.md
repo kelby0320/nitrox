@@ -631,18 +631,40 @@ Toolkit pieces the three applications share, so each is built once and restyled 
 
 ## Part J — the editor
 
-- [ ] **Monospace text** in `font_mono`, on 20 px lines at the body size. Code in a proportional
+- [x] **Monospace text** in `font_mono`, on 20 px lines at the body size. Code in a proportional
       face is the largest single difference in this window.
-- [ ] **A line-number gutter**: 36 px on `face_hover` with a `--lineSoft` rule, numbers right-aligned
+      **Built**, and it needed the toolkit to reach a second face: `Font` carries a mono companion
+      beside its bold, `Node::Mono` threads `TextStyle.mono` through measure, arrange, diff and
+      paint, and the face is chosen fixed-advance first with the weight within it. The chrome
+      around the buffer stays proportional. **The caret had to move with it** — turning a pixel
+      into a column means measuring in the face the text is *drawn* in, and `BUFFER_STYLE` names
+      that pair so the two cannot drift.
+- [x] **A line-number gutter**: 36 px on `face_hover` with a `--lineSoft` rule, numbers right-aligned
       8 px from it in dim mono, text starting 12 px after.
-- [ ] **The tab strip carries the file's controls**: the byte count in dim mono and an accent
+      **Built**: 36 px on `face_hover` with a rule down its right edge, numbers right-aligned
+      clear of it in the dim step of the same fixed-advance face. **A sibling of the document, not
+      a wrapper round it** — the router hands a widget pointer events in its own coordinates, so a
+      gutter inside the area would have shifted every column by its width.
+- [x] **The tab strip carries the file's controls**: the byte count in dim mono and an accent
       **Save** pill in its right-hand slot, replacing the separate `save` row.
-- [ ] **A status bar at the foot**: the message on the left, `language · ln N, col M` on the right.
-- [ ] **Syntax colours, decided rather than copied.** The page colours TOML's keys in the accent —
+      **Built**: the byte count in dim mono and the accent `Save` pill in the strip's right-hand
+      slot, which Part H put there for this. The separate save row is gone.
+- [x] **A status bar at the foot**: the message on the left, `language · ln N, col M` on the right.
+      **Built**, using Part H's widget with its rule facing the content: the message on the left,
+      `toml · line 1, col 1` on the right in mono so the numbers do not shuffle the line about as
+      the caret moves.
+- [x] **Syntax colours, decided rather than copied.** The page colours TOML's keys in the accent —
       a kind this scanner does not have (Part A recorded it) — strings in a red and numbers in
       `ok`. Adding a key kind is a scanner change; whether the six colours move to the design's
       is a palette decision.
 
+      **Decided, and one half built.** The scanner gained the `Key` kind the design colours and
+      this system did not have: the plain name at the head of a line, before the `=` a language
+      declares in its table — `None` for every language whose `=` is an operator. **The six
+      colours stay ours**: the design paints a TOML key in its accent, and ours is the focus ring
+      and what a selection is made from, so a third meaning for it is how a person stops being
+      able to read either. Whether the palette moves to the design's is still the open decision
+      Part A recorded.
 ## Part K — the terminal's window
 
 Beside Part F, which owns the terminal's colours.

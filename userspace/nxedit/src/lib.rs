@@ -39,16 +39,18 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, mono, padding, row, sized, text, with_spacing,
+    Edge, Element, Insets, TextSize, center_v, column, dock, docked, fill, mono, padding, row,
+    scaled, sized, stack, text, with_spacing,
 };
 use libui::widget::{
     GRIP_W, InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
     TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
-    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_text, tab_strip, text_area,
-    text_field, title_bar, window_frame_with_grip,
+    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_separator, status_text,
+    tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
-/// The status strip's height in pixels — one row of chrome under the title bar.
+/// The status bar's height in pixels — one row of chrome along the window's foot since the
+/// desktop refresh's Part J, where it sat under the title bar.
 ///
 /// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
 /// so its height is that widget's and a second 24 here would have clamped it.
@@ -66,6 +68,23 @@ pub const ROW_H: u32 = 20;
 
 /// The element key on the text area.
 pub const AREA_KEY: u64 = 1;
+
+/// The element key on the byte count in the tab strip, and on the gap after it.
+pub const BYTES_KEY: u64 = 26;
+/// See [`BYTES_KEY`].
+pub const BYTES_GAP_KEY: u64 = 27;
+
+/// The line-number gutter's width: the design's 36.
+pub const GUTTER_W: u32 = 36;
+
+/// How far the numbers sit clear of the gutter's rule: the design's 8.
+const GUTTER_GAP: u32 = 8;
+
+/// The element key on the gutter.
+pub const GUTTER_KEY: u64 = 24;
+
+/// The element key on the gutter and the document together.
+pub const AREA_PANE_KEY: u64 = 25;
 
 /// The text style the buffer is drawn in — and so the one anything measuring it must use.
 ///
@@ -704,6 +723,13 @@ fn colour_of(kind: syntax::Kind, theme: &UiTheme) -> libdraw::format::Rgb {
         syntax::Kind::Number => theme.syntax_number,
         syntax::Kind::Heading => theme.syntax_heading,
         syntax::Kind::Variable => theme.syntax_variable,
+        // **A key takes the variable's colour** (desktop refresh, Part J), which no language
+        // that has keys also uses for variables. The design paints a TOML key in its accent;
+        // ours is the focus ring and a selection is made from it, and a third meaning for one
+        // colour is how a person stops being able to read either. **Whether the six syntax
+        // colours become the design's is a palette decision**, which Part A left open and this
+        // part does not settle.
+        syntax::Kind::Key => theme.syntax_variable,
         // Plain text is the theme's foreground, which the widget draws without being told.
         syntax::Kind::Plain => theme.foreground,
     }
@@ -1796,6 +1822,16 @@ impl App {
         true
     }
 
+    /// How big the buffer is, as the tab strip says it: `1173 bytes`.
+    ///
+    /// **What would be written, not what was read**: the count follows the text as it is typed,
+    /// which is the number a person is watching when they decide to save (desktop refresh,
+    /// Part J).
+    pub fn size_text(&self) -> String {
+        let n = to_bytes(&self.buf().text.text()).len();
+        if n == 1 { String::from("1 byte") } else { alloc::format!("{n} bytes") }
+    }
+
     /// What the current buffer is being highlighted as, for a receipt.
     ///
     /// **A name rather than a boolean**, because the interesting failure is not "highlighting
@@ -2180,14 +2216,11 @@ impl App {
         )
         .key(TITLE_KEY);
 
-        // The status strip: the one control, and what the last thing that happened was.
-        //
-        // **`libui`'s status bar since the desktop refresh's Part H** — the ground, the rule and
-        // the dim step come from there now, so this window's foot and the browser's agree. Its
-        // rule is on the *bottom* because this strip is still under the chrome rather than along
-        // the window's foot, which is where Part J puts it.
+        // **The foot of the window, where the design puts it** (desktop refresh, Part J): what
+        // last happened on the left, and what the buffer is and where the caret is on the right.
+        // Its rule faces the content above it, which is what makes it read as a floor.
         let reading = match self.field.as_ref() {
-            // **The field replaces the status, it does not sit beside it.** The strip is one row
+            // **The field replaces the status, it does not sit beside it.** The bar is one row
             // of chrome and a name being typed *is* what last happened — showing both would make
             // a person read two things to find out which one is asking for an answer.
             Some((_, f)) => padding(
@@ -2196,38 +2229,17 @@ impl App {
             ),
             None => status_text(self.status.clone(), &ui),
         };
+        // **`language · ln N, col M`**, in the fixed-advance face so the numbers do not shuffle
+        // the line about as the caret moves through a file.
+        let position = libui::element::row(alloc::vec![
+            status_text(self.language_name(), &ui),
+            status_separator(&ui),
+            mono(status_text(self.position_text(), &ui)),
+        ]);
         let strip = status_bar(
-            row(alloc::vec![
-                // **The one action in this window, so it is the accent pill** (desktop refresh,
-                // Part H) — the design's `Save`, which is the only control it fills with the
-                // accent. Part J moves it to the tab strip, where the design puts it.
-                // **Sized to the design's 21**, so the control sits *on* the bar rather than
-                // filling it: a pill as tall as the strip it is in reads as a coloured end to
-                // the strip.
-                sized(
-                    Size::new(0, PILL_H),
-                    pill(
-                        "Save",
-                        Msg::Save,
-                        WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                        &ui,
-                    ),
-                )
-                .key(SAVE_KEY),
-                padding(Insets { top: 0, right: 0, bottom: 0, left: STATUS_GAP }, reading)
-                    .key(STATUS_KEY)
-                    .flex(1),
-            ]),
-            // **Line and column, at the right of the strip this window already has** (M14 Part E).
-            // A second bar along the bottom is where a status bar conventionally goes and would
-            // have moved every gate coordinate in the text area for a number; the strip is
-            // already the status bar, and the position a person is at is status.
-            //
-            // **Counted from one**, because that is what every editor's "line 3" means and what a
-            // person comparing against a compiler's error message needs it to mean; the buffer
-            // counts from zero and the conversion belongs at the one place it is displayed.
-            Some(status_text(self.position_text(), &ui).key(POSITION_KEY)),
-            Edge::Bottom,
+            reading.key(STATUS_KEY),
+            Some(position.key(POSITION_KEY)),
+            Edge::Top,
             &ui,
         );
 
@@ -2243,13 +2255,29 @@ impl App {
                 marked: *marked,
             })
             .collect();
+        // **The file's own controls ride on the tab strip** (desktop refresh, Part J), which is
+        // where the design puts them: how big the buffer is, and the one action that changes it.
+        let controls = libui::element::row(alloc::vec![
+            center_v(mono(status_text(self.size_text(), &ui))).key(BYTES_KEY),
+            sized(Size::new(STATUS_GAP, 0), text("")).key(BYTES_GAP_KEY),
+            center_v(sized(
+                Size::new(0, PILL_H),
+                pill(
+                    "Save",
+                    Msg::Save,
+                    WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                    &ui,
+                ),
+            ))
+            .key(SAVE_KEY),
+        ]);
         let strip_tabs = tab_strip(
             &items,
             self.current,
             hovered,
             Msg::SelectTab,
             Msg::CloseTab,
-            TabExtras::new_tab(Msg::NewTab),
+            TabExtras { new_tab: Some(Msg::NewTab), right: Some(controls) },
             &ui,
         );
 
@@ -2286,17 +2314,72 @@ impl App {
             .on_drop(Msg::Dropped)
             .on_wheel(Msg::AreaWheel),
         );
+        // **The line-number gutter** (desktop refresh, Part J): 36 pixels on `face_hover` with a
+        // rule down its right edge, the numbers right-aligned a little clear of it in the dim
+        // step of the same fixed-advance face the buffer uses.
+        //
+        // **A sibling of the document, not a wrapper round it.** The router hands a widget
+        // pointer events in its *own* coordinates, so a gutter beside the area leaves the
+        // caret's arithmetic alone; a gutter inside it would shift every column by 36 pixels and
+        // the caret would land that much to the left of the pointer.
+        let first = self.buf().text.offset();
+        let last = self.buf().text.lines().len();
+        let mut numbers = alloc::vec::Vec::with_capacity(visible);
+        // **`row` and `ink` are taken here** — the loop's index and the highlighter's runs — so
+        // the element builders are named in full rather than shadowed.
+        for n in 0..visible {
+            let line = first + n;
+            let label = if line < last { alloc::format!("{}", line + 1) } else { String::new() };
+            let number = libui::element::ink(
+                ui.foreground_dim,
+                mono(scaled(TextSize::Small, text(label))),
+            );
+            numbers.push(sized(
+                Size::new(0, ROW_H),
+                libui::element::row(alloc::vec![
+                    text("").flex(1),
+                    center_v(number),
+                    sized(Size::new(GUTTER_GAP, 0), text("")),
+                ]),
+            ));
+        }
+        let gutter = sized(
+            Size::new(GUTTER_W, 0),
+            stack(alloc::vec![
+                fill(ui.face_hover),
+                dock(
+                    alloc::vec![docked(Edge::Right, sized(Size::new(1, 0), fill(ui.border)))],
+                    text(""),
+                ),
+                padding(
+                    Insets { top: libui::widget::TEXT_AREA_PAD.top, right: 0, bottom: 0, left: 0 },
+                    column(numbers),
+                ),
+            ]),
+        );
+
         // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
         // its own doc says so, and says it is the application's to compose, which `nxterm` does
         // for its grid and this window did not. Without it a document longer than the window had
         // nothing to say so, and no way to move but the arrow keys.
+        // **Both children keyed**, as the diff requires of a container: the gutter carries its
+        // own and the document keeps `AREA_KEY` one level down, inside the sized box the dock
+        // places.
+        // **`AREA_INNER_KEY` stays on the document itself**, which is what it names and what
+        // every test and gate aims from: putting it on the pair would move the origin to the
+        // gutter's left edge, and a press computed from it would land a gutter to the left of
+        // the column it meant.
+        let pane = libui::element::row(alloc::vec![
+            gutter.key(GUTTER_KEY),
+            padding(Insets::all(0), area).key(AREA_INNER_KEY).flex(1),
+        ]);
         let area = dock(
             alloc::vec![docked(
                 Edge::Right,
                 sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, &ui).on_pointer(Msg::AreaScroll))
                     .key(AREA_BAR_KEY),
             )],
-            area.key(AREA_INNER_KEY),
+            pane.key(AREA_PANE_KEY),
         );
 
         window_frame_with_grip(
@@ -2326,7 +2409,9 @@ impl App {
                         Edge::Top,
                         sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),
                     ),
-                    docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
+                    // **At the foot since Part J**, where it was under the chrome: a status bar
+                    // is a floor, and the design draws it along the bottom of the window.
+                    docked(Edge::Bottom, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
                 ],
             // Sized to the height it was built for, like every scrolling widget in this tree:
             // the dock's flex child otherwise gets whatever is left, and the widget would build
@@ -2532,6 +2617,76 @@ mod tests {
         (s.chars().count() * 8) as u32
     }
 
+    /// The gutter numbers the lines that are on screen, and scrolls with them.
+    ///
+    /// **Painted rather than read off the tree** for the numbers' *place*, and read off the tree
+    /// for which numbers they are: a gutter that showed `1..n` whatever the scroll would look
+    /// right in a screenshot of the top of a file and be wrong everywhere else (desktop refresh,
+    /// Part J).
+    #[test]
+    fn the_gutter_numbers_the_lines_that_are_showing() {
+        let mut a = App::new("/home/long.txt", "/home");
+        let body: String =
+            (1..=40).map(|n| alloc::format!("line {n}\n")).collect::<Vec<_>>().concat();
+        a.loaded(&body, body.as_bytes());
+        // Tall enough to show a dozen lines: the default window fits one, and a gutter with one
+        // number in it cannot say whether it follows the scroll.
+        a.resize(Size::new(600, 400));
+        let theme = UiTheme::default();
+        let numbers = |a: &mut App| -> Vec<String> {
+            let e = a.view(&theme, None);
+            let size = a.window_size();
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+            let g = libui::layout::locate(&e, &l, GUTTER_KEY).expect("the gutter is keyed");
+            assert_eq!(g.size.w, GUTTER_W, "the gutter is the design's width");
+            fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
+                if let libui::element::Node::Text(t) = &e.node
+                    && !t.is_empty()
+                {
+                    out.push(t.clone());
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+                if e.key == Some(key) {
+                    return Some(e);
+                }
+                e.children().find_map(|c| keyed(c, key))
+            }
+            let mut out = Vec::new();
+            walk(keyed(&e, GUTTER_KEY).expect("keyed"), &mut out);
+            out
+        };
+        let top = numbers(&mut a);
+        assert_eq!(top.first().map(String::as_str), Some("1"), "the first line is 1");
+        assert!(top.len() > 1, "and the gutter numbers more than one line");
+        // **Scrolled, the numbers follow.** `scroll_to` is what the wheel and the bar both use.
+        let visible = top.len();
+        a.buf_mut().text.scroll_to(10, visible);
+        let scrolled = numbers(&mut a);
+        assert_eq!(
+            scrolled.first().map(String::as_str),
+            Some("11"),
+            "ten lines down, the gutter starts at eleven"
+        );
+        // **And it stops at the end of the file rather than numbering past it** — the buffer's
+        // own count, which is 41 here because a file ending in a newline has an empty last line.
+        let lines = a.buf().text.lines().len();
+        a.buf_mut().text.scroll_to(lines.saturating_sub(2), visible);
+        let last = numbers(&mut a);
+        assert_eq!(
+            last.last().map(String::as_str),
+            Some(alloc::format!("{lines}").as_str()),
+            "the last number is the last line"
+        );
+        assert!(
+            last.len() <= visible,
+            "and the gutter does not number past the end: {last:?}"
+        );
+    }
+
     /// The view draws the buffer in the style [`BUFFER_STYLE`] names.
     ///
     /// **The link between the two readers** (desktop refresh, Part J): the binary measures a
@@ -2590,7 +2745,9 @@ mod tests {
         let size = a.window_size();
         let e = a.view(&theme, None);
         let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &m);
-        let area = libui::layout::locate(&e, &l, AREA_KEY).expect("the document is keyed");
+        // **From the document, not the pane**: `AREA_KEY` is the box that holds the gutter too
+        // since Part J, and a press computed from its edge would be a gutter to the left.
+        let area = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
         // **The prefix's width, not six times one glyph**: the widget walks boundaries by
         // measuring prefixes, and in integer pixels those are not the same number.
         let prefix = m.text_size_as("iiiimm", in_buffer).w as i32;
@@ -2875,6 +3032,7 @@ mod tests {
             ink_of(&mut a),
             alloc::vec![
                 (0, String::from("[server]"), ui.syntax_heading),
+                (1, String::from("port"), ui.syntax_variable),
                 (1, String::from("80"), ui.syntax_number),
                 (1, String::from("# here"), ui.syntax_comment),
             ]

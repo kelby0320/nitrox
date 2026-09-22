@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, and Part I gave a list columns, cells and row swatches), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -293,13 +293,22 @@ nothing can tell it yet — that is Part K.
 client draws it, because a client knows its own focus and the compositor draws no chrome; we keep
 the tinted title bar as well, which is the refresh's one deliberate divergence from the design.
 
-**And `scaled` and `bold`, which change the text's size and weight the same way** (desktop
-refresh, Part G). The theme carries one size, `font_px`, and text is set at one of three steps
+**And `scaled`, `bold` and `mono`, which change the text's size, weight and face the same way**
+(desktop refresh, Parts G and J). The theme carries one size, `font_px`, and text is set at one of three steps
 derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12, and no step goes under `MIN_FONT_PX`. Those are
 the design's proportions around its 11.5-pixel body: its status bar and secondary columns are
 10 to 10.5 pixels, and its top bar 12.5. `bold` sets text in the
 face's bold companion, `libdraw::text::Font::bold`, which `load_ui` attaches only to the built-in
-face; a face with no companion draws "bold" at its regular weight. Both are inherited like `ink`,
+face; a face with no companion draws "bold" at its regular weight. **`mono` is the same
+arrangement for the fixed-advance face** (Part J): a window is painted with one face, so a
+surface that wants a second — the editor's buffer — carries it as a companion rather than
+changing every paint signature. The theme names that one (`font_mono`), so a client loads it and
+attaches it; the face is chosen fixed-advance first and the weight within it.
+
+**A caller that turns a pixel into a column must measure in the face the text is *drawn* in.**
+The editor names the pair in one constant, `nxedit::BUFFER_STYLE`, because a caret measured in
+the proportional face while the buffer is set in the fixed-advance one lands further from the
+pointer the further into a line it goes — and nothing about the press looks wrong. Both are inherited like `ink`,
 with the innermost winning. **Unlike `ink`, both change geometry**, because they change what the
 text inside measures. So `measure` and `arrange` carry a `TextStyle` down the tree beside the
 constraints, and `Metrics::text_size_as` answers in it. Each is a distinct `Fingerprint`, so
