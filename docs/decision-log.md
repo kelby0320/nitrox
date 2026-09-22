@@ -27349,3 +27349,54 @@ confounded by ink that is not a glyph, the gutter's rule and then the caret, bot
 whole row. The rule is now pinned structurally (the numbers carry no size step) as well as by ink,
 because at the small step the two feet differ by a single pixel, which is inside any tolerance an
 antialiased glyph needs.
+
+## 2026-09-22 — Part K: a leading, a scrollbar that goes away, and OSC 7
+
+The desktop refresh's terminal part, and the last of G–K. Four decisions.
+
+**A row is 1.6 times the text's size, set here rather than taken from the face.** The design puts
+12 px text on 19.5 px rows; DejaVu Sans Mono's own line height is about 1.17, and that is what
+`libterm::render`'s `cell_h` had always been — which is why a terminal read cramped beside every
+other window. A face's line height is about what keeps its glyphs from colliding and says nothing
+about how a page should read. The leading applies to the *size*, as a typographer sets it, and is
+then held to at least the face's own figure so no face gets rows its glyphs do not fit in; the
+extra room is split above and below the glyphs rather than piling under them.
+
+**Nothing pinned `cell_h` before this.** All 131 of `libterm`'s tests passed unchanged with the
+leading in — the metrics test asserted the cell's *width* and the baseline and left the height
+alone, so the one number the grid is built from was free to be anything. That is the same shape
+as Part J's finding and it is the second in two parts: a value can be central to a subsystem and
+still have no test that fails when it changes.
+
+**The scrollbar is hidden until there is history, and its column is kept.** The page shows none;
+ours drew a full-height thumb whether or not anything had scrolled off, which on a screendump is
+a light strip of `--line` down the right of the darkest surface on the screen — the loudest thing
+in an empty terminal, and a control that did nothing. Taking `SCROLL_W` out of `CHROME_W` instead
+would have widened the grid, and the grid would then reflow the first time output ran off the top:
+a terminal rewrapping its screen because a command printed one line too many. So the slot stays
+and carries the terminal's own ground, and the pane simply looks that much wider.
+
+**The shell tells its terminal where it is with `OSC 7`, carrying a path rather than a URL.**
+`nxsh` writes `ESC ] 7 ; <path> BEL` from `repl::prompt` — one place, so the announcement and the
+prompt cannot drift, and `cd` then needs no announcement of its own. Elsewhere the payload is
+conventionally a `file://` URL whose authority names a host and whose octets are percent-encoded;
+Nitrox has neither hosts nor a URL type, so accepting one would mean writing a percent-decoder for
+a form nothing here emits, and half-reading a URL is worse than not claiming to read one. If a
+foreign program ever arrives, `libterm::parse::Parser::directory` is where the URL form goes.
+
+**The value lives on the parser, which is the one place that module owns terminal state.** Its
+rule is that the parser emits operations and owns nothing — SGR attributes are the grid's because
+they are what `DECSC` saves and `RIS` resets. A working directory is none of those: it sets no
+cell, and it is a fact about the *stream*. An `Op` is `Copy` and could not carry the string
+anyway, and a marker variant would leave the consumer reaching into the parser regardless.
+
+**The kernel's framebuffer console read `ESC ]` as a two-byte escape**, so the same change would
+have drawn `7;/home` into the boot log of a machine with no serial port — which is the whole of
+what that console is for. It now swallows a string sequence to `BEL` or `ST`, the rule already
+stated in `libterm::parse` and in `tty_server::Discipline`: an unrecognised sequence is consumed,
+never printed. Found by asking where else the new bytes would land, not by a failing gate.
+
+**Three crates that cannot test their agreement on the host**, so `cargo xtask check-terminal`
+asserts the round trip in a boot — the announcement at the first prompt, and that it follows a
+`cd`. That it is one line per `cd` rather than one per prompt is a host test in `nxterm`, because
+`expect` scans forward past what it does not match and a gate cannot assert a line's absence.

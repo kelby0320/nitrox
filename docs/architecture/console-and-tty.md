@@ -95,6 +95,15 @@ otherwise absorb by accident.
   that terminal is simply another *backend* — the serial console, or an emulator's channel —
   and it contains none of that emulation.
 
+  **What the shell says to its terminal goes the same way — through the bytes, not through
+  this server.** Since 2026-09-22 `nxsh` writes `OSC 7` beside every prompt (`ESC ] 7 ; <path>
+  BEL`), which is how a terminal learns the shell's working directory; `nxterm` shows it beside
+  the window's name. It is an ordinary escape sequence in the output stream, so the discipline
+  passes it through untouched, a backend that does not read it swallows it, and nothing here
+  needed an op. The payload is an absolute path rather than the `file://` URL the sequence
+  conventionally carries — see `libterm::parse::Parser::directory` for why. `cargo xtask
+  check-terminal` is what holds the three crates to the same bytes.
+
 ## Shape — the decisions
 
 **The `Tty` rsproto category is `0x0Bxx`** (`../spec/rsproto-wire-format.md`). It sat on

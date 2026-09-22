@@ -126,8 +126,22 @@ fn ends_in_terminal_operator(e: &Expr) -> bool {
 }
 
 /// The prompt for a fresh statement, showing the session's namespace position (§11a).
+///
+/// **It announces that position to the terminal as well** (desktop refresh, Part K), as
+/// `OSC 7` — `ESC ] 7 ; <path> BEL`, the sequence a terminal reads to learn where the shell
+/// running in it is. `nxterm` puts it in the window's title bar, which is what the design
+/// draws beside a window's name; a terminal that ignores the sequence swallows it whole.
+///
+/// **Here rather than at the six places the REPL writes a prompt**, because the announcement
+/// and the prompt are the same fact and two of the six would eventually disagree. It costs a
+/// few bytes per prompt and repeats a value that has usually not changed, which is what every
+/// shell that puts this in `PS1` does: `cd` then needs no separate announcement, and a prompt
+/// is the moment the shell is certainly idle and certainly somewhere.
 pub fn prompt(position: &str) -> String {
-    let mut s = String::from(position);
+    let mut s = String::from("\x1b]7;");
+    s.push_str(position);
+    s.push('\x07');
+    s.push_str(position);
     s.push_str("> ");
     s
 }
@@ -211,6 +225,16 @@ mod tests {
 
     #[test]
     fn the_prompt_shows_the_namespace_position() {
-        assert_eq!(prompt("/home/alice"), "/home/alice> ");
+        // **What a person sees is unchanged**, which is the half the escape must not disturb:
+        // the prompt is still the position and `> `, with everything before it invisible.
+        let p = prompt("/home/alice");
+        assert!(p.ends_with("/home/alice> "), "{p:?}");
+        // **And the terminal is told the same position**, byte for byte. `nxterm` reads this
+        // as `OSC 7` — `libterm::parse`'s `directory` — and a terminal that does not simply
+        // swallows it. Spelled out here rather than built from a constant, because the other
+        // end of this agreement is in another crate and a shared constant would only move the
+        // place the two could drift apart; what actually holds them together is
+        // `cargo xtask check-terminal`, which boots both.
+        assert_eq!(p, "\x1b]7;/home/alice\x07/home/alice> ");
     }
 }

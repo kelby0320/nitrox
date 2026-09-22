@@ -356,6 +356,9 @@ pub struct Term {
     view_moved: bool,
     /// Bytes the user typed, waiting for the binary to send them to *this* tab's tty.
     outbox: Vec<u8>,
+    /// Whether the shell in this tab has announced a *new* working directory since the binary
+    /// last asked — see [`take_directory_change`](Self::take_directory_change).
+    directory_changed: bool,
 }
 
 impl Term {
@@ -368,6 +371,7 @@ impl Term {
             view_top: None,
             view_moved: false,
             outbox: Vec::new(),
+            directory_changed: false,
         }
     }
 
@@ -379,6 +383,24 @@ impl Term {
     /// Bytes typed into this tab, taken exactly once.
     pub fn take_outbox(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbox)
+    }
+
+    /// Where the shell in this tab last said it is, or `None` if it has never said.
+    ///
+    /// `OSC 7`, read by [`libterm::parse::Parser::directory`]. The title bar shows it; the
+    /// binary logs each change.
+    pub fn directory(&self) -> Option<&str> {
+        self.parser.directory()
+    }
+
+    /// Whether the directory changed since this was last called, clearing it.
+    ///
+    /// The same shape as [`take_outbox`](Self::take_outbox) and `App::take_move_request`: the
+    /// binary asks once per turn of its loop and acts on a `true` exactly once. A shell
+    /// announces beside *every* prompt, so a console line per announcement would be a line per
+    /// command — this is what makes it a line per `cd`.
+    pub fn take_directory_change(&mut self) -> bool {
+        core::mem::take(&mut self.directory_changed)
     }
 }
 
@@ -741,10 +763,18 @@ impl App {
     pub fn feed_tab(&mut self, key: u64, bytes: &[u8]) {
         let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return };
         let t = &mut self.tabs[i];
+        // **Compared rather than counted.** A shell announces beside every prompt, so "the
+        // parser saw an `OSC 7`" is true once a command; "the answer is different from the one
+        // before" is true once a `cd`, which is what the title bar and the console line are
+        // about.
+        let before = t.parser.directory().map(alloc::string::String::from);
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
         for &b in bytes {
             let n = t.parser.feed(b, &mut out);
             t.grid.apply_all(&out[..n]);
+        }
+        if t.parser.directory() != before.as_deref() {
+            t.directory_changed = true;
         }
     }
 
@@ -1394,9 +1424,13 @@ impl App {
         // client's own answer.
         let title = title_bar(
             TITLE,
-            // The design shows the shell's working directory here; nothing tells a terminal
-            // where its shell is, which is the refresh's Part K.
-            None,
+            // **Where the shell in this tab says it is** (desktop refresh, Part K), which is
+            // what the design puts beside the window's name. It arrives as `OSC 7`, which
+            // `nxsh` emits beside every prompt — so it follows a `cd`, and a tab that has never
+            // heard from a shell simply has no subtitle rather than a guessed one.
+            //
+            // **Per tab**, since each runs its own shell: switching tabs changes the bar.
+            self.tab().parser.directory(),
             self.focused,
             Msg::DragWindow,
             TitleButtons {
@@ -1439,8 +1473,27 @@ impl App {
                     // children to be all keyed or all unkeyed and this one's siblings are keyed.
                     sized(
                         Size::new(SCROLL_W, self.track_h()),
-                        scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
-                            .on_pointer(Msg::Scroll),
+                        // **Drawn only when there is history to reach** (desktop refresh,
+                        // Part K). The design's terminal shows no scrollbar at all, and ours
+                        // drew a full-height thumb in `border` down the right of a near-black
+                        // pane whether or not anything had scrolled off — a light strip against
+                        // the darkest surface on the screen, so the one thing the eye found in
+                        // an empty terminal was a control that did nothing.
+                        //
+                        // **The column is kept, not removed.** Taking `SCROLL_W` out of
+                        // `CHROME_W` when there is nothing to scroll would give the grid a
+                        // wider box, and the grid would reflow the first time output ran off
+                        // the top — a terminal rewrapping its screen because a command printed
+                        // one line too many. That is the tab strip's argument one widget over.
+                        // So the slot stays and carries the terminal's own ground, which is
+                        // what the pane beside it is filled with: the pane simply looks that
+                        // much wider until there is a bar to put there.
+                        if self.scroll().scrollable() {
+                            scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
+                                .on_pointer(Msg::Scroll)
+                        } else {
+                            libui::element::fill(self.palette.background)
+                        },
                     )
                     .key(SCROLLBAR_KEY),
                 ),
@@ -1723,6 +1776,165 @@ mod tests {
         let border = libui::widget::WINDOW_BORDER as i64;
         assert_eq!(grip.bottom(), bounds.bottom() - border, "and the grip is still in the corner");
         assert_eq!(grip.right(), bounds.right() - border);
+    }
+
+    /// The title bar carries the working directory the shell in *this tab* announced.
+    ///
+    /// **Painted and measured, not read off the tree** (desktop refresh, Part K). `title_bar`
+    /// takes the subtitle as an `Option<&str>` and draws nothing for `None`, so a tree test
+    /// would be asserting that a string reached an argument — which is the half that was never
+    /// in doubt. What is in doubt is whether it reaches the *bar*, which is ink.
+    #[test]
+    fn the_title_bar_shows_where_the_shell_in_this_tab_says_it_is() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
+        let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
+        let mut a = App::new(40, 8, Metrics::new(&f, 16.0));
+        let ui = UiTheme::default();
+        let (w, h) = (a.window_size().w, a.window_size().h);
+
+        // How far right ink reaches along the title bar, left of the buttons — which is the
+        // title, and then the subtitle after it.
+        let reach = |a: &App| {
+            let e = a.view(&ui, None);
+            let l = layout(&e, Rect::new(0, 0, w, h), &FixedCell { w: 8, h: 16 });
+            let bar = locate(&e, &l, TITLE_KEY).expect("the title bar is keyed");
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(ui.background);
+            let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
+            libui::paint::paint(&mut fb, &f, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
+            // Stop short of the leftmost button, whose glyph is ink in the same bar.
+            let (minimise, _) = libui::widget::title_button_centre(w, 2);
+            let right = (minimise - libui::widget::TITLE_BUTTON_W as i32) as u32;
+            // **The text's own rows, not the whole bar.** The bar carries a rule along its
+            // bottom edge that runs its full width, so a scan over every row finds ink at
+            // whatever column it stops at and answers the same number for every subtitle —
+            // which is what the first version of this test did. The middle band holds the
+            // words and nothing else.
+            let inset = bar.size.h / 4;
+            let band = (bar.origin.y as u32 + inset)..(bar.bottom() as u32 - inset);
+            (bar.origin.x as u32..right)
+                .rev()
+                .find(|x| {
+                    band.clone().any(|y| {
+                        let c = fb.get_pixel(*x, y);
+                        c.is_some() && c != Some(ui.title_active) && c != Some(ui.title_inactive)
+                    })
+                })
+                .expect("the window's name is drawn")
+        };
+
+        let bare = reach(&a);
+        a.feed(b"\x1b]7;/home/alice\x07");
+        let with_place = reach(&a);
+        assert!(
+            with_place > bare,
+            "the bar reached {with_place} with a directory and {bare} without — no subtitle"
+        );
+
+        // **A second tab has its own shell and its own answer.** A directory kept on the
+        // window rather than on the tab passes everything above and shows the first tab's
+        // place in the second's bar.
+        a.update(Msg::NewTab);
+        assert_eq!(reach(&a), bare, "a fresh tab inherited the first tab's directory");
+        a.feed(b"\x1b]7;/home/alice/Documents\x07");
+        let deeper = reach(&a);
+        assert!(deeper > with_place, "the second tab's own, deeper, path did not reach the bar");
+    }
+
+    /// A shell announces beside every prompt; only a different answer is a change.
+    ///
+    /// **What makes the console line one per `cd` rather than one per command.** The binary
+    /// logs on `take_directory_change`, and `cargo xtask check-terminal` cannot assert the
+    /// absence of a line — `expect` scans forward past whatever it does not match — so the
+    /// claim is made here.
+    #[test]
+    fn a_repeated_announcement_is_not_a_change() {
+        let mut a = app();
+        let key = a.current_tab();
+        fn tab(a: &mut App, key: u64) -> &mut Term {
+            a.tabs_mut().iter_mut().find(|t| t.key() == key).expect("the tab is there")
+        }
+        assert!(!tab(&mut a, key).take_directory_change(), "nothing said, nothing owed");
+
+        a.feed(b"\x1b]7;/home\x07");
+        assert!(tab(&mut a, key).take_directory_change(), "the first answer is a change");
+        assert!(!tab(&mut a, key).take_directory_change(), "and it is owed exactly once");
+
+        // The same place again, which is what every prompt after this one says.
+        a.feed(b"\x1b]7;/home\x07");
+        assert!(!tab(&mut a, key).take_directory_change(), "the same place is not a change");
+
+        // And a `cd` is.
+        a.feed(b"\x1b]7;/home/alice\x07");
+        assert!(tab(&mut a, key).take_directory_change(), "a different place is a change");
+
+        // **A sequence that announces nothing changes nothing**, even though the parser saw an
+        // `OSC`: a version that flagged every terminated sequence would pass everything above.
+        a.feed(b"\x1b]0;a title\x07");
+        assert!(!tab(&mut a, key).take_directory_change(), "a window title moved the terminal");
+    }
+
+    /// The scrollbar's column carries the terminal's ground until there is history in it.
+    ///
+    /// **Painted and scanned, not read off the tree** (desktop refresh, Part K). The widget is
+    /// in the slot either way — the wrapper keeps its key and its size so the grid's box never
+    /// changes — so "is there a bar" is a question about pixels, and a tree test would pass for
+    /// a bar drawn in the ground's own colour as readily as for one that is absent.
+    ///
+    /// **Both halves, in one test**, because each is the other's control: hide the bar always
+    /// and the second half fails, hide it never and the first does.
+    #[test]
+    fn the_scrollbar_appears_only_once_there_is_something_to_scroll() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
+        let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
+        let mut a = App::new(40, 8, Metrics::new(&f, 16.0));
+        let ui = UiTheme::default();
+        let (w, h) = (a.window_size().w, a.window_size().h);
+
+        // How many pixels in the bar's own column are neither the terminal's ground nor the
+        // window's face — that is, belong to a groove or a thumb.
+        let bar_ink = |a: &App| {
+            let e = a.view(&ui, None);
+            let l = layout(&e, Rect::new(0, 0, w, h), &FixedCell { w: 8, h: 16 });
+            let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar's slot is keyed");
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(ui.background);
+            // The grid is a `Custom` node and draws nothing here; none of it is in this column.
+            let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
+            libui::paint::paint(&mut fb, &f, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
+            let mut n = 0;
+            for y in bar.origin.y as u32..bar.bottom() as u32 {
+                for x in bar.origin.x as u32..bar.right() as u32 {
+                    let c = fb.get_pixel(x, y);
+                    if c.is_some()
+                        && c != Some(a.palette.background)
+                        && c != Some(ui.background)
+                        && c != Some(ui.face)
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            (bar, n)
+        };
+
+        // **A terminal nothing has scrolled off the top of.** The eight rows hold what is
+        // written, so there is no history and nothing to reach with a bar.
+        assert!(!a.scroll().scrollable(), "precondition: nothing has scrolled away yet");
+        let (bar, ink) = bar_ink(&a);
+        assert_eq!(ink, 0, "an empty terminal drew a bar in {bar:?}");
+
+        // **And once output has run off the top**, which is the moment the control becomes
+        // worth having.
+        produce(&mut a, 40);
+        assert!(a.scroll().scrollable(), "precondition: there is history now");
+        let (bar2, ink2) = bar_ink(&a);
+        assert_eq!(bar2, bar, "the slot itself must not move, or the grid reflows");
+        assert!(ink2 > 0, "a terminal with history drew no bar in {bar2:?}");
     }
 
     #[test]

@@ -37,6 +37,14 @@ pub struct Metrics {
     pub px: f32,
 }
 
+/// How tall a row is, as a multiple of the text's size: the design's 19.5 on 12.
+///
+/// **Set here rather than taken from the face**, because a face's own line height is about what
+/// keeps its glyphs from colliding and says nothing about how a page should read. Every other
+/// surface on this desktop is set with room around its text; a terminal that used the face's
+/// figure alone was the one window that looked cramped (desktop refresh, Part K).
+pub const LINE_HEIGHT: f32 = 1.6;
+
 impl Metrics {
     /// Measure `font` at `px`.
     ///
@@ -49,10 +57,22 @@ impl Metrics {
     /// every rectangle below would be empty.
     pub fn new(font: &Font, px: f32) -> Metrics {
         let v = font.v_metrics(px);
+        // **A row is the design's leading, not the face's own line height** (desktop refresh,
+        // Part K). The page sets 12-pixel text on 19.5-pixel rows — 1.6 times the size — where
+        // DejaVu Sans Mono's own line height is about 1.17, so a terminal read cramped beside
+        // every other window on the desktop. The leading is applied to the *size*, as a
+        // typographer sets it, and then held to at least the face's own line height so that no
+        // face can be given rows its glyphs do not fit in.
+        let leading = libm::ceilf(px * LINE_HEIGHT) as u32;
+        let natural = libm::ceilf(v.line_height) as u32;
         Metrics {
             cell_w: font.advance('M', px).max(1),
-            cell_h: (libm::ceilf(v.line_height) as u32).max(1),
-            ascent: libm::ceilf(v.ascent).max(0.0) as u32,
+            cell_h: leading.max(natural).max(1),
+            // **The baseline moves down with the extra room**, so the leading is split above and
+            // below the glyphs rather than all piling under them: a line sitting hard against
+            // the top of a tall cell reads as a line with a gap after it, not as a line.
+            ascent: libm::ceilf(v.ascent).max(0.0) as u32
+                + leading.saturating_sub(natural) / 2,
             px,
         }
     }
@@ -376,6 +396,27 @@ mod tests {
         let f = font();
         let m = Metrics::new(&f, 16.0);
         assert_eq!(m.cell_w, f.advance('M', 16.0));
+        // **A row is the design's leading, and the glyphs sit in the middle of it** (desktop
+        // refresh, Part K). Nothing pinned `cell_h` before this, so multiplying it by 1.6 broke
+        // no test at all.
+        assert_eq!(
+            m.cell_h,
+            libm::ceilf(m.px * LINE_HEIGHT) as u32,
+            "a row is {LINE_HEIGHT} times the text's size"
+        );
+        let natural = libm::ceilf(font().v_metrics(m.px).line_height) as u32;
+        assert!(
+            m.cell_h > natural,
+            "the leading adds room: {} against the face's own {natural}",
+            m.cell_h
+        );
+        // The extra room is split, so the text is not hard against the top of its cell.
+        let bare = libm::ceilf(font().v_metrics(m.px).ascent) as u32;
+        assert!(
+            m.ascent > bare,
+            "the baseline moved down with the leading: {} against {bare}",
+            m.ascent
+        );
         assert!(m.cell_h >= m.ascent, "the baseline is below the cell: {m:?}");
         assert!(m.cell_w > 0 && m.cell_h > 0);
         // A monospace font gives every glyph the same advance, which is the assumption the

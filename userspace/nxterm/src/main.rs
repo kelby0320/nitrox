@@ -820,6 +820,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     report_row(&app, now);
                 }
             }
+            // **Where the shell in this tab says it is**, once per change (desktop refresh,
+            // Part K). `nxsh` announces it beside every prompt as `OSC 7`, `libterm` reads it
+            // and `nxterm` puts it in the window's title bar — three crates that cannot test
+            // their agreement on the host, so this line is what `cargo xtask check-terminal`
+            // asserts on. **Not what anyone typed**: the path is the shell's own answer, and
+            // it is already on screen in the prompt and in the title bar.
+            if let Some(t) = app.tabs_mut().iter_mut().find(|t| t.key() == tb.key)
+                && t.take_directory_change()
+                && let Some(dir) = t.directory()
+            {
+                libkern::debug::Line::new().s(b"nxterm: shell is at ").s(dir.as_bytes()).end();
+            }
             if tb.backend.is_gone() {
                 ended.push(tb.key);
             }

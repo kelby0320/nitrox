@@ -118,16 +118,16 @@ choosing two colours that do.
       in the design's style.
 - [x] **Part C — the panels**: the Applications and Places menus, and a bottom bar with a
       show-desktop button and the new switcher.
-- [ ] **Part D — the greeter**, which the design does not cover and which has to match anyway.
+- [x] **Part D — the greeter**, which the design does not cover and which has to match anyway.
 - [ ] **Part E — the overview**, whose layout changes.
 - [ ] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
       has.
-- [ ] **Part G — type, in DejaVu**: a smaller body size, a size scale, and weight only if it earns it.
-- [ ] **Part H — the parts of a window**: title and subtitle, the focus border, the tab strip, the
+- [x] **Part G — type, in DejaVu**: a smaller body size, a size scale, and weight only if it earns it.
+- [x] **Part H — the parts of a window**: title and subtitle, the focus border, the tab strip, the
       status bar, fields and buttons — shared by all three applications.
-- [ ] **Part I — the file browser**: toolbar, columns, sidebar, status bar.
-- [ ] **Part J — the editor**: monospace text, a gutter, Save on the tab strip, a status bar.
-- [ ] **Part K — the terminal's window**: line spacing, the scrollbar, the working directory.
+- [x] **Part I — the file browser**: toolbar, columns, sidebar, status bar.
+- [x] **Part J — the editor**: monospace text, a gutter, Save on the tab strip, a status bar.
+- [x] **Part K — the terminal's window**: line spacing, the scrollbar, the working directory.
 
 G–K were added on 2026-09-18, after measuring the applications against the page — see [How far
 the applications are from the design](#how-far-the-applications-are-from-the-design--measured-2026-09-18)
@@ -678,14 +678,41 @@ that noticed it.
 
 Beside Part F, which owns the terminal's colours.
 
-- [ ] **The tab strip**, from Part H.
-- [ ] **Line spacing**: the design's 12 px text sits on 19.5 px rows, 1.6 times its size. Our row
+- [x] **The tab strip**, from Part H. **Already built** — `nxterm` took `libui::widget::tab_strip`
+      with the `+` in Part H along with its two siblings, and nothing here is the terminal's own.
+      Kept as a box because it is part of what "the terminal's window" means, and a part nobody
+      would otherwise confirm.
+- [x] **Line spacing**: the design's 12 px text sits on 19.5 px rows, 1.6 times its size. Our row
       is the font's own line height (`libterm::render`'s `cell_h`), so a terminal reads cramped
       beside everything else. A leading on the cell, with the grid's reflow unchanged.
-- [ ] **The scrollbar**: the page shows none; ours is always drawn. Hidden until scrolled, or
+
+      **Built** as `render::LINE_HEIGHT`, applied to the text's *size* the way a typographer sets
+      leading and then held to at least the face's own line height, so no face is given rows its
+      glyphs do not fit in. The extra room is split above and below the glyphs rather than piling
+      under them — a line hard against the top of a tall cell reads as a line with a gap after it.
+      **Nothing pinned `cell_h` before this**: all 131 of `libterm`'s tests passed unchanged with
+      the leading in, which is what the new assertions in `the_metrics_are_the_faces` fix.
+- [x] **The scrollbar**: the page shows none; ours is always drawn. Hidden until scrolled, or
       restyled — decided by looking at both on a screendump.
-- [ ] **The working directory in the title** — the subtitle from Part H, which needs the shell to
+
+      **Hidden**, and the screendump decided it: always drawn, the bar was a solid 12 px strip of
+      `--line` down the right of the near-black pane, so the loudest thing in an empty terminal
+      was a control that did nothing. **The column is kept and filled with the terminal's own
+      ground** rather than removed — taking it out of `CHROME_W` would widen the grid, and the
+      grid would reflow the first time output ran off the top, which is the tab strip's argument
+      one widget over.
+- [x] **The working directory in the title** — the subtitle from Part H, which needs the shell to
       tell its terminal where it is.
+
+      **Built**, as `OSC 7`: `nxsh` writes `ESC ] 7 ; <path> BEL` beside every prompt (in
+      `repl::prompt`, so the announcement and the prompt cannot drift), `libterm::parse` reads it
+      and `nxterm` puts it in the title bar, per tab. **A path, not the `file://` URL the
+      sequence conventionally carries** — Nitrox has no hosts and no URL type, and half-reading a
+      URL is worse than not claiming to read one. Three crates whose host tests cannot see each
+      other, so `cargo xtask check-terminal` asserts the round trip in a boot, including that it
+      follows a `cd`. **The kernel's framebuffer console learned to swallow a string sequence in
+      the same change** — it read `ESC ]` as a two-byte escape and would have drawn `7;/home`
+      into the boot log of a machine with no serial port.
 
 ## Menus the design names and does not fill
 

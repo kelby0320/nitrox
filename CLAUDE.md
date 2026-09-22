@@ -120,6 +120,10 @@ must be the release root partition's, file for file.
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
 rendered there. It runs unconditionally in CI's QEMU job (promoted 2026-08-18); `check-input`
 stops at the test client's event log and `check-display` never types, so nothing else covers it.
+Since the desktop refresh's Part K it also holds the **shell-to-terminal** direction: `nxsh`
+writes its working directory as `OSC 7`, `libterm` reads it and `nxterm` shows it beside the
+window's name — three crates whose host tests cannot see each other, so a boot is what makes them
+agree on the bytes.
 
 `cargo xtask check-login` is the **graphical login gate**, and the second of the two that boot a
 release image. It drives the greeter with the PS/2 injection `check-input` and `check-terminal`

@@ -7062,6 +7062,14 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // output direction already works before a key is injected.
     session.expect("nxterm: grid> nxsh: interactive shell")?;
 
+    // **And the shell told the window where it is** (desktop refresh, Part K). `nxsh` writes
+    // `OSC 7` beside every prompt, `libterm::parse` reads it and `nxterm` puts it in the title
+    // bar as the design's subtitle. Three crates, each with host tests of its own that cannot
+    // see the other two: the shell's test pins the bytes it writes, the parser's pins the bytes
+    // it reads, and nothing on the host makes them the same bytes. This line is where they meet.
+    session.expect("nxterm: shell is at /")?;
+    println!("  ok: the shell announced its directory and the terminal read it");
+
     // Wait for `ui-testclient` to finish churning windows before touching focus — a click
     // landing mid-churn raises whatever exists at that instant. Same reason `check-input`
     // waits for it.
@@ -7167,6 +7175,19 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "remove /nothing-here")?;
     session.expect("nxterm: grid> remove: ")?;
     println!("  ok: a stage's diagnostic rendered in the grid, not on the kernel log");
+
+    // **And it follows the shell.** The line above proves the announcement arrives once; this
+    // proves it is the shell's *current* answer rather than a value read at startup — which is
+    // the whole point of putting it in a title bar, and which a terminal that announced only
+    // its first prompt would pass the first assertion for. `cd` is a builtin, so nothing but
+    // the shell's own state changes here.
+    //
+    // That the line is a *change* rather than one per prompt is
+    // `a_repeated_announcement_is_not_a_change` in `nxterm`, on the host: `expect` scans
+    // forward past whatever it does not match, so a gate cannot assert the absence of a line.
+    type_at_terminal(&mut qmp, "cd /home")?;
+    session.expect("nxterm: shell is at /home")?;
+    println!("  ok: the terminal followed the shell into another directory");
 
     // **The menu is a window now (M6 C3).** It was a `Stack` layer over the terminal, which
     // worked only because it happened to fit inside it; as a `popup` it is parented to the
