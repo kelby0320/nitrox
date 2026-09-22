@@ -783,6 +783,30 @@ Beside Part F, which owns the terminal's colours.
       the same change** — it read `ESC ]` as a two-byte escape and would have drawn `7;/home`
       into the boot log of a machine with no serial port.
 
+## After Part K — two things noticed at the end
+
+Raised by the maintainer once all eleven parts had merged (2026-09-22), and small enough to close
+the refresh with rather than to open a part for.
+
+- [x] **The current tab outlined, as the design draws it.** The page's active tab has a 1 px
+      `--line` border on three sides with its bottom in the ground, open into the content; ours
+      was the window's white on a strip one shade off white, with nothing between them. Now two
+      faces — the tab's shape in `border`, then in the ground inset a pixel on three sides — and
+      a painted test reads each edge back, including that the bottom is open and that the tab
+      beside it stays unoutlined.
+- [x] **A hover on the title-bar buttons and on a tab's `×`.** The design lights minimise and
+      maximise on `--faceLo` with the glyph in full ink and close on `--deny` with a white one,
+      and those are what shipped. **The tab's `×` has no hover in the design**, so that one is
+      ours: the neutral `face_pressed`, not close's red — closing a tab loses one view of
+      something where closing a window ends a program, and it is the convention every browser
+      keeps. The buttons needed keys for hover to name them (`TITLE_*_KEY`, from the top of the
+      key space) and the `×` one of its own (`tab_close_key`), which is a contract with every
+      application's tab numbering and is tested in each. `cargo xtask shot` gained a ninth
+      moment, the pointer resting on the terminal's close button, because only a live window
+      shows that an application repaints when the pointer crosses onto a new key. **The `+`
+      lights too**, in full ink as the design has it — not raised by the maintainer, but the one
+      tab-strip control the design lights that had nothing (PR #325 review, optional 5).
+
 ## Menus the design names and does not fill
 
 `Go`, `View` and `Terminal` are words on the page's menu bars that open nothing. **A menu is added

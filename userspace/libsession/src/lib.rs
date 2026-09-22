@@ -660,8 +660,9 @@ pub fn session_has_bin() -> bool {
     unsafe { SESSION_HAS_BIN }
 }
 
-/// Set by [`build_session_namespace`]; see [`session_has_bin`].
+/// Set by [`build_session_namespace`]; see [`session_has_blk`].
 static mut SESSION_HAS_BLK: bool = false;
+/// Set by [`build_session_namespace`]; see [`session_has_bin`].
 static mut SESSION_HAS_BIN: bool = false;
 
 /// Whether the last [`build_namespace`] bound `/dev/console`.

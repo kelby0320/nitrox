@@ -419,6 +419,28 @@ const TAB_CLOSE_GAP: u32 = 8;
 /// The key the `+` carries, so the strip's children are all keyed as the diff requires.
 const NEW_TAB_KEY: u64 = u64::MAX;
 
+/// The current tab's outline: the design's 1.
+const TAB_OUTLINE: u32 = 1;
+
+/// The side of the face behind a hovered tab's `×` — smaller than the 20-wide close box, so the
+/// highlight is a square round the glyph rather than a column down the tab.
+const TAB_CLOSE_HOVER: u32 = 16;
+
+/// The bit a tab's close box sets in its tab's key to have a key of its own.
+///
+/// **A caller's tab keys must leave it clear.** Every application numbers its tabs from
+/// `1 << 62` or `1 << 63` with a small offset, which never reaches bit 60, and each of the three
+/// has a test saying so against this constant rather than against a copy of it.
+pub const TAB_CLOSE_BIT: u64 = 1 << 60;
+
+/// The key the close box of the tab keyed `tab` carries — see [`TAB_CLOSE_BIT`].
+///
+/// Public so a caller's `hovered` can be compared against it, and so a caller can test that its
+/// tab keys leave room for it.
+pub const fn tab_close_key(tab: u64) -> u64 {
+    tab | TAB_CLOSE_BIT
+}
+
 /// How wide the close box at a tab's right end is.
 pub const TAB_CLOSE_W: u32 = 20;
 
@@ -434,6 +456,10 @@ pub struct Tab<'a> {
     ///
     /// **Not the index**, because closing a tab renumbers every one after it and the diff would
     /// pair each surviving tab's widget with its neighbour's element.
+    ///
+    /// **Must leave [`TAB_CLOSE_BIT`] clear.** The tab's `×` is keyed as this with that bit set,
+    /// so a key that already has it collides with its own close box — `Tree::update` answers
+    /// `DuplicateKey` and the window draws nothing (PR #325 review, optional 4).
     pub key: u64,
     /// What it is called.
     pub label: &'a str,
@@ -472,10 +498,31 @@ pub fn tab_strip<Msg: Clone>(
         // continuation of the content below, and the rest are a strip above it. An inactive tab
         // has no face at all — the strip's is what shows through — so hover is a wash over it,
         // the treatment every other momentary highlight in this toolkit gets.
-        let mut layers = alloc::vec::Vec::with_capacity(3);
+        let close_key = tab_close_key(t.key);
+        // **Over its `×` is still over the tab.** The close box carries a key of its own, so
+        // `hovered` names it rather than the tab there — and a tab whose highlight went out as the
+        // pointer reached its `×` would flicker at exactly the moment a person is aiming.
+        let over_tab = hovered == Some(t.key) || hovered == Some(close_key);
+        let mut layers = alloc::vec::Vec::with_capacity(4);
         if current {
-            layers.extend(tab_face(theme.background));
-        } else if hovered == Some(t.key) {
+            // **Outlined in `border` on three sides and open on the fourth** (desktop refresh,
+            // after Part K) — the design's `border: 1px solid var(--line)` with its bottom edge in
+            // the ground colour. Without it the current tab was the window's white on a strip one
+            // shade off white, and the one tab a person most needs to find was the hardest to see.
+            //
+            // Two faces rather than a stroked outline, because the toolkit's `Outline` is square
+            // and this one must follow the rounded top: the tab's shape in `border`, then the
+            // same shape in the ground **inset on three sides and not the fourth**. The inner
+            // curve is a pixel tighter than the outer, as a CSS border's is, so the line stays a
+            // pixel wide round the corner. Down the sides the outline runs through the strip's
+            // rule, and across the bottom the ground covers it — which is what "open into the
+            // content" is.
+            layers.extend(tab_face(theme.border, TAB_RADIUS));
+            layers.push(padding(
+                Insets { top: TAB_OUTLINE, right: TAB_OUTLINE, bottom: 0, left: TAB_OUTLINE },
+                stack(tab_face(theme.background, TAB_RADIUS.saturating_sub(TAB_OUTLINE))),
+            ));
+        } else if over_tab {
             // **A face rather than a wash**, which every other momentary highlight here is: a
             // wash cannot be rounded, and a square highlight behind a rounded tab reads as a
             // second shape. One shade off the strip is enough to say "this one".
@@ -486,24 +533,49 @@ pub fn tab_strip<Msg: Clone>(
             // supposed to mark the current tab alone (PR #319 review, optional 7).
             layers.push(padding(
                 Insets { top: 0, right: 0, bottom: TAB_RULE, left: 0 },
-                stack(tab_face(theme.face)),
+                stack(tab_face(theme.face, TAB_RADIUS)),
             ));
         }
         let ink_colour = if current { theme.foreground } else { theme.foreground_dim };
+        // **The close box lights on hover** (desktop refresh, after Part K): a small face in
+        // `face_pressed` behind the `×` and the `×` in full ink — the treatment the title bar's
+        // minimise and maximise get, **not** close's red. Closing a tab loses one view of
+        // something; closing a window ends a program. The design gives the tab's `×` no hover
+        // at all, so this is ours, and the neutral one is the convention every browser keeps.
+        let mut close_layers = alloc::vec::Vec::with_capacity(2);
+        let close_ink = if hovered == Some(close_key) {
+            // `sized` gives the face a size to be centred at; a bare fill measures as nothing.
+            close_layers.push(center(sized(
+                Size::new(TAB_CLOSE_HOVER, TAB_CLOSE_HOVER),
+                rounded_fill(theme.face_pressed, TITLE_BUTTON_RADIUS),
+            )));
+            theme.foreground
+        } else {
+            theme.foreground_dim
+        };
+        // **The icon fills the box rather than being centred in it**: `Node::Icon` measures as
+        // nothing and draws into the rect it is given, so a `center` around one hands it a zero
+        // rect and the tab loses its close box while still clicking like one.
+        close_layers.push(ink(close_ink, icon(IconKind::Close)));
         layers.push(row(alloc::vec![
+            // **The label carries its tab's own key.** The close box needs a key of its own for
+            // hover to tell it apart from the tab, and the diff wants a container's children all
+            // keyed or none. Giving the label the *tab's* key keeps "the pointer is over this tab"
+            // meaning exactly what it did — `hovered_key` walks to the nearest keyed node, which
+            // is the label — while `locate` and `find_by_key` walk outside-in and still find the
+            // whole tab first. A key repeated at a different depth is legal (the diff forbids
+            // duplicates only among siblings); both of those properties are pinned by tests.
             padding(
                 Insets { top: 0, right: TAB_CLOSE_GAP, bottom: 0, left: TAB_LABEL_PAD },
                 center_v(ink(ink_colour, text(label))),
             )
-            .flex(1),
-            // **The icon fills the box rather than being centred in it**: `Node::Icon` measures
-            // as nothing and draws into the rect it is given, so a `center` around one hands it
-            // a zero rect and the tab loses its close box while still clicking like one.
+            .flex(1)
+            .key(t.key),
             sized(
                 Size::new(TAB_CLOSE_W, TAB_BOX_H),
-                stack(alloc::vec![ink(theme.foreground_dim, icon(IconKind::Close))])
-                    .on_press(close(t.key)),
-            ),
+                stack(close_layers).on_press(close(t.key)),
+            )
+            .key(close_key),
         ]));
         row_items.push(
             sized(Size::new(TAB_W, TAB_BOX_H), stack(layers).on_press(select(t.key)))
@@ -516,7 +588,14 @@ pub fn tab_strip<Msg: Clone>(
         row_items.push(
             sized(
                 Size::new(NEW_TAB_W, TAB_BOX_H),
-                stack(alloc::vec![center(ink(theme.foreground_dim, text("+")))])
+                // **Full ink on hover**, the design's `style-hover="color:var(--fg)"` — the one
+                // tab-strip control it lights that had nothing (PR #325 review, optional 5). No
+                // face: the design gives the `+` none, and it reads as a glyph beside the tabs
+                // rather than as a button among them.
+                stack(alloc::vec![center(ink(
+                    if hovered == Some(NEW_TAB_KEY) { theme.foreground } else { theme.foreground_dim },
+                    text("+"),
+                ))])
                     .on_press(new_tab),
             )
             .key(NEW_TAB_KEY),
@@ -579,10 +658,10 @@ impl<Msg> TabExtras<Msg> {
 /// **Two layers rather than a per-corner radius**, which the toolkit does not have: a rounded
 /// fill over the whole box, then a square one below the curve. The square layer is what covers
 /// the strip's rule under the current tab.
-fn tab_face<Msg>(colour: Rgb) -> alloc::vec::Vec<Element<Msg>> {
+fn tab_face<Msg>(colour: Rgb, radius: u32) -> alloc::vec::Vec<Element<Msg>> {
     alloc::vec![
-        rounded_fill(colour, TAB_RADIUS),
-        padding(Insets { top: TAB_RADIUS, right: 0, bottom: 0, left: 0 }, fill(colour)),
+        rounded_fill(colour, radius),
+        padding(Insets { top: radius, right: 0, bottom: 0, left: 0 }, fill(colour)),
     ]
 }
 
@@ -1056,6 +1135,22 @@ pub const TITLE_BUTTON_GAP: u32 = 9;
 /// The space after the last button, before the window's border: the design's 5.
 pub const TITLE_BUTTON_PAD: u32 = 5;
 
+/// The corner of a title-bar button's hover face: the design's 2.
+const TITLE_BUTTON_RADIUS: u32 = 2;
+
+/// The keys a title bar's buttons carry, so a caller's `hovered` can say which one the pointer is
+/// over (desktop refresh, after Part K).
+///
+/// **The toolkit's, from the top of the key space down**, beside the `+`'s key at `u64::MAX`:
+/// an application's own keys are small numbers and its tab keys start at `1 << 62` or `1 << 63`
+/// with a small offset, so nothing a caller writes comes within reach of these. Each window is its
+/// own tree, so two windows' title bars carrying the same three keys is not a collision.
+pub const TITLE_MINIMISE_KEY: u64 = u64::MAX - 1;
+/// See [`TITLE_MINIMISE_KEY`].
+pub const TITLE_MAXIMISE_KEY: u64 = u64::MAX - 2;
+/// See [`TITLE_MINIMISE_KEY`].
+pub const TITLE_CLOSE_KEY: u64 = u64::MAX - 3;
+
 /// The centre of the `nth` title-bar button counting from the **right** — the close button is
 /// `0` — in a framed window `window_w` wide, in the window's own coordinates.
 ///
@@ -1094,6 +1189,7 @@ pub fn title_bar<Msg: Clone>(
     focused: bool,
     drag: Msg,
     buttons: TitleButtons<Msg>,
+    hovered: Option<u64>,
     theme: &Theme,
 ) -> Element<Msg> {
     let face = if focused { theme.title_active } else { theme.title_inactive };
@@ -1103,12 +1199,35 @@ pub fn title_bar<Msg: Clone>(
     // **In the dim ink, on no face of their own** — the design's controls are borderless and
     // `--fgdim`, and read as part of the bar rather than as three buttons on it. Each takes its
     // whole column of the bar as a target and draws its glyph in the middle of the design's 23x21.
-    let btn = |glyph: IconKind, msg: Msg| {
+    //
+    // **Until the pointer is over one** (desktop refresh, after Part K). A borderless glyph gives
+    // no sign it is a control, so the design lights it on hover: minimise and maximise on
+    // `--faceLo` (`face_pressed`) with the glyph in full ink, close on `--deny` with a light one.
+    // **Red for close alone** — the one button of the three that destroys something, and the one
+    // a person should see coming before they press it.
+    let btn = |glyph: IconKind, key: u64, danger: bool, msg: Msg| {
+        let mut layers = alloc::vec::Vec::with_capacity(2);
+        let glyph_ink = match (hovered == Some(key), danger) {
+            (false, _) => theme.foreground_dim,
+            (true, false) => {
+                layers.push(rounded_fill(theme.face_pressed, TITLE_BUTTON_RADIUS));
+                theme.foreground
+            }
+            (true, true) => {
+                layers.push(rounded_fill(theme.deny, TITLE_BUTTON_RADIUS));
+                // The further of the scheme's two inks from the red — the dark scheme's paper is
+                // near-black, so a fixed white would be right in one scheme only (the `pill`'s
+                // reasoning, Part H).
+                furthest_from(theme.deny, theme.background, theme.foreground)
+            }
+        };
+        layers.push(ink(glyph_ink, icon(glyph)));
         sized(
             Size::new(TITLE_BUTTON_W, 0),
-            center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(alloc::vec![icon(glyph)]))),
+            center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(layers))),
         )
         .on_press(msg)
+        .key(key)
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
     // does nothing, and a control that looks live and is not is the defect this milestone's
@@ -1116,13 +1235,13 @@ pub fn title_bar<Msg: Clone>(
     // them somewhere to go: minimise and maximise in Part B, close in Part C.
     let mut glyphs = alloc::vec::Vec::with_capacity(3);
     if let Some(m) = buttons.minimise {
-        glyphs.push(btn(IconKind::Minimise, m));
+        glyphs.push(btn(IconKind::Minimise, TITLE_MINIMISE_KEY, false, m));
     }
     if let Some(m) = buttons.maximise {
-        glyphs.push(btn(IconKind::Maximise, m));
+        glyphs.push(btn(IconKind::Maximise, TITLE_MAXIMISE_KEY, false, m));
     }
     if let Some(m) = buttons.close {
-        glyphs.push(btn(IconKind::Close, m));
+        glyphs.push(btn(IconKind::Close, TITLE_CLOSE_KEY, true, m));
     }
     let mut controls = alloc::vec::Vec::with_capacity(3);
     // **Bold, at the body's size** (desktop refresh, Part G): the design heads a window with its
@@ -1142,10 +1261,8 @@ pub fn title_bar<Msg: Clone>(
     }
     let title = center_v(with_spacing(row(name), TITLE_SUBTITLE_GAP));
     controls.push(padding(TITLE_PAD, title).flex(1));
-    controls.push(ink(
-        theme.foreground_dim,
-        crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),
-    ));
+    // Each button sets its own ink now, since a hovered one differs from its neighbours.
+    controls.push(crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP));
     controls.push(sized(Size::new(TITLE_BUTTON_PAD, 0), text("")));
     // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
     // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
@@ -4483,6 +4600,7 @@ mod tests {
                 maximise: Some(M::Max),
                 close: Some(M::Close),
             },
+            None,
             &p,
         );
         let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
@@ -5546,6 +5664,7 @@ two");
                 maximise: Some(M::Max),
                 close: Some(M::Close),
             },
+            None,
             &p,
         );
         let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
@@ -5970,7 +6089,7 @@ two");
         let (w, h) = (300, TITLE_BAR_H);
         let draw = |subtitle: Option<&str>| {
             let e: Element<Msg> =
-                title_bar("Files", subtitle, true, (), TitleButtons::default(), &t);
+                title_bar("Files", subtitle, true, (), TitleButtons::default(), None, &t);
             let all = Rect::new(0, 0, w, h);
             let l = layout(&e, all, &CELL);
             let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
@@ -6113,6 +6232,386 @@ two");
         assert!(inked(to, to + TAB_GAP + 4) == 0, "and it stays inside the tab");
     }
 
+    /// The current tab is outlined in `border` on three sides, and open on the fourth.
+    ///
+    /// **Painted and read back** (desktop refresh, after Part K). The outline is two faces, and
+    /// the tree has them whether or not they come out as a line: an inner face a pixel too wide,
+    /// or inset on the bottom as well, leaves the tree identical and the tab unoutlined or closed.
+    /// So this looks at the pixels where each edge must be — and at the **resting** state of the
+    /// tab beside it, which must stay unoutlined, since an outline on every tab marks none.
+    #[test]
+    fn the_current_tab_is_outlined_and_open_into_the_content() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let tabs = [
+            Tab { key: 1, label: "one", marked: false },
+            Tab { key: 2, label: "two", marked: false },
+        ];
+        let ui: Element<M> = tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
+        let w = TAB_SIDE * 2 + TAB_W * 2 + TAB_GAP;
+        let all = Rect::new(0, 0, w, TAB_STRIP_H);
+        let l = layout(&ui, all, &CELL);
+        let mut fb = MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+        fb.clear(t.background);
+        paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+        let at = |x: u32, y: u32| fb.get_pixel(x, y).expect("inside the strip");
+
+        // The current tab spans `TAB_SIDE..TAB_SIDE + TAB_W`, from `TAB_TOP` to the strip's foot,
+        // whose last row is the strip's rule.
+        let (left, right) = (TAB_SIDE, TAB_SIDE + TAB_W - 1);
+        let (mid, middle_y, rule_y) = (TAB_SIDE + TAB_W / 2, TAB_TOP + TAB_H / 2, TAB_STRIP_H - 1);
+        assert_eq!(at(mid, TAB_TOP), t.border, "no line along the current tab's top");
+        assert_eq!(at(left, middle_y), t.border, "no line down its left side");
+        assert_eq!(at(right, middle_y), t.border, "no line down its right side");
+        // **A line, not a border-coloured tab**: a pixel in, it is the window's ground again.
+        assert_eq!(at(left + 1, middle_y), t.background, "the outline is more than a pixel wide");
+        assert_eq!(at(mid, TAB_TOP + 1), t.background, "the outline is more than a pixel deep");
+        // **And open at the bottom**: the strip's rule stops under the current tab, which is what
+        // makes the tab a continuation of the content rather than a box sitting on it.
+        assert_eq!(at(mid, rule_y), t.background, "the current tab is closed at the bottom");
+
+        // The tab beside it has no outline, and the rule runs under it.
+        let next = TAB_SIDE + TAB_W + TAB_GAP;
+        assert_ne!(at(next, middle_y), t.border, "an inactive tab was outlined too");
+        assert_eq!(at(next + TAB_W / 2, rule_y), t.border, "the rule stopped under an inactive tab");
+    }
+
+    /// Each title-bar button lights on hover, in its own colour, and only that one.
+    ///
+    /// **Painted, and the resting state asserted first** — the state no test passed in Part H, when
+    /// a widget that drew nothing passed every tree test. Close lights in `deny` and the other two
+    /// in `face_pressed`; a hover that lit the wrong button, or all three, or lit close in the
+    /// neutral face, fails here.
+    #[test]
+    fn a_title_bar_button_lights_only_when_the_pointer_is_over_it() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let t = Theme::default();
+        let (w, h) = (400u32, TITLE_BAR_H);
+        let draw = |hovered: Option<u64>| {
+            let e: Element<M> = title_bar(
+                "x",
+                None,
+                true,
+                M::Drag,
+                TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+                hovered,
+                &t,
+            );
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            let rects: alloc::vec::Vec<Rect> = [TITLE_MINIMISE_KEY, TITLE_MAXIMISE_KEY, TITLE_CLOSE_KEY]
+                .iter()
+                .map(|k| crate::layout::locate(&e, &l, *k).expect("each button is keyed"))
+                .collect();
+            (fb, rects)
+        };
+        let count = |fb: &MemFramebuffer, r: Rect, c: Rgb| {
+            (r.origin.x as u32..r.right() as u32)
+                .flat_map(|x| (r.origin.y as u32..r.bottom() as u32).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
+                .count()
+        };
+
+        // At rest, no button has a face of either colour.
+        let (fb, rects) = draw(None);
+        for r in &rects {
+            assert_eq!(count(&fb, *r, t.face_pressed) + count(&fb, *r, t.deny), 0, "a button lit at rest");
+        }
+
+        // Hovered, each lights alone, and in its own colour.
+        for (i, (key, face)) in [
+            (TITLE_MINIMISE_KEY, t.face_pressed),
+            (TITLE_MAXIMISE_KEY, t.face_pressed),
+            (TITLE_CLOSE_KEY, t.deny),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (fb, rects) = draw(Some(*key));
+            assert!(count(&fb, rects[i], *face) > 100, "button {i} did not light in its colour");
+            for (j, r) in rects.iter().enumerate().filter(|(j, _)| *j != i) {
+                assert_eq!(
+                    count(&fb, *r, t.face_pressed) + count(&fb, *r, t.deny),
+                    0,
+                    "hovering button {i} lit button {j}"
+                );
+            }
+        }
+        // **Close is red, not neutral** — the one button of the three that ends something.
+        let (fb, rects) = draw(Some(TITLE_CLOSE_KEY));
+        assert_eq!(count(&fb, rects[2], t.face_pressed), 0, "close lit in the neutral face");
+    }
+
+    /// Hover reaches the keys the buttons carry **through the real router**, not only in a tree.
+    ///
+    /// **The half the painted tests cannot see.** They hand `hovered` in directly, so they pass
+    /// for a key that no pointer could ever produce — a button keyed but laid out under a sibling
+    /// that the hit-test finds first, say. This moves a pointer over each target and asks the
+    /// router what it names, which is what an application's `view` is actually given.
+    ///
+    /// **And the tab's label keeps its tab's key** — the property the close box's own key rests
+    /// on: a label keyed anything else would stop "the pointer is over this tab" from meaning what
+    /// it did, and `locate` must still find the *whole* tab under that key rather than the label.
+    #[test]
+    fn hover_names_the_button_and_the_close_box_through_the_router() {
+        use crate::diff::Tree;
+        use crate::route::Router;
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Close,
+            Select(u64),
+            Shut(u64),
+        }
+        let t = Theme::default();
+        let over = |e: &Element<M>, x: i32, y: i32| {
+            let l = layout(e, Rect::new(0, 0, 400, 100), &CELL);
+            let mut tree = Tree::new();
+            tree.update(e, &l).expect("a clean frame");
+            let mut r = Router::new();
+            let motion = PointerEvent { kind: librsproto::surface::POINTER_MOTION, x, y, ..Default::default() };
+            r.pointer(&tree, e, &l, motion);
+            r.hovered_key(&tree)
+        };
+
+        let bar: Element<M> = title_bar(
+            "x",
+            None,
+            true,
+            M::Drag,
+            TitleButtons { minimise: None, maximise: None, close: Some(M::Close) },
+            None,
+            &t,
+        );
+        let l = layout(&bar, Rect::new(0, 0, 400, 100), &CELL);
+        let c = crate::layout::locate(&bar, &l, TITLE_CLOSE_KEY).expect("close is keyed");
+        let (cx, cy) = (c.origin.x + c.size.w as i32 / 2, c.origin.y + c.size.h as i32 / 2);
+        assert_eq!(over(&bar, cx, cy), Some(TITLE_CLOSE_KEY), "the pointer over close does not name it");
+
+        let tabs = [Tab { key: 1 << 62, label: "one", marked: false }];
+        let strip: Element<M> =
+            tab_strip(&tabs, 1 << 62, None, M::Select, M::Shut, TabExtras::none(), &t);
+        let l = layout(&strip, Rect::new(0, 0, 400, 100), &CELL);
+        let tab = crate::layout::locate(&strip, &l, 1 << 62).expect("the tab is keyed");
+        assert_eq!(tab.size.w, TAB_W, "`locate` found the label rather than the whole tab");
+        let y = tab.origin.y + tab.size.h as i32 / 2;
+        let close_x = tab.origin.x + (TAB_W - TAB_CLOSE_W / 2) as i32;
+        let label_x = tab.origin.x + (TAB_LABEL_PAD + 4) as i32;
+        assert_eq!(over(&strip, close_x, y), Some(tab_close_key(1 << 62)), "the `×` has no key of its own");
+        assert_eq!(over(&strip, label_x, y), Some(1 << 62), "the label stopped naming its tab");
+    }
+
+    /// A tab's `×` lights when the pointer is over it, and the tab stays lit around it.
+    #[test]
+    fn a_tabs_close_box_lights_on_hover_and_its_tab_stays_lit() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let tabs = [
+            Tab { key: 1, label: "one", marked: false },
+            Tab { key: 2, label: "two", marked: false },
+        ];
+        let w = TAB_SIDE * 2 + TAB_W * 2 + TAB_GAP;
+        let draw = |hovered: Option<u64>| {
+            let ui: Element<M> =
+                tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::none(), &t);
+            let all = Rect::new(0, 0, w, TAB_STRIP_H);
+            let l = layout(&ui, all, &CELL);
+            let mut fb =
+                MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let count = |fb: &MemFramebuffer, x0: u32, x1: u32, c: Rgb| {
+            (x0..x1)
+                .flat_map(|x| (0..TAB_STRIP_H).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
+                .count()
+        };
+        // The second tab — inactive — and its close box.
+        let tab2 = TAB_SIDE + TAB_W + TAB_GAP;
+        let (box0, box1) = (tab2 + TAB_W - TAB_CLOSE_W, tab2 + TAB_W);
+
+        let rest = draw(None);
+        assert_eq!(count(&rest, box0, box1, t.face_pressed), 0, "the `×` lit at rest");
+
+        let hot = draw(Some(tab_close_key(2)));
+        assert!(count(&hot, box0, box1, t.face_pressed) > 50, "the `×` did not light on hover");
+        // **Its tab stays lit.** The pointer over the `×` names the close box rather than the tab,
+        // and a tab that went dark there would flicker at exactly the moment a person is aiming.
+        assert!(
+            count(&hot, tab2, box0, t.face) > 100,
+            "the inactive tab lost its hover face as the pointer reached its `×`"
+        );
+        // Nothing lights on the *other* tab's `×`.
+        let other = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
+        assert_eq!(count(&hot, other.0, other.1, t.face_pressed), 0, "the wrong `×` lit");
+
+        // **And the `×` stays at rest while only its tab is hovered** (PR #325 review, finding 1).
+        // Without this the two states above pass for a `×` that lights whenever its tab does —
+        // a one-word "simplification" to `if over_tab` — which would light every tab's `×` the
+        // moment the pointer crossed into it, the current tab's included.
+        let tab_only = draw(Some(2));
+        assert!(count(&tab_only, tab2, box0, t.face) > 100, "precondition: the tab is lit");
+        assert_eq!(
+            count(&tab_only, box0, box1, t.face_pressed),
+            0,
+            "the `×` lit with its tab rather than with the pointer on it"
+        );
+    }
+
+    /// A lit button's glyph is set in an ink that reads on its face — in both schemes.
+    ///
+    /// **The faces were counted and the inks were not** (PR #325 review, finding 2): swapping the
+    /// close glyph to the scheme's `foreground` passed every test while shipping `#16201F` on
+    /// `#A4453C`, about 2.8:1. So this reads the glyph's own pixels.
+    ///
+    /// **Close is pinned by its reason rather than by its colour.** The design writes `#fff`; in
+    /// the dark scheme that is 3.36:1 on its `#D46F63`, below what text needs, and the near-black
+    /// `furthest_from` picks instead is 5.25:1. So the assertion is that the glyph is whichever of
+    /// the scheme's two inks has the higher **WCAG** contrast on `deny`, and that it clears 4.5:1
+    /// — a different formula from `furthest_from`'s weighted brightness, so this is not the code
+    /// checking itself, and it stays right if either scheme's red is retuned.
+    #[test]
+    fn a_lit_buttons_glyph_reads_on_its_face_in_both_schemes() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        fn lum(c: Rgb) -> f32 {
+            fn ch(v: u8) -> f32 {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            }
+            0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+        }
+        fn contrast(a: Rgb, b: Rgb) -> f32 {
+            let (hi, lo) = if lum(a) >= lum(b) { (lum(a), lum(b)) } else { (lum(b), lum(a)) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        let draw = |t: &Theme, hovered: Option<u64>| {
+            let e: Element<M> = title_bar(
+                "x",
+                None,
+                true,
+                M::Drag,
+                TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+                hovered,
+                t,
+            );
+            let (w, h) = (400u32, TITLE_BAR_H);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            let rects: alloc::vec::Vec<Rect> = [TITLE_MINIMISE_KEY, TITLE_MAXIMISE_KEY, TITLE_CLOSE_KEY]
+                .iter()
+                .map(|k| crate::layout::locate(&e, &l, *k).expect("each button is keyed"))
+                .collect();
+            (fb, rects)
+        };
+        let count = |fb: &MemFramebuffer, r: Rect, c: Rgb| {
+            (r.origin.x as u32..r.right() as u32)
+                .flat_map(|x| (r.origin.y as u32..r.bottom() as u32).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
+                .count()
+        };
+
+        for (scheme, t) in [("light", Theme::default()), ("dark", Theme::dark())] {
+            // At rest every glyph is dim, and no button holds a pixel of full ink.
+            let (fb, rects) = draw(&t, None);
+            for (i, r) in rects.iter().enumerate() {
+                assert!(count(&fb, *r, t.foreground_dim) > 0, "{scheme}: button {i}'s glyph is not dim at rest");
+                assert_eq!(count(&fb, *r, t.foreground), 0, "{scheme}: button {i} in full ink at rest");
+            }
+
+            // Minimise and maximise lit: the glyph goes to full ink, the dim one is gone.
+            for (i, key) in [(0, TITLE_MINIMISE_KEY), (1, TITLE_MAXIMISE_KEY)] {
+                let (fb, rects) = draw(&t, Some(key));
+                assert!(count(&fb, rects[i], t.foreground) > 0, "{scheme}: button {i} lit, glyph not in full ink");
+                assert_eq!(count(&fb, rects[i], t.foreground_dim), 0, "{scheme}: button {i} lit, glyph still dim");
+            }
+
+            // Close lit: the glyph is the more legible of the scheme's two inks on red.
+            let (better, worse) = if contrast(t.background, t.deny) >= contrast(t.foreground, t.deny) {
+                (t.background, t.foreground)
+            } else {
+                (t.foreground, t.background)
+            };
+            assert!(
+                contrast(better, t.deny) >= 4.5,
+                "{scheme}: neither ink reads on `deny` — {:.2}:1 at best",
+                contrast(better, t.deny)
+            );
+            let (fb, rects) = draw(&t, Some(TITLE_CLOSE_KEY));
+            assert!(count(&fb, rects[2], better) > 20, "{scheme}: close's glyph is not the legible ink");
+            assert_eq!(count(&fb, rects[2], worse), 0, "{scheme}: close's glyph is the illegible ink");
+        }
+    }
+
+    /// The `+` goes to full ink when the pointer is on it — the design's own hover for it.
+    #[test]
+    fn the_new_tab_plus_lights_on_hover() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+            New,
+        }
+        let t = Theme::default();
+        let tabs = [Tab { key: 1, label: "one", marked: false }];
+        let w = TAB_SIDE * 2 + TAB_W + TAB_GAP + NEW_TAB_W;
+        let draw = |hovered: Option<u64>| {
+            let ui: Element<M> =
+                tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::new_tab(M::New), &t);
+            let all = Rect::new(0, 0, w, TAB_STRIP_H);
+            let l = layout(&ui, all, &CELL);
+            let plus = crate::layout::locate(&ui, &l, NEW_TAB_KEY).expect("the `+` is keyed");
+            let mut fb =
+                MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // **The darkest pixel, not a count of exact ink.** The `+` is text, antialiased, and
+            // at this size no pixel of its strokes is fully covered — so a count of pixels exactly
+            // `foreground` is zero lit or not, which is how the first version of this test
+            // failed for a `+` that did light. The darkest pixel is the glyph's most-covered one,
+            // and which ink it sits nearer says which ink the glyph was drawn in.
+            (plus.origin.x as u32..plus.right() as u32)
+                .flat_map(|x| (plus.origin.y as u32..plus.bottom() as u32).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .min_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b))
+                .expect("the `+` has pixels")
+        };
+        let nearer_full = |c: Rgb| {
+            let d = |a: Rgb, b: Rgb| a.r.abs_diff(b.r) as u32 + a.g.abs_diff(b.g) as u32 + a.b.abs_diff(b.b) as u32;
+            d(c, t.foreground) < d(c, t.foreground_dim)
+        };
+        assert!(!nearer_full(draw(None)), "the `+` is in full ink at rest");
+        assert!(nearer_full(draw(Some(NEW_TAB_KEY))), "the `+` did not light on hover");
+        assert!(!nearer_full(draw(Some(1))), "the `+` lit when its neighbouring tab was hovered");
+    }
+
     #[test]
     fn a_marked_tab_says_so_in_its_label() {
         // The editor's unsaved mark, which is the only thing distinguishing two tabs on the same
@@ -6159,6 +6658,7 @@ two");
             true,
             M::Drag,
             TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+            None,
             &theme,
         )
         .key(1);
@@ -6279,6 +6779,7 @@ two");
                 true,
                 M::Drag,
                 TitleButtons { minimise: None, maximise: None, close: None },
+                None,
                 &theme,
             )
             .key(1),

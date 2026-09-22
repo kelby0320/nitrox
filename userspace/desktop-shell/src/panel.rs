@@ -634,7 +634,6 @@ mod tests {
     /// built-in size alone while the guest drew the staged one (PR #314 review, finding 4).
     const FONT_SIZES: [f32; 2] = [12.0, 13.0];
 
-    /// The light theme at each of [`FONT_SIZES`].
     /// `check-login`'s presses on the two top-bar words, as it writes them.
     const APPS_CLICK: i32 = 60;
     const PLACES_CLICK: i32 = 141;
@@ -645,6 +644,7 @@ mod tests {
     /// two — so an aim wants room for several such steps, not proof that it fits this pair.
     const AIM_MARGIN: i32 = 20;
 
+    /// The light theme at each of [`FONT_SIZES`].
     fn themes() -> impl Iterator<Item = Theme> {
         FONT_SIZES.into_iter().map(|px| Theme { font_px: px, ..Theme::light() })
     }

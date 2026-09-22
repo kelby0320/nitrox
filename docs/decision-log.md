@@ -27598,3 +27598,93 @@ the *same trap* `silent-probe-validity` already records about this exact file, a
 not fire because the probe was "grep a log" rather than "add a probe". **A stale artifact is a
 probe that cannot fire.** Checking the file's mtime against the clock is what turned it around;
 `check-login` writes its transcript unconditionally and was the instrument that worked.
+
+## 2026-09-22 — After Part K: an outlined tab, and hover on the controls that had none
+
+Two things the maintainer noticed once the refresh's eleven parts had merged. Both are small, and
+the second needed a decision about keys that is worth keeping.
+
+**The current tab had no edge.** The design outlines its active tab in `--line` on three sides and
+leaves the bottom open into the content; ours was the window's white on a strip one shade off
+white. It is now two faces rather than a stroked outline — the toolkit's `Outline` is square and
+this must follow a rounded top — and the test that pins it reads back each edge from a painted
+strip, including that the bottom stays open and that an inactive tab stays unoutlined, since an
+outline on every tab marks none.
+
+**The title-bar buttons and a tab's `×` lit on nothing.** The design gives minimise and maximise a
+`--faceLo` face with the glyph in full ink, and close a `--deny` one with a white glyph; those
+shipped as drawn, the white taken as the further of the scheme's two inks from the red (the
+`pill`'s reasoning, since the dark scheme's paper is near-black). The design gives a tab's `×` no
+hover at all, so that one is ours: the neutral `face_pressed`, **not** close's red — closing a tab
+loses one view, closing a window ends a program, and every browser draws that difference.
+
+**Hover in this toolkit is by key, so the controls needed keys.** The title-bar buttons take three
+from the top of the key space, beside the `+`'s `u64::MAX`, far from an application's small
+element keys and its tab keys at `1 << 62` or `1 << 63`. A tab's `×` needs one *per tab*, so it
+is derived: the tab's key with bit 60 set. That is a contract with every application's tab
+numbering, and each of the three now tests it against the toolkit's constant rather than a copy.
+
+**And the label beside the `×` carries its tab's own key.** The diff wants a container's children
+all keyed or none, so keying the `×` meant keying the label too — and keying it with the tab's own
+key keeps "the pointer is over this tab" meaning what it did, while `locate` and `find_by_key`
+walk outside-in and still find the whole tab first. A key repeated at a different depth is legal;
+the diff forbids duplicates only among siblings. Both halves are tested through the real router
+rather than by handing `hovered` in, because a key no pointer could produce passes every painted
+test.
+
+**One control did not apply, and it looked like a failure.** Moving the close bit onto bit 63 to
+check the applications' tests, nxterm's passed — correctly, since its tab keys start at bit 62 and
+never touch 63. The control was aimed at the other two; nxterm needed its own, on the bit its keys
+do use, and that one failed as it should.
+
+**`shot` gained a ninth moment**: the pointer resting on the terminal's close button. The host
+tests paint a hovered button and route a pointer to its key, but only a live window shows that the
+application *repaints* when the pointer crosses onto a new key — and a highlight nobody can see in
+the product is exactly the defect Part H's invisible close box was. The screendump shows 386
+`deny` pixels in the design's 23×21.
+
+## 2026-09-22 — After Part K, reviewed: tests that counted faces, and seven docs on the wrong item
+
+PR #325's review found nothing blocking and three things worth fixing. Two were tests with a
+gap; the third turned out to be a class, and the class was bigger than the PR.
+
+**A `×` that lit with its tab passed every test.** The tab test covered the pointer nowhere and on
+the `×`, never on the tab with the `×` at rest — so `if over_tab` in place of the close-key check,
+a one-word "simplification" that lights every tab's `×` as the pointer enters it, stayed green.
+The title-bar test had exactly that control already ("hovering button 0 lit button 1"); the tab
+test now has its own.
+
+**The faces were counted and the glyphs were not.** Swapping the close glyph to the scheme's
+`foreground` shipped `#16201F` on `#A4453C`, about 2.8:1, and passed. The new test reads the
+glyph's pixels in both schemes, and it pins close **by its reason rather than its colour**: the
+glyph must be whichever of the scheme's two inks has the higher WCAG contrast on `deny`, clearing
+4.5:1. That matters in the dark scheme, where the design's literal `#fff` is 3.36:1 on `#D46F63`
+and the near-black `furthest_from` picks is 5.25:1 — a departure from the design the test now
+holds, and a control using the design's white fails there and only there.
+
+**My first test for the `+` could not fire.** The `+` is antialiased text, and at this size no
+pixel of its strokes is fully covered, so a count of pixels exactly `foreground` is zero lit or
+not. It failed against a `+` that did light; a probe of the box's colours showed the darkest pixel
+moving from next to `foreground_dim` to next to `foreground`. The test now asks which ink the
+darkest pixel sits nearer. **An exact-colour count works for icons and fills and not for text.**
+
+**The orphaned doc comment was the fourteenth of its kind, and the sweep for it could not see
+it.** Inserting a test between another test's `///` block and its `#[test]` fuses the two docs
+into one and leaves the second test with none. Both sweeps I had skip exactly this shape: the one run
+this session looked for a doc block followed by a blank line, and the recorded one flags an added
+line that is *not* `///` under an unchanged `///` — while a fused doc is an added run that
+*starts* with its own `///`. A diff-based sweep over whole runs replaces both: flag an
+added run that sits directly under an unchanged `///` line **and** brings an item of its own
+(`fn`, `const`, `struct`, …). Both halves matter: without the second, a doc being *extended*
+matches; an attribute alone between a doc and its own item is legal and is excluded. It flags the
+reviewed commit, clears the fix, and the rewrite that briefly matched `tab_face`'s changed
+signature (a replaced line, not an inserted one) was the third refinement it needed.
+
+**Run over the last thirty merges it found six more, all in `main`**: `check_diagnostic_colour`
+inside `cmd_test_interactive`'s doc (Part F), the Places-menu test constants inside `themes()`'s
+(Part G's review), the check-install constants inside `cmd_check_live`'s (Phase 5 H.1b),
+`BlockDeviceInfo` inserted *through the middle* of `FramebufferInfo`'s doc and `SESSION_HAS_BLK`
+wearing `SESSION_HAS_BIN`'s (H.1), and the attribute-table static inside `record_framebuffer`'s
+(Part G of Phase 5). Every one is doc-only and fixed here. None was caught by a build, since the
+item that lost its doc was rarely under `deny(missing_docs)` and the one that gained a second
+paragraph compiles either way.

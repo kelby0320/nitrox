@@ -2415,6 +2415,7 @@ impl App {
                 // this is the path an unanswered request ends on.)
                 close: Some(Msg::Close),
             },
+            hovered,
             &ui,
         )
         .key(TITLE_KEY);
@@ -2788,6 +2789,7 @@ impl App {
             Msg::DragConfirm,
             // One button, and it is the cautious answer: closing a question must not perform it.
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::KeepIt) },
+            hovered,
             ui,
         )
         .key(CONFIRM_TITLE_KEY);
@@ -2830,6 +2832,7 @@ impl App {
             self.dialog_focused,
             Msg::DragConfirm,
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::CloseProperties) },
+            hovered,
             ui,
         )
         .key(PROPS_KEY);
@@ -4199,6 +4202,16 @@ mod tests {
         // A row index is a `usize` that counts entries; it cannot reach the high bit, so the two
         // ranges are disjoint by construction rather than by being far apart.
         assert_eq!(TAB_KEY_BASE, 1 << 63);
+
+        // **And a tab's `×` has a key of its own** (desktop refresh, after Part K): the toolkit
+        // keys it as the tab's key with `TAB_CLOSE_BIT` set, which relies on every tab key
+        // leaving that bit clear. They are numbered upward from the base, and four billion tabs
+        // later they still do — nor can a close key reach a row index, which is a `usize`
+        // counting entries.
+        for (key, _) in a.tabs() {
+            assert_eq!(key & libui::widget::TAB_CLOSE_BIT, 0, "tab key {key:#x} sets the close bit");
+        }
+        assert_eq!((TAB_KEY_BASE + (1 << 32)) & libui::widget::TAB_CLOSE_BIT, 0);
     }
 
     #[test]
