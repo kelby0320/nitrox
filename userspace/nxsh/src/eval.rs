@@ -370,7 +370,8 @@ impl Interp {
             let value = boundary_value(self.exec(stmt)?)?;
             self.bind_last(&value)?;
             if crate::repl::should_display(stmt) && !value.is_null() {
-                out = Some(crate::ops::display(&value));
+                let styled = self.host.styled();
+                out = Some(crate::ops::display(&value, styled));
             }
         }
         Ok(out)
@@ -1828,7 +1829,8 @@ impl Interp {
                         None => need(None)?,
                     },
                 };
-                let text = ops::display(&v);
+                let styled = self.host.styled();
+                let text = ops::display(&v, styled);
                 self.host.out(&text);
                 // A terminal operator: the chain ends here, so it yields Null rather than
                 // passing the value on to be displayed twice.

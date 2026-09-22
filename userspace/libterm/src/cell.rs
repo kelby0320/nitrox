@@ -112,7 +112,18 @@ pub struct Palette {
 }
 
 impl Default for Palette {
-    /// A conventional dark palette.
+    /// The design's terminal, as sixteen colours and a pair of defaults.
+    ///
+    /// **Retuned once, for the whole set** (desktop refresh, Part F). The design names five of
+    /// these outright — the banner's cyan, the prompt's bright cyan, the dim its table headers
+    /// and notes are set in, its success green and its error red — plus `--term` and `--termFg`.
+    /// The other eleven are built in the same key rather than left at the previous set's, because
+    /// a palette half in one key and half in another is what makes a terminal look like two
+    /// programs. `ok`, `warn` and `deny` from the theme are the anchors for green, yellow and red.
+    ///
+    /// **One set, not one per palette.** The design keeps its terminal colours outside both of
+    /// its themes, which is the same conclusion the paragraph below reaches from the other
+    /// direction: these are tuned for a dark ground and a light desktop does not retune them.
     ///
     /// **All eighteen are the terminal's.** `ansi` is what a program addresses with `ESC[31m` — a
     /// vocabulary defined by what programs expect, which is why retheming a desktop must not
@@ -140,30 +151,32 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             ansi: [
-                Rgb::new(0x1C, 0x22, 0x2A), // black
-                Rgb::new(0xC4, 0x3B, 0x3B), // red
-                Rgb::new(0x4E, 0xA8, 0x4E), // green
-                Rgb::new(0xC0, 0x94, 0x2E), // yellow
-                Rgb::new(0x41, 0x7C, 0xC4), // blue
-                Rgb::new(0xA0, 0x55, 0xB8), // magenta
-                Rgb::new(0x3E, 0xA6, 0xA6), // cyan
-                Rgb::new(0xC8, 0xCE, 0xD4), // white
-                Rgb::new(0x44, 0x4E, 0x5A), // bright black
-                Rgb::new(0xE6, 0x5C, 0x5C), // bright red
-                Rgb::new(0x74, 0xCE, 0x74), // bright green
-                Rgb::new(0xE6, 0xB8, 0x50), // bright yellow
-                Rgb::new(0x6A, 0xA2, 0xE6), // bright blue
-                Rgb::new(0xC2, 0x7C, 0xDA), // bright magenta
-                Rgb::new(0x60, 0xC8, 0xC8), // bright cyan
-                Rgb::new(0xEC, 0xF0, 0xF4), // bright white
+                Rgb::new(0x1A, 0x22, 0x24), // black
+                Rgb::new(0xBE, 0x6A, 0x62), // red
+                Rgb::new(0x5E, 0x9E, 0x78), // green
+                Rgb::new(0xB0, 0x8A, 0x4A), // yellow
+                Rgb::new(0x4E, 0x8C, 0xA6), // blue
+                Rgb::new(0x9A, 0x7B, 0xA8), // magenta
+                Rgb::new(0x6F, 0xB7, 0xAE), // cyan — the design's banner
+                Rgb::new(0xB8, 0xC6, 0xC4), // white
+                Rgb::new(0x8F, 0xA5, 0xA3), // bright black — the design's dim
+                Rgb::new(0xD6, 0x8A, 0x83), // bright red — the design's error
+                Rgb::new(0x8F, 0xD6, 0xA8), // bright green — the design's success
+                Rgb::new(0xD6, 0xB8, 0x7F), // bright yellow
+                Rgb::new(0x79, 0xA8, 0xD6), // bright blue
+                Rgb::new(0xC0, 0xA0, 0xCC), // bright magenta
+                Rgb::new(0x79, 0xC6, 0xD6), // bright cyan — the design's prompt
+                Rgb::new(0xEA, 0xF6, 0xF6), // bright white
             ],
-            // The dark theme's own two, carried here when the desktop turned light rather than
-            // re-chosen: the grid looked like this for four milestones and nothing about it was
-            // the thing being changed. **Not `ansi[0]`**, which is a different colour for a
-            // reason — a ground equal to a cell colour is text nobody can read, and the first
-            // attempt at this line used it (caught by `xtask`'s own cross-crate test).
-            foreground: Rgb::new(0xE0, 0xE6, 0xEC),
-            background: Rgb::new(0x0E, 0x14, 0x1B),
+            // **The design's `--term` and `--termFg`** (desktop refresh, Part F). They were the
+            // dark theme's own two, carried here when the desktop turned light rather than
+            // re-chosen; the design names a pair for its terminal specifically, and keeps them
+            // *outside* both of its palettes for the same reason this whole set sits outside the
+            // theme. **Not `ansi[0]`**, which is a different colour for a reason — a ground equal
+            // to a cell colour is text nobody can read, and the first attempt at this line used
+            // it (caught by `xtask`'s own cross-crate test).
+            foreground: Rgb::new(0xCF, 0xDE, 0xDC),
+            background: Rgb::new(0x0C, 0x12, 0x13),
         }
     }
 }
@@ -296,6 +309,50 @@ mod tests {
         // renders in the wrong one — visible, but only to someone who knows what it should be.
         for (i, c) in Ansi::ALL.iter().enumerate() {
             assert_eq!(c.index(), i, "{c:?} indexes {} but sits at {i}", c.index());
+        }
+    }
+
+    /// Every colour a program prints in is readable on the ground it is printed on.
+    ///
+    /// **The one property of a palette that is not a matter of taste** (desktop refresh, Part F).
+    /// `xtask` already asserts no colour *equals* the ground — the sharp edge — but a colour a
+    /// shade off the ground is text nobody can read either, and a whole set was retuned here by
+    /// hand. 4.5:1 is WCAG's threshold for body text; the tightest of the fifteen is plain red at
+    /// 4.88, so this has room without being slack.
+    ///
+    /// **ANSI black is exempt, and that is the convention rather than a hole.** Slot 0 is what a
+    /// program means by "the darkest thing"; it is dim on a dark ground in every terminal ever
+    /// shipped, and a palette that made it readable would have stopped being black.
+    #[test]
+    fn every_colour_but_black_is_readable_on_the_terminals_ground() {
+        // sRGB relative luminance, as WCAG defines it.
+        fn lum(c: Rgb) -> f32 {
+            fn chan(v: u8) -> f32 {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            }
+            0.2126 * chan(c.r) + 0.7152 * chan(c.g) + 0.0722 * chan(c.b)
+        }
+        fn ratio(a: Rgb, b: Rgb) -> f32 {
+            let (hi, lo) = if lum(a) >= lum(b) { (lum(a), lum(b)) } else { (lum(b), lum(a)) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        let p = Palette::default();
+        for (i, c) in p.ansi.iter().enumerate() {
+            if i == Ansi::Black.index() {
+                continue;
+            }
+            let r = ratio(*c, p.background);
+            assert!(r >= 4.5, "ANSI colour {i} ({c:?}) is {r:.2}:1 on the terminal's ground");
+        }
+        assert!(ratio(p.foreground, p.background) >= 4.5, "the default foreground is unreadable");
+
+        // **And the sixteen are sixteen.** A duplicate loses a colour with no other symptom:
+        // `ESC[32m` and `ESC[36m` would print the same pixels and nothing would say so.
+        for (i, a) in p.ansi.iter().enumerate() {
+            for (j, b) in p.ansi.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "ANSI colours {i} and {j} are the same colour");
+            }
         }
     }
 

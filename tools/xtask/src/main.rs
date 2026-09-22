@@ -1275,6 +1275,42 @@ fn cmd_qemu(
 ///
 /// One boot serves every scenario: the shell returns to `login:`, so the session sequence
 /// continues rather than paying ~15 s of boot per case.
+/// The shell's diagnostics reach a real terminal in the design's colour.
+///
+/// **On the bytes, because nothing else can see this** (desktop refresh, Part F; PR #324 review,
+/// blocking 1). `libterm` swallows SGR, so the graphical gate reads the same grid text whether
+/// or not a diagnostic was painted — and every host test is of a function, not of the path a
+/// message actually takes. This gate is the one place a diagnostic is *printed to a terminal*
+/// and the raw bytes are kept.
+///
+/// The first version of this part painted `Host::diag`, which no interactive path calls: the
+/// branch was dead and four documents said the shell coloured its diagnostics. This is what
+/// would have caught it.
+fn check_diagnostic_colour(transcript: &str) -> R<()> {
+    let open = "\x1b[91m";
+    let Some(at) = transcript.find(open) else {
+        return Err("no diagnostic was printed in the design's colour: the transcript holds no \
+                    `ESC[91m`, although this gate provokes several errors at a real prompt. \
+                    Painting a path nothing calls looks exactly like this"
+            .into());
+    };
+    // **And the reset closes before the line ends.** `tty_write_crlf` makes a chunk of anything
+    // after a `\n`, so a reset on the far side of one is a blank line with `ESC[0m` at the head
+    // of the next. Checked here because the shape only goes wrong on the wire.
+    let rest = &transcript[at + open.len()..];
+    let end = rest.find("\x1b[0m").ok_or("a diagnostic was opened in colour and never reset")?;
+    let body = &rest[..end];
+    if body.contains('\n') || body.contains('\r') {
+        return Err(format!(
+            "a diagnostic's colour spans a line ending ({body:?}): the reset belongs before it, \
+             or `tty_write_crlf` prints a blank line with `ESC[0m` on the next one"
+        )
+        .into());
+    }
+    println!("  ok: a diagnostic reached the terminal in colour, reset before its line ended");
+    Ok(())
+}
+
 fn cmd_test_interactive(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
@@ -1309,6 +1345,7 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
 
     match result {
         Ok(n) => {
+            check_diagnostic_colour(&transcript)?;
             println!("\nxtask: interactive tests PASSED ({n} steps)");
             Ok(())
         }

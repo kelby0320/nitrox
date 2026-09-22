@@ -179,7 +179,10 @@ fn drain_diagnostics(err: u64, tty: u64) {
             // between every message.
             let text = text.strip_suffix('\n').unwrap_or(text);
             if tty != 0 {
-                tty_write_crlf(tty, text);
+                // A stage's own diagnostic, in the same colour the shell's are — it is the same
+                // kind of thing to the person reading it. The newline is already off, which is
+                // what makes painting here safe; see `repl::diagnostic`.
+                tty_write_crlf(tty, &nxsh::style::paint(true, nxsh::style::DIAG, text));
             } else {
                 kprint(text.as_bytes());
                 kprint(b"\n");
@@ -660,6 +663,14 @@ impl Host for NitroxHost {
     }
 
     fn diag(&mut self, text: &str) {
+        // **Not painted, and the reason is worth keeping** (PR #324 review, blocking 1). Every
+        // caller of this is in `run` — script mode — which builds its host with `tty: 0`, and a
+        // script's output is plain text by design. A first version painted here and coloured
+        // nothing anybody could see, while the docs claimed the shell coloured its diagnostics.
+        //
+        // It also arrives in fragments: `run` calls this three times for one message
+        // (`"nxsh: "`, the message, `"\n"`), so there is no whole run here to bracket even if
+        // there were a terminal. What the REPL shows is painted in `run_and_render`.
         self.say(text);
     }
 
@@ -714,6 +725,10 @@ impl Host for NitroxHost {
     /// redirect. TODO(tty-server): `docs/rationale/deferred-decisions.md`.
     fn out(&mut self, text: &str) {
         self.say(text);
+    }
+
+    fn styled(&mut self) -> bool {
+        self.tty != 0
     }
 }
 
@@ -1064,7 +1079,18 @@ fn repl(
     tty_set_echo(tty, false);
     let mut disc = tty_server::Discipline::new();
 
-    tty_write(tty, b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
+    // The banner in the design's cyan. The loop only runs with a terminal, and `tty` is it.
+    tty_write(tty, b"\r\n");
+    tty_write(
+        tty,
+        nxsh::style::paint(
+            tty != 0,
+            nxsh::style::BANNER,
+            "nxsh: interactive shell (Ctrl-D or `exit` to leave)",
+        )
+        .as_bytes(),
+    );
+    tty_write(tty, b"\r\n");
 
     // `pending` accumulates across continuation lines. Deciding whether what has been typed
     // is *complete input* stays here rather than in the tty: the discipline hands over
@@ -1073,7 +1099,7 @@ fn repl(
     let mut history = nxsh::history::History::new();
     // Reverse-search state, `None` when not searching.
     let mut search: Option<Search> = None;
-    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
 
     let mut chunk = [0u8; 64];
     loop {
@@ -1100,7 +1126,7 @@ fn repl(
             pending.clear();
             disc.reset();
             tty_write(tty, b"^C\r\n");
-            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
             continue;
         }
         for &b in &chunk[..n] {
@@ -1137,7 +1163,7 @@ fn repl(
                                 return status;
                             }
                         }
-                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
                     }
                     SearchStep::None => {}
                 }
@@ -1196,7 +1222,7 @@ fn repl(
                         match pending.is_empty() {
                             true => tty_write(
                                 tty,
-                                nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes(),
+                                nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes(),
                             ),
                             false => {
                                 tty_write(tty, nxsh::repl::continuation_prompt().as_bytes())
@@ -1240,7 +1266,7 @@ fn repl(
 
                     let src = core::mem::take(&mut pending);
                     if src.trim().is_empty() {
-                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
                         continue;
                     }
                     history.push(&src);
@@ -1248,7 +1274,7 @@ fn repl(
                     if let Some(status) = run_and_render(&mut interp, tty, &src) {
                         return status;
                     }
-                    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
                 }
             }
         }
@@ -1275,8 +1301,14 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
         Ok(None) => None,
         Err(e) if e.is_exit() => Some(e.exit.unwrap_or(0) as i64),
         Err(e) => {
-            let mut msg = String::from("nxsh: ");
-            msg.push_str(&e.message);
+            // **This is where the REPL reports an error**, and therefore where the design's
+            // diagnostic colour belongs (PR #324 review, blocking 1). `Host::diag` is the
+            // *script* path — `run` builds its host with no terminal — so painting there
+            // coloured nothing anybody could see.
+            //
+            // The newline is added after the painted message, never inside it: see
+            // [`repl::diagnostic`](nxsh::repl::diagnostic).
+            let mut msg = nxsh::repl::diagnostic(&e.message, tty != 0);
             msg.push('\n');
             tty_write_crlf(tty, &msg);
             None

@@ -137,13 +137,37 @@ fn ends_in_terminal_operator(e: &Expr) -> bool {
 /// few bytes per prompt and repeats a value that has usually not changed, which is what every
 /// shell that puts this in `PS1` does: `cd` then needs no separate announcement, and a prompt
 /// is the moment the shell is certainly idle and certainly somewhere.
-pub fn prompt(position: &str) -> String {
+pub fn prompt(position: &str, styled: bool) -> String {
     let mut s = String::from("\x1b]7;");
     s.push_str(position);
     s.push('\x07');
-    s.push_str(position);
-    s.push_str("> ");
+    // **The prompt in the design's bright cyan** (desktop refresh, Part F), bracketing the
+    // trailing space too — see [`style::paint`](crate::style::paint) for why the reset goes
+    // after it rather than before.
+    let mut text = String::from(position);
+    text.push_str("> ");
+    s.push_str(&crate::style::paint(styled, crate::style::PROMPT, &text));
     s
+}
+
+/// The shell's own diagnostic, as it goes to a terminal: `nxsh: <message>`, in the diagnostic
+/// colour when there is one.
+///
+/// **No trailing newline, and that is the contract** (desktop refresh, Part F). Every caller
+/// hands this to something that ends the line itself — `tty_write_crlf` emits a `\r\n` after
+/// each chunk it splits on `\n`, so a reset that landed *after* a newline would be a chunk of
+/// its own: a blank line with `\x1b[0m` at the head of the next one. Returning the message
+/// without a line terminator is what makes that mistake impossible to make here rather than a
+/// rule each caller has to remember.
+///
+/// **Here rather than in the binary**, because the binary is not host-tested: the first version
+/// of this painted `NitroxHost::diag`, which no interactive path calls at all — script mode
+/// builds its host with no terminal, so the branch was dead and the claim that the shell
+/// coloured its diagnostics was false (PR #324 review, blocking 1).
+pub fn diagnostic(message: &str, styled: bool) -> String {
+    let mut body = String::from("nxsh: ");
+    body.push_str(message);
+    crate::style::paint(styled, crate::style::DIAG, &body)
 }
 
 /// The continuation prompt, bash's `PS2` by another name.
@@ -224,10 +248,25 @@ mod tests {
     }
 
     #[test]
+    fn a_diagnostic_is_painted_and_carries_no_line_of_its_own() {
+        assert_eq!(diagnostic("boom", false), "nxsh: boom");
+
+        let d = diagnostic("boom", true);
+        assert!(d.contains("nxsh: boom"), "{d:?}");
+        // **The rule this function exists to keep.** A newline inside the paint puts the reset
+        // on the far side of it, and `tty_write_crlf` then makes `\x1b[0m` a chunk — a blank
+        // line with the reset at the head of the next. Asserted on the bytes, because stripping
+        // the escapes back out gives the same text either way and cannot tell the two apart
+        // (PR #324 review, finding 2).
+        assert!(!d.contains('\n'), "{d:?} carries a newline the caller must add");
+        assert!(d.ends_with(crate::style::RESET), "{d:?}");
+    }
+
+    #[test]
     fn the_prompt_shows_the_namespace_position() {
         // **What a person sees is unchanged**, which is the half the escape must not disturb:
         // the prompt is still the position and `> `, with everything before it invisible.
-        let p = prompt("/home/alice");
+        let p = prompt("/home/alice", false);
         assert!(p.ends_with("/home/alice> "), "{p:?}");
         // **And the terminal is told the same position**, byte for byte. `nxterm` reads this
         // as `OSC 7` — `libterm::parse`'s `directory` — and a terminal that does not simply
@@ -236,5 +275,12 @@ mod tests {
         // place the two could drift apart; what actually holds them together is
         // `cargo xtask check-terminal`, which boots both.
         assert_eq!(p, "\x1b]7;/home/alice\x07/home/alice> ");
+
+        // **And coloured, with the text still in one piece.** A terminal gets the prompt in the
+        // design's bright cyan; the OSC comes first because it is not part of what is drawn.
+        let c = prompt("/home/alice", true);
+        assert!(c.starts_with("\x1b]7;/home/alice\x07"), "{c:?}");
+        assert!(c.contains("/home/alice> "), "{c:?} split the prompt");
+        assert!(c.ends_with(crate::style::RESET), "{c:?}");
     }
 }

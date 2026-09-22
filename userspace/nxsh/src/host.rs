@@ -133,6 +133,19 @@ pub trait Host {
     /// Ordinary output: what `display` and the REPL's auto-display write to.
     fn out(&mut self, text: &str);
 
+    /// Whether what this host writes is going to a terminal that reads SGR.
+    ///
+    /// **The whole of "only when it has a terminal"** (desktop refresh, Part F). A shell with no
+    /// terminal is a script or a Tier-0 stage, and its output is bytes somebody will read as
+    /// text or feed to something else — an escape in it is corruption, not colour.
+    ///
+    /// **A default of `false`**, so a host that has not thought about it emits nothing: the same
+    /// shape as [`interrupted`](Self::interrupted), where "no terminal" means the question is
+    /// never asked of anyone.
+    fn styled(&mut self) -> bool {
+        false
+    }
+
     /// The external programs this shell could run by name, for completion (§11c).
     ///
     /// **On the trait rather than in the library**, because *where* programs come from is

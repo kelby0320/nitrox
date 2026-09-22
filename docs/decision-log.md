@@ -27504,3 +27504,97 @@ pixels, and the capture was being asked for at *that* size — so the compositor
 into four and the result was a smear, where the screen itself shows the window's left-hand edge.
 `capture_box` is now the window's own scale and the blit crops to the box, which is the same thing
 the screen is doing.
+
+## 2026-09-22 — Part F: the shell colours its own output, and the refresh is complete
+
+The last part of the desktop refresh. Three decisions, and the first is the one that makes the
+other two small.
+
+**The shell emits SGR, not each program.** A Unix terminal has the same mechanism and the
+*program* emits it, which is why `ls --color` and `grep --color` each carry a flag and an `isatty`
+check. Here a program's output is a **typed stream that the shell renders**, so colouring the
+shell's renderer once colours every program's output — and the shell knows which row is a header
+because it built the table. There is no per-program flag to forget, and no program has to learn
+what a terminal is.
+
+**Four things are structural and nothing else is**: the banner, the prompt, a table's header row
+and a diagnostic — which is exactly what the design colours. **Values are left alone.** A value is
+data; tinting it means guessing what it means, and guessing is the thing this arrangement exists
+to avoid. `nxsh::style` is the one place that names which code each role uses.
+
+**"Only when it has a terminal" is asked in two places**, because two kinds of code emit. The
+library asks `Host::styled`, defaulting to `false` — the same shape as `Host::interrupted`, where
+a shell with no terminal is a script or a Tier-0 stage and the question is never asked of anyone.
+The REPL loop knows its own `tty` and tests it directly. A script's output is bytes somebody will
+read as text or feed to something else, and an escape in it is corruption rather than colour.
+
+**Two placement rules for the reset, with opposite reasons.** A trailing **space** goes *inside*
+the paint: a space has no ink, so it makes no visual difference, but it decides whether what a
+reader sees as one string is one string in the byte stream — `\x1b[96m/home> \x1b[0m` keeps
+`/home> ` contiguous where resetting before the space would split it, and every gate matches
+`"/home>"`. A trailing **newline** goes *outside*: `tty_write_crlf` emits a `\r\n` after every
+chunk it splits on `\n`, so a reset after the newline is a chunk of its own — a blank line, with
+`\x1b[0m` at the head of the next. The first version of the diagnostic path did precisely that —
+though in a branch that never ran, which review caught separately and is recorded below.
+
+**One set of sixteen, retuned whole.** The design names five outright — the banner's cyan, the
+prompt's bright cyan, the dim its headers and notes share, its success green and its error red —
+plus `--term` and `--termFg`, which are now `Palette::default`'s `background` and `foreground`.
+The other eleven were rebuilt in the same key rather than left at the previous set's, because a
+palette half in one key and half in another is what makes a terminal look like two programs;
+`ok`, `warn` and `deny` anchor green, yellow and red. **One set, not one per scheme**, which is
+the conclusion the design reaches by keeping its terminal outside both of its palettes and the one
+`Palette::default`'s own doc already reached from the other direction.
+
+**Legibility became a test rather than a judgement.** A whole palette was retuned by hand, and
+`xtask` only asserted that no colour *equals* the ground — the sharp edge. Every colour but ANSI
+black now clears 4.5:1 against the ground, the tightest being plain red at 4.88, and the sixteen
+are checked to *be* sixteen: a duplicate loses a colour with no other symptom, since `ESC[32m` and
+`ESC[36m` would print the same pixels and nothing would say so. ANSI black is exempt, which is the
+convention rather than a hole — slot 0 is what a program means by "the darkest thing".
+
+**No truecolour needed nothing built.** `libterm`'s parser already swallows `38;2;r;g;b` whole,
+with a test, and `nxsh::style` names only codes in 30–37 and 90–97 — asserted, so a 24-bit escape
+cannot be added there without the test saying so.
+
+**The desktop refresh is complete**: eleven parts, A–K. Next is administration
+(`docs/planning/administration.md`), then Phase 6 — USB.
+
+## 2026-09-22 — Part F, reviewed: a colour nothing printed, and a test that did not test it
+
+PR #324's review found one blocking fault and one that undercut the evidence for it. Both are the
+same failure wearing different clothes: **a claim with nothing executing it.**
+
+**The shell's diagnostics were never coloured.** The paint went into `NitroxHost::diag`, whose
+every caller is in `run` — script mode — which builds its host with `tty: 0`, so the painted
+branch could not execute. The REPL reports errors somewhere else entirely: `run_and_render`'s
+error arm, and `drain_diagnostics` for a stage's own messages. Four documents said the shell
+coloured its diagnostics; typing `nosuchprog` printed them in the default foreground. The fix is
+to paint where the REPL actually writes, and `diag` now paints nothing and says why — it also
+receives one message in three fragments, so there is no whole run there to bracket.
+
+**And my evidence for the newline rule was about that dead branch.** The decision-log entry above
+records catching a reset-after-newline "in the first version of the diagnostic path". That path
+never ran. The rule is real — `tty_write_crlf` makes a chunk of anything after a `\n` — but it
+was never demonstrated where it bites.
+
+**The test that claimed to cover it could not.** `display`'s test strips the escapes back out and
+compares against the uncoloured render, and the comment said that shows a reset on the wrong side
+of a `\n` as a layout change. It does not: stripping gives identical text either way. The reviewer
+demonstrated it by moving the newline inside the paint and watching the test pass. Byte-order
+assertions replaced the claim — `RESET` immediately before the `\n`, and never after it.
+
+**The real guard is a gate, because nothing else can see this.** `libterm` swallows SGR, so the
+graphical gate reads the same grid text painted or not, and every host test is of a *function*
+rather than of the path a message takes. `cargo xtask test-interactive` is the one place a
+diagnostic is printed to a terminal with the raw bytes kept, so `check_diagnostic_colour` scans
+its transcript for `ESC[91m` and checks the reset closes before the line ends. Reverting the paint
+fails it with the message it was written for.
+
+**A method note worth more than the fix.** Checking whether the colour reached the wire, I grepped
+`guest-transcript-test-interactive.log` and found no escapes — and nearly concluded the fix had
+not worked. The file was twenty minutes old: that gate writes a transcript only on failure. It is
+the *same trap* `silent-probe-validity` already records about this exact file, and the memory did
+not fire because the probe was "grep a log" rather than "add a probe". **A stale artifact is a
+probe that cannot fire.** Checking the file's mtime against the clock is what turned it around;
+`check-login` writes its transcript unconditionally and was the instrument that worked.
