@@ -665,6 +665,15 @@ Toolkit pieces the three applications share, so each is built once and restyled 
       and what a selection is made from, so a third meaning for it is how a person stops being
       able to read either. Whether the palette moves to the design's is still the open decision
       Part A recorded.
+
+**Named by Part J's review and not fixed there**: `text_area` inserts the caret as a two-pixel
+element *in* the row, so the line the caret is on is drawn two pixels right of every other line
+(`libui::widget`, the caret is a `Row` split at the cursor). In a proportional buffer nobody could
+tell; in a fixed-advance one "columns that line up" is the stated point of the part. Fixing it
+means drawing the caret as an overlay rather than as a sibling of the text, which is a change to
+a widget three applications use — so it is written down here rather than bundled into the part
+that noticed it.
+
 ## Part K — the terminal's window
 
 Beside Part F, which owns the terminal's colours.

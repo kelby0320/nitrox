@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-21, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -954,7 +954,9 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   toolkit draws with and is *proportional*; `font_mono` is the fixed-advance face
   [`libterm`](../../userspace/libterm) measures a cell from. Until that part there was one
   `SYSTEM_FONT_PATH` and every client loaded it, so every label in every window was monospaced.
-  `nxterm` is the one program that loads both: its menus are widgets and its grid is not.
+  `nxterm` was the one program that loads both until the desktop refresh's Part J, when the
+  editor became the second: `mono` draws through the same face, so `nxedit` loads it and attaches
+  it to the proportional one as a companion.
 
   **And widgets react to the pointer**, since M11 Part E batch 3 — which is later than it
   sounds: `Router::inside` has reported the widget under the cursor since M4 and

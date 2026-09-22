@@ -91,7 +91,7 @@ once did, because it still showed the dark theme M11 Part E replaced (PR #265 re
 | `font_px` | number, `6`–`16` | The body text size in pixels per em, read to the nearest hundredth; `13` if absent | |
 | `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens | flat: `0` |
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional | |
-| `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance | |
+| `font_mono` | `"/path"` | The fixed-advance face: a character grid, and anything the toolkit draws through `mono` — the editor's buffer since Part J | |
 | `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none | |
 | `wallpaper_mode` | `"fit"` or `"fill"` | How it is placed when it is not the screen's size | |
 
@@ -136,9 +136,16 @@ neither can emphasis, "working" or "destructive". They are read by whatever high
 shipped scheme, like any other omitted key.
 
 **Two fonts because a grid is not a label** (M11 Part D). Everything the toolkit draws takes
-`font_ui`; `nxterm`'s grid takes `font_mono`, and `nxterm` is the one program that loads both —
-its menus are widgets and its cells are not. Before Part D there was a single path constant and
-every client loaded it, so every label in the system was monospaced.
+`font_ui` unless it asks for the other; `nxterm`'s grid takes `font_mono`. Before Part D there
+was a single path constant and every client loaded it, so every label in the system was
+monospaced.
+
+**`nxterm` was the one program that loaded both until the desktop refresh's Part J**, and this
+said so. `nxedit` loads both now and attaches the fixed-advance face to the proportional one as a
+companion, which is how `libui`'s `mono` reaches a second face: the editor's buffer, its byte
+count and its position readout are set in `font_mono` while the chrome around them is not. So
+this key is no longer "the face a character grid is drawn with" — it is the face anything drawn
+through `mono` uses, a grid included.
 
 **The wallpaper is a file a person supplies**, which is why the built-in theme names none and
 why the guest decodes PNG at all rather than reading something the build converted (M12

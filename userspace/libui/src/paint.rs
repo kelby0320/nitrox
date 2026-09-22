@@ -424,6 +424,24 @@ mod tests {
         // And the wrapper is what does it: the same strings unwrapped differ even when paired.
         let bare = |s: &'static str| -> Element<Msg> { text(s) };
         assert!(measured(&paired, &bare("iiii")) < measured(&paired, &bare("mmmm")));
+
+        // **And the glyphs are *painted* in it, which measuring cannot say** (PR #321 review,
+        // worth fixing 1): the bold test this one is modelled on counts ink as well, and without
+        // that half, dropping the face selection in `draw` leaves text laid out at mono advances
+        // and drawn with proportional glyphs — every column crooked — with libui green.
+        let inked = |f: &Font, e: Element<Msg>| {
+            let mut b = fb();
+            b.clear(t.background);
+            go(&mut b, f, &t, &sized(Size::new(W, 40), e), Rect::new(0, 0, W, H));
+            ink(&b, &t)
+        };
+        // Eight narrow glyphs: the fixed-advance face spaces them out, so it puts down more ink
+        // across the row than the proportional one, which packs them.
+        let narrow_run = || -> Element<Msg> { mono(text("iiiiiiii")) };
+        assert!(
+            inked(&paired, narrow_run()) > inked(&plain, narrow_run()),
+            "the companion's wider advances put down more ink than the proportional face"
+        );
     }
 
     /// Bold text is set in the face's bold companion — wider, and heavier on the page — and in the

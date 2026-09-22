@@ -27307,3 +27307,45 @@ being a character a name may contain. A test cannot tell them apart today; the p
 because the spelling rule is about *names* and would reasonably be widened one day, at which
 point the comment would stop being protected by an accident. The comment says exactly that,
 rather than implying the check is load-bearing.
+
+## 2026-09-22 — Part J, reviewed: a test satisfied by the gutter, and a grip that moved
+
+PR #321's review found three blocking faults. The first is the one worth remembering.
+
+**The test that was supposed to pin Part J's headline feature was satisfied by a different
+element.** `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` located `AREA_KEY` and
+searched its whole subtree for a `Mono` wrapper — and `AREA_KEY` holds the scrollbar *and* the
+pane, and the pane holds the gutter, whose numbers this same part sets in `mono`. Deleting the
+wrapper from the document — Part J's entire point — left all 103 tests passing. The fix is one
+word, `AREA_INNER_KEY`, and the test now also asserts the gutter is *outside* what it searched,
+so the two cannot nest and quietly restore the hole.
+
+**The press test did not carry the claim in its name either.** It computes a press position with
+the test's own metric and converts back with the same one: a round trip that never consults the
+face the view laid out with. It pins `AREA_INNER_KEY` and the text area's inset, which is real,
+and the face claim now lives in a painted test — the window rendered with the real faces, and the
+drawn line's reach compared against what each face would give. Its first version used `iiiimmmm`,
+which the two faces draw within two pixels of each other; eight narrow glyphs differ by 29.
+
+**A resize grip subtracted from a text area it no longer covers.** Moving the status bar to the
+foot put the grip over the bar, and `area_h` went on taking `GRIP_W` out of the document: sixteen
+pixels of bare window between the gutter and the bar, and one line of the file the window had room
+for. `nxfiles::list_h` had the same fault in Part I and the same fix; this is the second window.
+
+**Two current-behaviour docs said `nxterm` was the only program that loads both faces.** It was
+true until this part and is not now. `font_mono` is also no longer "the face a character grid is
+drawn with" — it is what anything drawn through `mono` uses.
+
+**And three smaller ones, each with a test that could not fail.** The libui mono test measured but
+did not paint, so dropping the face selection in `draw` left it green; the gutter's
+"does not number past the end" half only ever scrolled a *long* file, where the offset clamps and
+the guard never runs; and four new element keys were never added to the collision list that exists
+because a key is a number nothing checks.
+
+**The gutter's numbers were a step smaller than the lines they number**, which is what made them
+sit low. Measuring that honestly took four attempts: the first compared two `text_size_as` calls
+with the test's own style — the same round trip as the press test — and the next three were
+confounded by ink that is not a glyph, the gutter's rule and then the caret, both of which span a
+whole row. The rule is now pinned structurally (the numbers carry no size step) as well as by ink,
+because at the small step the two feet differ by a single pixel, which is inside any tolerance an
+antialiased glyph needs.
