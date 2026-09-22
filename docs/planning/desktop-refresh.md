@@ -119,7 +119,7 @@ choosing two colours that do.
 - [x] **Part C — the panels**: the Applications and Places menus, and a bottom bar with a
       show-desktop button and the new switcher.
 - [x] **Part D — the greeter**, which the design does not cover and which has to match anyway.
-- [ ] **Part E — the overview**, whose layout changes.
+- [x] **Part E — the overview**, whose layout changes.
 - [ ] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
       has.
 - [x] **Part G — type, in DejaVu**: a smaller body size, a size scale, and weight only if it earns it.
@@ -399,14 +399,47 @@ expectation changes in the same commit as the code is the shape that needs a rea
 
 ## Part E — the overview
 
-- [ ] **Cards per desktop**, the current one outlined in `accent`, with `Desktop 1 · 3 windows`
+- [x] **Cards per desktop**, the current one outlined in `accent`, with `Desktop 1 · 3 windows`
       beneath. A layout change to a surface that exists (M13 Part C), over the translucent ground
       that already works.
-- [ ] **The miniatures stay frozen**, which `desktop-shell.md` §6 already decided: "thumbnails are
+
+      **Built, and it replaced the thumbnail grid and the sidebar rather than joining them** —
+      the maintainer's call, asked because the design's overview is *only* a desktop switcher
+      while ours was that plus an Exposé. No gesture was lost: a window's box inside a card is
+      what a thumbnail was, a card is what a sidebar row was, and a window is now drawn where it
+      actually is rather than in a fixed cell. What it costs is size, 22.9% of the screen rather
+      than 240×150.
+
+      **The card's width is a fraction of the screen's, not a number.** 330 on the page's 1440 is
+      a quarter of a 1360-wide screen and an eighth of a 2560-wide one, and `check-resolutions`
+      boots five; as a fraction the same three fit across at every size, which is what the
+      design's composition is actually saying. Everything else derives from it — the strip is the
+      top bar scaled, the interior is the screen's own proportions — so `card_rect` and
+      `window_box` are host-tested at seven sizes rather than checked by eye at one.
+
+      **The caption is two runs, not one string with a separator** — the name, and the count
+      dimmed beside it — which is what the design draws; the `·` above was shorthand. Its dim ink
+      was `#666` on the overview's ground at first, about 2.4:1, because `blend`'s coverage is
+      the *source's* share and 102 is 40% where the design says 60%. Caught on a screendump.
+- [x] **The miniatures stay frozen**, which `desktop-shell.md` §6 already decided: "thumbnails are
       frozen … live thumbnails are an optimisation with a trigger". The first draft said "live",
       which would have pulled that trigger by accident (review, finding 7). The design's own cards
       are schematic boxes labelled with the application's name rather than pixels at all, so
       frozen captures are if anything more than it asks for.
+
+      **Built, and the split is where the pixels exist**: the current desktop's card carries real
+      captures, because the compositor can only capture what it is compositing; every other card
+      draws the design's named boxes. The schematic is drawn *underneath* the captures rather than
+      instead of them, so a window whose capture failed still appears. Captures are now asked for
+      at the size of the box they are drawn in, so nothing is scaled twice.
+
+**Two divergences, both deliberate.** The design's cards have an 8 px radius and ours are square:
+a card's ground is a photograph blitted per pixel, and rounding it means clipping that blit, which
+is a change to the blitter for a corner. And **no gate renders this surface** — `preview` draws
+the toolkit's own widgets and the overview is composed in the guest — so its appearance is judged
+on `cargo xtask shot`, which is how both faults above were found. Giving `desktop_card` a preview
+frame would need it moved into `desktop-shell`'s library along with the window record it reads;
+worth doing, not done here.
 
 ## Part F — a terminal with colour
 

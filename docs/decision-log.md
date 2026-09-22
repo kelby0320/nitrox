@@ -27414,3 +27414,60 @@ directions of the off-by-one fail it.
 This is the same shape as the part's own finding one layer down — `cell_h` was central and
 unpinned — and the general form is worth saying once: **a constant is tested when a test fails for
 the value next to it**, not when a test exercises a value far from it.
+
+## 2026-09-22 — Part E: the overview becomes cards, and loses its Exposé
+
+The desktop refresh's overview part. The design's overview is **only** a desktop switcher — cards
+per desktop, each a scale model of the screen — while ours was that *plus* an Exposé of the
+current desktop's windows at 240×150 with a sidebar down the right-hand edge. Which of the two to
+keep is a product question, so it went to the maintainer, who chose the design's.
+
+**No gesture was lost, which is what made the choice cheap.** A window's box inside a card is what
+a thumbnail was, and a card is what a sidebar row was: drag a window onto another card to move it,
+click a window to raise it, click a card to go there, click the card you are on or the background
+to dismiss. What it costs is size — a window is drawn at 22.9% of the screen rather than in a
+fixed cell — and what it buys is that every desktop is shown the same way, with its windows in the
+arrangement they are actually in rather than in a grid.
+
+**A window's box is *inside* a card, so the click arm had to be tried before the drop arm.** Every
+release over a window is also a release over the card holding it; matching the drop first turns
+"click the window you pressed" into "move it to the desktop it is already on", which is a manager
+round trip for nothing and closes the overview instead of raising anything.
+
+**The card's width is a fraction of the screen's, not a number.** The design's 330 is on a
+1440-wide page — 22.9% — and written down as 330 it would be a quarter of a 1360-wide screen and
+an eighth of a 2560-wide one, while `check-resolutions` boots five. Everything else derives from
+it: the strip is the top bar at the card's scale, and the interior is the screen's own
+proportions, so a window is drawn the shape it is. `card_rect` and `window_box` are therefore
+arithmetic in the shell's library, host-tested at seven sizes, and the one function both the
+drawing and the hit-testing use — the lesson the bottom bar's indicator taught (PR #243).
+
+**Captures are asked for at the size they are drawn at.** §6's "capture at thumbnail size, not
+full size" used to mean a fixed 240×150 cell; a card's window box is smaller and varies per
+window, so the compositor now scales to exactly that and nothing is scaled twice. A card for a
+desktop that is *not* being composited has nothing to capture, so it draws the design's named
+boxes instead — and those boxes are drawn underneath the captures rather than instead of them, so
+a window whose capture failed still appears.
+
+**Two faults found on a screendump, and neither could have been found any other way.** The
+caption's dim ink was `#666` on the overview's ground, about 2.4:1, because `Rgb::blend`'s
+coverage is the *source's* share and 102 is 40% where the design says 60%. And an earlier reading
+of the accent border looked absent until the pixels said `2C7F92` — it was the thumbnail that was
+misleading, not the code. **No gate renders this surface**: `preview` draws the toolkit's own
+widgets, and the overview is composed in the guest over the live desktop. Its appearance is judged
+on `cargo xtask shot`. Giving `desktop_card` a preview frame would need it moved into the shell's
+library along with the window record it reads — worth doing, not done here.
+
+**A pre-existing failure at 1024×768, found on the way and not fixed here.** Every overview step
+passes at that size; `check-login` then fails at the *editor's* tab aim, which assumes the two
+windows snapped to half the work area each and at 1024 clicks the browser's close box instead.
+Confirmed pre-existing by running the same gate at that size on `main`, which fails identically —
+a fact rather than an argument, because "nothing I changed touches placement" is exactly the
+reasoning that is wrong when it is wrong. `check-resolutions` is on-demand and not run per PR,
+which is why this has sat there.
+
+**And I verified the new hit-testing with the wrong gate first.** `check-input` passed, and
+`check-input` never opens the overview — the overview's steps are `check-login`'s. A green gate
+that does not execute the changed code says nothing, which is the same rule as a negative control
+that did not apply. The gate that matters printed the coordinates: a card click at (532, 450)
+switching to `cli`, the same point again dismissing, and a window box at (598, 366) raising.
