@@ -2691,13 +2691,44 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             .zip(row)
                             .is_some_and(|(e, i)| e.desktop == desktops[i].id);
                         match (picked, row) {
-                            // A press and a release on the same window: a click, so raise it.
+                            // **A press and a release on the same window: a click, so go to
+                            // it** — and *going to* a window on another desktop means switching
+                            // there first (PR #323 review, blocking 1).
+                            //
+                            // Until cards, only the current desktop's windows had a target at
+                            // all; now every card's do, and `raise_window` alone reorders a
+                            // stack nobody is looking at. `WindowStack::raise` does not change
+                            // which desktop is composited, so the overview closed and the
+                            // screen was exactly as it had been — on a card holding a maximised
+                            // window that is most of the card, which is also most of the area
+                            // "click a card to switch" was supposed to cover.
                             (Some(wid), _) if under == Some(wid) => {
+                                let home =
+                                    entries.iter().find(|e| e.id == wid).map(|e| e.desktop);
                                 if let Some(m) = manager.as_mut()
-                                    && let Some(e) = entries.iter_mut().find(|e| e.id == wid)
+                                    && let Some(home) = home
                                 {
                                     sent_request = true;
-                                    if raise_window(m, e) {
+                                    // **The switch is not attempted when it is already there**,
+                                    // because `switch_desktop` answers `false` for that and
+                                    // would read as a refusal. No `normalize_desktops` after
+                                    // it: the desktop being switched to holds this window, so
+                                    // it is occupied by definition and the trailing scratch
+                                    // slot is untouched — which is the one thing that call is
+                                    // for.
+                                    let there = home == current_desktop
+                                        || switch_desktop(
+                                            m,
+                                            &desktops,
+                                            &mut current_desktop,
+                                            &mut told_desktop,
+                                            home,
+                                        );
+                                    if there
+                                        && let Some(e) =
+                                            entries.iter_mut().find(|e| e.id == wid)
+                                        && raise_window(m, e)
+                                    {
                                         list_dirty = true;
                                         Line::new()
                                             .s(b"desktop-shell: overview raised window ")
@@ -3852,15 +3883,15 @@ fn window_in_card_at(
         .map(|e| e.id)
 }
 
-/// How big a capture of `window` should be: the box it will be drawn in, inside its border.
+/// How big a capture of `window` should be — [`desktop_shell::capture_box`], which says why it
+/// is the window's own scale rather than the box it lands in.
 ///
 /// **Captured at the size it is shown at** (desktop refresh, Part E), which is what makes this
 /// affordable with no GPU — `desktop-shell.md` §6's "capture at thumbnail size, not full size",
 /// now that a thumbnail is a card's window box rather than a fixed 240×150 cell. The compositor
 /// scales once, on entry; nothing rescales per frame.
 fn capture_size(e: &WinEntry, screen: Screen) -> (u32, u32) {
-    let (_, _, bw, bh) = desktop_shell::window_box((0, 0, 0, 0), e.origin, e.size, screen);
-    (bw.saturating_sub(2).max(1), bh.saturating_sub(2).max(1))
+    desktop_shell::capture_box(e.size, screen)
 }
 
 /// Ask the compositor to scale `window` into a fresh buffer, and return the pixels.

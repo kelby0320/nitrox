@@ -4594,6 +4594,36 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // dropped on. **`(empty)` rather than the bare prefix**, which matched a list still holding
     // the window just as happily as one that had lost it (PR #244 review, optional 6).
     session.expect("desktop-shell: window list on work of 3 (empty)")?;
+
+    // **A window clicked in a card that is not the current desktop's** (PR #323 review,
+    // blocking 1). The state here is exactly the one that matters: `work` is current and empty,
+    // and the terminal is on `cli` — so the terminal's box is in a card the user is not on.
+    //
+    // Before the fix this raised a window on a desktop nobody was looking at and closed the
+    // overview, leaving the screen unchanged: `WindowStack::raise` reorders a stack, and
+    // nothing had changed which desktop was being composited. **No step reached it**, because
+    // the card click above aims at `card_click` — "where the placement cascade never reaches" —
+    // and the raise click below only ever ran once its desktop was already current.
+    //
+    // The switch is asserted *before* the raise because that is the order the shell does it in:
+    // a raise on a desktop that is not being composited is the bug, not the fix.
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    let open_line = session.rest_of_line()?;
+    let cards = parse_overview_line(&open_line)
+        .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
+    let away = size.window_in_card(1, cards, (term_x, term_y, term_w, term_h));
+    click_at(&mut qmp, &mut session, away.0, away.1)?;
+    // **`Desktop 2`, not `cli`**: the second desktop is not named until 6f, so at this point its
+    // label is the positional one `desktop_label` gives an unnamed desktop.
+    session.expect("desktop-shell: switched to Desktop 2")?;
+    session.expect("desktop-shell: overview raised window ")?;
+    session.expect("desktop-shell: overview closed")?;
+    println!("  ok: a window in another desktop's card went to that desktop and raised it");
+
+    // Back to `work`, so the rest of this step runs from where it used to.
+    chord(&mut qmp, false, "1")?;
+    session.expect("desktop-shell: switched to work")?;
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;

@@ -27471,3 +27471,36 @@ which is why this has sat there.
 that does not execute the changed code says nothing, which is the same rule as a negative control
 that did not apply. The gate that matters printed the coordinates: a card click at (532, 450)
 switching to `cli`, the same point again dismissing, and a window box at (598, 366) raising.
+
+## 2026-09-22 — Part E, reviewed: a card gave every desktop's windows a click target
+
+PR #323's review found one blocking fault, and it is a good example of a change *widening* what
+an existing arm can reach.
+
+**Clicking a window in another desktop's card raised a window nobody could see.** Before cards,
+only the current desktop's windows had a pick-up target — the old thumbnails were of one desktop.
+A card gives every desktop's windows one, and the click arm ran `raise_window` unconditionally:
+`WindowStack::raise` reorders a stack and does not change which desktop is composited, so the
+overview closed and the screen was exactly as it had been. The reviewer measured the blast radius
+rather than asserting it — on a card holding a maximised window the box is **77% of the card's
+clickable area**, so "click a card to switch" worked only on the strip, a seven-pixel band and the
+caption. The fix is to switch to the window's desktop first and then raise.
+
+**No gate reached it, and the reasons are worth keeping.** `check-login`'s card click aims at
+`card_click`, documented as "where the placement cascade never reaches" — a point chosen to be
+clear of windows, which is exactly the case that worked. Its raise click only ever ran once the
+window's desktop was already current. Two aims that were each individually reasonable left the
+combination untested. The new step clicks a window's box in a **non-current** card, and it was
+written *before* the fix and watched to fail: `overview raised window 10` with no switch.
+
+**The general shape: a new surface can widen an old branch's reach without touching it.** The
+click arm was not edited by the part that broke it. What changed was the *hit-test* feeding it,
+which went from "windows on one desktop" to "windows on any desktop" — and the arm's unstated
+precondition went with it. Worth asking of any change that generalises a lookup: which branches
+downstream assumed the narrower answer?
+
+**And one optional finding taken.** A window dragged mostly off-screen has a box clamped to a few
+pixels, and the capture was being asked for at *that* size — so the compositor scaled 900 columns
+into four and the result was a smear, where the screen itself shows the window's left-hand edge.
+`capture_box` is now the window's own scale and the blit crops to the box, which is the same thing
+the screen is doing.

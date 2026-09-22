@@ -275,6 +275,20 @@ pub fn window_box(
     (card.0 + CARD_BORDER as i32 + sx as i32, card.1 + CARD_BORDER as i32 + sy as i32, sw, sh)
 }
 
+/// How big a capture of a window `size` pixels on screen should be: its box's interior at the
+/// card's scale, **unclamped**.
+///
+/// **Unclamped on purpose** (PR #323 review, optional 2). [`window_box`] clamps a window into the
+/// card's interior, so a window dragged mostly off the right of the screen has a box a few pixels
+/// wide. Asking the compositor to scale the *whole* window into that width scales 900 columns
+/// into four and the capture is a smear — where what the screen actually shows is the window's
+/// left-hand edge. Capturing at the window's own scale and letting the blit clip to the box
+/// crops it instead, which is the same thing the screen is doing.
+pub fn capture_box(size: (u32, u32), screen: Screen) -> (u32, u32) {
+    let inner = |n: u32| screen.scaled_to_card(n).max(2).saturating_sub(2).max(1);
+    (inner(size.0), inner(size.1))
+}
+
 /// One window, as show-desktop sees it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Window {
@@ -557,6 +571,30 @@ mod tests {
         assert_eq!(card_at(x0 + w0 as i32 + CARD_GAP as i32 / 2, y0 + 4, n, s), None);
         assert_eq!(card_at(-1, y0, n, s), None, "a negative x is off the overview, not card 0");
         assert_eq!(card_at(x0, BAR_H as i32, n, s), None, "the top bar is not a card");
+    }
+
+    #[test]
+    fn a_capture_is_the_windows_own_scale_however_far_off_screen_it_is() {
+        // **The capture is a function of the window's size alone**, not of where it happens to
+        // sit: `window_box` clamps a window that runs off the edge into a sliver, and a capture
+        // scaled to *that* squashes the whole window into it rather than showing the part the
+        // screen shows. The blit crops to the box, so the two answers must not agree.
+        let s = Screen { width: 1360, height: 768 };
+        let size = (900, 600);
+        let want = capture_box(size, s);
+        assert!(want.0 > 100 && want.1 > 60, "a big window scales to a big capture: {want:?}");
+
+        let card = card_rect(0, 1, s);
+        let on = window_box(card, (10, BAR_H as i32), size, s);
+        let off = window_box(card, (s.width as i32 - 20, BAR_H as i32), size, s);
+        assert!(off.2 < on.2, "precondition: the off-screen window's box is clamped narrower");
+        // The capture does not shrink with it — which is the whole claim.
+        assert_eq!(capture_box(size, s), want);
+        assert!(
+            want.0 > off.2,
+            "the capture {want:?} fits inside the clamped box {off:?}, so nothing is cropped \
+             and the squash this guards against cannot be told apart"
+        );
     }
 
     #[test]

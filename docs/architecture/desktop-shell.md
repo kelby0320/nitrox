@@ -3,7 +3,8 @@
 ## Status
 
 **Partly built, and checked 2026-09-22**, when the desktop refresh's Part E replaced the
-overview's thumbnail grid and desktop sidebar with the design's **cards per desktop** — Milestone 7 Part E built the shell and M8 Part C
+overview's thumbnail grid and desktop sidebar with the design's **cards per desktop**, and a
+click on a window in another desktop's card learned to switch there before raising it — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
 click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
 Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
@@ -52,8 +53,16 @@ it opened, which §6 accepts deliberately. Cards for other desktops draw the box
 because there is nothing to capture on a desktop the compositor is not compositing.
 
 **Its gestures all work as of 2026-08-26, and most of them did not before**: a window *dragged*
-onto another card moves it to that desktop (M8 Part E), a window *clicked* raises it and closes
-the overview, and a card *clicked* switches to that desktop — which is what §6 always claimed. It
+onto another card moves it to that desktop (M8 Part E), a window *clicked* goes to it — switching
+desktops first if it is on another one — and a card *clicked* switches to that desktop, which is
+what §6 always claimed.
+
+**Clicking a window on another desktop switches there and then raises it** (Part E, PR #323
+review). Until cards only the current desktop's windows had a target at all; a card gave every
+desktop's windows one, and a raise alone reorders a stack nobody is looking at — `Manage::Raise`
+does not change which desktop is composited, so the overview closed and the screen was exactly as
+it had been. On a card holding a maximised window that box is most of the card, which is most of
+the area "click a card to switch" was meant to cover. It
 is dismissed by clicking the card you are already on, by clicking its background (which makes the
 desktop's name a toggle, since the overview covers the bar), by clicking a window, or by Escape —
 four ways, because with none of the first three an overview on a desktop with no windows was a
