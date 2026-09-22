@@ -84,10 +84,11 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, column, custom, fill, offset, padding, row, sized, stack, text};
+use libui::element::{Element, Insets, custom, fill, offset, padding, row, sized, stack, text};
 use libui::layout::layout;
 use desktop_shell::{
-    Application, BAR_H, SIDE_W, Screen, ShownDesktop, THUMB_PAD, THUMB_W, parse_entry,
+    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop,
+    parse_entry,
 };
 use desktop_shell::panel::{self, BottomMsg, MenuMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
@@ -470,17 +471,90 @@ fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
 }
 
 
-/// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
-/// window ground as ink.
+/// `theme`, as the overview wears it: light ink for a card's caption, on no ground of its own.
 ///
-/// **Not a colour of its own.** Everything here is derived from two the theme already has, so a
-/// new palette needs no extra decision — and the sidebar stays related to the desktop it sits
-/// over rather than being a third surface.
-fn sidebar(theme: &Theme) -> Theme {
+/// **Ink only.** The overview's ground is a fill at an alpha, and every card draws its own; what
+/// this is for is the text beside them, which sits on the darkened desktop and must read against
+/// a photograph. The design's caption ink is `#EAF6F6` with the count at 60% of it — taken here
+/// as the theme's own paper and a blend towards the ground, so a new palette needs no extra
+/// decision.
+///
+/// **Not `background` and `foreground` swapped**, which is what the sidebar did until Part E: a
+/// card is a picture of a desktop rather than a panel, so there is no second surface to relate a
+/// pair of colours to.
+///
+/// **`blend`'s coverage is the *source's* share**, which is the way round this had wrong at
+/// first: the design's count is its ink at 60%, and `blend(ground, 102)` is 40% of it — `#666`
+/// on the overview's ground, about 2.4:1, where 60% gives `#999` and about 3.4:1. Measured on a
+/// screendump, because nothing renders this surface on the host (see `desktop-refresh.md`).
+fn overview_ink(theme: &Theme) -> Theme {
+    let paper = theme.background;
     Theme {
-        background: theme.desktop.shade(-24),
-        foreground: theme.background,
+        foreground: paper,
+        foreground_dim: paper.blend(OVERVIEW_GROUND, CAPTION_DIM),
         ..*theme
+    }
+}
+
+/// How much of the caption's ink the window count keeps: the design's 60%.
+const CAPTION_DIM: u8 = 153;
+
+/// How many windows are on `desktop`, as the caption says it.
+///
+/// **"empty" rather than "0 windows"**, and the singular where there is one — the design's own
+/// wording, and the difference between a card that reads as a sentence and one that reads as a
+/// counter.
+fn window_count(entries: &[WinEntry], desktop: u32) -> alloc::string::String {
+    let n = entries.iter().filter(|e| e.desktop == desktop && !e.minimized).count();
+    match n {
+        0 => alloc::string::String::from("empty"),
+        1 => alloc::string::String::from("1 window"),
+        _ => {
+            let mut s = alloc::string::String::new();
+            let mut digits = alloc::vec::Vec::new();
+            let mut v = n;
+            while v > 0 {
+                digits.push(b'0' + (v % 10) as u8);
+                v /= 10;
+            }
+            for d in digits.iter().rev() {
+                s.push(*d as char);
+            }
+            s.push_str(" windows");
+            s
+        }
+    }
+}
+
+/// Copy `src` into `fb` at `(x, y)`, clipped to `clip`.
+///
+/// **One function for the two places that blit** — a card's wallpaper ground and a window's
+/// capture. They were the same loop written twice, and the first of them honoured the clip while
+/// the second did not, which only showed when a card ran under another.
+fn blit_clipped(
+    fb: &mut MemFramebuffer,
+    src: &[u8],
+    g: Geometry,
+    x: i32,
+    y: i32,
+    clip: Rect,
+) {
+    use libdraw::framebuffer::Framebuffer as _;
+    for sy in 0..g.height {
+        for sx in 0..g.width {
+            let (dx, dy) = (x + sx as i32, y + sy as i32);
+            if dx < clip.origin.x
+                || dy < clip.origin.y
+                || dx >= clip.right() as i32
+                || dy >= clip.bottom() as i32
+            {
+                continue;
+            }
+            let off = sy as usize * g.pitch + sx as usize * 4;
+            let Some(b) = src.get(off..off + 4) else { continue };
+            let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            fb.put_pixel(dx as u32, dy as u32, PixelFormat::XRGB8888.decode(word));
+        }
     }
 }
 
@@ -2577,7 +2651,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // has nothing to be wrong about. That deferral named this as its second
                         // consumer; it is re-deferred rather than answered, and the reason is
                         // that this drag does not need what it is about.
-                        dragging = thumb_at(p.x, p.y, shots.len(), screen).map(|i| shots[i].0);
+                        dragging = window_in_card_at(p.x, p.y, &desktops, &entries, screen);
                         if let Some(id) = dragging {
                             Line::new()
                                 .s(b"desktop-shell: dragging window ")
@@ -2604,9 +2678,75 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // drag was wired up, and only the drag was gated — which is how an
                         // unimplemented affordance passed for a tested one.
                         let picked = dragging.take();
-                        let row = side_row_at(p.x, p.y, desktops.len(), screen);
-                        let under = thumb_at(p.x, p.y, shots.len(), screen).map(|i| shots[i].0);
+                        let row = desktop_shell::card_at(p.x, p.y, desktops.len(), screen);
+                        let under = window_in_card_at(p.x, p.y, &desktops, &entries, screen);
+                        // **A window's box is *inside* a card**, so every release over a window
+                        // is also a release over a card (desktop refresh, Part E). The click
+                        // arm therefore has to be tried first: matching the drop arm first would
+                        // turn "click the window you pressed" into "move it to the desktop it is
+                        // already on", which is a manager round trip for nothing and closes the
+                        // overview instead of raising anything.
+                        let same_desktop = picked
+                            .and_then(|wid| entries.iter().find(|e| e.id == wid))
+                            .zip(row)
+                            .is_some_and(|(e, i)| e.desktop == desktops[i].id);
                         match (picked, row) {
+                            // **A press and a release on the same window: a click, so go to
+                            // it** — and *going to* a window on another desktop means switching
+                            // there first (PR #323 review, blocking 1).
+                            //
+                            // Until cards, only the current desktop's windows had a target at
+                            // all; now every card's do, and `raise_window` alone reorders a
+                            // stack nobody is looking at. `WindowStack::raise` does not change
+                            // which desktop is composited, so the overview closed and the
+                            // screen was exactly as it had been — on a card holding a maximised
+                            // window that is most of the card, which is also most of the area
+                            // "click a card to switch" was supposed to cover.
+                            (Some(wid), _) if under == Some(wid) => {
+                                let home =
+                                    entries.iter().find(|e| e.id == wid).map(|e| e.desktop);
+                                if let Some(m) = manager.as_mut()
+                                    && let Some(home) = home
+                                {
+                                    sent_request = true;
+                                    // **The switch is not attempted when it is already there**,
+                                    // because `switch_desktop` answers `false` for that and
+                                    // would read as a refusal. No `normalize_desktops` after
+                                    // it: the desktop being switched to holds this window, so
+                                    // it is occupied by definition and the trailing scratch
+                                    // slot is untouched — which is the one thing that call is
+                                    // for.
+                                    let there = home == current_desktop
+                                        || switch_desktop(
+                                            m,
+                                            &desktops,
+                                            &mut current_desktop,
+                                            &mut told_desktop,
+                                            home,
+                                        );
+                                    if there
+                                        && let Some(e) =
+                                            entries.iter_mut().find(|e| e.id == wid)
+                                        && raise_window(m, e)
+                                    {
+                                        list_dirty = true;
+                                        Line::new()
+                                            .s(b"desktop-shell: overview raised window ")
+                                            .u(wid as u64)
+                                            .end();
+                                        close_overview(
+                                            &mut session,
+                                            &mut overview,
+                                            &mut shots,
+                                            &mut dragging,
+                                            &mut over_addrs,
+                                            screen,
+                                        );
+                                    }
+                                }
+                            }
+                            // Dropped back on the desktop it came from: nothing to ask for.
+                            (Some(_), Some(_)) if same_desktop => {}
                             (Some(wid), Some(i)) => {
                                 if let Some(m) = manager.as_mut() {
                                     let to = desktops[i].id;
@@ -2631,32 +2771,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                         // The overview is a snapshot of a desktop that has just
                                         // changed, so it is closed rather than left showing a
                                         // window that is no longer here.
-                                        close_overview(
-                                            &mut session,
-                                            &mut overview,
-                                            &mut shots,
-                                            &mut dragging,
-                                            &mut over_addrs,
-                                            screen,
-                                        );
-                                    }
-                                }
-                            }
-                            (Some(wid), None) if under == Some(wid) => {
-                                // **A window, so the overview has done its job.**
-                                // `raise_window` is what a window-list entry does, and focus
-                                // follows the raise — `focus_candidate` is topmost-focusable,
-                                // so there is no second request and no second piece of state.
-                                if let Some(m) = manager.as_mut()
-                                    && let Some(e) = entries.iter_mut().find(|e| e.id == wid)
-                                {
-                                    sent_request = true;
-                                    if raise_window(m, e) {
-                                        list_dirty = true;
-                                        Line::new()
-                                            .s(b"desktop-shell: overview raised window ")
-                                            .u(wid as u64)
-                                            .end();
                                         close_overview(
                                             &mut session,
                                             &mut overview,
@@ -2838,7 +2952,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             }
                             sent_request = true;
                             let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
-                            recapture(m, &entries, current_desktop, &mut shots, cap);
+                            recapture(m, &entries, current_desktop, &mut shots, cap, screen);
                             overview = open_overview(
                                 &mut session, window, &theme, &font, &shots, &desktops,
                                 current_desktop, &entries, &mut over_addrs,
@@ -2935,7 +3049,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             {
                 sent_request = true;
                 let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
-                recapture(m, &entries, current_desktop, &mut shots, cap);
+                recapture(m, &entries, current_desktop, &mut shots, cap, screen);
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
                     &entries, &over_addrs,
@@ -3348,94 +3462,71 @@ fn render_overview(
     // desktop would repeat a million reads for an identical answer.
     let mini = wallpaper.and_then(|p| mini_wallpaper(p, screen));
 
-    // The sidebar's rows, drawn through the toolkit so they look like the rest of the shell.
-    let mut rows: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
-    for d in desktops {
-        let mut label = alloc::string::String::new();
-        label.push_str(if d.id == current { "> " } else { "  " });
-        label.push_str(&desktop_label(desktops, d.id));
-        rows.push(sized(
-            libdraw::geom::Size::new(SIDE_W, SIDE_ROW_H),
-            row(alloc::vec![
-                padding(
-                    Insets::all(MINI_PAD),
-                    desktop_preview(entries, d.id, theme, mini.is_some(), screen)
-                ),
-                padding(Insets { top: 8, right: 8, bottom: 8, left: 0 }, text(label)),
-            ]),
-        ));
-    }
-    let side = column(rows);
-    let bounds = Rect::new(
-        screen.width.saturating_sub(SIDE_W) as i32,
-        BAR_H as i32,
-        SIDE_W,
-        screen.height.saturating_sub(BAR_H),
-    );
+    // **A card per desktop, laid out by the one function the presses are hit-tested with.**
+    // Each card is painted at its own rect rather than the whole block being one element tree:
+    // `card_rect` is the layout, it is host-tested at five screen sizes, and a tree built here
+    // would be a second description of the same arrangement for the drawing half alone.
+    let ink = overview_ink(theme);
     let metrics = FontMetrics::new(font, theme.font_px);
-    let l = layout(&side, bounds, &metrics);
-    // **A translucent panel with opaque ink on it** — Stretch 3, finally as asked (M13 Part C).
-    // M11 batch 10 could only make it a *dark* panel: `paint` clears to `background`, which since
-    // the theme turned light is the white an application draws on, so the sidebar was a white
-    // column down the side of the desktop. A dark panel read as deliberate without translucency.
-    //
-    // The ground is filled here at its own opacity — lower than the overview's, so the sidebar
-    // reads as a lighter sheet of glass over the darkened desktop — and the rows are then drawn
-    // with `paint_over`, which is `paint` without the clear. That ordering is the whole trick and
-    // it is why this needed a per-pixel alpha channel rather than a per-window opacity: the panel
-    // is see-through and the text on it is not, and one opacity for the whole surface could not
-    // say both.
-    let side_theme = sidebar(theme);
-    fb.fill_rect_alpha(bounds, side_theme.background, OVERVIEW_SIDE_ALPHA);
-    // **The shell's first custom node**, and what it draws is the miniature's ground. Bounded by
-    // the clip as well as the node's rect: `paint` gives both, and a callback that honoured only
-    // the rect would draw a whole miniature over a partly-damaged sidebar.
-    paint_over(&mut fb, font, &side_theme, &side, &l, bounds, &mut |kind,
-                                                              rect,
-                                                              clip,
-                                                              fb: &mut MemFramebuffer| {
-        if kind != MINI_KIND {
-            return;
-        }
-        let Some((px, g)) = mini.as_ref() else { return };
-        for y in 0..g.height {
-            for x in 0..g.width {
-                let (dx, dy) = (rect.origin.x + x as i32, rect.origin.y + y as i32);
-                if dx < clip.origin.x
-                    || dy < clip.origin.y
-                    || dx >= clip.right() as i32
-                    || dy >= clip.bottom() as i32
-                {
-                    continue;
-                }
-                let off = y as usize * g.pitch + x as usize * 4;
-                let Some(b) = px.get(off..off + 4) else { continue };
-                let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                fb.put_pixel(dx as u32, dy as u32, PixelFormat::XRGB8888.decode(word));
+    for (i, d) in desktops.iter().enumerate() {
+        let (cx, cy, cw, ch) = desktop_shell::card_rect(i, desktops.len(), screen);
+        let card = desktop_card(entries, d.id, d.id == current, theme, mini.is_some(), screen);
+        let bounds = Rect::new(cx, cy, cw, ch);
+        let l = layout(&card, bounds, &metrics);
+        // **The shell's first custom node**, and what it draws is the card's ground. Bounded by
+        // the clip as well as the node's rect: `paint` gives both, and a callback that honoured
+        // only the rect would draw a whole card over a partly-damaged one.
+        paint_over(&mut fb, font, &ink, &card, &l, bounds, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
+            if kind != MINI_KIND {
+                return;
             }
-        }
-    });
+            let Some((px, g)) = mini.as_ref() else { return };
+            blit_clipped(fb, px, *g, rect.origin.x, rect.origin.y, clip);
+        });
 
-    // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
-    // toolkit to lay out and a element per pixel would be absurd.
-    for (i, (_, w, h, px)) in shots.iter().enumerate() {
-        let (tx, ty, _, _) = thumb_rect(i, screen);
-        let pitch = (*w as usize) * 4;
-        for y in 0..*h {
-            for x in 0..*w {
-                let off = y as usize * pitch + x as usize * 4;
-                if off + 4 > px.len() {
-                    continue;
-                }
-                let word = u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
-                fb.put_pixel(tx + x, ty + y, PixelFormat::XRGB8888.decode(word));
-            }
+        // The caption beneath: the desktop's name, and how many windows are on it.
+        //
+        // **Two runs rather than one string with a separator**, which is what the design draws:
+        // the name in the ink and the count dimmed beside it, so the count reads as a note on
+        // the name rather than as part of it.
+        let count = window_count(entries, d.id);
+        let caption: Element<()> = row(alloc::vec![
+            text(desktop_label(desktops, d.id)),
+            sized(libdraw::geom::Size::new(CARD_CAPTION_GAP, 0), text("")),
+            libui::element::ink(ink.foreground_dim, text(count)),
+        ]);
+        let cap_rect = Rect::new(
+            cx,
+            cy + ch as i32 + CARD_CAPTION_GAP as i32,
+            cw,
+            CARD_CAPTION_H,
+        );
+        let cl = layout(&caption, cap_rect, &metrics);
+        paint_over(&mut fb, font, &ink, &caption, &cl, cap_rect, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    }
+
+    // **The captures, blitted over the current desktop's card**, straight in: they are already
+    // pixels at the size of the box they go in, so there is nothing for the toolkit to lay out.
+    // A window whose capture failed keeps the schematic box `desktop_card` drew underneath.
+    if let Some(i) = desktops.iter().position(|d| d.id == current) {
+        let card = desktop_shell::card_rect(i, desktops.len(), screen);
+        for (id, w, h, px) in shots {
+            let Some(e) = entries.iter().find(|e| e.id == *id) else { continue };
+            let (bx, by, bw, bh) = desktop_shell::window_box(card, e.origin, e.size, screen);
+            // Inside the box's own border, so a capture cannot paint over the edge that makes
+            // two overlapping windows read as two.
+            let inner = Rect::new(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2));
+            let g = match Geometry::with_pitch(*w, *h, *w as usize * 4, PixelFormat::XRGB8888) {
+                Some(g) => g,
+                None => continue,
+            };
+            blit_clipped(&mut fb, px, g, inner.origin.x, inner.origin.y, inner);
         }
     }
     fb
 }
 
-/// The wallpaper scaled to one sidebar miniature's interior, or `None` if it will not scale.
+/// The wallpaper scaled to one card's interior, or `None` if it will not scale.
 ///
 /// **Undimmed, unlike the overview's own ground.** The ground is dimmed so the things drawn over
 /// it read; a miniature *is* the thing being read, and a dimmed one would be a picture of a
@@ -3446,7 +3537,7 @@ fn render_overview(
 /// every row comes out that many bytes out of step — sheared, with nothing logged.
 fn mini_wallpaper(picture: &[u8], screen: Screen) -> Option<(alloc::vec::Vec<u8>, Geometry)> {
     let src = Geometry::with_pitch(screen.width, screen.height, screen.pitch(), PixelFormat::XRGB8888)?;
-    let (w, h) = (MINI_W - 2, MINI_H - 2);
+    let (w, h) = (screen.card_interior_w(), screen.card_interior_h());
     let dst = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888)?;
     let mut out = alloc::vec![0u8; dst.pitch * h as usize];
     if !libdraw::scale::box_downscale(picture, src, &mut out, dst) {
@@ -3480,13 +3571,14 @@ fn recapture(
     current: u32,
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
     capacity: usize,
+    screen: Screen,
 ) {
     shots.clear();
     for e in visible_entries(entries, current, capacity) {
         if e.minimized {
             continue;
         }
-        if let Some((w, h, px)) = capture_window(mgr, e.id, e.size) {
+        if let Some((w, h, px)) = capture_window(mgr, e.id, e.size, capture_size(e, screen)) {
             shots.push((e.id, w, h, px));
         }
     }
@@ -3635,100 +3727,118 @@ fn close_overview(
     }
 }
 
-/// A miniature of one desktop: its ground, with a box where each of its windows is.
+/// One desktop's card: its ground, the top bar's strip, and a box where each of its windows is.
 ///
-/// **Rectangles rather than scaled window contents** (M11 Part E batch 10). The maintainer named
-/// both and said "whatever is easy"; the difference is not effort but *availability*. A thumbnail
-/// is a capture, and the compositor can only capture what it composites — the windows on the
-/// desktop being shown. A sidebar is a row per desktop that is *not* being shown, so there is
-/// nothing to capture, and asking the compositor to composite an off-screen desktop to photograph
-/// it is a different feature from drawing where its windows are.
+/// **A card is a model of the screen** (desktop refresh, Part E), which is what the design draws:
+/// the same rectangle at 22.9% of its width, with the top bar as a strip across it and every
+/// window where it actually is. Clicking a window in it raises that window; clicking the card
+/// goes to that desktop; dragging a window onto another card moves it there.
 ///
-/// What the shell does have is every window's origin, size and desktop, which it keeps for the
-/// taskbar. So the *windows* are arithmetic rather than pixels: they need no capture, no scaling
-/// and no image decoding — which is what the same request looked like it needed.
+/// **Rectangles rather than scaled window contents, where there is nothing to scale** (M11 Part E
+/// batch 10). A thumbnail is a capture, and the compositor can only capture what it composites —
+/// the windows on the desktop being *shown*. So a card for another desktop draws where its
+/// windows are and names them, which is what the design draws for every card; the current
+/// desktop's card has real captures blitted over these boxes by [`render_overview`], which is
+/// more than the design asks for and is why the schematic is drawn underneath rather than
+/// instead.
 ///
-/// **The ground beneath them is pixels, since 2026-09-02**, and that is the one clause above
-/// that stopped being true: a miniature's ground is the wallpaper, box-downscaled once for every
-/// row. A preview of a desktop that has a picture, drawn as flat blue, is a preview of a desktop
-/// nobody has (PR #273 review, optional 3).
+/// **The ground beneath them is pixels, since 2026-09-02**: a card's ground is the wallpaper,
+/// box-downscaled once for every card. A preview of a desktop that has a picture, drawn as flat
+/// blue, is a preview of a desktop nobody has (PR #273 review, optional 3).
 ///
 /// **Bordered boxes rather than filled ones**, so two overlapping windows read as two.
-fn desktop_preview(
+fn desktop_card(
     entries: &[WinEntry],
     desktop: u32,
+    current: bool,
     theme: &Theme,
     wallpaper: bool,
     screen: Screen,
 ) -> Element<()> {
-    // The screen's proportions, so the miniature is the shape of the thing it stands for.
-    let (iw, ih) = (MINI_W - 2, MINI_H - 2);
-    let mut layers = alloc::vec::Vec::with_capacity(4);
-    layers.push(fill(theme.border));
-    // **The miniature's ground is what a desktop's ground actually is**, which since M12 Part F
-    // is a picture rather than a colour. A preview showing flat blue while the desktop behind it
-    // shows a photograph is a preview of something that does not exist — the same complaint the
-    // overview's own ground drew, one level down. A `custom` node because the picture is pixels:
-    // there is nothing here for the toolkit to lay out, and `render_overview`'s paint callback
-    // blits the thumbnail it scaled once.
+    let (iw, ih) = (screen.card_interior_w(), screen.card_interior_h());
+    let mut layers = alloc::vec::Vec::with_capacity(6);
+    // **The current desktop is outlined in the accent**, the design's own cue and the same one a
+    // focused window wears since Part H. The rest take a pale edge against the darkened desktop
+    // rather than a theme colour: a card sits on the overview's ground, which is neither a
+    // window's paper nor a panel, so a border from either palette reads as belonging elsewhere.
+    layers.push(fill(if current { theme.accent } else { CARD_EDGE }));
+    // **The card's ground is what a desktop's ground actually is**, which since M12 Part F is a
+    // picture rather than a colour. A `custom` node because the picture is pixels: there is
+    // nothing here for the toolkit to lay out, and `render_overview`'s paint callback blits the
+    // wallpaper it scaled once.
     layers.push(padding(
-        Insets::all(1),
+        Insets::all(CARD_BORDER),
         if wallpaper {
             custom(MINI_KIND, libdraw::geom::Size::new(iw, ih))
         } else {
             fill(theme.desktop)
         },
     ));
+    // The top bar, at the card's own scale — so a card is the whole screen and not just the part
+    // of it windows live in.
+    layers.push(offset(
+        CARD_BORDER as i32,
+        CARD_BORDER as i32,
+        sized(libdraw::geom::Size::new(iw, screen.card_strip_h()), fill(theme.panel)),
+    ));
     for e in entries.iter().filter(|e| e.desktop == desktop && !e.minimized) {
-        // Scaled by the same ratio in both axes as the screen, and clamped into the interior: a
-        // window dragged partly off-screen must not draw outside the miniature that stands for
-        // the screen.
-        let (screen_w, screen_h) = (screen.width.max(1), screen.height.max(1));
-        let sx = (e.origin.0.max(0) as u32 * iw / screen_w).min(iw.saturating_sub(1));
-        let sy = (e.origin.1.max(0) as u32 * ih / screen_h).min(ih.saturating_sub(1));
-        // At least two pixels, or the border and the face have nowhere to go and a window
-        // vanishes rather than being small.
-        let sw = (e.size.0 * iw / screen_w).max(2).min(iw - sx);
-        let sh = (e.size.1 * ih / screen_h).max(2).min(ih - sy);
+        // **Positioned by the same function the press is hit-tested with**, which is the lesson
+        // the bottom bar's indicator taught: a hit region computed separately from the layout is
+        // right at one window count and wrong everywhere else (PR #243 review, blocking 2).
+        // The card is passed at the origin, so what comes back is card-local.
+        let (bx, by, bw, bh) = desktop_shell::window_box((0, 0, 0, 0), e.origin, e.size, screen);
         let face = if e.focused { theme.face_hover } else { theme.face };
+        layers.push(offset(bx, by, sized(libdraw::geom::Size::new(bw, bh), window_mini(e, face, theme, screen))));
+    }
+    sized(libdraw::geom::Size::new(screen.card_w(), screen.card_h()), stack(layers))
+}
+
+/// One window inside a card: a bordered box, its title bar as a strip, and its name.
+///
+/// **The name is the design's**, and it is what makes a card of a desktop you are not on worth
+/// looking at — two bordered rectangles say how many windows there are and nothing about what
+/// they are. It is drawn only when the box can hold it: at the card's scale a small window is a
+/// few pixels across, and text laid out in a box smaller than itself would spill over the window
+/// beside it.
+fn window_mini(e: &WinEntry, face: libdraw::format::Rgb, theme: &Theme, screen: Screen) -> Element<()> {
+    let strip = screen.scaled_to_card(libui::widget::TITLE_BAR_H).max(1);
+    let (bw, bh) = (
+        screen.scaled_to_card(e.size.0).max(2),
+        screen.scaled_to_card(e.size.1).max(2),
+    );
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    layers.push(fill(theme.border));
+    layers.push(padding(Insets::all(1), fill(face)));
+    if bw >= MINI_LABEL_W && bh >= MINI_LABEL_H && !e.title.is_empty() {
         layers.push(offset(
-            1 + sx as i32,
-            1 + sy as i32,
-            sized(
-                libdraw::geom::Size::new(sw, sh),
-                stack(alloc::vec![fill(theme.border), padding(Insets::all(1), fill(face))]),
+            1,
+            (1 + strip) as i32,
+            padding(
+                Insets { top: 1, right: 2, bottom: 0, left: 2 },
+                libui::element::scaled(libui::element::TextSize::Small, text(e.title.as_str())),
             ),
         ));
     }
-    sized(libdraw::geom::Size::new(MINI_W, MINI_H), stack(layers))
+    stack(layers)
 }
 
-/// The `custom` node a sidebar miniature's ground is drawn as. See [`desktop_preview`].
-const MINI_KIND: u32 = 1;
-
-/// A sidebar miniature's size — the screen's 16:10, small enough for a row.
-const MINI_W: u32 = 96;
-/// See [`MINI_W`].
-const MINI_H: u32 = 60;
-/// Space around a miniature inside its row.
-const MINI_PAD: u32 = 6;
-
-// **A miniature has an interior.** It must also be smaller than the screen, which `box_downscale`
-// requires and refuses otherwise — a refusal that `mini_wallpaper` logs by name (PR #273 review,
-// optional 5). That half was a compile-time check against a written-down 1280×800 until Phase 5
-// Part E; against a screen read at startup it is the log line, and any screen too small for a
-// 94-pixel miniature is too small for the overview's chrome anyway.
-const _: () = assert!(MINI_W > 2 && MINI_H > 2, "a sidebar miniature needs an interior");
-
-/// One desktop row in the sidebar.
+/// How wide and tall a window's box must be before its name is drawn in it.
 ///
-/// **Tall enough for a miniature** since M11 Part E batch 10: `MINI_H` plus `MINI_PAD` on each
-/// side. `check-login` clicks a row by index and computes the same arithmetic, so this number is
-/// in two places and the gate names which (that is the cost of a click point a gate can aim at,
-/// and M11's decision 2 chose it deliberately).
-const SIDE_ROW_H: u32 = MINI_H + MINI_PAD * 2;
-/// A thumbnail's height in the overview's grid; its width is [`THUMB_W`].
-const THUMB_H: u32 = 150;
+/// Sized from what a name needs rather than guessed: a box narrower than this holds two or three
+/// characters, which is not a name, and one shorter has no room under the title strip.
+const MINI_LABEL_W: u32 = 44;
+/// See [`MINI_LABEL_W`].
+const MINI_LABEL_H: u32 = 22;
+
+/// The edge of a card that is not the current desktop's: white at a third, the design's own.
+///
+/// A literal rather than a theme colour because it sits on the overview's ground — see
+/// [`desktop_card`]. `libdraw` has no alpha in a `Rgb`, so this is that blend against the ground
+/// the overview fills, which is [`OVERVIEW_GROUND`] over the desktop.
+const CARD_EDGE: libdraw::format::Rgb = libdraw::format::Rgb::new(0x8A, 0x92, 0x95);
+
+/// The `custom` node a card's ground is drawn as. See [`desktop_card`].
+const MINI_KIND: u32 = 1;
 
 /// How far the wallpaper is darkened under the overview, as a coverage of black.
 ///
@@ -3746,60 +3856,58 @@ const OVERVIEW_GROUND: libdraw::format::Rgb = libdraw::format::Rgb::new(0, 0, 0)
 /// copy of every window behind its own thumbnail.
 const OVERVIEW_GROUND_ALPHA: u8 = 210;
 
-/// How opaque the sidebar's ground is.
+/// Which window's box in a card a point is in, if any — the window's id and the card it is on.
 ///
-/// **Less than [`OVERVIEW_GROUND_ALPHA`], deliberately.** A panel that is *more* see-through than
-/// the ground it sits on reads as a lighter sheet laid over it, which is what a sidebar is; the
-/// other way round it would read as a hole.
-const OVERVIEW_SIDE_ALPHA: u8 = 150;
-
-/// Where thumbnail `i` sits in the overview, in overview-local pixels.
-///
-/// **One function for drawing and for hit-testing**, which is the lesson the bottom bar's
-/// indicator taught: a hit region computed separately from the layout is right at one window
-/// count and wrong everywhere else (PR #243 review, blocking 2).
-fn thumb_rect(i: usize, screen: Screen) -> (u32, u32, u32, u32) {
-    let cols = screen.thumb_cols();
-    let col = (i as u32) % cols;
-    let row = (i as u32) / cols;
-    let x = THUMB_PAD + col * (THUMB_W + THUMB_PAD);
-    let y = BAR_H + THUMB_PAD + row * (THUMB_H + THUMB_PAD);
-    (x, y, THUMB_W, THUMB_H)
+/// **Searched topmost-first within a card, which is the order they are drawn in reverse.**
+/// `desktop_card` stacks windows in `entries` order, so the last one drawn is on top and is the
+/// one a press means; walking forwards would hand a press to whichever overlapping window
+/// happened to be first in the list.
+fn window_in_card_at(
+    x: i32,
+    y: i32,
+    desktops: &[Desktop],
+    entries: &[WinEntry],
+    screen: Screen,
+) -> Option<u32> {
+    let i = desktop_shell::card_at(x, y, desktops.len(), screen)?;
+    let card = desktop_shell::card_rect(i, desktops.len(), screen);
+    let d = desktops[i].id;
+    entries
+        .iter()
+        .filter(|e| e.desktop == d && !e.minimized)
+        .rev()
+        .find(|e| {
+            let (bx, by, bw, bh) = desktop_shell::window_box(card, e.origin, e.size, screen);
+            x >= bx && x < bx + bw as i32 && y >= by && y < by + bh as i32
+        })
+        .map(|e| e.id)
 }
 
-/// Which sidebar row a point is in, if any.
-fn side_row_at(x: i32, y: i32, rows: usize, screen: Screen) -> Option<usize> {
-    if x < screen.width.saturating_sub(SIDE_W) as i32 || y < BAR_H as i32 {
-        return None;
-    }
-    let i = ((y as u32 - BAR_H) / SIDE_ROW_H) as usize;
-    (i < rows).then_some(i)
-}
-
-/// Which thumbnail a point is in, if any.
-fn thumb_at(x: i32, y: i32, n: usize, screen: Screen) -> Option<usize> {
-    if x < 0 || y < 0 {
-        return None;
-    }
-    (0..n).find(|&i| {
-        let (tx, ty, tw, th) = thumb_rect(i, screen);
-        x >= tx as i32 && x < (tx + tw) as i32 && y >= ty as i32 && y < (ty + th) as i32
-    })
+/// How big a capture of `window` should be — [`desktop_shell::capture_box`], which says why it
+/// is the window's own scale rather than the box it lands in.
+///
+/// **Captured at the size it is shown at** (desktop refresh, Part E), which is what makes this
+/// affordable with no GPU — `desktop-shell.md` §6's "capture at thumbnail size, not full size",
+/// now that a thumbnail is a card's window box rather than a fixed 240×150 cell. The compositor
+/// scales once, on entry; nothing rescales per frame.
+fn capture_size(e: &WinEntry, screen: Screen) -> (u32, u32) {
+    desktop_shell::capture_box(e.size, screen)
 }
 
 /// Ask the compositor to scale `window` into a fresh buffer, and return the pixels.
 ///
 /// **The manager allocates**, which is the mirror of a client attaching a buffer the compositor
 /// reads. Clamped to the window's own size, because a capture may not scale *up*: a window
-/// smaller than the grid cell is captured at its own size and drawn smaller.
+/// smaller than the box it will be drawn in is captured at its own size and drawn smaller.
 fn capture_window(
     mgr: &mut ChannelTransport,
     window: u32,
     size: (u32, u32),
+    want: (u32, u32),
 ) -> Option<(u32, u32, alloc::vec::Vec<u8>)> {
     use librsproto::surface::{MgrCapture, OP_MGR_CAPTURE};
-    let w = THUMB_W.min(size.0.max(1));
-    let h = THUMB_H.min(size.1.max(1));
+    let w = want.0.min(size.0.max(1));
+    let h = want.1.min(size.1.max(1));
     let pitch = (w as usize) * 4;
     let len = pitch * h as usize;
     let (handle, addr) = shared_buffer(len)?;

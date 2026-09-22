@@ -967,8 +967,24 @@ impl DisplaySize {
     /// any name of two characters or more — which `panel`'s own test pins, at five widths and
     /// four names.
     const NAME_FROM_RIGHT: i32 = 30;
-    /// The overview sidebar's width — `desktop_shell::SIDE_W`, for the same reason.
-    const SIDE_W: i32 = 200;
+    /// The overview card's width, as a fraction of the screen — `desktop_shell::CARD_W_NUM` over
+    /// `CARD_W_DEN`, for the same reason. **The gate keeps its own copy** (M11 decision 2): a
+    /// gate that read the shell's layout to know where to aim could agree with a shell that had
+    /// stopped drawing where it says. `the_gates_card_metrics_are_the_shells` compares these
+    /// against the shell's source, which is the half that keeps a copy honest.
+    const CARD_W_NUM: i32 = 330;
+    /// See [`CARD_W_NUM`](Self::CARD_W_NUM).
+    const CARD_W_DEN: i32 = 1440;
+    /// A card's border, its gap to the next, and the gap and height of its caption.
+    const CARD_BORDER: i32 = 2;
+    /// See [`CARD_BORDER`](Self::CARD_BORDER).
+    const CARD_GAP: i32 = 24;
+    /// See [`CARD_BORDER`](Self::CARD_BORDER).
+    const CARD_CAPTION_GAP: i32 = 9;
+    /// See [`CARD_BORDER`](Self::CARD_BORDER).
+    const CARD_CAPTION_H: i32 = 18;
+    /// The clear space either side of the block of cards.
+    const CARD_SIDE_PAD: i32 = 40;
 
     /// Parse `WxH`, refusing a size QEMU cannot show or a guest cannot use.
     fn parse(text: &str) -> R<DisplaySize> {
@@ -1027,9 +1043,72 @@ impl DisplaySize {
         (Self::SHOW_DESKTOP_X, self.bottom_bar_click_y())
     }
 
-    /// The middle of the overview sidebar's width.
-    fn sidebar_x(self) -> i32 {
-        self.w as i32 - Self::SIDE_W / 2
+    /// One overview card's width, border included.
+    fn card_w(self) -> i32 {
+        (self.w as i32 * Self::CARD_W_NUM / Self::CARD_W_DEN).max(Self::CARD_BORDER * 2 + 2)
+    }
+
+    /// `n` screen pixels at a card's scale.
+    fn scaled_to_card(self, n: i32) -> i32 {
+        n * (self.card_w() - Self::CARD_BORDER * 2) / self.w.max(1) as i32
+    }
+
+    /// A card's miniature box, border included — the strip is the top bar at the card's scale.
+    fn card_h(self) -> i32 {
+        self.scaled_to_card(Self::BAR_H)
+            + self.scaled_to_card(self.h as i32 - Self::BAR_H)
+            + Self::CARD_BORDER * 2
+    }
+
+    /// A whole card: its box, the gap, and the caption beneath.
+    fn card_total_h(self) -> i32 {
+        self.card_h() + Self::CARD_CAPTION_GAP + Self::CARD_CAPTION_H
+    }
+
+    /// How many cards fit across.
+    fn card_cols(self) -> i32 {
+        let avail = self.w as i32 - Self::CARD_SIDE_PAD * 2;
+        ((avail + Self::CARD_GAP) / (self.card_w() + Self::CARD_GAP)).max(1)
+    }
+
+    /// The top-left of card `i` of `n` in the overview — its miniature box.
+    ///
+    /// The shell's `card_rect`, recomputed here. Centred both ways, each row centred on its own,
+    /// and the block sitting between the two bars.
+    fn card_origin(self, i: i32, n: i32) -> (i32, i32) {
+        let (cols, cw) = (self.card_cols(), self.card_w());
+        let (row, col) = (i / cols, i % cols);
+        let rows = n.div_euclid(cols) + i32::from(n.rem_euclid(cols) != 0);
+        let in_row = (n - row * cols).min(cols);
+        let across = in_row * cw + (in_row - 1).max(0) * Self::CARD_GAP;
+        let x = (self.w as i32 - across) / 2 + col * (cw + Self::CARD_GAP);
+        let total = self.card_total_h();
+        let down = rows * total + (rows - 1).max(0) * Self::CARD_GAP;
+        let avail = self.h as i32 - Self::BAR_H * 2;
+        let y = Self::BAR_H + (avail - down) / 2 + row * (total + Self::CARD_GAP);
+        (x, y)
+    }
+
+    /// A point inside card `i` of `n`, clear of its border and of any window drawn in it —
+    /// the bottom-left of its miniature box, where the placement cascade never reaches.
+    fn card_click(self, i: i32, n: i32) -> (i32, i32) {
+        let (x, y) = self.card_origin(i, n);
+        (x + Self::CARD_BORDER + 6, y + self.card_h() - Self::CARD_BORDER - 6)
+    }
+
+    /// The middle of the box a window at `(wx, wy)` sized `(ww, wh)` is drawn in, inside card
+    /// `i` of `n` — where a press that picks that window up has to land.
+    ///
+    /// The shell's `window_box`, recomputed here: the screen's geometry at the card's scale,
+    /// with the top bar as a strip so a window at the top of the screen starts below it.
+    fn window_in_card(self, i: i32, n: i32, w: (i32, i32, u32, u32)) -> (i32, i32) {
+        let (cx, cy) = self.card_origin(i, n);
+        let sx = self.scaled_to_card(w.0.max(0));
+        let sy = self.scaled_to_card(Self::BAR_H)
+            + self.scaled_to_card(w.1.max(Self::BAR_H) - Self::BAR_H);
+        let sw = self.scaled_to_card(w.2 as i32).max(2);
+        let sh = self.scaled_to_card(w.3 as i32).max(2);
+        (cx + Self::CARD_BORDER + sx + sw / 2, cy + Self::CARD_BORDER + sy + sh / 2)
     }
 
     /// How many `(100, 100)` motions pin the pointer into the bottom-right corner from anywhere on
@@ -2245,6 +2324,18 @@ fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
     let (x, y) = it.next()?.split_once(',')?;
     let (w, h) = it.next()?.split_once('x')?;
     Some((id, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Read the tail of `desktop-shell: overview open, window <id> showing <k> of <n> desktops`.
+///
+/// Returns `n`, the number of cards. **The count is the guest's, the positions are the gate's**
+/// (desktop refresh, Part E): the block of cards is centred, so every card's place depends on how
+/// many there are, and how many desktops exist is a fact about the session rather than about the
+/// layout. A gate that also took the *positions* from the shell could agree with a shell that had
+/// stopped drawing where it says, which is what M11 decision 2 is about.
+fn parse_overview_line(rest: &str) -> Option<i32> {
+    let (_, tail) = rest.split_once(" of ")?;
+    tail.trim().split_whitespace().next()?.parse().ok()
 }
 
 /// Read `desktop-shell: window N geometry X,Y WxH` — the shell's own report of where a window is.
@@ -4460,15 +4551,23 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // nothing at all.
     session.expect("desktop-shell: thumbnail of window ")?;
     session.expect("desktop-shell: overview open, window ")?;
+    // **How many cards there are, read rather than assumed** (desktop refresh, Part E). The
+    // block of cards is centred, so every card's position depends on the count — and the count
+    // is a fact about this desktop's *state*, which the gate cannot compute. The line reads
+    // `<id> showing <k> of <n> desktops`. Where each card then *sits* is the gate's own
+    // arithmetic, kept here on purpose (M11 decision 2).
+    let open_line = session.rest_of_line()?;
+    let cards = parse_overview_line(&open_line)
+        .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
 
-    // The first thumbnail sits at (16, 46) and is 240x150 — see `thumb_rect`. Press inside it,
-    // release over the second sidebar row, which is desktop 2.
-    const THUMB: (i32, i32) = (100, 100);
-    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
-    // padding — and this is the second place that number lives. The rows start below the top
-    // bar, which is what `BAR_H` is doing here. Half a row down, so the aim is clear of both
-    // edges.
-    let side_row = |i: i32| (size.sidebar_x(), DisplaySize::BAR_H + i * 72 + 36);
+    // Press inside the terminal's box in the **current** desktop's card, which is the first —
+    // 6d switched to `work` with the chord above. Release over the second card, which is the
+    // desktop the window is being moved to.
+    //
+    // **Aimed from the window's real geometry**, which the shell reported when it placed it:
+    // a card draws every window where it actually is, so unlike the old fixed grid there is no
+    // cell to aim at, and a hard-coded point would be a point that moved with the cascade.
+    let thumb = size.window_in_card(0, cards, (term_x, term_y, term_w, term_h));
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
     // by then it has begun. The name's `click_at` above asserted where it landed and left the
@@ -4480,11 +4579,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // that did nothing either. As of 2026-08-26 a click on a thumbnail raises its window and a
     // click on the background dismisses — which is the point of those changes, and leaves a
     // verifying click with no inert place to land.
-    move_pointer_to(&mut qmp, THUMB.0, THUMB.1)?;
-    qmp.pointer = Some(THUMB);
+    move_pointer_to(&mut qmp, thumb.0, thumb.1)?;
+    qmp.pointer = Some(thumb);
     qmp.send_button("left", true)?;
     session.expect("desktop-shell: dragging window ")?;
-    let (dx, dy) = side_row(1);
+    let (dx, dy) = size.card_click(1, cards);
     move_pointer_to(&mut qmp, dx, dy)?;
     qmp.pointer = Some((dx, dy));
     qmp.send_button("left", false)?;
@@ -4495,6 +4594,36 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // dropped on. **`(empty)` rather than the bare prefix**, which matched a list still holding
     // the window just as happily as one that had lost it (PR #244 review, optional 6).
     session.expect("desktop-shell: window list on work of 3 (empty)")?;
+
+    // **A window clicked in a card that is not the current desktop's** (PR #323 review,
+    // blocking 1). The state here is exactly the one that matters: `work` is current and empty,
+    // and the terminal is on `cli` — so the terminal's box is in a card the user is not on.
+    //
+    // Before the fix this raised a window on a desktop nobody was looking at and closed the
+    // overview, leaving the screen unchanged: `WindowStack::raise` reorders a stack, and
+    // nothing had changed which desktop was being composited. **No step reached it**, because
+    // the card click above aims at `card_click` — "where the placement cascade never reaches" —
+    // and the raise click below only ever ran once its desktop was already current.
+    //
+    // The switch is asserted *before* the raise because that is the order the shell does it in:
+    // a raise on a desktop that is not being composited is the bug, not the fix.
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    let open_line = session.rest_of_line()?;
+    let cards = parse_overview_line(&open_line)
+        .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
+    let away = size.window_in_card(1, cards, (term_x, term_y, term_w, term_h));
+    click_at(&mut qmp, &mut session, away.0, away.1)?;
+    // **`Desktop 2`, not `cli`**: the second desktop is not named until 6f, so at this point its
+    // label is the positional one `desktop_label` gives an unnamed desktop.
+    session.expect("desktop-shell: switched to Desktop 2")?;
+    session.expect("desktop-shell: overview raised window ")?;
+    session.expect("desktop-shell: overview closed")?;
+    println!("  ok: a window in another desktop's card went to that desktop and raised it");
+
+    // Back to `work`, so the rest of this step runs from where it used to.
+    chord(&mut qmp, false, "1")?;
+    session.expect("desktop-shell: switched to work")?;
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;
@@ -4624,22 +4753,25 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     tell the difference between "unimplemented" and "untested".
     click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
+    let open_line = session.rest_of_line()?;
+    let cards = parse_overview_line(&open_line)
+        .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
 
     // The chord path first: an overview left showing the desktop you just switched away from is
-    // showing thumbnails of windows that are no longer there. It follows instead of closing,
+    // showing a card whose windows are no longer on it. It follows instead of closing,
     // which is what §6 means by "it fetches a different set of images".
     chord(&mut qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
     session.expect("desktop-shell: overview now showing 0 on work")?;
 
-    // Then the sidebar click, with no drag in flight. Row 1 is the second desktop — `cli`,
+    // Then a click on a card, with no drag in flight. Card 1 is the second desktop — `cli`,
     // which is where the terminal is — so the refresh must find it again.
-    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
-    // padding — and this is the second place that number lives. The rows start below the top
-    // bar, which is what `BAR_H` is doing here. Half a row down, so the aim is clear of both
-    // edges.
-    let side_row = |i: i32| (size.sidebar_x(), DisplaySize::BAR_H + i * 72 + 36);
-    let (sx, sy) = side_row(1);
+    //
+    // **Aimed at the foot of the card**, clear of its border and of any window drawn in it:
+    // this click means "go to that desktop", and one that landed on a window would mean "raise
+    // that window" instead — which is the distinction the cards made possible and the reason
+    // this point is not simply the card's middle.
+    let (sx, sy) = size.card_click(1, cards);
     click_at(&mut qmp, &mut session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
     session.expect("desktop-shell: overview now showing 1 on cli")?;
@@ -4658,11 +4790,19 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     click_at(&mut qmp, &mut session, 600, 700)?;
     session.expect("desktop-shell: overview closed")?;
 
-    // And a click on a thumbnail activates its window, which is the third way out and the one
+    // And a click on a window in a card activates it, which is the third way out and the one
     // that takes you somewhere. `raise_window` is the same call the window list's entries make.
+    //
+    // **The terminal is on `cli` now**, which the clicks above switched to, so its box is in
+    // whichever card that is — found by the same arithmetic as the drag, against the geometry
+    // the shell reported when it placed the window.
     click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
-    click_at(&mut qmp, &mut session, 100, 100)?;
+    let open_line = session.rest_of_line()?;
+    let cards = parse_overview_line(&open_line)
+        .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
+    let on_term = size.window_in_card(1, cards, (term_x, term_y, term_w, term_h));
+    click_at(&mut qmp, &mut session, on_term.0, on_term.1)?;
     session.expect("desktop-shell: overview raised window ")?;
     session.expect("desktop-shell: overview closed")?;
 
@@ -14084,6 +14224,66 @@ mod tests {
         );
     }
 
+    /// The gate's copy of the overview's card metrics is the shell's.
+    ///
+    /// **The copy is deliberate** (M11 decision 2): a gate that read the shell's layout to know
+    /// where to aim could agree with a shell that had stopped drawing where it says. What a copy
+    /// still needs is this — the greeter's `340x141` was `420x200` for a milestone, and the
+    /// lesson Part D drew is that a copy without a comparison is a number nobody checks.
+    ///
+    /// **Parsed rather than imported**, because `desktop-shell` is a bare-target crate this one
+    /// cannot link — the same reason `the_gates_browser_table_is_the_browsers` reads source.
+    #[test]
+    fn the_gates_card_metrics_are_the_shells() {
+        let path = repo_root().join("userspace/desktop-shell/src/lib.rs");
+        let text = fs::read_to_string(&path).expect("the shell's source is readable");
+        let mut found: Vec<(String, i32)> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub const ") else { continue };
+            let Some((name, tail)) = rest.split_once(':') else { continue };
+            let Some((ty, val)) = tail.split_once('=') else { continue };
+            if ty.trim() != "u32" {
+                continue;
+            }
+            if let Ok(v) = val.trim().trim_end_matches(';').parse::<i32>() {
+                found.push((name.trim().to_string(), v));
+            }
+        }
+        let get = |what: &str| {
+            found.iter().find(|(n, _)| n == what).map(|(_, v)| *v).unwrap_or_else(|| {
+                panic!(
+                    "no `pub const {what}: u32` in {} — this checker's pattern has gone stale, \
+                     which silently stops comparing anything",
+                    path.display()
+                )
+            })
+        };
+        assert_eq!(
+            (
+                get("CARD_W_NUM"),
+                get("CARD_W_DEN"),
+                get("CARD_BORDER"),
+                get("CARD_GAP"),
+                get("CARD_CAPTION_GAP"),
+                get("CARD_CAPTION_H"),
+                get("CARD_SIDE_PAD"),
+                get("BAR_H"),
+            ),
+            (
+                DisplaySize::CARD_W_NUM,
+                DisplaySize::CARD_W_DEN,
+                DisplaySize::CARD_BORDER,
+                DisplaySize::CARD_GAP,
+                DisplaySize::CARD_CAPTION_GAP,
+                DisplaySize::CARD_CAPTION_H,
+                DisplaySize::CARD_SIDE_PAD,
+                DisplaySize::BAR_H,
+            ),
+            "the overview's card metrics and this file's copy of them have drifted"
+        );
+    }
+
     /// The shipped UI face carries the glyph a marked menu row draws.
     ///
     /// **A missing glyph is a silent failure** — `.notdef`, drawn as a blank or a box, reported
@@ -14537,12 +14737,13 @@ mod diag_tests {
         assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (770, 785));
         assert_eq!(old.desktop_name_click(), (1250, 785));
         assert_eq!((old.task_click(0), old.task_click(1), old.show_desktop_click()), ((141, 785), (331, 785), (20, 785)));
-        assert_eq!(old.sidebar_x(), 1180);
+        assert_eq!(old.card_w(), 293, "the design's 330 on 1440, at this width");
         assert_eq!(old.pin_motions(), 20, "the pin the gates always used at this size");
         let big = DisplaySize::parse("2560x1440").unwrap();
         assert!(big.pin_motions() * 100 > big.w as usize, "a pin that cannot cross the screen");
         let gate = DisplaySize::GATE;
-        assert_eq!((gate.bottom_bar_y(), gate.desktop_name_click(), gate.sidebar_x()), (738, (1330, 753), 1260));
+        assert_eq!((gate.bottom_bar_y(), gate.desktop_name_click()), (738, (1330, 753)));
+        assert_eq!((gate.card_w(), gate.card_cols()), (311, 3));
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-18** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-22**, when the desktop refresh's Part E replaced the
+overview's thumbnail grid and desktop sidebar with the design's **cards per desktop**, and a
+click on a window in another desktop's card learned to switch there before raising it — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
 click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
 Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
@@ -41,22 +43,37 @@ into. When the desktop that disappears is the current one, the shell lands on th
 its place **and tells the compositor** — which, until the desktop refresh's Part C, it did not:
 the two went on disagreeing about which desktop was current until a switch showed it.
 
-Since M8 Part E the desktop's name at the bar's end opens the **overview** (§6): frozen
-thumbnails of the current desktop's windows, a sidebar of the others, and a window moved to
-another desktop by dropping its thumbnail on it. The thumbnails are snapshots — `Manage::Capture` scales a window into a buffer
-the shell allocated — so a window drawn after the overview opens shows its state at the moment it
-opened, which §6 accepts deliberately.
+Since M8 Part E the desktop's name at the bar's end opens the **overview** (§6), and since the
+desktop refresh's Part E it is **a card per desktop**: each card a model of the screen at 22.9% of
+its width, with the top bar as a strip across it and a box where each of that desktop's windows
+is. The current desktop's card is outlined in the accent and carries frozen *captures* in those
+boxes — `Manage::Capture` scales a window into a buffer the shell allocated, now at the size of
+the box it is drawn in — so a window drawn after the overview opens shows its state at the moment
+it opened, which §6 accepts deliberately. Cards for other desktops draw the boxes and name them,
+because there is nothing to capture on a desktop the compositor is not compositing.
 
-**Its gestures all work as of 2026-08-26, and most of them did not before**: a thumbnail
-*dragged* onto a sidebar row moves that window to that desktop (M8 Part E), a thumbnail
-*clicked* raises its window and closes the overview, and a sidebar row *clicked* switches to that
-desktop — which is what §6 always claimed. It is dismissed by clicking the desktop row you are
-already on, by clicking its background (which makes the desktop's name a toggle, since the overview
-covers the bar), by clicking a window, or by Escape — four ways, because with none of the first
-three an overview on a desktop with no windows was a dead end. The overview is **sticky** like the bars, so it
-survives the switch and re-captures for the desktop arrived at, whether that switch came from its
-own sidebar or from a chord; the menus and the name prompt are sticky for the same reason. Reported from a real session: only the drag had ever been built, and only the drag had
-ever been gated.
+**Its gestures all work as of 2026-08-26, and most of them did not before**: a window *dragged*
+onto another card moves it to that desktop (M8 Part E), a window *clicked* goes to it — switching
+desktops first if it is on another one — and a card *clicked* switches to that desktop, which is
+what §6 always claimed.
+
+**Clicking a window on another desktop switches there and then raises it** (Part E, PR #323
+review). Until cards only the current desktop's windows had a target at all; a card gave every
+desktop's windows one, and a raise alone reorders a stack nobody is looking at — `Manage::Raise`
+does not change which desktop is composited, so the overview closed and the screen was exactly as
+it had been. On a card holding a maximised window that box is most of the card, which is most of
+the area "click a card to switch" was meant to cover. It
+is dismissed by clicking the card you are already on, by clicking its background (which makes the
+desktop's name a toggle, since the overview covers the bar), by clicking a window, or by Escape —
+four ways, because with none of the first three an overview on a desktop with no windows was a
+dead end. The overview is **sticky** like the bars, so it survives the switch and re-captures for
+the desktop arrived at, whether that switch came from a card or from a chord; the menus and the
+name prompt are sticky for the same reason. Reported from a real session: only the drag had ever
+been built, and only the drag had ever been gated.
+
+**A window's box is inside a card, so the click arm is tried before the drop arm** (Part E).
+Every release over a window is also a release over the card holding it; matching the drop first
+would turn "click the window you pressed" into "move it to the desktop it is already on".
 
 Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's
 "placement", from the other side). A client
@@ -330,9 +347,23 @@ enough to be a target.
 
 ## 6. The overview
 
-The workspaces button shows the current desktop's windows laid out so all are visible, with a
-sidebar previewing the other desktops. You can switch desktops from inside it, and drag a window
-onto another desktop — including onto a new one.
+The desktop's name at the bottom bar's end opens a **card per desktop**, centred on a darkened
+copy of the live desktop. A card is a model of the screen: the wallpaper as its ground, the top
+bar as a strip across it, and a box where each of that desktop's windows is. You can switch
+desktops from inside it, and drag a window onto another desktop — including onto a new one.
+
+**Cards rather than a grid of large thumbnails, since the desktop refresh's Part E.** Until then
+the overview was an Exposé of the current desktop's windows at 240×150 with a sidebar of the
+other desktops down the right-hand edge. The design's overview is only a desktop switcher, and
+the two collapse into one surface without losing a gesture: a window's box inside a card is what
+a thumbnail was, and a card is what a sidebar row was. What it costs is size — a window is drawn
+at 22.9% rather than in a fixed cell — and what it buys is that every desktop is shown the same
+way, in the arrangement its windows are actually in.
+
+**Its geometry is `desktop_shell::card_rect` and `window_box`**, host-tested at seven screen
+sizes: the card's width is a *fraction* of the screen's, so the same three fit across whether the
+screen is 1024 or 2560 wide, and its interior is the screen's own proportions so a window is
+drawn the shape it is.
 
 **Thumbnails are frozen, and that changes what this is.**
 
@@ -347,12 +378,13 @@ pipeline**, which is the right side of "the compositor stays small".
 
 Three consequences:
 
-- **Capture at thumbnail size, not full size.** Snapshotting eight 1920×1080 surfaces is ~66 MB;
-  scaling once at capture and storing 480×270 is ~4 MB. The downscale happens once per window on
-  entry rather than once per frame, which is what makes this affordable with no GPU.
+- **Capture at the size it is shown at, not full size.** Snapshotting eight 1920×1080 surfaces is
+  ~66 MB; scaling once at capture is a fraction of that. The downscale happens once per window on
+  entry rather than once per frame, which is what makes this affordable with no GPU. Since Part E
+  the size asked for is the window's own box in its card, so nothing is scaled twice.
 - **Switching desktops inside the overview is trivial** — it fetches a different set of images.
-  Nothing moves and nothing needs restoring. Sidebar previews are smaller versions of the same
-  thing.
+  Nothing moves and nothing needs restoring. A card for a desktop that is not being composited
+  draws its windows as named boxes, which needs no capture at all.
 - **A window's content does not update while the overview is open.** A terminal printing behind
   the overview shows its state at the moment you opened it. Accepted deliberately; live
   thumbnails are an optimisation with a trigger (§9), not a v1 goal.

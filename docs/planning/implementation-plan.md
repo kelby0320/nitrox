@@ -30,7 +30,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 3 — Service ecosystem | [phase-3-service-ecosystem.md](phase-3-service-ecosystem.md) | ✅ complete (2026-07-21) |
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
-| — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | 🚧 in progress — Parts A, B, C, D and G–K of eleven built; E and F remain (G–K added 2026-09-18) |
+| — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | 🚧 in progress — Parts A–E and G–K of eleven built; only F remains (G–K added 2026-09-18) |
 | — Administration | [administration.md](administration.md) | planned, to be scoped |
 | 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
