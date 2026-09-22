@@ -179,7 +179,10 @@ fn drain_diagnostics(err: u64, tty: u64) {
             // between every message.
             let text = text.strip_suffix('\n').unwrap_or(text);
             if tty != 0 {
-                tty_write_crlf(tty, text);
+                // A stage's own diagnostic, in the same colour the shell's are — it is the same
+                // kind of thing to the person reading it. The newline is already off, which is
+                // what makes painting here safe; see `repl::diagnostic`.
+                tty_write_crlf(tty, &nxsh::style::paint(true, nxsh::style::DIAG, text));
             } else {
                 kprint(text.as_bytes());
                 kprint(b"\n");
@@ -660,23 +663,15 @@ impl Host for NitroxHost {
     }
 
     fn diag(&mut self, text: &str) {
-        // **In the diagnostic colour when there is a terminal** (desktop refresh, Part F), which
-        // is the design's `#D68A83`. `say` falls back to `kprint` when there is not, and a
-        // kernel log line is not a terminal — so this branches on the same question rather than
-        // painting inside `say`, which `out` shares.
+        // **Not painted, and the reason is worth keeping** (PR #324 review, blocking 1). Every
+        // caller of this is in `run` — script mode — which builds its host with `tty: 0`, and a
+        // script's output is plain text by design. A first version painted here and coloured
+        // nothing anybody could see, while the docs claimed the shell coloured its diagnostics.
         //
-        // **The trailing newline stays outside the paint**, which is not cosmetic:
-        // `tty_write_crlf` emits a `\r\n` after *every* chunk it splits on `\n`, and `say`
-        // strips the last newline so the line does not double. A reset after that newline makes
-        // `\x1b[0m` a chunk of its own — a blank line, with the reset at the head of the next
-        // one. Painting the content and letting `say` handle the line is the only arrangement
-        // that leaves the output shape alone.
-        if self.tty == 0 {
-            kprint(text.as_bytes());
-            return;
-        }
-        let body = text.strip_suffix('\n').unwrap_or(text);
-        self.say(&nxsh::style::paint(true, nxsh::style::DIAG, body));
+        // It also arrives in fragments: `run` calls this three times for one message
+        // (`"nxsh: "`, the message, `"\n"`), so there is no whole run here to bracket even if
+        // there were a terminal. What the REPL shows is painted in `run_and_render`.
+        self.say(text);
     }
 
     /// §11h. A **non-blocking** receive: this runs at every statement boundary, so it
@@ -1306,8 +1301,14 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
         Ok(None) => None,
         Err(e) if e.is_exit() => Some(e.exit.unwrap_or(0) as i64),
         Err(e) => {
-            let mut msg = String::from("nxsh: ");
-            msg.push_str(&e.message);
+            // **This is where the REPL reports an error**, and therefore where the design's
+            // diagnostic colour belongs (PR #324 review, blocking 1). `Host::diag` is the
+            // *script* path — `run` builds its host with no terminal — so painting there
+            // coloured nothing anybody could see.
+            //
+            // The newline is added after the painted message, never inside it: see
+            // [`repl::diagnostic`](nxsh::repl::diagnostic).
+            let mut msg = nxsh::repl::diagnostic(&e.message, tty != 0);
             msg.push('\n');
             tty_write_crlf(tty, &msg);
             None

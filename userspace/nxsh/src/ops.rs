@@ -1180,7 +1180,24 @@ mod tests {
         assert!(body.contains("short") && body.contains('1'), "{body:?}");
         assert!(!body.contains('\x1b'), "{body:?}: a value was coloured");
 
-        // And the text is the same text: colour adds bytes, it does not move columns.
+        // **The reset closes the row before its newline, not after it.** Asserted on the bytes,
+        // because the strip-and-compare below cannot tell the two orders apart — it was claimed
+        // to, and did not (PR #324 review, finding 2). The order matters wherever the caller
+        // strips a trailing newline before handing the text to `tty_write_crlf`, which is what
+        // `drain_diagnostics` does: a reset on the far side of a `\n` becomes a chunk of its
+        // own, printing a blank line with `\x1b[0m` at the head of the next.
+        assert!(
+            styled.contains(&alloc::format!("{}\n", crate::style::RESET)),
+            "{styled:?}: the header's reset does not close before its newline"
+        );
+        assert!(
+            !styled.contains(&alloc::format!("\n{}", crate::style::RESET)),
+            "{styled:?}: the reset is on the far side of a newline"
+        );
+
+        // And the text is the same text: colour adds bytes, it does not move columns. **This
+        // half does not see the order above** — stripping the escapes gives identical text
+        // either way — so the two assertions are about different things.
         let stripped: String = {
             let mut out = String::new();
             let mut rest = styled.as_str();

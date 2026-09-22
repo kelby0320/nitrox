@@ -88,10 +88,11 @@ mod tests {
         //
         // **The newline rule is a caller's to keep, so it is not asserted here**: `paint` wraps
         // whatever it is given, and a test feeding it a string with no newline would only be
-        // checking its own input. Where it is checked is `ops::display`'s
-        // `a_terminal_gets_a_coloured_header_and_plain_values`, which strips the escapes back
-        // out and compares the result against the uncoloured render — so a reset on the wrong
-        // side of a `\n` shows up as a layout change.
+        // checking its own input. It is asserted where the callers are — on the *bytes*, in
+        // `repl::diagnostic`'s test and in `ops::display`'s. **Not** by the strip-and-compare
+        // in the latter, which was claimed to catch it and cannot: removing the escapes gives
+        // the same text whichever side of the `\n` the reset fell on (PR #324 review,
+        // finding 2).
         for sgr in [PROMPT, BANNER, HEADER, DIAG] {
             let code: u16 = sgr.trim_start_matches("\x1b[").trim_end_matches('m').parse().unwrap();
             assert!(

@@ -462,9 +462,16 @@ reinvention per tool. `nxsh` knows which cell is a header because it built the t
       thing this approach exists to avoid. `nxsh::style` is the one place naming what each role's
       code is.
 
-      **"Only when it has a terminal" is `Host::styled`**, defaulting to `false` — the same shape
-      as `Host::interrupted`, where a shell with no terminal is a script or a Tier-0 stage and the
-      question is never asked. `NitroxHost` answers `tty != 0`.
+      **"Only when it has a terminal" is asked in two places**, because two kinds of code emit.
+      The library asks `Host::styled`, which defaults to `false` — the same shape as
+      `Host::interrupted`, where a shell with no terminal is a script or a Tier-0 stage and the
+      question is never asked. The REPL loop knows its own `tty` and tests it directly. The first
+      version painted `Host::diag` instead, whose only callers are script mode with no terminal:
+      the branch was dead, and the claim that the shell coloured its diagnostics was false until
+      review caught it (PR #324, blocking 1). `diag` now paints nothing and says why, the REPL
+      paints where it actually writes, and `cargo xtask test-interactive` reads the raw bytes off
+      a real terminal — the only place that can see this, since `libterm` swallows SGR and the
+      graphical gate reads the same grid text either way.
 
       **Two placement rules, both found the hard way.** A trailing *space* goes inside the paint,
       so `/home> ` stays contiguous for anything reading the stream as text — every gate matches
