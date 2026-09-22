@@ -1,7 +1,7 @@
 # The framebuffer console
 
-**Status: built with Phase 5 Part B; last checked 2026-09-14, when Part D gave the hardware report
-an owner state of its own.** Everything COM1 receives is also
+**Status: built with Phase 5 Part B; last checked 2026-09-22, when the decoder learned to swallow
+a string sequence whole.** Everything COM1 receives is also
 drawn on the screen from the first line of `kernel_main` until a client is handed
 `/dev/framebuffer`, and again when the machine stops. Gated by `cargo xtask check-fbcon`, which
 boots with no serial port and reads the screen back as text, and by `cargo xtask check-report`,
@@ -38,6 +38,13 @@ The stream is decoded in `kernel/src/fbcon/text.rs`:
   on the next glyph, so a line exactly as wide as the screen costs no blank row.
 - **Escape sequences are swallowed** (`ESC [ … final`, and `ESC` plus one byte). A console with
   one colour has nothing to do with them, and drawing `[1;32m` mid-line is worse than dropping it.
+- **String sequences are swallowed to their terminator**, not to a second byte: `ESC ]` (`OSC`),
+  `ESC P`, `ESC ^` and `ESC _` run to `BEL` or `ST` (`ESC \`). Added 2026-09-22 with the desktop
+  refresh's Part K, which gave `nxsh` an `OSC 7` beside every prompt — the sequence that tells a
+  terminal the shell's working directory. Read as a two-byte escape it drew `7;/home` into the
+  boot log, which is the whole of what this console is for on a machine with no serial port. An
+  `ESC` inside a string cancels, so one stray introducer cannot take the screen for the rest of
+  the run.
 
 ## Glyphs
 

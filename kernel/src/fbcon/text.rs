@@ -107,6 +107,17 @@ enum State {
     Escape,
     /// After `ESC [`, until a final byte.
     Csi,
+    /// After `ESC ]`, `ESC P`, `ESC ^` or `ESC _` — a *string* sequence, whose payload runs to
+    /// `BEL` or `ST` (`ESC \`) rather than to a final byte.
+    ///
+    /// **Not a two-byte escape.** `ESC ] 7 ; /home BEL` is what `nxsh` writes beside every
+    /// prompt to tell its terminal where it is, and `ESC ] 0 ; title BEL` is what most of the
+    /// world writes; taking the introducer for a whole sequence drew the payload on the screen.
+    /// The rule this restores is the one stated everywhere else in this system — an
+    /// unrecognised sequence is consumed, never printed.
+    String,
+    /// `ESC` inside a string: `\` ends it, anything else cancels and starts afresh.
+    StringEscape,
 }
 
 /// Turns bytes into [`Action`]s, carrying state across writes — a `kprintln!` arrives as several
@@ -144,7 +155,31 @@ impl Decoder {
                 }
             }
             State::Escape => {
-                self.state = if byte == b'[' { State::Csi } else { State::Ground };
+                self.state = match byte {
+                    b'[' => State::Csi,
+                    b']' | b'P' | b'^' | b'_' => State::String,
+                    _ => State::Ground,
+                };
+            }
+            State::String => match byte {
+                0x07 => self.state = State::Ground,
+                0x1B => self.state = State::StringEscape,
+                // **Everything else, controls included.** A newline inside a string is part of
+                // the payload here, unlike inside a CSI: a string has an explicit terminator,
+                // so there is no ambiguity to resolve by guessing that the sequence was
+                // abandoned.
+                _ => {}
+            },
+            State::StringEscape => {
+                if byte == b'\\' {
+                    // `ST` — the proper terminator.
+                    self.state = State::Ground;
+                } else {
+                    // A lone `ESC`, which cancels here as it does in a CSI. Without this an
+                    // unterminated string would swallow every byte the kernel printed after it.
+                    self.state = State::Escape;
+                    self.feed(byte, out);
+                }
             }
             State::Csi => {
                 if (0x40..=0x7E).contains(&byte) {
@@ -473,6 +508,33 @@ mod tests {
         assert_eq!(actions(b"\x1b7a"), [Glyph(b'a')], "a two-byte escape");
         assert_eq!(actions(b"\x1b[12\nz"), [Newline, Glyph(b'z')], "a control ends a sequence and still acts");
         assert_eq!(actions(b"\r\t\x08\x07\x7f"), [Return, Tab, Backspace], "BEL and DEL draw nothing");
+    }
+
+    #[test]
+    fn a_string_sequence_is_swallowed_to_its_terminator() {
+        use Action::*;
+        // **The sequence `nxsh` writes beside every prompt** (desktop refresh, Part K), and the
+        // window title every other shell in the world writes. Taken for a two-byte escape, the
+        // payload landed on the screen — which is what this console is *for* on a machine with
+        // no serial port, so it was the boot log with `7;/home` down the middle of it.
+        for seq in [
+            &b"\x1b]7;/home/alice\x07"[..], // OSC, BEL-terminated
+            &b"\x1b]0;a title\x1b\\"[..],   // OSC, ST-terminated
+            &b"\x1bP1;2q#0\x1b\\"[..],      // DCS
+            &b"\x1b^private\x1b\\"[..],     // PM
+            &b"\x1b_app\x1b\\"[..],         // APC
+        ] {
+            let mut bytes = Vec::from(b"a".as_slice());
+            bytes.extend_from_slice(seq);
+            bytes.push(b'z');
+            assert_eq!(actions(&bytes), [Glyph(b'a'), Glyph(b'z')], "{seq:x?} leaked");
+        }
+        // A newline inside a string is payload, not a terminator: a string says where it ends.
+        assert_eq!(actions(b"a\x1b]0;one\ntwo\x07z"), [Glyph(b'a'), Glyph(b'z')]);
+        // **And an unterminated one does not swallow the rest of the boot log.** `ESC` cancels,
+        // which is the rule a CSI already follows — without it one stray introducer would take
+        // the screen for the rest of the run.
+        assert_eq!(actions(b"\x1b]0;oops\x1b[31mz"), [Glyph(b'z')]);
     }
 
     #[test]

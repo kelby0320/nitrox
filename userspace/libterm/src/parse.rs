@@ -44,6 +44,17 @@ pub const MAX_PER_BYTE: usize = MAX_PARAMS;
 /// fit and is more surprising than ignoring the tail.
 pub const MAX_PARAMS: usize = 16;
 
+/// How many bytes of an `OSC` payload are retained.
+///
+/// **A bound, because the payload arrives from the program on the other end.** A sequence with
+/// no terminator would otherwise grow a buffer for as long as it kept writing. A payload that
+/// overruns is *discarded whole* rather than truncated: acting on half a path would take the
+/// terminal somewhere the shell never named.
+///
+/// 256 because that is longer than any path this system's namespace can produce and short
+/// enough that a runaway sequence costs nothing.
+pub const MAX_OSC: usize = 256;
+
 /// How much of a region an erase covers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Erase {
@@ -135,9 +146,20 @@ enum State {
     CsiIgnore,
     /// Inside an `OSC`/`DCS`/`PM`/`APC` *string* sequence, whose payload runs until `BEL` or
     /// `ST` (`ESC \\`) rather than until a final byte.
-    String,
+    ///
+    /// `osc` is set for `ESC ]` alone, and is what decides whether the payload is *kept*: the
+    /// other three introducers have nothing this build reads, and buffering their bytes would
+    /// be paying [`MAX_OSC`] for a string nobody looks at.
+    String {
+        /// Whether this is an `OSC`, whose payload is accumulated.
+        osc: bool,
+    },
     /// `ESC` seen inside a string — `\\` ends it, anything else starts a new sequence.
-    StringEscape,
+    StringEscape {
+        /// Carried through from [`String`](State::String), so the terminator finishes the
+        /// sequence it actually belongs to.
+        osc: bool,
+    },
     /// Mid-character in a UTF-8 sequence.
     Utf8 {
         /// Bits decoded so far.
@@ -160,6 +182,13 @@ pub struct Parser {
     params: [Option<u16>; MAX_PARAMS],
     /// How many parameter slots the sequence has used, saturating at [`MAX_PARAMS`].
     count: usize,
+    /// The `OSC` payload accumulating, bounded by [`MAX_OSC`].
+    osc: alloc::vec::Vec<u8>,
+    /// Whether the payload in progress ran past [`MAX_OSC`], so that the terminator discards
+    /// it instead of acting on the part that fit.
+    osc_overran: bool,
+    /// Where the program last said it is — see [`Parser::directory`].
+    directory: Option<alloc::string::String>,
 }
 
 impl Default for Parser {
@@ -194,7 +223,38 @@ const fn c0_op(b: u8) -> Option<Op> {
 impl Parser {
     /// A parser in the ground state.
     pub const fn new() -> Self {
-        Parser { state: State::Ground, params: [None; MAX_PARAMS], count: 0 }
+        Parser {
+            state: State::Ground,
+            params: [None; MAX_PARAMS],
+            count: 0,
+            osc: alloc::vec::Vec::new(),
+            osc_overran: false,
+            directory: None,
+        }
+    }
+
+    /// Where the program on the other end last said it is, if it has ever said.
+    ///
+    /// Set by `OSC 7` — `ESC ] 7 ; <path> BEL`, or with `ST` in place of `BEL` — which is the
+    /// sequence a shell emits beside its prompt to tell its terminal its working directory.
+    /// `nxterm` puts it in the window's title bar, which is the design's subtitle
+    /// (desktop refresh, Part K).
+    ///
+    /// **A path, not a `file://` URL.** Elsewhere the payload is conventionally a URL, whose
+    /// authority names the host the path is on and whose octets are percent-encoded. Nitrox has
+    /// no hosts and no URL type, so accepting one would mean writing a percent-decoder and an
+    /// authority parser for a form nothing on this system emits — and half-reading a URL is
+    /// worse than not claiming to read one. If a foreign program ever arrives, this is where
+    /// the URL form goes.
+    ///
+    /// **This is on the parser rather than in an [`Op`]**, which is the one place this module
+    /// departs from "the parser emits operations and owns no terminal state". An `Op` is `Copy`
+    /// and carries no payload, and a marker variant would leave the consumer reaching in here
+    /// anyway. The argument that keeps SGR attributes on the grid does not reach this: a
+    /// working directory sets no cell, is not what `DECSC` saves, and is not what `RIS` resets
+    /// — it is a fact about the *stream*, which is what this type parses.
+    pub fn directory(&self) -> Option<&str> {
+        self.directory.as_deref()
     }
 
     /// Feed one byte. Returns how many of `out`'s slots were filled.
@@ -219,28 +279,45 @@ impl Parser {
                 0
             }
             State::Csi => self.csi(b, out),
-            State::String => {
+            State::String { osc } => {
                 // **Swallowed to the terminator, not to a final byte.** `ESC ] 0 ; title BEL`
                 // is the most common escape sequence in the wild — every prompt that sets a
                 // window title emits one — and treating its introducer as a two-byte sequence
                 // dumps `0;title` into the grid on every redraw (PR #189 review, finding 2).
                 match b {
-                    0x07 => self.state = State::Ground,
-                    0x1B => self.state = State::StringEscape,
-                    _ => {}
+                    0x07 => {
+                        self.state = State::Ground;
+                        if osc {
+                            self.finish_osc();
+                        }
+                    }
+                    0x1B => self.state = State::StringEscape { osc },
+                    _ => {
+                        if osc {
+                            self.push_osc(b);
+                        }
+                    }
                 }
                 0
             }
-            State::StringEscape => {
+            State::StringEscape { osc } => {
                 if b == b'\\' {
                     // `ST` — the proper terminator.
                     self.state = State::Ground;
+                    if osc {
+                        self.finish_osc();
+                    }
                     0
                 } else {
                     // A lone `ESC` inside a string is illegal, and this parser's rule
                     // everywhere else is that `ESC` cancels and restarts. Applied here too, so
                     // an unterminated string cannot swallow the rest of the session.
+                    //
+                    // **And the payload is dropped with it.** A sequence nothing terminated
+                    // announced nothing; keeping the bytes would let the next `OSC` inherit
+                    // the tail of an abandoned one.
                     self.state = State::Escape;
+                    self.discard_osc();
                     self.escape(b)
                 }
             }
@@ -317,12 +394,55 @@ impl Parser {
             0x20..=0x2F => self.state = State::EscapeIntermediate,
             // String introducers: `OSC`, `DCS`, `PM`, `APC`. Their payload is terminated by
             // `BEL` or `ST`, not by their own second byte.
-            b']' | b'P' | b'^' | b'_' => self.state = State::String,
+            b']' | b'P' | b'^' | b'_' => {
+                // The payload is kept for `OSC` alone, which is the only one this build reads
+                // anything out of.
+                self.discard_osc();
+                self.state = State::String { osc: b == b']' };
+            }
             // `ESC` and a final byte: `RIS`, keypad modes, `ESC 7`/`ESC 8`. None implemented
             // here; consumed whole.
             _ => self.state = State::Ground,
         }
         0
+    }
+
+    /// Add a byte to the `OSC` payload, or note that it did not fit.
+    fn push_osc(&mut self, b: u8) {
+        if self.osc.len() >= MAX_OSC {
+            self.osc_overran = true;
+            return;
+        }
+        self.osc.push(b);
+    }
+
+    /// Forget the payload in progress, leaving what was already announced alone.
+    fn discard_osc(&mut self) {
+        self.osc.clear();
+        self.osc_overran = false;
+    }
+
+    /// A terminated `OSC`: read what this build understands out of it, and forget the rest.
+    fn finish_osc(&mut self) {
+        let payload = core::mem::take(&mut self.osc);
+        let overran = core::mem::take(&mut self.osc_overran);
+        if overran {
+            return;
+        }
+        // `7` is the working directory. `0`, `1` and `2` are window and icon titles, which this
+        // build has no use for — `nxterm` names itself — and every other number is somebody
+        // else's extension. All of them are swallowed either way; this only decides what is
+        // *read*.
+        let Some(rest) = payload.strip_prefix(b"7;") else { return };
+        let Ok(path) = core::str::from_utf8(rest) else { return };
+        // **An absolute path with nothing in it that is not a character.** The value goes
+        // straight into a title bar, so a payload carrying a newline or an escape would let the
+        // program on the other end put anything it liked in a window's chrome. A path that does
+        // not start at the root is not a place this could name, so it is not accepted either.
+        if !path.starts_with('/') || path.chars().any(|c| is_control(c)) {
+            return;
+        }
+        self.directory = Some(path.into());
     }
 
     fn utf8(&mut self, b: u8, acc: u32, left: u8, min: u32, out: &mut [Op]) -> usize {
@@ -744,6 +864,87 @@ mod tests {
             run("\x1b]0;oops\x1b[31mZ"),
             alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('Z')]
         );
+    }
+
+    /// Feed a string and hand back the parser, so a test can ask it what it learned.
+    fn parse(s: &str) -> Parser {
+        let mut p = Parser::new();
+        let mut out = [Op::Print('\0'); MAX_PER_BYTE];
+        for &b in s.as_bytes() {
+            p.feed(b, &mut out);
+        }
+        p
+    }
+
+    #[test]
+    fn osc_7_is_where_the_program_says_it_is() {
+        assert_eq!(Parser::new().directory(), None, "nothing said, nothing claimed");
+        // Both terminators, because a shell may emit either.
+        for seq in ["\x1b]7;/home/alice\x07", "\x1b]7;/home/alice\x1b\\"] {
+            assert_eq!(parse(seq).directory(), Some("/home/alice"), "{seq:?}");
+        }
+        // **And none of it is printed** — the payload is read *and* swallowed, which are two
+        // different things and a version that emitted the path as text would pass the line
+        // above.
+        assert_eq!(printed(&run("a\x1b]7;/home/alice\x07Z")), "aZ");
+        // The last one wins: a shell announces beside every prompt, and `cd` is what changes it.
+        assert_eq!(parse("\x1b]7;/a\x07\x1b]7;/b\x07").directory(), Some("/b"));
+    }
+
+    #[test]
+    fn an_osc_this_build_does_not_read_leaves_the_directory_alone() {
+        // Every one of these is a payload a program might send. None of them may become a
+        // place, and none may leak into the grid.
+        for seq in [
+            "\x1b]0;a title\x07",           // a window title, not a directory
+            "\x1b]77;/home/alice\x07",      // a number that merely starts with 7
+            "\x1b]7;relative/path\x07",     // not a path this could name
+            "\x1b]7;\x07",                  // empty
+            "\x1b]7;/home/a\nb\x07",        // a control, on its way to a title bar
+            "\x1bP7;/home/alice\x1b\\",     // a DCS wearing OSC 7's clothes
+        ] {
+            let p = parse(&alloc::format!("\x1b]7;/start\x07{seq}"));
+            assert_eq!(p.directory(), Some("/start"), "{seq:?} was taken for a place");
+            assert_eq!(printed(&run(&alloc::format!("a{seq}Z"))), "aZ", "{seq:?} leaked");
+        }
+        // **An `ESC` in the payload is not a payload byte** — it cancels, which is this
+        // parser's rule in every state. So this is an abandoned `OSC` followed by a real
+        // `SGR`: no place is announced, and the `b` after it is ordinary text rather than
+        // something swallowed. Written out rather than folded into the loop above, because
+        // the loop asserts nothing is printed and here something correctly is.
+        let esc = "\x1b]7;/home/a\x1b[31mb\x07";
+        assert_eq!(parse(&alloc::format!("\x1b]7;/start\x07{esc}")).directory(), Some("/start"));
+        assert_eq!(printed(&run(&alloc::format!("a{esc}Z"))), "abZ");
+        // **An abandoned payload is not inherited by the next sequence.** `ESC` restarts, so
+        // the `/bad` below never terminated and the `7;` that follows is a fresh payload — a
+        // parser that kept the bytes would read `7;/bad7;/good` and announce nothing at all.
+        assert_eq!(parse("\x1b]7;/bad\x1b]7;/good\x07").directory(), Some("/good"));
+    }
+
+    #[test]
+    fn an_osc_payload_is_bounded_and_an_overrun_announces_nothing() {
+        // The bytes come from the program on the other end, so the buffer is a thing it can
+        // grow. Past the bound the whole payload is dropped rather than truncated: a path cut
+        // to 256 bytes is a different directory, and a title bar showing one would be a lie
+        // rather than an omission.
+        let long = alloc::format!("/{}", "x".repeat(MAX_OSC));
+        let p = parse(&alloc::format!("\x1b]7;/start\x07\x1b]7;{long}\x07"));
+        assert_eq!(p.directory(), Some("/start"), "an overrun payload was acted on");
+        // And the sequence is still swallowed whole, overrun or not.
+        assert_eq!(printed(&run(&alloc::format!("a\x1b]7;{long}\x07Z"))), "aZ");
+
+        // **The limit itself, from both sides.** A payload that is merely *large* says nothing
+        // about where the bound is: with `>=` loosened to `>` in `push_osc` the two assertions
+        // above and the one below all still pass, and the parser then takes a payload one byte
+        // past the `MAX_OSC` its own doc comment states (PR #322 review, optional 1).
+        //
+        // `7;` is two of the payload's bytes, so a path of `MAX_OSC - 2` makes it exactly one
+        // too long — and the same path a byte shorter makes it exactly full.
+        let over = alloc::format!("/{}", "x".repeat(MAX_OSC - 2));
+        let p = parse(&alloc::format!("\x1b]7;/start\x07\x1b]7;{over}\x07"));
+        assert_eq!(p.directory(), Some("/start"), "a payload one byte past the bound was taken");
+        let fits = alloc::format!("/{}", "x".repeat(MAX_OSC - 3));
+        assert_eq!(parse(&alloc::format!("\x1b]7;{fits}\x07")).directory(), Some(fits.as_str()));
     }
 
     #[test]
