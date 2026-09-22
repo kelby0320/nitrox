@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons and a tab's `×` a hover), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -1029,8 +1029,10 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   key keeps "the pointer is over this tab" meaning what it did, while `locate` and `find_by_key`
   walk outside-in and still find the whole tab first. A key repeated at a different depth is
   legal — the diff forbids duplicates only among siblings — and both halves are tested through
-  the real router. **A caller's tab keys must leave bit 60 clear**; every application numbers
-  from `1 << 62` or `1 << 63` and has a test saying so against the toolkit's constant.
+  the real router. **A caller's tab keys must leave bit 60 clear** — `Tab::key` says so, since a
+  key that sets it collides with its own close box and the diff refuses the frame; every
+  application numbers from `1 << 62` or `1 << 63` and has a test saying so against the toolkit's
+  constant. **The `+` goes to full ink on hover**, the design's own treatment of it, with no face.
 - **Columns in a list** — *here since the desktop refresh's Part I*, because the browser's
   listing is a name and three facts about it where every other list in the system is a name. A
   `ListRow` carries trailing `cells` and an optional `swatch`; `list_view` takes the column

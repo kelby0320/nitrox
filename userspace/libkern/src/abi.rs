@@ -416,16 +416,6 @@ const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
 
 // --- Framebuffer geometry -----------------------------------------------
 
-/// Geometry and pixel layout of the system framebuffer.
-///
-/// The userspace mirror of `kernel/src/libkern/framebuffer.rs`. Obtained by mapping
-/// `/dev/framebuffer/info`, which resolves to a read-only `MemoryObject` holding exactly
-/// one of these; the aperture itself is `/dev/framebuffer`.
-///
-/// Both sides carry the layout asserts below. `cargo xtask abi-sync-check` deliberately
-/// does not compare `#[repr(C)]` layouts — the asserts are the stronger check, and they
-/// fail at build time rather than in a separate pass.
-///
 /// What a block device is, mirroring `kernel/src/libkern/block.rs` byte for byte.
 ///
 /// Read from `/dev/blk/<n>/info`, the shape `/dev/framebuffer/info` already uses. A program that
@@ -540,6 +530,16 @@ impl BlockKind {
     }
 }
 
+/// Geometry and pixel layout of the system framebuffer.
+///
+/// The userspace mirror of `kernel/src/libkern/framebuffer.rs`. Obtained by mapping
+/// `/dev/framebuffer/info`, which resolves to a read-only `MemoryObject` holding exactly
+/// one of these; the aperture itself is `/dev/framebuffer`.
+///
+/// Both sides carry the layout asserts below. `cargo xtask abi-sync-check` deliberately
+/// does not compare `#[repr(C)]` layouts — the asserts are the stronger check, and they
+/// fail at build time rather than in a separate pass.
+///
 /// **Channel layout is reported, not assumed.** Firmware does not always choose
 /// `0x00RRGGBB`; a client that hardcodes it renders channel-swapped output on hardware
 /// that reports BGR.

@@ -27642,3 +27642,49 @@ tests paint a hovered button and route a pointer to its key, but only a live win
 application *repaints* when the pointer crosses onto a new key — and a highlight nobody can see in
 the product is exactly the defect Part H's invisible close box was. The screendump shows 386
 `deny` pixels in the design's 23×21.
+
+## 2026-09-22 — After Part K, reviewed: tests that counted faces, and seven docs on the wrong item
+
+PR #325's review found nothing blocking and three things worth fixing. Two were tests with a
+gap; the third turned out to be a class, and the class was bigger than the PR.
+
+**A `×` that lit with its tab passed every test.** The tab test covered the pointer nowhere and on
+the `×`, never on the tab with the `×` at rest — so `if over_tab` in place of the close-key check,
+a one-word "simplification" that lights every tab's `×` as the pointer enters it, stayed green.
+The title-bar test had exactly that control already ("hovering button 0 lit button 1"); the tab
+test now has its own.
+
+**The faces were counted and the glyphs were not.** Swapping the close glyph to the scheme's
+`foreground` shipped `#16201F` on `#A4453C`, about 2.8:1, and passed. The new test reads the
+glyph's pixels in both schemes, and it pins close **by its reason rather than its colour**: the
+glyph must be whichever of the scheme's two inks has the higher WCAG contrast on `deny`, clearing
+4.5:1. That matters in the dark scheme, where the design's literal `#fff` is 3.36:1 on `#D46F63`
+and the near-black `furthest_from` picks is 5.25:1 — a departure from the design the test now
+holds, and a control using the design's white fails there and only there.
+
+**My first test for the `+` could not fire.** The `+` is antialiased text, and at this size no
+pixel of its strokes is fully covered, so a count of pixels exactly `foreground` is zero lit or
+not. It failed against a `+` that did light; a probe of the box's colours showed the darkest pixel
+moving from next to `foreground_dim` to next to `foreground`. The test now asks which ink the
+darkest pixel sits nearer. **An exact-colour count works for icons and fills and not for text.**
+
+**The orphaned doc comment was the fourteenth of its kind, and the sweep for it could not see
+it.** Inserting a test between another test's `///` block and its `#[test]` fuses the two docs
+into one and leaves the second test with none. Both sweeps I had skip exactly this shape: the one run
+this session looked for a doc block followed by a blank line, and the recorded one flags an added
+line that is *not* `///` under an unchanged `///` — while a fused doc is an added run that
+*starts* with its own `///`. A diff-based sweep over whole runs replaces both: flag an
+added run that sits directly under an unchanged `///` line **and** brings an item of its own
+(`fn`, `const`, `struct`, …). Both halves matter: without the second, a doc being *extended*
+matches; an attribute alone between a doc and its own item is legal and is excluded. It flags the
+reviewed commit, clears the fix, and the rewrite that briefly matched `tab_face`'s changed
+signature (a replaced line, not an inserted one) was the third refinement it needed.
+
+**Run over the last thirty merges it found six more, all in `main`**: `check_diagnostic_colour`
+inside `cmd_test_interactive`'s doc (Part F), the Places-menu test constants inside `themes()`'s
+(Part G's review), the check-install constants inside `cmd_check_live`'s (Phase 5 H.1b),
+`BlockDeviceInfo` inserted *through the middle* of `FramebufferInfo`'s doc and `SESSION_HAS_BLK`
+wearing `SESSION_HAS_BIN`'s (H.1), and the attribute-table static inside `record_framebuffer`'s
+(Part G of Phase 5). Every one is doc-only and fixed here. None was caught by a build, since the
+item that lost its doc was rarely under `deny(missing_docs)` and the one that gained a second
+paragraph compiles either way.

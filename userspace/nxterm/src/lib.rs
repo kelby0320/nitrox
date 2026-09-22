@@ -3182,12 +3182,6 @@ mod tests {
 
     // --- tabs (M14 Part B) --------------------------------------------------
 
-    /// A second tab is a second terminal, sharing nothing with the first.
-    ///
-    /// **The failure this is written against is inheritance, not absence.** Tabs built by adding
-    /// a strip over one grid look right until you type in the second one and the first scrolls;
-    /// the plan names it exactly — "getting it wrong is how a second tab inherits the first's
-    /// scrollback".
     /// A tab's `×` can have a key of its own, because no tab key sets the bit it uses.
     ///
     /// **The toolkit's half of a contract with this crate** (desktop refresh, after Part K):
@@ -3209,6 +3203,12 @@ mod tests {
         assert_eq!((TAB_KEY_BASE + (1 << 32)) & libui::widget::TAB_CLOSE_BIT, 0);
     }
 
+    /// A second tab is a second terminal, sharing nothing with the first.
+    ///
+    /// **The failure this is written against is inheritance, not absence.** Tabs built by adding
+    /// a strip over one grid look right until you type in the second one and the first scrolls;
+    /// the plan names it exactly — "getting it wrong is how a second tab inherits the first's
+    /// scrollback".
     #[test]
     fn a_second_tab_shares_nothing_with_the_first() {
         let mut a = app();

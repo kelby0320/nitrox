@@ -492,8 +492,8 @@ fn print_help() {
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
            preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
-           shot              boot the release image and photograph the desktop;\n  \
-           \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
+           shot              boot the release image and photograph the desktop; `shot all`, or\n  \
+           \x20                one of greeter|desktop|apps|windows|terminal|hover|files|editor|overview\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -1252,29 +1252,6 @@ fn cmd_qemu(
     run(&mut qemu)
 }
 
-/// **Interactive-session tests: drive the real login and shell over the serial console.**
-///
-/// This boots `BuildMode::Normal` — the **release image**, which nothing else ever boots.
-///
-/// **Why it exists**, in the past tense since 2026-08-21: `session-mgr` used to auto-log-in
-/// and run a fixed script under `test-harness`, so the `login:` prompt, a typed password, a
-/// real shell prompt and `exit` were all `#[cfg(not(feature = "test-harness"))]` code that CI
-/// compiled and never executed. Every interactive bug this project has had lived exactly
-/// there — the console read using the wrong rights, a `cd` guard refusing a builtin that
-/// existed, a login that could not be repeated, a password prompt landing on the username's
-/// line. Retrofit Part B deleted that substitution: `session-mgr` now has one `login()` in
-/// every build, and this gate is what exercises it.
-///
-/// It still boots the only release image any gate boots, and that is still the point — the
-/// `test-harness` image differs by a service declaration and by `init`'s remaining cfgs
-/// (retrofit Part C), so "the same code" is a claim this gate is the only one able to test.
-///
-/// **Expect-driven, not sleep-driven.** Each step waits for the text that says the guest is
-/// ready for it, so the run is paced by the guest rather than by guessed delays. That is
-/// the difference between a test and a flake.
-///
-/// One boot serves every scenario: the shell returns to `login:`, so the session sequence
-/// continues rather than paying ~15 s of boot per case.
 /// The shell's diagnostics reach a real terminal in the design's colour.
 ///
 /// **On the bytes, because nothing else can see this** (desktop refresh, Part F; PR #324 review,
@@ -1311,6 +1288,29 @@ fn check_diagnostic_colour(transcript: &str) -> R<()> {
     Ok(())
 }
 
+/// **Interactive-session tests: drive the real login and shell over the serial console.**
+///
+/// This boots `BuildMode::Normal` — the **release image**, which nothing else ever boots.
+///
+/// **Why it exists**, in the past tense since 2026-08-21: `session-mgr` used to auto-log-in
+/// and run a fixed script under `test-harness`, so the `login:` prompt, a typed password, a
+/// real shell prompt and `exit` were all `#[cfg(not(feature = "test-harness"))]` code that CI
+/// compiled and never executed. Every interactive bug this project has had lived exactly
+/// there — the console read using the wrong rights, a `cd` guard refusing a builtin that
+/// existed, a login that could not be repeated, a password prompt landing on the username's
+/// line. Retrofit Part B deleted that substitution: `session-mgr` now has one `login()` in
+/// every build, and this gate is what exercises it.
+///
+/// It still boots the only release image any gate boots, and that is still the point — the
+/// `test-harness` image differs by a service declaration and by `init`'s remaining cfgs
+/// (retrofit Part C), so "the same code" is a claim this gate is the only one able to test.
+///
+/// **Expect-driven, not sleep-driven.** Each step waits for the text that says the guest is
+/// ready for it, so the run is paced by the guest rather than by guessed delays. That is
+/// the difference between a test and a flake.
+///
+/// One boot serves every scenario: the shell returns to `login:`, so the session sequence
+/// continues rather than paying ~15 s of boot per case.
 fn cmd_test_interactive(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
@@ -2624,21 +2624,6 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
     v[idx]
 }
 
-/// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5
-/// Part C).
-///
-/// Boots `nitrox-live.img` attached as a **USB stick** (`qemu-xhci` + `usb-storage`) with nothing
-/// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
-/// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
-///
-/// 1. no SATA disk — no storage driver carried the boot;
-/// 2. the second Limine module became a block device, and the GPT pass found a partition labelled
-///    `nitrox-live` on it;
-/// 3. `init` mounted `/` from that partition, and the greeter was presented **within
-///    [`LIVE_MOUNT_TO_GREETER`]** — a RAM disk that completed on the timer tick instead of on its
-///    own interrupt does not make it;
-/// 4. a login on the serial column writes a file under `/home` and reads it back — the root is
-///    writable, in RAM.
 /// The model and serial the gate's target disk reports, and the identity they compose into.
 ///
 /// **Set explicitly rather than taken from QEMU's defaults**, for two reasons. The gate has to
@@ -3122,6 +3107,21 @@ fn run_installed_boot_steps(session: &mut Session) -> R<()> {
     Ok(())
 }
 
+/// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5
+/// Part C).
+///
+/// Boots `nitrox-live.img` attached as a **USB stick** (`qemu-xhci` + `usb-storage`) with nothing
+/// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
+/// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
+///
+/// 1. no SATA disk — no storage driver carried the boot;
+/// 2. the second Limine module became a block device, and the GPT pass found a partition labelled
+///    `nitrox-live` on it;
+/// 3. `init` mounted `/` from that partition, and the greeter was presented **within
+///    [`LIVE_MOUNT_TO_GREETER`]** — a RAM disk that completed on the timer tick instead of on its
+///    own interrupt does not make it;
+/// 4. a login on the serial column writes a file under `/home` and reads it back — the root is
+///    writable, in RAM.
 fn cmd_check_live(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
@@ -7997,7 +7997,7 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
     Ok((info.width, info.height, buf))
 }
 
-/// `cargo xtask shot [all|greeter|desktop|apps|windows|terminal|files|editor|overview]` —
+/// `cargo xtask shot [all|greeter|desktop|apps|windows|terminal|hover|files|editor|overview]` —
 /// photograph the running desktop.
 ///
 /// **The other half of `preview`, and the half it said it could not be.** Part A's command
@@ -8012,11 +8012,14 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// **release** image — the one a person would use, with no `--selftest` clients on the screen —
 /// drives it to each moment worth looking at, and writes what QEMU says is on the display.
 ///
-/// **Several moments per boot**, because the boot is the cost. One run gives the greeter, the
-/// bare desktop, the Applications menu, a screen with real windows on it, and the overview — a
-/// polish list is written against all five. The overview is there because it is the one surface
-/// with no other way to be looked at: it covers the screen and closes when anything else is
-/// clicked.
+/// **Several moments per boot**, because the boot is the cost. One run gives nine: the greeter,
+/// the bare desktop, the Applications menu, a screen with real windows on it, the terminal, the
+/// pointer resting on the terminal's close button, the file browser, the editor, and the overview.
+/// The overview is there because it is the one surface with no other way to be looked at: it
+/// covers the screen and closes when anything else is clicked. **The hover is there for the same
+/// kind of reason** (added after the desktop refresh's Part K): a host render can paint a lit
+/// button and a routed test can prove a pointer names its key, but only a live window shows that
+/// the application repaints when the pointer crosses onto it.
 ///
 /// It is a tool and not a gate: it asserts only enough to know the picture is of a working
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be

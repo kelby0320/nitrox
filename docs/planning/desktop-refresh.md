@@ -803,7 +803,9 @@ the refresh with rather than to open a part for.
       key space) and the `×` one of its own (`tab_close_key`), which is a contract with every
       application's tab numbering and is tested in each. `cargo xtask shot` gained a ninth
       moment, the pointer resting on the terminal's close button, because only a live window
-      shows that an application repaints when the pointer crosses onto a new key.
+      shows that an application repaints when the pointer crosses onto a new key. **The `+`
+      lights too**, in full ink as the design has it — not raised by the maintainer, but the one
+      tab-strip control the design lights that had nothing (PR #325 review, optional 5).
 
 ## Menus the design names and does not fill
 

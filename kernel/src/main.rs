@@ -807,11 +807,6 @@ fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
     Ok(unsafe { &*fb_ptr })
 }
 
-/// Capture Limine's framebuffer as a userspace-mappable aperture.
-///
-/// Must run before `run_first_userspace` binds `/dev/framebuffer`. Requires the HHDM, since
-/// Limine reports the framebuffer at a higher-half virtual address and a `MemoryObject` needs
-/// the physical base.
 /// Whether this CPU has a cache-attribute table, recorded by `paging_init` for
 /// [`record_framebuffer`] to read: without one there is no write-combining to ask for.
 ///
@@ -824,6 +819,11 @@ fn policy_installed() -> bool {
     ATTRIBUTE_TABLE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Capture Limine's framebuffer as a userspace-mappable aperture.
+///
+/// Must run before `run_first_userspace` binds `/dev/framebuffer`. Requires the HHDM, since
+/// Limine reports the framebuffer at a higher-half virtual address and a `MemoryObject` needs
+/// the physical base.
 fn record_framebuffer() {
     let fb = match limine_framebuffer() {
         Ok(fb) => fb,

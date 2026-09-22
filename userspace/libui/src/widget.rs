@@ -456,6 +456,10 @@ pub struct Tab<'a> {
     ///
     /// **Not the index**, because closing a tab renumbers every one after it and the diff would
     /// pair each surviving tab's widget with its neighbour's element.
+    ///
+    /// **Must leave [`TAB_CLOSE_BIT`] clear.** The tab's `×` is keyed as this with that bit set,
+    /// so a key that already has it collides with its own close box — `Tree::update` answers
+    /// `DuplicateKey` and the window draws nothing (PR #325 review, optional 4).
     pub key: u64,
     /// What it is called.
     pub label: &'a str,
@@ -584,7 +588,14 @@ pub fn tab_strip<Msg: Clone>(
         row_items.push(
             sized(
                 Size::new(NEW_TAB_W, TAB_BOX_H),
-                stack(alloc::vec![center(ink(theme.foreground_dim, text("+")))])
+                // **Full ink on hover**, the design's `style-hover="color:var(--fg)"` — the one
+                // tab-strip control it lights that had nothing (PR #325 review, optional 5). No
+                // face: the design gives the `+` none, and it reads as a glyph beside the tabs
+                // rather than as a button among them.
+                stack(alloc::vec![center(ink(
+                    if hovered == Some(NEW_TAB_KEY) { theme.foreground } else { theme.foreground_dim },
+                    text("+"),
+                ))])
                     .on_press(new_tab),
             )
             .key(NEW_TAB_KEY),
@@ -6452,6 +6463,153 @@ two");
         // Nothing lights on the *other* tab's `×`.
         let other = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
         assert_eq!(count(&hot, other.0, other.1, t.face_pressed), 0, "the wrong `×` lit");
+
+        // **And the `×` stays at rest while only its tab is hovered** (PR #325 review, finding 1).
+        // Without this the two states above pass for a `×` that lights whenever its tab does —
+        // a one-word "simplification" to `if over_tab` — which would light every tab's `×` the
+        // moment the pointer crossed into it, the current tab's included.
+        let tab_only = draw(Some(2));
+        assert!(count(&tab_only, tab2, box0, t.face) > 100, "precondition: the tab is lit");
+        assert_eq!(
+            count(&tab_only, box0, box1, t.face_pressed),
+            0,
+            "the `×` lit with its tab rather than with the pointer on it"
+        );
+    }
+
+    /// A lit button's glyph is set in an ink that reads on its face — in both schemes.
+    ///
+    /// **The faces were counted and the inks were not** (PR #325 review, finding 2): swapping the
+    /// close glyph to the scheme's `foreground` passed every test while shipping `#16201F` on
+    /// `#A4453C`, about 2.8:1. So this reads the glyph's own pixels.
+    ///
+    /// **Close is pinned by its reason rather than by its colour.** The design writes `#fff`; in
+    /// the dark scheme that is 3.36:1 on its `#D46F63`, below what text needs, and the near-black
+    /// `furthest_from` picks instead is 5.25:1. So the assertion is that the glyph is whichever of
+    /// the scheme's two inks has the higher **WCAG** contrast on `deny`, and that it clears 4.5:1
+    /// — a different formula from `furthest_from`'s weighted brightness, so this is not the code
+    /// checking itself, and it stays right if either scheme's red is retuned.
+    #[test]
+    fn a_lit_buttons_glyph_reads_on_its_face_in_both_schemes() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        fn lum(c: Rgb) -> f32 {
+            fn ch(v: u8) -> f32 {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            }
+            0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+        }
+        fn contrast(a: Rgb, b: Rgb) -> f32 {
+            let (hi, lo) = if lum(a) >= lum(b) { (lum(a), lum(b)) } else { (lum(b), lum(a)) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        let draw = |t: &Theme, hovered: Option<u64>| {
+            let e: Element<M> = title_bar(
+                "x",
+                None,
+                true,
+                M::Drag,
+                TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+                hovered,
+                t,
+            );
+            let (w, h) = (400u32, TITLE_BAR_H);
+            let all = Rect::new(0, 0, w, h);
+            let l = layout(&e, all, &CELL);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            let rects: alloc::vec::Vec<Rect> = [TITLE_MINIMISE_KEY, TITLE_MAXIMISE_KEY, TITLE_CLOSE_KEY]
+                .iter()
+                .map(|k| crate::layout::locate(&e, &l, *k).expect("each button is keyed"))
+                .collect();
+            (fb, rects)
+        };
+        let count = |fb: &MemFramebuffer, r: Rect, c: Rgb| {
+            (r.origin.x as u32..r.right() as u32)
+                .flat_map(|x| (r.origin.y as u32..r.bottom() as u32).map(move |y| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
+                .count()
+        };
+
+        for (scheme, t) in [("light", Theme::default()), ("dark", Theme::dark())] {
+            // At rest every glyph is dim, and no button holds a pixel of full ink.
+            let (fb, rects) = draw(&t, None);
+            for (i, r) in rects.iter().enumerate() {
+                assert!(count(&fb, *r, t.foreground_dim) > 0, "{scheme}: button {i}'s glyph is not dim at rest");
+                assert_eq!(count(&fb, *r, t.foreground), 0, "{scheme}: button {i} in full ink at rest");
+            }
+
+            // Minimise and maximise lit: the glyph goes to full ink, the dim one is gone.
+            for (i, key) in [(0, TITLE_MINIMISE_KEY), (1, TITLE_MAXIMISE_KEY)] {
+                let (fb, rects) = draw(&t, Some(key));
+                assert!(count(&fb, rects[i], t.foreground) > 0, "{scheme}: button {i} lit, glyph not in full ink");
+                assert_eq!(count(&fb, rects[i], t.foreground_dim), 0, "{scheme}: button {i} lit, glyph still dim");
+            }
+
+            // Close lit: the glyph is the more legible of the scheme's two inks on red.
+            let (better, worse) = if contrast(t.background, t.deny) >= contrast(t.foreground, t.deny) {
+                (t.background, t.foreground)
+            } else {
+                (t.foreground, t.background)
+            };
+            assert!(
+                contrast(better, t.deny) >= 4.5,
+                "{scheme}: neither ink reads on `deny` — {:.2}:1 at best",
+                contrast(better, t.deny)
+            );
+            let (fb, rects) = draw(&t, Some(TITLE_CLOSE_KEY));
+            assert!(count(&fb, rects[2], better) > 20, "{scheme}: close's glyph is not the legible ink");
+            assert_eq!(count(&fb, rects[2], worse), 0, "{scheme}: close's glyph is the illegible ink");
+        }
+    }
+
+    /// The `+` goes to full ink when the pointer is on it — the design's own hover for it.
+    #[test]
+    fn the_new_tab_plus_lights_on_hover() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+            New,
+        }
+        let t = Theme::default();
+        let tabs = [Tab { key: 1, label: "one", marked: false }];
+        let w = TAB_SIDE * 2 + TAB_W + TAB_GAP + NEW_TAB_W;
+        let draw = |hovered: Option<u64>| {
+            let ui: Element<M> =
+                tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::new_tab(M::New), &t);
+            let all = Rect::new(0, 0, w, TAB_STRIP_H);
+            let l = layout(&ui, all, &CELL);
+            let plus = crate::layout::locate(&ui, &l, NEW_TAB_KEY).expect("the `+` is keyed");
+            let mut fb =
+                MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            // **The darkest pixel, not a count of exact ink.** The `+` is text, antialiased, and
+            // at this size no pixel of its strokes is fully covered — so a count of pixels exactly
+            // `foreground` is zero lit or not, which is how the first version of this test
+            // failed for a `+` that did light. The darkest pixel is the glyph's most-covered one,
+            // and which ink it sits nearer says which ink the glyph was drawn in.
+            (plus.origin.x as u32..plus.right() as u32)
+                .flat_map(|x| (plus.origin.y as u32..plus.bottom() as u32).map(move |y| (x, y)))
+                .filter_map(|(x, y)| fb.get_pixel(x, y))
+                .min_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b))
+                .expect("the `+` has pixels")
+        };
+        let nearer_full = |c: Rgb| {
+            let d = |a: Rgb, b: Rgb| a.r.abs_diff(b.r) as u32 + a.g.abs_diff(b.g) as u32 + a.b.abs_diff(b.b) as u32;
+            d(c, t.foreground) < d(c, t.foreground_dim)
+        };
+        assert!(!nearer_full(draw(None)), "the `+` is in full ink at rest");
+        assert!(nearer_full(draw(Some(NEW_TAB_KEY))), "the `+` did not light on hover");
+        assert!(!nearer_full(draw(Some(1))), "the `+` lit when its neighbouring tab was hovered");
     }
 
     #[test]
