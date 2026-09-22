@@ -98,7 +98,12 @@ otherwise absorb by accident.
   **What the shell says to its terminal goes the same way — through the bytes, not through
   this server.** Since 2026-09-22 `nxsh` writes `OSC 7` beside every prompt (`ESC ] 7 ; <path>
   BEL`), which is how a terminal learns the shell's working directory; `nxterm` shows it beside
-  the window's name. It is an ordinary escape sequence in the output stream, so the discipline
+  the window's name. It also emits **SGR** for the four things it knows are structural — the
+  banner, the prompt, a table's header row and a diagnostic — and only when
+  [`Host::styled`](../../userspace/nxsh/src/host.rs) says there is a terminal to read it, so a
+  script's output stays plain text. **The shell rather than each program**: output here is a
+  typed stream the shell renders, so colouring its renderer once colours every program's output,
+  where a Unix terminal needs a `--color` flag and an `isatty` check per tool. It is an ordinary escape sequence in the output stream, so the discipline
   passes it through untouched, a backend that does not read it swallows it, and nothing here
   needed an op. The payload is an absolute path rather than the `file://` URL the sequence
   conventionally carries — see `libterm::parse::Parser::directory` for why. `cargo xtask

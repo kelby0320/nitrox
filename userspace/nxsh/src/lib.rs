@@ -29,6 +29,7 @@ pub mod ops;
 pub mod parse;
 pub mod regex;
 pub mod repl;
+pub mod style;
 pub mod value;
 
 pub use complete::{Completion, Where, word_at_end};

@@ -27504,3 +27504,57 @@ pixels, and the capture was being asked for at *that* size — so the compositor
 into four and the result was a smear, where the screen itself shows the window's left-hand edge.
 `capture_box` is now the window's own scale and the blit crops to the box, which is the same thing
 the screen is doing.
+
+## 2026-09-22 — Part F: the shell colours its own output, and the refresh is complete
+
+The last part of the desktop refresh. Three decisions, and the first is the one that makes the
+other two small.
+
+**The shell emits SGR, not each program.** A Unix terminal has the same mechanism and the
+*program* emits it, which is why `ls --color` and `grep --color` each carry a flag and an `isatty`
+check. Here a program's output is a **typed stream that the shell renders**, so colouring the
+shell's renderer once colours every program's output — and the shell knows which row is a header
+because it built the table. There is no per-program flag to forget, and no program has to learn
+what a terminal is.
+
+**Four things are structural and nothing else is**: the banner, the prompt, a table's header row
+and a diagnostic — which is exactly what the design colours. **Values are left alone.** A value is
+data; tinting it means guessing what it means, and guessing is the thing this arrangement exists
+to avoid. `nxsh::style` is the one place that names which code each role uses.
+
+**"Only when it has a terminal" is `Host::styled`, defaulting to `false`** — the same shape as
+`Host::interrupted`, where a shell with no terminal is a script or a Tier-0 stage and the question
+is never asked of anyone. `NitroxHost` answers `tty != 0`. A script's output is bytes somebody
+will read as text or feed to something else, and an escape in it is corruption rather than colour.
+
+**Two placement rules for the reset, with opposite reasons.** A trailing **space** goes *inside*
+the paint: a space has no ink, so it makes no visual difference, but it decides whether what a
+reader sees as one string is one string in the byte stream — `\x1b[96m/home> \x1b[0m` keeps
+`/home> ` contiguous where resetting before the space would split it, and every gate matches
+`"/home>"`. A trailing **newline** goes *outside*: `tty_write_crlf` emits a `\r\n` after every
+chunk it splits on `\n`, so a reset after the newline is a chunk of its own — a blank line, with
+`\x1b[0m` at the head of the next. The first version of the diagnostic path did precisely that,
+caught by reading `tty_write_crlf` rather than by a gate.
+
+**One set of sixteen, retuned whole.** The design names five outright — the banner's cyan, the
+prompt's bright cyan, the dim its headers and notes share, its success green and its error red —
+plus `--term` and `--termFg`, which are now `Palette::default`'s `background` and `foreground`.
+The other eleven were rebuilt in the same key rather than left at the previous set's, because a
+palette half in one key and half in another is what makes a terminal look like two programs;
+`ok`, `warn` and `deny` anchor green, yellow and red. **One set, not one per scheme**, which is
+the conclusion the design reaches by keeping its terminal outside both of its palettes and the one
+`Palette::default`'s own doc already reached from the other direction.
+
+**Legibility became a test rather than a judgement.** A whole palette was retuned by hand, and
+`xtask` only asserted that no colour *equals* the ground — the sharp edge. Every colour but ANSI
+black now clears 4.5:1 against the ground, the tightest being plain red at 4.88, and the sixteen
+are checked to *be* sixteen: a duplicate loses a colour with no other symptom, since `ESC[32m` and
+`ESC[36m` would print the same pixels and nothing would say so. ANSI black is exempt, which is the
+convention rather than a hole — slot 0 is what a program means by "the darkest thing".
+
+**No truecolour needed nothing built.** `libterm`'s parser already swallows `38;2;r;g;b` whole,
+with a test, and `nxsh::style` names only codes in 30–37 and 90–97 — asserted, so a 24-bit escape
+cannot be added there without the test saying so.
+
+**The desktop refresh is complete**: eleven parts, A–K. Next is administration
+(`docs/planning/administration.md`), then Phase 6 — USB.

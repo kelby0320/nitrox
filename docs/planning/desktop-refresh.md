@@ -120,7 +120,7 @@ choosing two colours that do.
       show-desktop button and the new switcher.
 - [x] **Part D — the greeter**, which the design does not cover and which has to match anyway.
 - [x] **Part E — the overview**, whose layout changes.
-- [ ] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
+- [x] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
       has.
 - [x] **Part G — type, in DejaVu**: a smaller body size, a size scale, and weight only if it earns it.
 - [x] **Part H — the parts of a window**: title and subtitle, the focus border, the tab strip, the
@@ -454,14 +454,43 @@ text only". And because output here is a *typed stream rendered by the shell*, c
 renderer once colours every program's output: no per-program flag, no `isatty` dance, no
 reinvention per tool. `nxsh` knows which cell is a header because it built the table.
 
-- [ ] **`nxsh` emits SGR** for what it knows is structural, and only when it has a terminal.
-- [ ] **One new set of sixteen, not one per palette.** The design keeps `--term` and `--termFg`
+- [x] **`nxsh` emits SGR** for what it knows is structural, and only when it has a terminal.
+
+      **Built**, for the four things the design colours: the banner (cyan), the prompt (bright
+      cyan), a table's header row (bright black) and a diagnostic (bright red). **Values are not
+      coloured** — a value is data, and tinting data means guessing what it means, which is the
+      thing this approach exists to avoid. `nxsh::style` is the one place naming what each role's
+      code is.
+
+      **"Only when it has a terminal" is `Host::styled`**, defaulting to `false` — the same shape
+      as `Host::interrupted`, where a shell with no terminal is a script or a Tier-0 stage and the
+      question is never asked. `NitroxHost` answers `tty != 0`.
+
+      **Two placement rules, both found the hard way.** A trailing *space* goes inside the paint,
+      so `/home> ` stays contiguous for anything reading the stream as text — every gate matches
+      `"/home>"`. A trailing *newline* goes outside: `tty_write_crlf` emits a `\r\n` after every
+      chunk it splits on `\n`, so a reset after the newline becomes a blank line with `\x1b[0m`
+      at the head of the next one. The first version of the diagnostic path did exactly that.
+- [x] **One new set of sixteen, not one per palette.** The design keeps `--term` and `--termFg`
       *outside* its two themes, so its terminal is identical in light and dark — and
       `Palette::default`'s own doc says why that is right: "retheming a desktop must not retheme
       `ls` output", the sixteen are tuned for a dark ground, and "a dark terminal sits on a light
       desktop". So this is a change to `Palette::default()`'s values, once (review, finding 5).
-- [ ] **No truecolour.** Sixteen symbolic colours is what keeps scrollback re-themable, and
+
+      **Built.** Five of the sixteen are the design's own — the banner's cyan, the prompt's bright
+      cyan, the dim of its headers and notes, its success green and its error red — plus `--term`
+      and `--termFg` as `background` and `foreground`. The other eleven are built in the same key
+      rather than left at the old set's, because a palette half in one key and half in another is
+      what makes a terminal look like two programs; `ok`, `warn` and `deny` anchor green, yellow
+      and red. **Legibility is a test, not a judgement**: every colour but ANSI black clears 4.5:1
+      against the ground, the tightest being plain red at 4.88, and the sixteen are checked to be
+      sixteen — a duplicate loses a colour with no other symptom.
+- [x] **No truecolour.** Sixteen symbolic colours is what keeps scrollback re-themable, and
       adding a stored 24-bit colour would undo the argument `libterm` already makes.
+
+      **Nothing to build**: `libterm`'s parser already swallows `38;2;r;g;b` and `38;5;n` whole,
+      with a test, and `nxsh::style` names only codes in the 30–37 and 90–97 ranges — asserted,
+      so a 24-bit escape cannot be added here without the test saying so.
 
 ## How far the applications are from the design — measured 2026-09-18
 

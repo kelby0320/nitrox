@@ -125,7 +125,10 @@ only surfaces the refresh does not build — a primary button, a notification ba
 
 **The terminal's colours are not here**, as they were not before: `--term` and `--termFg` sit
 outside the design's two palettes too, and they belong to `libterm`'s sixteen, where retheming a
-desktop does not retheme `ls`.
+desktop does not retheme `ls`. Since the desktop refresh's Part F they are *literally* those two —
+`Palette::default`'s `background` and `foreground` are the design's pair, and the sixteen were
+retuned in the same key. One set, not one per scheme: a light desktop does not retune them, which
+is the same conclusion the design reaches by keeping them outside both of its palettes.
 
 **The six `syntax_*` keys, and `accent`, `ok` and `deny`, are the colours not derived from a
 surface** (M14 Part G; the last three since the desktop refresh). Every other key here is a ground

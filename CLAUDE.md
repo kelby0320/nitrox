@@ -373,6 +373,7 @@ The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are
 Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem, a usable windowed desktop, bare metal) are **complete** (Phase 5 closed 2026-09-17). The target laptop boots Nitrox from its own internal disk, installed by `nxinstall` from a live USB stick, to a greeter and a terminal — so "it has only ever run under an emulator" is no longer true of anything below the display arm. **Two things come before Phase 6** (2026-09-17): the **desktop refresh**
 (`docs/planning/desktop-refresh.md`), adopting a polished design, and then **administration**
 (`docs/planning/administration.md`) — elevation and the tools an installed system needs. The
-refresh is first because the admin tools are UI surfaces. Phases are **not renumbered**: the
+refresh is first because the admin tools are UI surfaces. **The refresh is complete as of
+2026-09-22** — all eleven parts, A–K — so administration is the current work. Phases are **not renumbered**: the
 numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
 portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

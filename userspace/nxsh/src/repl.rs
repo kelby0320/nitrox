@@ -137,12 +137,16 @@ fn ends_in_terminal_operator(e: &Expr) -> bool {
 /// few bytes per prompt and repeats a value that has usually not changed, which is what every
 /// shell that puts this in `PS1` does: `cd` then needs no separate announcement, and a prompt
 /// is the moment the shell is certainly idle and certainly somewhere.
-pub fn prompt(position: &str) -> String {
+pub fn prompt(position: &str, styled: bool) -> String {
     let mut s = String::from("\x1b]7;");
     s.push_str(position);
     s.push('\x07');
-    s.push_str(position);
-    s.push_str("> ");
+    // **The prompt in the design's bright cyan** (desktop refresh, Part F), bracketing the
+    // trailing space too — see [`style::paint`](crate::style::paint) for why the reset goes
+    // after it rather than before.
+    let mut text = String::from(position);
+    text.push_str("> ");
+    s.push_str(&crate::style::paint(styled, crate::style::PROMPT, &text));
     s
 }
 
@@ -227,7 +231,7 @@ mod tests {
     fn the_prompt_shows_the_namespace_position() {
         // **What a person sees is unchanged**, which is the half the escape must not disturb:
         // the prompt is still the position and `> `, with everything before it invisible.
-        let p = prompt("/home/alice");
+        let p = prompt("/home/alice", false);
         assert!(p.ends_with("/home/alice> "), "{p:?}");
         // **And the terminal is told the same position**, byte for byte. `nxterm` reads this
         // as `OSC 7` — `libterm::parse`'s `directory` — and a terminal that does not simply
@@ -236,5 +240,12 @@ mod tests {
         // place the two could drift apart; what actually holds them together is
         // `cargo xtask check-terminal`, which boots both.
         assert_eq!(p, "\x1b]7;/home/alice\x07/home/alice> ");
+
+        // **And coloured, with the text still in one piece.** A terminal gets the prompt in the
+        // design's bright cyan; the OSC comes first because it is not part of what is drawn.
+        let c = prompt("/home/alice", true);
+        assert!(c.starts_with("\x1b]7;/home/alice\x07"), "{c:?}");
+        assert!(c.contains("/home/alice> "), "{c:?} split the prompt");
+        assert!(c.ends_with(crate::style::RESET), "{c:?}");
     }
 }

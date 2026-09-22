@@ -780,7 +780,12 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
 /// with the operator that ends a chain rather than with the value.
 ///
 /// **A text-fallback stream prints as text**, with no header — see [`text_fallback_lines`].
-pub fn display(v: &Val) -> String {
+///
+/// **`styled` colours the header row and nothing else** (desktop refresh, Part F). The shell
+/// knows which row is a header because it built the table, which is the whole argument for
+/// colouring here rather than in each program; the *values* are left alone, because a value is
+/// data and tinting data means guessing what it means.
+pub fn display(v: &Val, styled: bool) -> String {
     let Val::Data(Value::Table(t)) = v else {
         let mut s = v.render();
         s.push('\n');
@@ -807,10 +812,15 @@ pub fn display(v: &Val) -> String {
             }
         }
     }
-    let mut out = String::new();
+    let mut head = String::new();
     for (i, h) in headers.iter().enumerate() {
-        pad_into(&mut out, h, widths[i], i + 1 == headers.len());
+        pad_into(&mut head, h, widths[i], i + 1 == headers.len());
     }
+    // **The row, and its newline after the reset.** `display`'s caller may hand the text to
+    // `tty_write_crlf`, which makes a chunk of anything following a `\n` — so a reset placed
+    // after it becomes a line of its own. The row's own trailing spaces are inside the paint,
+    // which is what `style::paint` is about.
+    let mut out = crate::style::paint(styled, crate::style::HEADER, &head);
     out.push('\n');
     for row in &cells {
         for (i, c) in row.iter().enumerate() {
@@ -956,13 +966,13 @@ mod tests {
         // **The flag had no reader for four milestones** — `clip` is the first producer in the
         // tree (M12 Part E), and what it produced printed `line` above somebody's pasted text.
         assert_eq!(
-            display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"])),
+            display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"]), false),
             "one\ntwo\n"
         );
         // The control: the identical rows *without* the flag are a table, and a table has
         // columns. Without this the test above would pass for a `display` that dropped every
         // header.
-        assert_eq!(display(&text_stream(StreamFlags::NONE, &["one", "two"])), "line\none\ntwo\n");
+        assert_eq!(display(&text_stream(StreamFlags::NONE, &["one", "two"]), false), "line\none\ntwo\n");
     }
 
     #[test]
@@ -978,14 +988,14 @@ mod tests {
             schema,
             rows: vec![vec![Value::Str(String::from("one")), Value::Int(1)]],
         })));
-        assert!(display(&v).starts_with("line"));
+        assert!(display(&v, false).starts_with("line"));
     }
 
     #[test]
     fn an_empty_text_fallback_stream_displays_as_nothing() {
         // `clip` on an empty ring emits exactly this, and a shell that printed a bare `line`
         // for it would be reporting a column name as the clipboard's contents.
-        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &[])), "");
+        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &[]), false), "");
     }
     use alloc::vec;
 
@@ -1136,7 +1146,7 @@ mod tests {
     #[test]
     fn display_lays_a_table_out_in_columns() {
         let t = table(&["short", "a-longer-name"], &[1, 200]);
-        let out = display(&t);
+        let out = display(&t, false);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "name           size");
         assert_eq!(lines[1], "short          1");
@@ -1145,6 +1155,43 @@ mod tests {
 
     #[test]
     fn display_of_a_scalar_is_just_the_value() {
-        assert_eq!(display(&Val::int(5)), "5\n");
+        assert_eq!(display(&Val::int(5), false), "5\n");
+    }
+
+    /// A table's header row is coloured and its values are not.
+    ///
+    /// **The values half is the claim worth making** (desktop refresh, Part F). Painting a whole
+    /// table is easy and wrong: a value is data, and tinting data means guessing what it means.
+    /// A version that wrapped the whole string would pass an assertion about the header alone.
+    #[test]
+    fn a_terminal_gets_a_coloured_header_and_plain_values() {
+        let t = table(&["short"], &[1]);
+        let plain = display(&t, false);
+        let styled = display(&t, true);
+
+        // Nothing at all when there is no terminal — a script's output is text.
+        assert!(!plain.contains('\x1b'), "{plain:?} carries an escape with no terminal");
+
+        // The header row, and only it: the escape opens before the first header and the reset
+        // closes before the first row of values.
+        assert!(styled.starts_with(crate::style::HEADER), "{styled:?}");
+        let (head, body) = styled.split_once(crate::style::RESET).expect("the header is reset");
+        assert!(head.contains("name") && head.contains("size"), "{head:?}");
+        assert!(body.contains("short") && body.contains('1'), "{body:?}");
+        assert!(!body.contains('\x1b'), "{body:?}: a value was coloured");
+
+        // And the text is the same text: colour adds bytes, it does not move columns.
+        let stripped: String = {
+            let mut out = String::new();
+            let mut rest = styled.as_str();
+            while let Some(i) = rest.find('\x1b') {
+                out.push_str(&rest[..i]);
+                let j = rest[i..].find('m').expect("a complete SGR") + i + 1;
+                rest = &rest[j..];
+            }
+            out.push_str(rest);
+            out
+        };
+        assert_eq!(stripped, plain, "colouring changed the layout");
     }
 }
