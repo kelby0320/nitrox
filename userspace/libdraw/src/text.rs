@@ -50,6 +50,11 @@ pub struct Font {
     /// is the only bold text on the desktop, and threading two faces through every `paint` and
     /// every metric would put the weight in a hundred signatures for one line of text.
     bold: Option<alloc::boxed::Box<Font>>,
+    /// The theme's fixed-advance face, which [`mono`](Self::mono) answers with (Part J).
+    ///
+    /// **Beside the bold rather than instead of it**: an editor's buffer is set in this one while
+    /// its chrome stays proportional, so a window needs both at once.
+    mono: Option<alloc::boxed::Box<Font>>,
 }
 
 /// What a font's vertical metrics come to at a given size.
@@ -69,13 +74,33 @@ impl Font {
     /// Takes ownership: the bytes come from a file read at runtime, not from a `'static`
     /// slice, which is what `FontVec` exists for.
     pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
-        FontVec::try_from_vec(data).ok().map(|inner| Self { inner, bold: None })
+        FontVec::try_from_vec(data).ok().map(|inner| Self { inner, bold: None, mono: None })
     }
 
     /// This face with `bold` as its bold companion.
     pub fn with_bold(mut self, bold: Font) -> Self {
         self.bold = Some(alloc::boxed::Box::new(bold));
         self
+    }
+
+    /// This face with `mono` as its fixed-advance companion.
+    ///
+    /// **The same arrangement as [`with_bold`](Self::with_bold), and for the same reason**: a
+    /// window is painted with one face, so a surface that wants a second — an editor's buffer,
+    /// where a proportional face is the largest single difference from the design — carries it
+    /// alongside rather than changing every paint signature (desktop refresh, Part J).
+    ///
+    /// **The theme names this one.** Bold is the built-in face's own companion, chosen by
+    /// `load_ui`; the fixed-advance face is `font_mono`, which a theme may point anywhere, so a
+    /// client loads it with [`load_mono`] and attaches it here.
+    pub fn with_mono(mut self, mono: Font) -> Self {
+        self.mono = Some(alloc::boxed::Box::new(mono));
+        self
+    }
+
+    /// The face fixed-advance text is drawn in: the companion if there is one, this face if not.
+    pub fn mono(&self) -> &Font {
+        self.mono.as_deref().unwrap_or(self)
     }
 
     /// The face bold text is drawn in: the companion if there is one, and this face if not.

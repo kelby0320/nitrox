@@ -595,15 +595,19 @@ const STATUS_PAD_X: u32 = 11;
 /// A window's status bar: what it is doing at one end, where it is at the other.
 ///
 /// **The rule is on the edge that faces the content** — `Edge::Top` for a bar along the bottom of
-/// a window, which is where the design puts one and where the editor's is going (Part J), and
-/// `Edge::Bottom` for one that sits under the chrome, which is where the editor's is today. A bar
-/// with its rule on the wrong side reads as a lid rather than a floor.
+/// a window, which is where the design puts one and where the editor's went in Part J, and
+/// `Edge::Bottom` for one that sits under the chrome. A bar with its rule on the wrong side reads
+/// as a lid rather than a floor.
 ///
-/// **Not in the mono face, which the design uses.** A window is painted with one face, and the
-/// fixed-advance one belongs to a character grid; a status bar set in it would be the toolkit's
-/// first two-face surface for the sake of a byte count. It is [`TextSize::Small`] and
-/// `foreground_dim` instead — the design's hierarchy by size and ink, which is what carries the
-/// "read this second" (desktop refresh, Part H).
+/// **The readings are [`TextSize::Small`] and `foreground_dim`** — the design's hierarchy by size
+/// and ink, which is what carries the "read this second" (desktop refresh, Part H).
+///
+/// **The face is the caller's**, and this paragraph used to say otherwise: it argued that a
+/// status bar in the fixed-advance face would be the toolkit's first two-face surface "for the
+/// sake of a byte count". Part J gave `libui` a `mono` wrapper for the editor's buffer, and the
+/// editor wraps its own position readout in it — numbers that shuffle the line about as a caret
+/// moves are what a fixed advance is for. A bar set wholly in it would still be wrong; a reading
+/// inside one is the caller's judgement (PR #321 review, worth fixing 5).
 pub fn status_bar<Msg>(
     left: Element<Msg>,
     right: Option<Element<Msg>>,
@@ -1235,6 +1239,10 @@ const TITLE_SUBTITLE_GAP: u32 = 9;
 
 /// Space between a text field's content and its edge.
 const FIELD_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
+
+/// The same inset, for a caller that must aim inside a text area — the editor's tests, which
+/// press at a column and need to know where column nought begins.
+pub const TEXT_AREA_PAD: Insets = FIELD_PAD;
 
 /// How wide the caret is, in pixels.
 const CARET: u32 = 2;

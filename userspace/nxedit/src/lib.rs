@@ -39,16 +39,18 @@ use alloc::vec;
 use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, column, dock, docked, padding, row, sized, text, with_spacing,
+    Edge, Element, Insets, center_v, column, dock, docked, fill, mono, padding, row, sized,
+    stack, text, with_spacing,
 };
 use libui::widget::{
-    GRIP_W, InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
+    InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
     TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
-    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_text, tab_strip, text_area,
-    text_field, title_bar, window_frame_with_grip,
+    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_separator, status_text,
+    tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
-/// The status strip's height in pixels — one row of chrome under the title bar.
+/// The status bar's height in pixels — one row of chrome along the window's foot since the
+/// desktop refresh's Part J, where it sat under the title bar.
 ///
 /// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
 /// so its height is that widget's and a second 24 here would have clamped it.
@@ -66,6 +68,36 @@ pub const ROW_H: u32 = 20;
 
 /// The element key on the text area.
 pub const AREA_KEY: u64 = 1;
+
+/// The element key on the byte count in the tab strip, and on the gap after it.
+pub const BYTES_KEY: u64 = 26;
+/// See [`BYTES_KEY`].
+pub const BYTES_GAP_KEY: u64 = 27;
+
+/// The line-number gutter's width: the design's 36.
+pub const GUTTER_W: u32 = 36;
+
+/// How far the numbers sit clear of the gutter's rule: the design's 8.
+const GUTTER_GAP: u32 = 8;
+
+/// The element key on the gutter.
+pub const GUTTER_KEY: u64 = 24;
+
+/// The element key on the gutter and the document together.
+pub const AREA_PANE_KEY: u64 = 25;
+
+/// The text style the buffer is drawn in — and so the one anything measuring it must use.
+///
+/// **One constant, two readers** (desktop refresh, Part J): the view wraps the document in
+/// `mono` and the binary turns a pointer's `x` into a column by measuring with a style. Those
+/// being different faces is a caret that lands further from the pointer the further into the
+/// line it goes, and nothing about the press looks wrong — so the pair is named here and
+/// `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` pins that the view agrees.
+pub const BUFFER_STYLE: libui::element::TextStyle = libui::element::TextStyle {
+    size: libui::element::TextSize::Body,
+    bold: false,
+    mono: true,
+};
 
 /// The document's own key inside the area's dock — see [`AREA_KEY`].
 ///
@@ -691,6 +723,13 @@ fn colour_of(kind: syntax::Kind, theme: &UiTheme) -> libdraw::format::Rgb {
         syntax::Kind::Number => theme.syntax_number,
         syntax::Kind::Heading => theme.syntax_heading,
         syntax::Kind::Variable => theme.syntax_variable,
+        // **A key takes the variable's colour** (desktop refresh, Part J), which no language
+        // that has keys also uses for variables. The design paints a TOML key in its accent;
+        // ours is the focus ring and a selection is made from it, and a third meaning for one
+        // colour is how a person stops being able to read either. **Whether the six syntax
+        // colours become the design's is a palette decision**, which Part A left open and this
+        // part does not settle.
+        syntax::Kind::Key => theme.syntax_variable,
         // Plain text is the theme's foreground, which the widget draws without being told.
         syntax::Kind::Plain => theme.foreground,
     }
@@ -1783,6 +1822,16 @@ impl App {
         true
     }
 
+    /// How big the buffer is, as the tab strip says it: `1173 bytes`.
+    ///
+    /// **What would be written, not what was read**: the count follows the text as it is typed,
+    /// which is the number a person is watching when they decide to save (desktop refresh,
+    /// Part J).
+    pub fn size_text(&self) -> String {
+        let n = to_bytes(&self.buf().text.text()).len();
+        if n == 1 { String::from("1 byte") } else { alloc::format!("{n} bytes") }
+    }
+
     /// What the current buffer is being highlighted as, for a receipt.
     ///
     /// **A name rather than a boolean**, because the interesting failure is not "highlighting
@@ -2108,8 +2157,14 @@ impl App {
         // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`. And
         // `MENU_BAR_H` since M14 Part A: a bar that took its height out of the text area would
         // be chrome the person paid for in rows of their document.
+        // **No `GRIP_W` since the refresh's Part J** (PR #321 review, blocking 2). The grip is an
+        // overlay in the window's corner, and it was subtracted so that no row of the document
+        // sat under it — but the status bar moved to the foot in this same part, so the grip now
+        // covers the *bar*. Subtracting it left a 16-pixel band of bare window face between the
+        // document and the bar, and one line of the file that the window had room for and did
+        // not show. `nxfiles::list_h` dropped it in Part I for the same reason.
         self.window.h.saturating_sub(
-            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + GRIP_W + WINDOW_FRAME_H,
+            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + WINDOW_FRAME_H,
         )
     }
 
@@ -2167,14 +2222,11 @@ impl App {
         )
         .key(TITLE_KEY);
 
-        // The status strip: the one control, and what the last thing that happened was.
-        //
-        // **`libui`'s status bar since the desktop refresh's Part H** — the ground, the rule and
-        // the dim step come from there now, so this window's foot and the browser's agree. Its
-        // rule is on the *bottom* because this strip is still under the chrome rather than along
-        // the window's foot, which is where Part J puts it.
+        // **The foot of the window, where the design puts it** (desktop refresh, Part J): what
+        // last happened on the left, and what the buffer is and where the caret is on the right.
+        // Its rule faces the content above it, which is what makes it read as a floor.
         let reading = match self.field.as_ref() {
-            // **The field replaces the status, it does not sit beside it.** The strip is one row
+            // **The field replaces the status, it does not sit beside it.** The bar is one row
             // of chrome and a name being typed *is* what last happened — showing both would make
             // a person read two things to find out which one is asking for an answer.
             Some((_, f)) => padding(
@@ -2183,38 +2235,17 @@ impl App {
             ),
             None => status_text(self.status.clone(), &ui),
         };
+        // **`language · ln N, col M`**, in the fixed-advance face so the numbers do not shuffle
+        // the line about as the caret moves through a file.
+        let position = libui::element::row(alloc::vec![
+            status_text(self.language_name(), &ui),
+            status_separator(&ui),
+            mono(status_text(self.position_text(), &ui)),
+        ]);
         let strip = status_bar(
-            row(alloc::vec![
-                // **The one action in this window, so it is the accent pill** (desktop refresh,
-                // Part H) — the design's `Save`, which is the only control it fills with the
-                // accent. Part J moves it to the tab strip, where the design puts it.
-                // **Sized to the design's 21**, so the control sits *on* the bar rather than
-                // filling it: a pill as tall as the strip it is in reads as a coloured end to
-                // the strip.
-                sized(
-                    Size::new(0, PILL_H),
-                    pill(
-                        "Save",
-                        Msg::Save,
-                        WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                        &ui,
-                    ),
-                )
-                .key(SAVE_KEY),
-                padding(Insets { top: 0, right: 0, bottom: 0, left: STATUS_GAP }, reading)
-                    .key(STATUS_KEY)
-                    .flex(1),
-            ]),
-            // **Line and column, at the right of the strip this window already has** (M14 Part E).
-            // A second bar along the bottom is where a status bar conventionally goes and would
-            // have moved every gate coordinate in the text area for a number; the strip is
-            // already the status bar, and the position a person is at is status.
-            //
-            // **Counted from one**, because that is what every editor's "line 3" means and what a
-            // person comparing against a compiler's error message needs it to mean; the buffer
-            // counts from zero and the conversion belongs at the one place it is displayed.
-            Some(status_text(self.position_text(), &ui).key(POSITION_KEY)),
-            Edge::Bottom,
+            reading.key(STATUS_KEY),
+            Some(position.key(POSITION_KEY)),
+            Edge::Top,
             &ui,
         );
 
@@ -2230,13 +2261,29 @@ impl App {
                 marked: *marked,
             })
             .collect();
+        // **The file's own controls ride on the tab strip** (desktop refresh, Part J), which is
+        // where the design puts them: how big the buffer is, and the one action that changes it.
+        let controls = libui::element::row(alloc::vec![
+            center_v(mono(status_text(self.size_text(), &ui))).key(BYTES_KEY),
+            sized(Size::new(STATUS_GAP, 0), text("")).key(BYTES_GAP_KEY),
+            center_v(sized(
+                Size::new(0, PILL_H),
+                pill(
+                    "Save",
+                    Msg::Save,
+                    WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                    &ui,
+                ),
+            ))
+            .key(SAVE_KEY),
+        ]);
         let strip_tabs = tab_strip(
             &items,
             self.current,
             hovered,
             Msg::SelectTab,
             Msg::CloseTab,
-            TabExtras::new_tab(Msg::NewTab),
+            TabExtras { new_tab: Some(Msg::NewTab), right: Some(controls) },
             &ui,
         );
 
@@ -2255,28 +2302,101 @@ impl App {
         let focused = self.focused;
         let visible = (h / ROW_H) as usize;
         let bar = self.buf().text.bar(visible);
-        let area = text_area(
-            &mut self.buf_mut().text,
-            h,
-            ROW_H,
-            focused,
-            &ink,
-            Some(Msg::AreaPointer),
-            &ui,
-        )
-        .on_drop(Msg::Dropped)
-        .on_wheel(Msg::AreaWheel);
+        // **The buffer is set in the fixed-advance face** (desktop refresh, Part J): code in a
+        // proportional face was the largest single difference between this window and the
+        // design, and it is the difference between columns that line up and columns that do not.
+        // The chrome around it stays proportional — `mono` wraps what is inside it and nothing
+        // else, which is how a window comes to be painted in two faces at once.
+        let area = mono(
+            text_area(
+                &mut self.buf_mut().text,
+                h,
+                ROW_H,
+                focused,
+                &ink,
+                Some(Msg::AreaPointer),
+                &ui,
+            )
+            .on_drop(Msg::Dropped)
+            .on_wheel(Msg::AreaWheel),
+        );
+        // **The line-number gutter** (desktop refresh, Part J): 36 pixels on `face_hover` with a
+        // rule down its right edge, the numbers right-aligned a little clear of it in the dim
+        // step of the same fixed-advance face the buffer uses.
+        //
+        // **A sibling of the document, not a wrapper round it.** The router hands a widget
+        // pointer events in its *own* coordinates, so a gutter beside the area leaves the
+        // caret's arithmetic alone; a gutter inside it would shift every column by 36 pixels and
+        // the caret would land that much to the left of the pointer.
+        let first = self.buf().text.offset();
+        let last = self.buf().text.lines().len();
+        let mut numbers = alloc::vec::Vec::with_capacity(visible);
+        // **`row` and `ink` are taken here** — the loop's index and the highlighter's runs — so
+        // the element builders are named in full rather than shadowed.
+        for n in 0..visible {
+            let line = first + n;
+            let label = if line < last { alloc::format!("{}", line + 1) } else { String::new() };
+            // **At the body size and against the top of the row**, which is what puts a number
+            // on the line it belongs to: the document sets each line at the top of its box at
+            // the body size, and a smaller number centred in the same box sat three pixels low
+            // — worse as `font_px` grows, since the two steps diverge (PR #321 review, worth
+            // fixing 3). The design's gutter is the same size as its text for this reason.
+            let number = libui::element::ink(ui.foreground_dim, mono(text(label)));
+            // **Against the top of the row, where the document puts its line** (PR #321 review,
+            // worth fixing 3). A row centres its children down the box it is given, so a
+            // centred number sits four pixels below the line it belongs to; the flexible space
+            // underneath pins it up. The number is also at the body step, not a step below —
+            // the design's gutter is the same size as its text, and two steps in one row is
+            // what made the original three pixels out.
+            numbers.push(sized(
+                Size::new(0, ROW_H),
+                column(alloc::vec![
+                    libui::element::row(alloc::vec![
+                        text("").flex(1),
+                        number,
+                        sized(Size::new(GUTTER_GAP, 0), text("")),
+                    ]),
+                    text("").flex(1),
+                ]),
+            ));
+        }
+        let gutter = sized(
+            Size::new(GUTTER_W, 0),
+            stack(alloc::vec![
+                fill(ui.face_hover),
+                dock(
+                    alloc::vec![docked(Edge::Right, sized(Size::new(1, 0), fill(ui.border)))],
+                    text(""),
+                ),
+                padding(
+                    Insets { top: libui::widget::TEXT_AREA_PAD.top, right: 0, bottom: 0, left: 0 },
+                    column(numbers),
+                ),
+            ]),
+        );
+
         // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
         // its own doc says so, and says it is the application's to compose, which `nxterm` does
         // for its grid and this window did not. Without it a document longer than the window had
         // nothing to say so, and no way to move but the arrow keys.
+        // **Both children keyed**, as the diff requires of a container: the gutter carries its
+        // own and the document keeps `AREA_KEY` one level down, inside the sized box the dock
+        // places.
+        // **`AREA_INNER_KEY` stays on the document itself**, which is what it names and what
+        // every test and gate aims from: putting it on the pair would move the origin to the
+        // gutter's left edge, and a press computed from it would land a gutter to the left of
+        // the column it meant.
+        let pane = libui::element::row(alloc::vec![
+            gutter.key(GUTTER_KEY),
+            padding(Insets::all(0), area).key(AREA_INNER_KEY).flex(1),
+        ]);
         let area = dock(
             alloc::vec![docked(
                 Edge::Right,
                 sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, &ui).on_pointer(Msg::AreaScroll))
                     .key(AREA_BAR_KEY),
             )],
-            area.key(AREA_INNER_KEY),
+            pane.key(AREA_PANE_KEY),
         );
 
         window_frame_with_grip(
@@ -2306,7 +2426,9 @@ impl App {
                         Edge::Top,
                         sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),
                     ),
-                    docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
+                    // **At the foot since Part J**, where it was under the chrome: a status bar
+                    // is a floor, and the design draws it along the bottom of the window.
+                    docked(Edge::Bottom, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
                 ],
             // Sized to the height it was built for, like every scrolling widget in this tree:
             // the dock's flex child otherwise gets whatever is left, and the widget would build
@@ -2497,6 +2619,12 @@ mod tests {
             TAB_STRIP_KEY,
             POSITION_KEY,
             BAR_KEY,
+            // Part J's four, added when they were (PR #321 review, worth fixing 2): a key is a
+            // number nothing checks, and this list is the check.
+            GUTTER_KEY,
+            AREA_PANE_KEY,
+            BYTES_KEY,
+            BYTES_GAP_KEY,
         ];
         keys.extend(MENU_BAR_KEY..MENU_BAR_KEY + menus);
         let mut sorted = keys.clone();
@@ -2510,6 +2638,423 @@ mod tests {
     /// Eight pixels a character, which is what `CELL` gives these tests.
     fn width(s: &str) -> u32 {
         (s.chars().count() * 8) as u32
+    }
+
+    /// The byte count on the tab strip counts what would be written, and says "1 byte" once.
+    ///
+    /// **The one new user-visible string in this part** and it had no test (PR #321 review).
+    /// It follows the buffer rather than the file, which is the number a person is watching
+    /// when they decide to save.
+    #[test]
+    fn the_byte_count_follows_the_buffer() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("", b"");
+        assert_eq!(a.size_text(), "0 bytes", "an empty buffer is plural, like every other count");
+        // **`to_bytes` ends the file with a newline**, which is what the editor writes — so a
+        // one-character buffer is two bytes, and the singular is the buffer that is *only* that
+        // newline. This is the half "what would be written" is about.
+        a.loaded("\n", b"\n");
+        assert_eq!(a.size_text(), "1 byte", "one is singular");
+        a.loaded("x", b"x\n");
+        assert_eq!(a.size_text(), "2 bytes", "a character and the newline after it");
+        a.loaded("hello", b"hello\n");
+        assert_eq!(a.size_text(), "6 bytes");
+        // **It follows the buffer, not the file**: typing changes it before any save does.
+        a.buf_mut().text.place(0, 5);
+        a.buf_mut().text.insert('!');
+        assert_eq!(a.size_text(), "7 bytes", "the count followed the keystroke");
+    }
+
+    /// A line's number sits on the line it numbers.
+    ///
+    /// **Measured as baselines, which is what an eye reads** (PR #321 review, worth fixing 3):
+    /// the document sets each line at the top of its box and a number centred in the same box at
+    /// a smaller step sat three pixels low — worse as `font_px` grows, since the steps diverge.
+    #[test]
+    fn a_line_number_sits_on_its_line() {
+        use libui::layout::Metrics as _;
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+        let face = libdraw::text::Font::from_bytes(DEJAVU.to_vec())
+            .expect("the vendored face")
+            .with_mono(libdraw::text::Font::from_bytes(MONO.to_vec()).expect("its mono"));
+        for font_px in [12.0, 16.0] {
+            let ui = UiTheme { font_px, ..UiTheme::default() };
+            let m = libui::paint::FontMetrics::new(&face, ui.font_px);
+            let mut a = App::new("/home/notes.txt", "/home");
+            // **No ascenders or descenders**: `1` is cap-height and `l` is taller, so comparing
+            // the *tops* of two inks compares glyph shapes. `nn` sits between the baseline and
+            // the x-height, and a digit's foot is the baseline too — so the ink *bottoms* are
+            // the same line when the two are aligned.
+            a.loaded("nn\nnn\n", b"nn\nnn\n");
+            a.resize(Size::new(600, 300));
+            let e = a.view(&ui, None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, 600, 300), &m);
+            let doc = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document");
+            let gutter = libui::layout::locate(&e, &l, GUTTER_KEY).expect("the gutter");
+            // Both put their first row at the same inset from their own top, so the rows line
+            // up when the boxes do and the text inside them starts at the same height.
+            assert_eq!(
+                doc.origin.y, gutter.origin.y,
+                "the gutter and the document start at the same height at font_px {font_px}"
+            );
+            // **Where the ink lands, not what a constant says.** A first version compared two
+            // `text_size_as` calls with the *test's* own style and passed against a number set
+            // a step smaller — the same round trip through the test's metric that review found
+            // in the press test. So this paints the window and compares the top of the number's
+            // ink with the top of the line's.
+            use libdraw::format::PixelFormat;
+            use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+            let (w, h) = (600u32, 300u32);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(ui.background);
+            let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
+            libui::paint::paint(&mut fb, &face, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
+            // **The gutter's rule is ink too**, and it runs the whole height — so a scan that
+            // counted it found the band's last row every time and passed against anything. The
+            // border colour is excluded, and the number's column stops short of the rule.
+            let foot_ink = |x0: u32, x1: u32, y0: u32, y1: u32| {
+                (y0..y1).rev().find(|y| {
+                    (x0..x1).any(|x| {
+                        let c = fb.get_pixel(x, *y);
+                        c.is_some()
+                            && c != Some(ui.background)
+                            && c != Some(ui.face_hover)
+                            && c != Some(ui.border)
+                            // **And the caret**, which is a full-height fill in the accent: a
+                            // scan that counted it found the row's own bottom on whichever line
+                            // the cursor was on.
+                            && c != Some(ui.accent)
+                    })
+                })
+            };
+            // Exactly the first row, so the second line's ink cannot be mistaken for it.
+            let band = (doc.origin.y as u32, doc.origin.y as u32 + ROW_H);
+            let number = foot_ink(
+                gutter.origin.x as u32,
+                (gutter.origin.x + gutter.size.w as i32) as u32 - 2,
+                band.0,
+                band.1,
+            );
+            let line = foot_ink(doc.origin.x as u32 + 4, doc.origin.x as u32 + 60, band.0, band.1);
+            let number = number.expect("a number is drawn");
+            let line = line.expect("a line is drawn");
+            assert!(
+                number.abs_diff(line) <= 1,
+                "the number's ink ends at {number} and the line's at {line}, at font_px \
+                 {font_px}"
+            );
+            // **And the number carries no size step**, which the ink cannot say on its own: at
+            // the small step the two feet differ by a single pixel here, inside any tolerance
+            // an antialiased glyph needs. The rule is that a gutter's numbers are set at the
+            // body size like the lines they number — the design's are — so this asserts the
+            // rule rather than one of its consequences (PR #321 review, worth fixing 3).
+            fn scaled_inside<M>(e: &Element<M>) -> bool {
+                matches!(e.node, libui::element::Node::Scale { .. })
+                    || e.children().any(scaled_inside)
+            }
+            fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+                if e.key == Some(key) {
+                    return Some(e);
+                }
+                e.children().find_map(|c| keyed(c, key))
+            }
+            let g = keyed(&e, GUTTER_KEY).expect("the gutter is keyed");
+            assert!(
+                !scaled_inside(g),
+                "a number set at another step than its line, at font_px {font_px}"
+            );
+        }
+    }
+
+    /// The document reaches the status bar, with no band of bare window between them.
+    ///
+    /// **The grip is an overlay on the bar, not a row of the document** (PR #321 review,
+    /// blocking 2): `area_h` subtracted it while the bar was under the chrome, and kept doing so
+    /// when the bar moved to the foot — leaving sixteen pixels of window face below the gutter
+    /// and one line of the file that the window had room for and did not show.
+    #[test]
+    fn the_document_reaches_the_status_bar() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("one\ntwo\n", b"one\ntwo\n");
+        a.resize(Size::new(600, 400));
+        let ui = UiTheme::default();
+        let e = a.view(&ui, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, 600, 400), &CELL);
+        let at = |key: u64| libui::layout::locate(&e, &l, key).expect("keyed");
+        let (area, strip, gutter) = (at(AREA_KEY), at(STRIP_KEY), at(GUTTER_KEY));
+        assert_eq!(
+            area.origin.y + area.size.h as i32,
+            strip.origin.y,
+            "the document stops short of the status bar"
+        );
+        assert_eq!(
+            gutter.origin.y + gutter.size.h as i32,
+            strip.origin.y,
+            "and so does the gutter's own column"
+        );
+        // The grip still sits over chrome rather than over a row: it is in the bar's band.
+        let grip = at(GRIP_KEY);
+        assert!(
+            grip.origin.y >= strip.origin.y,
+            "the grip is over the document rather than over the bar: {grip:?} against {strip:?}"
+        );
+    }
+
+    /// The gutter numbers the lines that are on screen, and scrolls with them.
+    ///
+    /// **Painted rather than read off the tree** for the numbers' *place*, and read off the tree
+    /// for which numbers they are: a gutter that showed `1..n` whatever the scroll would look
+    /// right in a screenshot of the top of a file and be wrong everywhere else (desktop refresh,
+    /// Part J).
+    #[test]
+    fn the_gutter_numbers_the_lines_that_are_showing() {
+        let mut a = App::new("/home/long.txt", "/home");
+        let body: String =
+            (1..=40).map(|n| alloc::format!("line {n}\n")).collect::<Vec<_>>().concat();
+        a.loaded(&body, body.as_bytes());
+        // Tall enough to show a dozen lines: the default window fits one, and a gutter with one
+        // number in it cannot say whether it follows the scroll.
+        a.resize(Size::new(600, 400));
+        let theme = UiTheme::default();
+        let numbers = |a: &mut App| -> Vec<String> {
+            let e = a.view(&theme, None);
+            let size = a.window_size();
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+            let g = libui::layout::locate(&e, &l, GUTTER_KEY).expect("the gutter is keyed");
+            assert_eq!(g.size.w, GUTTER_W, "the gutter is the design's width");
+            fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
+                if let libui::element::Node::Text(t) = &e.node
+                    && !t.is_empty()
+                {
+                    out.push(t.clone());
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+                if e.key == Some(key) {
+                    return Some(e);
+                }
+                e.children().find_map(|c| keyed(c, key))
+            }
+            let mut out = Vec::new();
+            walk(keyed(&e, GUTTER_KEY).expect("keyed"), &mut out);
+            out
+        };
+        let top = numbers(&mut a);
+        assert_eq!(top.first().map(String::as_str), Some("1"), "the first line is 1");
+        assert!(top.len() > 1, "and the gutter numbers more than one line");
+        // **Scrolled, the numbers follow.** `scroll_to` is what the wheel and the bar both use.
+        let visible = top.len();
+        a.buf_mut().text.scroll_to(10, visible);
+        let scrolled = numbers(&mut a);
+        assert_eq!(
+            scrolled.first().map(String::as_str),
+            Some("11"),
+            "ten lines down, the gutter starts at eleven"
+        );
+        // **And it stops at the end of the file rather than numbering past it** — the buffer's
+        // own count, which is 41 here because a file ending in a newline has an empty last line.
+        let lines = a.buf().text.lines().len();
+        a.buf_mut().text.scroll_to(lines.saturating_sub(2), visible);
+        let last = numbers(&mut a);
+        assert_eq!(
+            last.last().map(String::as_str),
+            Some(alloc::format!("{lines}").as_str()),
+            "the last number is the last line"
+        );
+        assert!(
+            last.len() <= visible,
+            "and the gutter does not number past the end: {last:?}"
+        );
+        // **A file shorter than the window**, which is the case that actually exercises the
+        // guard and the common one (PR #321 review, worth fixing 4): scrolling a long file
+        // clamps the offset, so the visible rows never run past the last line and an
+        // unconditional `line + 1` passed this test either way.
+        let mut short = App::new("/home/short.txt", "/home");
+        short.loaded("one\ntwo\nthree\n", b"one\ntwo\nthree\n");
+        short.resize(Size::new(600, 400));
+        let shown = numbers(&mut short);
+        assert_eq!(
+            shown,
+            alloc::vec!["1", "2", "3", "4"],
+            "a three-line file with a trailing newline numbers four rows and stops"
+        );
+    }
+
+    /// The view draws the buffer in the style [`BUFFER_STYLE`] names.
+    ///
+    /// **The link between the two readers** (desktop refresh, Part J): the binary measures a
+    /// pointer's `x` with that constant, and this asserts the tree wraps the document to match.
+    /// Without it the pair can drift with nothing failing — the caret simply lands in the wrong
+    /// column, further off the further into a line it goes.
+    #[test]
+    fn the_buffer_is_drawn_in_the_style_the_caret_is_measured_in() {
+        assert!(BUFFER_STYLE.mono, "the buffer is fixed-advance");
+        let mut a = app();
+        let e = a.view(&UiTheme::default(), None);
+        // **The wrapper is inside the keyed element**, not above it: the key goes on the sized
+        // box the dock places, and `mono` wraps the widget within it.
+        fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
+            if e.key == Some(key) {
+                return Some(e);
+            }
+            e.children().find_map(|c| keyed(c, key))
+        }
+        fn has_mono<M>(e: &Element<M>) -> bool {
+            matches!(e.node, libui::element::Node::Mono { .. }) || e.children().any(has_mono)
+        }
+        // **`AREA_INNER_KEY`, not `AREA_KEY`** (PR #321 review, blocking 1): the outer box holds
+        // the scrollbar *and* the pane, and the pane holds the gutter — whose numbers are `mono`
+        // too. Searching from there, this assertion was satisfied by the gutter, and deleting
+        // the wrapper from the document left all 103 tests passing.
+        let area = keyed(&e, AREA_INNER_KEY).expect("the document is keyed");
+        assert!(
+            has_mono(area),
+            "the document is not drawn in the face the caret is measured in"
+        );
+        // **And the gutter is outside it**, which is what makes the search above mean the
+        // document: if the two ever nest, this test goes back to passing for the wrong reason.
+        assert!(
+            keyed(area, GUTTER_KEY).is_none(),
+            "the gutter is inside the document's subtree, so `has_mono` proves nothing"
+        );
+    }
+
+    /// The buffer's glyphs are *painted* at fixed advances, end to end.
+    ///
+    /// **The claim carried by ink rather than by the shape of the tree** (PR #321 review,
+    /// blocking 1). The wrapper test asserts a `Mono` node is above the document; this one
+    /// renders the real window with the real faces and measures how far the drawn line reaches.
+    /// A proportional face draws `iiiimmmm` a great deal wider than a fixed-advance one, so the
+    /// reach says which face put the glyphs down — and the control is that the *other* face's
+    /// width is nothing like it.
+    #[test]
+    fn the_buffers_glyphs_are_painted_at_fixed_advances() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        use libui::layout::Metrics as _;
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+        let face = libdraw::text::Font::from_bytes(DEJAVU.to_vec())
+            .expect("the vendored face")
+            .with_mono(libdraw::text::Font::from_bytes(MONO.to_vec()).expect("its mono"));
+        let theme = UiTheme::default();
+        let m = libui::paint::FontMetrics::new(&face, theme.font_px);
+        let mut a = App::new("/home/notes.txt", "/home");
+        // **All narrow glyphs**: `iiiimmmm` averages out — 56 proportional against 54 mono —
+        // and a test that cannot tell the two apart proves nothing. Eight `i`s are half as wide
+        // in the proportional face as in the fixed-advance one.
+        a.loaded("iiiiiiii\n", b"iiiiiiii\n");
+        a.resize(Size::new(600, 300));
+        let (w, h) = (600u32, 300u32);
+        let e = a.view(&theme, None);
+        let all = Rect::new(0, 0, w, h);
+        let l = libui::layout::layout(&e, all, &m);
+        let doc = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
+        let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+        fb.clear(theme.background);
+        let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
+        libui::paint::paint(&mut fb, &face, &theme, &e, &l, all, &mut custom);
+        // How far the first line's ink reaches, inside the document's own column.
+        let row = (doc.origin.y + libui::widget::TEXT_AREA_PAD.top as i32) as u32;
+        let band = row..(row + ROW_H);
+        let left = doc.origin.x as u32;
+        let right = (doc.origin.x + doc.size.w as i32) as u32;
+        let reach = (left..right)
+            .rev()
+            .find(|x| {
+                band.clone().any(|y| {
+                    let c = fb.get_pixel(*x, y);
+                    c.is_some() && c != Some(theme.background) && c != Some(theme.face_hover)
+                })
+            })
+            .expect("the line is drawn");
+        let drawn = reach - left - libui::widget::TEXT_AREA_PAD.left;
+        let in_mono = m.text_size_as("iiiiiiii", BUFFER_STYLE).w;
+        let proportional = m.text_size("iiiiiiii").w;
+        assert!(
+            proportional.abs_diff(in_mono) > 8,
+            "the two faces must differ for this to discriminate: {proportional} against {in_mono}"
+        );
+        // Within a couple of pixels: a glyph's ink stops short of its advance.
+        assert!(
+            drawn.abs_diff(in_mono) <= 4,
+            "the line reaches {drawn}, the fixed-advance face would put it at {in_mono} \
+             (the proportional one at {proportional})"
+        );
+    }
+
+    /// A press in the buffer lands on the column the **drawn** face puts there.
+    ///
+    /// **The other tests here cannot tell the two faces apart**: they lay out with a `FixedCell`
+    /// of eight pixels and measure with eight-per-character, so a proportional face and a
+    /// fixed-advance one are the same to them. This one uses the real faces, which is the only
+    /// way to catch a caret measured in one and drawn in the other — the pointer would land
+    /// further from the column the further into the line it went (desktop refresh, Part J).
+    #[test]
+    fn a_press_in_the_buffer_lands_where_the_mono_face_draws() {
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+        let face = libdraw::text::Font::from_bytes(DEJAVU.to_vec())
+            .expect("the vendored face")
+            .with_mono(libdraw::text::Font::from_bytes(MONO.to_vec()).expect("its mono"));
+        let theme = UiTheme::default();
+        use libui::layout::Metrics as _;
+        let m = libui::paint::FontMetrics::new(&face, theme.font_px);
+        let in_buffer = libui::element::TextStyle {
+            mono: true,
+            ..libui::element::TextStyle::default()
+        };
+        // A line of `i`s and `m`s: in the fixed-advance face they are the same width, and in the
+        // proportional one an `m` is more than twice an `i`. Pressing past the `i`s is what
+        // separates the two.
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("iiiimmmm", b"iiiimmmm\n");
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &m);
+        // **From the document, not the pane**: `AREA_KEY` is the box that holds the gutter too
+        // since Part J, and a press computed from its edge would be a gutter to the left.
+        let area = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
+        // **The prefix's width, not six times one glyph**: the widget walks boundaries by
+        // measuring prefixes, and in integer pixels those are not the same number.
+        let prefix = m.text_size_as("iiiimm", in_buffer).w as i32;
+        let inset = libui::widget::TEXT_AREA_PAD;
+        let x = area.origin.x + inset.left as i32 + prefix;
+        let y = area.origin.y + inset.top as i32 + (ROW_H / 2) as i32;
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+        let p = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x,
+            y,
+            ..Default::default()
+        };
+        for msg in r.pointer(&tree, &e, &l, p).0 {
+            a.update(msg);
+        }
+        a.take_area_pointer(|s| m.text_size_as(s, in_buffer).w);
+        assert_eq!(a.buf().text.cursor(), (0, 6), "the caret is in the column pressed");
+        // **The control, run here rather than by hand**: the same press measured in the
+        // proportional face lands somewhere else entirely.
+        let mut b = App::new("/home/notes.txt", "/home");
+        b.loaded("iiiimmmm", b"iiiimmmm\n");
+        for msg in r.pointer(&tree, &e, &l, p).0 {
+            b.update(msg);
+        }
+        b.take_area_pointer(|s| m.text_size(s).w);
+        assert_ne!(
+            b.buf().text.cursor(),
+            (0, 6),
+            "measuring the face the buffer is *not* drawn in would have to be wrong"
+        );
     }
 
     /// A pointer event over the document, routed through the real tree.
@@ -2758,6 +3303,7 @@ mod tests {
             ink_of(&mut a),
             alloc::vec![
                 (0, String::from("[server]"), ui.syntax_heading),
+                (1, String::from("port"), ui.syntax_variable),
                 (1, String::from("80"), ui.syntax_number),
                 (1, String::from("# here"), ui.syntax_comment),
             ]

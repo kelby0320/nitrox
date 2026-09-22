@@ -47,6 +47,12 @@ pub enum Kind {
     Heading,
     /// A shell variable.
     Variable,
+    /// The name on the left of an assignment: a TOML key (desktop refresh, Part J).
+    ///
+    /// **A kind this scanner did not have**, which Part A recorded when it compared the editor
+    /// with the design: the page colours a TOML key distinctly and everything here drew it as
+    /// plain text, so the eye had nothing to catch on down a column of settings.
+    Key,
 }
 
 /// A coloured stretch of one line, in byte offsets within that line.
@@ -128,6 +134,13 @@ pub struct Language {
     pub fence: Option<&'static str>,
     /// A delimiter for a *span* of verbatim text within a line — Markdown's backtick.
     pub code_span: Option<char>,
+    /// The character that separates a name from its value, when a language has one line-shaped
+    /// assignment — TOML's `=`. The name before it is a [`Kind::Key`].
+    ///
+    /// **`None` for every language with a grammar**: in Rust or a shell an `=` is an operator and
+    /// what precedes it is an expression, so colouring it as a name would be wrong more often
+    /// than right (desktop refresh, Part J).
+    pub assignment: Option<char>,
 }
 
 /// The empty language: everything is plain. What a file with no known extension gets.
@@ -142,6 +155,7 @@ pub const PLAIN: Language = Language {
     line_prefixes: &[],
     fence: None,
     code_span: None,
+    assignment: None,
 };
 
 /// `nxsh`, this system's shell — see `docs/spec/shell-language.md`.
@@ -162,6 +176,7 @@ pub const NXSH: Language = Language {
     line_prefixes: &[],
     fence: None,
     code_span: None,
+    assignment: None,
 };
 
 /// TOML, which every configuration file in this system is written in.
@@ -179,6 +194,8 @@ pub const TOML: Language = Language {
     line_prefixes: &[("[", Kind::Heading)],
     fence: None,
     code_span: None,
+    // **The name before the `=`**, which is what a TOML file is mostly made of.
+    assignment: Some('='),
 };
 
 /// Rust.
@@ -203,6 +220,7 @@ pub const RUST: Language = Language {
     line_prefixes: &[],
     fence: None,
     code_span: None,
+    assignment: None,
 };
 
 /// Markdown — every document under `docs/`.
@@ -227,6 +245,7 @@ pub const MARKDOWN: Language = Language {
     ],
     fence: Some("```"),
     code_span: Some('`'),
+    assignment: None,
 };
 
 /// The language a file's name implies.
@@ -310,6 +329,37 @@ pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
         if trimmed.starts_with(prefix) {
             push(&mut out, 0, line.len(), *kind);
             return (out, State::Normal);
+        }
+    }
+
+    // ---- the name on the left of an assignment ----
+    //
+    // **The head of the line only**, and only up to the first separator: an `=` inside a string
+    // or after one is somebody's value, not a second key. That is the whole of the rule, which
+    // is why it is a character in the table rather than a grammar (desktop refresh, Part J).
+    //
+    // **The comment check is deliberately redundant**, and a test cannot tell it apart from the
+    // name's spelling today: comments are found inside `scan_from`, which runs after this, and
+    // what keeps `# font_px = 12` a comment right now is that `#` is not a character a name may
+    // contain. Two guards for one invariant usually drift; this pair is kept because the
+    // spelling rule is about *names* and would reasonably be widened one day, at which point the
+    // comment would stop being protected by an accident. Remove both and the comment becomes a
+    // key and a number, which is the control this pair was written against.
+    let commented = lang.line_comments.iter().any(|c| trimmed.starts_with(c));
+    if let Some(sep) = lang.assignment
+        && !commented
+        && let Some(at) = line.find(sep)
+    {
+        let name = &line[..at];
+        let trimmed_name = name.trim();
+        let plain_name = !trimmed_name.is_empty()
+            && trimmed_name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ' ');
+        if plain_name {
+            let from = name.len() - name.trim_start().len();
+            push(&mut out, from, from + trimmed_name.len(), Kind::Key);
+            return scan_from(lang, line, at, State::Normal, out);
         }
     }
 
@@ -611,7 +661,12 @@ mod tests {
     /// to be open on this system (PR #289 review, 3).
     #[test]
     fn a_decimal_point_joins_a_number_and_nothing_else() {
-        assert_eq!(runs(&TOML, "timeout = 1.5"), vec![("1.5", Kind::Number)]);
+        // **The name is a `Key` since the refresh's Part J**, which is why it leads each of
+        // these: the value's colouring is what this test is about and is unchanged.
+        assert_eq!(
+            runs(&TOML, "timeout = 1.5"),
+            vec![("timeout", Kind::Key), ("1.5", Kind::Number)]
+        );
         assert_eq!(runs(&RUST, "let x = 1.0;"), vec![
             ("let", Kind::Keyword),
             ("1.0", Kind::Number),
@@ -628,14 +683,62 @@ mod tests {
         assert_eq!(runs(&RUST, "self.field"), vec![("self", Kind::Keyword)]);
     }
 
+    /// A key is the plain name at the head of a line, and nothing else is.
+    ///
+    /// **The rule is a character in the table, not a grammar** (desktop refresh, Part J), so what
+    /// matters is where it declines: an `=` inside a value, a comment that contains one, and any
+    /// language whose `=` is an operator rather than an assignment of this shape.
+    #[test]
+    fn a_key_is_the_name_at_the_head_of_a_line() {
+        assert_eq!(
+            runs(&TOML, "wallpaper = \"/home/a.png\""),
+            vec![("wallpaper", Kind::Key), ("\"/home/a.png\"", Kind::Str)],
+            "the name, then the value"
+        );
+        assert_eq!(
+            runs(&TOML, "  indented = 1"),
+            vec![("indented", Kind::Key), ("1", Kind::Number)],
+            "leading space is not part of the name"
+        );
+        // **A comment is a comment**, even one with an `=` in it: the line rules run first.
+        assert_eq!(
+            runs(&TOML, "# font_px = 12"),
+            vec![("# font_px = 12", Kind::Comment)],
+            "a commented-out setting is not a key"
+        );
+        // **A table header is a header**, for the same reason.
+        assert_eq!(runs(&TOML, "[a.b]"), vec![("[a.b]", Kind::Heading)]);
+        // **Nothing before the `=` that is not a name**: an `=` inside a string on the value's
+        // side must not make the string into a key.
+        assert_eq!(
+            runs(&TOML, "greeting = \"a = b\""),
+            vec![("greeting", Kind::Key), ("\"a = b\"", Kind::Str)],
+            "only the first separator counts"
+        );
+        assert_eq!(
+            runs(&TOML, "\"quoted = key\" = 1"),
+            vec![("\"quoted = key\"", Kind::Str), ("1", Kind::Number)],
+            "a quoted name is a string, which this rule leaves alone"
+        );
+        // **And a language whose `=` is an operator says so by having no rule at all.**
+        assert_eq!(
+            runs(&RUST, "let x = 1;"),
+            vec![("let", Kind::Keyword), ("1", Kind::Number)],
+            "Rust has no line-shaped assignment"
+        );
+    }
+
     #[test]
     fn a_toml_table_header_and_its_values() {
         assert_eq!(runs(&TOML, "[server.tls]"), vec![("[server.tls]", Kind::Heading)]);
         assert_eq!(
             runs(&TOML, "port = 8080 # the usual"),
-            vec![("8080", Kind::Number), ("# the usual", Kind::Comment)]
+            vec![("port", Kind::Key), ("8080", Kind::Number), ("# the usual", Kind::Comment)]
         );
-        assert_eq!(runs(&TOML, "enabled = true"), vec![("true", Kind::Keyword)]);
+        assert_eq!(
+            runs(&TOML, "enabled = true"),
+            vec![("enabled", Kind::Key), ("true", Kind::Keyword)]
+        );
     }
 
     #[test]

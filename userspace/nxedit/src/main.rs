@@ -23,7 +23,7 @@ extern crate alloc;
 
 
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, load_ui};
+use libdraw::text::{Font, load_mono, load_ui};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
@@ -272,6 +272,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"nxedit: the UI font ").s(e.why()).end();
+            fail(b"nxedit: font load FAILED\n");
+        }
+    };
+    // **And the fixed-advance face, for the buffer** (desktop refresh, Part J). Code set in a
+    // proportional face was the largest single difference between this window and the design.
+    // It rides on the UI face as a companion, which is how `libui` reaches a second face at all
+    // — the same arrangement the bold title uses.
+    //
+    // **Fatal, like the UI face.** An editor that cannot draw its text in the face it lays it
+    // out in has nothing useful to show, and a silent fallback to the proportional one would be
+    // a window that looks subtly wrong for a reason nobody can see.
+    // SAFETY: as above.
+    let font = match unsafe { load_mono(root_ns, &theme, b"nxedit") } {
+        Ok((mono, _)) => font.with_mono(mono),
+        Err(e) => {
+            libkern::debug::Line::new().s(b"nxedit: the mono font ").s(e.why()).end();
             fail(b"nxedit: font load FAILED\n");
         }
     };
@@ -1206,8 +1222,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // means measuring text with the font the area was drawn with, and the
                     // library half of this application holds neither a font nor a syscall. The
                     // same seam `nxterm::note_press` uses for the clock.
+                    // **Measured in the face the buffer is *drawn* in** (desktop refresh,
+                    // Part J), which is the fixed-advance one since this part. Measuring the
+                    // proportional face here would put the caret in a column that has nothing to
+                    // do with where the pointer landed — further off the further into the line
+                    // it went — and nothing about the press would look wrong.
                     let m = FontMetrics::new(&font, theme.font_px);
-                    app.take_area_pointer(|s| m.text_size(s).w);
+                    app.take_area_pointer(|s| m.text_size_as(s, nxedit::BUFFER_STYLE).w);
                 }
                 WindowEvent::Focus(f) => {
                     top.route(&ui, &font, &theme, &WindowEvent::Focus(f));

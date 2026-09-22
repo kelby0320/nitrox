@@ -27260,3 +27260,92 @@ to scroll — the doc claimed "the two cannot drift apart" while they were drift
 and the sidebar both stopped short of the new status bar: the listing still subtracted a resize
 grip the status bar now covers, and the sidebar was sized to the listing's height while its column
 is that plus the header.
+
+## 2026-09-22 — Desktop refresh Part J: the editor, and a second face in the toolkit
+
+**A window is painted with one face, and the editor needs two.** Code set in a proportional face
+was the largest single difference between this window and the design. `libdraw::text::Font`
+carries a fixed-advance companion beside the bold one Part G added, `Node::Mono` threads
+`TextStyle.mono` through measure, arrange, diff and paint, and the face is chosen fixed-advance
+first with the weight within it. The theme names this one — `font_mono`, which a theme may point
+anywhere — so a client loads it and attaches it, where `load_ui` attaches the bold itself.
+
+**Changing the drawn face silently moves the caret, and that is the part worth remembering.**
+Turning a pointer's `x` into a column means measuring text, and the editor's closure still
+measured the proportional face: the caret would land further from the pointer the further into a
+line it went, with nothing about the press looking wrong. The same shape as Part I's blocking
+finding — two spaces that agreed until something made them differ. `nxedit::BUFFER_STYLE` names
+the pair now, the binary measures with it, and a test asserts the view wraps the document to
+match.
+
+**The tests that existed could not have caught it**: they lay out with an eight-pixel `FixedCell`
+and measure eight per character, so a proportional face and a fixed-advance one are the same
+thing to them. The new one uses the real faces and a line of `i`s and `m`s, which are the same
+width in one and nothing like it in the other.
+
+**The gutter is a sibling of the document, not a wrapper round it.** The router hands a widget
+pointer events in its *own* coordinates, so a gutter beside the area leaves the caret's
+arithmetic alone; inside it, every column would have shifted by 36 pixels. `AREA_INNER_KEY` stays
+on the document for the same reason — it is what the tests and gates aim from, and moving it to
+the pair would have moved every press a gutter to the left.
+
+**The byte count and `Save` moved to the tab strip's right-hand slot**, which Part H built for
+them, and the status bar moved to the foot with its rule facing the content. The separate save
+row is gone.
+
+**The scanner gained a `Key` kind, and the palette did not move.** The design colours a TOML key
+distinctly and this system had no kind for it — Part A recorded that. The rule is a character in
+the language table (`assignment`, `=` for TOML and `None` wherever `=` is an operator) and the
+plain name at the head of a line before it. **A key takes the variable colour, not the accent**:
+ours is the focus ring and what a selection is made from, and a third meaning for one colour is
+how a person stops being able to read either. Whether the six syntax colours become the design's
+is the palette decision Part A left open, and this part does not settle it.
+
+**Two guards for one invariant, kept deliberately and said so.** A commented line is excluded
+from the key rule twice over — by a check against the language's comment markers, and by `#` not
+being a character a name may contain. A test cannot tell them apart today; the pair is kept
+because the spelling rule is about *names* and would reasonably be widened one day, at which
+point the comment would stop being protected by an accident. The comment says exactly that,
+rather than implying the check is load-bearing.
+
+## 2026-09-22 — Part J, reviewed: a test satisfied by the gutter, and a grip that moved
+
+PR #321's review found three blocking faults. The first is the one worth remembering.
+
+**The test that was supposed to pin Part J's headline feature was satisfied by a different
+element.** `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` located `AREA_KEY` and
+searched its whole subtree for a `Mono` wrapper — and `AREA_KEY` holds the scrollbar *and* the
+pane, and the pane holds the gutter, whose numbers this same part sets in `mono`. Deleting the
+wrapper from the document — Part J's entire point — left all 103 tests passing. The fix is one
+word, `AREA_INNER_KEY`, and the test now also asserts the gutter is *outside* what it searched,
+so the two cannot nest and quietly restore the hole.
+
+**The press test did not carry the claim in its name either.** It computes a press position with
+the test's own metric and converts back with the same one: a round trip that never consults the
+face the view laid out with. It pins `AREA_INNER_KEY` and the text area's inset, which is real,
+and the face claim now lives in a painted test — the window rendered with the real faces, and the
+drawn line's reach compared against what each face would give. Its first version used `iiiimmmm`,
+which the two faces draw within two pixels of each other; eight narrow glyphs differ by 29.
+
+**A resize grip subtracted from a text area it no longer covers.** Moving the status bar to the
+foot put the grip over the bar, and `area_h` went on taking `GRIP_W` out of the document: sixteen
+pixels of bare window between the gutter and the bar, and one line of the file the window had room
+for. `nxfiles::list_h` had the same fault in Part I and the same fix; this is the second window.
+
+**Two current-behaviour docs said `nxterm` was the only program that loads both faces.** It was
+true until this part and is not now. `font_mono` is also no longer "the face a character grid is
+drawn with" — it is what anything drawn through `mono` uses.
+
+**And three smaller ones, each with a test that could not fail.** The libui mono test measured but
+did not paint, so dropping the face selection in `draw` left it green; the gutter's
+"does not number past the end" half only ever scrolled a *long* file, where the offset clamps and
+the guard never runs; and four new element keys were never added to the collision list that exists
+because a key is a number nothing checks.
+
+**The gutter's numbers were a step smaller than the lines they number**, which is what made them
+sit low. Measuring that honestly took four attempts: the first compared two `text_size_as` calls
+with the test's own style — the same round trip as the press test — and the next three were
+confounded by ink that is not a glyph, the gutter's rule and then the caret, both of which span a
+whole row. The rule is now pinned structurally (the numbers carry no size step) as well as by ink,
+because at the small step the two feet differ by a single pixel, which is inside any tolerance an
+antialiased glyph needs.
