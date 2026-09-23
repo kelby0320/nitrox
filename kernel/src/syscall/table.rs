@@ -1415,12 +1415,17 @@ pub fn sys_ns_create() -> SysResult {
 /// `sys_ns_derive(ns)` — create a new [`Namespace`] holding a **copy of `ns`'s bindings**, and
 /// return a handle to it with full namespace rights. Requires `LOOKUP` on `ns`.
 ///
-/// **`LOOKUP` is enough because a copy grants nothing a caller could not already resolve.**
-/// Every binding in the copy is one the caller could reach through `ns`. The full rights on the
-/// result — `BIND`, `UNBIND`, `TRANSFER` — add only what `sys_ns_create` already hands anyone:
-/// binding still needs `BIND_NAMESPACE`, unbinding can only narrow, and transfer is the point. A
-/// process's own root arrives `LOOKUP`-only and cannot be sent, so this is how a program hands
-/// someone its namespace: it derives a copy and sends that.
+/// **`LOOKUP` is enough because a copy binds nothing a caller could not already resolve.**
+/// Every binding in the copy is one the caller could reach through `ns`, binding into it still
+/// needs `BIND_NAMESPACE`, and transfer is the point. A process's own root arrives `LOOKUP`-only
+/// and cannot be sent, so this is how a program hands someone its namespace: it derives a copy
+/// and sends that.
+///
+/// **`UNBIND` on the copy can widen what it reaches.** Resolution is longest-prefix, so removing
+/// a narrower binding exposes the broader one beneath it — which is why no namespace may rely on
+/// a narrower binding to hide part of a broader one
+/// (`docs/architecture/namespace-and-resource-servers.md`, and the test
+/// `unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`).
 ///
 /// **A snapshot**: later changes to either namespace do not reach the other
 /// ([`Namespace::try_derive`]). Built for the view broker, which binds a profile's grants into a

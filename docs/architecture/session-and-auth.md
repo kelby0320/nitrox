@@ -219,9 +219,12 @@ property of the namespace object; see
 `desktop-session-mgr`; both do — sends `OpenSession` for the principal it authenticated, over a
 channel it resolved once at `/svc/views/session`, and gets an id. It binds the broker's forwarding
 endpoint at `/dev/views` with the subtree base `/s/<id>`, so every resolve of `/dev/views` from the
-session reaches the broker with the suffix `s/<id>`, which nothing in the session can change.
+session reaches the broker with the suffix `s/<id>`, which no program in the session can change.
 `desktop-shell` binds the same endpoint, at the same base, into every application namespace it
-builds, so `with` works in a terminal it launched.
+builds, so `with` works in a terminal it launched — and is the one exception: it holds the raw
+endpoint and `BIND_NAMESPACE` to do that, so it could bind any base. It already holds the
+whole-tree filesystem endpoint, so this trusts it with nothing new, but the graphical session's
+identity rests on it.
 
 **When the leader exits, the supervisor sends `CloseSession`.** The endpoint closing could not be
 the signal: a program the broker started in a view still binds the session's `/dev/views`, so the

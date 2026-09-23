@@ -24,10 +24,21 @@ A session id is decimal, non-zero, with no leading zero; any other suffix is `No
 base of a session that is not open. **Ids increase and are never reused within a boot** — a program
 that ignored its session's end still holds a namespace with that base in it.
 
+**A resolve the broker has no room for is `WouldBlock`.** It waits on every channel in one wait
+set of `MAX_WAIT_HANDLES`, and **counts a client channel as two slots from the moment it is let
+in** — the channel, and the life channel of the program it may start (`view_broker::slots`) — so a
+client it admits can always start its program with its exit heard.
+
+**Only `Request` carries handles.** Any handle sent with another op is closed unread.
+
 **The boundary.** Anything holding the unscoped root namespace can resolve `/svc/views/session` and
 `/svc/views/s/<id>`, and so act as any session — the same boundary `/svc/auth` has
-(`TODO(svc-auth-ungated)`), and the same fix. A session cannot: its namespace is built, and binds
-only its own base.
+(`TODO(svc-auth-ungated)`), and the same fix. A program in a session cannot: its namespace is
+built, and binds only its own base. **One process in a session can**: `desktop-shell`, the
+graphical session's leader, holds the raw forwarding endpoint and `BIND_NAMESPACE` so that it can
+bind `/dev/views` into the applications it launches, and could bind any base. That adds no one to
+the trusted set — it already holds the whole-tree filesystem endpoint — but the graphical
+session's identity rests on it ([`graphical-session.md`](../architecture/graphical-session.md) §3).
 
 ## Operations
 
@@ -87,7 +98,10 @@ A channel carries one request.
 
 Request: the password's bytes. Reply: `Started`, or `Denied` with `retry` set while the request
 has failures left. **The broker holds the check** until the session's delay from its last failure
-has passed — on whichever request that failure was — and caps each request at three failures. See
+has passed — on whichever request that failure was, **and whenever the check arrived**: passwords
+waiting on several requests are checked oldest first, one at a time, and a failure holds the rest
+(`view_broker::pacing::Held`). So a session makes at most one guess per delay however many
+requests it opens. Each request is capped at three failures. See
 [`administration.md`](../planning/administration.md) § *The shape* for why the delay is the
 session's and the cap the request's.
 

@@ -953,8 +953,18 @@ fn views_call(
     handles: &[u64],
     exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<(bool, alloc::vec::Vec<u8>)> {
+    if !views_send(ch, op, request_id, body, handles) {
+        return None;
+    }
+    views_receive(ch, request_id, exited)
+}
+
+/// Send one message to the broker without waiting for its answer.
+fn views_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
     let mut msg = [0u8; 4096];
-    let n = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16)?;
+    let Some(n) = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16) else {
+        return false;
+    };
     msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
     msg[8] = handles.len() as u8;
     // SAFETY: valid message buffer and handle array.
@@ -968,10 +978,7 @@ fn views_call(
             libkern::SENDMODE_NOBLOCK,
         )
     };
-    if sr != 0 {
-        return None;
-    }
-    views_receive(ch, request_id, exited)
+    sr == 0
 }
 
 /// Wait for the message with `request_id` on `ch` (`0` for the next `Exited`), setting any other
@@ -1027,16 +1034,21 @@ fn views_receive(
 /// supervisor — opening a session for the demo account — and a client in that session, at
 /// `/svc/views/s/<id>`, which is exactly what a session's `/dev/views` reaches.
 ///
-/// What it proves, each a thing a later piece depends on:
+/// What it proves, in the order it runs, each a thing a later piece depends on:
 /// 1. a request the policy allows asks for a password;
 /// 2. a wrong password is refused with a retry, and the right one — offered straight after — is
 ///    **held for the session's delay** before it is answered;
 /// 3. **the grant arrived**: `nxinstall` is sent a copy of this namespace with `/dev/blk`
 ///    removed, and still exits 0, which is "listed the devices it can see" — its 1 would be
 ///    "none";
-/// 4. a program outside a rule's `run` is refused by the policy;
-/// 5. `with --check`'s op refuses a policy nobody could administer;
-/// 6. once the session is closed, its base names nothing.
+/// 4. a client the broker lets in can start its program with its exit heard, even when the
+///    broker has let in all it can;
+/// 5. **one guess per delay, however many requests**: passwords queued on two requests during
+///    one delay are answered a delay apart, not together when it ends;
+/// 6. a program outside a rule's `run` is refused by the policy;
+/// 7. `with --check`'s op refuses a policy nobody could administer, and a handle sent with an op
+///    that takes none is closed rather than kept;
+/// 8. once the session is closed, its base names nothing.
 fn view_broker_test(root_ns: u64) -> bool {
     use librsproto::views::*;
     let fail = |what: &[u8]| {
@@ -1137,6 +1149,99 @@ fn view_broker_test(root_ns: u64) -> bool {
     // SAFETY: closing our own handle; the request is done.
     unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
 
+    // 4. **A client let in can always start its program.** Open clients until the broker refuses
+    // one, then start a program on the last it let in: that program's exit must still be heard.
+    // Admitting by what was open let the last channel into the last slot, and its program's life
+    // channel then had none — an exit never seen (PR #329 review, finding 5).
+    let mut filled = alloc::vec::Vec::new();
+    let refused = loop {
+        let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        if st != 0 || ch == 0 {
+            break st;
+        }
+        filled.push(ch);
+        if filled.len() > libkern::MAX_WAIT_HANDLES {
+            return fail(b"the broker never refused a client");
+        }
+    };
+    if refused != libkern::KError::WouldBlock.as_i32() {
+        Line::new().s(b"boot-probe: view broker: client ").u(filled.len() as u64 + 1).s(b" refused with ").i(refused as i64).end();
+        return fail(b"a client was refused for something other than room");
+    }
+    let Some(&last) = filled.last() else {
+        return fail(b"no client was let in");
+    };
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    if copy <= 0 || !matches!(views_call(last, OP_VIEWS_REQUEST, 8, &req[..n], &[copy as u64], &mut exited), Some((false, _))) {
+        return fail(b"the last client's request");
+    }
+    match views_call(last, OP_VIEWS_PASSWORD, 9, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"the last client's program did not start"),
+    }
+    let heard = exited.pop().or_else(|| views_receive(last, 0, &mut exited).map(|r| r.1));
+    if heard.as_deref().and_then(parse_exited).is_none() {
+        Line::new().s(b"boot-probe: view broker: ").u(filled.len() as u64).s(b" clients let in").end();
+        return fail(b"the exit of the last client's program was never heard");
+    }
+    for ch in filled {
+        // SAFETY: closing our own handles.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
+    }
+
+    // 5. Two more requests, `b` and `c`. `b` fails; then a password goes on each before the
+    // delay ends. Both are held — and when the first of them fails too, it holds the second
+    // (PR #329 review, blocking finding 1: they were once checked back to back).
+    let mut pair = [0u64; 2];
+    for (k, slot) in pair.iter_mut().enumerate() {
+        let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        if st != 0 || ch == 0 || copy <= 0 {
+            return fail(b"a client channel and a copy for the paced pair");
+        }
+        let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+            return fail(b"build a request");
+        };
+        match views_call(ch, OP_VIEWS_REQUEST, 10 + k as u64, &req[..n], &[copy as u64], &mut exited) {
+            Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+            _ => return fail(b"the paced pair's request did not ask for a password"),
+        }
+        *slot = ch;
+    }
+    let [b, c] = pair;
+    let retry = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
+        matches!(r, Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))))
+    };
+    if !retry(views_call(b, OP_VIEWS_PASSWORD, 20, b"wrong", &[], &mut exited)) {
+        return fail(b"the paced pair's first wrong password");
+    }
+    let t0 = clock_ns();
+    if !views_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !views_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
+        return fail(b"send the paced pair's passwords");
+    }
+    if !retry(views_receive(b, 21, &mut exited)) {
+        return fail(b"the first held password's answer");
+    }
+    let t1 = clock_ns();
+    if !retry(views_receive(c, 22, &mut exited)) {
+        return fail(b"the second held password's answer");
+    }
+    let t2 = clock_ns();
+    if t1.saturating_sub(t0) < 1_900_000_000 || t2.saturating_sub(t1) < 1_900_000_000 {
+        Line::new().s(b"boot-probe: view broker: held answers after ").u((t1 - t0) / 1_000_000).s(b" ms and ").u(t2.saturating_sub(t1) / 1_000_000).s(b" ms").end();
+        return fail(b"two passwords held in one delay were checked together");
+    }
+    // SAFETY: closing our own handles; the broker drops what they asked for.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, b);
+        syscall1(SYS_HANDLE_CLOSE, c);
+    }
+
     // A second client in the same session: a program the `install` view does not include.
     let (st, cli2) = ns_lookup(root_ns, client_path.as_bytes(), chan);
     if st != 0 || cli2 == 0 {
@@ -1156,6 +1261,33 @@ fn view_broker_test(root_ns: u64) -> bool {
         Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { .. }, _))) => {}
         _ => return fail(b"a policy nobody could administer passed the check"),
     }
+    // **A handle sent with anything but a request is closed.** Each op carries one end of a new
+    // channel; the broker closing it is what the other end sees as `PeerClosed` — a leak would
+    // leave it open, and any program in any session can send handles (PR #329 review, finding 4).
+    for (k, op) in [OP_VIEWS_STOP, OP_VIEWS_LIST, OP_VIEWS_CHECK].into_iter().enumerate() {
+        let (mut ours, mut theirs) = (0u64, 0u64);
+        // SAFETY: valid writable out-params.
+        let r = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
+        if r != 0 {
+            return fail(b"a channel to send the broker");
+        }
+        if views_call(cli2, op, 30 + k as u64, b"", &[theirs], &mut exited).is_none() {
+            return fail(b"no answer to an op carrying a handle");
+        }
+        let mut buf = [0u8; 64];
+        let mut hs = [0u64; 1];
+        let mut count = 0usize;
+        // SAFETY: valid recv out-params; `ours` is this process's.
+        let rr = unsafe {
+            let rr = syscall4(libkern::SYS_CHANNEL_RECV, ours, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64);
+            syscall1(SYS_HANDLE_CLOSE, ours);
+            rr
+        };
+        if rr != libkern::KError::PeerClosed.as_i32() as i64 {
+            Line::new().s(b"boot-probe: view broker: op ").u(op as u64).s(b" kept the handle sent with it").end();
+            return fail(b"a handle sent with an op that takes none was kept");
+        }
+    }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, cli2) };
 
@@ -1170,9 +1302,14 @@ fn view_broker_test(root_ns: u64) -> bool {
         unsafe { syscall1(SYS_HANDLE_CLOSE, gone) };
         return fail(b"a closed session's base still resolves");
     }
+    // `NotFound`, not merely a failure: an error body the kernel cannot read is `KernelError`.
+    if st != libkern::KError::NotFound.as_i32() {
+        Line::new().s(b"boot-probe: view broker: a closed session's base answered ").i(st as i64).end();
+        return fail(b"a closed session's base was refused for something other than being gone");
+    }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, sup) };
-    kprint(b"boot-probe: view broker: password held, grant arrived, policy refused, session closed ok\n");
+    kprint(b"boot-probe: view broker: password held, one per delay, grant arrived, exit heard when full, policy refused, stray handles closed, session closed ok\n");
     true
 }
 

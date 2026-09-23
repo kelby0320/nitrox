@@ -309,10 +309,32 @@ handle right, and `sys_ns_bind` enforces both. It concentrates *all* namespace
 mutation in a few coordination roles (init, service-mgr, the session supervisors,
 `desktop-shell`) so namespace policy has a chokepoint that can be audited — see
 `docs/rationale/why-supervisor-registration.md` and [syscaps](syscaps.md).
-**Unbinding is not gated by it**: `sys_ns_unbind` needs only the `UNBIND` right,
-because removing a binding can only narrow what a namespace reaches. (This paragraph
-described the syscap as future work until 2026-09-23; it had been enforced since
-Phase 3 slice 6 Part C, 2026-07-14.)
+**Unbinding is not gated by it**: `sys_ns_unbind` needs only the `UNBIND` right.
+(This paragraph described the syscap as future work until 2026-09-23; it had been
+enforced since Phase 3 slice 6 Part C, 2026-07-14.)
+
+**Removing a binding can widen what a namespace reaches**, not only narrow it.
+Resolution is longest-prefix, so a path under a removed binding falls to the next
+shorter one: with `/` bound to a filesystem and `/home` to alice's subtree of it,
+`/home/bob/x` resolves through `/home` and stays in alice's; unbind `/home` and it
+resolves through `/`, to bob's. Since `sys_ns_derive` (below), **any holder of a
+namespace can make a copy it may unbind in**, so this is a rule for whoever builds
+one:
+
+> **A narrower binding must never be what hides part of a broader one.** If a path
+> under a binding must be out of reach, the broader binding must not reach it —
+> bind a subtree base, or bind less — rather than covering it with a narrower
+> binding a copy can remove.
+
+No namespace built to confine depends on covering (checked 2026-09-23). A
+session's (`libsession::build_namespace`) and an application's (`desktop-shell`'s
+`build_app_namespace`) bind subtrees — `/home`, `/bin`, `/applications`,
+`/system/fonts`, `/dev/…` — with nothing narrower beneath any of them that hides
+part of it, and a view adds only `/dev/blk/<n>` and its `info`, the same server's
+two names for one disk. Services share `init`'s root, which binds the whole root
+filesystem at `/` and so confines nothing to begin with. The kernel test
+`unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`
+(`kernel/src/object/namespace.rs`) pins the behaviour.
 
 **Deriving a namespace** (`sys_ns_derive`, 2026-09-23) copies every binding of one
 the caller can `LOOKUP` into a new namespace it holds with full rights. The copy is

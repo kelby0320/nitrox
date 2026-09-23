@@ -1136,6 +1136,39 @@ mod tests {
         assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "the registration freed once");
     }
 
+    /// **Unbinding can widen.** Resolution is longest-prefix, so removing a narrower binding
+    /// hands its paths to the broader one beneath it. Here `/` reaches a whole filesystem and
+    /// `/home` only alice's subtree of it: the source confines `/home/bob/x` to alice's, and a
+    /// copy with `/home` unbound reaches bob's. Any holder of a namespace can derive a copy and
+    /// unbind in it, so **a narrower binding must never be what hides part of a broader one** —
+    /// the rule `docs/architecture/namespace-and-resource-servers.md` states (PR #329 review,
+    /// finding 3, which corrected docs that said unbinding could only narrow).
+    #[test]
+    fn unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one() {
+        let n = ns();
+        let whole = us_reg_target();
+        let whole_addr = whole.as_ptr() as usize;
+        n.bind_userspace_server(b"/", whole, Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let alice = SubtreeBase::from_path(b"/home/alice").unwrap();
+        n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP, alice).unwrap();
+
+        let d = n.try_derive().unwrap();
+        drop(d.unbind(b"/home").expect("was bound"));
+        match d.resolve(b"/home/bob/x").unwrap() {
+            (ResolvedTarget::UserspaceServer(reg, b), _, suf) => {
+                assert_eq!(reg.as_ptr() as usize, whole_addr, "the whole filesystem");
+                assert_eq!((b.as_path(), suf), (&b""[..], &b"home/bob/x"[..]), "bob's file");
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+        match n.resolve(b"/home/bob/x").unwrap() {
+            (ResolvedTarget::UserspaceServer(_, b), _, suf) => {
+                assert_eq!((b.as_path(), suf), (&b"/home/alice"[..], &b"bob/x"[..]), "confined");
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+    }
+
     /// **The copy's cache starts empty.** The source's entries are indices into *its* binding
     /// list, so an inherited entry would be right only while the two lists happened to agree.
     #[test]

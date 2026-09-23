@@ -14,7 +14,10 @@
 //!
 //! **It reads the password, not the broker** — on the terminal its shell handed it, echo off. The
 //! broker holds each check for the session's delay after a wrong one, and ends a request after
-//! three.
+//! three. **An older reader on the same backend gets the line first**: input goes to the oldest
+//! terminal with a read pending, so a program still reading one — an earlier stage of this
+//! pipeline, or one a previous command left behind — receives what is typed at the prompt. `sudo`
+//! has the same limit; `docs/planning/administration.md` records it.
 
 #![no_std]
 #![no_main]
@@ -27,6 +30,7 @@ use alloc::vec::Vec;
 
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
+use libkern::scrub;
 use libkern::syscall::{
     SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_NOTIF_RECV,
     SYS_NS_DERIVE, SYS_WAIT, syscall1, syscall2, syscall4, syscall5,
@@ -125,9 +129,12 @@ fn recv(ch: u64) -> Result<Option<Msg>, ()> {
         close(h);
     }
     let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    Ok(librsproto::decode(&buf[24..24 + len.min(IPC_PAYLOAD_SIZE)])
+    let msg = librsproto::decode(&buf[24..24 + len.min(IPC_PAYLOAD_SIZE)])
         .ok()
-        .map(|m| (m.op, m.request_id, m.is_error(), m.body.to_vec())))
+        .map(|m| (m.op, m.request_id, m.is_error(), m.body.to_vec()));
+    // A line read at the password prompt came through here; the caller has its copy.
+    scrub(&mut buf);
+    Ok(msg)
 }
 
 /// Send `op` on `ch`, moving `handles`.
@@ -140,7 +147,7 @@ fn send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool
     buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
     buf[8] = handles.len() as u8;
     // SAFETY: valid message buffer and handle array.
-    unsafe {
+    let sent = unsafe {
         syscall5(
             SYS_CHANNEL_SEND,
             ch,
@@ -149,7 +156,10 @@ fn send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool
             handles.len() as u64,
             SENDMODE_NOBLOCK,
         ) == 0
-    }
+    };
+    // So did the password on its way to the broker.
+    scrub(&mut buf);
+    sent
 }
 
 /// Send `op` and wait for the reply to it, as `(is_error, body)`.
@@ -203,7 +213,11 @@ fn ask_password(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
     let _ = tty(term, OP_TTY_WRITE, b"\r\n", &mut interrupted);
     match line {
         Some((false, bytes)) if !interrupted => Some(bytes),
-        _ => None,
+        Some((_, mut bytes)) => {
+            scrub(&mut bytes);
+            None
+        }
+        None => None,
     }
 }
 
@@ -388,12 +402,14 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
             prompt.push_str("\r\n");
         }
         prompt.push_str(&alloc::format!("[with {view}] password ({tries} of {TRIES}): "));
-        let Some(pw) = ask_password(term, prompt.as_bytes()) else {
+        let Some(mut pw) = ask_password(term, prompt.as_bytes()) else {
             // Nobody answered. Closing the channel is the broker's cue to drop the request.
             stage.die(b"with: cancelled\n", EXIT_FAILURE);
         };
         rid += 1;
-        (o, why) = match call(ch, OP_VIEWS_PASSWORD, rid, &pw, &[]) {
+        let answer = call(ch, OP_VIEWS_PASSWORD, rid, &pw, &[]);
+        scrub(&mut pw);
+        (o, why) = match answer {
             Some((false, body)) => outcome(&body),
             _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
         };

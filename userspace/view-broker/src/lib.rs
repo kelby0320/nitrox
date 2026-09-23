@@ -10,6 +10,7 @@
 //! - [`pacing`] — the delay after a wrong password, held per *session*, so a program that opens
 //!   several requests at once still guesses at one per delay;
 //! - [`sessions`] — which sessions are open, for whom, under ids that are never reused;
+//! - [`slots`] — room in the one wait set, counted so a client let in can always start;
 //! - [`suffix`] — what a forwarded resolve asked for, which is where a client's identity comes
 //!   from.
 //!
@@ -247,7 +248,9 @@ pub mod policy {
 
     enum Section {
         None,
-        Profile(usize),
+        /// A profile, by index, and whether its `grants` has been given — which its grants
+        /// cannot say, since `grants = []` gives none.
+        Profile(usize, bool),
         Rule(PartialRule),
     }
 
@@ -291,7 +294,7 @@ pub mod policy {
                     return Err(err(line, format!("profile `{name}` is defined twice")));
                 }
                 policy.profiles.push(Profile { name: name.to_string(), grants: Vec::new() });
-                section = Section::Profile(policy.profiles.len() - 1);
+                section = Section::Profile(policy.profiles.len() - 1, false);
                 continue;
             }
             if l.starts_with('[') {
@@ -306,14 +309,14 @@ pub mod policy {
                 Section::None => {
                     return Err(err(line, format!("`{key}` is outside any profile or rule")));
                 }
-                Section::Profile(p) => {
+                Section::Profile(p, given) => {
                     if key != "grants" {
                         return Err(err(line, format!("a profile has `grants`, not `{key}`")));
                     }
-                    let profile = &mut policy.profiles[*p];
-                    if !profile.grants.is_empty() {
+                    if core::mem::replace(given, true) {
                         return Err(err(line, String::from("`grants` is given twice")));
                     }
+                    let profile = &mut policy.profiles[*p];
                     for g in list(value, key, line)? {
                         let grant = Grant::from_name(&g).ok_or_else(|| {
                             let known: Vec<&str> = KNOWN_GRANTS.iter().map(|g| g.name()).collect();
@@ -474,8 +477,11 @@ pub mod pacing {
     //! would let one program's wrong guesses lock its person out of `with` until they logged out.
     //!
     //! **A deadline, never a sleep.** The broker is one thread serving every session and the
-    //! supervisors' logins; it holds a check until [`Pacing::check_at`] and waits on its other
-    //! channels meanwhile.
+    //! supervisors' logins; it keeps a check in [`Held`] until its session's
+    //! [`Pacing::check_at`] and waits on its other channels meanwhile.
+
+    use crate::sessions::Sessions;
+    use alloc::vec::Vec;
 
     /// How long after a wrong password the session's next check waits: two seconds, the login
     /// prompt's pause.
@@ -500,6 +506,61 @@ pub mod pacing {
         /// A check failed at `now`: hold the session's next one.
         pub fn failed(&mut self, now: u64) {
             self.not_before = now.saturating_add(FAIL_DELAY_NS);
+        }
+    }
+
+    /// Passwords waiting to be checked, across every session, oldest first — each named by a
+    /// key the broker chooses (its client's channel) and the session it arrived in.
+    ///
+    /// **A held check has no deadline of its own.** When one may run is asked of its session
+    /// each time, so a failure on any request holds every check still waiting in that session —
+    /// including those that arrived before it, whose delay had seemed to end sooner. A deadline
+    /// fixed when a password arrived would let a program queue a password on each of several
+    /// requests during one delay and have them all checked the moment it ended.
+    #[derive(Debug, Default)]
+    pub struct Held {
+        waiting: Vec<(u64, u64)>,
+    }
+
+    impl Held {
+        /// Hold a check for `key`, in `session`, behind every one already held.
+        pub fn hold(&mut self, key: u64, session: u64) {
+            self.waiting.push((key, session));
+        }
+
+        /// Drop `key`'s check, if one is held: its request ended some other way.
+        pub fn forget(&mut self, key: u64) {
+            self.waiting.retain(|&(k, _)| k != key);
+        }
+
+        /// The oldest held check its session lets run at `now`, taken out. A check whose session
+        /// has closed is dropped on the way. **Take one, make the check, and ask again** — the
+        /// check's failure is what holds the next.
+        pub fn take_ready(&mut self, sessions: &Sessions, now: u64) -> Option<u64> {
+            let mut i = 0;
+            while i < self.waiting.len() {
+                let (key, session) = self.waiting[i];
+                match sessions.get(session) {
+                    None => {
+                        self.waiting.remove(i);
+                    }
+                    Some(s) if s.pacing.check_at(now) <= now => {
+                        self.waiting.remove(i);
+                        return Some(key);
+                    }
+                    Some(_) => i += 1,
+                }
+            }
+            None
+        }
+
+        /// The soonest a held check may run, if any is held: when to wake.
+        pub fn next_due(&self, sessions: &Sessions, now: u64) -> Option<u64> {
+            self.waiting
+                .iter()
+                .filter_map(|&(_, session)| sessions.get(session))
+                .map(|s| s.pacing.check_at(now))
+                .min()
         }
     }
 }
@@ -569,13 +630,56 @@ pub mod sessions {
     }
 }
 
+pub mod slots {
+    //! Room in the broker's one wait set, which holds at most `MAX_WAIT_HANDLES` handles.
+    //!
+    //! **A client is two slots from the moment it is let in**: its channel, and the life channel
+    //! of the program it may start. Counting only what is open would admit a channel into the
+    //! last slot and leave its program's life channel nowhere to go — and a life channel the
+    //! broker does not wait on is an exit it never sees, whose code is then paired with some other
+    //! program's.
+
+    /// The forwarding endpoint and the notification channel.
+    pub const FIXED: usize = 2;
+
+    /// What the wait set holds, by how many slots each may come to need.
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Load {
+        /// Supervisors' channels: one slot each.
+        pub supervisors: usize,
+        /// Clients that may yet start a program, or are running one: two slots each.
+        pub clients: usize,
+        /// Handles that stay one slot: a client whose request is over, or a running program
+        /// whose client has gone.
+        pub singles: usize,
+    }
+
+    impl Load {
+        /// The most slots this load can come to need.
+        pub fn worst(&self) -> usize {
+            FIXED + self.supervisors + 2 * self.clients + self.singles
+        }
+
+        /// Whether another supervisor's channel fits in `max`.
+        pub fn admits_supervisor(&self, max: usize) -> bool {
+            self.worst() + 1 <= max
+        }
+
+        /// Whether another client fits in `max` — with room for the program it may start.
+        pub fn admits_client(&self, max: usize) -> bool {
+            self.worst() + 2 <= max
+        }
+    }
+}
+
 pub mod suffix {
     //! What a resolve that reached the broker asked for.
     //!
     //! **This is where identity comes from.** A session's `/dev/views` is the broker's forwarding
     //! endpoint bound with the base `/s/<session>`, so a resolve from inside it arrives with the
-    //! suffix `s/<session>` — and nothing inside the session can change the base. A supervisor,
-    //! holding the unscoped `/svc/views`, resolves `session`.
+    //! suffix `s/<session>` — and no program in the session can change the base, except
+    //! `desktop-shell`, which holds the raw endpoint to bind it into its applications. A
+    //! supervisor, holding the unscoped `/svc/views`, resolves `session`.
 
     /// A forwarded suffix, classified.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -613,9 +717,10 @@ pub mod suffix {
 
 #[cfg(test)]
 mod tests {
-    use super::pacing::{FAIL_DELAY_NS, Pacing};
+    use super::pacing::{FAIL_DELAY_NS, Held, Pacing};
     use super::policy::*;
     use super::sessions::Sessions;
+    use super::slots::{FIXED, Load};
     use super::suffix::{self, Suffix};
 
     const SEED: &str = r#"
@@ -650,6 +755,9 @@ auth = "password"
         assert_eq!(p.rules[1].line, 15, "a rule remembers its header's line");
     }
 
+    /// **Two rules that both match, with different `auth`, in both orders** — the only fixture
+    /// that tells the first match from the last. Were the last to decide, the broad passwordless
+    /// rule below would let alice skip her password for `nxinstall` (PR #329 review, finding 2).
     #[test]
     fn a_request_is_decided_by_the_first_rule_that_matches_all_three() {
         let p = parse(SEED).unwrap();
@@ -658,6 +766,20 @@ auth = "password"
             Decision::Allow { auth: Auth::Password, rule_line: 9, .. }
         ));
         assert!(matches!(p.decide("bob", "install", "nxinstall"), Decision::Allow { .. }));
+        let strict = "[[rule]]\nwho = [\"alice\"]\nuse = [\"admin\"]\nrun = [\"*\"]\n\
+                      auth = \"password\"\n";
+        let lax = "[[rule]]\nwho = [\"*\"]\nuse = [\"admin\"]\nrun = [\"nxinstall\"]\n\
+                   auth = \"none\"\n";
+        let profile = "[profile.admin]\ngrants = [\"disks\"]\n";
+        let decide = |first: &str, second: &str| {
+            let p = parse(&format!("{profile}{first}{second}")).unwrap();
+            match p.decide("alice", "admin", "nxinstall") {
+                Decision::Allow { auth, rule_line, .. } => (auth, rule_line),
+                d => panic!("{d:?}"),
+            }
+        };
+        assert_eq!(decide(strict, lax), (Auth::Password, 3), "the strict rule is first");
+        assert_eq!(decide(lax, strict), (Auth::None, 3), "the lax rule is first");
     }
 
     #[test]
@@ -690,6 +812,9 @@ auth = "password"
         bad("[[rule]]\nwho = [\"*\", \"a\"]\n", 2, "already means everyone");
         bad("grants = [\"disks\"]\n", 1, "outside any profile");
         bad("[profile.a]\n[profile.a]\n", 2, "defined twice");
+        bad("[profile.a]\ngrants = [\"disks\"]\ngrants = [\"disks\"]\n", 3, "given twice");
+        bad("[profile.a]\ngrants = []\ngrants = [\"disks\"]\n", 3, "given twice");
+        bad("[[rule]]\nwho = [\"a\"]\nwho = [\"b\"]\n", 3, "given twice");
         bad("[profiles.a]\n", 1, "not a section");
         bad("[profile.a]\ngrants = [\"disks\"\n", 2, "close on the same line");
     }
@@ -753,6 +878,59 @@ auth = "password"
         assert_eq!(Pacing::default().check_at(0), 0);
     }
 
+    /// **One guess per delay, however many requests.** Passwords queued on several requests
+    /// during one delay are checked one per delay, not all at its end — a failure holds the checks that arrived before
+    /// it as well as after.
+    #[test]
+    fn held_checks_in_a_session_run_one_per_delay_however_many_are_queued() {
+        let mut s = Sessions::new();
+        let a = s.open("alice");
+        let b = s.open("bob");
+        let mut held = Held::default();
+        let t0 = 1_000;
+        // One request in `a` fails at t0; during the delay, three more queue a password each, and
+        // one in `b` does.
+        s.get_mut(a).unwrap().pacing.failed(t0);
+        for key in [1, 2, 3] {
+            held.hold(key, a);
+        }
+        held.hold(9, b);
+        let half = t0 + FAIL_DELAY_NS / 2;
+        assert_eq!(held.take_ready(&s, half), Some(9), "another session is not held");
+        assert_eq!(held.take_ready(&s, half), None);
+        assert_eq!(held.next_due(&s, half), Some(t0 + FAIL_DELAY_NS));
+        // The delay ends: the oldest runs, and fails.
+        let t1 = t0 + FAIL_DELAY_NS;
+        assert_eq!(held.take_ready(&s, t1), Some(1));
+        s.get_mut(a).unwrap().pacing.failed(t1);
+        // The other two arrived before that failure and wait for it all the same.
+        assert_eq!(held.take_ready(&s, t1), None, "a second guess in the same delay");
+        assert_eq!(held.next_due(&s, t1), Some(t1 + FAIL_DELAY_NS));
+        let t2 = t1 + FAIL_DELAY_NS;
+        assert_eq!(held.take_ready(&s, t2), Some(2));
+        // A success holds nothing, so the next may run at once.
+        assert_eq!(held.take_ready(&s, t2), Some(3));
+        assert_eq!(held.next_due(&s, t2), None);
+    }
+
+    #[test]
+    fn a_held_check_goes_with_its_request_or_its_session() {
+        let mut s = Sessions::new();
+        let a = s.open("alice");
+        let b = s.open("bob");
+        let mut held = Held::default();
+        held.hold(1, a);
+        held.hold(2, b);
+        held.hold(3, b);
+        held.forget(2);
+        assert_eq!(held.take_ready(&s, 5), Some(1));
+        assert_eq!(held.take_ready(&s, 5), Some(3), "a forgotten check is not taken");
+        held.hold(4, a);
+        s.close(a);
+        assert_eq!(held.next_due(&s, 5), None, "a closed session's check is no reason to wake");
+        assert_eq!(held.take_ready(&s, 5), None);
+    }
+
     #[test]
     fn session_ids_are_never_reused() {
         let mut s = Sessions::new();
@@ -762,6 +940,35 @@ auth = "password"
         let b = s.open("alice");
         assert_ne!(a, b, "the next login got the old id");
         assert!(a != 0 && b != 0, "zero never names a session");
+    }
+
+    /// **At the neighbour.** With two slots free a client is let in and with one it is not;
+    /// either way, every client admitted can start its program without the wait set outgrowing
+    /// `max`.
+    #[test]
+    fn a_client_is_admitted_only_with_room_for_its_program_too() {
+        const MAX: usize = 32;
+        let mut load = Load::default();
+        while load.admits_client(MAX) {
+            load.clients += 1;
+        }
+        assert_eq!(load.clients, 15, "(32 - 2) / 2");
+        // Every one of them starts a program: channel and life channel each.
+        let running = FIXED + 2 * load.clients;
+        assert!(running <= MAX, "{running} handles in a {MAX}-slot wait set");
+        // Exactly two slots free: one more client fits.
+        let two = Load { clients: 14, ..Load::default() };
+        assert_eq!(two.worst(), MAX - 2);
+        assert!(two.admits_client(MAX));
+        // One free: a supervisor fits, and half a client does not.
+        let one = Load { singles: 1, ..two };
+        assert_eq!(one.worst(), MAX - 1);
+        assert!(!one.admits_client(MAX), "its program's life channel would have no slot");
+        assert!(one.admits_supervisor(MAX));
+        // None free: nothing fits.
+        let none = Load { supervisors: 1, ..one };
+        assert!(!none.admits_supervisor(MAX));
+        assert!(!none.admits_client(MAX));
     }
 
     #[test]

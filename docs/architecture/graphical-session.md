@@ -228,6 +228,11 @@ to a namespace that already exists rather than composing one from endpoints. Wha
 reaches is set out in [`administration.md`](../planning/administration.md) § *Why one broker*: the
 raw disks, and whatever the domain services will do on request.
 
+**The shell holds the broker's raw endpoint**, to bind `/dev/views` into each application at the
+session's base, and with `BIND_NAMESPACE` it could bind any base — so the graphical session's
+identity with the broker rests on the shell, where no program in a serial session can choose its
+base at all. That trusts it with nothing new: it already holds the whole-tree filesystem endpoint.
+
 ## 4. The session recipe, and what the two supervisors share
 
 Both supervisors run the same five steps. Only the first and last differ.

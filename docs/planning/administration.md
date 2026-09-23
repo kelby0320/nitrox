@@ -258,6 +258,14 @@ request. It is the most trusted process in userspace after `init`, and should be
   delay after each failure held for the whole session, a cap per request, and every failure in the
   log. Any program in a session
   can call `/dev/views` in a loop, and this is what stops it becoming a password-guessing service.
+- **What the prompt does not stop: a program on the same backend reading the password.** Every
+  stage holds a sibling terminal, and input goes to the *oldest* terminal on the backend with a
+  read pending (`tty-server`'s routing). So a program that keeps a read pending — a stage's child
+  that outlived its pipeline, or an earlier stage of the same pipeline — receives the line typed at
+  `with`'s prompt, password included. Pacing does nothing here: this is not a guess. `sudo` has the
+  same limit, since anything holding the tty can read it. **Accepted for Part A and recorded**
+  (PR #329 review); the remedy is a prompt nothing in the session can read, which is what the
+  graphical design below is.
 - **Graphical — designed here, built when needed.** A UAC-style window asking for permission. What
   makes it more than a dialog is that **only the broker can open it**, and the compositor draws it in
   a way no application can imitate — the desktop dimmed behind it, as Windows does. **Trigger:** the
@@ -500,7 +508,8 @@ closes the phase**.
   path its channel was resolved through (`/log/system/<name>`), and `desktop-shell` confines an
   application to `/dev/draw/new` with a narrow bind. So `/dev/views` needs no endpoint minted per
   session. One forwarding endpoint, bound into each session with a **subtree base naming that
-  session**, reaches the broker with a suffix the session cannot choose.
+  session**, reaches the broker with a suffix no program in the session can choose — the
+  graphical leader excepted, above.
 - **`init` binds what services cannot.** A service `service-mgr` starts inherits a `LOOKUP`-only
   root, which is why `init` spawns `auth-service` and binds it at `/svc/auth`. The broker has the
   same need and gets the same treatment, with the same boundary: anything holding the root
@@ -571,8 +580,11 @@ closes the phase**.
   view, because a caller can prune its copy.** `sys_ns_unbind` needs only the `UNBIND` right, which
   a derived namespace carries. So a caller can remove `/bin` from the copy it sends, and a name
   would then resolve through any shorter binding that covers it. Today's namespaces have none, but
-  the image must not depend on that. Pruning otherwise only narrows what the program sees. Its own
-  later lookups happen in the view, as they would without `with`.
+  the image must not depend on that. Pruning elsewhere can widen what the program sees the same way,
+  to whatever part of a broader binding a narrower one covered — which is why no namespace may
+  rely on covering to hide anything
+  ([`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md)). The
+  program's own later lookups happen in the view, as they would without `with`.
 - **The delay after a failure is per session; the cap is per request.** A failure holds that
   session's *next* password check until the delay has passed, on whichever request it arrives.
   Otherwise a program could open several requests at once and guess on each in parallel. A request

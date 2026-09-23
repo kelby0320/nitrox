@@ -312,11 +312,14 @@ fn sys_ns_derive(ns: RawHandle) -> isize
 Creates a new `Namespace` holding **a copy of every binding in `ns`** — each path, target,
 subtree base and rights value — and returns a handle to it with the same full rights
 `sys_ns_create` gives. Requires `LOOKUP` on `ns`: every binding in the copy is one the caller
-could already resolve, and the rights on the result add only what `sys_ns_create` hands anyone
-(binding still needs `BIND_NAMESPACE`, unbinding only narrows). A process's own root arrives
-`LOOKUP`-only and cannot be transferred; deriving a copy is how it hands its namespace to
-someone. **A snapshot**: targets are shared, so both resolve the same paths to the same
-resources, but a later bind or unbind in either does not reach the other. Returns
+could already resolve, and binding into the result still needs `BIND_NAMESPACE`. **Unbinding in
+it does not only narrow**: resolution is longest-prefix, so removing a narrower binding exposes
+the broader one beneath it, and a copy can reach through `/` what the source's `/home` confined.
+A namespace must therefore never rely on a narrower binding to hide part of a broader one —
+[`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md) states
+the rule. A process's own root arrives `LOOKUP`-only and cannot be transferred; deriving a copy
+is how it hands its namespace to someone. **A snapshot**: targets are shared, so both resolve the
+same paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
 `OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
 broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
 

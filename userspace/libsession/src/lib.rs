@@ -155,9 +155,11 @@ pub struct NamespaceSpec<'a> {
     /// the broker did not start, whose sessions simply have no `with`.
     ///
     /// **The base is the session's identity** (administration Part A): the broker learns which
-    /// session a request comes from by the suffix a resolve reaches it with, and nothing inside
-    /// the session can choose another base. The endpoint rather than the session's binding of it,
-    /// for `/dev/tty`'s reason — a binding resolves to a registration, never back to an endpoint.
+    /// session a request comes from by the suffix a resolve reaches it with, and no program in the
+    /// session can choose another base — except `desktop-shell`, which is handed this endpoint to
+    /// bind into its applications (`graphical-session.md` §3). The endpoint rather than the
+    /// session's binding of it, for `/dev/tty`'s reason — a binding resolves to a registration,
+    /// never back to an endpoint.
     pub views_endpoint: u64,
     /// `/s/<session>`, from [`views_open_session`]. Empty binds nothing.
     pub views_base: &'a [u8],
@@ -170,10 +172,17 @@ pub struct NamespaceSpec<'a> {
 pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
     // Build the request body, then wrap it in the rsproto envelope at the payload offset.
     let mut body = [0u8; 512];
-    let body_len = build_authenticate_request(&mut body, user, pass)?;
+    let body_len = build_authenticate_request(&mut body, user, pass);
     // SAFETY: SEND_MSG is a valid 4 KiB buffer; the envelope goes at offset 24.
-    let rs_len = unsafe {
-        encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..body_len], 0)?
+    let rs_len = body_len.and_then(|n| unsafe {
+        encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0)
+    });
+    // **Both copies of the password go as soon as it is sent**, sent or not: `body` is this
+    // frame's, and `SEND_MSG` is the crate's and outlives it — every later message here restamps
+    // only as much as it needs. A supervisor and the view broker both live as long as the machine.
+    let Some(rs_len) = rs_len else {
+        scrub(&mut body);
+        return None;
     };
     // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8 = 0) and send.
     let sr = unsafe {
@@ -188,6 +197,9 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
             SENDMODE_NOBLOCK,
         )
     };
+    scrub(&mut body);
+    // SAFETY: the crate's buffer; the kernel copied the message during the send.
+    unsafe { scrub(&mut *(&raw mut SEND_MSG)) };
     if sr != 0 {
         return None;
     }
@@ -1135,13 +1147,12 @@ pub fn spawn_leader(
         {
             // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
             let r = unsafe {
-                // **Scrub the payload first.** This buffer is the crate's, and `authenticate`
-                // filled it with an `Authenticate` request — the username and password in the
-                // clear. Restamping only the header would send all `MSG_LEN` bytes anyway, so
-                // the leader would receive the login password and hold it in `.bss` for the life
-                // of the process. `desktop-session-mgr` volatile-zeroes its own stack copy two
-                // lines from here; handing the same bytes to a child instead would make that
-                // pointless (PR #237 review, finding 1).
+                // **Scrub the payload first.** This buffer is the crate's, and holds whatever
+                // was sent last — once, an `Authenticate` request, the username and password in
+                // the clear, which `authenticate` now scrubs itself. Restamping only the header
+                // would send all `MSG_LEN` bytes anyway, so the leader would receive whatever was
+                // there and hold it in `.bss` for the life of the process (PR #237 review,
+                // finding 1).
                 SEND_MSG[PAYLOAD_OFF..].fill(0);
                 SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
                 SEND_MSG[8] = count as u8;

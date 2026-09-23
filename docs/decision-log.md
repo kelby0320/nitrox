@@ -27998,10 +27998,14 @@ a direct handle's object and a registration each gain a reference, a kernel serv
 — and keeps each subtree base and rights value. The resolution cache is not copied.
 
 **`LOOKUP` is the whole requirement**, and the doc comment says why rather than leaving it to be
-rediscovered: every binding in the copy is one the caller could already resolve, binding into it
-still needs `BIND_NAMESPACE`, and unbinding only narrows. What the full rights add that matters is
-`TRANSFER` — a process's own root arrives `LOOKUP`-only, so a copy is how it hands its namespace to
-the broker.
+rediscovered: every binding in the copy is one the caller could already resolve, and binding into
+it still needs `BIND_NAMESPACE`. What the full rights add that matters is `TRANSFER` — a process's
+own root arrives `LOOKUP`-only, so a copy is how it hands its namespace to the broker — and
+`UNBIND`, which **can widen**: resolution is longest-prefix, so removing a narrower binding
+exposes the broader one beneath it. Any holder of a namespace can now derive one and unbind in it,
+so no namespace may rely on a narrower binding to hide part of a broader one; none built to
+confine does (`namespace-and-resource-servers.md` states the rule, and a kernel test pins the
+behaviour). This entry first said unbinding only narrows; PR #329's review found that false.
 
 **The lock discipline is the module's.** Targets are cloned under the source's lock, into a list
 that outlives the guard, so a failed allocation part-way drops what was cloned only after the lock
@@ -28198,3 +28202,75 @@ splits an em dash across two reads, and the old decoding fails it.
 - an audit record per request.
 
 `with --edit` and the other grants belong to later parts.
+
+## 2026-09-23 — Part A, reviewed: a deadline fixed too early, and unbinding that widens
+
+PR #329's review found three blocking problems, two worth fixing and four smaller ones. All are
+fixed, each with a test that fails against the old code. A new boot-probe step also found a
+seventh problem, which the review had not.
+
+**Passwords queued on several requests got one guess each per delay.** A held password's deadline
+was fixed when it arrived. A failure on one request moved the session's delay, but not the
+deadlines already queued, so a program could open N requests, fail once, queue a password on each
+of the others, and have all N−1 checked back to back when the delay ended. The queue is now
+`view_broker::pacing::Held`, where a held check has no deadline of its own. Whether it may run is
+asked of its session each time, and the broker takes one, checks it, and asks again. A host test
+holds three checks in one session and one in another, and a mutation that caches each deadline
+fails it. The boot probe now races two held passwords and needs their answers a delay apart. A
+broker that takes every ready check before making any fails it with "held answers after 2029 ms
+and 18 ms", which is the review's scenario reproduced.
+
+**The first-match test could not tell first from last.** No fixture had two rules matching one
+request. One now has two, with different `auth`, in both orders. A `decide` that returns the last
+match fails it; before, it passed every test.
+
+**Unbinding does not only narrow.** Resolution is longest-prefix, so removing a narrower binding
+exposes the broader one beneath it. `sys_ns_derive` gives every process a namespace it may unbind
+in, so the argument this PR made for why a copy needs only `LOOKUP` was false in four places: the
+syscall spec, `namespace-and-resource-servers.md`, `sys_ns_derive`'s doc comment and the A.1 entry
+above. The A.1 entry is still unmerged, so it was corrected in place. The architecture doc now
+states the rule: **a narrower binding must never be what hides part of a broader one.** A kernel
+test pins the behaviour. No namespace built to confine depends on covering: not a session's, an
+application's, or a view's. #328's review had already named the same fall-through for `/bin`.
+That fix was made at its site, and its class was never swept.
+
+**Handles sent with `Stop`, `List` or `Check` were kept for good.** They are now closed before
+dispatch, for every op but `Request`, rather than by each arm. A stray message on a life channel
+now has its handles closed too. The probe sends one end of a new channel with each op and needs
+the other end to see `PeerClosed`. Keeping them fails it on `Stop`.
+
+**A full broker could push its wait set past 32.** Admission counted open channels, so a channel
+admitted into the last slot left its program's life channel with none. That program's exit was
+never heard, and its code was later paired with another program's. The count is now
+`view_broker::slots::Load`, where a client is two slots from the moment it is admitted. A host
+test checks the neighbouring cases: a client fits with two slots free and not with one. The probe
+fills the broker until it refuses a client, then starts a program on the last client admitted.
+Under the old admission, 27 clients get in and that exit is never heard.
+
+**Found by that probe step: every error the broker returned on its forwarding endpoint was
+malformed.** It sent a 4-byte body. The kernel reads anything shorter than a 12-byte `ErrorBody` as
+malformed and hands the caller `KernelError`, so a full broker's `WouldBlock` and a closed session's
+`NotFound` both arrived as -255. The probe's closed-session check had asked only for "not success",
+which -255 satisfies. It now asks for `NotFound`. The broker builds its errors with
+`librsproto::error::error_body`, as every other server does.
+
+**The four smaller findings:**
+
+- **Identity wording.** "Nothing in the session can change the base" overclaimed at five sites.
+  `desktop-shell` holds the raw endpoint and `BIND_NAMESPACE` so it can bind `/dev/views` into
+  applications, so it could bind any base. Each site now names that exception, and
+  `graphical-session.md` §3 states it.
+- **A reader on the same backend gets the password.** Input goes to the oldest terminal on the
+  backend with a read pending. So a program still reading one receives the line typed at `with`'s
+  prompt: a stage's child left behind, or, more cheaply than the review's case, an earlier stage of
+  the same pipeline. This is accepted and recorded in the plan's prompt section and in `with`'s
+  doc; `sudo` has the same limit.
+- **Scrubbing.** `libkern::scrub` zeroes with volatile stores, so the optimiser cannot delete it.
+  `libsession::authenticate` now scrubs its own request, both the stack body and the crate's send
+  buffer, straight after sending. That covers every caller, not only the broker. The broker also
+  scrubs its receive buffer and each password once it is checked, and `with` its buffers and
+  password.
+- **`grants` given twice** is now caught when the first is `[]`. The parser records that the key
+  was given rather than inferring it from a non-empty list, and tests cover both forms.
+
+`test-qemu` is about four seconds longer, for the two paced delays.

@@ -33,9 +33,10 @@ use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
-use view_broker::pacing::MAX_FAILURES;
+use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
 use view_broker::sessions::Sessions;
+use view_broker::slots::Load;
 use view_broker::suffix::{self, Suffix};
 
 #[global_allocator]
@@ -110,9 +111,9 @@ struct Pending {
     grants: Vec<Grant>,
     handles: Handles,
     failures: u8,
-    /// A password that arrived while the session's delay was still running: when it may be
-    /// checked, the `Password` request to answer, and the password.
-    queued: Option<(u64, u64, Vec<u8>)>,
+    /// A password waiting in [`Broker::held`] to be checked: the `Password` request to answer,
+    /// and the password.
+    queued: Option<(u64, Vec<u8>)>,
 }
 
 enum State {
@@ -136,6 +137,9 @@ struct Broker {
     supervisors: Vec<u64>,
     clients: Vec<Client>,
     sessions: Sessions,
+    /// Passwords waiting to be checked, by client channel — see [`Held`] for why none of them
+    /// carries a deadline of its own.
+    held: Held,
     /// Exit codes from `ChildExited`, in arrival order, and programs whose life channel closed
     /// before their code came. Paired first-to-first — see [`Broker::pair_exits`].
     codes: VecDeque<(i32, bool)>,
@@ -166,8 +170,14 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
     }
 }
 
+/// An error reply: an `ErrorBody`, as every server sends one. **Its whole twelve bytes** — the
+/// kernel reads a shorter one on a forwarded resolve as malformed and hands the caller
+/// `KernelError`, which is how a full broker's `WouldBlock` and a closed session's `NotFound`
+/// once arrived (found by `boot-probe`'s full-broker step).
 fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
-    let _ = send(ch, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &err.as_i32().to_le_bytes(), &[]);
+    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
+    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
+    let _ = send(ch, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
 }
 
 fn reply_outcome(ch: u64, op: u16, request_id: u64, outcome: Outcome, reason: &str) {
@@ -266,8 +276,11 @@ impl Broker {
                 return;
             }
         };
-        // Every channel is a slot in the one wait set this process has.
-        if self.wait_count() >= MAX_WAIT_HANDLES {
+        // Every channel is a slot in the one wait set this process has, and a client's program
+        // will need a second.
+        let load = self.load();
+        let fits = if session.is_none() { load.admits_supervisor(MAX_WAIT_HANDLES) } else { load.admits_client(MAX_WAIT_HANDLES) };
+        if !fits {
             reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock);
             return;
         }
@@ -345,6 +358,12 @@ impl Broker {
                 }
                 State::Password(p) => {
                     p.handles.close();
+                    self.held.forget(c.ch);
+                    if let Some((request_id, mut pw)) = p.queued.take() {
+                        scrub(&mut pw);
+                        let why = "this session has ended";
+                        reply_outcome(c.ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, why);
+                    }
                     c.state = State::Done;
                 }
                 _ => {}
@@ -354,29 +373,38 @@ impl Broker {
     }
 
     /// A client's channel: requests, passwords, stops, listings and checks.
-    fn serve_client(&mut self, i: usize, now: u64) {
+    fn serve_client(&mut self, i: usize) {
         let ch = self.clients[i].ch;
-        let (op, request_id, body) = match recv(ch) {
+        let (op, request_id, mut body) = match recv(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => return self.client_gone(i),
         };
-        let handles = received();
+        if op == OP_VIEWS_PASSWORD {
+            // The password now lives only in `body`, until it has been checked.
+            // SAFETY: our receive buffer; single-threaded, and the message was copied out.
+            unsafe { scrub(&mut *(&raw mut RECV_MSG)) };
+        }
+        // **Only a request carries handles.** Whatever came with anything else is closed here,
+        // once, rather than by each arm — an arm that forgot would keep them for good, and any
+        // program in any session can send them.
+        let mut handles = received();
+        if op != OP_VIEWS_REQUEST {
+            for h in handles.drain(..) {
+                close(h);
+            }
+        }
         let session = self.clients[i].session;
         let Some(principal) = self.principal(session) else {
             for h in handles {
                 close(h);
             }
+            scrub(&mut body);
             return reply_outcome(ch, op, request_id, Outcome::Denied { retry: false }, "this session has ended");
         };
         match op {
-            OP_VIEWS_REQUEST => self.request(i, request_id, &body, handles, &principal, now),
-            OP_VIEWS_PASSWORD => {
-                for h in handles {
-                    close(h);
-                }
-                self.password(i, request_id, body, now);
-            }
+            OP_VIEWS_REQUEST => self.request(i, request_id, &body, handles, &principal),
+            OP_VIEWS_PASSWORD => self.password(i, request_id, body),
             OP_VIEWS_STOP => {
                 if let State::Running { process, .. } = &self.clients[i].state {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
@@ -395,12 +423,7 @@ impl Broker {
                     Err(e) => reply_outcome(ch, op, request_id, Outcome::Denied { retry: false }, &e),
                 }
             }
-            _ => {
-                for h in handles {
-                    close(h);
-                }
-                reply_error(ch, op, request_id, KError::Unsupported);
-            }
+            _ => reply_error(ch, op, request_id, KError::Unsupported),
         }
     }
 
@@ -411,7 +434,7 @@ impl Broker {
         policy::parse(text).map_err(|e| alloc::format!("the policy does not read — {e}"))
     }
 
-    fn request(&mut self, i: usize, request_id: u64, body: &[u8], handles: Vec<u64>, principal: &str, now: u64) {
+    fn request(&mut self, i: usize, request_id: u64, body: &[u8], handles: Vec<u64>, principal: &str) {
         let ch = self.clients[i].ch;
         let deny = |handles: Vec<u64>, reason: &str| {
             for h in handles {
@@ -487,33 +510,32 @@ impl Broker {
                 self.clients[i].state = State::Password(pending);
                 reply_outcome(ch, OP_VIEWS_REQUEST, request_id, Outcome::NeedPassword, "");
             }
-            Auth::None => {
-                let _ = now;
-                self.start(i, OP_VIEWS_REQUEST, request_id, pending, principal);
-            }
+            Auth::None => self.start(i, OP_VIEWS_REQUEST, request_id, pending, principal),
         }
     }
 
-    /// A password for a request waiting on one. Checked now, or when the session's delay from
-    /// its last failure has passed — on whichever request that failure was.
-    fn password(&mut self, i: usize, request_id: u64, pw: Vec<u8>, now: u64) {
+    /// A password for a request waiting on one: held, and checked by [`Broker::run_due`] once
+    /// the session's delay from its last failure has passed — on whichever request that failure
+    /// was, and whenever it came.
+    fn password(&mut self, i: usize, request_id: u64, mut pw: Vec<u8>) {
         let ch = self.clients[i].ch;
         let session = self.clients[i].session;
+        let refuse = |pw: &mut Vec<u8>, why: &str| {
+            scrub(pw);
+            reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, why);
+        };
         let State::Password(p) = &mut self.clients[i].state else {
-            return reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, "no request is waiting for a password");
+            return refuse(&mut pw, "no request is waiting for a password");
         };
         if p.queued.is_some() {
-            return reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, "a password is already waiting to be checked");
+            return refuse(&mut pw, "a password is already waiting to be checked");
         }
-        let at = self.sessions.get(session).map_or(now, |s| s.pacing.check_at(now));
-        p.queued = Some((at, request_id, pw));
-        if at <= now {
-            self.check_due(i, now);
-        }
+        p.queued = Some((request_id, pw));
+        self.held.hold(ch, session);
     }
 
-    /// Check a queued password whose time has come.
-    fn check_due(&mut self, i: usize, now: u64) {
+    /// Check client `i`'s held password: its session's delay has passed.
+    fn check(&mut self, i: usize) {
         let ch = self.clients[i].ch;
         let session = self.clients[i].session;
         let Some(principal) = self.principal(session) else {
@@ -522,18 +544,15 @@ impl Broker {
         let State::Password(p) = &mut self.clients[i].state else {
             return;
         };
-        let Some((at, request_id, pw)) = p.queued.take() else {
+        let Some((request_id, mut pw)) = p.queued.take() else {
             return;
         };
-        if at > now {
-            p.queued = Some((at, request_id, pw));
-            return;
-        }
         if self.auth_ch == 0 {
             self.auth_ch = ns_lookup(self.root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
         }
         let mut home = [0u8; 256];
         let ok = self.auth_ch != 0 && libsession::authenticate(self.auth_ch, principal.as_bytes(), &pw, &mut home).is_some();
+        scrub(&mut pw);
         let State::Password(p) = &mut self.clients[i].state else {
             return;
         };
@@ -547,8 +566,10 @@ impl Broker {
         }
         p.failures += 1;
         let failures = p.failures;
+        // From when the check ended, not when the wake that ran it began: the delay is the gap
+        // between one answer and the next check.
         if let Some(s) = self.sessions.get_mut(session) {
-            s.pacing.failed(now);
+            s.pacing.failed(now_ns());
         }
         self.audit(&alloc::format!("view: {what} — wrong password ({failures} of {MAX_FAILURES})"));
         if failures >= MAX_FAILURES {
@@ -685,9 +706,15 @@ impl Broker {
                     state: State::Running { process, life, view_ns, view: String::new(), program: String::new() },
                 });
             }
-            State::Password(mut p) => p.handles.close(),
+            State::Password(mut p) => {
+                p.handles.close();
+                if let Some((_, mut pw)) = p.queued.take() {
+                    scrub(&mut pw);
+                }
+            }
             _ => {}
         }
+        self.held.forget(c.ch);
         close(c.ch);
     }
 
@@ -748,29 +775,32 @@ impl Broker {
         }
     }
 
-    /// Every handle the wait set holds.
-    fn wait_count(&self) -> usize {
-        2 + self.supervisors.len()
-            + self.clients.iter().filter(|c| c.ch != 0).count()
-            + self.clients.iter().filter(|c| matches!(c.state, State::Running { .. })).count()
+    /// What the wait set holds, by the most each may come to need.
+    fn load(&self) -> Load {
+        let (mut clients, mut singles) = (0, 0);
+        for c in &self.clients {
+            // A client whose request is over keeps only its channel; a program whose client has
+            // gone, only its life channel. Anything else may yet hold both.
+            if c.ch == 0 || matches!(c.state, State::Done) {
+                singles += 1;
+            } else {
+                clients += 1;
+            }
+        }
+        Load { supervisors: self.supervisors.len(), clients, singles }
     }
 
-    /// The soonest a queued password may be checked.
+    /// The soonest a held password may be checked.
     fn next_deadline(&self) -> u64 {
-        self.clients
-            .iter()
-            .filter_map(|c| match &c.state {
-                State::Password(p) => p.queued.as_ref().map(|q| q.0),
-                _ => None,
-            })
-            .min()
-            .unwrap_or(u64::MAX)
+        self.held.next_due(&self.sessions, now_ns()).unwrap_or(u64::MAX)
     }
 
-    fn run_due(&mut self, now: u64) {
-        for i in 0..self.clients.len() {
-            if matches!(&self.clients[i].state, State::Password(p) if p.queued.as_ref().is_some_and(|q| q.0 <= now)) {
-                self.check_due(i, now);
+    /// Check every held password its session now allows, **one at a time and asking again after
+    /// each** — a failure holds the rest of its session's.
+    fn run_due(&mut self) {
+        while let Some(ch) = self.held.take_ready(&self.sessions, now_ns()) {
+            if let Some(i) = self.clients.iter().position(|c| c.ch == ch && ch != 0) {
+                self.check(i);
             }
         }
     }
@@ -821,13 +851,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         supervisors: Vec::new(),
         clients: Vec::new(),
         sessions: Sessions::new(),
+        held: Held::default(),
         codes: VecDeque::new(),
         exited: VecDeque::new(),
         log: liblog::open_source(root_ns, b"/log/system/view-broker"),
     };
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots and `wait_count` is kept within it
-        // by `serve_resolve`, which refuses a channel that would not fit.
+        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots, and `serve_resolve` admits a channel
+        // only when the load's worst case — every client running a program — still fits
+        // (`view_broker::slots`). `push` checks the bound all the same.
         let (n, waited) = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -860,7 +892,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             (n, w)
         };
         let _ = n;
-        let now = now_ns();
         if waited > 0 {
             for j in 0..waited as usize {
                 // SAFETY: `waited` records were written; the handle is the first word of each.
@@ -875,16 +906,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 } else if let Some(i) = b.supervisors.iter().position(|&s| s == h) {
                     b.serve_supervisor(i);
                 } else if let Some(i) = b.clients.iter().position(|c| c.ch == h && h != 0) {
-                    b.serve_client(i, now);
+                    b.serve_client(i);
                 } else if b.clients.iter().any(|c| matches!(c.state, State::Running { life, .. } if life == h)) {
-                    // A life channel only ever signals its peer closing.
-                    if let Err(()) = recv(h) {
-                        b.life_closed(h);
+                    // A life channel only ever signals its peer closing. The program holds the other
+                    // end, so anything it sends on it is closed unread.
+                    match recv(h) {
+                        Err(()) => b.life_closed(h),
+                        Ok(Some(_)) => {
+                            for stray in received() {
+                                close(stray);
+                            }
+                        }
+                        Ok(None) => {}
                     }
                 }
             }
         }
-        b.run_due(now);
+        b.run_due();
     }
 }
 
