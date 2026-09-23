@@ -1525,30 +1525,6 @@ interpolation it needs: a `fill` of a picture smaller than the screen draws it a
 **Trigger: a screen larger than the picture a person wants filling it** — the first 2560×1440
 screen with the shipped 1920×1200 picture is one.
 
-**A press whose release never arrives — `TODO(lost-release)`.** Seen once, in CI, on 2026-09-08:
-`check-login --kvm` timed out on the editor's unsaved-buffer question because the click on its
-close button never completed. The compositor logged the press and **no release**.
-
-**What that rules out, and it is most of the field.** It is not `click-not-acted-on`, whose whole
-signature is *both* halves present and the client doing nothing — releases are logged beside
-presses since PR #280 exactly so these two are different sentences. It is not the diagnostic cap:
-a local run of the same gate reaches that click after 133 of the 256 permitted lines. It is not
-ring overflow: no `SYN_DROPPED` anywhere in the run. So an injected release went missing somewhere
-below the compositor — QEMU's injection, the i8042, the driver ring, or `input-server`.
-
-**Rate: one in six KVM runs of that gate** (one CI failure, one CI re-run pass, four local passes),
-on a branch that added a good deal of injected input earlier in the same gate without touching the
-input path. That is consistent with a pre-existing hazard whose odds rise with the number of
-events, which is the shape the tick-driven sweep in `drivers/ps2` already exists to cover.
-
-**The obvious remedy is known-bad and must not be reached for.** Making `click_at` confirm the
-release and re-send a missing one was tried during PR #280 and made the `nxfiles` drag step fail
-deterministically, three runs out of three — trading one red gate for another. Whatever fixes this
-has to be below the gate.
-
-**Trigger: a second occurrence, or any change to the PS/2 or input-server path** — the second is
-listed because that is where the evidence points and where a fix would land anyway.
-
 **Making a new user's folders on first login — `TODO(home-folders)`.** M14 Part D gave `nxfiles`
 a sidebar of common locations, and the folders it points at — Documents, Downloads, Pictures — are
 staged into the demo home by the image build. That is right while there is exactly one home
@@ -2002,6 +1978,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A press whose release never arrives (`lost-release`) | 2026-09-23 | **QEMU held it.** Its PS/2 queue is sixteen bytes, and a packet that will not fit stays in the device's state until the next injected event (`ps2_mouse_send_packet`, the same in 8.2 and 11.0). A gate injects a click's release last and then waits, so after a walk that filled the queue the press went and the release waited for ever. Proven by a guest probe that held the i8042 drain for a 3-step walk and a click: ten releases held of ten, and QEMU's trace showed no button-up packet until the next event. The gates now flush — an event that moves nothing, which can only deliver what was injected — after a click's press receipt and while waiting after any other release (`expect_after_pointer`): ten of ten through the real `click_at`, none without its flush. The entry's reasoning ruled out everything *in* the guest correctly, and said a fix had to be below the gate; the loss was below the guest, in the injector, so the gate — the one thing that knows it has stopped injecting — is where the fix belongs. |
 | An account that can see more than one user's own (`admin-visibility`) | 2026-09-23 | Administration Part A answered the three questions the entry asked. **An administrator is a mode, not a second account**: a *view* — the caller's own namespace plus a profile's grants — that a person reaches with `with`, proved by their own password, when `/system/views.toml` lets them. What such a view may do is what its profile grants (`disks`, first). The symptom the entry opened with — application namespaces omit `/applications` — was never the deferral's to fix: it stands on its own, because nothing in an application reads it, and `desktop-shell` now says so without the tag. |
 | Cross-group inode/block allocation (`fs-server-ext4`) | 2026-09-17 | Both allocators scan every block group — `alloc_block` from the goal's group outward, `alloc_inode` from the first with a free one — clamped to the last group's short tail. The trigger fired exactly as written: `nxinstall` made a root the size of a 931 GiB disk and it held about 112 MiB. Phase 5 Part H.2. |
 | A cache attribute on a mapped device aperture (`framebuffer-cache-attr`) | 2026-09-16 | Phase 5 Part G, and **the entry above was wrong about what it would cost**: it called a write-back mapping of a PCI BAR a *correctness* problem — writes left in cache, reordered — and on the laptop nothing was ever cached, because the firmware's range registers call the graphics aperture uncacheable and the stronger of the two wins. It was a performance problem, and a 45x one: a full screen took 72930 us through a `/dev/framebuffer` mapping against 1368 through the bootloader's mapping of the same pixels. **The bootloader had already asked for write-combining**; this kernel dropped the attribute at the namespace boundary, where `protection_to_page_flags` gave every user mapping no attribute at all. The fix is `mm::Caching` on the `MemoryObject` and the VMA, `PageFlags::WRITE_COMBINING` selecting entry 5 of a table the kernel now programs itself on every CPU (keeping the bootloader's exact values, because two entries were already live in mappings it made), and the framebuffer aperture recording its answer once for the object and the boot's own measurement to read. "A way for the namespace server to set it" was **not** needed and is not built: the aperture the kernel mints is the only device object userspace maps, so the attribute is the object's. A compositor with no shadow buffer now refuses to serve rather than composing into the display, because composing into write-combining memory reads it back. Measured after: 1632 us, 2451 MiB/s. **Two of this part's own instruments lied before they worked** — the measurement built its second mapping with the attribute written into the measurement, and the handout line printed the aperture's value instead of the object's — each caught by a control that should have failed and did not. |

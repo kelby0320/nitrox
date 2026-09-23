@@ -28310,3 +28310,54 @@ shell's `placed dialog` line comes after the compositor has placed the window.
 still types into the parent, as the compositor's comment on `focus_candidate` says. The receipt
 makes the gate wait; making a dialog own the keyboard from the moment it is asked for is still
 that deferral's job.
+
+## 2026-09-23 — Main's red CI: QEMU holds a mouse packet, and an event can precede its greeting
+
+PR #330's review noted that main had gone red three times. None of the three involved a dialog.
+
+**`check-login --kvm`, twice: the `lost-release` deferral's second and third occurrences, and its
+trigger.** Both logged `compositor: press at …` on a bar button with no `release` after it, and
+the shell never answered. The deferral had already ruled out the guest correctly: nothing hit the
+diagnostic cap, there was no `SYN_DROPPED`, and both halves are logged. The cause was one layer
+further down, in QEMU. Its PS/2 queue is sixteen bytes, and `ps2_mouse_send_packet` returns
+without queuing a packet that will not fit, leaving the buttons and motion in the device's state
+until the next sync. Only an injected event causes a sync. I read this in QEMU 11.0.2's source
+and checked that 8.2, which CI runs, is the same. `click_at` walks, presses and releases back to
+back, and then waits. After a walk that filled the queue, the press went and the release waited
+for ever.
+
+**Proven before fixed.** Neither a slower guest nor a KVM guest pinned to one host CPU lost a
+release in 60 clicks. The window is narrow: the queue needs room for exactly the press. So the
+state was built on purpose. A kernel probe stopped the i8042 drain for 300 ms after F9, and inside
+that window the host sent a 3-step walk (twelve bytes of 4-byte packets), a press and a release.
+Ten releases out of ten were held. One event that moved nothing delivered each of them. QEMU's
+`ps2_mouse_send_packet` and `input_event_*` trace showed that no button-up packet was queued until
+that event, which separates "QEMU held it" from "the guest lost it". A zero-motion packet would
+have recovered a guest loss just as well, so the trace was needed.
+
+**The fix is in the gate, because only the gate knows it has stopped injecting.**
+- `Qmp::flush` sends an event that moves nothing. The only packet it can produce carries what was
+  already injected, so it cannot add input.
+- `click_at` flushes after the press receipt, which proves the guest drained through the press.
+  It still waits for nothing: PR #280 found that waiting for the release line broke the drag step.
+- `middle_click_at` does the same.
+- Every drag's post-release wait, and the `shot` tool's click, use `expect_after_pointer`, which
+  flushes each second it goes without its line.
+
+Under the probe, the real `click_at` delivered ten releases out of ten, and none with its flush
+removed. `expect_after_pointer` delivered five out of five at its first flush, 1017 ms in.
+
+**It also explains an older note.** `move_pointer_to` said QEMU's queue *drops* a packet it cannot
+fit. Its own evidence, from 2026-08-31, was a walk landing exactly one step of (−98, −56) short.
+That is the pin's held over-drive riding on the walk's first step and cancelling it. The pin is
+now drained and then flushed, so the held remainder goes into the corner, where the pointer is
+clamped. `check-input`'s paced-burst comment made the same misreading, and both now say "held".
+Merged decision-log entries that say "drops" stay as they are, because they record what was
+believed on their date.
+
+**The Display gate, once: an event before QMP's greeting.** `Qmp::connect` read a `RESUME` event as
+the first line on the socket and refused it as a greeting. It connects the moment the socket
+exists, and QEMU had started the guest before greeting that connection. It now reads past up to
+eight events, as `execute` already skips them, and still fails on a socket that never greets. A
+host test drives it against a stand-in socket at the bound and one past it, and a connect that
+skips nothing fails the test.
