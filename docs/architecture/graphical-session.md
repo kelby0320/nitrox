@@ -133,6 +133,7 @@ profile lookup in session construction today — per-user overlays are deferred
 ```
 kernel ─spawns→ init (full SysCaps)
   init ─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
+  init ─spawns with BIND_NAMESPACE, binds /svc/views→ view-broker (builds views; see below)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
     │      + fs ep, profile ep, tty ep;  auth resolved from /svc/auth
@@ -217,6 +218,21 @@ full. And if that ever stops being acceptable, the split is available: the servi
 (`/dev/desktop`) can move to a separate process, leaving the constructor half in the shell. Naming
 that now is cheaper than discovering it is impossible later.
 
+### The view broker is the second, and its constructing is narrower
+
+`view-broker` (administration Part A, 2026-09-23) also serves and holds `BIND_NAMESPACE`, and
+it reconciles the same way: it binds only into namespaces it *created* — each view a copy it made of
+the namespace its caller sent, via `sys_ns_derive` — and it never registers itself (`init` binds it
+at `/svc/views`). Its constructing is narrower than the shell's, since it adds one profile's grants
+to a namespace that already exists rather than composing one from endpoints. What a bug in it
+reaches is set out in [`administration.md`](../planning/administration.md) § *Why one broker*: the
+raw disks, and whatever the domain services will do on request.
+
+**The shell holds the broker's raw endpoint**, to bind `/dev/views` into each application at the
+session's base, and with `BIND_NAMESPACE` it could bind any base — so the graphical session's
+identity with the broker rests on the shell, where no program in a serial session can choose its
+base at all. That trusts it with nothing new: it already holds the whole-tree filesystem endpoint.
+
 ## 4. The session recipe, and what the two supervisors share
 
 Both supervisors run the same five steps. Only the first and last differ.
@@ -288,10 +304,11 @@ application reads it, and an application holds no authority to spawn in the firs
 why `Desktop::Open` exists. A binding whose only justification is that it would be harmless is a
 hole in a sandbox with nothing on the other side of it.
 
-It is also a symptom of a gap this document does not fill: there is one kind of account, restricted
-by design, and no session that sees the system rather than one user's corner of it. Filed as
-`TODO(admin-visibility)` in `deferred-decisions.md`, triggered by the first tool that needs to see
-past a single user.
+**It stands on its own, and is not a symptom of anything.** It was filed as one until 2026-09-23 —
+"there is one kind of account … and no session that sees the system" (`TODO(admin-visibility)`).
+Administration Part A answered that: seeing more than one user's corner is a *view*, reached with
+`with`, not a different account or a wider application namespace. An application's missing
+`/applications` is simply that nothing in an application reads it.
 
 **One edge is left, and it is an attenuation problem rather than a naming one.** A terminal
 minted *without* attaching a backend sits on the **console** backend, and `drive` gives each

@@ -27988,3 +27988,289 @@ moves to `check-login`, which logs in on the release image and launches `nxterm`
 **Smaller:** session ids are never reused, since a program that ignores its session's end keeps the
 old base. The graphical session's identity rests on `desktop-shell`, which holds the raw endpoint.
 And the reason the broker copies again includes a kept `DUPLICATE`, not only a spawned child.
+
+## 2026-09-23 — Administration A.1: `sys_ns_derive`, a namespace you can hand someone
+
+The first piece of Part A, and its only kernel work. `sys_ns_derive(ns)` (syscall 37) needs
+`LOOKUP` on `ns` and returns a new namespace holding a copy of every binding in it, with the same
+full rights `sys_ns_create` gives. `Namespace::try_derive` copies each path, shares each target —
+a direct handle's object and a registration each gain a reference, a kernel server's id is copied
+— and keeps each subtree base and rights value. The resolution cache is not copied.
+
+**`LOOKUP` is the whole requirement**, and the doc comment says why rather than leaving it to be
+rediscovered: every binding in the copy is one the caller could already resolve, and binding into
+it still needs `BIND_NAMESPACE`. What the full rights add that matters is `TRANSFER` — a process's
+own root arrives `LOOKUP`-only, so a copy is how it hands its namespace to the broker — and
+`UNBIND`, which **can widen**: resolution is longest-prefix, so removing a narrower binding
+exposes the broader one beneath it. Any holder of a namespace can now derive one and unbind in it,
+so no namespace may rely on a narrower binding to hide part of a broader one; none built to
+confine does (`namespace-and-resource-servers.md` states the rule, and a kernel test pins the
+behaviour). This entry first said unbinding only narrows; PR #329's review found that false.
+
+**The lock discipline is the module's.** Targets are cloned under the source's lock, into a list
+that outlives the guard, so a failed allocation part-way drops what was cloned only after the lock
+is released; the new namespace's lock is never taken while the source's is held, both being
+rank 4.
+
+**Tested twice, because the host tests cannot see the syscall.** Four host tests on
+`try_derive` — every binding kind with its rights and base, a snapshot in both directions, targets
+shared and each freed once, an empty cache — each negative-controlled: skipping userspace-server
+bindings, losing rights, losing a base, and re-adopting a direct handle without a reference bump
+(which crashed the test on a double free) all fail them. And a `boot-probe` check through the
+syscall, in `test-qemu`: the copy resolves, can be sent and pruned, pruning it leaves the root
+alone, and a handle without `LOOKUP` is refused. Three kernel mutations fail that boot at the line
+naming them — returning a full-rights handle to the *same* namespace ("unbinding in the copy
+reached the root"), which is the shape a hurried "derive" would take and a silent upgrade of every
+`LOOKUP`-only root; returning a `LOOKUP`-only copy; and dropping the `LOOKUP` requirement.
+
+**A current-behaviour doc was wrong, and is fixed with this.** `namespace-and-resource-servers.md`
+described `BIND_NAMESPACE` as "not yet designed" and said `sys_ns_bind` "will additionally require"
+it. It has been enforced since Phase 3 slice 6 Part C (2026-07-14). It also now says what the
+broker's design turned on: `sys_ns_unbind` is not syscap-gated, because removing a binding only
+narrows.
+
+## 2026-09-23 — Administration A.2: every stage gets a terminal, beside the shell's
+
+The second piece of Part A: a stage `nxsh` spawns now has a terminal of its own, so the one
+that needs to ask something — `with`, for a password — can. It is a **sibling** of the shell's
+terminal, minted by a new tty op, `Tty::OpenSibling` (`0x0B09`), on the shell's own backend,
+and passed in the setup message's existing `terminal` field (the one M5 built for `nxterm` to
+hand `nxsh` its window). coreutils' `Stage` exposes it.
+
+**Almost none of it was new.** The tty server already delivered input to the first terminal
+waiting on a backend and `Ctrl-C` to all of them, and each terminal already had its own
+discipline, so echo was already per terminal. `Registry::move_to` had been written for exactly
+this shared case and was only ever called by tests. The server gained `open_sibling` — a
+terminal added on another's backend — and one request arm. Six routing tests pin the shape a
+shell and its stage make: the sibling joins the window rather than the console, the reading stage
+gets the input while the shell only waits, `Ctrl-C` reaches both, a stage's echo setting is its
+own, closing the stage leaves the shell its window, and a sibling of nothing is refused. Three
+mutations fail them: siblings landing on the console, siblings never added, and echo set for the
+whole backend. The mutations also showed the "closing" test passing vacuously when no sibling
+existed, so it now checks its own precondition.
+
+**Two things only a boot showed.**
+
+- **A leak would be silent, so the gate counts.** There are fifteen terminals, and a stage the
+  server cannot give one runs without it rather than failing — so a sibling that outlived its
+  stage would, a dozen commands later, quietly leave every stage without a terminal. The server
+  logs the open count with each sibling, and `test-interactive` requires the same number at step 8
+  as at step 5, for the same command. A shell keeping a duplicate of each terminal fails it:
+  "3 open at step 5, 6 open at step 8".
+- **Asking for a terminal could eat a `Ctrl-C`.** The sibling request is a tty exchange, and an
+  interrupt arriving during one is recorded by `tty_await_reply` rather than left queued, which
+  is right for a prompt and wrong for a pipeline: its waits look only for a *new* interrupt
+  message. `test-interactive`'s step 19 — `sleep 60`, interrupted the moment it starts — timed
+  out on the first run. The shell now asks the stages to stop, after spawning them, when the flag
+  is already set. The evaluator's checkpoint clears the flag before each statement, so anything
+  set there arrived during this one.
+
+## 2026-09-23 — Administration A.3: the view broker, proven through its own protocol
+
+The third piece of Part A: `view-broker`, a lib and bin split like `auth-service`, spawned by `init`
+with `BIND_NAMESPACE` and bound at `/svc/views`.
+
+**The library holds everything the broker decides with, and is host-tested.**
+
+- **A focused `views.toml` reader.** It errors with the line it stopped at, knows exactly one grant
+  (`disks`), and refuses a grant it does not know rather than ignoring it.
+- **First-match rule evaluation.** A denial says whether the view or the program was the problem.
+- **The last-administrator guard.** It is narrow: an administrator is `admin` with `run = ["*"]`,
+  and the test sits at each neighbour.
+- **Per-session pacing.** A failure holds the session's next check on any of its requests, but not
+  another session's.
+- **Session ids that are never reused.**
+- **The suffix parser that identity comes from**, with one spelling per id.
+
+Four mutations fail those tests: the guard counting `admin` for one program, a delay that never
+holds, a leading zero accepted, and a `#` inside a string taken for a comment.
+
+**The protocol is `Views` (`0x0Exx`), written up in `rsproto-views-ops.md`; the file in
+`views-toml-schema.md`.**
+
+**Proven in a boot before any shell or `with` exists to drive it.** `boot-probe` holds the unscoped
+root namespace, so it can be both a supervisor and a client at `/svc/views/s/<id>`. It opens a
+session for the demo account and sends `admin nxinstall` carrying a copy of its namespace with
+`/dev/blk` unbound, keeping a duplicate of that copy. Then it gives a wrong password and, straight
+after, the right one. It asserts that:
+- the password was asked for;
+- the right one was answered only after the session's two-second delay;
+- `nxinstall` exited 0, which means "listed the disks it can see", so the grant arrived;
+- the duplicate it kept still cannot reach `/dev/blk/0`, so the broker built the view in a copy of
+  its own;
+- a program outside a rule's `run` is refused;
+- `Check` refuses a policy nobody could administer;
+- a closed session's base resolves to nothing.
+
+Four broker mutations each fail that boot at their own line: binding into the namespace the caller
+sent, no pacing, no grant, and a session never removed. The audit records it leaves on the console
+tell the same story, and none contains a password.
+
+**Three things settled in passing.**
+- **Exit attribution:** `service-mgr`'s way, a life channel per program plus codes in arrival order.
+  That was the maintainer's call over closing `TODO(child-exit-attribution)` now, and the entry
+  names the broker as a consumer.
+- **`/svc/views` shares `/svc/auth`'s boundary and costs more.** Its supervisor channel opens a
+  session for any principal named. `TODO(svc-auth-ungated)` says so, with the same fix.
+- **A session's end is asked for, not forced** (`TODO(forcible-kill)`, a new entry).
+
+The seeded policy landed here rather than in A.6, because the boot needed one to decide against.
+
+## 2026-09-23 — Administration A.4: every session opens one with the broker
+
+The fourth piece of Part A: the broker's forwarding endpoint reaches every session.
+- `init` keeps a duplicate when it binds `/svc/views` and sends it to `service-mgr` as a sixth
+  handoff.
+- `service-mgr` forwards it to both login supervisors, the fifth for `session-mgr` and the sixth for
+  `desktop-session-mgr`.
+- `desktop-session-mgr` hands it to `desktop-shell` as a sixth extra, with the session's base as
+  `argv[2]` beside the home, for the home's reason: a binding does not resolve back to its base.
+
+**Each supervisor resolves `/svc/views/session` once, as it does `/svc/auth`.** It opens a session
+for every login before it builds the namespace, since the base is part of what the namespace binds,
+and closes it when the leader exits. `libsession` gained `/dev/views` in `build_namespace` and the
+two helpers, because both supervisors use them. `desktop-shell` binds `/dev/views` at the session's
+base into every application namespace, so `with` will work in a terminal it launched. A boot
+without the broker builds sessions without `/dev/views`, and each supervisor says so.
+
+**Gated from the serial column, where the order is deterministic.**
+- **Login:** `test-interactive`'s step 4 requires the broker to open a session and the namespace
+  line to include `/dev/views`.
+- **Logout and back in:** step 21 requires the broker to hear the session end, and the next login
+  to get a *higher* id — "never reused", checked in a boot rather than only in a host test.
+- **The graphical column:** `check-login` requires `desktop-session-mgr: session has /dev/views`.
+
+Two mutations fail these gates: ids handed out again ("session 1 ended and the next login got 1"),
+and a serial session built without the binding.
+
+## 2026-09-23 — Administration A.5 and A.6: `with`, and Part A complete
+
+**`with` is a coreutil** (`userspace/coreutils/src/bin/with.rs`), in three shapes: `with VIEW PROGRAM
+ARGS…`, `--list` (a typed table), and `--check FILE`. For a request it:
+- copies its own namespace and sends the copy;
+- moves stdin and stdout to the program;
+- sends `stderr` and its terminal as *duplicates*, since it still needs one to report on and the
+  other to ask for a password on;
+- prompts with echo off, and turns echo back on before the program inherits the terminal;
+- passes the shell's stop request on to the broker once, and exits with the program's code.
+
+coreutils' `Stage` gained the whole environment, which `with` forwards unchanged.
+
+**`test-interactive` gained a step that uses it the way a person would.** In order:
+- `nxinstall` alone sees no disks;
+- `with install nxsh` is refused by the policy, with no prompt;
+- `with --list` shows the `install` row;
+- `with admin nxinstall` refuses a wrong password, then *holds* the right one — the listing arrives
+  at least 1.5 s after the refusal, measured on the host — and the listing names `/dev/blk/0`;
+- three wrong passwords end a request;
+- `Ctrl-C` stops `with admin sleep 60` well inside the minute;
+- the audit records exist, and neither password appears anywhere on the console.
+
+Three mutations fail it at the matching claim: echo left on ("a password reached the console"),
+`with` not passing the stop on, and a broker that does not hold the check ("answered 86 ms after
+the refusal").
+
+**`check-login` runs the same request from the desktop.** `with admin nxinstall` is typed into the
+terminal the Applications menu opened, and the password is typed into that window. The broker's
+audit then shows the program started and exited 0. That is the graphical chain end to end:
+`desktop-shell`'s `/dev/views`, the sibling terminal on the window's backend, the password read
+there. Dropping the application-namespace bind fails it.
+
+**The full gate run before the PR caught an ordering bug in `with` itself.** After a wrong password
+it wrote the reason to `stderr` — which reaches the screen when the shell next drains that sink — and
+the next prompt straight to its terminal, so the two could land in either order: a person saw the
+second prompt and then "wrong password" under it, and `test-interactive` scanned past the prompt it
+was about to wait for. The reason now goes on the terminal in the same write as the prompt. The same
+run exposed a genuinely unordered pair in the gate — the audit's `exited`, from the logging service,
+and the shell's prompt, from the tty server — which now waits with `expect_all`.
+
+**The gate harness decoded each serial read on its own**, so a character split across two reads
+became two replacement characters, and an `expect` for `sleep — exited` could never match
+`sleep �� exited`. It now carries an incomplete trailing sequence into the next read. A host test
+splits an em dash across two reads, and the old decoding fails it.
+
+**`TODO(admin-visibility)` is resolved.** An administrator is a mode — a view — reached with
+`with`. The `/applications` asymmetry its code marker sat on stands on its own, and
+`desktop-shell`'s comment and `graphical-session.md` §6.1 say so.
+
+**Part A is complete.** It delivered:
+- views and the broker;
+- `with`, on a terminal and in a desktop window;
+- one grant end to end;
+- per-session pacing;
+- sessions opened and closed by both supervisors;
+- an audit record per request.
+
+`with --edit` and the other grants belong to later parts.
+
+## 2026-09-23 — Part A, reviewed: a deadline fixed too early, and unbinding that widens
+
+PR #329's review found three blocking problems, two worth fixing and four smaller ones. All are
+fixed, each with a test that fails against the old code. A new boot-probe step also found a
+seventh problem, which the review had not.
+
+**Passwords queued on several requests got one guess each per delay.** A held password's deadline
+was fixed when it arrived. A failure on one request moved the session's delay, but not the
+deadlines already queued, so a program could open N requests, fail once, queue a password on each
+of the others, and have all N−1 checked back to back when the delay ended. The queue is now
+`view_broker::pacing::Held`, where a held check has no deadline of its own. Whether it may run is
+asked of its session each time, and the broker takes one, checks it, and asks again. A host test
+holds three checks in one session and one in another, and a mutation that caches each deadline
+fails it. The boot probe now races two held passwords and needs their answers a delay apart. A
+broker that takes every ready check before making any fails it with "held answers after 2029 ms
+and 18 ms", which is the review's scenario reproduced.
+
+**The first-match test could not tell first from last.** No fixture had two rules matching one
+request. One now has two, with different `auth`, in both orders. A `decide` that returns the last
+match fails it; before, it passed every test.
+
+**Unbinding does not only narrow.** Resolution is longest-prefix, so removing a narrower binding
+exposes the broader one beneath it. `sys_ns_derive` gives every process a namespace it may unbind
+in, so the argument this PR made for why a copy needs only `LOOKUP` was false in four places: the
+syscall spec, `namespace-and-resource-servers.md`, `sys_ns_derive`'s doc comment and the A.1 entry
+above. The A.1 entry is still unmerged, so it was corrected in place. The architecture doc now
+states the rule: **a narrower binding must never be what hides part of a broader one.** A kernel
+test pins the behaviour. No namespace built to confine depends on covering: not a session's, an
+application's, or a view's. #328's review had already named the same fall-through for `/bin`.
+That fix was made at its site, and its class was never swept.
+
+**Handles sent with `Stop`, `List` or `Check` were kept for good.** They are now closed before
+dispatch, for every op but `Request`, rather than by each arm. A stray message on a life channel
+now has its handles closed too. The probe sends one end of a new channel with each op and needs
+the other end to see `PeerClosed`. Keeping them fails it on `Stop`.
+
+**A full broker could push its wait set past 32.** Admission counted open channels, so a channel
+admitted into the last slot left its program's life channel with none. That program's exit was
+never heard, and its code was later paired with another program's. The count is now
+`view_broker::slots::Load`, where a client is two slots from the moment it is admitted. A host
+test checks the neighbouring cases: a client fits with two slots free and not with one. The probe
+fills the broker until it refuses a client, then starts a program on the last client admitted.
+Under the old admission, 27 clients get in and that exit is never heard.
+
+**Found by that probe step: every error the broker returned on its forwarding endpoint was
+malformed.** It sent a 4-byte body. The kernel reads anything shorter than a 12-byte `ErrorBody` as
+malformed and hands the caller `KernelError`, so a full broker's `WouldBlock` and a closed session's
+`NotFound` both arrived as -255. The probe's closed-session check had asked only for "not success",
+which -255 satisfies. It now asks for `NotFound`. The broker builds its errors with
+`librsproto::error::error_body`, as every other server does.
+
+**The four smaller findings:**
+
+- **Identity wording.** "Nothing in the session can change the base" overclaimed at five sites.
+  `desktop-shell` holds the raw endpoint and `BIND_NAMESPACE` so it can bind `/dev/views` into
+  applications, so it could bind any base. Each site now names that exception, and
+  `graphical-session.md` §3 states it.
+- **A reader on the same backend gets the password.** Input goes to the oldest terminal on the
+  backend with a read pending. So a program still reading one receives the line typed at `with`'s
+  prompt: a stage's child left behind, or, more cheaply than the review's case, an earlier stage of
+  the same pipeline. This is accepted and recorded in the plan's prompt section and in `with`'s
+  doc; `sudo` has the same limit.
+- **Scrubbing.** `libkern::scrub` zeroes with volatile stores, so the optimiser cannot delete it.
+  `libsession::authenticate` now scrubs its own request, both the stack body and the crate's send
+  buffer, straight after sending. That covers every caller, not only the broker. The broker also
+  scrubs its receive buffer and each password once it is checked, and `with` its buffers and
+  password.
+- **`grants` given twice** is now caught when the first is `[]`. The parser records that the key
+  was given rather than inferring it from a non-empty list, and tests cover both forms.
+
+`test-qemu` is about four seconds longer, for the two paced delays.

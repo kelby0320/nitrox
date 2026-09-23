@@ -50,6 +50,20 @@ pub struct Stage {
     /// `None` in Tier 0, and in Tier 1 when the spawner passed no `PWD`. A relative path
     /// then fails rather than resolving against `/` — see [`Stage::path`].
     pub cwd: Option<String>,
+    /// The terminal the shell handed this stage, if it handed one — a sibling of its own, on the
+    /// same window or console (administration Part A.2).
+    ///
+    /// What a stage that has to *ask* something prompts on: `with` for a password, an elevated
+    /// shell for its commands. `None` in Tier 0, under a spawner that passes none, and when the
+    /// tty server had no terminal to spare, so a stage that needs one must say so rather than
+    /// assume it.
+    pub terminal: Option<u64>,
+    /// The whole environment the spawner passed, as it passed it — empty in Tier 0.
+    ///
+    /// `cwd` above is the one entry most stages need; a stage that hands its environment on
+    /// unchanged — `with`, forwarding it to the program it asks the view broker to run — needs
+    /// the rest, and rebuilding it from pieces would drop whatever it did not know about.
+    pub env: libstream::wire::Record,
     /// Whether a setup message was received (Tier 1).
     pub from_shell: bool,
 }
@@ -104,6 +118,8 @@ impl Stage {
                 streams: s.streams,
                 argv: s.argv,
                 cwd: cwd_of(&s.env),
+                terminal: s.terminal,
+                env: s.env,
                 from_shell: true,
             },
             Some(Err(_)) => {
@@ -119,6 +135,8 @@ impl Stage {
                 streams: Streams::default(),
                 argv: Vec::new(),
                 cwd: None,
+                terminal: None,
+                env: libstream::wire::Record::default(),
                 from_shell: false,
             },
         }

@@ -498,6 +498,16 @@ FAIL; no session can authenticate`. Not exploitable today — nothing hostile ru
 `desktop-session-mgr` resolves *later*, in Part D, so the window widens exactly when a second
 supervisor arrives. Same fix as the rest of this entry (PR #235 review, finding 8).
 
+**`/svc/views` sits on the same boundary, and costs more there** (administration Part A,
+2026-09-23). `init` binds the view broker at `/svc/views` in the root namespace for `auth-service`'s
+reason, and its supervisor channel — `/svc/views/session` — **opens a session for any principal
+named**, while `/svc/views/s/<id>` speaks as any open session. Anything holding the root namespace
+can therefore act as any account to the broker, where for `/svc/auth` it could only guess
+passwords. It is the same trusted set — every holder of the unscoped root is a system service — and
+the same fix closes both: supervisors given *constructed* namespaces, so that only the two login
+supervisors hold `/svc/views/session` and nothing holds the unscoped `/svc/views`. Sessions are not
+on this boundary: their namespaces are built, and bind only `/dev/views` at their own base.
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly
@@ -556,6 +566,14 @@ exit per wake — every case the system produces today — that is right; with t
 the codes can swap, which matters only to `on-failure` (`never` and `always` do not read the
 code). A service found dead with no code queued is treated as a failure, since a crash that
 outruns its notification is the case worth restarting.
+
+**The view broker lives with the same residual** (administration Part A.3, 2026-09-23), and it
+matters a little more there: its programs belong to different sessions, and each code goes to a
+different `with`, so a swap would tell one person their elevated command failed when someone else's
+did. It does what `service-mgr` does — a *life channel* per program, a handle moved to the program
+at spawn that it never learns of, whose close says exactly *which* program exited — and pairs codes
+in arrival order. The maintainer took that over closing this entry now (2026-09-23), since two of
+the broker's programs exiting in one wake is rare and closing it needs the ABI.
 
 **`init` is untouched and still has the original bug**: `reap_loop` attributes the first
 `ChildExited` to its primary child without comparing the pid. Its children do not all have control
@@ -1059,6 +1077,24 @@ also stays deferred — it needs the fault path to distinguish a stack overrun f
 access, and 8 MiB of demand-paged reservation makes it much less interesting. Trigger for
 either: a client that exhausts 8 MiB, or a stack-depth question that costs debugging time.
 
+**There is no forcible kill — `TODO(forcible-kill)`.** `sys_process_terminate` *asks*: it
+enqueues `TerminateRequested` on the target's notification channel, and a process that ignores it
+keeps running (`docs/spec/syscall-abi.md`). The kernel reserves the `TERMINATE` right for the day
+one is built. That has been fine for a shell's pipeline, whose stages are ordinary programs that
+listen.
+
+**The view broker is the first place it costs something** (administration Part A, 2026-09-23).
+When a session ends, the broker asks every program it started for that session to exit and
+unbinds their grants, so nothing *new* can be resolved through them — but a program that ignores
+the request keeps running with whatever it had already resolved, since the kernel has no
+revocation either. An elevated program can therefore outlive the login that started it. The
+maintainer took "asked, not forced" for Part A over building a kill inside it.
+
+**Trigger: the first program that must not outlive its session** — anything granted authority a
+lingering copy could misuse without a person present. Building it means tearing down another
+process's threads and address space from outside, which is a substantial kernel feature rather
+than a syscall.
+
 ### Filesystems
 
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
@@ -1456,31 +1492,6 @@ the file becomes cumbersome." Its scope and its gate are kept in
 **This is the first use of the `no-code-site` escape hatch**, which until now had only a unit test
 — it belongs to no milestone and has no code to hang a marker on, which is the case that hatch was
 written for.
-
-**An account that can see more than one user's own — `TODO(admin-visibility)`.** A session
-namespace holds `/applications`; an *application* namespace does not, so `nxsh` on the serial
-console can list the installed applications and the same `nxsh` inside `nxterm` cannot. That was
-decided deliberately (M14 Part H): nothing in an application reads it, an application holds no
-authority to spawn — `Desktop::Open` exists because of that — and a binding with no consumer is a
-hole in a sandbox that nobody is watching.
-
-**What it exposes is the larger question rather than the binding.** The default account is
-restricted by design and there is nothing else: no administrator account, no tools that see the
-system rather than one user's corner of it, and no notion of a session with wider visibility. The
-asymmetry above is one small symptom — a person exploring finds that the same shell shows
-different things depending on how they reached it, and the honest answer today is "that is the
-sandbox, and there is no other kind of session to be in".
-
-Deciding it means answering three things that have not been asked: whether an administrator is a
-*user* (a second account) or a *mode* (a session built with a wider spec), what a tool with system
-visibility is allowed to do beyond looking, and how a person moves between the two — because
-"log in as someone else" and "elevate" are different designs with different failure modes. None of
-that is a namespace question; the namespace is where it would show up.
-
-**Trigger: the first tool that needs to see past one user** — a package manager, a service
-inspector, anything that reports on the system rather than on a home directory. Whichever arrives
-first is the thing that makes the shape concrete, and until one does, guessing at the shape is how
-you get an administrator account that fits nothing.
 
 **An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
@@ -1986,6 +1997,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| An account that can see more than one user's own (`admin-visibility`) | 2026-09-23 | Administration Part A answered the three questions the entry asked. **An administrator is a mode, not a second account**: a *view* — the caller's own namespace plus a profile's grants — that a person reaches with `with`, proved by their own password, when `/system/views.toml` lets them. What such a view may do is what its profile grants (`disks`, first). The symptom the entry opened with — application namespaces omit `/applications` — was never the deferral's to fix: it stands on its own, because nothing in an application reads it, and `desktop-shell` now says so without the tag. |
 | Cross-group inode/block allocation (`fs-server-ext4`) | 2026-09-17 | Both allocators scan every block group — `alloc_block` from the goal's group outward, `alloc_inode` from the first with a free one — clamped to the last group's short tail. The trigger fired exactly as written: `nxinstall` made a root the size of a 931 GiB disk and it held about 112 MiB. Phase 5 Part H.2. |
 | A cache attribute on a mapped device aperture (`framebuffer-cache-attr`) | 2026-09-16 | Phase 5 Part G, and **the entry above was wrong about what it would cost**: it called a write-back mapping of a PCI BAR a *correctness* problem — writes left in cache, reordered — and on the laptop nothing was ever cached, because the firmware's range registers call the graphics aperture uncacheable and the stronger of the two wins. It was a performance problem, and a 45x one: a full screen took 72930 us through a `/dev/framebuffer` mapping against 1368 through the bootloader's mapping of the same pixels. **The bootloader had already asked for write-combining**; this kernel dropped the attribute at the namespace boundary, where `protection_to_page_flags` gave every user mapping no attribute at all. The fix is `mm::Caching` on the `MemoryObject` and the VMA, `PageFlags::WRITE_COMBINING` selecting entry 5 of a table the kernel now programs itself on every CPU (keeping the bootloader's exact values, because two entries were already live in mappings it made), and the framebuffer aperture recording its answer once for the object and the boot's own measurement to read. "A way for the namespace server to set it" was **not** needed and is not built: the aperture the kernel mints is the only device object userspace maps, so the attribute is the object's. A compositor with no shadow buffer now refuses to serve rather than composing into the display, because composing into write-combining memory reads it back. Measured after: 1632 us, 2451 MiB/s. **Two of this part's own instruments lied before they worked** — the measurement built its second mapping with the attribute written into the measurement, and the handout line printed the aperture's value instead of the object's — each caught by a control that should have failed and did not. |
 | MSI (message-signalled interrupts) | 2026-09-11 | Phase 5 Part A, and **the trigger this entry carried was the wrong one** — it was filed as performance work ("NVMe, multi-queue NICs, or performance work on interrupt-heavy devices") when on real hardware it is a correctness unblocker: the AHCI driver took its GSI from the PCI interrupt-line register, which QEMU's firmware programs and real UEFI frequently leaves meaningless, the authoritative routing being the DSDT's `_PRT` — which needs AML, which means ACPICA. MSI needs none of it. `pci::read_msi` and `pci::program_msi` decode and program the capability, `ArchIrqInstall::install_msi` composes the x86 message, and AHCI prefers MSI while keeping INTx as the fallback for a function that advertises no capability. **Message Control bit 7 selects the structure, not the address width**: Message Data sits at `+0x0C` when the address is 64-bit and `+0x08` when it is not, and the two target controllers disagree — QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise Point-LP is not — so the branch the target machine takes is the one no QEMU boot can exercise. Host tests carry both shapes, built from the real captures, and are negative-controlled by forcing the offset to `+0x0C` unconditionally, which is the driver the emulator alone would have produced. Bus mastering and the INTx-disable bit came with it, being the same config-space plumbing: nothing in Nitrox had ever set either, and DMA worked only because the firmware did. MSI-X stays deferred with a consumer-based trigger of its own. |

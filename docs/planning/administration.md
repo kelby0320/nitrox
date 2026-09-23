@@ -1,13 +1,13 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: scoped, not started (2026-09-22; revised after the PR #326 review; Part A detailed
-2026-09-23).** Scheduled after
+**Status: in progress — Part A complete (2026-09-23); scoped 2026-09-22 and revised after the
+PR #326 review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below), so **A.1 is next**; the other parts are
-sketched. The plan began as a stub on 2026-09-16, written while building the
+had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, so **Part B's
+detail pass is next**; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -258,6 +258,14 @@ request. It is the most trusted process in userspace after `init`, and should be
   delay after each failure held for the whole session, a cap per request, and every failure in the
   log. Any program in a session
   can call `/dev/views` in a loop, and this is what stops it becoming a password-guessing service.
+- **What the prompt does not stop: a program on the same backend reading the password.** Every
+  stage holds a sibling terminal, and input goes to the *oldest* terminal on the backend with a
+  read pending (`tty-server`'s routing). So a program that keeps a read pending — a stage's child
+  that outlived its pipeline, or an earlier stage of the same pipeline — receives the line typed at
+  `with`'s prompt, password included. Pacing does nothing here: this is not a guess. `sudo` has the
+  same limit, since anything holding the tty can read it. **Accepted for Part A and recorded**
+  (PR #329 review); the remedy is a prompt nothing in the session can read, which is what the
+  graphical design below is.
 - **Graphical — designed here, built when needed.** A UAC-style window asking for permission. What
   makes it more than a dialog is that **only the broker can open it**, and the compositor draws it in
   a way no application can imitate — the desktop dimmed behind it, as Windows does. **Trigger:** the
@@ -445,7 +453,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 
 ## Parts — sketched
 
-- [ ] **A — the view broker, on a terminal** — *detailed below, A.1–A.6.* The broker service;
+- [x] **A — the view broker, on a terminal** — *detailed below, A.1–A.6; complete 2026-09-23.* The broker service;
       `/dev/views`, one forwarding endpoint bound into each session with its base by **both** login
       supervisors, which also tell the broker when a session ends, and by `desktop-shell` into the
       applications it launches; namespace derivation in the kernel; `with`, `--list` and `--check`; `views.toml`, its schema
@@ -500,7 +508,8 @@ closes the phase**.
   path its channel was resolved through (`/log/system/<name>`), and `desktop-shell` confines an
   application to `/dev/draw/new` with a narrow bind. So `/dev/views` needs no endpoint minted per
   session. One forwarding endpoint, bound into each session with a **subtree base naming that
-  session**, reaches the broker with a suffix the session cannot choose.
+  session**, reaches the broker with a suffix no program in the session can choose — the
+  graphical leader excepted, above.
 - **`init` binds what services cannot.** A service `service-mgr` starts inherits a `LOOKUP`-only
   root, which is why `init` spawns `auth-service` and binds it at `/svc/auth`. The broker has the
   same need and gets the same treatment, with the same boundary: anything holding the root
@@ -571,8 +580,11 @@ closes the phase**.
   view, because a caller can prune its copy.** `sys_ns_unbind` needs only the `UNBIND` right, which
   a derived namespace carries. So a caller can remove `/bin` from the copy it sends, and a name
   would then resolve through any shorter binding that covers it. Today's namespaces have none, but
-  the image must not depend on that. Pruning otherwise only narrows what the program sees. Its own
-  later lookups happen in the view, as they would without `with`.
+  the image must not depend on that. Pruning elsewhere can widen what the program sees the same way,
+  to whatever part of a broader binding a narrower one covered — which is why no namespace may
+  rely on covering to hide anything
+  ([`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md)). The
+  program's own later lookups happen in the view, as they would without `with`.
 - **The delay after a failure is per session; the cap is per request.** A failure holds that
   session's *next* password check until the delay has passed, on whichever request it arrives.
   Otherwise a program could open several requests at once and guess on each in parallel. A request
@@ -626,37 +638,44 @@ closes the phase**.
 
 ### The pieces, in dependency order
 
-- [ ] **A.1 — `sys_ns_derive`.** `Namespace::try_derive`, the syscall, `libkern`'s constant, the ABI
+- [x] **A.1 — `sys_ns_derive`** *(2026-09-23)*. `Namespace::try_derive`, the syscall, `libkern`'s constant, the ABI
       spec and `abi-sync-check`. Host tests: the copy resolves what the source resolves; a bind or
       an unbind in either one leaves the other alone; a subtree base survives the copy; and
-      dropping one namespace leaves the other's registrations alive.
-- [ ] **A.2 — a terminal per stage.** A tty op minting a sibling terminal on the caller's backend,
+      dropping one namespace leaves the other's registrations alive. **Plus a `boot-probe` check
+      through the syscall itself**, which the host tests cannot reach: the copy resolves, can be
+      sent and pruned, pruning it leaves the root alone, and a handle without `LOOKUP` is refused.
+- [x] **A.2 — a terminal per stage** *(2026-09-23)*. A tty op minting a sibling terminal on the caller's backend,
       and its spec. Echo is per terminal, so a password prompt does not turn the shell's echo off.
       `nxsh` mints one for each external stage and moves it in through the **existing** `terminal`
       field (`send_setup_full`), and coreutils' `Stage` exposes what it receives. Routing tests: input reaches whichever
       sibling is waiting; `Ctrl-C` reaches both; and retiring one leaves the other on its backend.
-- [ ] **A.3 — the broker.** `view-broker`, a lib and bin split like `auth-service`, and host-tested:
+- [x] **A.3 — the broker** *(2026-09-23)*. `view-broker`, a lib and bin split like `auth-service`, and host-tested:
       - the `views.toml` reader, rule evaluation, and the last-administrator guard, each tested at
         its neighbours;
-      - the `Views` protocol (`0x0Exx`), with `rsproto-views-ops.md` and `views-toml-schema.md`; <!-- check-docs: allow-missing -->
+      - the `Views` protocol (`0x0Exx`), with `rsproto-views-ops.md` and `views-toml-schema.md`;
       - `init` spawning it with `BIND_NAMESPACE` and binding `/svc/views`;
       - per-session pacing, with a host test that two requests in one session share the delay a
         failure on either one starts, while another session's do not wait;
       - the audit records, and the spawn;
-      - `Exited`, `Stop`, and the end of a session.
-- [ ] **A.4 — the supervisors.** The forwarding endpoint couriered from `init` to both login
+      - `Exited`, `Stop`, and the end of a session;
+      - **a `boot-probe` check through the broker's own protocol**, in `test-qemu`, before any shell
+        or `with` drives it — which needed A.6's seeded policy early, so the seed landed here.
+- [x] **A.4 — the supervisors** *(2026-09-23)*. The forwarding endpoint couriered from `init` to both login
       supervisors and on to `desktop-shell`. A supervisor opens a session at login, binds
       `/dev/views` with its base, and closes the session when its leader exits. `desktop-shell`
       binds the same thing into every application namespace.
-- [ ] **A.5 — `with`.** A coreutil: `with <view> <program> [args]`, `--list` (a typed table) and
+- [x] **A.5 — `with`** *(2026-09-23)*. A coreutil: `with <view> <program> [args]`, `--list` (a typed table) and
       `--check <file>`. The last sends the file's text for the broker to judge, so there is one
       parser. It prompts with echo off, relays the exit status, and passes on a stop request. The
       shell spec records the name as taken by `/bin`.
-- [ ] **A.6 — the seed and the gates.** The build seeds `/system/views.toml`:
+- [x] **A.6 — the seed and the gates** *(2026-09-23)*. The build seeds `/system/views.toml` *(landed with A.3,
+      which needed it to test the broker in a boot)*:
       - an `admin` profile holding `disks`, which the demo account may use for any program with a
         password;
       - a narrower profile allowing one program, so a gate can see a request refused by policy.
-- [ ] **Docs:**
+
+      What is left is the gates: `test-interactive`'s `with` steps and `check-login`'s.
+- [x] **Docs** *(2026-09-23)*:
       - `session-and-auth.md` gains the broker, and its deferred "privilege broker" line is closed;
       - `namespace-and-resource-servers.md` gains derivation;
       - `console-and-tty.md` gains sibling terminals, and `pipeline-stdio.md` says who sends a

@@ -2,7 +2,8 @@
 
 **Status:** Implemented — `kernel/src/object/namespace.rs`, with userspace resource servers
 (fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
-Verified 2026-08-05.
+Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
+to "enforced" 2026-09-23.
 
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
@@ -304,13 +305,46 @@ authority is the handle, **you can only bind into a namespace you hold a
 This is the capability-correct gate, and it is what slice 1 enforces.
 
 **`BIND_NAMESPACE` (a system capability) is an *additional* gate**, above the
-handle right, that lands with the process-capability model (`SysCaps`), which is
-not yet designed. It concentrates *all* namespace mutation in a few coordination
-roles (init, service-mgr, session-mgr) so namespace policy has a chokepoint that
-can be audited — see `docs/rationale/why-supervisor-registration.md`. Until the
-syscap model exists, the handle `BIND` right is the enforced gate; `sys_ns_bind`
-will additionally require `BIND_NAMESPACE` once syscaps land. (Both gates apply in
-the final design; slice 1 implements the handle-right one.)
+handle right, and `sys_ns_bind` enforces both. It concentrates *all* namespace
+mutation in a few coordination roles (init, service-mgr, the session supervisors,
+`desktop-shell`) so namespace policy has a chokepoint that can be audited — see
+`docs/rationale/why-supervisor-registration.md` and [syscaps](syscaps.md).
+**Unbinding is not gated by it**: `sys_ns_unbind` needs only the `UNBIND` right.
+(This paragraph described the syscap as future work until 2026-09-23; it had been
+enforced since Phase 3 slice 6 Part C, 2026-07-14.)
+
+**Removing a binding can widen what a namespace reaches**, not only narrow it.
+Resolution is longest-prefix, so a path under a removed binding falls to the next
+shorter one: with `/` bound to a filesystem and `/home` to alice's subtree of it,
+`/home/bob/x` resolves through `/home` and stays in alice's; unbind `/home` and it
+resolves through `/`, to bob's. Since `sys_ns_derive` (below), **any holder of a
+namespace can make a copy it may unbind in**, so this is a rule for whoever builds
+one:
+
+> **A narrower binding must never be what hides part of a broader one.** If a path
+> under a binding must be out of reach, the broader binding must not reach it —
+> bind a subtree base, or bind less — rather than covering it with a narrower
+> binding a copy can remove.
+
+No namespace built to confine depends on covering (checked 2026-09-23). A
+session's (`libsession::build_namespace`) and an application's (`desktop-shell`'s
+`build_app_namespace`) bind subtrees — `/home`, `/bin`, `/applications`,
+`/system/fonts`, `/dev/…` — with nothing narrower beneath any of them that hides
+part of it, and a view adds only `/dev/blk/<n>` and its `info`, the same server's
+two names for one disk. Services share `init`'s root, which binds the whole root
+filesystem at `/` and so confines nothing to begin with. The kernel test
+`unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`
+(`kernel/src/object/namespace.rs`) pins the behaviour.
+
+**Deriving a namespace** (`sys_ns_derive`, 2026-09-23) copies every binding of one
+the caller can `LOOKUP` into a new namespace it holds with full rights. The copy is
+a **snapshot** — the targets are shared (a registration stays alive while either
+binds it), but a later bind or unbind in one does not reach the other — so a copy can
+be sent, pruned, or have bindings added by a holder of `BIND_NAMESPACE`, and the
+source is untouched. It exists for the view broker, which runs a program in its
+caller's namespace plus a profile's grants: the caller sends a copy, and the broker
+copies *that* again before binding anything, since whoever sent a namespace may still
+hold a handle to it (`docs/planning/administration.md` § Part A).
 
 **Supervisor-mediated binding.** Resource servers never bind themselves; a
 supervisor holding the binding authority does it on their behalf after a Ready
@@ -557,9 +591,11 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
 
 - **`sys_ns_create() -> handle`** — a fresh, empty `Namespace` with full namespace
   rights (`LOOKUP | BIND | UNBIND` + generic management).
+- **`sys_ns_derive(ns) -> handle`** — a new namespace holding a snapshot copy of
+  `ns`'s bindings, with the same full rights. Needs `LOOKUP` on `ns`.
 - **`sys_ns_bind(ns, path, path_len, resource) -> 0`** — bind `resource` (a direct
   handle in slice 1; a userspace-server endpoint in slice 7) at `path`. Needs `BIND`
-  on `ns` (and, later, the `BIND_NAMESPACE` syscap). In-kernel `KernelServer`
+  on `ns` and the `BIND_NAMESPACE` syscap. In-kernel `KernelServer`
   bindings are made by the kernel at boot, not through this syscall.
 - **`sys_ns_unbind(ns, path, path_len) -> 0`** — remove the binding at `path`. Needs
   `UNBIND`.
@@ -567,7 +603,7 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `path`, requesting at most `rights`; the PO completes with the resolved handle
   (`IoResult.result`) or an error (`IoResult.status`). Needs `LOOKUP`.
 
-Numbers `22`–`25` (reserved in the spec; pre-stabilization).
+Numbers `22`–`25`, `30` (`sys_ns_enumerate`) and `37` (`sys_ns_derive`); pre-stabilization.
 
 ## Scope summary
 

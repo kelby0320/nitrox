@@ -105,13 +105,19 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
 - Don't pass handles around with more rights than necessary. Use `sys_handle_restrict` / `Handle::without_*` to attenuate before transferring.
 - A handle granted to a child process should have the minimum rights the child needs.
 - Resource servers don't hold `BIND_NAMESPACE`. Coordination supervisors (init, service-mgr,
-  session-mgr) do. **`desktop-shell` is the one process that does both**, and the reconciliation
-  is in [`graphical-session.md`](../docs/architecture/graphical-session.md) §3: it holds the
-  capability to *construct application namespaces continuously*, which is its job, rather than to
-  register itself once — and it does not register itself. It serves `/dev/desktop` by binding its
-  endpoint into the namespaces it builds, never into one a supervisor owns. Read §3 before
-  copying the pattern; the trusted set widens when a process does both, and that cost is named
-  there.
+  session-mgr) do. **Two processes do both**, and the reconciliation is the same for each: they
+  hold the capability to *construct namespaces*, which is their job, rather than to register
+  themselves — and neither registers itself.
+  - **`desktop-shell`** builds application namespaces continuously, and serves `/dev/desktop` by
+    binding its endpoint into the namespaces it builds, never into one a supervisor owns. See
+    [`graphical-session.md`](../docs/architecture/graphical-session.md) §3.
+  - **`view-broker`** (administration Part A) binds a profile's grants into the views it builds —
+    each a copy it made itself of the namespace its caller sent — and is registered at
+    `/svc/views` by `init`, like any server. See
+    [`rsproto-views-ops.md`](../docs/spec/rsproto-views-ops.md).
+
+  Read §3 before copying the pattern: the trusted set widens when a process does both, and that
+  cost is named there.
 
 ## Per-crate notes
 

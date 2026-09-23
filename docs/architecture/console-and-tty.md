@@ -1,6 +1,6 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-09-17**, when a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-09-23**, when every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -184,6 +184,26 @@ and only the binder knows which it holds.
 So a session binds the **forwarding endpoint**, handed down init → service-mgr →
 session-mgr alongside the fs and profile endpoints, sharing init's registration exactly as
 `/home` shares the fs-server's. Every program in the session then resolves its own terminal.
+
+**A stage's terminal is not resolved; it is handed down** (administration Part A.2, 2026-09-23).
+A resolve mints a terminal on the console, so a stage that resolved `/dev/tty` inside `nxterm`
+would prompt on a serial port nobody is looking at. Instead `nxsh` sends `Tty::OpenSibling` on
+its own terminal before spawning each stage, and passes the result in the setup message. The
+sibling lives on the shell's backend, so the rules for a shared backend decide everything else:
+- input goes to whichever terminal is waiting, which during a pipeline is the stage's, since the
+  shell only listens for an interrupt;
+- `Ctrl-C` reaches both, so the shell can stop the pipeline and a prompt the stage holds ends;
+- each terminal has its own echo setting.
+
+A sibling is freed when its stage exits, like any terminal, and `test-interactive` compares the
+open count across two identical commands to prove it. There are only fifteen, and a stage the
+server cannot give one runs without it.
+
+**One consequence for the shell.** Asking for a sibling is a tty exchange, and a `Ctrl-C` that
+lands during it is taken by the exchange and recorded rather than left queued. So after spawning
+a pipeline, `nxsh` checks the flag as well as waiting for a new interrupt. Otherwise a stage
+interrupted while it was being set up ran to completion, which `test-interactive`'s step 19
+caught.
 
 ### What ends a terminal
 

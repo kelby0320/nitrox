@@ -94,6 +94,10 @@ pub const SYS_FILE_RENAME: u64 = 35;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
 /// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
+/// `sys_ns_derive(ns)` — a new namespace holding a **copy of `ns`'s bindings**, returned as a
+/// handle with full namespace rights (so it can be transferred, which a process's own root
+/// cannot). Requires `LOOKUP` on `ns`. A snapshot: later changes to either do not reach the other.
+pub const SYS_NS_DERIVE: u64 = 37;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to

@@ -228,6 +228,9 @@ pub const SYS_FILE_RENAME: u64 = 35;
 /// `sys_process_terminate` — **ask** a process to exit (§11h). Delivered as a
 /// `TerminateRequested` notification; nothing stops a process that ignores it.
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
+/// `sys_ns_derive` — create a namespace holding a copy of another's bindings, and return a
+/// full-rights handle to it.
+pub const SYS_NS_DERIVE: u64 = 37;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -277,6 +280,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create()),
+        SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
@@ -1401,6 +1405,46 @@ pub fn sys_ns_create() -> SysResult {
         Err(e) => {
             // `allocate` did not adopt the creation reference; reclaim + drop it
             // (running `Namespace::Drop`) outside the table call.
+            // SAFETY: `ptr` carries the single outstanding creation reference.
+            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Namespace) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_ns_derive(ns)` — create a new [`Namespace`] holding a **copy of `ns`'s bindings**, and
+/// return a handle to it with full namespace rights. Requires `LOOKUP` on `ns`.
+///
+/// **`LOOKUP` is enough because a copy binds nothing a caller could not already resolve.**
+/// Every binding in the copy is one the caller could reach through `ns`, binding into it still
+/// needs `BIND_NAMESPACE`, and transfer is the point. A process's own root arrives `LOOKUP`-only
+/// and cannot be sent, so this is how a program hands someone its namespace: it derives a copy
+/// and sends that.
+///
+/// **`UNBIND` on the copy can widen what it reaches.** Resolution is longest-prefix, so removing
+/// a narrower binding exposes the broader one beneath it — which is why no namespace may rely on
+/// a narrower binding to hide part of a broader one
+/// (`docs/architecture/namespace-and-resource-servers.md`, and the test
+/// `unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`).
+///
+/// **A snapshot**: later changes to either namespace do not reach the other
+/// ([`Namespace::try_derive`]). Built for the view broker, which binds a profile's grants into a
+/// copy of its caller's namespace (`docs/planning/administration.md` § Part A). The broker copies
+/// what it is sent *again* before binding anything, since whoever sent a namespace may still hold
+/// a handle to it.
+pub fn sys_ns_derive(ns_h: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
+    // SAFETY: live `Namespace` (type verified by `lookup_typed`), pinned by `ns_ok`.
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    let obj = ns.try_derive().map_err(|_| KError::OutOfMemory)?;
+    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
+    match global::get().allocate(pid, ptr, KObjectType::Namespace, namespace_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // As in `sys_ns_create`: `allocate` did not adopt the creation reference, so reclaim
+            // and drop it here, outside the table call — which also releases every target the
+            // copy holds.
             // SAFETY: `ptr` carries the single outstanding creation reference.
             drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Namespace) });
             Err(map_handle_err(e))

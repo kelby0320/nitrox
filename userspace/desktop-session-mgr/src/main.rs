@@ -137,6 +137,8 @@ fn run_session(
     tty: u64,
     draw: u64,
     clipboard: u64,
+    views: u64,
+    views_sup: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -146,6 +148,16 @@ fn run_session(
         return false;
     };
     Line::new().s(b"desktop-session-mgr: login ok -> home=").s(&home[..hl]).end();
+    // **A session with the view broker, before the namespace** — its base is part of what the
+    // namespace binds, here and in every application the shell launches. `None` builds the session
+    // without `/dev/views`.
+    let mut views_base = [0u8; 24];
+    let opened = if views_sup != 0 {
+        libsession::views_open_session(views_sup, user, &mut views_base)
+    } else {
+        None
+    };
+    let base_len = opened.map_or(0, |v| v.1);
 
     // **No `/dev/console` in a graphical session** — governing decision 3, and this is that
     // flag's first caller since `libsession` gained it in Part B. Not "bound and unused": a
@@ -165,9 +177,14 @@ fn run_session(
         // **Only on an installer boot** (Phase 5 Part H.1) — the same decision the serial column
         // makes, from the same reader, because both build sessions and neither may differ.
         bind_blk: libsession::installer_boot(root_ns),
+        views_endpoint: if opened.is_some() { views } else { 0 },
+        views_base: &views_base[..base_len],
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
+        if let Some((id, _)) = opened {
+            libsession::views_close_session(views_sup, id);
+        }
         return true;
     }
     // **`/dev/draw`, bound as a subtree and unscoped**, so the shell resolves both `new` (a
@@ -204,6 +221,12 @@ fn run_session(
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/clipboard\n");
     }
+    // And the view broker, the same way (administration Part A.4).
+    if libsession::session_has_views() {
+        kprint(b"desktop-session-mgr: session has /dev/views\n");
+    } else {
+        kprint(b"desktop-session-mgr: session has NO /dev/views\n");
+    }
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
@@ -224,18 +247,29 @@ fn run_session(
     // to its base. Not authority: the fs endpoint above is the authority, and this only says
     // which subtree of it an application should see (PR #238 review, finding 3).
     let home_str = core::str::from_utf8(&home[..hl]).unwrap_or("");
+    // **The session's view base, as the second argument**, for the home's reason: the shell binds
+    // `/dev/views` into every application namespace, and that bind needs the base, which its own
+    // `/dev/views` cannot tell it. Not authority — the endpoint below is — only which session's.
+    // Empty when the broker gave no session, and the shell then binds nothing.
+    let base_str = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
+    let views_for_shell = if opened.is_some() { views } else { 0 };
     let code = spawn_leader(
         root_ns,
         session_ns,
         notif,
         "desktop-shell",
-        &[home_str],
+        &[home_str, base_str],
         SYSCAP_BIND_NAMESPACE,
-        // **Five now.** The fifth is the clipboard (M12 Part E); the shell binds it into every
-        // application namespace it constructs, for the same reason as the other four — a
-        // binding resolves to a kernel registration and never back to an endpoint.
-        &[draw, fs, tty, profile, clipboard],
+        // **Six now.** The fifth is the clipboard (M12 Part E) and the sixth the view broker
+        // (administration Part A.4); the shell binds each into every application namespace it
+        // constructs, for the same reason as the rest — a binding resolves to a kernel
+        // registration and never back to an endpoint.
+        &[draw, fs, tty, profile, clipboard, views_for_shell],
     );
+    // **Tell the broker the session ended**, as the serial column does.
+    if let Some((id, _)) = opened {
+        libsession::views_close_session(views_sup, id);
+    }
     // The leader has been reaped, so this drops the last reference to the namespace and with
     // it every binding in it.
     // SAFETY: closing the namespace we created for this session.
@@ -263,6 +297,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // The clipboard server's forwarding endpoint (M12 Part E) — the fifth, and the second
     // that both columns take.
     let clipboard_endpoint = recv_handoff(control);
+    // The view broker's (administration Part A.4) — the sixth, and the third both columns take.
+    let views_endpoint = recv_handoff(control);
+    // A supervisor channel to it, resolved once, as the serial column does: this process opens a
+    // session for each login and closes it when the shell exits.
+    let views_sup = if views_endpoint != 0 {
+        ns_lookup(root_ns, b"/svc/views/session", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).1
+    } else {
+        0
+    };
     // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
     // the machine's, and re-resolving per attempt would mint a session per keystroke.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
@@ -421,7 +464,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
-                draw_endpoint, clipboard_endpoint, &user[..ul], &pass[..pl],
+                draw_endpoint, clipboard_endpoint, views_endpoint, views_sup, &user[..ul],
+                &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.

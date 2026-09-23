@@ -1,7 +1,8 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-08-25). **`/svc/auth` is real as of M7 Part C** — the binding this document described
+2026-09-23, when each session gained a view-broker session and `/dev/views` — administration
+Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document described
 before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
 under "Credential validation" is the current shape; the history is kept because a doc that
 quietly starts being right again teaches nobody why it was wrong. The full
@@ -169,6 +170,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/home` | the fs-server endpoint, **scoped to the user's home subtree** | LOOKUP · READ · WRITE · MAP_READ · MAP_WRITE |
 | `/bin` | the system profile endpoint | read-only (program names resolve) |
 | `/store` | the store | read-only (shared artifacts) |
+| `/dev/views` | the view broker's forwarding endpoint, **scoped to `/s/<session>`** | the session's identity to the broker — see below |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
@@ -181,8 +183,9 @@ supervisor cannot re-bind the `/dev/blk` kernel server), and `desktop-shell` pas
 programs it launches, because on a machine with no serial port the graphical session is the only
 way to log in. Nothing else grants them: an ordinary live boot and an installed system build the
 namespace above, and `check-live` asserts that an ordinary boot's transcript never mentions an
-installer session. When elevation exists (`../planning/administration.md`), a broker will construct
-this namespace after authenticating, and the installer will not change. The user shell is then spawned with this
+installer session. The view broker (administration Part A) does not construct this namespace: it
+copies the caller's own and adds a profile's grants, and the `disks` grant *is* this binding, per
+device — which is what lets the installer run from an ordinary session under `with admin` (Part G). The user shell is then spawned with this
 namespace (`SpawnArgs.namespace`; the child receives a LOOKUP-only handle to it) and
 **empty `SysCaps`** — a fully unprivileged leaf.
 
@@ -209,6 +212,25 @@ absolute path and resolves it, unaware a base was prepended. (The mechanism is a
 property of the namespace object; see
 [namespace-and-resource-servers](namespace-and-resource-servers.md).)
 
+### The view broker's session
+
+**Each login opens a session with the view broker, and the session's base is its identity**
+(administration Part A.4). Before building the namespace, the supervisor — `session-mgr` or
+`desktop-session-mgr`; both do — sends `OpenSession` for the principal it authenticated, over a
+channel it resolved once at `/svc/views/session`, and gets an id. It binds the broker's forwarding
+endpoint at `/dev/views` with the subtree base `/s/<id>`, so every resolve of `/dev/views` from the
+session reaches the broker with the suffix `s/<id>`, which no program in the session can change.
+`desktop-shell` binds the same endpoint, at the same base, into every application namespace it
+builds, so `with` works in a terminal it launched — and is the one exception: it holds the raw
+endpoint and `BIND_NAMESPACE` to do that, so it could bind any base. It already holds the
+whole-tree filesystem endpoint, so this trusts it with nothing new, but the graphical session's
+identity rests on it.
+
+**When the leader exits, the supervisor sends `CloseSession`.** The endpoint closing could not be
+the signal: a program the broker started in a view still binds the session's `/dev/views`, so the
+registration outlives the login. Ids are never reused — the same lingering program still holds the
+old base. A boot without the broker builds sessions without `/dev/views`, and says so.
+
 ### Where the building-block endpoints come from
 
 Constructing a namespace means binding *endpoint handles*, so the process that
@@ -234,8 +256,9 @@ supervisor drops to on a critical-path failure — no longer the normal console.
 
 ## Deferred
 
-- Roles / role-to-capability mapping beyond a single principal; a privilege broker
-  for escalation (v5.1: "escalation is handle acquisition," not a state change).
+- Roles / role-to-capability mapping beyond a single principal. (*The privilege broker this line
+  also deferred — v5.1's "escalation is handle acquisition," not a state change — is built: the view
+  broker, administration Part A, 2026-09-23.*)
 - Per-user **profile overlays** (a user profile layered over the system profile) —
   designed in [profiles-and-namespace-projection](profiles-and-namespace-projection.md);
   a session binds the system `/bin` only.

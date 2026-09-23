@@ -448,6 +448,39 @@ impl Namespace {
         out.rights = b.rights.bits();
         true
     }
+
+    /// A new namespace holding **a copy of every binding** in this one — `sys_ns_derive`.
+    ///
+    /// **A snapshot, not a view.** The copy owns its own binding list, so a later bind or unbind
+    /// in either namespace does not reach the other. The *targets* are shared rather than
+    /// duplicated: a direct handle's object and a userspace server's registration each gain a
+    /// reference, and a kernel server's id is copied. So both namespaces resolve the same paths to
+    /// the same resources, and a registration stays alive while either one binds it. A binding's
+    /// subtree base and its rights are copied with it. The resolution cache is not: it is a pure
+    /// optimisation, and the copy starts with an empty one.
+    ///
+    /// **The module's lock discipline, twice over.** Targets are cloned under this namespace's
+    /// lock, which is an atomic bump and never a drop. The copy is built in a list that outlives
+    /// the guard, so a failed allocation partway through drops the targets cloned so far only
+    /// *after* the lock is released. And the new namespace's lock is taken only to install the
+    /// finished list, never while this one's is held: both are rank 4.
+    ///
+    /// Why it exists: a view is its caller's namespace plus a profile's grants, and a broker that
+    /// rebuilt a session from its ingredients would have to hold them all
+    /// (`docs/planning/administration.md` § *A view is your namespace plus a profile*).
+    pub fn try_derive(&self) -> Result<KBox<Namespace>, AllocError> {
+        let derived = Namespace::try_new()?;
+        let mut copied: KVec<Binding> = KVec::new();
+        let copy = {
+            let guard = self.inner.lock();
+            copy_bindings(&guard.bindings, &mut copied)
+        };
+        copy?;
+        // Swap rather than assign, so the empty list it replaces is dropped here, outside the
+        // new namespace's lock — it holds nothing, but the rule is simpler kept than argued.
+        core::mem::swap(&mut derived.inner.lock().bindings, &mut copied);
+        Ok(derived)
+    }
 }
 
 // No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
@@ -491,6 +524,30 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
             ResolvedTarget::UserspaceServer(reg.clone(), *base)
         }
     }
+}
+
+/// Copy every binding in `from` onto the end of `into`, for [`Namespace::try_derive`]: each path's
+/// bytes, each target shared (a direct handle or a registration cloned, a kernel server's id
+/// copied), each subtree base and rights value as they are.
+///
+/// **Called under the source's lock**, so it allocates (rank 4 → the rank-6 allocator is legal)
+/// and clones, and never drops a target. An `Err` leaves `into` holding the bindings copied so far,
+/// for the caller to drop once the lock is released.
+fn copy_bindings(from: &KVec<Binding>, into: &mut KVec<Binding>) -> Result<(), AllocError> {
+    into.try_reserve(from.len())?;
+    for b in from.iter() {
+        let mut path: KVec<u8> = KVec::new();
+        path.try_extend_from_slice(&b.path)?;
+        let target = match &b.target {
+            BindingTarget::DirectHandle(obj) => BindingTarget::DirectHandle(obj.clone()),
+            BindingTarget::KernelServer(id) => BindingTarget::KernelServer(*id),
+            BindingTarget::UserspaceServer(reg, base) => {
+                BindingTarget::UserspaceServer(reg.clone(), *base)
+            }
+        };
+        into.try_push(Binding { path, target, rights: b.rights }).expect("slot reserved above");
+    }
+    Ok(())
 }
 
 /// If `binding` is a component-boundary prefix of the absolute `query`, return
@@ -991,5 +1048,138 @@ mod tests {
             }
         }
         assert!(n.unbind(b"/dev/entropy").is_none(), "already removed");
+    }
+
+    /// **A copy resolves every kind of binding the way its source does.** A direct handle
+    /// resolves to the same object, a kernel server to the same id, and a userspace server to
+    /// the same registration **with the same subtree base**. Each binding keeps its rights. A
+    /// view is its caller's namespace plus a profile's grants, so a copy that lost a base would
+    /// widen a session's `/home` to the whole filesystem, and one that lost rights would change
+    /// what the program may do (`docs/planning/administration.md` § Part A).
+    #[test]
+    fn derive_copies_every_binding_kind_with_its_rights_and_base() {
+        let n = ns();
+        let obj = target();
+        let obj_addr = obj.as_ptr() as usize;
+        n.bind(b"/dev/timer", obj, Rights::LOOKUP | Rights::INSPECT).unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
+        let reg = us_reg_target();
+        let reg_addr = reg.as_ptr() as usize;
+        let base = SubtreeBase::from_path(b"/home/alice").unwrap();
+        n.bind_userspace_server(b"/home", reg, Rights::LOOKUP | Rights::WRITE, base).unwrap();
+
+        let d = n.try_derive().unwrap();
+        let (t, r, suf) = d.resolve(b"/dev/timer").unwrap();
+        assert_eq!((r, suf), (Rights::LOOKUP | Rights::INSPECT, &b""[..]));
+        match t {
+            ResolvedTarget::DirectHandle(o) => assert_eq!(o.as_ptr() as usize, obj_addr),
+            _ => panic!("expected a direct handle"),
+        }
+        let (t, r, _) = d.resolve(b"/dev/entropy").unwrap();
+        assert_eq!(r, Rights::READ);
+        assert!(matches!(t, ResolvedTarget::KernelServer(KernelServerId::Entropy)));
+        let (t, r, suf) = d.resolve(b"/home/notes.txt").unwrap();
+        assert_eq!((r, suf), (Rights::LOOKUP | Rights::WRITE, &b"notes.txt"[..]));
+        match t {
+            ResolvedTarget::UserspaceServer(reg, b) => {
+                assert_eq!(reg.as_ptr() as usize, reg_addr, "the same registration, shared");
+                assert_eq!(b.as_path(), b"/home/alice", "the base came with the binding");
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+    }
+
+    /// **A snapshot, not a view, in both directions.** After the copy, a bind or an unbind in
+    /// either namespace leaves the other as it was. A long-running program in a view does not
+    /// see its session change underneath it, and pruning a copy cannot reach the namespace it
+    /// was copied from.
+    #[test]
+    fn derive_is_a_snapshot_in_both_directions() {
+        let n = ns();
+        n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
+        n.bind(b"/b", target(), Rights::LOOKUP).unwrap();
+        let d = n.try_derive().unwrap();
+
+        n.bind(b"/c", target(), Rights::LOOKUP).unwrap();
+        drop(n.unbind(b"/a").expect("was bound"));
+        assert!(d.resolve(b"/c").is_none(), "a later bind in the source reached the copy");
+        assert!(d.resolve(b"/a").is_some(), "an unbind in the source reached the copy");
+
+        d.bind(b"/d", target(), Rights::LOOKUP).unwrap();
+        drop(d.unbind(b"/b").expect("was bound"));
+        assert!(n.resolve(b"/d").is_none(), "a bind in the copy reached the source");
+        assert!(n.resolve(b"/b").is_some(), "an unbind in the copy reached the source");
+    }
+
+    /// **Targets are shared, not moved or duplicated.** Dropping either namespace leaves the
+    /// other's targets alive, and dropping both destroys each exactly once. That holds for a
+    /// direct handle and for a registration alike. A registration outliving every binding of
+    /// it is how a server's kernel end is released, so a copy that took a reference too few
+    /// would free it under a live binding, and one too many would leak it.
+    #[test]
+    fn derive_shares_targets_and_each_is_freed_once() {
+        init_global_heap();
+        test_probe::reset();
+        let n = Namespace::try_new().unwrap();
+        n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
+        n.bind(b"/b", target(), Rights::LOOKUP).unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
+            .unwrap();
+        let d = n.try_derive().unwrap();
+
+        drop(n);
+        assert_eq!(test_probe::timer_destroys(), 0, "the copy still binds both timers");
+        assert_eq!(test_probe::userspace_server_reg_destroys(), 0, "and the registration");
+        assert!(d.resolve(b"/a").is_some());
+        drop(d);
+        assert_eq!(test_probe::timer_destroys(), 2, "each timer freed once");
+        assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "the registration freed once");
+    }
+
+    /// **Unbinding can widen.** Resolution is longest-prefix, so removing a narrower binding
+    /// hands its paths to the broader one beneath it. Here `/` reaches a whole filesystem and
+    /// `/home` only alice's subtree of it: the source confines `/home/bob/x` to alice's, and a
+    /// copy with `/home` unbound reaches bob's. Any holder of a namespace can derive a copy and
+    /// unbind in it, so **a narrower binding must never be what hides part of a broader one** —
+    /// the rule `docs/architecture/namespace-and-resource-servers.md` states (PR #329 review,
+    /// finding 3, which corrected docs that said unbinding could only narrow).
+    #[test]
+    fn unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one() {
+        let n = ns();
+        let whole = us_reg_target();
+        let whole_addr = whole.as_ptr() as usize;
+        n.bind_userspace_server(b"/", whole, Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let alice = SubtreeBase::from_path(b"/home/alice").unwrap();
+        n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP, alice).unwrap();
+
+        let d = n.try_derive().unwrap();
+        drop(d.unbind(b"/home").expect("was bound"));
+        match d.resolve(b"/home/bob/x").unwrap() {
+            (ResolvedTarget::UserspaceServer(reg, b), _, suf) => {
+                assert_eq!(reg.as_ptr() as usize, whole_addr, "the whole filesystem");
+                assert_eq!((b.as_path(), suf), (&b""[..], &b"home/bob/x"[..]), "bob's file");
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+        match n.resolve(b"/home/bob/x").unwrap() {
+            (ResolvedTarget::UserspaceServer(_, b), _, suf) => {
+                assert_eq!((b.as_path(), suf), (&b"/home/alice"[..], &b"bob/x"[..]), "confined");
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+    }
+
+    /// **The copy's cache starts empty.** The source's entries are indices into *its* binding
+    /// list, so an inherited entry would be right only while the two lists happened to agree.
+    #[test]
+    fn derive_starts_with_an_empty_cache() {
+        let n = ns();
+        n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
+        let _ = n.resolve(b"/dev/tty0");
+        assert_eq!(n.cache_len(), 1, "precondition: the source has a cached entry");
+        let d = n.try_derive().unwrap();
+        assert_eq!(d.cache_len(), 0);
+        assert!(d.resolve(b"/dev/tty0").is_some());
+        assert_eq!(d.cache_len(), 1, "and it caches its own resolutions");
     }
 }

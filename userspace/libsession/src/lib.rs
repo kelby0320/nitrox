@@ -150,6 +150,19 @@ pub struct NamespaceSpec<'a> {
     /// authenticating, and nothing here changes: the authority is a binding a supervisor made,
     /// which is what that phase is for.
     pub bind_blk: bool,
+    /// The view broker's forwarding endpoint, bound at `/dev/views` with
+    /// [`views_base`](Self::views_base) as its subtree base. `0` binds nothing — a boot where
+    /// the broker did not start, whose sessions simply have no `with`.
+    ///
+    /// **The base is the session's identity** (administration Part A): the broker learns which
+    /// session a request comes from by the suffix a resolve reaches it with, and no program in the
+    /// session can choose another base — except `desktop-shell`, which is handed this endpoint to
+    /// bind into its applications (`graphical-session.md` §3). The endpoint rather than the
+    /// session's binding of it, for `/dev/tty`'s reason — a binding resolves to a registration,
+    /// never back to an endpoint.
+    pub views_endpoint: u64,
+    /// `/s/<session>`, from [`views_open_session`]. Empty binds nothing.
+    pub views_base: &'a [u8],
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -159,10 +172,17 @@ pub struct NamespaceSpec<'a> {
 pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
     // Build the request body, then wrap it in the rsproto envelope at the payload offset.
     let mut body = [0u8; 512];
-    let body_len = build_authenticate_request(&mut body, user, pass)?;
+    let body_len = build_authenticate_request(&mut body, user, pass);
     // SAFETY: SEND_MSG is a valid 4 KiB buffer; the envelope goes at offset 24.
-    let rs_len = unsafe {
-        encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..body_len], 0)?
+    let rs_len = body_len.and_then(|n| unsafe {
+        encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0)
+    });
+    // **Both copies of the password go as soon as it is sent**, sent or not: `body` is this
+    // frame's, and `SEND_MSG` is the crate's and outlives it — every later message here restamps
+    // only as much as it needs. A supervisor and the view broker both live as long as the machine.
+    let Some(rs_len) = rs_len else {
+        scrub(&mut body);
+        return None;
     };
     // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8 = 0) and send.
     let sr = unsafe {
@@ -177,6 +197,9 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
             SENDMODE_NOBLOCK,
         )
     };
+    scrub(&mut body);
+    // SAFETY: the crate's buffer; the kernel copied the message during the send.
+    unsafe { scrub(&mut *(&raw mut SEND_MSG)) };
     if sr != 0 {
         return None;
     }
@@ -220,6 +243,85 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     if result_ok { Some(home_len) } else { None }
 }
 
+/// One request to the view broker on `ch`, and its reply's body copied into `out`. `None` if the
+/// exchange failed or the broker answered with an error. The broker is the one server this crate
+/// speaks to besides `auth-service`, and a supervisor's only exchanges with it are these two.
+fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
+    // SAFETY: SEND_MSG is a valid buffer; single-threaded supervisor.
+    let rs_len = unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], op, 1, 0, body, 0)? };
+    // SAFETY: as above; a valid endpoint and a zero-handle send.
+    let sr = unsafe {
+        SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        SEND_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 || !wait_one(ch) {
+        return None;
+    }
+    // SAFETY: valid recv out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return None;
+    }
+    // SAFETY: bounded read of the reply the kernel just wrote.
+    let reply = unsafe {
+        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            len.min(MSG_LEN - PAYLOAD_OFF),
+        )
+    };
+    let m = decode(reply).ok()?;
+    if m.op != op || m.is_error() {
+        return None;
+    }
+    let n = m.body.len().min(out.len());
+    out[..n].copy_from_slice(&m.body[..n]);
+    Some(n)
+}
+
+/// Open a session with the view broker for `principal`, over a supervisor channel resolved at
+/// `/svc/views/session`, and write the session's base — `/s/<id>`, what [`NamespaceSpec::views_base`]
+/// wants — into `base_out`. Returns the id and the base's length, or `None` if the broker did not
+/// answer: the session is then built without `/dev/views`.
+pub fn views_open_session(sup: u64, principal: &[u8], base_out: &mut [u8; 24]) -> Option<(u64, usize)> {
+    let mut reply = [0u8; 8];
+    let n = views_call(sup, librsproto::views::OP_VIEWS_OPEN_SESSION, principal, &mut reply)?;
+    let id = librsproto::views::parse_session_id(&reply[..n])?;
+    // `/s/` and at most twenty digits: 23 bytes, inside the 24 the caller gives.
+    let mut buf = [0u8; 20];
+    let d = libkern::debug::fmt_u64(id, &mut buf);
+    base_out[..3].copy_from_slice(b"/s/");
+    base_out[3..3 + d.len()].copy_from_slice(d);
+    Some((id, 3 + d.len()))
+}
+
+/// Tell the view broker that session `id` has ended, so it asks what it started there to stop and
+/// takes back the grants. **The supervisor's job, not the endpoint closing's**: a program running
+/// in a view still binds the session's `/dev/views`, so the registration outlives the login
+/// (`docs/planning/administration.md` § *Identity is the endpoint you call on*).
+pub fn views_close_session(sup: u64, id: u64) {
+    let mut body = [0u8; 8];
+    if let Some(n) = librsproto::views::build_session_id(&mut body, id) {
+        let _ = views_call(sup, librsproto::views::OP_VIEWS_CLOSE_SESSION, &body[..n], &mut [0u8; 1]);
+    }
+}
+
 /// Construct a session namespace for a login whose home is `home` (an absolute path,
 /// e.g. `/home/alice`): a fresh namespace binding the user's home subtree of the
 /// fs-server at `/home` (RW) and the console at `/dev/console` (so the shell has I/O).
@@ -240,6 +342,8 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         bind_fonts,
         bind_console,
         bind_blk,
+        views_endpoint,
+        views_base,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
@@ -414,6 +518,31 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         has_clipboard = cr == 0;
     }
 
+    // `/dev/views` → the view broker, **at this session's base** (administration Part A.4): a
+    // process here resolving `/dev/views` reaches the broker with the suffix `s/<session>`, which
+    // is how the broker knows whose request it is. Non-fatal, like the clipboard: a session
+    // without it has no `with`, and nothing else in it notices.
+    let mut has_views = false;
+    if views_endpoint != 0 && !views_base.is_empty() {
+        let dev = b"/dev/views";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let vr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                dev.as_ptr() as u64,
+                dev.len() as u64,
+                views_endpoint,
+                views_base.as_ptr() as u64,
+                views_base.len() as u64,
+            )
+        };
+        if vr != 0 {
+            kprint(b"libsession: /dev/views bind FAIL (no `with` in this session)\n");
+        }
+        has_views = vr == 0;
+    }
+
     // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
     // uses. Read-only by construction: a subtree bind forwards to the same registration, and
     // nothing in the session has a writable handle to it.
@@ -490,6 +619,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         SESSION_HAS_TTY = has_tty;
         SESSION_HAS_CONSOLE = has_console;
         SESSION_HAS_CLIPBOARD = has_clipboard;
+        SESSION_HAS_VIEWS = has_views;
     }
     ns
 }
@@ -557,6 +687,31 @@ pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
             .end();
     }
     bound
+}
+
+/// Take back what [`rebind_block_devices`] bound into `ns`: each `/dev/blk/<n>` and its `info`.
+/// Returns how many devices were unbound.
+///
+/// **The view broker's, for a session that ended** (`docs/planning/administration.md` § Part A).
+/// It asks every program it started for the session to exit, and unbinds their grants so nothing
+/// new can be resolved through them. A handle a program already holds is not taken back — the
+/// kernel has no revocation — which is why this is half of ending a session rather than all of it.
+pub fn unbind_block_devices(ns: u64) -> usize {
+    let mut unbound = 0;
+    for n in 0..MAX_BLOCK_DEVICES {
+        let mut path = [0u8; 20];
+        // The leaf first, so the device's binding is never left without the one beside it —
+        // and `NotFound` for a leaf that was never bound is no error.
+        let info_len = write_blk_path(&mut path, n, true);
+        // SAFETY: valid namespace handle and path.
+        unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, info_len as u64) };
+        let dev_len = write_blk_path(&mut path, n, false);
+        // SAFETY: as above.
+        if unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, dev_len as u64) } == 0 {
+            unbound += 1;
+        }
+    }
+    unbound
 }
 
 /// Block devices a session may be handed. The registry is small — a disk, its partitions, any
@@ -688,6 +843,16 @@ pub fn session_has_clipboard() -> bool {
 
 /// Set by [`build_namespace`]; see [`session_has_clipboard`].
 static mut SESSION_HAS_CLIPBOARD: bool = false;
+
+/// Whether the last [`build_namespace`] bound `/dev/views` — reported, for the log line that has
+/// to be able to say "no".
+pub fn session_has_views() -> bool {
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe { SESSION_HAS_VIEWS }
+}
+
+/// Set by [`build_namespace`]; see [`session_has_views`].
+static mut SESSION_HAS_VIEWS: bool = false;
 
 /// See [`session_has_console`].
 static mut SESSION_HAS_CONSOLE: bool = false;
@@ -982,13 +1147,12 @@ pub fn spawn_leader(
         {
             // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
             let r = unsafe {
-                // **Scrub the payload first.** This buffer is the crate's, and `authenticate`
-                // filled it with an `Authenticate` request — the username and password in the
-                // clear. Restamping only the header would send all `MSG_LEN` bytes anyway, so
-                // the leader would receive the login password and hold it in `.bss` for the life
-                // of the process. `desktop-session-mgr` volatile-zeroes its own stack copy two
-                // lines from here; handing the same bytes to a child instead would make that
-                // pointless (PR #237 review, finding 1).
+                // **Scrub the payload first.** This buffer is the crate's, and holds whatever
+                // was sent last — once, an `Authenticate` request, the username and password in
+                // the clear, which `authenticate` now scrubs itself. Restamping only the header
+                // would send all `MSG_LEN` bytes anyway, so the leader would receive whatever was
+                // there and hold it in `.bss` for the life of the process (PR #237 review,
+                // finding 1).
                 SEND_MSG[PAYLOAD_OFF..].fill(0);
                 SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
                 SEND_MSG[8] = count as u8;

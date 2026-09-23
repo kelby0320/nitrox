@@ -1,0 +1,27 @@
+[package]
+name = "view-broker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream", features = ["io"] }
+libsession = { path = "../libsession" }
+libfs = { path = "../libfs" }
+liblog = { path = "../liblog" }
+
+# The library/binary split every resource server here uses: the library is the part that can
+# be wrong about who may do what — the `views.toml` reader, rule evaluation, the
+# last-administrator guard, and per-session pacing — and is host-tested; the binary is the
+# bare-target event loop, which cannot build on host (`#![no_main]`). Not alloc-free: a policy
+# and a table of sessions are sized by what the file and the logins say, so `main.rs` registers
+# `libheap` as the `#[global_allocator]`.
+[lib]
+name = "view_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "view-broker"
+path = "src/main.rs"

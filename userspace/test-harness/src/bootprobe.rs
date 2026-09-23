@@ -29,11 +29,18 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 /// `Line` builds its text on the heap, so this bin needs an allocator.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 use libkern::debug::Line;
+use libkern::abi::HandleInfo;
+use libkern::{
+    RIGHT_LOOKUP, RIGHT_TRANSFER, RIGHT_UNBIND, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
+    SYS_NS_DERIVE, SYS_NS_UNBIND,
+};
 use libkern::{
     RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
     SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT,
@@ -783,7 +790,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & grow_test(root_ns)
         & create_test(root_ns)
         & subtree_bind_test(root_ns)
-        & auth_multi_client_test(root_ns);
+        & auth_multi_client_test(root_ns)
+        & ns_derive_test(root_ns)
+        & view_broker_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -835,6 +844,472 @@ fn auth_multi_client_test(root_ns: u64) -> bool {
         return false;
     }
     kprint(b"boot-probe: /svc/auth mints a session per caller (session-mgr + 2) ok\n");
+    true
+}
+
+/// Prove `sys_ns_derive` through the syscall, not only through `Namespace::try_derive`, whose host
+/// tests cannot see the rights check, the handle the syscall allocates, or the rights it carries
+/// (administration Part A.1).
+///
+/// Four claims, each one a view depends on:
+/// 1. the copy resolves what its source resolves;
+/// 2. it can be sent — `TRANSFER` — which the `LOOKUP`-only root this process was spawned with
+///    cannot, and it can be pruned, `UNBIND`;
+/// 3. pruning the copy leaves the source alone, the snapshot rule seen from the side that matters;
+/// 4. a namespace handle without `LOOKUP` cannot be copied.
+///
+/// `/subtreetest` is the test image's own `[[bind]]`, which `subtree_bind_test` above already
+/// resolves, so this borrows a binding that is known to be there rather than adding one.
+fn ns_derive_test(root_ns: u64) -> bool {
+    const PATH: &[u8] = b"/subtreetest/current-generation";
+    // SAFETY: a namespace handle this process holds.
+    let d = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if d <= 0 {
+        Line::new().s(b"boot-probe: ns derive FAIL (").i(d as i64).s(b")").end();
+        return false;
+    }
+    let d = d as u64;
+    let close = |h: u64| {
+        if h != 0 {
+            // SAFETY: closing a handle this process owns.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        }
+    };
+    let mut ok = true;
+
+    let (st, fh) = ns_lookup(d, PATH, RIGHT_MAP_READ);
+    close(fh);
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: ns derive: the copy does not resolve what the root does FAIL\n");
+        ok = false;
+    }
+
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, d, (&raw mut info) as u64) };
+    let want = RIGHT_TRANSFER | RIGHT_UNBIND;
+    if sr != 0 || info.rights & want != want {
+        kprint(b"boot-probe: ns derive: the copy cannot be sent or pruned FAIL\n");
+        ok = false;
+    }
+
+    let bind = b"/subtreetest";
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    let ur = unsafe { syscall4(SYS_NS_UNBIND, d, bind.as_ptr() as u64, bind.len() as u64, 0) };
+    let (cst, cfh) = ns_lookup(d, PATH, RIGHT_MAP_READ);
+    let (rst, rfh) = ns_lookup(root_ns, PATH, RIGHT_MAP_READ);
+    close(cfh);
+    close(rfh);
+    if ur != 0 || cst == 0 {
+        kprint(b"boot-probe: ns derive: unbinding in the copy did not take FAIL\n");
+        ok = false;
+    }
+    if rst != 0 {
+        kprint(b"boot-probe: ns derive: unbinding in the copy reached the root FAIL\n");
+        ok = false;
+    }
+
+    // A handle to the same copy with everything but `LOOKUP`.
+    // SAFETY: `d` carries `DUPLICATE`; the result is a handle this process owns.
+    let blind = unsafe { syscall2(SYS_HANDLE_DUPLICATE, d, !RIGHT_LOOKUP) };
+    // SAFETY: as above.
+    let refused = blind > 0 && unsafe { syscall1(SYS_NS_DERIVE, blind as u64) } < 0;
+    if blind > 0 {
+        close(blind as u64);
+    }
+    if !refused {
+        kprint(b"boot-probe: ns derive: copied a handle without LOOKUP FAIL\n");
+        ok = false;
+    }
+
+    close(d);
+    if ok {
+        kprint(b"boot-probe: ns derive: a sendable snapshot, pruned without touching the root ok\n");
+    }
+    ok
+}
+
+/// The demo account the build seeds, and the policy it seeds for it (`xtask`'s `DEMO_USER` and
+/// `DEMO_PASSWORD`, and `seeded_views_toml`). A build input, not a secret — `init`'s login
+/// selftest used the same literals.
+const DEMO_USER: &[u8] = b"alice";
+const DEMO_PASSWORD: &[u8] = b"correct horse battery staple";
+
+fn clock_ns() -> u64 {
+    let mut t = 0u64;
+    // SAFETY: `t` is a valid writable u64 out-param.
+    unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut t) as u64) };
+    t
+}
+
+/// One exchange with the view broker: send `op` on `ch` carrying `body` and moving `handles`, and
+/// wait — at most ten seconds — for the reply to it. An `Exited` that arrives first is set aside in
+/// `exited` rather than mistaken for the reply. `None` if nothing came.
+fn views_call(
+    ch: u64,
+    op: u16,
+    request_id: u64,
+    body: &[u8],
+    handles: &[u64],
+    exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Option<(bool, alloc::vec::Vec<u8>)> {
+    if !views_send(ch, op, request_id, body, handles) {
+        return None;
+    }
+    views_receive(ch, request_id, exited)
+}
+
+/// Send one message to the broker without waiting for its answer.
+fn views_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
+    let mut msg = [0u8; 4096];
+    let Some(n) = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    // SAFETY: valid message buffer and handle array.
+    let sr = unsafe {
+        syscall5(
+            libkern::SYS_CHANNEL_SEND,
+            ch,
+            msg.as_ptr() as u64,
+            handles.as_ptr() as u64,
+            handles.len() as u64,
+            libkern::SENDMODE_NOBLOCK,
+        )
+    };
+    sr == 0
+}
+
+/// Wait for the message with `request_id` on `ch` (`0` for the next `Exited`), setting any other
+/// `Exited` aside in `exited`. Ten seconds at most.
+fn views_receive(
+    ch: u64,
+    request_id: u64,
+    exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Option<(bool, alloc::vec::Vec<u8>)> {
+    let deadline = clock_ns() + 10_000_000_000;
+    let mut buf = [0u8; 4096];
+    let mut hs = [0u64; 8];
+    loop {
+        let mut count = 0usize;
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(
+                libkern::SYS_CHANNEL_RECV,
+                ch,
+                buf.as_mut_ptr() as u64,
+                hs.as_mut_ptr() as u64,
+                (&raw mut count) as u64,
+            )
+        };
+        if rr == 0 {
+            let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            let m = librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok()?;
+            if m.op == librsproto::views::OP_VIEWS_EXITED && m.request_id == 0 {
+                if request_id == 0 {
+                    return Some((false, m.body.to_vec()));
+                }
+                exited.push(m.body.to_vec());
+                continue;
+            }
+            if m.request_id == request_id {
+                return Some((m.is_error(), m.body.to_vec()));
+            }
+            continue;
+        }
+        if clock_ns() >= deadline {
+            return None;
+        }
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with a deadline.
+        unsafe {
+            WAIT_HANDLES[0] = ch;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline);
+        }
+    }
+}
+
+/// **The view broker, through its own protocol** (administration Part A.3), before any shell or
+/// `with` exists to drive it. `boot-probe` holds the unscoped root namespace, so it can be both a
+/// supervisor — opening a session for the demo account — and a client in that session, at
+/// `/svc/views/s/<id>`, which is exactly what a session's `/dev/views` reaches.
+///
+/// What it proves, in the order it runs, each a thing a later piece depends on:
+/// 1. a request the policy allows asks for a password;
+/// 2. a wrong password is refused with a retry, and the right one — offered straight after — is
+///    **held for the session's delay** before it is answered;
+/// 3. **the grant arrived**: `nxinstall` is sent a copy of this namespace with `/dev/blk`
+///    removed, and still exits 0, which is "listed the devices it can see" — its 1 would be
+///    "none";
+/// 4. a client the broker lets in can start its program with its exit heard, even when the
+///    broker has let in all it can;
+/// 5. **one guess per delay, however many requests**: passwords queued on two requests during
+///    one delay are answered a delay apart, not together when it ends;
+/// 6. a program outside a rule's `run` is refused by the policy;
+/// 7. `with --check`'s op refuses a policy nobody could administer, and a handle sent with an op
+///    that takes none is closed rather than kept;
+/// 8. once the session is closed, its base names nothing.
+fn view_broker_test(root_ns: u64) -> bool {
+    use librsproto::views::*;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: view broker: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => match parse_session_id(&body) {
+            Some(id) => id,
+            None => return fail(b"OpenSession's reply"),
+        },
+        _ => return fail(b"OpenSession"),
+    };
+    let client_path = alloc::format!("/svc/views/s/{session}");
+    let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st != 0 || cli == 0 {
+        return fail(b"no client channel at the session's base");
+    }
+
+    // A copy of this namespace with every disk removed, so a 0 from `nxinstall` can only be the
+    // grant's doing.
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if copy <= 0 {
+        return fail(b"derive");
+    }
+    let copy = copy as u64;
+    let blk = b"/dev/blk";
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    unsafe { syscall4(SYS_NS_UNBIND, copy, blk.as_ptr() as u64, blk.len() as u64, 0) };
+    let (bst, bh) = ns_lookup(copy, b"/dev/blk/0", libkern::RIGHT_READ);
+    if bst == 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, bh) };
+        return fail(b"precondition: the copy still reaches /dev/blk/0");
+    }
+
+    // **Keep a duplicate of what is sent**, the way a caller hoping to reach the view would: the
+    // broker must build the view in a namespace of its own, so nothing it grants reaches this.
+    // SAFETY: `copy` carries `DUPLICATE`; the result is a handle this process owns.
+    let kept = unsafe { syscall2(SYS_HANDLE_DUPLICATE, copy, u64::MAX) };
+    if kept <= 0 {
+        return fail(b"duplicate the copy");
+    }
+    let kept = kept as u64;
+
+    let mut req = [0u8; 256];
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli, OP_VIEWS_REQUEST, 2, &req[..n], &[copy], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+        _ => return fail(b"an allowed request did not ask for a password"),
+    }
+    match views_call(cli, OP_VIEWS_PASSWORD, 3, b"not the password", &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))) => {}
+        _ => return fail(b"a wrong password was not refused with a retry"),
+    }
+    let refused_at = clock_ns();
+    match views_call(cli, OP_VIEWS_PASSWORD, 4, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"the right password did not start the program"),
+    }
+    // **Held, not merely slow.** The delay is two seconds; the scheduler's tick is ten
+    // milliseconds, so anything past 1.9 s is the broker holding the check, and an answer much
+    // sooner is a broker that did not.
+    let held = clock_ns().saturating_sub(refused_at);
+    if held < 1_900_000_000 {
+        return fail(b"the password after a wrong one was answered without the session's delay");
+    }
+    // The program is running with its grant; the namespace this process sent must not have it.
+    let (kst, kh) = ns_lookup(kept, b"/dev/blk/0", libkern::RIGHT_READ);
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, kept);
+        if kh != 0 {
+            syscall1(SYS_HANDLE_CLOSE, kh);
+        }
+    }
+    if kst == 0 {
+        return fail(b"the grant was bound into the namespace the caller sent, which it still holds");
+    }
+    let code = match exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) {
+        Some(body) => parse_exited(&body),
+        None => None,
+    };
+    if code != Some((0, false)) {
+        Line::new().s(b"boot-probe: view broker: nxinstall exited ").i(code.map_or(-99, |c| c.0 as i64)).end();
+        return fail(b"the program did not see the granted disks");
+    }
+    // SAFETY: closing our own handle; the request is done.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
+
+    // 4. **A client let in can always start its program.** Open clients until the broker refuses
+    // one, then start a program on the last it let in: that program's exit must still be heard.
+    // Admitting by what was open let the last channel into the last slot, and its program's life
+    // channel then had none — an exit never seen (PR #329 review, finding 5).
+    let mut filled = alloc::vec::Vec::new();
+    let refused = loop {
+        let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        if st != 0 || ch == 0 {
+            break st;
+        }
+        filled.push(ch);
+        if filled.len() > libkern::MAX_WAIT_HANDLES {
+            return fail(b"the broker never refused a client");
+        }
+    };
+    if refused != libkern::KError::WouldBlock.as_i32() {
+        Line::new().s(b"boot-probe: view broker: client ").u(filled.len() as u64 + 1).s(b" refused with ").i(refused as i64).end();
+        return fail(b"a client was refused for something other than room");
+    }
+    let Some(&last) = filled.last() else {
+        return fail(b"no client was let in");
+    };
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    if copy <= 0 || !matches!(views_call(last, OP_VIEWS_REQUEST, 8, &req[..n], &[copy as u64], &mut exited), Some((false, _))) {
+        return fail(b"the last client's request");
+    }
+    match views_call(last, OP_VIEWS_PASSWORD, 9, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"the last client's program did not start"),
+    }
+    let heard = exited.pop().or_else(|| views_receive(last, 0, &mut exited).map(|r| r.1));
+    if heard.as_deref().and_then(parse_exited).is_none() {
+        Line::new().s(b"boot-probe: view broker: ").u(filled.len() as u64).s(b" clients let in").end();
+        return fail(b"the exit of the last client's program was never heard");
+    }
+    for ch in filled {
+        // SAFETY: closing our own handles.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
+    }
+
+    // 5. Two more requests, `b` and `c`. `b` fails; then a password goes on each before the
+    // delay ends. Both are held — and when the first of them fails too, it holds the second
+    // (PR #329 review, blocking finding 1: they were once checked back to back).
+    let mut pair = [0u64; 2];
+    for (k, slot) in pair.iter_mut().enumerate() {
+        let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        if st != 0 || ch == 0 || copy <= 0 {
+            return fail(b"a client channel and a copy for the paced pair");
+        }
+        let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+            return fail(b"build a request");
+        };
+        match views_call(ch, OP_VIEWS_REQUEST, 10 + k as u64, &req[..n], &[copy as u64], &mut exited) {
+            Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+            _ => return fail(b"the paced pair's request did not ask for a password"),
+        }
+        *slot = ch;
+    }
+    let [b, c] = pair;
+    let retry = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
+        matches!(r, Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))))
+    };
+    if !retry(views_call(b, OP_VIEWS_PASSWORD, 20, b"wrong", &[], &mut exited)) {
+        return fail(b"the paced pair's first wrong password");
+    }
+    let t0 = clock_ns();
+    if !views_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !views_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
+        return fail(b"send the paced pair's passwords");
+    }
+    if !retry(views_receive(b, 21, &mut exited)) {
+        return fail(b"the first held password's answer");
+    }
+    let t1 = clock_ns();
+    if !retry(views_receive(c, 22, &mut exited)) {
+        return fail(b"the second held password's answer");
+    }
+    let t2 = clock_ns();
+    if t1.saturating_sub(t0) < 1_900_000_000 || t2.saturating_sub(t1) < 1_900_000_000 {
+        Line::new().s(b"boot-probe: view broker: held answers after ").u((t1 - t0) / 1_000_000).s(b" ms and ").u(t2.saturating_sub(t1) / 1_000_000).s(b" ms").end();
+        return fail(b"two passwords held in one delay were checked together");
+    }
+    // SAFETY: closing our own handles; the broker drops what they asked for.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, b);
+        syscall1(SYS_HANDLE_CLOSE, c);
+    }
+
+    // A second client in the same session: a program the `install` view does not include.
+    let (st, cli2) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st != 0 || cli2 == 0 {
+        return fail(b"a second client channel");
+    }
+    // SAFETY: a namespace handle this process holds.
+    let copy2 = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let Some(n) = build_request(&mut req, 0, b"install", b"nxsh", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli2, OP_VIEWS_REQUEST, 5, &req[..n], &[copy2 as u64], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: false }, _))) => {}
+        _ => return fail(b"a program outside the rule's `run` was not refused"),
+    }
+    let orphaned = b"[profile.admin]\ngrants = [\"disks\"]\n";
+    match views_call(cli2, OP_VIEWS_CHECK, 6, orphaned, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { .. }, _))) => {}
+        _ => return fail(b"a policy nobody could administer passed the check"),
+    }
+    // **A handle sent with anything but a request is closed.** Each op carries one end of a new
+    // channel; the broker closing it is what the other end sees as `PeerClosed` — a leak would
+    // leave it open, and any program in any session can send handles (PR #329 review, finding 4).
+    for (k, op) in [OP_VIEWS_STOP, OP_VIEWS_LIST, OP_VIEWS_CHECK].into_iter().enumerate() {
+        let (mut ours, mut theirs) = (0u64, 0u64);
+        // SAFETY: valid writable out-params.
+        let r = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
+        if r != 0 {
+            return fail(b"a channel to send the broker");
+        }
+        if views_call(cli2, op, 30 + k as u64, b"", &[theirs], &mut exited).is_none() {
+            return fail(b"no answer to an op carrying a handle");
+        }
+        let mut buf = [0u8; 64];
+        let mut hs = [0u64; 1];
+        let mut count = 0usize;
+        // SAFETY: valid recv out-params; `ours` is this process's.
+        let rr = unsafe {
+            let rr = syscall4(libkern::SYS_CHANNEL_RECV, ours, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64);
+            syscall1(SYS_HANDLE_CLOSE, ours);
+            rr
+        };
+        if rr != libkern::KError::PeerClosed.as_i32() as i64 {
+            Line::new().s(b"boot-probe: view broker: op ").u(op as u64).s(b" kept the handle sent with it").end();
+            return fail(b"a handle sent with an op that takes none was kept");
+        }
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli2) };
+
+    let mut id = [0u8; 8];
+    let n = build_session_id(&mut id, session).unwrap_or(0);
+    if !matches!(views_call(sup, OP_VIEWS_CLOSE_SESSION, 7, &id[..n], &[], &mut exited), Some((false, _))) {
+        return fail(b"CloseSession");
+    }
+    let (st, gone) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st == 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, gone) };
+        return fail(b"a closed session's base still resolves");
+    }
+    // `NotFound`, not merely a failure: an error body the kernel cannot read is `KernelError`.
+    if st != libkern::KError::NotFound.as_i32() {
+        Line::new().s(b"boot-probe: view broker: a closed session's base answered ").i(st as i64).end();
+        return fail(b"a closed session's base was refused for something other than being gone");
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, sup) };
+    kprint(b"boot-probe: view broker: password held, one per delay, grant arrived, exit heard when full, policy refused, stray handles closed, session closed ok\n");
     true
 }
 

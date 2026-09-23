@@ -570,6 +570,9 @@ const COREUTILS: &[&str] = &[
     // The clipboard, either side of a pipe — M12 decision 4, which is what makes the kill ring
     // reachable by something other than a window.
     "clip",
+    // Running a program in a view (administration Part A.5): the view broker's client, typed at a
+    // shell like the rest of these.
+    "with",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -600,6 +603,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The kill ring (M12 Part E). A store package like the rest: nothing about a clipboard is
     // needed to reach a mounted root, and its only client runs long after one.
     "clipboard-server",
+    // The view broker (administration Part A). `init` spawns it — only `init` can bind a server
+    // into the root namespace — from here, as it does `auth-service`.
+    "view-broker",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -659,6 +665,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The clipboard (M12 Part E). A lib + bin split like `auth-service`: the ring is
     // host-tested, this builds the bare-target server.
     build_userspace_bin("clipboard-server", None)?;
+    // The view broker (administration Part A). A lib + bin split like `auth-service`: who may
+    // do what is host-tested, this builds the bare-target server.
+    build_userspace_bin("view-broker", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -1390,6 +1399,20 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // which is exactly the shape of the title cap PR #233 shipped. The line names the
     // program, so a supervisor that went back to spawning `nxsh` directly would be silent
     // here rather than passing.
+    //
+    // **And a session with the view broker, bound in** (administration Part A.4): `session-mgr`
+    // opens one before it builds the namespace, and the namespace binds `/dev/views` at its base.
+    // Reported from what was bound, so a session built without it says so.
+    s.expect("view-broker: session ")?;
+    let opened = s.rest_of_line()?;
+    if !opened.ends_with("opened") {
+        return Err(format!("expected the broker to open a session, saw `{opened}`").into());
+    }
+    s.expect("session-mgr: session namespace built (")?;
+    let built = s.rest_of_line()?;
+    if !built.contains("/dev/views") {
+        return Err(format!("the serial session was built without /dev/views: ({built}").into());
+    }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1397,6 +1420,11 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // 5. A program from the profile runs — `/bin` is bound in the session namespace and
     //    the shell can spawn through it.
     s.send("whoami")?;
+    // **And it was handed a terminal of its own** (administration Part A.2): the shell asks the
+    // tty server for a sibling of its terminal before each stage, and the server says how many
+    // terminals are open once it has made one. Kept, and compared at step 8.
+    s.expect("tty-server: terminal opened beside another, ")?;
+    let open_at_5 = s.rest_of_line()?;
     s.expect("alice")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1467,6 +1495,18 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    the erase-and-redraw is bytes on a wire that only a real terminal renders, so
     //    asserting on appearance would assert on the capture rather than the shell.
     s.send("whoami")?;
+    // **The same command, so the same number of terminals** — unless one leaked. Every stage
+    // since step 5 was handed a terminal, and each should have been freed when its stage exited.
+    // There are fifteen, so a leak here would leave every stage after a dozen commands without
+    // one, silently: a stage is run without a terminal rather than refused.
+    s.expect("tty-server: terminal opened beside another, ")?;
+    let open_at_8 = s.rest_of_line()?;
+    if open_at_8 != open_at_5 {
+        return Err(format!(
+            "a stage's terminal outlived its stage: {open_at_5} at step 5, {open_at_8} at step 8"
+        )
+        .into());
+    }
     s.expect("alice")?;
     s.expect("/home>")?;
     s.send("\x1b[A")?;
@@ -1766,13 +1806,124 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 20b. **`with`: a program in a view** (administration Part A). Everything a person does with
+    //      it, at the real prompt, in the order that makes each claim depend on the last.
+    //
+    //      (a) **Without `with`, no disks** — `nxinstall`'s own answer when its session holds none.
+    //          The baseline the grant is measured against: the same program, a moment later, sees
+    //          them only because the broker bound them.
+    s.send("nxinstall")?;
+    s.expect("no block devices in this session")?;
+    s.expect("/home>")?;
+    //      (b) **Refused by the policy, and nothing asked.** `install` lets alice run `nxinstall`
+    //          and nothing else; a request for `nxsh` there is refused before any password, and
+    //          the refusal says which half — the view or the program — was the problem.
+    s.send("with install nxsh")?;
+    s.expect("`install` does not let alice run `nxsh`")?;
+    s.expect("/home>")?;
+    //      (c) **`with --list`**, as a table: the seeded `install` row names its one program.
+    s.send("with --list")?;
+    s.expect("nxinstall")?;
+    s.expect("/home>")?;
+    //      (d) **A wrong password, then the right one — held for the session's delay — and the
+    //          grant arrived.** The right password is typed the moment the second prompt appears;
+    //          the broker holds its check until two seconds after the failure, so the listing
+    //          cannot come sooner. And the listing names `/dev/blk/0`, which (a) could not.
+    const WRONG: &str = "not-the-password-4271";
+    s.send("with admin nxinstall")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(WRONG)?;
+    s.expect("with: wrong password")?;
+    let refused = s.matched_at();
+    s.expect("[with admin] password (2 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/dev/blk/0")?;
+    let held = s.matched_at().saturating_duration_since(refused);
+    if held < std::time::Duration::from_millis(1500) {
+        return Err(format!(
+            "the password after a wrong one was answered {held:?} after the refusal — the broker did \
+             not hold it for the session's delay"
+        )
+        .into());
+    }
+    s.expect("/home>")?;
+    //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
+    //          delay, so this costs about four seconds.
+    s.send("with admin whoami")?;
+    for n in 1..=3 {
+        s.expect(&format!("[with admin] password ({n} of 3): "))?;
+        s.send(WRONG)?;
+    }
+    s.expect("with: three wrong passwords")?;
+    s.expect("/home>")?;
+    //      (f) **`Ctrl-C` stops a program started with `with`.** The shell asks `with` to stop,
+    //          `with` asks the broker, and the broker asks the program — which is `sleep`, which
+    //          listens. Sixty seconds is far past what this waits, so only a stop passes.
+    s.send("with admin sleep 60")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("view: alice admin sleep — started")?;
+    let asked = std::time::Instant::now();
+    s.send_raw("\x03")?;
+    // **Unordered, because two processes say them.** The audit record reaches the console through
+    // the logging service and the prompt through the tty server; the shell's prompt can land
+    // first, and a sequence of two `expect`s would then scan past it.
+    s.expect_all(&["view: alice admin sleep — exited", "/home>"])?;
+    if asked.elapsed() > std::time::Duration::from_secs(20) {
+        return Err("`with admin sleep 60` took more than 20 s to stop after Ctrl-C".into());
+    }
+    //      (g) **An audit record for each, and no password in any.** Neither password was echoed —
+    //          the prompts turned echo off — and none reached a log line.
+    let t = s.transcript();
+    for line in [
+        "view: alice install nxsh — denied: `install` does not let alice run `nxsh`",
+        "view: alice admin nxinstall — wrong password (1 of 3)",
+        "view: alice admin nxinstall — started",
+        "view: alice admin whoami — wrong password (3 of 3)",
+    ] {
+        if !t.contains(line) {
+            return Err(format!("no audit record `{line}`").into());
+        }
+    }
+    for secret in [DEMO_PASSWORD, WRONG] {
+        if t.contains(secret) {
+            return Err(format!("a password reached the console: `{secret}`").into());
+        }
+    }
+    steps += 1;
+
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
+    //
+    //     **And the broker hears both** (administration Part A.4): the session that ended is
+    //     closed, and the next login gets a *new* id. Ids are never reused — a program that
+    //     ignored its session's end still holds a namespace with the old base, and a reused id
+    //     would give its requests the next login's identity.
     s.send("exit")?;
+    s.expect("view-broker: session ")?;
+    let ended = s.rest_of_line()?;
+    let ended_id = match ended.split_once(' ') {
+        Some((id, "ended")) => id.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("expected the broker to end the session, saw `{ended}`"))?;
     s.expect("nitrox login:")?;
     s.send("alice")?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
+    s.expect("view-broker: session ")?;
+    let reopened = s.rest_of_line()?;
+    let new_id = match reopened.split_once(' ') {
+        Some((id, "opened")) => id.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("expected the broker to open a session, saw `{reopened}`"))?;
+    if new_id <= ended_id {
+        return Err(format!(
+            "the broker reused a session id: session {ended_id} ended and the next login got {new_id}"
+        )
+        .into());
+    }
     s.expect("/home>")?;
     steps += 1;
 
@@ -3972,6 +4123,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     session.expect("desktop-session-mgr: login ok -> home=/home/alice")?;
     session.expect("desktop-session-mgr: session namespace built (no /dev/console)")?;
+    // **And the view broker's `/dev/views`, at the session's base** (administration Part A.4).
+    // Printed before the leader is spawned, so it is ordered against the next line, not racing it.
+    session.expect("desktop-session-mgr: session has /dev/views")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and
@@ -6074,6 +6228,33 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     }
     session.expect("/home>")?;
     println!("  ok: the paste reached the shell in the terminal, and it made {TYPED}.clip");
+
+    // 9a2. **`with`, from a terminal the Applications menu opened** (administration Part A). The
+    //      whole chain the serial gate cannot see: `desktop-shell` bound `/dev/views` into this
+    //      terminal's namespace at the graphical session's base; `nxsh` handed `with` a sibling of
+    //      the window's terminal; the password is typed into *this window* and read there. A
+    //      release image does not narrate the grid, so what is asserted is the broker's audit on
+    //      the console — started, and `nxinstall` exiting 0 because it saw the granted disks.
+    type_at_terminal(&mut qmp, "with admin nxinstall")?;
+    session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
+    // No leading Enter here, unlike `type_at_terminal`: at a password prompt one would be an empty
+    // password. Paced like it, before every key.
+    for c in DEMO_PASSWORD.chars() {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(&mut qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(&mut qmp, "ret")?;
+    session.expect("view: alice admin nxinstall — started")?;
+    session.expect("view: alice admin nxinstall — exited, code 0")?;
+    println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
 
     // Close the terminal from inside, so steps 11 and 12 drive the windows step 9 left.
     for qcode in ["e", "x", "i", "t"] {
@@ -9619,6 +9800,36 @@ impl Drop for Session {
     }
 }
 
+/// Take the text in `pending` that is whole, leaving a character a read stopped in the middle of
+/// for the next one.
+///
+/// **A read's boundary is not a character's.** Decoding each chunk on its own turned a multi-byte
+/// character split across two reads into two replacement characters, so an `expect` for text
+/// containing it could never match: `test-interactive` timed out waiting for `sleep — exited` with
+/// `sleep �� exited` sitting in the transcript (administration Part A.6). Bytes that are simply
+/// invalid still decode lossily, as before.
+fn take_utf8(pending: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let text = text.to_string();
+            pending.clear();
+            text
+        }
+        // An incomplete sequence at the end: keep it, and take everything before it.
+        Err(e) if e.error_len().is_none() => {
+            let cut = e.valid_up_to();
+            let text = String::from_utf8_lossy(&pending[..cut]).into_owned();
+            pending.drain(..cut);
+            text
+        }
+        Err(_) => {
+            let text = String::from_utf8_lossy(pending).into_owned();
+            pending.clear();
+            text
+        }
+    }
+}
+
 impl Session {
     fn spawn(mut cmd: Command, gate: &'static str) -> R<Session> {
         let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
@@ -9631,13 +9842,16 @@ impl Session {
             use std::io::Read;
             let mut r = stdout;
             let mut buf = [0u8; 1024];
+            // Bytes of a character a read ended in the middle of — see `take_utf8`.
+            let mut pending: Vec<u8> = Vec::new();
             while let Ok(n) = r.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 let now = std::time::Instant::now();
+                pending.extend_from_slice(&buf[..n]);
                 if let Ok(mut g) = sink.lock() {
-                    g.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    g.push_str(&take_utf8(&mut pending));
                     if let Ok(mut a) = clock.lock() {
                         a.push((g.len(), now));
                     }
@@ -10767,6 +10981,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("clipboard-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // view-broker's library tests (the policy reader, rule evaluation, the last-administrator
+    // guard, per-session pacing and session ids). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("view-broker")
         .arg("--lib")
         .arg("--target")
         .arg(&host)
@@ -13142,6 +13366,35 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
     Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
 }
 
+/// The policy the build seeds at `/system/views.toml` — see where it is staged.
+///
+/// **A function rather than a literal**, because the account name is `DEMO_USER` and a policy that
+/// named someone the build did not make would deny everything while reading perfectly well.
+fn seeded_views_toml() -> String {
+    format!(
+        "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
+         # Seeded by the build; an installed system's comes from the installer.\n\
+         \n\
+         [profile.admin]\n\
+         grants = [\"disks\"]\n\
+         \n\
+         [profile.install]\n\
+         grants = [\"disks\"]\n\
+         \n\
+         [[rule]]\n\
+         who  = [\"{DEMO_USER}\"]\n\
+         use  = [\"admin\"]\n\
+         run  = [\"*\"]\n\
+         auth = \"password\"\n\
+         \n\
+         [[rule]]\n\
+         who  = [\"{DEMO_USER}\"]\n\
+         use  = [\"install\"]\n\
+         run  = [\"nxinstall\"]\n\
+         auth = \"password\"\n"
+    )
+}
+
 /// The programs a session gets through its profile: the coreutils, plus `nxsh`.
 ///
 /// `nxsh` is here as well as being the login leaf — a user should be able to run a nested
@@ -13740,6 +13993,11 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         writeln!(users, ":{DEMO_HOME}").unwrap();
         fs::write(staging.join("system").join("users"), users.as_bytes())?;
     }
+    // `/system/views.toml` — the view broker's policy (administration Part A.6). The demo account
+    // administers the machine, as it is the only account the build makes; `install` is a narrower
+    // view that lets it run one program, so a gate can see a request refused by policy rather than
+    // by the absence of any rule. An installed system gets its own from the installer (Part G).
+    fs::write(staging.join("system").join("views.toml"), seeded_views_toml().as_bytes())?;
     // The demo user's home directory — the writable session root a login constructs
     // (auth Part E). The user shell writes into it, and since M11 Part C it arrives holding
     // the session's theme.
@@ -15084,5 +15342,26 @@ mod diag_tests {
         // group's own `id:` prefix, not on the group containing the number anywhere.
         assert_eq!(taskbar_slot("Desktop 1 of 1 [7:file20.txt]", 20), None);
         assert_eq!(taskbar_slot("Desktop 1 of 1 (empty)", 20), None);
+    }
+
+    /// **A character split across two reads arrives whole** — the failure that made
+    /// `test-interactive` wait for `sleep — exited` with `sleep �� exited` in its transcript.
+    #[test]
+    fn a_character_split_across_reads_is_decoded_whole() {
+        let line = "sleep — exited\n".as_bytes();
+        let dash = line.iter().position(|&b| b == 0xE2).unwrap();
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&line[..dash + 1]); // the read ends one byte into the dash
+        let first = super::take_utf8(&mut pending);
+        assert_eq!(first, "sleep ");
+        assert_eq!(pending, [0xE2], "the dash's first byte waits for the rest");
+        pending.extend_from_slice(&line[dash + 1..]);
+        let second = super::take_utf8(&mut pending);
+        assert_eq!(format!("{first}{second}"), "sleep — exited\n");
+        assert!(pending.is_empty());
+        // Bytes that are not UTF-8 at all still decode, lossily, rather than being held forever.
+        let mut bad = vec![b'a', 0xFF, b'b'];
+        assert_eq!(super::take_utf8(&mut bad), "a\u{FFFD}b");
+        assert!(bad.is_empty());
     }
 }

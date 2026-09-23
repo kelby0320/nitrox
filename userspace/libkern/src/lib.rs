@@ -4,7 +4,8 @@
 //! canonical userspace mirror of the kernel ABI — syscall numbers + the
 //! `syscall`-instruction wrappers ([`syscall`]), the `#[repr(C)]` boundary types
 //! ([`abi`]), [`KError`](error::KError), [`Rights`](handle::Rights),
-//! [`KObjectType`](handle::KObjectType), and thin debug helpers ([`debug`]).
+//! [`KObjectType`](handle::KObjectType), thin debug helpers ([`debug`]), and [`scrub`], for
+//! the passwords that pass through a process.
 //!
 //! `#![no_std]`, no `alloc`, `core` only — init and the demos link it before any
 //! heap exists. The one exception is `cargo test`, where the host harness needs
@@ -41,3 +42,25 @@ pub use error::{KError, from_raw};
 pub use handle::*;
 pub use syscall::*;
 pub use syscaps::{SYSCAP_BIND_NAMESPACE, SYSCAP_REAL_TIME, SysCaps};
+
+/// Zero `bytes` where they lie — a password, once it has been used.
+///
+/// **Volatile, a byte at a time**, because an ordinary fill of memory that nothing reads again is
+/// a dead store the optimiser may delete, and a scrub that was compiled out looks exactly like one
+/// that ran.
+pub fn scrub(bytes: &mut [u8]) {
+    for b in bytes {
+        // SAFETY: `b` is a valid, exclusive reference to one byte.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    #[test]
+    fn scrub_zeroes_every_byte_and_nothing_past_them() {
+        let mut b = [0xA5u8; 9];
+        super::scrub(&mut b[1..8]);
+        assert_eq!(b, [0xA5, 0, 0, 0, 0, 0, 0, 0, 0xA5]);
+    }
+}
