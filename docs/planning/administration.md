@@ -3,9 +3,9 @@
 **Status: scoped, not started (2026-09-22; revised after the PR #326 review).** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
-several mechanisms depend on things the code does not have, and **three of its resolutions are
-proposals awaiting the maintainer**, marked *proposed* where they appear. The parts are sketched, and
-**Part A's detail pass is next**. The plan began as a stub on 2026-09-16, written while building the
+several mechanisms depend on things the code does not have, and **the maintainer took the four
+resolutions that needed a decision the same day** (the last item under *Decisions*). The parts are
+sketched, and **Part A's detail pass is next**. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -43,6 +43,11 @@ installer — the first program that needed authority an ordinary session cannot
   and its initramfs is the release one with only `init.toml` changed, which `check-images` enforces.
   The one live-only file is `etc/install-allowed`, a policy marker kept in the initramfs precisely
   because `root.img` must match the release root file for file.
+- **After the PR #326 review, four more**, each argued where it appears below: **views are derived**
+  from the caller's namespace by a new kernel operation, not rebuilt from a session's ingredients;
+  **`/storage` is built on `OBJECT_KIND_SUBNAMESPACE`**; **the installer's boot entry stays, and its
+  session becomes an ordinary one** running `with admin nxinstall`; and **`services.toml` moves onto
+  the root filesystem** in Part E.
 
 ## What the 5.1 design said
 
@@ -145,7 +150,7 @@ namespace plus a profile's grants** — not 5.1's standalone administrator names
 
 **How it is built decides what the broker must hold.** Rebuilding the caller's session from a recipe
 means holding everything the recipe is made of — the whole-tree filesystem endpoint above all, which
-reaches `/system/users`. **Proposed instead: a kernel operation that derives a new namespace from an
+reaches `/system/users`. **Decided instead: a kernel operation that derives a new namespace from an
 existing one**, a copy of its bindings. `with` passes its own namespace, the broker derives a view
 from it and binds the profile's grants in. The broker then holds **only what it adds**, never a
 session's ingredients, and there is no recipe to record. A caller can only pass a namespace it
@@ -229,11 +234,10 @@ services."
 
 **Two grants are raw, and a broker bug reaches them directly.** `disks` needs every block device in
 the broker's own namespace, because a device is granted by resolving it there. The clock is a syscap
-it holds. **And if views were built by rebuilding sessions, the broker would also hold the whole
-filesystem** — the price the proposed namespace derivation exists to avoid. So the honest summary:
-with derivation, a broker bug reaches the disks and whatever the domain services will do on request;
-without it, the disks and every file. Either way it is the most trusted process in userspace after
-`init`, and should be small.
+it holds. **It does not hold the whole filesystem only because views are derived** rather than
+rebuilt from a session (above), which would mean holding each session's fs endpoint. So the honest
+summary: a broker bug reaches the disks, the clock, and whatever the domain services will do on
+request. It is the most trusted process in userspace after `init`, and should be small.
 
 ### The prompt, and a terminal to prompt on
 
@@ -308,11 +312,11 @@ view such as the installer. What a person browses is a *filesystem*, which appea
 
 - **`/storage/<label>`**, served by the **storage service** — the class owner the device manager
   hands disks to — and bound into every session and application namespace.
-- **"Nothing re-bound" needs kernel work, and Part C must choose it.** A single `/storage` binding
-  that gains children as filesystems mount means a resolve under it has to continue in the mounted
-  filesystem's server. **Proposed: build `OBJECT_KIND_SUBNAMESPACE`** — the reply a server gives to
-  say "continue in this namespace" — which is also what makes a lazily filled file under
-  `/storage` fill through the right registration. The alternatives are worse: proxying the whole
+- **"Nothing re-bound" needs kernel work.** A single `/storage` binding that gains children as
+  filesystems mount means a resolve under it has to continue in the mounted filesystem's server.
+  **Decided: build `OBJECT_KIND_SUBNAMESPACE`** — the reply a server gives to say "continue in this
+  namespace" — which is also what makes a lazily filled file under `/storage` fill through the
+  right registration. The alternatives were worse: proxying the whole
   file protocol, fills included, through the storage service; or re-binding into every session and
   application namespace on each mount, which means holding them all.
 - **Names are labels, not numbers.** `/dev/blk/<n>` is discovery order, so a stick that is `2` today
@@ -362,13 +366,13 @@ view such as the installer. What a person browses is a *filesystem*, which appea
 `service-mgr` gains an admin endpoint: **list** — each service's name, state and restart count, for
 anyone — and **start, stop and restart** under the `services` grant.
 
-**Moving the declarations onto the root filesystem — proposed for Part E.** `services.toml` has no
+**Moving the declarations onto the root filesystem — decided, for Part E.** `services.toml` has no
 reason to be in the initramfs (above), and it cannot be edited there: the initramfs is a boot archive
 on the FAT EFI partition, which nothing here writes. On root, `service-mgr` reads it after `init` has
 mounted the filesystem it lives on, and **enabling and disabling become a small edit** — still
 deferred, since no service wants disabling yet. `profiles/system.toml` probably follows it. The live
 image then gets it through `root.img` like everything else on root, with no special case.
-**`check-images` changes shape**: test and release images would then differ in a root-filesystem file
+**`check-images` changes shape**: test and release images will then differ in a root-filesystem file
 rather than an initramfs one, which its allow-list has to learn.
 
 ## Power
@@ -422,9 +426,9 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 
 | Work | For | Part |
 |---|---|---|
-| Deriving a namespace from an existing one (*proposed*) | views without holding a session's ingredients | A |
+| Deriving a namespace from an existing one | views without holding a session's ingredients | A |
 | Enumerating the device registry | coldplug; listing `/dev/blk` | B |
-| `OBJECT_KIND_SUBNAMESPACE` — a resolve continuing in another namespace (*proposed*) | `/storage` with nothing re-bound | C |
+| `OBJECT_KIND_SUBNAMESPACE` — a resolve continuing in another namespace | `/storage` with nothing re-bound | C |
 | Writing back every `FileObject` under a registration | unmount and shutdown without losing mapped writes | C |
 | `FLUSH CACHE` in the AHCI driver (`TODO(ahci-flush)`) | the last link of every unmount | C |
 | A system-control object in `init`'s boot grant, and a power operation | `shutdown` | E |
@@ -435,7 +439,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 
 - [ ] **A — the view broker, on a terminal.** The broker service; `/dev/views`, minted per session and
       bound by **both** login supervisors, which also tell the broker when a session ends; namespace
-      derivation in the kernel (*proposed*); `with`, `--list` and `--check`; `views.toml`, its schema
+      derivation in the kernel; `with`, `--list` and `--check`; `views.toml`, its schema
       spec, and the last-administrator guard; **a terminal a stage can own** — the handoff the prompt
       and interactive programs both need; the prompt, with echo off and delayed, counted failures;
       **one grant end to end, `disks`**; streams, and a stop handle for the shell; programs ended with
@@ -445,23 +449,22 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       announced for everything present at boot; `input-server` taking its devices from it; read-only
       device information for anyone; `/dev/blk`'s children listable at last.
 - [ ] **C — storage.** Write-back of a registration's `FileObject`s; a whole-filesystem sync and
-      clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`; `OBJECT_KIND_SUBNAMESPACE`
-      (*proposed*); the storage service — mount, unmount, auto-mount (read-only on a live boot),
-      `/storage` bound into sessions and application namespaces, refusing a raw grant of a mounted
-      device; `disk`.
+      clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`; `OBJECT_KIND_SUBNAMESPACE`; the
+      storage service — mount, unmount, auto-mount (read-only on a live boot), `/storage` bound into
+      sessions and application namespaces, refusing a raw grant of a mounted device; `disk`.
 - [ ] **D — accounts.** `auth-service`'s admin ops and atomic rewrite; `account`, including the
       offline mode; removal refused when the broker says it would leave no administrator; ending a
       removed account's sessions.
-- [ ] **E — services, power, the clock and the log.** `services.toml` moved onto the root filesystem
-      (*proposed*); `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
+- [ ] **E — services, power, the clock and the log.** `services.toml` moved onto the root
+      filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
 - [ ] **F — the desktop's share.** `desktop-shell` building application namespaces in the same
       vocabulary; the graphical prompt's design written down, with its trigger.
 - [ ] **G — the installer, the broker's first client** (decided 2026-09-17). **The installer's boot
       entry stays** — it is still the one that loads the 33 MiB installable ESP, which is H.1's
       reasoning and still sound — **but its session stops being special**. It becomes an ordinary
-      session in which the person types `with admin nxinstall`, with the binary unchanged
-      (*proposed*; the alternative is moving the ESP module onto the default entry). The installer
+      session in which the person types `with admin nxinstall`, with the binary unchanged (decided
+      2026-09-22, over moving the ESP module onto the default entry). The installer
       creates the first account and the `views.toml` that makes it an administrator, instead of
       inheriting the build's demo account.
 

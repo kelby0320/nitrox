@@ -27759,7 +27759,7 @@ become a small edit, still deferred until a service wants it.
 PR #326's review checked every claim the plan made about today's code, and every mechanism against
 the code it would be built from. The "what exists" list held up almost entirely. The design did not
 always: several mechanisms quietly assumed something the kernel or the protocol cannot do, and three
-of the fixes are proposals the maintainer has not yet taken.
+of the fixes needed the maintainer's decision (the last paragraph).
 
 **A factual error in the entry above, corrected in place before merge.** The live image does not run
 from its initramfs. It mounts a root like any other boot: the `nitrox-live` partition inside
@@ -27820,3 +27820,8 @@ data today, because every file writer syncs.
 
 The plan collects the kernel work in one table, because the review's main lesson was that this is
 not a userspace-only phase.
+
+**Taken, the same day.** The maintainer adopted all three proposals — namespace derivation for views,
+`OBJECT_KIND_SUBNAMESPACE` for `/storage`, and the installer's entry kept with an ordinary session —
+and the one the scoping entry above left open: `services.toml` moves onto the root filesystem in
+Part E. The plan now records them as decisions.
