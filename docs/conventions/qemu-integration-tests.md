@@ -222,6 +222,22 @@ screen from every caller, so a new boot cannot forget to say.
 result, whether a boot's demo chain finished, since that is where a size-dependent failure outside
 the gates has shown up (the dead-log-source check at 1024×768, decision log 2026-09-15).
 
+### A key goes where the keyboard is, not where the log says
+
+**Type at a dialog only after its keyboard receipt.** A dialog's owner announces it *before*
+asking for the window — `nxedit: choosing a file in …`, `nxfiles: showing properties` — because
+that is the only order that cannot race the shell's placement line to the console (PR #267). So
+that line says nothing about where the next key goes: the window is created, held for the manager,
+placed, and only then handed the keyboard, and a key that reaches the compositor before that goes
+to the parent window. Every dialog therefore prints a second line when the keyboard first reaches
+it — `nxedit: the chooser has the keyboard`, `nxedit: the question has the keyboard`,
+`nxfiles: properties has the keyboard`, `nxfiles: the question has the keyboard` — from
+`libui::window::Child::took_keyboard`, and a gate that types waits for it. `check-login` once
+typed a Save As backspace into the document by missing this.
+
+A click needs no such receipt: it is routed by position, and the shell's `placed dialog` line
+is printed only after the compositor has placed the window.
+
 ### Host requirement: x2APIC
 
 The kernel is **x2APIC-only** (decision log, 2026-06-26 — the ≈2014 baseline

@@ -1621,6 +1621,11 @@ the question is re-derived from `modified()` each time it is asked, so an edit m
 is simply part of what is being discarded, and a *save* made while it is up removes the reason to
 ask at all. **Trigger: a dialog whose question can be invalidated by what its parent does** — one
 that names a file being renamed, say, rather than one that asks about a buffer.
+It also covers **the gap before a dialog is placed** (2026-09-23): a dialog is not a focus
+candidate until the manager places it, so keys typed between asking for one and its placement go
+to the parent. `check-login` hit this as a flake, and a gate now waits for each dialog's
+keyboard receipt (`libui::window::Child::took_keyboard`); a person typing that fast still reaches
+the parent.
 
 **A confirmation has two answers and not three — `TODO(dialog-save-answer)`.** Discard and keep editing; there is no *save and close*.
 The reason is that an untitled buffer has nowhere to save to, so the third answer is not a button

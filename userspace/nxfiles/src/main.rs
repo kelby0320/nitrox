@@ -1080,7 +1080,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let view = app.dialog_view(&theme, *dialog_hovered);
                 let mut msgs = dialog
                     .as_mut()
-                    .map(|(_, c)| c.route(&view, &font, &theme, &event))
+                    .map(|(kind, c)| {
+                        // **The receipt a key may be pressed after** — `opening` is said before
+                        // the window is asked for, and a key that beats the manager's placement
+                        // reaches the browser instead (see `Child::took_keyboard`).
+                        if c.took_keyboard(&event) {
+                            kprint(kind.has_keyboard());
+                        }
+                        c.route(&view, &font, &theme, &event)
+                    })
                     .unwrap_or_default();
                 match event {
                     // What a key means is the dialog's own — for the question, `Esc` keeps the

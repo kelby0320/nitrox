@@ -1101,6 +1101,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // answered — but a manager asking it to close means the same as *Cancel*.
                 let mut msgs = match chooser.as_mut() {
                     Some(c) => {
+                        // **The receipt a name may be typed after.** "choosing a file" is said
+                        // before the window is asked for, and a key that beats the manager's
+                        // placement goes to the document instead — `check-login` once typed a
+                        // backspace into the buffer that way. This is the window saying the
+                        // keyboard is here.
+                        if c.took_keyboard(&event) {
+                            kprint(b"nxedit: the chooser has the keyboard\n");
+                        }
                         let view = app.chooser_view(&theme, *chooser_hovered);
                         c.route(&view, &font, &theme, &event)
                     }
@@ -1150,7 +1158,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let ask = app.confirm_view(&theme, *confirm_hovered);
                 let mut msgs = confirm
                     .as_mut()
-                    .map(|c| c.route(&ask, &font, &theme, &event))
+                    .map(|c| {
+                        // As the chooser's: every dialog says when the keyboard reaches it, so a
+                        // gate that types an answer has a line to wait for.
+                        if c.took_keyboard(&event) {
+                            kprint(b"nxedit: the question has the keyboard\n");
+                        }
+                        c.route(&ask, &font, &theme, &event)
+                    })
                     .unwrap_or_default();
                 match event {
                     // **`Esc` is the dialog's, and nothing else is.** No widget in this tree

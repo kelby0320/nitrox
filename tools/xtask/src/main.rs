@@ -5455,6 +5455,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "i")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: showing properties")?;
+    // **Pressed once the dialog has the keyboard, not once it was asked for.** `showing` is
+    // printed before the window exists, and while the shell is still placing it a key goes to
+    // the browser — an `Esc` there does nothing, and the dialog never closes. A probe that held
+    // the shell's placement for half a second failed this step exactly that way.
+    session.expect("nxfiles: properties has the keyboard")?;
     press(&mut qmp, "esc")?;
     session.expect("nxfiles: properties closed")?;
     let props_window = session.transcript()[before_props..].to_string();
@@ -6064,6 +6069,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // application listing and the widget rendering what it was handed. Two entries here:
     // `notes.txt` and the `other.txt` the serial side made at step 8.
     session.expect("nxedit: choosing a file in /home/papers - 2 entries")?;
+    // **And then the keyboard.** The line above is said before the chooser's window is asked
+    // for, so a backspace sent on it could reach the editor while the shell was still placing
+    // the dialog — and delete a character of the *document*. That was this gate's flake:
+    // `buffer rev 12` where `chooser name so far 8 chars` should have been.
+    session.expect("nxedit: the chooser has the keyboard")?;
     // **A receipt per character**, which is the discipline every typed sequence here follows and
     // the reason `nxedit` grew the line: an unacknowledged burst is a dropped keystroke found as a
     // wrong filename several steps later, and under KVM the injected keys arrive bunched enough

@@ -726,6 +726,18 @@ impl Dialog {
         }
     }
 
+    /// The line printed when the window is first handed the keyboard.
+    ///
+    /// **The one a gate types after**, not [`Dialog::opening`]: that is said before the window
+    /// exists, and a key pressed on it can reach the browser while the manager is still placing
+    /// the dialog (`libui::window::Child::took_keyboard`).
+    pub fn has_keyboard(self) -> &'static [u8] {
+        match self {
+            Dialog::Confirm => b"nxfiles: the question has the keyboard\n",
+            Dialog::Properties => b"nxfiles: properties has the keyboard\n",
+        }
+    }
+
     /// The line printed when the window goes away.
     ///
     /// **Symmetric with [`Dialog::opening`]**, and not decoration: a dialog that opened and never
