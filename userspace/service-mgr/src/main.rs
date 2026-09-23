@@ -637,9 +637,12 @@ fn bring_up_login_chain(
     tty_endpoint: u64,
     draw_endpoint: u64,
     clip_endpoint: u64,
+    views_endpoint: u64,
 ) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
+        // SAFETY: closing our own handle — the broker's endpoint is no use without a session.
+        unsafe { close_one(views_endpoint) };
         // A profile endpoint without an fs endpoint is no more usable — a session with
         // programs but no home is not a session. Don't retain it.
         if profile_endpoint != 0 {
@@ -667,12 +670,15 @@ fn bring_up_login_chain(
     // want for the same reason.** `/dev/draw` goes only to the graphical twin because a serial
     // session has no compositor; the clipboard is reachable as a path precisely so a pipeline
     // can use it (M12 decision 4), and pipelines run in both.
-    let (fs_dup, profile_dup, tty_dup, clip_dup) = unsafe {
+    // **And the view broker's** (administration Part A.4), for the clipboard's reason: both
+    // columns open sessions with it, since `with` is typed at a shell in either.
+    let (fs_dup, profile_dup, tty_dup, clip_dup, views_dup) = unsafe {
         (
             dup_endpoint(fs_endpoint),
             dup_endpoint(profile_endpoint),
             dup_endpoint(tty_endpoint),
             dup_endpoint(clip_endpoint),
+            dup_endpoint(views_endpoint),
         )
     };
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
@@ -688,6 +694,8 @@ fn bring_up_login_chain(
             close_one(tty_dup);
             close_one(clip_endpoint);
             close_one(clip_dup);
+            close_one(views_endpoint);
+            close_one(views_dup);
         }
         return;
     }
@@ -701,6 +709,8 @@ fn bring_up_login_chain(
     send_handle(sess_ctrl, tty_endpoint);
     // (4) the clipboard server's forwarding endpoint (M12 Part E).
     send_handle(sess_ctrl, clip_endpoint);
+    // (5) the view broker's forwarding endpoint (administration Part A.4).
+    send_handle(sess_ctrl, views_endpoint);
     // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
     // session of its own, and so will `desktop-session-mgr`.
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
@@ -714,7 +724,15 @@ fn bring_up_login_chain(
     // them — so they are duplicated before the serial column is given its set. Duplicating
     // first rather than after means a failure here costs the graphical login, not both:
     // init makes the same argument where it retains the profile endpoint before binding it.
-    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup, draw_endpoint, clip_dup) {
+    if !bring_up_desktop_session(
+        root_ns,
+        fs_dup,
+        profile_dup,
+        tty_dup,
+        draw_endpoint,
+        clip_dup,
+        views_dup,
+    ) {
         // Non-fatal by design. A machine with a serial login and no graphical one is
         // degraded; a machine with neither is unreachable, and the serial column is already
         // up by this point.
@@ -735,6 +753,7 @@ fn bring_up_desktop_session(
     tty: u64,
     draw: u64,
     clip: u64,
+    views: u64,
 ) -> bool {
     if fs == 0 {
         // The duplicates are this function's to release once it declines to use them.
@@ -744,6 +763,7 @@ fn bring_up_desktop_session(
             close_one(tty);
             close_one(draw);
             close_one(clip);
+            close_one(views);
         }
         return false;
     }
@@ -757,6 +777,7 @@ fn bring_up_desktop_session(
             close_one(tty);
             close_one(draw);
             close_one(clip);
+            close_one(views);
         }
         return false;
     }
@@ -768,6 +789,8 @@ fn bring_up_desktop_session(
     send_handle(ctrl, draw);
     // The fifth: the clipboard, which both columns get (M12 Part E).
     send_handle(ctrl, clip);
+    // The sixth: the view broker's, which both columns get too (administration Part A.4).
+    send_handle(ctrl, views);
     // SAFETY: closing our own handles; the twin runs independently from here.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, ctrl);
@@ -815,9 +838,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     kprint(b"service-mgr: up\n");
     // The handoffs, in init's send order: the fs-server endpoint, then the profile
     // server's. Positional — see `bring_up_login_chain`.
-    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint, clip_endpoint) =
+    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint, clip_endpoint, views_endpoint) =
         if handoff == 0 {
-            (0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0)
         } else {
             let fs = recv_handoff(handoff);
             let profile = recv_handoff(handoff);
@@ -829,9 +852,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
             // The clipboard's, which **both** columns take — M12 decision 4 makes it reachable
             // as a path so a pipeline can use it, and a pipeline runs in either.
             let clip = recv_handoff(handoff);
+            // The view broker's, which both columns take as well (administration Part A.4).
+            let views = recv_handoff(handoff);
             // SAFETY: closing our own handoff-channel end; every handoff is in hand.
             unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
-            (fs, profile, tty, draw, clip)
+            (fs, profile, tty, draw, clip, views)
         };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
     bring_up_login_chain(
@@ -841,6 +866,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
         tty_endpoint,
         draw_endpoint,
         clip_endpoint,
+        views_endpoint,
     );
     supervise(notif, root_ns, load_declarations(root_ns));
 }

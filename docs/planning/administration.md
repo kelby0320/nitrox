@@ -648,7 +648,7 @@ closes the phase**.
       - `Exited`, `Stop`, and the end of a session;
       - **a `boot-probe` check through the broker's own protocol**, in `test-qemu`, before any shell
         or `with` drives it — which needed A.6's seeded policy early, so the seed landed here.
-- [ ] **A.4 — the supervisors.** The forwarding endpoint couriered from `init` to both login
+- [x] **A.4 — the supervisors** *(2026-09-23)*. The forwarding endpoint couriered from `init` to both login
       supervisors and on to `desktop-shell`. A supervisor opens a session at login, binds
       `/dev/views` with its base, and closes the session when its leader exits. `desktop-shell`
       binds the same thing into every application namespace.

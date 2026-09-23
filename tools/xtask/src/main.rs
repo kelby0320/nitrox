@@ -1396,6 +1396,20 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // which is exactly the shape of the title cap PR #233 shipped. The line names the
     // program, so a supervisor that went back to spawning `nxsh` directly would be silent
     // here rather than passing.
+    //
+    // **And a session with the view broker, bound in** (administration Part A.4): `session-mgr`
+    // opens one before it builds the namespace, and the namespace binds `/dev/views` at its base.
+    // Reported from what was bound, so a session built without it says so.
+    s.expect("view-broker: session ")?;
+    let opened = s.rest_of_line()?;
+    if !opened.ends_with("opened") {
+        return Err(format!("expected the broker to open a session, saw `{opened}`").into());
+    }
+    s.expect("session-mgr: session namespace built (")?;
+    let built = s.rest_of_line()?;
+    if !built.contains("/dev/views") {
+        return Err(format!("the serial session was built without /dev/views: ({built}").into());
+    }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1791,11 +1805,36 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
+    //
+    //     **And the broker hears both** (administration Part A.4): the session that ended is
+    //     closed, and the next login gets a *new* id. Ids are never reused — a program that
+    //     ignored its session's end still holds a namespace with the old base, and a reused id
+    //     would give its requests the next login's identity.
     s.send("exit")?;
+    s.expect("view-broker: session ")?;
+    let ended = s.rest_of_line()?;
+    let ended_id = match ended.split_once(' ') {
+        Some((id, "ended")) => id.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("expected the broker to end the session, saw `{ended}`"))?;
     s.expect("nitrox login:")?;
     s.send("alice")?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
+    s.expect("view-broker: session ")?;
+    let reopened = s.rest_of_line()?;
+    let new_id = match reopened.split_once(' ') {
+        Some((id, "opened")) => id.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("expected the broker to open a session, saw `{reopened}`"))?;
+    if new_id <= ended_id {
+        return Err(format!(
+            "the broker reused a session id: session {ended_id} ended and the next login got {new_id}"
+        )
+        .into());
+    }
     s.expect("/home>")?;
     steps += 1;
 
@@ -3995,6 +4034,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     session.expect("desktop-session-mgr: login ok -> home=/home/alice")?;
     session.expect("desktop-session-mgr: session namespace built (no /dev/console)")?;
+    // **And the view broker's `/dev/views`, at the session's base** (administration Part A.4).
+    // Printed before the leader is spawned, so it is ordered against the next line, not racing it.
+    session.expect("desktop-session-mgr: session has /dev/views")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and

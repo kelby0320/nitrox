@@ -28111,3 +28111,30 @@ tell the same story, and none contains a password.
 - **A session's end is asked for, not forced** (`TODO(forcible-kill)`, a new entry).
 
 The seeded policy landed here rather than in A.6, because the boot needed one to decide against.
+
+## 2026-09-23 — Administration A.4: every session opens one with the broker
+
+The fourth piece of Part A: the broker's forwarding endpoint reaches every session.
+- `init` keeps a duplicate when it binds `/svc/views` and sends it to `service-mgr` as a sixth
+  handoff.
+- `service-mgr` forwards it to both login supervisors, the fifth for `session-mgr` and the sixth for
+  `desktop-session-mgr`.
+- `desktop-session-mgr` hands it to `desktop-shell` as a sixth extra, with the session's base as
+  `argv[2]` beside the home, for the home's reason: a binding does not resolve back to its base.
+
+**Each supervisor resolves `/svc/views/session` once, as it does `/svc/auth`.** It opens a session
+for every login before it builds the namespace, since the base is part of what the namespace binds,
+and closes it when the leader exits. `libsession` gained `/dev/views` in `build_namespace` and the
+two helpers, because both supervisors use them. `desktop-shell` binds `/dev/views` at the session's
+base into every application namespace, so `with` will work in a terminal it launched. A boot
+without the broker builds sessions without `/dev/views`, and each supervisor says so.
+
+**Gated from the serial column, where the order is deterministic.**
+- **Login:** `test-interactive`'s step 4 requires the broker to open a session and the namespace
+  line to include `/dev/views`.
+- **Logout and back in:** step 21 requires the broker to hear the session end, and the next login
+  to get a *higher* id — "never reused", checked in a boot rather than only in a host test.
+- **The graphical column:** `check-login` requires `desktop-session-mgr: session has /dev/views`.
+
+Two mutations fail these gates: ids handed out again ("session 1 ended and the next login got 1"),
+and a serial session built without the binding.

@@ -172,6 +172,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // too**: M12 decision 4 makes the clipboard reachable as a path so a pipeline can use it,
     // and this is the column where pipelines are typed.
     let clipboard_endpoint = recv_handoff(control);
+    // The view broker's forwarding endpoint (administration Part A.4), bound into every session
+    // at `/dev/views` with that session's base. `0` on a boot without a broker.
+    let views_endpoint = recv_handoff(control);
     // **The auth channel is resolved, not couriered** (M7 Part C). **`init`** binds
     // `auth-service` at `/svc/auth` — not `service-mgr`, which spawned it and cannot bind,
     // because a declared service holds an inherited LOOKUP-only root — and every supervisor
@@ -204,6 +207,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"session-mgr: no profile endpoint -- sessions will have no /bin\n");
     }
     kprint(b"session-mgr: received fs + profile endpoints; auth resolved from /svc/auth\n");
+    // **A supervisor channel to the view broker**, resolved once, for `/svc/auth`'s reason: its
+    // lifetime is the machine's. On it this supervisor opens a session for each login and closes
+    // it when the shell exits — the broker's only way to know a session has ended, since a view's
+    // program keeps the session's `/dev/views` registration alive after logout.
+    let views_sup = if views_endpoint != 0 {
+        ns_lookup(root_ns, b"/svc/views/session", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).1
+    } else {
+        0
+    };
+    if views_endpoint != 0 && views_sup == 0 {
+        kprint(b"session-mgr: /svc/views/session resolve FAIL; sessions will have no `with`\n");
+    }
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
     // the shell into it, and reap it — the same way in every build.
@@ -220,6 +235,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     match login(tty, auth_ch, &mut home, &mut user) {
         Some((hl, ul)) => {
             Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
+            // **A session with the view broker, before the namespace** — its base is part of what
+            // the namespace binds. `None` builds the session without `/dev/views`.
+            let mut views_base = [0u8; 24];
+            let views = if views_sup != 0 {
+                libsession::views_open_session(views_sup, &user[..ul], &mut views_base)
+            } else {
+                None
+            };
             let session_ns = libsession::build_namespace(&NamespaceSpec {
                 root_ns,
                 fs_endpoint,
@@ -237,9 +260,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 // every disk in the machine exists to install one, and the live image starts it
                 // from its own boot-menu entry.
                 bind_blk: libsession::installer_boot(root_ns),
+                views_endpoint: if views.is_some() { views_endpoint } else { 0 },
+                views_base: &views_base[..views.map_or(0, |v| v.1)],
             });
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");
+                if let Some((id, _)) = views {
+                    libsession::views_close_session(views_sup, id);
+                }
                 // One bad session: go back to the prompt rather than bricking the console,
                 // since a permanent park is a worse answer than letting someone try again.
                 continue;
@@ -254,6 +282,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             if session_has_tty() {
                 kprint(b" + /dev/tty");
             }
+            if libsession::session_has_views() {
+                kprint(b" + /dev/views");
+            }
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.
             // `nxsh` here; the graphical column will pass `desktop-shell`. Everything
@@ -261,6 +292,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // setup channel carrying argv and the environment -- is identical, which is what
             // made it worth sharing.
             let code = spawn_leader(root_ns, session_ns, notif, "nxsh", &[], 0, &[]);
+            // **Tell the broker the session ended**, before the namespace goes: it asks whatever
+            // it started for this session to stop, and takes back their grants.
+            if let Some((id, _)) = views {
+                libsession::views_close_session(views_sup, id);
+            }
 
             // Tear the session down. The shell has been reaped, so this drops the last
             // reference to the namespace and with it every binding in it — the `/home`

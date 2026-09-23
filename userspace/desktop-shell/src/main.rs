@@ -658,6 +658,8 @@ fn build_app_namespace(
     home: &str,
     desktop: u64,
     clipboard: u64,
+    views: u64,
+    views_base: &str,
 ) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -851,6 +853,28 @@ fn build_app_namespace(
         };
         if hr != 0 {
             kprint(b"desktop-shell: application /home subtree bind FAIL\n");
+        }
+    }
+
+    // **`/dev/views`, at the session's base** (administration Part A.4), so `with` typed in a
+    // terminal launched here reaches the view broker as *this* session: the base is the identity,
+    // and an application cannot choose another. The same bind the session itself got.
+    if views != 0 && !views_base.is_empty() {
+        let vpath = b"/dev/views";
+        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
+        let vr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                vpath.as_ptr() as u64,
+                vpath.len() as u64,
+                views,
+                views_base.as_ptr() as u64,
+                views_base.len() as u64,
+            )
+        };
+        if vr != 0 {
+            kprint(b"desktop-shell: application /dev/views bind FAIL\n");
         }
     }
     ns
@@ -1097,6 +1121,10 @@ struct Launcher<'a> {
     desktop: u64,
     /// The clipboard server, bound into what it builds — see [`build_app_namespace`].
     clipboard: u64,
+    /// The view broker, bound at `/dev/views` with [`Launcher::views_base`] (administration Part A).
+    views: u64,
+    /// The session's view base, `/s/<id>`; empty binds no `/dev/views`.
+    views_base: &'a str,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
     /// The environment record an application reads its `HOME` from.
@@ -1126,11 +1154,13 @@ impl Launcher<'_> {
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
         (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
+    let (views, views_base) = (l.views, l.views_base);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(draw, fs, tty, profile, home, desktop, clipboard);
+    let app_ns =
+        build_app_namespace(draw, fs, tty, profile, home, desktop, clipboard, views, views_base);
     if app_ns == 0 {
         return false;
     }
@@ -1573,6 +1603,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // other four: a `/dev/clipboard` *binding* resolves to a kernel registration and never
     // back to an endpoint, so the shell cannot re-bind what its own namespace holds.
     let clipboard_endpoint = recv_handle(setup);
+    // The view broker's (administration Part A.4), and `argv[2]`, the session's base: both
+    // bound into every application namespace so `with` works in a terminal launched here. Either
+    // absent means the session has no `/dev/views`, and applications get none.
+    let views_endpoint = recv_handle(setup);
+    let views_base: &str = argv.get(2).map(|s| s.as_str()).unwrap_or("");
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
     }
@@ -1708,6 +1743,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 home,
                 desktop_endpoint,
                 clipboard_endpoint,
+                views_endpoint,
+                views_base,
             );
         if app_ns != 0 {
             may_launch = verify_app_namespace(app_ns, !home.is_empty(), desktop_endpoint != 0);
@@ -1726,6 +1763,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         profile: profile_endpoint,
         desktop: desktop_endpoint,
         clipboard: clipboard_endpoint,
+        views: views_endpoint,
+        views_base,
         home,
         env: &env,
         enabled: may_launch,

@@ -93,6 +93,10 @@ static mut DRAW_ENDPOINT: u64 = 0;
 /// pipeline lives in the serial session as much as the graphical one. `/dev/draw` is the
 /// counter-example — one column has no use for a compositor.
 static mut CLIPBOARD_ENDPOINT: u64 = 0;
+/// The view broker's forwarding endpoint, retained for the handoff to `service-mgr` and on to
+/// both login supervisors (administration Part A.4): each binds it into every session it builds, at
+/// `/dev/views` with that session's base, which is how the broker knows whose request it is.
+static mut VIEWS_ENDPOINT: u64 = 0;
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -980,11 +984,23 @@ fn bind_view_broker(root_ns: u64) -> bool {
     };
     // SAFETY: closing our own control endpoint (handshake done).
     unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+    // Duplicate *before* binding, for `bind_clipboard_server`'s reason: the supervisors bind this
+    // endpoint into every session, so a broker bound where no session can be given it is no use.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained =
+        unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
     let path = b"/svc/views";
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
     let br = unsafe {
         syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
     };
+    if br == 0 && retained >= 0 {
+        // SAFETY: single-threaded init.
+        unsafe { VIEWS_ENDPOINT = retained as u64 };
+    } else if retained >= 0 {
+        // SAFETY: the bind failed; nothing will use the duplicate.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
+    }
     // SAFETY: closing init's endpoint handle (the binding holds its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
@@ -1383,6 +1399,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
             && TTY_ENDPOINT == 0
             && DRAW_ENDPOINT == 0
             && CLIPBOARD_ENDPOINT == 0
+            && VIEWS_ENDPOINT == 0
     } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
@@ -1442,6 +1459,9 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         DRAW_ENDPOINT = 0;
         send_handle(init_end, CLIPBOARD_ENDPOINT);
         CLIPBOARD_ENDPOINT = 0;
+        // The sixth (administration Part A.4): the view broker's, which both supervisors bind.
+        send_handle(init_end, VIEWS_ENDPOINT);
+        VIEWS_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1513,6 +1533,10 @@ unsafe fn close_retained_endpoints() {
         if CLIPBOARD_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, CLIPBOARD_ENDPOINT);
             CLIPBOARD_ENDPOINT = 0;
+        }
+        if VIEWS_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, VIEWS_ENDPOINT);
+            VIEWS_ENDPOINT = 0;
         }
     }
 }
