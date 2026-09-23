@@ -1,8 +1,8 @@
 # Filesystem data path (kernel ↔ fs-server contract)
 
 **Status:** Implemented — the kernel page-cache/mapping path between fs-server and client,
-with deferrals (periodic writeback daemon, per-page dirty tracking) marked inline.
-Verified 2026-08-05.
+with deferrals (writeback on teardown, periodic writeback daemon, per-page dirty tracking) marked
+inline. Verified 2026-08-05; the writeback triggers corrected 2026-09-22.
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -87,9 +87,14 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   when requested and permitted; a store faults in a writable PTE and marks the `CachePage`
   **dirty**.
 - **Writeback**: a dirty page is flushed by a block **write** IRP from the cache frame to its
-  `device_lba` (via `AllocRange` first if it has no backing block), then marked clean. Triggers:
-  **`sys_file_sync`** (an `msync`-style syscall) and **unmap / teardown** of a `MAP_WRITE` VMA.
-  A periodic writeback daemon is deferred.
+  `device_lba` (via `AllocRange` first if it has no backing block), then marked clean. **The one
+  trigger is `sys_file_sync`** (an `msync`-style syscall). Unmapping a `MAP_WRITE` VMA does *not*
+  write back, and when a `FileObject`'s last reference goes its `Drop` frees the cached frames
+  without writing them — so data written through a mapping and never synced is **lost** when its
+  writer lets go. Every file writer today syncs first (`libfs`'s write paths, `nxsh`), which is why
+  nothing loses data. Writeback on teardown, and a periodic writeback daemon, are deferred; the
+  administration plan's unmount and shutdown need the first (`docs/planning/administration.md`).
+  (This bullet said unmap was a trigger until 2026-09-22; it never was — PR #326 review.)
 - **Shared device by capability**: the block device (`/dev/blk/N`, a kernel `DeviceNode`) is
   reachable by two handles — the fs-server keeps a read-write handle for **metadata** I/O, and
   the `FileObject` producer references the same device so the kernel can IRP **file data**

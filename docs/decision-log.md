@@ -27718,9 +27718,10 @@ aside: it contains a bug to one domain at the cost of several policies, prompts 
 broker does identity, the password, the policy, the audit and the spawn. What it grants is mostly an
 endpoint to the service that owns a domain and keeps enforcing that domain's rules.
 
-**Identity is the endpoint.** `session-mgr` binds each session a broker endpoint minted for its
-principal. That same design gives the broker a list of live sessions for free, which is why "who is
-logged in" came into scope rather than needing a registry.
+**Identity is the endpoint.** The supervisor that builds a session — `session-mgr` or
+`desktop-session-mgr`, and both must — binds it a broker endpoint minted for its principal, and tells
+the broker when the session ends. That gives the broker a list of live sessions, which is why "who
+is logged in" came into scope rather than needing a registry.
 
 **The device manager is general — disks, keyboards, mice — and is built now, with coldplug.** It
 hands each arrival to the class's owner (`input-server` already owns input hotplug by design) and
@@ -27747,10 +27748,75 @@ gate.
 **One thing looked simple and is not, and it led to a principle.** `service --enable` looked like an
 edit to a TOML file. The file is `services.toml` in the **initramfs**, a boot archive on the FAT EFI
 partition, which nothing here writes. The maintainer's rule, stated in reply: **the initramfs holds
-only what it takes to boot and mount the root filesystem, and everything else comes up from root.**
-The live image is the one exception — it runs entirely from memory because it has no root to mount —
-and a special case rather than a precedent. The initramfs's *programs* already follow the rule,
+only what it takes to boot and mount the root filesystem, and everything else comes up from root.** The initramfs's *programs* already follow the rule,
 enforced by `INITRAMFS_PROGRAMS` (each with its reason) and a size tripwire. Its *configuration*
 does not: `init.toml` has a bootstrap reason, and `services.toml` has none, since `service-mgr`
 itself runs from `/bin`. Moving it onto root is proposed for Part E; enabling and disabling then
 become a small edit, still deferred until a service wants it.
+
+## 2026-09-22 — Administration, reviewed: a plan that assumed mechanisms the code does not have
+
+PR #326's review checked every claim the plan made about today's code, and every mechanism against
+the code it would be built from. The "what exists" list held up almost entirely. The design did not
+always: several mechanisms quietly assumed something the kernel or the protocol cannot do, and three
+of the fixes are proposals the maintainer has not yet taken.
+
+**A factual error in the entry above, corrected in place before merge.** The live image does not run
+from its initramfs. It mounts a root like any other boot: the `nitrox-live` partition inside
+`root.img`, a module the kernel publishes as a RAM disk, with an initramfs that is the release one
+except for `init.toml`. So it is not an exception to "the initramfs holds only what boots and mounts
+root", and `services.toml` moved onto root reaches it through `root.img` with no special case. The
+one live-only file is `etc/install-allowed`, a policy marker kept in the initramfs because
+`root.img` must match the release root file for file.
+
+**A view built by rebuilding a session would make the broker hold the whole filesystem.** A
+`NamespaceSpec` is handles, not data — the whole-tree fs endpoint, scoped to `/home/<user>` at bind
+time, among them — so a per-session endpoint cannot "record the recipe". Whoever rebuilds a session
+holds its ingredients, and that endpoint reaches `/system/users`. **Proposed: a kernel operation that
+derives a namespace from an existing one.** The broker then holds only what it adds. The plan now
+also says plainly that `disks` is raw whichever way views are built: a device is granted by resolving
+it in the grantor's own namespace. "One front door, several vaults" was true of the domain services
+and not of the disks.
+
+**No program can read a terminal**, so a password prompt is new mechanism rather than wiring. The
+terminal is a handle in the setup message, not a nameable path. Binding a tty channel resolves as
+`Unsupported`. A stage sharing the shell's channel loses its replies to `drain_tty_interrupt`, which
+takes every message on it. Part A now carries a terminal handoff.
+
+**Liveness by endpoint close would fail for exactly the programs it exists to stop.** A binding keeps
+its server's registration alive, and a view includes `/dev/views`, so an elevated program holds its
+session's endpoint open after logout. The login supervisor tells the broker instead.
+
+**The last-administrator guard was placed where the policy cannot be read, and the example policy
+defeated it.** `auth-service` reads only `/system/users`. And a `who = ["*"]` rule on `admin` for
+`shutdown` counted every account as an administrator. The guard moves to the broker. An
+administrator is now narrowly "may use `admin` with `run = ["*"]`", and powering off gets a profile
+of its own.
+
+**`/storage` with "nothing re-bound" needs a resolve that can continue in another namespace**
+(`OBJECT_KIND_SUBNAMESPACE`), deferred with no kernel handling. Without it a lazily filled file fills
+through the wrong registration. **Proposed: build it.**
+
+**The flush chain missed the page cache.** `sys_file_sync` is the only writeback trigger, and a
+dropped `FileObject` frees its frames unwritten. So "stop services, sync, flush, mark clean" would
+lose unsynced mapped writes and still pass `e2fsck`. Unmount now starts with a kernel write-back of
+every `FileObject` under the registration, and the gates check a file's *contents*, not just the
+filesystem's consistency. It also exposed a current-behaviour doc: `filesystem-data-path.md` listed
+unmap as a writeback trigger, which it is not. That is corrected in the same change. Nothing loses
+data today, because every file writer syncs.
+
+**And five smaller things.**
+- Auto-mount plus a raw-disk installer would let a reinstall rewrite a disk under a live
+  `fs-server`. A mounted device is now released before it is granted raw, and a live boot
+  auto-mounts read-only.
+- Part C's gate could not `e2fsck` a RAM disk on the host. It now uses `check-install`'s topology,
+  whose SATA disk is the second disk.
+- Part G from an ordinary desktop had no installable ESP, which rides on the installer entry alone.
+  **Proposed:** that entry stays and its session stops being special.
+- Phase 6's plan did not know what was deferred to it, and planned a driver manager beside Part B's
+  device manager. It is the same component, as in 5.1.
+- 5.1's system-control handle was never built, so power needs a new kernel object, not only a
+  syscall.
+
+The plan collects the kernel work in one table, because the review's main lesson was that this is
+not a userspace-only phase.

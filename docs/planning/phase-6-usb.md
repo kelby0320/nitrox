@@ -64,7 +64,11 @@ Ordered by dependency, not yet sliced into parts:
 - [ ] **The module loader**: `export!` symbol tables, ELF relocation, ABI-hash enforcement,
       `SysCaps::LOAD_MODULE`.
 - [ ] **The userspace driver manager**: matching `DeviceNode`s to modules and handing a driver
-      process a `Handle<DeviceNode>`.
+      process a `Handle<DeviceNode>`. **This is the administration phase's device manager, extended**
+      — not a second component beside it. Administration's Part B builds the device manager with
+      *coldplug* (every boot device announced as an arrival, handed to the class's owner). Phase 6
+      adds the two things it lacks: matching a device to a driver module, and a real arrival
+      source. 5.1 had one component for both jobs, and two would drift.
 
 **This is where they belong, and the reason is a rule this project applies elsewhere: build an
 abstraction at its second consumer, not its first.** The Tier 1 / Tier 2 split is already
@@ -79,6 +83,23 @@ across two hardware targets (QEMU and the laptop) by keeping unused drivers out 
 image. That is true and it is not urgent — the kernel image is small, and a driver compiled in
 and never bound costs a few kilobytes. Designing the load boundary before knowing which drivers
 cross it is the more expensive mistake.
+
+### What the administration phase hands to this one
+
+[`administration.md`](administration.md) defers these here, because USB is what makes them
+necessary:
+
+- [ ] **Hot-plug event sources** feeding the device manager — a notification when a device node is
+      published or withdrawn. Administration builds everything downstream of it.
+- [ ] **FAT under the storage service.** Administration's storage service spawns the server for the
+      filesystem it finds, and is not ext4-shaped. This phase's `fs-server-fat` is its second kind,
+      and the Definition of Done's thumb drive mounts through it and appears under
+      `/storage/<label>`, auto-mounted.
+- [ ] **Formatting and partitioning** — `disk --format` and `disk --partition`, thin over what
+      `nxinstall` already does through `libgpt` and the filesystem libraries. A USB stick is the first
+      thing outside the installer that wants them.
+- [ ] **The graphical prompt**, if its trigger arrives here: unmounting a USB stick from Files is the
+      first desktop surface likely to need an action the policy will not allow without a password.
 
 ### Definition of Done
 

@@ -1432,6 +1432,16 @@ place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
+**Writeback when a `FileObject` is torn down.** `sys_file_sync` is the only writeback trigger:
+unmapping a `MAP_WRITE` VMA writes nothing back, and a `FileObject`'s `Drop` frees its cached frames
+unwritten, so data written through a mapping and never synced is lost when its writer lets go.
+Nothing loses data today, because every file writer (`libfs`, `nxsh`) syncs before letting go — but
+that is a convention held by each writer, not a property of the system, and
+`filesystem-data-path.md` claimed otherwise until 2026-09-22. **Trigger, and it is scheduled**: the
+administration plan's unmount and shutdown (`docs/planning/administration.md`, Part C), which must
+write back every `FileObject` under a registration before tearing its server down, or lose whatever
+a writer left unsynced while still marking the filesystem clean.
+
 ### Userspace
 
 **A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
@@ -1788,21 +1798,6 @@ would be resident more than once.
 
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
-### Resource servers (in-kernel)
-
-**`/dev` directory stub (enumerable placeholder).** Slice 5 gives `DeviceNode` a
-real kernel struct (PCI-discovered nodes; block disks resolve via
-`KernelServerId::BlockDevice` at `/dev/blk`), but there is still **no enumeration
-syscall** (`ENUMERATE` is defined but unused) and **no listable `/dev` directory**
-— lookups resolve a known path to a node; nothing enumerates the children of
-`/dev`. A directory-listing surface was deferred until a device manager or a real enumeration
-consumer existed. **The consumer now exists**: `list` (coreutils Milestone 1) makes
-`list /dev` a day-one shell command, and `sys_ns_enumerate` is built but has no user. The
-open design question is how a listing tool chooses between *namespace enumeration* (what
-`/dev` needs — it is kernel-served) and an *fs-server directory session* (what `list` uses
-today). Scheduled as **D3 of the pre-CLI substrate-hardening pass**
-(`docs/planning/phase-4-desktop.md`). See the decision log (2026-06-22, 2026-06-23).
-
 ### Runtime libraries
 
 **TypedRecord support for enums.** The `#[derive(TypedRecord)]` macro initially supports primitive scalars, `String`, `Vec<T>` of TypedRecord, nested structs, `Option<T>`, and `RawHandle`. Enums (tagged unions) are deferred; they require wire-format extensions and more complex derive code. Trigger: a concrete need; not foreseen as urgent.
@@ -2015,6 +2010,7 @@ decision log entry for the date shown.
 | `cd` as a shell-state builtin (`shell-cwd`) | 2026-07-31 | Milestone 3.5. The answer was not a shell-side string: the kernel gives every child a **LOOKUP-only** namespace handle unconditionally, so no non-supervisor can rebind its own root, and `cd`-as-rebinding was never possible. `PWD` is a conventional entry in the environment `Record`, carried on the Tier-1 setup message; relative paths are expanded by `librsproto::path::resolve` before any syscall, and the kernel still refuses `.`/`..` by name. The shell does not rewrite a spawned stage's arguments — it hands over the same `PWD`, so both sides resolve identically. **Closing the tag is what found the rest of it:** `check-deferrals` failed on two `TODO(shell-cwd)` markers still in `nxsh`'s REPL loop, guarding a hardcoded refusal of `cd` that predated the implementation. Scripts called `run_line` and worked; the interactive path never reached it, so `cd` at a prompt answered "`cd` is not implemented" while `cd` in a script changed directory. Driving it after the deletion then found `cd` refused every *binding* — `cd /` and `cd /bin` both — because `Host::exists` knew only two of the three ways a namespace path can be real: it resolves to an object, or a directory session opens it. The third is that it names a binding or sits above one, which is what `list` walks (`SYS_NS_ENUMERATE`) and what makes `/` and `/bin` visible in the first place. `cd` now asks the namespace the same question `list` does. |
 | Filesystem errors collapsed into `InvalidArgument` (`fs-error-granularity`) | 2026-07-30 | `KError` gained `AlreadyExists` (-14) and `NotEmpty` (-15), and the batched ABI pass found the collapse was not the fs-server's alone: `sys_ns_bind` on an occupied path had the identical one, which is what makes these kernel errors rather than filesystem ones. Three further arms of `fs_kerror` were also reaching for a vaguer error than existed — `TooLarge`→`OutOfMemory`, `Io`→`KernelError`. Separately, `libkern`'s `from_i32` had never decoded `IoError`, so every device error read as `KernelError`; `abi-sync-check` now derives the decode table from the kernel's enum. See [error-codes.md](../reference/error-codes.md). |
 | `cargo xtask abi-sync-check` | 2026-07-29 | Built (Slice D2) and wired into CI. Compares the four hand-mirrored ABI families — syscall numbers, `KError`/`KObjectType` discriminants, `Rights` bits — plus individually-paired shared limits (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`), 91 values in all. `#[repr(C)]` layouts stay out of it: both sides already assert their own offsets and sizes at compile time, which is stronger and fails earlier. |
+| A listable `/dev` (`/dev` directory stub) | 2026-07-29 | Phase 4 D3: `list` takes the **union** of the filesystem under a path and the namespace bindings beneath it, so `/dev` lists like any directory of mount points and `sys_ns_enumerate` found its consumer. **One limitation stays open, and is now carried by the administration plan's Part B**: a kernel server owning a subtree is one binding, so `/dev/blk` lists as empty until the device registry can be enumerated. (Moved here 2026-09-22; the entry had read as open for two months — PR #326 review.) |
 | x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |
 | Concurrent direct-block + forwarded-lookup hang | 2026-07-20 | Not the block/forwarding path — a missing cross-CPU wake; fixed by the reschedule IPI. |
 | Writeback IRPs | Phase 3 | Dirty-page writeback landed with read-write `fs-server-ext4` (`FileObject::writeback` / `sys_file_sync`). |
