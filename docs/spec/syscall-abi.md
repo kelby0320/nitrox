@@ -109,6 +109,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `34` | `sys_file_truncate` |
 | `35` | `sys_file_rename` |
 | `36` | `sys_process_terminate` |
+| `37` | `sys_ns_derive` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -304,6 +305,20 @@ fn sys_ns_create() -> isize
 Creates a new empty `Namespace` kernel object, independent of the caller's root
 namespace. Returns a handle with full namespace rights (`LOOKUP | BIND | UNBIND`
 plus the generic duplicate/transfer/inspect band).
+
+```rust
+fn sys_ns_derive(ns: RawHandle) -> isize
+```
+Creates a new `Namespace` holding **a copy of every binding in `ns`** — each path, target,
+subtree base and rights value — and returns a handle to it with the same full rights
+`sys_ns_create` gives. Requires `LOOKUP` on `ns`: every binding in the copy is one the caller
+could already resolve, and the rights on the result add only what `sys_ns_create` hands anyone
+(binding still needs `BIND_NAMESPACE`, unbinding only narrows). A process's own root arrives
+`LOOKUP`-only and cannot be transferred; deriving a copy is how it hands its namespace to
+someone. **A snapshot**: targets are shared, so both resolve the same paths to the same
+resources, but a later bind or unbind in either does not reach the other. Returns
+`OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
+broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
 
 ### Entropy
 

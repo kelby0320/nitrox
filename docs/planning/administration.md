@@ -626,10 +626,12 @@ closes the phase**.
 
 ### The pieces, in dependency order
 
-- [ ] **A.1 — `sys_ns_derive`.** `Namespace::try_derive`, the syscall, `libkern`'s constant, the ABI
+- [x] **A.1 — `sys_ns_derive`** *(2026-09-23)*. `Namespace::try_derive`, the syscall, `libkern`'s constant, the ABI
       spec and `abi-sync-check`. Host tests: the copy resolves what the source resolves; a bind or
       an unbind in either one leaves the other alone; a subtree base survives the copy; and
-      dropping one namespace leaves the other's registrations alive.
+      dropping one namespace leaves the other's registrations alive. **Plus a `boot-probe` check
+      through the syscall itself**, which the host tests cannot reach: the copy resolves, can be
+      sent and pruned, pruning it leaves the root alone, and a handle without `LOOKUP` is refused.
 - [ ] **A.2 — a terminal per stage.** A tty op minting a sibling terminal on the caller's backend,
       and its spec. Echo is per terminal, so a password prompt does not turn the shell's echo off.
       `nxsh` mints one for each external stage and moves it in through the **existing** `terminal`

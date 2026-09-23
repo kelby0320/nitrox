@@ -27988,3 +27988,39 @@ moves to `check-login`, which logs in on the release image and launches `nxterm`
 **Smaller:** session ids are never reused, since a program that ignores its session's end keeps the
 old base. The graphical session's identity rests on `desktop-shell`, which holds the raw endpoint.
 And the reason the broker copies again includes a kept `DUPLICATE`, not only a spawned child.
+
+## 2026-09-23 — Administration A.1: `sys_ns_derive`, a namespace you can hand someone
+
+The first piece of Part A, and its only kernel work. `sys_ns_derive(ns)` (syscall 37) needs
+`LOOKUP` on `ns` and returns a new namespace holding a copy of every binding in it, with the same
+full rights `sys_ns_create` gives. `Namespace::try_derive` copies each path, shares each target —
+a direct handle's object and a registration each gain a reference, a kernel server's id is copied
+— and keeps each subtree base and rights value. The resolution cache is not copied.
+
+**`LOOKUP` is the whole requirement**, and the doc comment says why rather than leaving it to be
+rediscovered: every binding in the copy is one the caller could already resolve, binding into it
+still needs `BIND_NAMESPACE`, and unbinding only narrows. What the full rights add that matters is
+`TRANSFER` — a process's own root arrives `LOOKUP`-only, so a copy is how it hands its namespace to
+the broker.
+
+**The lock discipline is the module's.** Targets are cloned under the source's lock, into a list
+that outlives the guard, so a failed allocation part-way drops what was cloned only after the lock
+is released; the new namespace's lock is never taken while the source's is held, both being
+rank 4.
+
+**Tested twice, because the host tests cannot see the syscall.** Four host tests on
+`try_derive` — every binding kind with its rights and base, a snapshot in both directions, targets
+shared and each freed once, an empty cache — each negative-controlled: skipping userspace-server
+bindings, losing rights, losing a base, and re-adopting a direct handle without a reference bump
+(which crashed the test on a double free) all fail them. And a `boot-probe` check through the
+syscall, in `test-qemu`: the copy resolves, can be sent and pruned, pruning it leaves the root
+alone, and a handle without `LOOKUP` is refused. Three kernel mutations fail that boot at the line
+naming them — returning a full-rights handle to the *same* namespace ("unbinding in the copy
+reached the root"), which is the shape a hurried "derive" would take and a silent upgrade of every
+`LOOKUP`-only root; returning a `LOOKUP`-only copy; and dropping the `LOOKUP` requirement.
+
+**A current-behaviour doc was wrong, and is fixed with this.** `namespace-and-resource-servers.md`
+described `BIND_NAMESPACE` as "not yet designed" and said `sys_ns_bind` "will additionally require"
+it. It has been enforced since Phase 3 slice 6 Part C (2026-07-14). It also now says what the
+broker's design turned on: `sys_ns_unbind` is not syscap-gated, because removing a binding only
+narrows.

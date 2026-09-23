@@ -34,6 +34,11 @@
 static ALLOC: libheap::Heap = libheap::Heap;
 
 use libkern::debug::Line;
+use libkern::abi::HandleInfo;
+use libkern::{
+    RIGHT_LOOKUP, RIGHT_TRANSFER, RIGHT_UNBIND, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
+    SYS_NS_DERIVE, SYS_NS_UNBIND,
+};
 use libkern::{
     RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
     SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT,
@@ -783,7 +788,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & grow_test(root_ns)
         & create_test(root_ns)
         & subtree_bind_test(root_ns)
-        & auth_multi_client_test(root_ns);
+        & auth_multi_client_test(root_ns)
+        & ns_derive_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -836,6 +842,88 @@ fn auth_multi_client_test(root_ns: u64) -> bool {
     }
     kprint(b"boot-probe: /svc/auth mints a session per caller (session-mgr + 2) ok\n");
     true
+}
+
+/// Prove `sys_ns_derive` through the syscall, not only through `Namespace::try_derive`, whose host
+/// tests cannot see the rights check, the handle the syscall allocates, or the rights it carries
+/// (administration Part A.1).
+///
+/// Four claims, each one a view depends on:
+/// 1. the copy resolves what its source resolves;
+/// 2. it can be sent — `TRANSFER` — which the `LOOKUP`-only root this process was spawned with
+///    cannot, and it can be pruned, `UNBIND`;
+/// 3. pruning the copy leaves the source alone, the snapshot rule seen from the side that matters;
+/// 4. a namespace handle without `LOOKUP` cannot be copied.
+///
+/// `/subtreetest` is the test image's own `[[bind]]`, which `subtree_bind_test` above already
+/// resolves, so this borrows a binding that is known to be there rather than adding one.
+fn ns_derive_test(root_ns: u64) -> bool {
+    const PATH: &[u8] = b"/subtreetest/current-generation";
+    // SAFETY: a namespace handle this process holds.
+    let d = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if d <= 0 {
+        Line::new().s(b"boot-probe: ns derive FAIL (").i(d as i64).s(b")").end();
+        return false;
+    }
+    let d = d as u64;
+    let close = |h: u64| {
+        if h != 0 {
+            // SAFETY: closing a handle this process owns.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        }
+    };
+    let mut ok = true;
+
+    let (st, fh) = ns_lookup(d, PATH, RIGHT_MAP_READ);
+    close(fh);
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: ns derive: the copy does not resolve what the root does FAIL\n");
+        ok = false;
+    }
+
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, d, (&raw mut info) as u64) };
+    let want = RIGHT_TRANSFER | RIGHT_UNBIND;
+    if sr != 0 || info.rights & want != want {
+        kprint(b"boot-probe: ns derive: the copy cannot be sent or pruned FAIL\n");
+        ok = false;
+    }
+
+    let bind = b"/subtreetest";
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    let ur = unsafe { syscall4(SYS_NS_UNBIND, d, bind.as_ptr() as u64, bind.len() as u64, 0) };
+    let (cst, cfh) = ns_lookup(d, PATH, RIGHT_MAP_READ);
+    let (rst, rfh) = ns_lookup(root_ns, PATH, RIGHT_MAP_READ);
+    close(cfh);
+    close(rfh);
+    if ur != 0 || cst == 0 {
+        kprint(b"boot-probe: ns derive: unbinding in the copy did not take FAIL\n");
+        ok = false;
+    }
+    if rst != 0 {
+        kprint(b"boot-probe: ns derive: unbinding in the copy reached the root FAIL\n");
+        ok = false;
+    }
+
+    // A handle to the same copy with everything but `LOOKUP`.
+    // SAFETY: `d` carries `DUPLICATE`; the result is a handle this process owns.
+    let blind = unsafe { syscall2(SYS_HANDLE_DUPLICATE, d, !RIGHT_LOOKUP) };
+    // SAFETY: as above.
+    let refused = blind > 0 && unsafe { syscall1(SYS_NS_DERIVE, blind as u64) } < 0;
+    if blind > 0 {
+        close(blind as u64);
+    }
+    if !refused {
+        kprint(b"boot-probe: ns derive: copied a handle without LOOKUP FAIL\n");
+        ok = false;
+    }
+
+    close(d);
+    if ok {
+        kprint(b"boot-probe: ns derive: a sendable snapshot, pruned without touching the root ok\n");
+    }
+    ok
 }
 
 
