@@ -28274,3 +28274,39 @@ which -255 satisfies. It now asks for `NotFound`. The broker builds its errors w
   was given rather than inferring it from a non-empty list, and tests cover both forms.
 
 `test-qemu` is about four seconds longer, for the two paced delays.
+
+## 2026-09-23 — A dialog says when it has the keyboard: the `check-login` Save As flake
+
+**The flake.** `check-login` failed once during Part A's full gate run. The gate saw `buffer rev 12`
+where it expected `chooser name so far 8 chars` after `Ctrl+Shift+S`. A backspace meant for the
+Save As chooser had deleted a character of the document.
+
+**The cause, made observable before anything was fixed.** `nxedit` prints `choosing a file in …`
+before it asks for the chooser's window. That order is deliberate: PR #267 made every dialog line
+precede the window, so it cannot race the shell's placement line to the console. The window is
+then created, held for the manager, placed, and only then handed the keyboard. Until then the
+compositor's `focus_candidate` skips it, so a key that reaches the compositor first goes to the
+editor, and the gate sent its backspace on the first line. A probe that held `desktop-shell`'s
+`Place` of every dialog for half a second made the race deterministic. It first failed
+`nxfiles`'s Properties step: `showing properties` has the same shape, and the gate's `Esc`
+reached the browser, so the dialog never closed. With only the chooser's new wait removed, it
+failed exactly as the gate run's flake had: `buffer rev 12`, then a timeout on the chooser's name.
+
+**The fix is a second receipt, not a moved first one.** The opening lines stay where PR #267 put
+them. `libui::window::Child::took_keyboard` answers `true` once, for a window's first
+`Focus(true)`, and every dialog prints a line on it. That covers `nxedit`'s chooser and its
+question, and `nxfiles`'s question and Properties, the latter through a new `Dialog::has_keyboard`
+so a variant carries the line. The gate waits for the chooser's and the Properties dialog's lines
+before typing. The decision is a pure function with a host test, `reported_hover`'s pattern,
+because a `Child` cannot be built on the host. With the half-second hold still in place, every
+dialog step of `check-login` passes. The one failure is the gate's own check that the
+compositor's 200 ms configure fallback never fired, which the probe trips by design.
+
+**The rule is written down** in `docs/conventions/qemu-integration-tests.md`: type at a dialog
+only after its keyboard receipt. A click needs none, because it is routed by position, and the
+shell's `placed dialog` line comes after the compositor has placed the window.
+
+**What this does not change is `TODO(dialog-modality)`.** A person who types during the placement
+still types into the parent, as the compositor's comment on `focus_candidate` says. The receipt
+makes the gate wait; making a dialog own the keyboard from the moment it is asked for is still
+that deferral's job.

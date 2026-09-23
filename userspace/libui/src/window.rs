@@ -111,6 +111,9 @@ pub struct Child {
     /// hover and strands the capture. It failed about one run in seven, and a probe in the guest
     /// is what finally said so rather than any amount of reading (M12 Part D).
     shown: Option<u64>,
+    /// Whether this window has been handed the keyboard since it opened — see
+    /// [`took_keyboard`](Self::took_keyboard).
+    had_keyboard: bool,
 }
 
 impl Child {
@@ -188,6 +191,7 @@ impl Child {
             pool,
             hover: None,
             shown: None,
+            had_keyboard: false,
         })
     }
 
@@ -287,6 +291,7 @@ impl Child {
             pool,
             hover: None,
             shown: None,
+            had_keyboard: false,
         })
     }
 
@@ -535,6 +540,23 @@ impl Child {
         y: i32,
     ) -> bool {
         self.router.drop_at(&self.tree, content, l, x, y).is_some()
+    }
+
+    /// Whether `event` hands this window the keyboard **for the first time since it opened** —
+    /// `true` once, for its first `Focus(true)`, and never again.
+    ///
+    /// **The line a gate may type after.** A dialog's owner announces it *before* asking for the
+    /// window, which is the only order that cannot race the shell's placement line to the
+    /// console (PR #267) — and so that line says nothing about where the next key goes. The
+    /// window is created, held for a manager, placed, and only then handed the keyboard, and a
+    /// key that reaches the compositor before that goes to the parent: `check-login` once typed a
+    /// Save As backspace into the document that way. What the owner prints on this is the receipt
+    /// that the keyboard is here (`docs/conventions/qemu-integration-tests.md`).
+    ///
+    /// Once rather than on every gain, so clicking between a dialog and its parent does not
+    /// repeat it; a new window is a new `Child`, and announces again.
+    pub fn took_keyboard(&mut self, event: &WindowEvent) -> bool {
+        first_keyboard(&mut self.had_keyboard, event)
     }
 
     /// Destroy the window and give this side's pixels back.
@@ -805,6 +827,24 @@ mod tests {
         assert!(Child::create_sized(&mut session, panel, size, 2).is_none(), "the mock refuses");
         assert!(session.into_transport().requests > 0, "a panel was never asked for");
     }
+
+    /// **Once, on the first gain.** A loss before it does not count, a key is not focus, and a
+    /// second gain — the person clicked the parent and came back — is not announced again.
+    #[test]
+    fn a_window_takes_the_keyboard_once() {
+        let key = WindowEvent::Key(librsproto::surface::KeyEvent::default());
+        let (gain, loss) = (WindowEvent::Focus(true), WindowEvent::Focus(false));
+        // One window's life, event by event, through the flag it keeps.
+        let mut had = false;
+        assert!(!first_keyboard(&mut had, &loss), "a loss first is not the keyboard");
+        assert!(!first_keyboard(&mut had, &key), "a key is not the keyboard");
+        assert!(first_keyboard(&mut had, &gain), "the first gain is");
+        assert!(!first_keyboard(&mut had, &loss));
+        assert!(!first_keyboard(&mut had, &gain), "once: back from the parent is not announced");
+        assert!(had, "kept");
+        // A new window starts again.
+        assert!(first_keyboard(&mut false, &gain));
+    }
 }
 
 /// What a caller is told the hover is: the tree's while a gesture runs, the pointer's otherwise.
@@ -821,6 +861,19 @@ mod tests {
 /// the part that can be pinned without one.
 fn reported_hover(grabbed: bool, live: Option<u64>, shown: Option<u64>) -> Option<u64> {
     if grabbed { shown } else { live }
+}
+
+/// Whether `event` is a window's first keyboard, recording in `had` that it has had one.
+///
+/// A function for [`reported_hover`]'s reason — a `Child` cannot be built on the host. **It
+/// takes the flag rather than returning it**, so the record is part of what the test runs: a
+/// version that returned the new value left the one line storing it untested, and deleting that
+/// line announced every gain (PR #330 review, optional 2).
+fn first_keyboard(had: &mut bool, event: &WindowEvent) -> bool {
+    match event {
+        WindowEvent::Focus(true) => !core::mem::replace(had, true),
+        _ => false,
+    }
 }
 
 /// A private framebuffer of `size` to compose a frame into.
