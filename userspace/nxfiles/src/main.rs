@@ -688,10 +688,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // its own, so a key injected between the receipt and the close was routed to the menu and
         // dropped. `check-login` timed out on that (PR #278 review, blocking 1).
         //
-        // **What it proves and what it does not.** The destroy has been *sent* when this prints;
-        // the compositor processing it is a separate round trip this cannot see. That is strictly
-        // stronger than before and is not a guarantee — `compositor: focus win=… has=1` would be
-        // the real one, and `log_route` caps routed-input lines at eight, long past by here.
+        // **What it proves.** The destroy has been *sent* when this prints, and since 2026-09-23
+        // that is enough: the compositor serves every queued request before it routes input, so
+        // a key that arrives after this line is routed after the menu is gone. Until then it was
+        // not — a busy compositor served the key first, and `check-login` still timed out here
+        // now and then under KVM (`serve_queued_requests`, in the compositor).
         let typed = app.prompt_len();
         // **What is selected, reported on change** (M14 Part D, decision 5). Since a single click
         // selects rather than opens, "the click landed and selected the right row" is a fact with

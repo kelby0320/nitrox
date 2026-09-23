@@ -6174,9 +6174,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // printed *before* closing the menu, which narrowed the window without closing it).
     //
     // `nxfiles` now emits this after the close rather than before, so it means the destroy has
-    // been sent. The compositor processing it is a further round trip nothing here can observe;
-    // `compositor: focus win=… has=1` would be the real signal and `log_route` caps routed-input
-    // lines at eight, long past by this point in the gate.
+    // been sent — **and since 2026-09-23 that is the whole guarantee**, because the compositor
+    // serves every queued request before it routes input. Before that, a busy compositor could
+    // still route the key first, and this step timed out now and then in CI with the destroy
+    // served a millisecond after the key.
     session.expect("nxfiles: name so far 0 chars")?;
 
     // **A receipt per character**, the discipline every typed sequence in this gate follows —

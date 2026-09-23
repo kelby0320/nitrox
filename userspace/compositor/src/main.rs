@@ -1075,6 +1075,60 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     Some(ch.into_raw().0)
 }
 
+/// Serve every request already queued on the manager's channel and every client's, **before an
+/// input batch is routed** — so input is routed against every request sent before it arrived.
+///
+/// **What went wrong without it.** The wait loop serves input first when both are ready, and a
+/// client's channel one request per wake. So a busy compositor woke to a key *and* a menu's
+/// destroy, routed the key to the menu — which still existed and still held the keyboard — and
+/// then destroyed it. The client had let the menu go when it sent the destroy, so the key named
+/// a window it no longer had and `libsurface` dropped it: `check-login` timing out on
+/// `nxfiles: name so far 1 chars` in CI. The destroy had been sent *before the key existed* —
+/// the gate types only once `nxfiles` reports the prompt open, which it does after sending it —
+/// so nothing on the client's side could have ordered them. Holding the compositor busy for a
+/// second after a menu click reproduced it every time, and did the same to a click on the panel
+/// just after the overview closed, so it was never only the keyboard's.
+///
+/// **One pass over each channel, bounded by its depth.** `SESSION_QUEUE_DEPTH` is everything a
+/// channel can hold, so it is everything that was queued when the input arrived; a client that
+/// keeps sending cannot hold input off by doing so. The manager goes first because it arranges
+/// the stack the sessions' windows are in.
+fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
+    for _ in 0..SESSION_QUEUE_DEPTH {
+        // SAFETY: reading our own manager slot.
+        if unsafe { MANAGER_CH } == 0 {
+            break;
+        }
+        match serve_manager(srv, screen) {
+            Served::One => {}
+            Served::Empty => break,
+            Served::Closed => {
+                close_manager(srv, screen);
+                break;
+            }
+        }
+    }
+    for slot in 0..MAX_SESSIONS {
+        for _ in 0..SESSION_QUEUE_DEPTH {
+            // SAFETY: reading our own slot table.
+            if unsafe { SESSION_CH[slot] } == 0 {
+                break;
+            }
+            match serve_session(slot, srv, screen) {
+                Served::One => {}
+                Served::Empty => break,
+                // As the wait loop closes one, and for its reason: through `repaint`, so the
+                // pointer survives a client dying under it.
+                Served::Closed => {
+                    close_session(slot, srv);
+                    repaint(srv, screen);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Batches to take from the input channel in one pass.
 ///
 /// **A bound, not a target.** The loop drains what is queued and stops; this only keeps a
@@ -1671,8 +1725,24 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     reply_on_session(ch, OP_MGR_CAPTURE, request_id, &[])
 }
 
-/// Handle one request on the manager channel. Returns `false` if the manager is gone.
-fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+/// What one call to [`serve_manager`] or [`serve_session`] found on its channel.
+///
+/// **Three answers, because the queue drain needs the third.** A `bool` said "keep this peer or
+/// close it", which is all the wait loop asks; [`serve_queued_requests`] also has to know when a
+/// channel is *empty*, or it cannot stop draining one without a wasted receive per slot per
+/// input batch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// A request was handled, and the peer is still there.
+    One,
+    /// Nothing was queued — or a spurious signal with nothing behind it.
+    Empty,
+    /// The peer has gone, or a reply to it failed; the caller closes it.
+    Closed,
+}
+
+/// Handle one request on the manager channel, if one is queued.
+fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
     let rr = unsafe {
@@ -1686,8 +1756,14 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
     };
     if rr != 0 {
         // `PeerClosed` means the manager exited. Anything else is an empty ring.
-        return rr != KError::PeerClosed.as_i32() as i64;
+        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
+    if handle_manager_request(ch, srv, screen) { Served::One } else { Served::Closed }
+}
+
+/// Handle the request [`serve_manager`] has just received into `RECV_MSG`. Returns `false` if
+/// the manager is gone.
+fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body, carried) = unsafe {
         // **Close every transfer this message carried, except the one `Capture` needs.**
@@ -2217,8 +2293,8 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
     }
 }
 
-/// Serve one request on session `slot`. Returns `false` if the session should close.
-fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+/// Serve one request on session `slot`, if one is queued.
+fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     let ch = unsafe { SESSION_CH[slot] };
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -2232,9 +2308,19 @@ fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuff
     };
     if rr != 0 {
         // `PeerClosed` is the client going away, which is the normal end of a session.
-        return rr != KError::PeerClosed.as_i32() as i64;
+        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
+    if handle_session_request(slot, ch, srv, screen) { Served::One } else { Served::Closed }
+}
 
+/// Handle the request [`serve_session`] has just received into `RECV_MSG`. Returns `false` if
+/// the session should close.
+fn handle_session_request(
+    slot: usize,
+    ch: u64,
+    srv: &mut Server,
+    screen: &mut Screen<RawFramebuffer>,
+) -> bool {
     // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch; the
     // alternative is two live `static mut` borrows at once. `MAX_BODY` is sized so a whole
     // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
@@ -2809,26 +2895,29 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 serve_signalled = true;
                 continue;
             }
-            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
-                // The input server died. Close the endpoint and carry on serving the
-                // display — the alternative is a compositor that exits because a mouse
-                // went away.
-                kprint(b"compositor: input server gone\n");
-                // SAFETY: closing an endpoint this process owns and stops using.
-                unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
-                srv.input_ch = 0;
+            if srv.input_ch != 0 && h == srv.input_ch {
+                serve_queued_requests(srv, &mut screen);
+                if !serve_input(srv, &mut screen) {
+                    // The input server died. Close the endpoint and carry on serving the
+                    // display — the alternative is a compositor that exits because a mouse
+                    // went away.
+                    kprint(b"compositor: input server gone\n");
+                    // SAFETY: closing an endpoint this process owns and stops using.
+                    unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
+                    srv.input_ch = 0;
+                }
                 continue;
             }
             // SAFETY: reading our own manager slot.
             if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
-                if !serve_manager(srv, &mut screen) {
+                if serve_manager(srv, &mut screen) == Served::Closed {
                     close_manager(srv, &mut screen);
                 }
                 continue;
             }
             // SAFETY: scanning our own slot table for the signalled endpoint.
             if let Some(slot) = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == h) }
-                && !serve_session(slot, srv, &mut screen)
+                && serve_session(slot, srv, &mut screen) == Served::Closed
             {
                 close_session(slot, srv);
                 // Through `repaint`, so the pointer survives a client dying under it. It did

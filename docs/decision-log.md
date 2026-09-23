@@ -27825,3 +27825,48 @@ not a userspace-only phase.
 `OBJECT_KIND_SUBNAMESPACE` for `/storage`, and the installer's entry kept with an ordinary session —
 and the one the scoping entry above left open: `services.toml` moves onto the root filesystem in
 Part E. The plan now records them as decisions.
+
+## 2026-09-23 — Input waits for the requests already sent: the "name so far 1 chars" flake
+
+`check-login --kvm` failed once on PR #326 — a docs-only change, so the same code had passed on the
+commit before — timing out on `nxfiles: name so far 1 chars` with `0 chars` in the transcript. That is
+the symptom the 2026-09-03 entry ("typing into a prompt before it exists") fixed by moving the
+receipt after the menu's destroy, and said plainly it had narrowed rather than closed: the destroy
+was *sent*, and the compositor processing it was "a further round trip nothing observable can
+prove".
+
+**The round trip was the whole bug, and it was the compositor's.** The wait loop served the input
+channel before the client channels when both were ready, and a client channel one request per
+wake. So a compositor that was busy when `nxfiles` sent the destroy woke to the destroy *and* the
+gate's key, routed the key to the menu — which still existed, and still held the keyboard — and
+destroyed the menu a millisecond later. `libsurface` in `nxfiles` had already forgotten the
+window, because `destroy` removes it, and dropped the key as naming a window it does not have. The
+destroy was sent before the key *existed*, so no care on the client's side could order them.
+
+**Proven before fixed.** Probes on the compositor (each destroy served, every key routed, uncapped)
+and on `libsurface` (a key dropped for a gone window), and a simulated busy compositor: one second
+of spinning after a release on a popup. The first three runs reproduced nothing, and the probe
+timestamps said why — routed events are flushed at the *end* of a loop iteration, so the spin ran
+before `nxfiles` had even heard the click. Moved after the flush, it reproduced the CI failure
+exactly: `key routed to win=28` at t=37645 and 37646, `served destroy win=28` at 37647, two keys
+dropped. Spinning after *every* popup release reproduced the same thing for a **click**: the gate's
+press on the panel, just after the overview closed, went to the overview. So it was never only
+keyboard focus.
+
+**The fix is an ordering, in the compositor.** Before routing an input batch it serves everything
+queued on the manager's channel and every client's (`serve_queued_requests`), one pass bounded by
+the queue depth — everything that could have been queued when the input arrived, and a client that
+keeps sending cannot hold input off. `serve_session` and `serve_manager` now say whether they
+served, found nothing, or found the peer gone (`Served`), because a drain has to know when to stop.
+With the fix, both simulations pass: the destroy is served, then the keys go to the browser's
+window, and the panel gets its click.
+
+**Not a client-side fix, deliberately.** Re-addressing a key for a closed popup to its parent would
+have been right for `nxfiles`, `nxedit` and `nxterm` and wrong for `desktop-shell`, whose overview
+and Applications menu hand the keyboard to *another program's* window when they close. And it
+would not have reached the click at all.
+
+**What remains is the other order**: a key routed *before* the client sent its request — typed
+while the client is still handling the keystroke that closes the window. That key went to the
+window that really was focused, and a client closing it drops the rest. Every such drop the probes
+saw was the closing key's own release, which nothing acts on; `input-subsystem.md` §4 says so.
