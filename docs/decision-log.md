@@ -28138,3 +28138,63 @@ without the broker builds sessions without `/dev/views`, and each supervisor say
 
 Two mutations fail these gates: ids handed out again ("session 1 ended and the next login got 1"),
 and a serial session built without the binding.
+
+## 2026-09-23 — Administration A.5 and A.6: `with`, and Part A complete
+
+**`with` is a coreutil** (`userspace/coreutils/src/bin/with.rs`), in three shapes: `with VIEW PROGRAM
+ARGS…`, `--list` (a typed table), and `--check FILE`. For a request it:
+- copies its own namespace and sends the copy;
+- moves stdin and stdout to the program;
+- sends `stderr` and its terminal as *duplicates*, since it still needs one to report on and the
+  other to ask for a password on;
+- prompts with echo off, and turns echo back on before the program inherits the terminal;
+- passes the shell's stop request on to the broker once, and exits with the program's code.
+
+coreutils' `Stage` gained the whole environment, which `with` forwards unchanged.
+
+**`test-interactive` gained a step that uses it the way a person would.** In order:
+- `nxinstall` alone sees no disks;
+- `with install nxsh` is refused by the policy, with no prompt;
+- `with --list` shows the `install` row;
+- `with admin nxinstall` refuses a wrong password, then *holds* the right one — the listing arrives
+  at least 1.5 s after the refusal, measured on the host — and the listing names `/dev/blk/0`;
+- three wrong passwords end a request;
+- `Ctrl-C` stops `with admin sleep 60` well inside the minute;
+- the audit records exist, and neither password appears anywhere on the console.
+
+Three mutations fail it at the matching claim: echo left on ("a password reached the console"),
+`with` not passing the stop on, and a broker that does not hold the check ("answered 86 ms after
+the refusal").
+
+**`check-login` runs the same request from the desktop.** `with admin nxinstall` is typed into the
+terminal the Applications menu opened, and the password is typed into that window. The broker's
+audit then shows the program started and exited 0. That is the graphical chain end to end:
+`desktop-shell`'s `/dev/views`, the sibling terminal on the window's backend, the password read
+there. Dropping the application-namespace bind fails it.
+
+**The full gate run before the PR caught an ordering bug in `with` itself.** After a wrong password
+it wrote the reason to `stderr` — which reaches the screen when the shell next drains that sink — and
+the next prompt straight to its terminal, so the two could land in either order: a person saw the
+second prompt and then "wrong password" under it, and `test-interactive` scanned past the prompt it
+was about to wait for. The reason now goes on the terminal in the same write as the prompt. The same
+run exposed a genuinely unordered pair in the gate — the audit's `exited`, from the logging service,
+and the shell's prompt, from the tty server — which now waits with `expect_all`.
+
+**The gate harness decoded each serial read on its own**, so a character split across two reads
+became two replacement characters, and an `expect` for `sleep — exited` could never match
+`sleep �� exited`. It now carries an incomplete trailing sequence into the next read. A host test
+splits an em dash across two reads, and the old decoding fails it.
+
+**`TODO(admin-visibility)` is resolved.** An administrator is a mode — a view — reached with
+`with`. The `/applications` asymmetry its code marker sat on stands on its own, and
+`desktop-shell`'s comment and `graphical-session.md` §6.1 say so.
+
+**Part A is complete.** It delivered:
+- views and the broker;
+- `with`, on a terminal and in a desktop window;
+- one grant end to end;
+- per-session pacing;
+- sessions opened and closed by both supervisors;
+- an audit record per request.
+
+`with --edit` and the other grants belong to later parts.

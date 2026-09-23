@@ -58,6 +58,12 @@ pub struct Stage {
     /// tty server had no terminal to spare, so a stage that needs one must say so rather than
     /// assume it.
     pub terminal: Option<u64>,
+    /// The whole environment the spawner passed, as it passed it — empty in Tier 0.
+    ///
+    /// `cwd` above is the one entry most stages need; a stage that hands its environment on
+    /// unchanged — `with`, forwarding it to the program it asks the view broker to run — needs
+    /// the rest, and rebuilding it from pieces would drop whatever it did not know about.
+    pub env: libstream::wire::Record,
     /// Whether a setup message was received (Tier 1).
     pub from_shell: bool,
 }
@@ -113,6 +119,7 @@ impl Stage {
                 argv: s.argv,
                 cwd: cwd_of(&s.env),
                 terminal: s.terminal,
+                env: s.env,
                 from_shell: true,
             },
             Some(Err(_)) => {
@@ -129,6 +136,7 @@ impl Stage {
                 argv: Vec::new(),
                 cwd: None,
                 terminal: None,
+                env: libstream::wire::Record::default(),
                 from_shell: false,
             },
         }

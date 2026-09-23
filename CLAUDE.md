@@ -94,8 +94,8 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
 `cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 78 expectations across
-25 steps, expect-driven rather than sleep-driven.
+the real prompt over the serial console and matches on what comes back — 28 steps,
+expect-driven rather than sleep-driven.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
 a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell

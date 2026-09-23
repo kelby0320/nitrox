@@ -1,13 +1,13 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: scoped, not started (2026-09-22; revised after the PR #326 review; Part A detailed
-2026-09-23).** Scheduled after
+**Status: in progress — Part A complete (2026-09-23); scoped 2026-09-22 and revised after the
+PR #326 review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below), so **A.1 is next**; the other parts are
-sketched. The plan began as a stub on 2026-09-16, written while building the
+had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, so **Part B's
+detail pass is next**; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -445,7 +445,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 
 ## Parts — sketched
 
-- [ ] **A — the view broker, on a terminal** — *detailed below, A.1–A.6.* The broker service;
+- [x] **A — the view broker, on a terminal** — *detailed below, A.1–A.6; complete 2026-09-23.* The broker service;
       `/dev/views`, one forwarding endpoint bound into each session with its base by **both** login
       supervisors, which also tell the broker when a session ends, and by `desktop-shell` into the
       applications it launches; namespace derivation in the kernel; `with`, `--list` and `--check`; `views.toml`, its schema
@@ -652,18 +652,18 @@ closes the phase**.
       supervisors and on to `desktop-shell`. A supervisor opens a session at login, binds
       `/dev/views` with its base, and closes the session when its leader exits. `desktop-shell`
       binds the same thing into every application namespace.
-- [ ] **A.5 — `with`.** A coreutil: `with <view> <program> [args]`, `--list` (a typed table) and
+- [x] **A.5 — `with`** *(2026-09-23)*. A coreutil: `with <view> <program> [args]`, `--list` (a typed table) and
       `--check <file>`. The last sends the file's text for the broker to judge, so there is one
       parser. It prompts with echo off, relays the exit status, and passes on a stop request. The
       shell spec records the name as taken by `/bin`.
-- [ ] **A.6 — the seed and the gates.** The build seeds `/system/views.toml` *(landed with A.3,
+- [x] **A.6 — the seed and the gates** *(2026-09-23)*. The build seeds `/system/views.toml` *(landed with A.3,
       which needed it to test the broker in a boot)*:
       - an `admin` profile holding `disks`, which the demo account may use for any program with a
         password;
       - a narrower profile allowing one program, so a gate can see a request refused by policy.
 
       What is left is the gates: `test-interactive`'s `with` steps and `check-login`'s.
-- [ ] **Docs:**
+- [x] **Docs** *(2026-09-23)*:
       - `session-and-auth.md` gains the broker, and its deferred "privilege broker" line is closed;
       - `namespace-and-resource-servers.md` gains derivation;
       - `console-and-tty.md` gains sibling terminals, and `pipeline-stdio.md` says who sends a

@@ -267,6 +267,11 @@ for scripts that want it.
   | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `parse`, `format`, `last`, `skip`, `dedupe`, and the §10b families | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
 
+  **`with` is taken, by an external program** (administration Part A, 2026-09-23): `with VIEW
+  PROGRAM ARGS…` runs a program in a view, through the view broker. It is recorded here so that a
+  future keyword does not claim the word — `as`, `in` and `use`, the obvious alternatives, are
+  keywords already. Should a keyword ever need it anyway, `^with` still reaches the program.
+
 ## 4. I/O: `save` / `open` replace redirection
 
 `save <path>` (output) and `open <path>` (input) replace `>` / `<` **entirely** — no leftover

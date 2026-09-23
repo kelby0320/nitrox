@@ -1493,31 +1493,6 @@ the file becomes cumbersome." Its scope and its gate are kept in
 — it belongs to no milestone and has no code to hang a marker on, which is the case that hatch was
 written for.
 
-**An account that can see more than one user's own — `TODO(admin-visibility)`.** A session
-namespace holds `/applications`; an *application* namespace does not, so `nxsh` on the serial
-console can list the installed applications and the same `nxsh` inside `nxterm` cannot. That was
-decided deliberately (M14 Part H): nothing in an application reads it, an application holds no
-authority to spawn — `Desktop::Open` exists because of that — and a binding with no consumer is a
-hole in a sandbox that nobody is watching.
-
-**What it exposes is the larger question rather than the binding.** The default account is
-restricted by design and there is nothing else: no administrator account, no tools that see the
-system rather than one user's corner of it, and no notion of a session with wider visibility. The
-asymmetry above is one small symptom — a person exploring finds that the same shell shows
-different things depending on how they reached it, and the honest answer today is "that is the
-sandbox, and there is no other kind of session to be in".
-
-Deciding it means answering three things that have not been asked: whether an administrator is a
-*user* (a second account) or a *mode* (a session built with a wider spec), what a tool with system
-visibility is allowed to do beyond looking, and how a person moves between the two — because
-"log in as someone else" and "elevate" are different designs with different failure modes. None of
-that is a namespace question; the namespace is where it would show up.
-
-**Trigger: the first tool that needs to see past one user** — a package manager, a service
-inspector, anything that reports on the system rather than on a home directory. Whichever arrives
-first is the thing that makes the shape concrete, and until one does, guessing at the shape is how
-you get an administrator account that fits nothing.
-
 **An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
 convention, a size convention and a lookup path, which is a second decision after the one that
@@ -2022,6 +1997,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| An account that can see more than one user's own (`admin-visibility`) | 2026-09-23 | Administration Part A answered the three questions the entry asked. **An administrator is a mode, not a second account**: a *view* — the caller's own namespace plus a profile's grants — that a person reaches with `with`, proved by their own password, when `/system/views.toml` lets them. What such a view may do is what its profile grants (`disks`, first). The symptom the entry opened with — application namespaces omit `/applications` — was never the deferral's to fix: it stands on its own, because nothing in an application reads it, and `desktop-shell` now says so without the tag. |
 | Cross-group inode/block allocation (`fs-server-ext4`) | 2026-09-17 | Both allocators scan every block group — `alloc_block` from the goal's group outward, `alloc_inode` from the first with a free one — clamped to the last group's short tail. The trigger fired exactly as written: `nxinstall` made a root the size of a 931 GiB disk and it held about 112 MiB. Phase 5 Part H.2. |
 | A cache attribute on a mapped device aperture (`framebuffer-cache-attr`) | 2026-09-16 | Phase 5 Part G, and **the entry above was wrong about what it would cost**: it called a write-back mapping of a PCI BAR a *correctness* problem — writes left in cache, reordered — and on the laptop nothing was ever cached, because the firmware's range registers call the graphics aperture uncacheable and the stronger of the two wins. It was a performance problem, and a 45x one: a full screen took 72930 us through a `/dev/framebuffer` mapping against 1368 through the bootloader's mapping of the same pixels. **The bootloader had already asked for write-combining**; this kernel dropped the attribute at the namespace boundary, where `protection_to_page_flags` gave every user mapping no attribute at all. The fix is `mm::Caching` on the `MemoryObject` and the VMA, `PageFlags::WRITE_COMBINING` selecting entry 5 of a table the kernel now programs itself on every CPU (keeping the bootloader's exact values, because two entries were already live in mappings it made), and the framebuffer aperture recording its answer once for the object and the boot's own measurement to read. "A way for the namespace server to set it" was **not** needed and is not built: the aperture the kernel mints is the only device object userspace maps, so the attribute is the object's. A compositor with no shadow buffer now refuses to serve rather than composing into the display, because composing into write-combining memory reads it back. Measured after: 1632 us, 2451 MiB/s. **Two of this part's own instruments lied before they worked** — the measurement built its second mapping with the attribute written into the measurement, and the handout line printed the aperture's value instead of the object's — each caught by a control that should have failed and did not. |
 | MSI (message-signalled interrupts) | 2026-09-11 | Phase 5 Part A, and **the trigger this entry carried was the wrong one** — it was filed as performance work ("NVMe, multi-queue NICs, or performance work on interrupt-heavy devices") when on real hardware it is a correctness unblocker: the AHCI driver took its GSI from the PCI interrupt-line register, which QEMU's firmware programs and real UEFI frequently leaves meaningless, the authoritative routing being the DSDT's `_PRT` — which needs AML, which means ACPICA. MSI needs none of it. `pci::read_msi` and `pci::program_msi` decode and program the capability, `ArchIrqInstall::install_msi` composes the x86 message, and AHCI prefers MSI while keeping INTx as the fallback for a function that advertises no capability. **Message Control bit 7 selects the structure, not the address width**: Message Data sits at `+0x0C` when the address is 64-bit and `+0x08` when it is not, and the two target controllers disagree — QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise Point-LP is not — so the branch the target machine takes is the one no QEMU boot can exercise. Host tests carry both shapes, built from the real captures, and are negative-controlled by forcing the offset to `+0x0C` unconditionally, which is the driver the emulator alone would have produced. Bus mastering and the INTx-disable bit came with it, being the same config-space plumbing: nothing in Nitrox had ever set either, and DMA worked only because the firmware did. MSI-X stays deferred with a consumer-based trigger of its own. |

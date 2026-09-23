@@ -299,10 +299,11 @@ application reads it, and an application holds no authority to spawn in the firs
 why `Desktop::Open` exists. A binding whose only justification is that it would be harmless is a
 hole in a sandbox with nothing on the other side of it.
 
-It is also a symptom of a gap this document does not fill: there is one kind of account, restricted
-by design, and no session that sees the system rather than one user's corner of it. Filed as
-`TODO(admin-visibility)` in `deferred-decisions.md`, triggered by the first tool that needs to see
-past a single user.
+**It stands on its own, and is not a symptom of anything.** It was filed as one until 2026-09-23 —
+"there is one kind of account … and no session that sees the system" (`TODO(admin-visibility)`).
+Administration Part A answered that: seeing more than one user's corner is a *view*, reached with
+`with`, not a different account or a wider application namespace. An application's missing
+`/applications` is simply that nothing in an application reads it.
 
 **One edge is left, and it is an attenuation problem rather than a naming one.** A terminal
 minted *without* attaching a backend sits on the **console** backend, and `drive` gives each
