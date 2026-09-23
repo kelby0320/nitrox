@@ -108,7 +108,10 @@ delivers `Interrupt`, and a program holds it *as well as* its stdin and stdout. 
 not even decode: `Streams::from_bitmap` refuses any bit outside the three streams. The field exists
 because `/dev/tty` mints a terminal rather than naming one, so a program cannot resolve its way to
 a *particular* window's terminal. A terminal emulator hands the shell it hosts the terminal it
-attached its backend to (Milestone 5 Part C, 2026-08-13). This table lacked the field until
+attached its backend to (Milestone 5 Part C, 2026-08-13), and since 2026-09-23 `nxsh` hands each
+stage it spawns a **sibling** of its own terminal, minted with `Tty::OpenSibling` on the same
+backend (administration Part A.2). coreutils' `Stage` exposes it as `terminal`; a stage handed
+none — a script's, or one spawned when the tty server had no terminal to spare — sees `None`. This table lacked the field until
 2026-09-23, when a plan that depended on it proposed re-adding it as a bit.
 
 **Fields are read by position, and may only be appended.** `SetupPayload::decode` takes

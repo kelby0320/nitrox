@@ -43,7 +43,7 @@ use libkern::syscall::{
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
 use libstream::wire::ByteSink;
-use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_env};
+use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_full};
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
 use nxsh::{Interp, RunMode};
 
@@ -352,11 +352,22 @@ impl Host for NitroxHost {
                 stderr: (err_dup > 0).then_some(err_dup as u64),
             };
             let argv: Vec<&str> = spec.argv.iter().map(|s| s.as_str()).collect();
+            // **A terminal of its own, beside the shell's** (administration Part A.2): a sibling
+            // on the same window or console, so a stage that has to ask something — `with`, for
+            // a password — asks it where the person is typing. The shell keeps its own terminal,
+            // and with it `Ctrl-C`. Resolving `/dev/tty` could not do this: it mints a terminal on
+            // the console, not on this window.
+            let terminal = if self.tty != 0 { tty_open_sibling(self.tty) } else { None };
             // The same environment to every stage, arguments passed through as written:
             // both sides then resolve a relative path identically, which is the property
             // this slice exists for.
-            send_setup_env(setup_shell, &streams, &argv, env)
-                .map_err(|_| alloc::format!("could not hand `{}` its streams", spec.program))?;
+            if send_setup_full(setup_shell, &streams, terminal, &argv, env).is_err() {
+                if let Some(t) = terminal {
+                    // SAFETY: the send failed, so the terminal never moved; it is ours to close.
+                    unsafe { syscall1(SYS_HANDLE_CLOSE, t) };
+                }
+                return Err(alloc::format!("could not hand `{}` its streams", spec.program));
+            }
             // **Keep the process handle for the life of the pipeline.** It used to be
             // closed here, which is why `strict` could only *relabel* the stages after a
             // failure: §1 says the shell "already holds process handles for everything it
@@ -382,6 +393,23 @@ impl Host for NitroxHost {
         // writer.
         // SAFETY: closing our own handle; the stages hold their duplicates.
         unsafe { syscall1(SYS_HANDLE_CLOSE, err_tx) };
+
+        // **An interrupt that arrived while the pipeline was being set up.** Handing each stage
+        // its terminal is a tty exchange (administration Part A.2), and a `Ctrl-C` that lands
+        // during one is taken by `tty_await_reply`, which records it rather than leaving it
+        // queued. The waits below look only for a *new* interrupt message, so they would never
+        // see it, and `sleep 60` would run for its minute — which is what `test-interactive`'s
+        // step 19 caught the first time this ran. The evaluator's checkpoint clears the flag
+        // before a statement starts, so anything here arrived during this one.
+        //
+        // The flag is left set: the checkpoint reads it after the pipeline, as it does for an
+        // interrupt drained in the waits.
+        if unsafe { (&raw const INTERRUPTED).read() } {
+            for &c in &children {
+                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+            }
+        }
 
         // Feed the head stage only once everything downstream is running.
         //
@@ -1519,6 +1547,21 @@ fn tty_set_echo(ch: u64, on: bool) {
 fn tty_write(ch: u64, text: &[u8]) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
+}
+
+/// Ask the tty server for **another terminal on this one's backend** (`Tty::OpenSibling`), for a
+/// stage to prompt on — administration Part A.2.
+///
+/// `None` if the server refused, which it does when it has no terminal to spare, or if the
+/// exchange failed. The stage then runs without one, as every stage did before this.
+fn tty_open_sibling(ch: u64) -> Option<u64> {
+    let mut scratch = [0u8; 1];
+    match tty_request(ch, librsproto::OP_TTY_OPEN_SIBLING, &[], &mut scratch) {
+        // SAFETY: `tty_await_reply` received the reply into these statics last — past any
+        // interrupt that arrived ahead of it — so its transferred handle is the one here.
+        Some((false, _)) => unsafe { (TTY_COUNT >= 1 && TTY_HANDLES[0] != 0).then(|| TTY_HANDLES[0]) },
+        _ => None,
+    }
 }
 
 /// Write with `\n` expanded to `\r\n`, which a raw terminal needs.

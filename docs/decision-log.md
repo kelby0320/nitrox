@@ -28024,3 +28024,39 @@ described `BIND_NAMESPACE` as "not yet designed" and said `sys_ns_bind` "will ad
 it. It has been enforced since Phase 3 slice 6 Part C (2026-07-14). It also now says what the
 broker's design turned on: `sys_ns_unbind` is not syscap-gated, because removing a binding only
 narrows.
+
+## 2026-09-23 — Administration A.2: every stage gets a terminal, beside the shell's
+
+The second piece of Part A: a stage `nxsh` spawns now has a terminal of its own, so the one
+that needs to ask something — `with`, for a password — can. It is a **sibling** of the shell's
+terminal, minted by a new tty op, `Tty::OpenSibling` (`0x0B09`), on the shell's own backend,
+and passed in the setup message's existing `terminal` field (the one M5 built for `nxterm` to
+hand `nxsh` its window). coreutils' `Stage` exposes it.
+
+**Almost none of it was new.** The tty server already delivered input to the first terminal
+waiting on a backend and `Ctrl-C` to all of them, and each terminal already had its own
+discipline, so echo was already per terminal. `Registry::move_to` had been written for exactly
+this shared case and was only ever called by tests. The server gained `open_sibling` — a
+terminal added on another's backend — and one request arm. Six routing tests pin the shape a
+shell and its stage make: the sibling joins the window rather than the console, the reading stage
+gets the input while the shell only waits, `Ctrl-C` reaches both, a stage's echo setting is its
+own, closing the stage leaves the shell its window, and a sibling of nothing is refused. Three
+mutations fail them: siblings landing on the console, siblings never added, and echo set for the
+whole backend. The mutations also showed the "closing" test passing vacuously when no sibling
+existed, so it now checks its own precondition.
+
+**Two things only a boot showed.**
+
+- **A leak would be silent, so the gate counts.** There are fifteen terminals, and a stage the
+  server cannot give one runs without it rather than failing — so a sibling that outlived its
+  stage would, a dozen commands later, quietly leave every stage without a terminal. The server
+  logs the open count with each sibling, and `test-interactive` requires the same number at step 8
+  as at step 5, for the same command. A shell keeping a duplicate of each terminal fails it:
+  "3 open at step 5, 6 open at step 8".
+- **Asking for a terminal could eat a `Ctrl-C`.** The sibling request is a tty exchange, and an
+  interrupt arriving during one is recorded by `tty_await_reply` rather than left queued, which
+  is right for a prompt and wrong for a pipeline: its waits look only for a *new* interrupt
+  message. `test-interactive`'s step 19 — `sleep 60`, interrupted the moment it starts — timed
+  out on the first run. The shell now asks the stages to stop, after spawning them, when the flag
+  is already set. The evaluator's checkpoint clears the flag before each statement, so anything
+  set there arrived during this one.

@@ -31,9 +31,9 @@ use libkern::*;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
-    OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OUTPUT, OP_TTY_READ,
-    OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_MODE_ECHO,
-    decode, encode,
+    OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING,
+    OP_TTY_OUTPUT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, RS_FLAG_ERROR,
+    RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink};
 
@@ -345,6 +345,80 @@ fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
     }
 }
 
+/// `Tty::OpenSibling` on terminal `of`: mint another terminal on its backend and hand the
+/// caller the new channel, moved in the reply.
+///
+/// **A shell's stages get their terminals here** (administration Part A.2): a stage's prompt has
+/// to appear where the shell's does, and resolving `/dev/tty` would land it on the console. The
+/// same cap as a resolve applies — every terminal is a slot in this server's wait set — and a
+/// refusal is `WouldBlock`, which the shell answers by running the stage with no terminal.
+fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
+    if reg.len() >= MAX_TTYS {
+        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::WouldBlock.as_i32());
+        return;
+    }
+    let Some((client_end, server_end)) = make_channel() else {
+        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::KernelError.as_i32());
+        return;
+    };
+    // Registered before the reply, so the new terminal exists by the time its holder can use it;
+    // undone below if the reply cannot go.
+    if !reg.open_sibling(server_end, of) {
+        // SAFETY: closing our own handles; neither has been sent.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, client_end);
+            syscall1(SYS_HANDLE_CLOSE, server_end);
+        }
+        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::NotFound.as_i32());
+        return;
+    }
+    // SAFETY: REPLY_MSG is a valid buffer; the new terminal's channel rides in handles[0].
+    let sent = unsafe {
+        match encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_TTY_OPEN_SIBLING,
+            request_id,
+            RS_FLAG_REPLY,
+            &[],
+            1,
+        ) {
+            Some(rs_len) => {
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 1;
+                REPLY_HANDLES[0] = client_end;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    of,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    1,
+                    SENDMODE_NOBLOCK,
+                ) == 0
+            }
+            None => false,
+        }
+    };
+    if sent {
+        // **With the count, so a leak is visible.** A stage's terminal is freed when the stage
+        // exits; one that was not would hold one of `MAX_TTYS` slots for good, and after a dozen
+        // commands every stage would quietly run without a terminal. `test-interactive` compares
+        // this number across two identical commands.
+        libkern::debug::Line::new()
+            .s(b"tty-server: terminal opened beside another, ")
+            .u(reg.len() as u64)
+            .s(b" open")
+            .end();
+    } else {
+        // The client end never moved, so nobody can use the terminal: take it back out.
+        reg.close(server_end);
+        // SAFETY: closing our own handles.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, client_end);
+            syscall1(SYS_HANDLE_CLOSE, server_end);
+        }
+    }
+}
+
 /// Free terminal `i`: close its endpoint and drop it.
 ///
 /// **This is the revocation point.** Handles are refcounted and this kernel has none, so a
@@ -426,6 +500,7 @@ fn serve_tty(reg: &mut Registry, ch: u64) -> bool {
                 }
             }
         }
+        OP_TTY_OPEN_SIBLING => open_sibling(reg, ch, request_id),
         OP_TTY_CLOSE => {
             reply(ch, OP_TTY_CLOSE, request_id, &[]);
             return false;

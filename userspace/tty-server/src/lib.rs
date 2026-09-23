@@ -455,6 +455,27 @@ pub mod routing {
             });
         }
 
+        /// Add terminal `ch` on the same backend as terminal `of` — `Tty::OpenSibling`.
+        ///
+        /// **The shared case, reached for real.** A shell hands each stage it spawns a sibling of
+        /// its own terminal (administration Part A.2), so one backend holds several terminals.
+        /// Input goes to whichever of them is waiting, `Ctrl-C` goes to all of them, and each
+        /// keeps its own discipline, so a password prompt that turns echo off on one leaves the
+        /// shell's echo alone. Returns `false`, adding nothing, if `of` does not exist.
+        pub fn open_sibling(&mut self, ch: u64, of: u64) -> bool {
+            let Some(backend) = self.ttys.iter().find(|t| t.ch == of).map(|t| t.backend) else {
+                return false;
+            };
+            self.ttys.push(Tty {
+                ch,
+                disc: Discipline::new(),
+                waiting: None,
+                interrupt_pending: false,
+                backend,
+            });
+            true
+        }
+
         /// Drop terminal `ch`. Returns whether it existed.
         pub fn close(&mut self, ch: u64) -> bool {
             match self.ttys.iter().position(|t| t.ch == ch) {
@@ -483,10 +504,11 @@ pub mod routing {
 
         /// Put terminal `ch` on the existing backend `id`.
         ///
-        /// Nothing calls this outside tests yet: a terminal joins a backend by *attaching* one
-        /// today, which is one terminal per emulator. It exists because the shared case is the
-        /// one `retire` has to get right — a backend with another terminal still on it must not
-        /// be handed back — and that is not otherwise reachable to test.
+        /// Nothing calls this outside tests: a terminal joins a backend by *attaching* one, or by
+        /// being opened as a sibling of a terminal already on it ([`open_sibling`]). It predates
+        /// the second, as the only way to reach the shared case in a test.
+        ///
+        /// [`open_sibling`]: Registry::open_sibling
         pub fn move_to(&mut self, ch: u64, id: u32) -> bool {
             if !self.backends.iter().any(|b| b.id == id) {
                 return false;
@@ -953,6 +975,79 @@ mod routing_tests {
         assert!(!r.close(2), "closing twice reported success");
         assert_eq!(r.sink_of(1), Some(Sink::Console));
         assert_eq!(r.sink_of(3), Some(Sink::Console));
+    }
+
+    /// A shell in a window (terminal 1 on backend `0xAB`) and a stage's sibling terminal (2), the
+    /// shape `Tty::OpenSibling` makes — administration Part A.2.
+    fn shell_and_stage_in_a_window() -> (Registry, u32) {
+        let mut r = console_ttys(1);
+        let (win, _) = r.attach_backend(1, 0xAB).expect("terminal 1 exists");
+        assert!(r.open_sibling(2, 1), "terminal 1 exists");
+        (r, win)
+    }
+
+    #[test]
+    fn a_sibling_joins_its_terminals_window_not_the_console() {
+        // The point of the op: a stage's prompt has to appear in the window it was typed into.
+        // A terminal resolved from `/dev/tty` would land on the console instead.
+        let (mut r, win) = shell_and_stage_in_a_window();
+        assert_eq!(r.sink_of(2), Some(Sink::Channel(0xAB)));
+        r.read(2, 7, ReadKind::Line);
+        assert!(replies_to(&r.feed(CONSOLE, b"no\r"), 2).is_empty(), "console input reached it");
+        assert_eq!(replies_to(&r.feed(win, b"pw\r"), 2), [(OP_TTY_READ_LINE, b"pw".to_vec())]);
+    }
+
+    #[test]
+    fn the_stage_that_is_reading_gets_the_input_while_the_shell_waits() {
+        // During a pipeline the shell reads nothing — it waits on its terminal only for an
+        // interrupt — so the stage's read is the one the bytes are for.
+        let (mut r, win) = shell_and_stage_in_a_window();
+        r.read(2, 3, ReadKind::Line);
+        let acts = r.feed(win, b"yes\r");
+        assert_eq!(replies_to(&acts, 2), [(OP_TTY_READ_LINE, b"yes".to_vec())]);
+        assert!(replies_to(&acts, 1).is_empty(), "the shell's terminal was sent a reply");
+    }
+
+    #[test]
+    fn ctrl_c_reaches_the_shell_and_the_stage_alike() {
+        // The shell has to see it to stop the pipeline, and the stage has to see it so a prompt
+        // it is holding ends: one keystroke, both terminals.
+        let (mut r, win) = shell_and_stage_in_a_window();
+        let acts = r.feed(win, &[0x03]);
+        assert_eq!(replies_to(&acts, 1), [(OP_TTY_INTERRUPT, Vec::new())], "the shell");
+        assert_eq!(replies_to(&acts, 2), [(OP_TTY_INTERRUPT, Vec::new())], "the stage");
+    }
+
+    #[test]
+    fn a_stages_echo_setting_is_its_own() {
+        // A password prompt turns echo off on the stage's terminal. The shell's must keep
+        // echoing afterwards, or the next command line is typed blind.
+        let (mut r, win) = shell_and_stage_in_a_window();
+        r.set_mode(2, 1, false);
+        r.read(2, 2, ReadKind::Line);
+        let acts = r.feed(win, b"secret\r");
+        assert_eq!(written(&acts, Sink::Channel(0xAB)), b"", "the password was echoed");
+        r.read(1, 3, ReadKind::Line);
+        let acts = r.feed(win, b"ls");
+        assert_eq!(written(&acts, Sink::Channel(0xAB)), b"ls", "the shell stopped echoing");
+    }
+
+    #[test]
+    fn closing_a_stages_terminal_leaves_the_shell_its_window() {
+        // A stage exits after every command; the window's backend has to outlive it.
+        let (mut r, _) = shell_and_stage_in_a_window();
+        // Without this the test passes vacuously for a sibling that never joined the window.
+        assert_eq!(r.sink_of(2), Some(Sink::Channel(0xAB)), "precondition: the stage is on it");
+        assert_eq!(r.close_and_retire(2), Vec::<u64>::new(), "the window's channel was released");
+        assert_eq!(r.sink_of(1), Some(Sink::Channel(0xAB)));
+        assert_eq!(r.close_and_retire(1), [0xAB], "and released with the last terminal on it");
+    }
+
+    #[test]
+    fn a_sibling_of_a_terminal_that_does_not_exist_is_refused() {
+        let mut r = console_ttys(1);
+        assert!(!r.open_sibling(2, 99));
+        assert_eq!(r.len(), 1, "a terminal was added anyway");
     }
 }
 

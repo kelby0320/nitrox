@@ -1397,6 +1397,11 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // 5. A program from the profile runs — `/bin` is bound in the session namespace and
     //    the shell can spawn through it.
     s.send("whoami")?;
+    // **And it was handed a terminal of its own** (administration Part A.2): the shell asks the
+    // tty server for a sibling of its terminal before each stage, and the server says how many
+    // terminals are open once it has made one. Kept, and compared at step 8.
+    s.expect("tty-server: terminal opened beside another, ")?;
+    let open_at_5 = s.rest_of_line()?;
     s.expect("alice")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1467,6 +1472,18 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    the erase-and-redraw is bytes on a wire that only a real terminal renders, so
     //    asserting on appearance would assert on the capture rather than the shell.
     s.send("whoami")?;
+    // **The same command, so the same number of terminals** — unless one leaked. Every stage
+    // since step 5 was handed a terminal, and each should have been freed when its stage exited.
+    // There are fifteen, so a leak here would leave every stage after a dozen commands without
+    // one, silently: a stage is run without a terminal rather than refused.
+    s.expect("tty-server: terminal opened beside another, ")?;
+    let open_at_8 = s.rest_of_line()?;
+    if open_at_8 != open_at_5 {
+        return Err(format!(
+            "a stage's terminal outlived its stage: {open_at_5} at step 5, {open_at_8} at step 8"
+        )
+        .into());
+    }
     s.expect("alice")?;
     s.expect("/home>")?;
     s.send("\x1b[A")?;

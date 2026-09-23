@@ -185,6 +185,15 @@ pub const OP_TTY_OUTPUT: u16 = 0x0B07;
 /// serial line, encoder output included — the server runs the discipline over it exactly as it
 /// does over console input, which is what keeps one implementation of `Ctrl-C`, erase, and echo.
 pub const OP_TTY_INPUT: u16 = 0x0B08;
+/// `Tty::OpenSibling` — mint **another terminal on this terminal's backend**, and hand back its
+/// channel (one moved handle in the reply). Empty request body.
+///
+/// A shell gives each stage it spawns a terminal this way (administration Part A.2): the stage's
+/// terminal shares the shell's backend — the same window, or the serial console — so its prompt
+/// appears where the person is typing, while the shell keeps its own terminal and still sees
+/// `Ctrl-C`. Resolving `/dev/tty` cannot do this, because a resolve mints a terminal on the
+/// *default* backend rather than on a particular window's.
+pub const OP_TTY_OPEN_SIBLING: u16 = 0x0B09;
 
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;

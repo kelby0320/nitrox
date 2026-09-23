@@ -632,7 +632,7 @@ closes the phase**.
       dropping one namespace leaves the other's registrations alive. **Plus a `boot-probe` check
       through the syscall itself**, which the host tests cannot reach: the copy resolves, can be
       sent and pruned, pruning it leaves the root alone, and a handle without `LOOKUP` is refused.
-- [ ] **A.2 — a terminal per stage.** A tty op minting a sibling terminal on the caller's backend,
+- [x] **A.2 — a terminal per stage** *(2026-09-23)*. A tty op minting a sibling terminal on the caller's backend,
       and its spec. Echo is per terminal, so a password prompt does not turn the shell's echo off.
       `nxsh` mints one for each external stage and moves it in through the **existing** `terminal`
       field (`send_setup_full`), and coreutils' `Stage` exposes what it receives. Routing tests: input reaches whichever

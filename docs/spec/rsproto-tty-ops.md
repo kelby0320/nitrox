@@ -1,8 +1,9 @@
 # rsproto — Tty operations (`0x0Bxx`)
 
-**Status: normative for what is built (2026-08-13).** `ReadLine`, `Read`, `Write`, `SetMode`,
-`Close` and `Interrupt` are implemented in `userspace/tty-server/`; `AttachBackend`, `Output`
-and `Input` landed with Milestone 5 Part C. Job control and terminal emulation are unbuilt —
+**Status: normative for what is built (2026-08-13; `OpenSibling` 2026-09-23).** `ReadLine`,
+`Read`, `Write`, `SetMode`, `Close` and `Interrupt` are implemented in `userspace/tty-server/`;
+`AttachBackend`, `Output` and `Input` landed with Milestone 5 Part C, and `OpenSibling` with
+administration Part A.2. Job control and terminal emulation are unbuilt —
 see [`console-and-tty.md`](../architecture/console-and-tty.md) for the design and its staging.
 
 Written 2026-08-13, when Part C gave this category a **second channel role** and the contract
@@ -22,12 +23,19 @@ Since Part C there is a third role, the **backend channel**, held by a terminal 
 | Role | Speaks | Who holds it |
 |---|---|---|
 | forwarding endpoint | `Namespace::Resolve` | bound by init at `/dev/tty`; by session-mgr in each session |
-| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` | the program using the terminal |
+| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` | the program using the terminal |
 | backend channel | `Output` (server→emulator), `Input` (emulator→server) | a terminal emulator |
 
 **A terminal is per resolver, not per session.** Each program that resolves `/dev/tty` gets its
 own — `session-mgr` opens one for the login prompt, `nxsh` opens its own, and every stage `nxsh`
 spawns can open another. Nothing in the protocol groups them by session.
+
+**Or per sibling, which is how a stage gets one where it is.** A terminal minted by a resolve
+lands on the console, so it cannot be a particular window's. `OpenSibling`, sent on a terminal a
+program already holds, mints another on *that terminal's* backend. `nxsh` hands each stage it
+spawns a sibling of its own terminal this way, so a stage that prompts — `with`, for a password
+— prompts in the window or console it was typed at, while the shell keeps its own terminal and
+still sees `Ctrl-C`.
 
 ## Operations
 
@@ -134,9 +142,24 @@ one. Writes longer than one message are split across several.
 a keyboard would have produced on a serial line. The server runs the discipline over it exactly
 as over console input, which is what keeps one implementation of `Ctrl-C`, erase and echo.
 
+### `OpenSibling` (`0x0B09`)
+
+Request: empty. Reply: empty, **one moved handle** — the new terminal's channel.
+
+Mints another terminal **on the backend of the terminal it is sent on**, with a discipline of its
+own. The rules for several terminals on one backend are the ones above: input goes to the first
+terminal waiting on it, `Ctrl-C` goes to every one, and each has its own echo setting — so a
+password prompt that turns echo off on a sibling leaves the terminal it was minted from echoing.
+
+Refused with `WouldBlock` when the server has no terminal to spare. Every terminal is a slot in
+the server's wait set, and the cap is the resolve's. A shell answers the refusal by running the
+stage without a terminal, which is what every stage had before this op.
+
 ## Lifetime
 
-- A **terminal** ends when its holder exits (`PeerClosed`), or on `Close`.
+- A **terminal** ends when its holder exits (`PeerClosed`), or on `Close`. A sibling is an
+  ordinary terminal in this respect: a stage's ends when the stage does, and its backend stays
+  while any terminal remains on it.
 - A **backend** is dropped when the last terminal on it is gone; if it was a channel, the server
   closes its end, which is how an emulator learns its terminal has ended.
 - An **emulator** going away ends every terminal on its backend. A terminal whose window has
