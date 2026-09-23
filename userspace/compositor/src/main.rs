@@ -1075,6 +1075,77 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     Some(ch.into_raw().0)
 }
 
+/// Serve every request already queued on the manager's channel and every client's, **between
+/// receiving an input pass and routing it** — so each batch is routed against every request
+/// sent before it arrived.
+///
+/// **What went wrong without it.** The wait loop serves input first when both are ready, and a
+/// client's channel one request per wake. So a busy compositor woke to a key *and* a menu's
+/// destroy, routed the key to the menu — which still existed and still held the keyboard — and
+/// then destroyed it. The client had let the menu go when it sent the destroy, so the key named
+/// a window it no longer had and `libsurface` dropped it: `check-login` timing out on
+/// `nxfiles: name so far 1 chars` in CI. The destroy had been sent *before the key existed* —
+/// the gate types only once `nxfiles` reports the prompt open, which it does after sending it —
+/// so nothing on the client's side could have ordered them. Holding the compositor busy for a
+/// second after a menu click reproduced it every time, and did the same to a click on the panel
+/// just after the overview closed, so it was never only the keyboard's.
+///
+/// **Why between, and not before the pass** (PR #327 review). Run before the first receive, as it
+/// first was, it left a gap: a batch arriving *after* the drain had passed a client's channel —
+/// while it served later slots, or during `serve_input`'s own receive loop — was routed without
+/// the requests that reached that channel after the visit. Reproduced with a click, a motion
+/// right after it to wake the compositor, and `nxfiles` slow to send the menu's destroy: the key
+/// went to the menu, 800 ms after the destroy was queued. Draining after the last receive closes
+/// it — a request sent before a batch arrived was queued before that batch was received, so
+/// before this runs — and routing nothing until then keeps the cursor's bookkeeping honest: a
+/// request that repaints mid-pass would otherwise draw the cursor where a batch had moved it,
+/// and nothing would erase it there.
+///
+/// **It also routes a batch against requests sent after it arrived**, up to the drain — a key
+/// typed just before a popup is requested reaches the popup. That is the mirror of the old order
+/// and the better default for type-ahead; nothing here can tell the two apart, since a request
+/// carries no time.
+///
+/// **One pass over each channel, bounded by its depth.** `SESSION_QUEUE_DEPTH` is everything a
+/// channel can hold, so it is everything that was queued when the pass was received; a client
+/// that keeps sending cannot hold input off by doing so. The manager goes first because it arranges
+/// the stack the sessions' windows are in.
+fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
+    for _ in 0..SESSION_QUEUE_DEPTH {
+        // SAFETY: reading our own manager slot.
+        if unsafe { MANAGER_CH } == 0 {
+            break;
+        }
+        match serve_manager(srv, screen) {
+            Served::One => {}
+            Served::Empty => break,
+            Served::Closed => {
+                close_manager(srv, screen);
+                break;
+            }
+        }
+    }
+    for slot in 0..MAX_SESSIONS {
+        for _ in 0..SESSION_QUEUE_DEPTH {
+            // SAFETY: reading our own slot table.
+            if unsafe { SESSION_CH[slot] } == 0 {
+                break;
+            }
+            match serve_session(slot, srv, screen) {
+                Served::One => {}
+                Served::Empty => break,
+                // As the wait loop closes one, and for its reason: through `repaint`, so the
+                // pointer survives a client dying under it.
+                Served::Closed => {
+                    close_session(slot, srv);
+                    repaint(srv, screen);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Batches to take from the input channel in one pass.
 ///
 /// **A bound, not a target.** The loop drains what is queued and stops; this only keeps a
@@ -1082,8 +1153,8 @@ fn connect_input(root_ns: u64) -> Option<u64> {
 /// One batch is one group, so this is about a second of a 100 Hz mouse.
 const INPUT_DRAIN_MAX: usize = 128;
 
-/// Drain every queued `Input::Events` batch, route them, and repaint once. `false` if the
-/// channel died.
+/// Drain every queued `Input::Events` batch, serve the requests already queued, route the
+/// batches, and repaint once. `false` if the channel died.
 ///
 /// **Once for the whole drain, not once per batch.** Each repaint is a compose plus a write to
 /// the framebuffer, and it happens with no input being read; doing it per message made the
@@ -1099,8 +1170,11 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let mut damage: alloc::vec::Vec<Rect> = alloc::vec::Vec::new();
     let cursor_was = srv.router.pointer();
     let mut alive = true;
-    let mut drained = 0;
-    while drained < INPUT_DRAIN_MAX {
+    // **Receive the whole pass, then serve the requests, then route** — see
+    // [`serve_queued_requests`]. Each batch is copied out because `RECV_MSG` is the buffer every
+    // receive in this process uses, the drain's included.
+    let mut batches: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    while batches.len() < INPUT_DRAIN_MAX {
         // SAFETY: valid recv out-params (an events batch carries no transferred handles).
         let rr = unsafe {
             syscall4(
@@ -1118,9 +1192,21 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
             alive = rr != KError::PeerClosed.as_i32() as i64;
             break;
         }
-        drained += 1;
+        // SAFETY: bounded read of the payload the kernel just wrote.
+        let payload = unsafe {
+            let payload_len =
+                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            core::slice::from_raw_parts(
+                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
+                payload_len.min(MSG_LEN - PAYLOAD_OFF),
+            )
+        };
+        batches.push(payload.to_vec());
+    }
+    serve_queued_requests(srv, screen);
+    for batch in &batches {
         let now = now_ns();
-        route_one_batch(srv, &mut out, &mut damage, now);
+        route_one_batch(srv, &mut out, &mut damage, batch, now);
     }
 
     deliver(srv, &out);
@@ -1152,16 +1238,12 @@ fn route_one_batch(
     srv: &mut Server,
     out: &mut alloc::vec::Vec<Outbound>,
     damage: &mut alloc::vec::Vec<Rect>,
+    msg: &[u8],
     now: u64,
 ) {
-    // SAFETY: bounded read of the payload the kernel just wrote.
+    // SAFETY: the input-diagnostics counter below is a `static mut` touched only from the serve
+    // loop of this single-threaded server.
     unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let msg = core::slice::from_raw_parts(
-            (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
         let Ok(m) = decode(msg) else {
             return;
         };
@@ -1671,8 +1753,24 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     reply_on_session(ch, OP_MGR_CAPTURE, request_id, &[])
 }
 
-/// Handle one request on the manager channel. Returns `false` if the manager is gone.
-fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+/// What one call to [`serve_manager`] or [`serve_session`] found on its channel.
+///
+/// **Three answers, because the queue drain needs the third.** A `bool` said "keep this peer or
+/// close it", which is all the wait loop asks; [`serve_queued_requests`] also has to know when a
+/// channel is *empty*, or it cannot stop draining one without a wasted receive per slot per
+/// input batch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// A request was handled, and the peer is still there.
+    One,
+    /// Nothing was queued — or a spurious signal with nothing behind it.
+    Empty,
+    /// The peer has gone, or a reply to it failed; the caller closes it.
+    Closed,
+}
+
+/// Handle one request on the manager channel, if one is queued.
+fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
     let rr = unsafe {
@@ -1686,8 +1784,14 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
     };
     if rr != 0 {
         // `PeerClosed` means the manager exited. Anything else is an empty ring.
-        return rr != KError::PeerClosed.as_i32() as i64;
+        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
+    if handle_manager_request(ch, srv, screen) { Served::One } else { Served::Closed }
+}
+
+/// Handle the request [`serve_manager`] has just received into `RECV_MSG`. Returns `false` if
+/// the manager is gone.
+fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body, carried) = unsafe {
         // **Close every transfer this message carried, except the one `Capture` needs.**
@@ -2217,8 +2321,8 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
     }
 }
 
-/// Serve one request on session `slot`. Returns `false` if the session should close.
-fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+/// Serve one request on session `slot`, if one is queued.
+fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     let ch = unsafe { SESSION_CH[slot] };
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -2232,9 +2336,19 @@ fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuff
     };
     if rr != 0 {
         // `PeerClosed` is the client going away, which is the normal end of a session.
-        return rr != KError::PeerClosed.as_i32() as i64;
+        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
+    if handle_session_request(slot, ch, srv, screen) { Served::One } else { Served::Closed }
+}
 
+/// Handle the request [`serve_session`] has just received into `RECV_MSG`. Returns `false` if
+/// the session should close.
+fn handle_session_request(
+    slot: usize,
+    ch: u64,
+    srv: &mut Server,
+    screen: &mut Screen<RawFramebuffer>,
+) -> bool {
     // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch; the
     // alternative is two live `static mut` borrows at once. `MAX_BODY` is sized so a whole
     // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
@@ -2821,14 +2935,14 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             }
             // SAFETY: reading our own manager slot.
             if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
-                if !serve_manager(srv, &mut screen) {
+                if serve_manager(srv, &mut screen) == Served::Closed {
                     close_manager(srv, &mut screen);
                 }
                 continue;
             }
             // SAFETY: scanning our own slot table for the signalled endpoint.
             if let Some(slot) = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == h) }
-                && !serve_session(slot, srv, &mut screen)
+                && serve_session(slot, srv, &mut screen) == Served::Closed
             {
                 close_session(slot, srv);
                 // Through `repaint`, so the pointer survives a client dying under it. It did
