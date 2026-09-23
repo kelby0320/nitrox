@@ -27688,3 +27688,69 @@ wearing `SESSION_HAS_BIN`'s (H.1), and the attribute-table static inside `record
 (Part G of Phase 5). Every one is doc-only and fixed here. None was caught by a build, since the
 item that lost its doc was rarely under `deny(missing_docs)` and the one that gained a second
 paragraph compiles either way.
+
+## 2026-09-22 — Administration scoped: views, not users; a device manager; `with`
+
+The administration stub became a plan (`docs/planning/administration.md`), after a scan of what the
+v5.1 design doc and the current docs already said. The decisions, with the maintainer:
+
+**Elevation keeps 5.1's principle — "handle acquisition, not state change" — and drops the user.**
+A broker authenticates against `auth-service`, builds a namespace with the right visibility, and
+spawns the program into it. The draft also offered "run as another account", `sudo -u` style. That
+was a Unix idea imported by habit, and it is gone: this system largely has no users, and what a
+person wants is a program running with more visibility, and perhaps more capability, than their
+session has. **So the target of a request is a *view* — a profile of grants — never an account.**
+Accounts appear only as who may ask.
+
+**The word is `with`, not `elevate`**, because the same mechanism will narrow as well as widen: a
+sandboxed application is a view too, and "elevate sandbox" says the opposite of what it does. `as`,
+`in` and `use` are already `nxsh` keywords; `with` is free. If the shell ever needs it, `^with`
+still reaches the program. `withview` and `with_view` were the alternatives, and were worse.
+
+**A view is the caller's session plus a profile**, not a standalone administrator namespace. An
+elevated editor still needs your files, and the kernel has no namespace layering yet, so the broker
+rebuilds the session's recipe with the profile's grants added. That makes `libsession`'s spec the
+recipe for three builders — `session-mgr`, `desktop-shell`, and the broker — rather than three
+recipes that drift.
+
+**One broker, with authority kept by domain services.** "Several brokers" was explained and set
+aside: it contains a bug to one domain at the cost of several policies, prompts and endpoints. One
+broker does identity, the password, the policy, the audit and the spawn. What it grants is mostly an
+endpoint to the service that owns a domain and keeps enforcing that domain's rules.
+
+**Identity is the endpoint.** `session-mgr` binds each session a broker endpoint minted for its
+principal. That same design gives the broker a list of live sessions for free, which is why "who is
+logged in" came into scope rather than needing a registry.
+
+**The device manager is general — disks, keyboards, mice — and is built now, with coldplug.** It
+hands each arrival to the class's owner (`input-server` already owns input hotplug by design) and
+drives nothing itself. Announcing every boot device as an arrival means every consumer is written
+against arrivals from the start, and Phase 6's USB only adds an event source.
+
+**Mounted filesystems appear under `/storage/<label>`, and auto-mount.** `/storage` rather than
+`/media`, because "media" says removable and a second internal partition is not. Labels rather than
+`/dev/blk/<n>` numbers, which are discovery order and will shift once devices come and go.
+
+**One command per domain, with flags as verbs** — `disk --list|--mount|--unmount`, `account`,
+`service` — which matches `clip --copy`.
+
+**Shutdown is old school**: flush everything, then "It is now safe to turn off your computer."
+Power-off needs ACPI S5 and therefore AML, which is deferred. **Reboot does not**: FADT's reset
+register is a table field, and the i8042 reset pulse is a port write on a controller this kernel
+already drives.
+
+**A complete pass.** A review of the draft found eight gaps, and all are in scope: interrupting an
+elevated program; its terminal; throttling password attempts; filesystem clean/dirty state; one
+namespace recipe; the first administrator and offline recovery; changing a password; and a shutdown
+gate.
+
+**One thing looked simple and is not, and it led to a principle.** `service --enable` looked like an
+edit to a TOML file. The file is `services.toml` in the **initramfs**, a boot archive on the FAT EFI
+partition, which nothing here writes. The maintainer's rule, stated in reply: **the initramfs holds
+only what it takes to boot and mount the root filesystem, and everything else comes up from root.**
+The live image is the one exception — it runs entirely from memory because it has no root to mount —
+and a special case rather than a precedent. The initramfs's *programs* already follow the rule,
+enforced by `INITRAMFS_PROGRAMS` (each with its reason) and a size tripwire. Its *configuration*
+does not: `init.toml` has a bootstrap reason, and `services.toml` has none, since `service-mgr`
+itself runs from `/bin`. Moving it onto root is proposed for Part E; enabling and disabling then
+become a small edit, still deferred until a service wants it.

@@ -31,7 +31,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
 | — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | ✅ complete 2026-09-22 — all eleven parts (A–K) built |
-| — Administration | [administration.md](administration.md) | planned, to be scoped |
+| — Administration | [administration.md](administration.md) | scoped 2026-09-22, not started — seven parts (A–G); Part A's detail pass is next |
 | 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
 | 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |
@@ -56,8 +56,9 @@ the table states it:
    because the administration tools are UI surfaces**, and building them against the old look to
    restyle them afterwards is the thing this project's standing rule forbids — the admin phase
    also contains an unanswered display question of its own (a prompt the compositor trusts).
-2. **Administration** — elevation, administrative policy, and the tools an installed system
-   needs. [`administration.md`](administration.md) is the stub; its closing slice should be the
+2. **Administration** — views (running a program with more, or later less, visibility than its
+   session), a general device manager, storage, accounts, services, power, and the log.
+   [`administration.md`](administration.md) was scoped on 2026-09-22; its closing slice is the
    installer becoming the broker's first client, because a broker with no consumer is the state
    Part H.1 was fairly criticised for.
 
@@ -67,12 +68,12 @@ so today the only way to get anything onto it is a reinstall from a stick.
 
 **Written down so it is not lost** (the first of these is now scheduled; see the table):
 
-- [administration.md](administration.md) — elevation (the capability-system answer to `sudo`),
-  administrative accounts as policy rather than identity, and the tools an installed system needs:
-  partitioning, formatting, mounting, accounts, passwords. **Scheduled** as of 2026-09-17 — it is
-  in the table above, after the desktop refresh — but still a **stub**: its internal scope is
-  decided when it is taken up. It exists because Phase 5 Part H's installer is its first client,
-  and an installer built without a destination is one that gets replaced.
+- [administration.md](administration.md) — views and the `with` command (the capability-system
+  answer to `sudo`: a program run in a namespace with more visibility, never "as" another user), a
+  general device manager with coldplug, `/storage` and auto-mount, accounts, services, an orderly
+  shutdown, the clock and the log. **Scoped** on 2026-09-22 into seven parts,
+  A–G, and next after the desktop refresh. It exists because Phase 5 Part H's installer is its
+  first client, and an installer built without a destination is one that gets replaced.
 
 **Subproject plans** (detailed breakdowns that hang off a phase):
 
