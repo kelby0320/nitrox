@@ -556,9 +556,7 @@ impl Child {
     /// Once rather than on every gain, so clicking between a dialog and its parent does not
     /// repeat it; a new window is a new `Child`, and announces again.
     pub fn took_keyboard(&mut self, event: &WindowEvent) -> bool {
-        let (first, had) = first_keyboard(self.had_keyboard, event);
-        self.had_keyboard = had;
-        first
+        first_keyboard(&mut self.had_keyboard, event)
     }
 
     /// Destroy the window and give this side's pixels back.
@@ -835,11 +833,17 @@ mod tests {
     #[test]
     fn a_window_takes_the_keyboard_once() {
         let key = WindowEvent::Key(librsproto::surface::KeyEvent::default());
-        assert_eq!(first_keyboard(false, &WindowEvent::Focus(false)), (false, false));
-        assert_eq!(first_keyboard(false, &key), (false, false), "a key is not the keyboard");
-        assert_eq!(first_keyboard(false, &WindowEvent::Focus(true)), (true, true));
-        assert_eq!(first_keyboard(true, &WindowEvent::Focus(false)), (false, true), "kept");
-        assert_eq!(first_keyboard(true, &WindowEvent::Focus(true)), (false, true), "once");
+        let (gain, loss) = (WindowEvent::Focus(true), WindowEvent::Focus(false));
+        // One window's life, event by event, through the flag it keeps.
+        let mut had = false;
+        assert!(!first_keyboard(&mut had, &loss), "a loss first is not the keyboard");
+        assert!(!first_keyboard(&mut had, &key), "a key is not the keyboard");
+        assert!(first_keyboard(&mut had, &gain), "the first gain is");
+        assert!(!first_keyboard(&mut had, &loss));
+        assert!(!first_keyboard(&mut had, &gain), "once: back from the parent is not announced");
+        assert!(had, "kept");
+        // A new window starts again.
+        assert!(first_keyboard(&mut false, &gain));
     }
 }
 
@@ -859,14 +863,16 @@ fn reported_hover(grabbed: bool, live: Option<u64>, shown: Option<u64>) -> Optio
     if grabbed { shown } else { live }
 }
 
-/// Whether `event` is a window's first keyboard, given whether it `had` one: `(first, had now)`.
+/// Whether `event` is a window's first keyboard, recording in `had` that it has had one.
 ///
-/// A function for [`reported_hover`]'s reason — a `Child` cannot be built on the host, so the
-/// decision is pinned here and the one line that calls it is the gate's.
-fn first_keyboard(had: bool, event: &WindowEvent) -> (bool, bool) {
+/// A function for [`reported_hover`]'s reason — a `Child` cannot be built on the host. **It
+/// takes the flag rather than returning it**, so the record is part of what the test runs: a
+/// version that returned the new value left the one line storing it untested, and deleting that
+/// line announced every gain (PR #330 review, optional 2).
+fn first_keyboard(had: &mut bool, event: &WindowEvent) -> bool {
     match event {
-        WindowEvent::Focus(true) => (!had, true),
-        _ => (false, had),
+        WindowEvent::Focus(true) => !core::mem::replace(had, true),
+        _ => false,
     }
 }
 

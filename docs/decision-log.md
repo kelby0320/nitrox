@@ -28290,7 +28290,7 @@ editor, and the gate sent its backspace on the first line. A probe that held `de
 `Place` of every dialog for half a second made the race deterministic. It first failed
 `nxfiles`'s Properties step: `showing properties` has the same shape, and the gate's `Esc`
 reached the browser, so the dialog never closed. With only the chooser's new wait removed, it
-failed exactly as CI's flake had: `buffer rev 12`, then a timeout on the chooser's name.
+failed exactly as the gate run's flake had: `buffer rev 12`, then a timeout on the chooser's name.
 
 **The fix is a second receipt, not a moved first one.** The opening lines stay where PR #267 put
 them. `libui::window::Child::took_keyboard` answers `true` once, for a window's first
