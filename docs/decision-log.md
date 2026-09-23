@@ -27908,3 +27908,44 @@ binary; every gate was green on `main` without it but for the intermittent failu
 this. A busy-compositor switch would make a test image's compositor differ from a release one,
 which `check-images` exists to refuse. So the evidence is the reproductions recorded here, and the
 guard is `check-login`'s rename step catching a regression now and then — as it caught this.
+
+## 2026-09-23 — Administration Part A's detail pass: the path is the identity, and a terminal per stage
+
+Part A (the view broker, on a terminal) got its detail pass in `administration.md`: a spike through
+the code it will be built from, the shape, and six pieces in dependency order, A.1–A.6.
+
+**The spike simplified the identity design.** The entry above has each login supervisor bind "a
+broker endpoint minted for its principal". Nothing needs minting. The logging service already knows
+a record's principal from the path its channel was resolved through, and a subtree base is a suffix
+the resolver cannot choose. So `init` binds one forwarding endpoint at `/svc/views`. Each supervisor
+binds it again at `/dev/views` with base `/s/<session>`, and the broker learns the session from the
+suffix. The supervisor still opens and closes the session over a channel of its own. The boundary
+is `/svc/auth`'s: it holds against sessions, and anything holding the root namespace can reach it.
+
+**And it pinned the kernel work to one syscall, with a rule.** `sys_ns_derive(ns)` needs only
+`LOOKUP` and returns a snapshot copy with full rights. `with` has to copy its own namespace before
+it can send it, because the handle a process gets at spawn cannot be transferred. The broker then
+copies *again* before binding anything. A caller could have spawned a child into the namespace it
+sent, and a bind there would reach that child; so **the broker binds only into a namespace it
+created**.
+
+**The maintainer's calls:**
+
+- **Every external stage gets a terminal**: a sibling on the shell's backend, in the setup message.
+  The tty server already routes input to the first terminal waiting on a backend and `Ctrl-C` to
+  every terminal on it; `routing::move_to` was written for this shared case and never called. Only
+  the first stage getting one was rejected as a rule people would have to learn. Handing a stage the
+  shell's own channel was rejected because the shell could then not see `Ctrl-C` while the stage
+  held it.
+- **`with` works in desktop terminals in Part A.** The endpoint goes on to `desktop-shell` for the
+  applications it launches, rather than waiting for Part F.
+- **A session's end is asked for, not forced.** The broker asks each program to exit and unbinds
+  its grants. A forcible kill is deferred, and the kernel keeps `TERMINATE` reserved for it.
+- **`with` reads the password**, and the broker paces and caps failures per session. A broker
+  prompting on a terminal it was handed would prove no more, since it could not tell a real
+  terminal from a channel that pretends to be one.
+
+**Two moves in the plan.** `with --edit` and the `views` grant go to Part D, where who
+administers the system becomes something a person changes. And `TODO(admin-visibility)` —
+"whether an administrator is a *user* … or a *mode*" — closes with Part A: a mode, a view,
+reached with `with`.
