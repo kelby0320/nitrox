@@ -31,7 +31,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
 | — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | ✅ complete 2026-09-22 — all eleven parts (A–K) built |
-| — Administration | [administration.md](administration.md) | scoped 2026-09-22, not started — seven parts (A–G); Part A's detail pass is next |
+| — Administration | [administration.md](administration.md) | scoped 2026-09-22, not started — seven parts (A–G); Part A detailed 2026-09-23, A.1 (`sys_ns_derive`) next |
 | 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
 | 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |
