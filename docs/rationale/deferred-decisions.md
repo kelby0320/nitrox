@@ -498,6 +498,16 @@ FAIL; no session can authenticate`. Not exploitable today — nothing hostile ru
 `desktop-session-mgr` resolves *later*, in Part D, so the window widens exactly when a second
 supervisor arrives. Same fix as the rest of this entry (PR #235 review, finding 8).
 
+**`/svc/views` sits on the same boundary, and costs more there** (administration Part A,
+2026-09-23). `init` binds the view broker at `/svc/views` in the root namespace for `auth-service`'s
+reason, and its supervisor channel — `/svc/views/session` — **opens a session for any principal
+named**, while `/svc/views/s/<id>` speaks as any open session. Anything holding the root namespace
+can therefore act as any account to the broker, where for `/svc/auth` it could only guess
+passwords. It is the same trusted set — every holder of the unscoped root is a system service — and
+the same fix closes both: supervisors given *constructed* namespaces, so that only the two login
+supervisors hold `/svc/views/session` and nothing holds the unscoped `/svc/views`. Sessions are not
+on this boundary: their namespaces are built, and bind only `/dev/views` at their own base.
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly
@@ -556,6 +566,14 @@ exit per wake — every case the system produces today — that is right; with t
 the codes can swap, which matters only to `on-failure` (`never` and `always` do not read the
 code). A service found dead with no code queued is treated as a failure, since a crash that
 outruns its notification is the case worth restarting.
+
+**The view broker lives with the same residual** (administration Part A.3, 2026-09-23), and it
+matters a little more there: its programs belong to different sessions, and each code goes to a
+different `with`, so a swap would tell one person their elevated command failed when someone else's
+did. It does what `service-mgr` does — a *life channel* per program, a handle moved to the program
+at spawn that it never learns of, whose close says exactly *which* program exited — and pairs codes
+in arrival order. The maintainer took that over closing this entry now (2026-09-23), since two of
+the broker's programs exiting in one wake is rare and closing it needs the ABI.
 
 **`init` is untouched and still has the original bug**: `reap_loop` attributes the first
 `ChildExited` to its primary child without comparing the pid. Its children do not all have control
@@ -1058,6 +1076,24 @@ to notice a client doing something silly rather than to size the stack. **Growth
 also stays deferred — it needs the fault path to distinguish a stack overrun from a stray
 access, and 8 MiB of demand-paged reservation makes it much less interesting. Trigger for
 either: a client that exhausts 8 MiB, or a stack-depth question that costs debugging time.
+
+**There is no forcible kill — `TODO(forcible-kill)`.** `sys_process_terminate` *asks*: it
+enqueues `TerminateRequested` on the target's notification channel, and a process that ignores it
+keeps running (`docs/spec/syscall-abi.md`). The kernel reserves the `TERMINATE` right for the day
+one is built. That has been fine for a shell's pipeline, whose stages are ordinary programs that
+listen.
+
+**The view broker is the first place it costs something** (administration Part A, 2026-09-23).
+When a session ends, the broker asks every program it started for that session to exit and
+unbinds their grants, so nothing *new* can be resolved through them — but a program that ignores
+the request keeps running with whatever it had already resolved, since the kernel has no
+revocation either. An elevated program can therefore outlive the login that started it. The
+maintainer took "asked, not forced" for Part A over building a kill inside it.
+
+**Trigger: the first program that must not outlive its session** — anything granted authority a
+lingering copy could misuse without a person present. Building it means tearing down another
+process's threads and address space from outside, which is a substantial kernel feature rather
+than a syscall.
 
 ### Filesystems
 

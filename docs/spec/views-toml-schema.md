@@ -1,0 +1,91 @@
+# `views.toml` — the view broker's policy
+
+**Status: normative for what is built (2026-09-23).** Read by `userspace/view-broker/`
+(`view_broker::policy`) from `/system/views.toml`, **for every request**. The build seeds one;
+an installed system's comes from the installer (administration Part G).
+
+Conceptually `sudoers` — who may use which view, for which programs, proved how — but not its
+syntax. A view is a profile's grants added to the caller's own namespace; see
+[`administration.md`](../planning/administration.md) § *Views and the view broker*.
+
+## Example
+
+```toml
+[profile.admin]
+grants = ["disks"]
+
+[profile.install]
+grants = ["disks"]
+
+[[rule]]
+who  = ["alice"]      # accounts that may ask, or ["*"] for any
+use  = ["admin"]      # profiles
+run  = ["*"]          # programs by bare name, or ["*"] for any
+auth = "password"     # "password" or "none"
+
+[[rule]]
+who  = ["alice"]
+use  = ["install"]
+run  = ["nxinstall"]
+auth = "password"
+```
+
+## Grammar
+
+**A focused reader, not TOML.** What is accepted is exactly:
+
+- `#` comments, whole-line or trailing, except inside a string;
+- `[profile.<name>]` — a profile, named with letters, digits, `-`, `_` and `.`;
+- `[[rule]]` — a rule;
+- `key = value`, where a value is a string `"…"` or an array of strings `["…", "…"]` **on one
+  line**, with no escapes: a string may not contain `"` or `\`.
+
+Anything else — another section, a key outside a section, a multi-line array — is an error that
+names its line.
+
+## Profiles
+
+| Key | Type | Meaning |
+|---|---|---|
+| `grants` | array | What the profile adds to the caller's namespace. |
+
+**Grants** this broker knows, and a policy naming any other is refused rather than ignored:
+
+| Grant | What it binds | Since |
+|---|---|---|
+| `disks` | every block device, raw: `/dev/blk/<n>` and its `info`, one binding each | Part A |
+
+Each later part of the administration phase adds its grant to this table.
+
+## Rules
+
+| Key | Type | Meaning |
+|---|---|---|
+| `who` | array | The accounts that may ask, or `["*"]`. `*` with other names is an error. |
+| `use` | array | Profiles, each defined in the file. |
+| `run` | array | Programs by bare name — no `/` — or `["*"]`. |
+| `auth` | string | `"password"`: the person's own password, checked by `auth-service`. `"none"`: nothing beyond being in the session. |
+
+All four are required, and each may be given once.
+
+## Decisions
+
+**The first rule that matches the principal, the view and the program decides**, and none matching
+is a denial. There are no `deny` rules yet, so "first" matters only for which `auth` applies.
+
+A denial says what was missing: a view that does not exist, a view no rule lets the principal
+use, or a program that view does not let them run.
+
+**A policy that does not read denies everything**, and the reason — with its line — is logged and
+returned to whoever asked.
+
+## Administrators, and the guard
+
+**An administrator is an account a rule lets use `admin` with `run = ["*"]`** — narrow on
+purpose, so that a broad rule letting everyone run one program does not count. A policy with no
+administrator reads, but `with --check` refuses it, because nothing could change the file again
+short of the live image. Part D's `with --edit` refuses to install one.
+
+## References
+
+- [`rsproto-views-ops.md`](rsproto-views-ops.md) — the protocol the broker speaks

@@ -445,3 +445,16 @@ dependencies = [
  "libkern",
  "librsproto",
 ]
+
+[[package]]
+name = "view-broker"
+version = "0.1.0"
+dependencies = [
+ "libfs",
+ "libheap",
+ "libkern",
+ "liblog",
+ "librsproto",
+ "libsession",
+ "libstream",
+]

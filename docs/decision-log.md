@@ -28060,3 +28060,54 @@ existed, so it now checks its own precondition.
   out on the first run. The shell now asks the stages to stop, after spawning them, when the flag
   is already set. The evaluator's checkpoint clears the flag before each statement, so anything
   set there arrived during this one.
+
+## 2026-09-23 — Administration A.3: the view broker, proven through its own protocol
+
+The third piece of Part A: `view-broker`, a lib and bin split like `auth-service`, spawned by `init`
+with `BIND_NAMESPACE` and bound at `/svc/views`.
+
+**The library holds everything the broker decides with, and is host-tested.**
+
+- **A focused `views.toml` reader.** It errors with the line it stopped at, knows exactly one grant
+  (`disks`), and refuses a grant it does not know rather than ignoring it.
+- **First-match rule evaluation.** A denial says whether the view or the program was the problem.
+- **The last-administrator guard.** It is narrow: an administrator is `admin` with `run = ["*"]`,
+  and the test sits at each neighbour.
+- **Per-session pacing.** A failure holds the session's next check on any of its requests, but not
+  another session's.
+- **Session ids that are never reused.**
+- **The suffix parser that identity comes from**, with one spelling per id.
+
+Four mutations fail those tests: the guard counting `admin` for one program, a delay that never
+holds, a leading zero accepted, and a `#` inside a string taken for a comment.
+
+**The protocol is `Views` (`0x0Exx`), written up in `rsproto-views-ops.md`; the file in
+`views-toml-schema.md`.**
+
+**Proven in a boot before any shell or `with` exists to drive it.** `boot-probe` holds the unscoped
+root namespace, so it can be both a supervisor and a client at `/svc/views/s/<id>`. It opens a
+session for the demo account and sends `admin nxinstall` carrying a copy of its namespace with
+`/dev/blk` unbound, keeping a duplicate of that copy. Then it gives a wrong password and, straight
+after, the right one. It asserts that:
+- the password was asked for;
+- the right one was answered only after the session's two-second delay;
+- `nxinstall` exited 0, which means "listed the disks it can see", so the grant arrived;
+- the duplicate it kept still cannot reach `/dev/blk/0`, so the broker built the view in a copy of
+  its own;
+- a program outside a rule's `run` is refused;
+- `Check` refuses a policy nobody could administer;
+- a closed session's base resolves to nothing.
+
+Four broker mutations each fail that boot at their own line: binding into the namespace the caller
+sent, no pacing, no grant, and a session never removed. The audit records it leaves on the console
+tell the same story, and none contains a password.
+
+**Three things settled in passing.**
+- **Exit attribution:** `service-mgr`'s way, a life channel per program plus codes in arrival order.
+  That was the maintainer's call over closing `TODO(child-exit-attribution)` now, and the entry
+  names the broker as a consumer.
+- **`/svc/views` shares `/svc/auth`'s boundary and costs more.** Its supervisor channel opens a
+  session for any principal named. `TODO(svc-auth-ungated)` says so, with the same fix.
+- **A session's end is asked for, not forced** (`TODO(forcible-kill)`, a new entry).
+
+The seeded policy landed here rather than in A.6, because the boot needed one to decide against.

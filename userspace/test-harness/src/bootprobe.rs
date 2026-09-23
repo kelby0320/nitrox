@@ -29,6 +29,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 /// `Line` builds its text on the heap, so this bin needs an allocator.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -789,7 +791,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & create_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
-        & ns_derive_test(root_ns);
+        & ns_derive_test(root_ns)
+        & view_broker_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -924,6 +927,253 @@ fn ns_derive_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: ns derive: a sendable snapshot, pruned without touching the root ok\n");
     }
     ok
+}
+
+/// The demo account the build seeds, and the policy it seeds for it (`xtask`'s `DEMO_USER` and
+/// `DEMO_PASSWORD`, and `seeded_views_toml`). A build input, not a secret — `init`'s login
+/// selftest used the same literals.
+const DEMO_USER: &[u8] = b"alice";
+const DEMO_PASSWORD: &[u8] = b"correct horse battery staple";
+
+fn clock_ns() -> u64 {
+    let mut t = 0u64;
+    // SAFETY: `t` is a valid writable u64 out-param.
+    unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut t) as u64) };
+    t
+}
+
+/// One exchange with the view broker: send `op` on `ch` carrying `body` and moving `handles`, and
+/// wait — at most ten seconds — for the reply to it. An `Exited` that arrives first is set aside in
+/// `exited` rather than mistaken for the reply. `None` if nothing came.
+fn views_call(
+    ch: u64,
+    op: u16,
+    request_id: u64,
+    body: &[u8],
+    handles: &[u64],
+    exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Option<(bool, alloc::vec::Vec<u8>)> {
+    let mut msg = [0u8; 4096];
+    let n = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16)?;
+    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    // SAFETY: valid message buffer and handle array.
+    let sr = unsafe {
+        syscall5(
+            libkern::SYS_CHANNEL_SEND,
+            ch,
+            msg.as_ptr() as u64,
+            handles.as_ptr() as u64,
+            handles.len() as u64,
+            libkern::SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        return None;
+    }
+    views_receive(ch, request_id, exited)
+}
+
+/// Wait for the message with `request_id` on `ch` (`0` for the next `Exited`), setting any other
+/// `Exited` aside in `exited`. Ten seconds at most.
+fn views_receive(
+    ch: u64,
+    request_id: u64,
+    exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Option<(bool, alloc::vec::Vec<u8>)> {
+    let deadline = clock_ns() + 10_000_000_000;
+    let mut buf = [0u8; 4096];
+    let mut hs = [0u64; 8];
+    loop {
+        let mut count = 0usize;
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(
+                libkern::SYS_CHANNEL_RECV,
+                ch,
+                buf.as_mut_ptr() as u64,
+                hs.as_mut_ptr() as u64,
+                (&raw mut count) as u64,
+            )
+        };
+        if rr == 0 {
+            let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            let m = librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok()?;
+            if m.op == librsproto::views::OP_VIEWS_EXITED && m.request_id == 0 {
+                if request_id == 0 {
+                    return Some((false, m.body.to_vec()));
+                }
+                exited.push(m.body.to_vec());
+                continue;
+            }
+            if m.request_id == request_id {
+                return Some((m.is_error(), m.body.to_vec()));
+            }
+            continue;
+        }
+        if clock_ns() >= deadline {
+            return None;
+        }
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with a deadline.
+        unsafe {
+            WAIT_HANDLES[0] = ch;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline);
+        }
+    }
+}
+
+/// **The view broker, through its own protocol** (administration Part A.3), before any shell or
+/// `with` exists to drive it. `boot-probe` holds the unscoped root namespace, so it can be both a
+/// supervisor — opening a session for the demo account — and a client in that session, at
+/// `/svc/views/s/<id>`, which is exactly what a session's `/dev/views` reaches.
+///
+/// What it proves, each a thing a later piece depends on:
+/// 1. a request the policy allows asks for a password;
+/// 2. a wrong password is refused with a retry, and the right one — offered straight after — is
+///    **held for the session's delay** before it is answered;
+/// 3. **the grant arrived**: `nxinstall` is sent a copy of this namespace with `/dev/blk`
+///    removed, and still exits 0, which is "listed the devices it can see" — its 1 would be
+///    "none";
+/// 4. a program outside a rule's `run` is refused by the policy;
+/// 5. `with --check`'s op refuses a policy nobody could administer;
+/// 6. once the session is closed, its base names nothing.
+fn view_broker_test(root_ns: u64) -> bool {
+    use librsproto::views::*;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: view broker: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => match parse_session_id(&body) {
+            Some(id) => id,
+            None => return fail(b"OpenSession's reply"),
+        },
+        _ => return fail(b"OpenSession"),
+    };
+    let client_path = alloc::format!("/svc/views/s/{session}");
+    let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st != 0 || cli == 0 {
+        return fail(b"no client channel at the session's base");
+    }
+
+    // A copy of this namespace with every disk removed, so a 0 from `nxinstall` can only be the
+    // grant's doing.
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if copy <= 0 {
+        return fail(b"derive");
+    }
+    let copy = copy as u64;
+    let blk = b"/dev/blk";
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    unsafe { syscall4(SYS_NS_UNBIND, copy, blk.as_ptr() as u64, blk.len() as u64, 0) };
+    let (bst, bh) = ns_lookup(copy, b"/dev/blk/0", libkern::RIGHT_READ);
+    if bst == 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, bh) };
+        return fail(b"precondition: the copy still reaches /dev/blk/0");
+    }
+
+    // **Keep a duplicate of what is sent**, the way a caller hoping to reach the view would: the
+    // broker must build the view in a namespace of its own, so nothing it grants reaches this.
+    // SAFETY: `copy` carries `DUPLICATE`; the result is a handle this process owns.
+    let kept = unsafe { syscall2(SYS_HANDLE_DUPLICATE, copy, u64::MAX) };
+    if kept <= 0 {
+        return fail(b"duplicate the copy");
+    }
+    let kept = kept as u64;
+
+    let mut req = [0u8; 256];
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli, OP_VIEWS_REQUEST, 2, &req[..n], &[copy], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+        _ => return fail(b"an allowed request did not ask for a password"),
+    }
+    match views_call(cli, OP_VIEWS_PASSWORD, 3, b"not the password", &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))) => {}
+        _ => return fail(b"a wrong password was not refused with a retry"),
+    }
+    let refused_at = clock_ns();
+    match views_call(cli, OP_VIEWS_PASSWORD, 4, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"the right password did not start the program"),
+    }
+    // **Held, not merely slow.** The delay is two seconds; the scheduler's tick is ten
+    // milliseconds, so anything past 1.9 s is the broker holding the check, and an answer much
+    // sooner is a broker that did not.
+    let held = clock_ns().saturating_sub(refused_at);
+    if held < 1_900_000_000 {
+        return fail(b"the password after a wrong one was answered without the session's delay");
+    }
+    // The program is running with its grant; the namespace this process sent must not have it.
+    let (kst, kh) = ns_lookup(kept, b"/dev/blk/0", libkern::RIGHT_READ);
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, kept);
+        if kh != 0 {
+            syscall1(SYS_HANDLE_CLOSE, kh);
+        }
+    }
+    if kst == 0 {
+        return fail(b"the grant was bound into the namespace the caller sent, which it still holds");
+    }
+    let code = match exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) {
+        Some(body) => parse_exited(&body),
+        None => None,
+    };
+    if code != Some((0, false)) {
+        Line::new().s(b"boot-probe: view broker: nxinstall exited ").i(code.map_or(-99, |c| c.0 as i64)).end();
+        return fail(b"the program did not see the granted disks");
+    }
+    // SAFETY: closing our own handle; the request is done.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
+
+    // A second client in the same session: a program the `install` view does not include.
+    let (st, cli2) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st != 0 || cli2 == 0 {
+        return fail(b"a second client channel");
+    }
+    // SAFETY: a namespace handle this process holds.
+    let copy2 = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let Some(n) = build_request(&mut req, 0, b"install", b"nxsh", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli2, OP_VIEWS_REQUEST, 5, &req[..n], &[copy2 as u64], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: false }, _))) => {}
+        _ => return fail(b"a program outside the rule's `run` was not refused"),
+    }
+    let orphaned = b"[profile.admin]\ngrants = [\"disks\"]\n";
+    match views_call(cli2, OP_VIEWS_CHECK, 6, orphaned, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { .. }, _))) => {}
+        _ => return fail(b"a policy nobody could administer passed the check"),
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli2) };
+
+    let mut id = [0u8; 8];
+    let n = build_session_id(&mut id, session).unwrap_or(0);
+    if !matches!(views_call(sup, OP_VIEWS_CLOSE_SESSION, 7, &id[..n], &[], &mut exited), Some((false, _))) {
+        return fail(b"CloseSession");
+    }
+    let (st, gone) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    if st == 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, gone) };
+        return fail(b"a closed session's base still resolves");
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, sup) };
+    kprint(b"boot-probe: view broker: password held, grant arrived, policy refused, session closed ok\n");
+    true
 }
 
 

@@ -184,6 +184,21 @@ static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
+/// Spawn args for the `view-broker` (administration Part A): the control endpoint, moved, as
+/// `auth-service`'s — and **`BIND_NAMESPACE`**, which no other resource server `init` spawns holds.
+/// The broker binds a profile's grants into the views it builds; it binds only into namespaces it
+/// created, and never registers itself (`docs/architecture/graphical-session.md` §3 is the same
+/// reconciliation, for `desktop-shell`).
+static mut SPAWN_VIEWS: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/view-broker
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE,
+};
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
 /// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
@@ -925,6 +940,63 @@ fn bind_auth_service(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the view broker and bind its forwarding endpoint at `/svc/views` (administration Part A).
+///
+/// **Bound by init for `auth-service`'s reason**: a service `service-mgr` starts holds an inherited
+/// `LOOKUP`-only root and cannot bind into it. And the same boundary follows: anything holding the
+/// root namespace can resolve `/svc/views/…`, including a session's base, which is
+/// `TODO(svc-auth-ungated)`'s reasoning and its fix. Sessions cannot — their namespaces are built,
+/// and hold only `/dev/views` at their own base.
+///
+/// Not critical-path: `false` is logged by the caller and the boot goes on.
+fn bind_view_broker(root_ns: u64) -> bool {
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+    // SAFETY: SPAWN_VIEWS is a valid writable arg block; spawn_program resolves the ELF, stamps
+    // it, spawns, and closes the image handle.
+    let vb_h = unsafe {
+        SPAWN_VIEWS.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/view-broker", &raw mut SPAWN_VIEWS)
+    };
+    if vb_h < 0 {
+        kprint(b"init: view-broker spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+    let endpoint = match wait_ready(ctrl_init, &[b"view-broker".as_slice()]) {
+        Some(e) => e,
+        None => {
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+    let path = b"/svc/views";
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
+    };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: view-broker bind FAIL at /svc/views\n");
+        return false;
+    }
+    kprint(b"init: view-broker bound at /svc/views\n");
+    // init keeps `vb_h` (the long-lived server's process handle).
+    let _ = vb_h;
+    true
+}
+
 /// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
 ///
 /// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
@@ -1646,6 +1718,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // pipeline, and a pipeline runs in a serial session too.
     if !bind_clipboard_server(root_ns) {
         kprint(b"init: no clipboard server; copy and paste will do nothing\n");
+    }
+
+    // The view broker (administration Part A), after the logging service — it opens its audit
+    // log at startup — and before the service manager, whose login supervisors resolve
+    // `/svc/views` for every session. **Not critical-path**: a machine without it still logs in;
+    // `with` just has nobody to ask.
+    if !bind_view_broker(root_ns) {
+        kprint(b"init: no view broker; `with` will have nothing to ask\n");
     }
 
     // ---- the display arm ----

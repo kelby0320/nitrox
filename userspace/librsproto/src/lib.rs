@@ -31,6 +31,7 @@ pub mod path;
 #[cfg(feature = "io")]
 pub mod session;
 pub mod surface;
+pub mod views;
 
 // --- Envelope (RsMsgHeader) -------------------------------------------------
 

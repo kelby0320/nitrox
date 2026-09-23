@@ -559,6 +559,31 @@ pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
     bound
 }
 
+/// Take back what [`rebind_block_devices`] bound into `ns`: each `/dev/blk/<n>` and its `info`.
+/// Returns how many devices were unbound.
+///
+/// **The view broker's, for a session that ended** (`docs/planning/administration.md` § Part A).
+/// It asks every program it started for the session to exit, and unbinds their grants so nothing
+/// new can be resolved through them. A handle a program already holds is not taken back — the
+/// kernel has no revocation — which is why this is half of ending a session rather than all of it.
+pub fn unbind_block_devices(ns: u64) -> usize {
+    let mut unbound = 0;
+    for n in 0..MAX_BLOCK_DEVICES {
+        let mut path = [0u8; 20];
+        // The leaf first, so the device's binding is never left without the one beside it —
+        // and `NotFound` for a leaf that was never bound is no error.
+        let info_len = write_blk_path(&mut path, n, true);
+        // SAFETY: valid namespace handle and path.
+        unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, info_len as u64) };
+        let dev_len = write_blk_path(&mut path, n, false);
+        // SAFETY: as above.
+        if unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, dev_len as u64) } == 0 {
+            unbound += 1;
+        }
+    }
+    unbound
+}
+
 /// Block devices a session may be handed. The registry is small — a disk, its partitions, any
 /// module — and a session that needed more than this would be a machine nothing here has seen.
 const MAX_BLOCK_DEVICES: usize = 16;

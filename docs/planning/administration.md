@@ -637,15 +637,17 @@ closes the phase**.
       `nxsh` mints one for each external stage and moves it in through the **existing** `terminal`
       field (`send_setup_full`), and coreutils' `Stage` exposes what it receives. Routing tests: input reaches whichever
       sibling is waiting; `Ctrl-C` reaches both; and retiring one leaves the other on its backend.
-- [ ] **A.3 — the broker.** `view-broker`, a lib and bin split like `auth-service`, and host-tested:
+- [x] **A.3 — the broker** *(2026-09-23)*. `view-broker`, a lib and bin split like `auth-service`, and host-tested:
       - the `views.toml` reader, rule evaluation, and the last-administrator guard, each tested at
         its neighbours;
-      - the `Views` protocol (`0x0Exx`), with `rsproto-views-ops.md` and `views-toml-schema.md`; <!-- check-docs: allow-missing -->
+      - the `Views` protocol (`0x0Exx`), with `rsproto-views-ops.md` and `views-toml-schema.md`;
       - `init` spawning it with `BIND_NAMESPACE` and binding `/svc/views`;
       - per-session pacing, with a host test that two requests in one session share the delay a
         failure on either one starts, while another session's do not wait;
       - the audit records, and the spawn;
-      - `Exited`, `Stop`, and the end of a session.
+      - `Exited`, `Stop`, and the end of a session;
+      - **a `boot-probe` check through the broker's own protocol**, in `test-qemu`, before any shell
+        or `with` drives it — which needed A.6's seeded policy early, so the seed landed here.
 - [ ] **A.4 — the supervisors.** The forwarding endpoint couriered from `init` to both login
       supervisors and on to `desktop-shell`. A supervisor opens a session at login, binds
       `/dev/views` with its base, and closes the session when its leader exits. `desktop-shell`
@@ -654,10 +656,13 @@ closes the phase**.
       `--check <file>`. The last sends the file's text for the broker to judge, so there is one
       parser. It prompts with echo off, relays the exit status, and passes on a stop request. The
       shell spec records the name as taken by `/bin`.
-- [ ] **A.6 — the seed and the gates.** The build seeds `/system/views.toml`:
+- [ ] **A.6 — the seed and the gates.** The build seeds `/system/views.toml` *(landed with A.3,
+      which needed it to test the broker in a boot)*:
       - an `admin` profile holding `disks`, which the demo account may use for any program with a
         password;
       - a narrower profile allowing one program, so a gate can see a request refused by policy.
+
+      What is left is the gates: `test-interactive`'s `with` steps and `check-login`'s.
 - [ ] **Docs:**
       - `session-and-auth.md` gains the broker, and its deferred "privilege broker" line is closed;
       - `namespace-and-resource-servers.md` gains derivation;

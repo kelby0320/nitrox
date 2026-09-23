@@ -600,6 +600,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The kill ring (M12 Part E). A store package like the rest: nothing about a clipboard is
     // needed to reach a mounted root, and its only client runs long after one.
     "clipboard-server",
+    // The view broker (administration Part A). `init` spawns it — only `init` can bind a server
+    // into the root namespace — from here, as it does `auth-service`.
+    "view-broker",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -659,6 +662,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The clipboard (M12 Part E). A lib + bin split like `auth-service`: the ring is
     // host-tested, this builds the bare-target server.
     build_userspace_bin("clipboard-server", None)?;
+    // The view broker (administration Part A). A lib + bin split like `auth-service`: who may
+    // do what is host-tested, this builds the bare-target server.
+    build_userspace_bin("view-broker", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -10788,6 +10794,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // view-broker's library tests (the policy reader, rule evaluation, the last-administrator
+    // guard, per-session pacing and session ids). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("view-broker")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // logging-service's library tests (the log-path classifier). `--lib` skips the
     // `#![no_main]` server bin.
     run(Command::new("cargo")
@@ -13159,6 +13175,35 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
     Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
 }
 
+/// The policy the build seeds at `/system/views.toml` — see where it is staged.
+///
+/// **A function rather than a literal**, because the account name is `DEMO_USER` and a policy that
+/// named someone the build did not make would deny everything while reading perfectly well.
+fn seeded_views_toml() -> String {
+    format!(
+        "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
+         # Seeded by the build; an installed system's comes from the installer.\n\
+         \n\
+         [profile.admin]\n\
+         grants = [\"disks\"]\n\
+         \n\
+         [profile.install]\n\
+         grants = [\"disks\"]\n\
+         \n\
+         [[rule]]\n\
+         who  = [\"{DEMO_USER}\"]\n\
+         use  = [\"admin\"]\n\
+         run  = [\"*\"]\n\
+         auth = \"password\"\n\
+         \n\
+         [[rule]]\n\
+         who  = [\"{DEMO_USER}\"]\n\
+         use  = [\"install\"]\n\
+         run  = [\"nxinstall\"]\n\
+         auth = \"password\"\n"
+    )
+}
+
 /// The programs a session gets through its profile: the coreutils, plus `nxsh`.
 ///
 /// `nxsh` is here as well as being the login leaf — a user should be able to run a nested
@@ -13757,6 +13802,11 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         writeln!(users, ":{DEMO_HOME}").unwrap();
         fs::write(staging.join("system").join("users"), users.as_bytes())?;
     }
+    // `/system/views.toml` — the view broker's policy (administration Part A.6). The demo account
+    // administers the machine, as it is the only account the build makes; `install` is a narrower
+    // view that lets it run one program, so a gate can see a request refused by policy rather than
+    // by the absence of any rule. An installed system gets its own from the installer (Part G).
+    fs::write(staging.join("system").join("views.toml"), seeded_views_toml().as_bytes())?;
     // The demo user's home directory — the writable session root a login constructs
     // (auth Part E). The user shell writes into it, and since M11 Part C it arrives holding
     // the session's theme.
