@@ -134,7 +134,11 @@ forwarding endpoint at `/dev/views` with a subtree base naming that session** �
 the serial column and `desktop-session-mgr` for the graphical one. **Both must**, or a session
 exists that the broker cannot see. A request arriving through that binding is from that session,
 and nothing in the session can choose another base — the logging service already works this way,
-with identity set by the supervisor. (This said *minted per session* until Part A's detail pass
+with identity set by the supervisor. **One exception: the graphical column's leader.**
+`desktop-shell` holds the raw forwarding endpoint and `BIND_NAMESPACE`, because it binds
+`/dev/views` into the applications it launches, so it could bind any base. That adds nothing to
+what it already holds: the whole-tree filesystem endpoint. It does mean the graphical session's
+identity rests on `desktop-shell`, where a serial session's rests on the binding alone. (This said *minted per session* until Part A's detail pass
 found the path already carries identity; see *Part A in detail*.) The password then confirms the person
 at the keyboard is that principal.
 
@@ -182,7 +186,7 @@ grants = ["power"]
 [[rule]]
 who  = ["kelby"]     # accounts that may ask, or "*" for any that can log in
 use  = ["admin"]     # profiles
-run  = ["*"]         # programs, resolved in the view being built
+run  = ["*"]         # programs, by bare name, resolved in the broker's /bin
 auth = "password"    # password · none
 
 [[rule]]
@@ -251,7 +255,8 @@ request. It is the most trusted process in userspace after `init`, and should be
   `Ctrl-C`. Both the password prompt and an interactive program under `with` need it. It also
   retires the reason `nxinstall` takes its confirmation as an operand.
 - **The prompt itself**: echo off, as the login prompt. **A failed attempt is slow and counted** — a
-  delay after each failure, a cap per request, and every failure in the log. Any program in a session
+  delay after each failure held for the whole session, a cap per request, and every failure in the
+  log. Any program in a session
   can call `/dev/views` in a loop, and this is what stops it becoming a password-guessing service.
 - **Graphical — designed here, built when needed.** A UAC-style window asking for permission. What
   makes it more than a dialog is that **only the broker can open it**, and the compositor draws it in
@@ -487,8 +492,9 @@ closes the phase**.
   already unprivileged (`sys_ns_create`); only *binding* needs `BIND_NAMESPACE`.
 - **A process cannot send its own namespace.** The handle a child gets at spawn is `LOOKUP`-only,
   with no `TRANSFER`. It can *copy* it, though, since a new namespace comes with full rights.
-- **So the broker must copy again.** A caller that sent the broker a namespace could first spawn a
-  child into it, and whatever the broker bound there later would reach that child. **The broker
+- **So the broker must copy again.** A derived handle carries `DUPLICATE`, so a caller that sent
+  the broker a namespace could keep a duplicate and resolve through it. It could also spawn a
+  child into it. Either way, whatever the broker bound there would reach the caller. **The broker
   binds only into a namespace it created**, derived from the one it was sent.
 - **The path is already an identity.** The logging service knows a record's principal from the
   path its channel was resolved through (`/log/system/<name>`), and `desktop-shell` confines an
@@ -506,8 +512,13 @@ closes the phase**.
   backend", `Ctrl-C` goes to every terminal on it, and a terminal is retired when its holder exits.
   `routing::move_to` exists for exactly the shared case, and nothing outside its tests calls it. So a terminal a
   stage can own is **one new operation**: another terminal on the shell's backend.
-- **The setup message has room.** Its fields may only be appended, and it transfers up to eight
-  handles, three of them used today; a terminal is a fourth, with a fourth bit in `streams`.
+- **The setup message already carries a terminal.** `SetupPayload::terminal` is an appended
+  field, and its handle follows the stream handles (`send_setup_full`). It was built in Milestone 5
+  Part C so `nxterm` could hand `nxsh` its window's terminal. It is **not** a `streams` bit: a
+  fourth bit would not decode, because `Streams::from_bitmap` refuses anything outside the three
+  streams. What is missing is `nxsh` *sending* one to its stages, and coreutils' `Stage` exposing
+  it — `Stage` has no terminal today. (`pipeline-stdio.md` never gained the field, which is how the
+  first draft of this pass proposed it again as a bit. It is fixed in the same change.)
 - **The shell already stops stages by request.** `nxsh` calls `sys_process_terminate` on each
   child. `with` is a child like any other, so it can pass the request on to the broker.
 - **There is no forcible kill.** `sys_process_terminate` is a request. The kernel reserves the
@@ -537,9 +548,9 @@ closes the phase**.
   deferred (`TODO(forcible-kill)`), triggered by the first program that must not outlive its
   session.
 - **`with` reads the password**, on its terminal with echo off, and sends it in the request. The
-  broker never touches a terminal, which keeps it small. It paces and caps failures **per
-  session**, because a program can always open a new request. Prompting from the broker would
-  prove no more: it could not tell a real terminal from a channel that pretends to be one.
+  broker never touches a terminal, which keeps it small. The broker paces and caps failures, as
+  set out below. Prompting from the broker would prove no more: it could not tell a real terminal
+  from a channel that pretends to be one.
 
 **Derived from the spike and the plan:**
 
@@ -551,10 +562,26 @@ closes the phase**.
   supervisor resolves `/svc/views/session` for a **supervisor channel** (`OpenSession` and
   `CloseSession`), and binds the forwarding endpoint at `/dev/views` in each session with base
   `/s/<session>`. A process in the session resolves `/dev/views` and gets a **client channel**,
-  which the broker tags with that session.
-- **A program is a bare name, resolved at `/bin/<name>` in the view.** No paths: a rule's `run`
-  names programs, and a path would let "the same name" mean something else. Only a process that
-  can already rebind `/bin` (one holding `BIND_NAMESPACE`) could change what a name resolves to.
+  which the broker tags with that session. **Session ids increase and are never reused within a
+  boot.** A program that ignores its session's end keeps a namespace with `/s/<old>` in it, and a
+  reused id would hand that program's requests the next login's identity.
+- **A program is a bare name, resolved at `/bin/<name>` in the broker's own namespace**, not in the
+  view. It reaches the same profile server as a session's `/bin`. No paths are accepted: a rule's
+  `run` names programs, and a path would let "the same name" mean something else. **Not the
+  view, because a caller can prune its copy.** `sys_ns_unbind` needs only the `UNBIND` right, which
+  a derived namespace carries. So a caller can remove `/bin` from the copy it sends, and a name
+  would then resolve through any shorter binding that covers it. Today's namespaces have none, but
+  the image must not depend on that. Pruning otherwise only narrows what the program sees. Its own
+  later lookups happen in the view, as they would without `with`.
+- **The delay after a failure is per session; the cap is per request.** A failure holds that
+  session's *next* password check until the delay has passed, on whichever request it arrives.
+  Otherwise a program could open several requests at once and guess on each in parallel. A request
+  that fails three times is refused, as a login would be. **The delay is a deadline in the broker's
+  wait set, never a sleep.** A single-threaded broker that slept would stall every other session's
+  requests, and the supervisors' `OpenSession` with them, so logins would wait on someone else's
+  typing. (This refines the call as first put, "paces and caps failures per session". A cap
+  per session would let one program's wrong guesses lock its person out of `with` for the rest of
+  the session; the per-session *delay* is what stops parallel guessing — PR #328 review.)
 - **The policy is read for every request.** It is small; a stale copy is a bug; and a policy that
   fails to parse then denies everything straight away, as the plan says it must.
 - **Part A knows one grant, `disks`, and a policy naming any other is refused.** Each later part
@@ -562,9 +589,17 @@ closes the phase**.
   mistake to report, not something to ignore.
 - **`with --edit` and the `views` grant move to Part D**, which is where who administers the system
   becomes something a person changes.
-- **`TODO(admin-visibility)` closes with this part.** It asked whether an administrator is a second
-  account or a mode, and how a person moves between them. The answer is a mode — a view — reached
-  with `with`.
+- **`TODO(admin-visibility)` is answered by this part.** It asked whether an administrator is a
+  second account or a mode, and how a person moves between them. The answer is a mode — a view —
+  reached with `with`. **Its code marker is on something that stands on its own**: application
+  namespaces omit `/applications` because nothing in an application reads it. So when A lands,
+  three things change:
+  - the entry moves to Resolved;
+  - `desktop-shell`'s comment keeps its reason and drops the tag;
+  - `graphical-session.md` §6.1 stops calling the asymmetry a symptom of the deferral.
+
+  `check-deferrals` would not notice a stale marker, because it only asks whether the tag appears
+  in the doc, so this has to be done by hand.
 
 ### A request, end to end
 
@@ -574,19 +609,20 @@ closes the phase**.
 3. The broker reads the policy and evaluates it for the session's principal. A denial is answered
    and logged, and nothing is prompted for.
 4. If the rule says `password`, the broker answers `NeedPassword`. `with` prompts, and sends the
-   password. The broker checks it against `auth-service`. After a failure it waits before
-   answering, and after the third failure in a request it refuses the request. Every failure is
-   logged.
-5. The broker derives the view from the copy, binds the profile's grants into it (`disks` is
-   `rebind_block_devices` from its own namespace), and spawns `/bin/<program>` there with no
-   syscaps beyond the profile's. The setup message carries the argv, the environment with
+   password. The broker checks it against `auth-service`, but not before the session's delay from
+   its last failure has passed. After a third failure in a request it refuses that request. Every
+   failure is logged.
+5. The broker derives the view from the copy and binds the profile's grants into it (`disks` is
+   `rebind_block_devices` from its own namespace). It resolves `/bin/<program>` in its own
+   namespace and spawns it into the view, with no syscaps beyond the profile's. The setup message carries the argv, the environment with
    `view = "admin"` added, the streams and the terminal. It answers `Started`, and logs it.
 6. The program's output goes straight into the caller's pipeline. When it exits, the broker sends
    `Exited { code }` and closes the view, and `with` exits with that code.
 7. When the shell asks `with` to stop, `with` sends `Stop`, and the broker passes the request on to
    the program.
 8. `CloseSession`: the broker asks every program it started for that session to exit, unbinds their
-   grants, and refuses anything further that arrives under that session's base.
+   grants, and refuses anything further that arrives under that session's base. Since ids are
+   never reused, that base can never be anyone else's.
 
 ### The pieces, in dependency order
 
@@ -596,15 +632,17 @@ closes the phase**.
       dropping one namespace leaves the other's registrations alive.
 - [ ] **A.2 — a terminal per stage.** A tty op minting a sibling terminal on the caller's backend,
       and its spec. Echo is per terminal, so a password prompt does not turn the shell's echo off.
-      A `terminal` bit and handle appended to the setup message, and `Stage` exposing it. `nxsh`
-      mints one for each external stage and moves it in. Routing tests: input reaches whichever
+      `nxsh` mints one for each external stage and moves it in through the **existing** `terminal`
+      field (`send_setup_full`), and coreutils' `Stage` exposes what it receives. Routing tests: input reaches whichever
       sibling is waiting; `Ctrl-C` reaches both; and retiring one leaves the other on its backend.
 - [ ] **A.3 — the broker.** `view-broker`, a lib and bin split like `auth-service`, and host-tested:
       - the `views.toml` reader, rule evaluation, and the last-administrator guard, each tested at
         its neighbours;
       - the `Views` protocol (`0x0Exx`), with `rsproto-views-ops.md` and `views-toml-schema.md`; <!-- check-docs: allow-missing -->
       - `init` spawning it with `BIND_NAMESPACE` and binding `/svc/views`;
-      - per-session pacing, the audit records, and the spawn;
+      - per-session pacing, with a host test that two requests in one session share the delay a
+        failure on either one starts, while another session's do not wait;
+      - the audit records, and the spawn;
       - `Exited`, `Stop`, and the end of a session.
 - [ ] **A.4 — the supervisors.** The forwarding endpoint couriered from `init` to both login
       supervisors and on to `desktop-shell`. A supervisor opens a session at login, binds
@@ -621,9 +659,11 @@ closes the phase**.
 - [ ] **Docs:**
       - `session-and-auth.md` gains the broker, and its deferred "privilege broker" line is closed;
       - `namespace-and-resource-servers.md` gains derivation;
-      - `console-and-tty.md` gains sibling terminals;
-      - `deferred-decisions.md`: `TODO(admin-visibility)` is resolved, and
-        `TODO(forcible-kill)` and the broker's share of `TODO(svc-auth-ungated)` are recorded.
+      - `console-and-tty.md` gains sibling terminals, and `pipeline-stdio.md` says who sends a
+        terminal (its field was specified by this pass);
+      - `deferred-decisions.md`: `TODO(admin-visibility)` is resolved, with its `desktop-shell`
+        comment and `graphical-session.md` §6.1 updated as above, and `TODO(forcible-kill)` and
+        the broker's share of `TODO(svc-auth-ungated)` are recorded.
 
 ### What to compare on the day
 
@@ -637,8 +677,12 @@ closes the phase**.
 - `with admin sleep 60`, then `Ctrl-C`, is back at the prompt well inside a minute.
 - There is an audit record for each request, and a password appears in none of them.
 
-**`check-terminal`** runs one `with` request from a desktop terminal, so the endpoint chain to
-`desktop-shell` is exercised in the column a person actually uses.
+**`check-login`** runs one `with` request from the terminal it opens through the Applications
+menu. That is the release image, after a real login, with `nxterm` in the namespace `desktop-shell`
+built for it, so the endpoint chain to `desktop-shell` and the session's base are both exercised.
+It asserts on the broker's `Started` and audit lines, since a release image does not narrate the
+grid. `check-terminal` cannot carry this: its `nxterm` is a boot-probe service in the root
+namespace, with no login and no session.
 
 ### Left alone
 
@@ -653,7 +697,7 @@ closes the phase**.
 
 | Part | What proves it |
 |---|---|
-| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-terminal`: one `with` request from a desktop terminal |
+| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-login`: one `with` request from the terminal the Applications menu opens |
 | B | every boot device announced as an arrival, in `test-qemu` and `check-live`, and keyboard and mouse still reaching a window |
 | C | **`check-install`'s topology**: a live boot, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync, unmounted — then `e2fsck` and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |

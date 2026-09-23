@@ -27914,8 +27914,8 @@ guard is `check-login`'s rename step catching a regression now and then — as i
 Part A (the view broker, on a terminal) got its detail pass in `administration.md`: a spike through
 the code it will be built from, the shape, and six pieces in dependency order, A.1–A.6.
 
-**The spike simplified the identity design.** The entry above has each login supervisor bind "a
-broker endpoint minted for its principal". Nothing needs minting. The logging service already knows
+**The spike simplified the identity design.** The *Administration scoped* entry (2026-09-22) has
+each login supervisor bind "a broker endpoint minted for its principal". Nothing needs minting. The logging service already knows
 a record's principal from the path its channel was resolved through, and a subtree base is a suffix
 the resolver cannot choose. So `init` binds one forwarding endpoint at `/svc/views`. Each supervisor
 binds it again at `/dev/views` with base `/s/<session>`, and the broker learns the session from the
@@ -27925,9 +27925,9 @@ is `/svc/auth`'s: it holds against sessions, and anything holding the root names
 **And it pinned the kernel work to one syscall, with a rule.** `sys_ns_derive(ns)` needs only
 `LOOKUP` and returns a snapshot copy with full rights. `with` has to copy its own namespace before
 it can send it, because the handle a process gets at spawn cannot be transferred. The broker then
-copies *again* before binding anything. A caller could have spawned a child into the namespace it
-sent, and a bind there would reach that child; so **the broker binds only into a namespace it
-created**.
+copies *again* before binding anything. A caller could have kept a duplicate of the namespace it
+sent (a derived handle carries `DUPLICATE`), or spawned a child into it, and a bind there would
+reach either; so **the broker binds only into a namespace it created**.
 
 **The maintainer's calls:**
 
@@ -27941,7 +27941,8 @@ created**.
   applications it launches, rather than waiting for Part F.
 - **A session's end is asked for, not forced.** The broker asks each program to exit and unbinds
   its grants. A forcible kill is deferred, and the kernel keeps `TERMINATE` reserved for it.
-- **`with` reads the password**, and the broker paces and caps failures per session. A broker
+- **`with` reads the password**, and the broker paces and caps failures (refined by the review
+  below: the delay per session, the cap per request). A broker
   prompting on a terminal it was handed would prove no more, since it could not tell a real
   terminal from a channel that pretends to be one.
 
@@ -27949,3 +27950,41 @@ created**.
 administers the system becomes something a person changes. And `TODO(admin-visibility)` —
 "whether an administrator is a *user* … or a *mode*" — closes with Part A: a mode, a view,
 reached with `with`.
+
+## 2026-09-23 — Part A's detail pass, reviewed: a field that existed, and a gate with no session
+
+PR #328's review checked each claim the pass made about today's code. Most held. Two were false,
+and a piece or a gate had been specified against each.
+
+**The setup message already carries a terminal.** `SetupPayload::terminal` was built in Milestone 5
+Part C so `nxterm` could hand `nxsh` its window's terminal. The pass proposed adding it again, as a
+fourth `streams` bit — the one encoding the decoder refuses, so every stage would have failed setup.
+The cause was a current-behaviour spec that never gained the field: `pipeline-stdio.md`'s payload
+table listed three fields. It lists four now, fixed in the same change. A.2 sends through the
+existing field.
+
+**`check-terminal` could not carry the desktop step.** Its `nxterm` is a boot-probe service in the
+root namespace, with no login and no session, so `with` there would find no `/dev/views`. The step
+moves to `check-login`, which logs in on the release image and launches `nxterm` through
+`desktop-shell`.
+
+**And three design gaps:**
+
+- **Pacing was decided per session and specified per request.** A program opening several requests
+  at once would have had a guess on each per delay. The delay is now per session, held as a
+  deadline in the broker's wait set. A sleep would stall other sessions and the supervisors'
+  logins. The cap is per request, not per session as the call was first put, since a cap per
+  session would let one program's wrong guesses lock its person out for the rest of the session.
+  A host test covers two requests sharing one session's delay.
+- **The program is resolved in the broker's own `/bin`, not the view.** The pass argued that only a
+  process holding `BIND_NAMESPACE` could change what `/bin/<name>` resolves to. But `sys_ns_unbind`
+  needs only the `UNBIND` right, which a derived namespace carries, so a caller can prune its copy
+  and let a name fall through to a shorter covering binding.
+- **`TODO(admin-visibility)` is answered, but its code marker stands on its own.** Application
+  namespaces omit `/applications` because nothing in an application reads it, not because of the
+  deferral. So when Part A lands, the comment keeps its reason and drops the tag, and
+  `graphical-session.md` §6.1 changes to match. `check-deferrals` would not have noticed a stale tag.
+
+**Smaller:** session ids are never reused, since a program that ignores its session's end keeps the
+old base. The graphical session's identity rests on `desktop-shell`, which holds the raw endpoint.
+And the reason the broker copies again includes a kept `DUPLICATE`, not only a spawned child.

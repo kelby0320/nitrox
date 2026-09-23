@@ -76,8 +76,9 @@ kernel installed at spawn and surfaced in `rdx`).
 The present stream endpoints ride in `IpcMsg.handles[]`, packed contiguously in the
 canonical order **stdin, stdout, stderr** — only those present are included. The
 `streams` bitmap (below) says which are present, so the *k*-th set bit maps to the
-*k*-th transferred handle. Room remains (`IPC_HANDLE_MAX = 8`) for later additions
-(a working-directory handle, extra streams) appended after `stderr`.
+*k*-th transferred handle. **A terminal, when the `terminal` field is set, follows the
+streams** as the next handle. Room remains (`IPC_HANDLE_MAX = 8`) for later additions
+(a working-directory handle, extra streams) appended after those.
 
 - **stdin** — the read end of the upstream pipe (a `sys_channel_create` endpoint).
   Absent for a *source* stage (no upstream).
@@ -96,9 +97,19 @@ message is one structured value, not a data stream:
 | `streams` | `Int` | Presence bitmap: bit 0 `stdin`, bit 1 `stdout`, bit 2 `stderr`. Set bits, ascending, index the packed transferred handles. |
 | `argv` | `List<String>` | Command-line arguments; `argv[0]` is the program name by convention. |
 | `env` | `Record` | The environment. Typed, not `key=value` strings. Empty when the spawner has none. |
+| `terminal` | `Int` | Non-zero: a **terminal channel** follows the stream handles. Absent or zero: none. |
 
 The exact record schema is pinned in `libstream::setup` (the sender,
-[`send_setup_env`]) and consumed by `bootstrap().setup()` (the receiver).
+[`send_setup_env`], or `send_setup_full` with a terminal) and consumed by
+`bootstrap().setup()` (the receiver).
+
+**A terminal is not a stream, which is why it is not a `streams` bit.** It answers `SetMode` and
+delivers `Interrupt`, and a program holds it *as well as* its stdin and stdout. A fourth bit would
+not even decode: `Streams::from_bitmap` refuses any bit outside the three streams. The field exists
+because `/dev/tty` mints a terminal rather than naming one, so a program cannot resolve its way to
+a *particular* window's terminal. A terminal emulator hands the shell it hosts the terminal it
+attached its backend to (Milestone 5 Part C, 2026-08-13). This table lacked the field until
+2026-09-23, when a plan that depended on it proposed re-adding it as a bit.
 
 **Fields are read by position, and may only be appended.** `SetupPayload::decode` takes
 `streams` and `argv` positionally and treats everything after them as optional, which is
