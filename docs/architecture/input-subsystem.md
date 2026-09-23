@@ -2,8 +2,8 @@
 
 **Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11),
 loss reworked so relative motion survives a slow consumer (2026-08-26), a key-press count for the
-hardware report (Phase 5 Part D, 2026-09-14), input routed only after every queued request
-(2026-09-23) — and this document describes what exists.** The whole path from an interrupt to a keystroke
+hardware report (Phase 5 Part D, 2026-09-14), input routed only after the requests sent before
+it (2026-09-22) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
@@ -249,10 +249,14 @@ wire break.
 | Focus, hit-testing, routing to a window | compositor | It owns stacking; routing anywhere else needs a second copy of that state |
 | Delivering input events to a window's event queue | `libsurface` | It arrives on the Surface session channel, alongside `Release` — that is already `libsurface`'s job |
 
-**Routing sees every request already sent** (2026-09-23). Before the compositor routes an input
-batch it serves everything queued on the manager's channel and every client's
+**Routing sees every request already sent** (2026-09-22). Between receiving an input pass and
+routing it, the compositor serves everything queued on the manager's channel and every client's
 (`serve_queued_requests`), so a key or a click that arrives after a client asked for something —
-a menu destroyed, a window raised — is routed against the stack *with* that change. Until then
+a menu destroyed, a window raised — is routed against the stack *with* that change. *Between*,
+not before: a batch that arrived after a drain had passed its client's channel would otherwise be
+routed without what reached the channel since. The drain cannot tell a request sent before a
+batch from one sent after it, so a batch is also routed against requests up to the drain — a key
+typed just before a popup is requested reaches the popup, which suits type-ahead. Until then
 the wait loop served input first, and a client channel one request per wake, so a busy compositor
 could route a key to a menu whose destroy was already queued. The client had let that window go
 when it sent the destroy, and `libsurface` drops an event naming a window it does not have; the

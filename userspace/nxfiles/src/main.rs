@@ -688,7 +688,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // its own, so a key injected between the receipt and the close was routed to the menu and
         // dropped. `check-login` timed out on that (PR #278 review, blocking 1).
         //
-        // **What it proves.** The destroy has been *sent* when this prints, and since 2026-09-23
+        // **What it proves.** The destroy has been *sent* when this prints, and since 2026-09-22
         // that is enough: the compositor serves every queued request before it routes input, so
         // a key that arrives after this line is routed after the menu is gone. Until then it was
         // not — a busy compositor served the key first, and `check-login` still timed out here

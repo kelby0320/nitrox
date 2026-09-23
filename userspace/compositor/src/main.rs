@@ -1075,8 +1075,9 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     Some(ch.into_raw().0)
 }
 
-/// Serve every request already queued on the manager's channel and every client's, **before an
-/// input batch is routed** — so input is routed against every request sent before it arrived.
+/// Serve every request already queued on the manager's channel and every client's, **between
+/// receiving an input pass and routing it** — so each batch is routed against every request
+/// sent before it arrived.
 ///
 /// **What went wrong without it.** The wait loop serves input first when both are ready, and a
 /// client's channel one request per wake. So a busy compositor woke to a key *and* a menu's
@@ -1089,9 +1090,25 @@ fn connect_input(root_ns: u64) -> Option<u64> {
 /// second after a menu click reproduced it every time, and did the same to a click on the panel
 /// just after the overview closed, so it was never only the keyboard's.
 ///
+/// **Why between, and not before the pass** (PR #327 review). Run before the first receive, as it
+/// first was, it left a gap: a batch arriving *after* the drain had passed a client's channel —
+/// while it served later slots, or during `serve_input`'s own receive loop — was routed without
+/// the requests that reached that channel after the visit. Reproduced with a click, a motion
+/// right after it to wake the compositor, and `nxfiles` slow to send the menu's destroy: the key
+/// went to the menu, 800 ms after the destroy was queued. Draining after the last receive closes
+/// it — a request sent before a batch arrived was queued before that batch was received, so
+/// before this runs — and routing nothing until then keeps the cursor's bookkeeping honest: a
+/// request that repaints mid-pass would otherwise draw the cursor where a batch had moved it,
+/// and nothing would erase it there.
+///
+/// **It also routes a batch against requests sent after it arrived**, up to the drain — a key
+/// typed just before a popup is requested reaches the popup. That is the mirror of the old order
+/// and the better default for type-ahead; nothing here can tell the two apart, since a request
+/// carries no time.
+///
 /// **One pass over each channel, bounded by its depth.** `SESSION_QUEUE_DEPTH` is everything a
-/// channel can hold, so it is everything that was queued when the input arrived; a client that
-/// keeps sending cannot hold input off by doing so. The manager goes first because it arranges
+/// channel can hold, so it is everything that was queued when the pass was received; a client
+/// that keeps sending cannot hold input off by doing so. The manager goes first because it arranges
 /// the stack the sessions' windows are in.
 fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     for _ in 0..SESSION_QUEUE_DEPTH {
@@ -1136,8 +1153,8 @@ fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) 
 /// One batch is one group, so this is about a second of a 100 Hz mouse.
 const INPUT_DRAIN_MAX: usize = 128;
 
-/// Drain every queued `Input::Events` batch, route them, and repaint once. `false` if the
-/// channel died.
+/// Drain every queued `Input::Events` batch, serve the requests already queued, route the
+/// batches, and repaint once. `false` if the channel died.
 ///
 /// **Once for the whole drain, not once per batch.** Each repaint is a compose plus a write to
 /// the framebuffer, and it happens with no input being read; doing it per message made the
@@ -1153,8 +1170,11 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let mut damage: alloc::vec::Vec<Rect> = alloc::vec::Vec::new();
     let cursor_was = srv.router.pointer();
     let mut alive = true;
-    let mut drained = 0;
-    while drained < INPUT_DRAIN_MAX {
+    // **Receive the whole pass, then serve the requests, then route** — see
+    // [`serve_queued_requests`]. Each batch is copied out because `RECV_MSG` is the buffer every
+    // receive in this process uses, the drain's included.
+    let mut batches: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    while batches.len() < INPUT_DRAIN_MAX {
         // SAFETY: valid recv out-params (an events batch carries no transferred handles).
         let rr = unsafe {
             syscall4(
@@ -1172,9 +1192,21 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
             alive = rr != KError::PeerClosed.as_i32() as i64;
             break;
         }
-        drained += 1;
+        // SAFETY: bounded read of the payload the kernel just wrote.
+        let payload = unsafe {
+            let payload_len =
+                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            core::slice::from_raw_parts(
+                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
+                payload_len.min(MSG_LEN - PAYLOAD_OFF),
+            )
+        };
+        batches.push(payload.to_vec());
+    }
+    serve_queued_requests(srv, screen);
+    for batch in &batches {
         let now = now_ns();
-        route_one_batch(srv, &mut out, &mut damage, now);
+        route_one_batch(srv, &mut out, &mut damage, batch, now);
     }
 
     deliver(srv, &out);
@@ -1206,16 +1238,12 @@ fn route_one_batch(
     srv: &mut Server,
     out: &mut alloc::vec::Vec<Outbound>,
     damage: &mut alloc::vec::Vec<Rect>,
+    msg: &[u8],
     now: u64,
 ) {
-    // SAFETY: bounded read of the payload the kernel just wrote.
+    // SAFETY: the input-diagnostics counter below is a `static mut` touched only from the serve
+    // loop of this single-threaded server.
     unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let msg = core::slice::from_raw_parts(
-            (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
         let Ok(m) = decode(msg) else {
             return;
         };
@@ -2895,17 +2923,14 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 serve_signalled = true;
                 continue;
             }
-            if srv.input_ch != 0 && h == srv.input_ch {
-                serve_queued_requests(srv, &mut screen);
-                if !serve_input(srv, &mut screen) {
-                    // The input server died. Close the endpoint and carry on serving the
-                    // display — the alternative is a compositor that exits because a mouse
-                    // went away.
-                    kprint(b"compositor: input server gone\n");
-                    // SAFETY: closing an endpoint this process owns and stops using.
-                    unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
-                    srv.input_ch = 0;
-                }
+            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
+                // The input server died. Close the endpoint and carry on serving the
+                // display — the alternative is a compositor that exits because a mouse
+                // went away.
+                kprint(b"compositor: input server gone\n");
+                // SAFETY: closing an endpoint this process owns and stops using.
+                unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
+                srv.input_ch = 0;
                 continue;
             }
             // SAFETY: reading our own manager slot.

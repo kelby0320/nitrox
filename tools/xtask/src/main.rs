@@ -6174,7 +6174,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // printed *before* closing the menu, which narrowed the window without closing it).
     //
     // `nxfiles` now emits this after the close rather than before, so it means the destroy has
-    // been sent — **and since 2026-09-23 that is the whole guarantee**, because the compositor
+    // been sent — **and since 2026-09-22 that is the whole guarantee**, because the compositor
     // serves every queued request before it routes input. Before that, a busy compositor could
     // still route the key first, and this step timed out now and then in CI with the destroy
     // served a millisecond after the key.

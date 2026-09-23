@@ -27826,7 +27826,7 @@ not a userspace-only phase.
 and the one the scoping entry above left open: `services.toml` moves onto the root filesystem in
 Part E. The plan now records them as decisions.
 
-## 2026-09-23 — Input waits for the requests already sent: the "name so far 1 chars" flake
+## 2026-09-22 — Input waits for the requests already sent: the "name so far 1 chars" flake
 
 `check-login --kvm` failed once on PR #326 — a docs-only change, so the same code had passed on the
 commit before — timing out on `nxfiles: name so far 1 chars` with `0 chars` in the transcript. That is
@@ -27853,10 +27853,11 @@ dropped. Spinning after *every* popup release reproduced the same thing for a **
 press on the panel, just after the overview closed, went to the overview. So it was never only
 keyboard focus.
 
-**The fix is an ordering, in the compositor.** Before routing an input batch it serves everything
-queued on the manager's channel and every client's (`serve_queued_requests`), one pass bounded by
-the queue depth — everything that could have been queued when the input arrived, and a client that
-keeps sending cannot hold input off. `serve_session` and `serve_manager` now say whether they
+**The fix is an ordering, in the compositor.** Between receiving an input pass and routing it, it
+serves everything queued on the manager's channel and every client's (`serve_queued_requests`), one
+pass bounded by the queue depth — everything that could have been queued, and a client that keeps
+sending cannot hold input off. (The first version drained *before* the receive; the review entry
+below is why that was not enough.) `serve_session` and `serve_manager` now say whether they
 served, found nothing, or found the peer gone (`Served`), because a drain has to know when to stop.
 With the fix, both simulations pass: the destroy is served, then the keys go to the browser's
 window, and the panel gets its click.
@@ -27870,3 +27871,40 @@ would not have reached the click at all.
 while the client is still handling the keystroke that closes the window. That key went to the
 window that really was focused, and a client closing it drops the rest. Every such drop the probes
 saw was the closing key's own release, which nothing acts on; `input-subsystem.md` §4 says so.
+
+## 2026-09-22 — Input ordering, reviewed: a drain before the receive left a gap
+
+PR #327's review found that the first version drained the request channels *once*, before
+`serve_input` began receiving — and `serve_input` then kept receiving until the input channel was
+empty. A batch that arrived after the drain had passed its client's channel, while the drain served
+later slots or during the receive loop, was routed without whatever reached that channel after the
+visit: the ordering the PR set out to fix, in a narrower window. `check-login`'s own step could not
+reach it (nothing else is in flight between the click and the first key), so the gate fix stood,
+but the docs and comments stated the guarantee without that condition.
+
+**Reproduced before it was fixed**, since the review had reasoned it rather than booted it. The gate
+injected one pointer motion right after the Rename click, so a batch woke the compositor; `nxfiles`
+held the menu's destroy for 200 ms, so that wake's drain found its channel empty; and the compositor
+spun for a second at the top of `serve_input`. The destroy was sent at t=40029, the key routed to
+the menu at t=40829, the destroy served at 40831 — `name so far 1 chars` timed out again.
+
+**The fix receives the whole pass, then drains, then routes.** A request sent before a batch arrived
+was queued before that batch was received, so before a drain that follows the last receive. The
+review's own suggestion was a drain per batch, which closes the gap as well; it was not taken
+because a request served *mid*-pass can repaint, `repaint_region` draws the cursor wherever the
+router has it, and the pass's closing repaint erases only the positions it started and ended at —
+a batch that moved the pointer before the drain would leave a cursor behind. Once per pass also
+costs one empty receive per channel per wake rather than per batch. With it, the same reproduction
+routes the key to the browser's window after the destroy, and the earlier every-popup simulation
+still passes.
+
+**The drain routes a batch against requests sent after it, too**, up to the drain — a key typed just
+before a popup is requested reaches the popup. That is the mirror of the old order, and the better
+default for type-ahead; nothing can tell the two apart, since a request carries no time.
+`input-subsystem.md` §4 now says so.
+
+**Nothing guards it.** Host tests reach the compositor's library, and the ordering lives in its
+binary; every gate was green on `main` without it but for the intermittent failure that started
+this. A busy-compositor switch would make a test image's compositor differ from a release one,
+which `check-images` exists to refuse. So the evidence is the reproductions recorded here, and the
+guard is `check-login`'s rename step catching a regression now and then — as it caught this.
