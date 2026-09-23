@@ -27688,3 +27688,140 @@ wearing `SESSION_HAS_BIN`'s (H.1), and the attribute-table static inside `record
 (Part G of Phase 5). Every one is doc-only and fixed here. None was caught by a build, since the
 item that lost its doc was rarely under `deny(missing_docs)` and the one that gained a second
 paragraph compiles either way.
+
+## 2026-09-22 — Administration scoped: views, not users; a device manager; `with`
+
+The administration stub became a plan (`docs/planning/administration.md`), after a scan of what the
+v5.1 design doc and the current docs already said. The decisions, with the maintainer:
+
+**Elevation keeps 5.1's principle — "handle acquisition, not state change" — and drops the user.**
+A broker authenticates against `auth-service`, builds a namespace with the right visibility, and
+spawns the program into it. The draft also offered "run as another account", `sudo -u` style. That
+was a Unix idea imported by habit, and it is gone: this system largely has no users, and what a
+person wants is a program running with more visibility, and perhaps more capability, than their
+session has. **So the target of a request is a *view* — a profile of grants — never an account.**
+Accounts appear only as who may ask.
+
+**The word is `with`, not `elevate`**, because the same mechanism will narrow as well as widen: a
+sandboxed application is a view too, and "elevate sandbox" says the opposite of what it does. `as`,
+`in` and `use` are already `nxsh` keywords; `with` is free. If the shell ever needs it, `^with`
+still reaches the program. `withview` and `with_view` were the alternatives, and were worse.
+
+**A view is the caller's session plus a profile**, not a standalone administrator namespace. An
+elevated editor still needs your files, and the kernel has no namespace layering yet, so the broker
+rebuilds the session's recipe with the profile's grants added. That makes `libsession`'s spec the
+recipe for three builders — `session-mgr`, `desktop-shell`, and the broker — rather than three
+recipes that drift.
+
+**One broker, with authority kept by domain services.** "Several brokers" was explained and set
+aside: it contains a bug to one domain at the cost of several policies, prompts and endpoints. One
+broker does identity, the password, the policy, the audit and the spawn. What it grants is mostly an
+endpoint to the service that owns a domain and keeps enforcing that domain's rules.
+
+**Identity is the endpoint.** The supervisor that builds a session — `session-mgr` or
+`desktop-session-mgr`, and both must — binds it a broker endpoint minted for its principal, and tells
+the broker when the session ends. That gives the broker a list of live sessions, which is why "who
+is logged in" came into scope rather than needing a registry.
+
+**The device manager is general — disks, keyboards, mice — and is built now, with coldplug.** It
+hands each arrival to the class's owner (`input-server` already owns input hotplug by design) and
+drives nothing itself. Announcing every boot device as an arrival means every consumer is written
+against arrivals from the start, and Phase 6's USB only adds an event source.
+
+**Mounted filesystems appear under `/storage/<label>`, and auto-mount.** `/storage` rather than
+`/media`, because "media" says removable and a second internal partition is not. Labels rather than
+`/dev/blk/<n>` numbers, which are discovery order and will shift once devices come and go.
+
+**One command per domain, with flags as verbs** — `disk --list|--mount|--unmount`, `account`,
+`service` — which matches `clip --copy`.
+
+**Shutdown is old school**: flush everything, then "It is now safe to turn off your computer."
+Power-off needs ACPI S5 and therefore AML, which is deferred. **Reboot does not**: FADT's reset
+register is a table field, and the i8042 reset pulse is a port write on a controller this kernel
+already drives.
+
+**A complete pass.** A review of the draft found eight gaps, and all are in scope: interrupting an
+elevated program; its terminal; throttling password attempts; filesystem clean/dirty state; one
+namespace recipe; the first administrator and offline recovery; changing a password; and a shutdown
+gate.
+
+**One thing looked simple and is not, and it led to a principle.** `service --enable` looked like an
+edit to a TOML file. The file is `services.toml` in the **initramfs**, a boot archive on the FAT EFI
+partition, which nothing here writes. The maintainer's rule, stated in reply: **the initramfs holds
+only what it takes to boot and mount the root filesystem, and everything else comes up from root.** The initramfs's *programs* already follow the rule,
+enforced by `INITRAMFS_PROGRAMS` (each with its reason) and a size tripwire. Its *configuration*
+does not: `init.toml` has a bootstrap reason, and `services.toml` has none, since `service-mgr`
+itself runs from `/bin`. Moving it onto root is proposed for Part E; enabling and disabling then
+become a small edit, still deferred until a service wants it.
+
+## 2026-09-22 — Administration, reviewed: a plan that assumed mechanisms the code does not have
+
+PR #326's review checked every claim the plan made about today's code, and every mechanism against
+the code it would be built from. The "what exists" list held up almost entirely. The design did not
+always: several mechanisms quietly assumed something the kernel or the protocol cannot do, and three
+of the fixes needed the maintainer's decision (the last paragraph).
+
+**A factual error in the entry above, corrected in place before merge.** The live image does not run
+from its initramfs. It mounts a root like any other boot: the `nitrox-live` partition inside
+`root.img`, a module the kernel publishes as a RAM disk, with an initramfs that is the release one
+except for `init.toml`. So it is not an exception to "the initramfs holds only what boots and mounts
+root", and `services.toml` moved onto root reaches it through `root.img` with no special case. The
+one live-only file is `etc/install-allowed`, a policy marker kept in the initramfs because
+`root.img` must match the release root file for file.
+
+**A view built by rebuilding a session would make the broker hold the whole filesystem.** A
+`NamespaceSpec` is handles, not data — the whole-tree fs endpoint, scoped to `/home/<user>` at bind
+time, among them — so a per-session endpoint cannot "record the recipe". Whoever rebuilds a session
+holds its ingredients, and that endpoint reaches `/system/users`. **Proposed: a kernel operation that
+derives a namespace from an existing one.** The broker then holds only what it adds. The plan now
+also says plainly that `disks` is raw whichever way views are built: a device is granted by resolving
+it in the grantor's own namespace. "One front door, several vaults" was true of the domain services
+and not of the disks.
+
+**No program can read a terminal**, so a password prompt is new mechanism rather than wiring. The
+terminal is a handle in the setup message, not a nameable path. Binding a tty channel resolves as
+`Unsupported`. A stage sharing the shell's channel loses its replies to `drain_tty_interrupt`, which
+takes every message on it. Part A now carries a terminal handoff.
+
+**Liveness by endpoint close would fail for exactly the programs it exists to stop.** A binding keeps
+its server's registration alive, and a view includes `/dev/views`, so an elevated program holds its
+session's endpoint open after logout. The login supervisor tells the broker instead.
+
+**The last-administrator guard was placed where the policy cannot be read, and the example policy
+defeated it.** `auth-service` reads only `/system/users`. And a `who = ["*"]` rule on `admin` for
+`shutdown` counted every account as an administrator. The guard moves to the broker. An
+administrator is now narrowly "may use `admin` with `run = ["*"]`", and powering off gets a profile
+of its own.
+
+**`/storage` with "nothing re-bound" needs a resolve that can continue in another namespace**
+(`OBJECT_KIND_SUBNAMESPACE`), deferred with no kernel handling. Without it a lazily filled file fills
+through the wrong registration. **Proposed: build it.**
+
+**The flush chain missed the page cache.** `sys_file_sync` is the only writeback trigger, and a
+dropped `FileObject` frees its frames unwritten. So "stop services, sync, flush, mark clean" would
+lose unsynced mapped writes and still pass `e2fsck`. Unmount now starts with a kernel write-back of
+every `FileObject` under the registration, and the gates check a file's *contents*, not just the
+filesystem's consistency. It also exposed a current-behaviour doc: `filesystem-data-path.md` listed
+unmap as a writeback trigger, which it is not. That is corrected in the same change. Nothing loses
+data today, because every file writer syncs.
+
+**And five smaller things.**
+- Auto-mount plus a raw-disk installer would let a reinstall rewrite a disk under a live
+  `fs-server`. A mounted device is now released before it is granted raw, and a live boot
+  auto-mounts read-only.
+- Part C's gate could not `e2fsck` a RAM disk on the host. It now uses `check-install`'s topology,
+  whose SATA disk is the second disk.
+- Part G from an ordinary desktop had no installable ESP, which rides on the installer entry alone.
+  **Proposed:** that entry stays and its session stops being special.
+- Phase 6's plan did not know what was deferred to it, and planned a driver manager beside Part B's
+  device manager. It is the same component, as in 5.1.
+- 5.1's system-control handle was never built, so power needs a new kernel object, not only a
+  syscall.
+
+The plan collects the kernel work in one table, because the review's main lesson was that this is
+not a userspace-only phase.
+
+**Taken, the same day.** The maintainer adopted all three proposals — namespace derivation for views,
+`OBJECT_KIND_SUBNAMESPACE` for `/storage`, and the installer's entry kept with an ordinary session —
+and the one the scoping entry above left open: `services.toml` moves onto the root filesystem in
+Part E. The plan now records them as decisions.
