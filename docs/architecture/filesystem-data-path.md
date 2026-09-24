@@ -2,7 +2,8 @@
 
 **Status:** Implemented — the kernel page-cache/mapping path between fs-server and client,
 with deferrals (writeback on teardown, periodic writeback daemon, per-page dirty tracking) marked
-inline. Verified 2026-08-05; the writeback triggers corrected 2026-09-22.
+inline. Verified 2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty
+tracking that the code never had corrected 2026-09-24.
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -83,12 +84,15 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   `file_block → device_lba` and issues a block **read** IRP into the cache frame. The **Model
   B** producer carries `{server, file-suffix}` and fills via `ReadRange` — the variant a
   non-block fs-server uses. A file has one producer, fixed by its filesystem's class.
-- **Writable mappings + dirty tracking**: `sys_memory_map` grants `MAP_WRITE` on a `FileObject`
-  when requested and permitted; a store faults in a writable PTE and marks the `CachePage`
-  **dirty**.
-- **Writeback**: a dirty page is flushed by a block **write** IRP from the cache frame to its
-  `device_lba` (via `AllocRange` first if it has no backing block), then marked clean. **The one
-  trigger is `sys_file_sync`** (an `msync`-style syscall). Unmapping a `MAP_WRITE` VMA does *not*
+- **Writable mappings, and no dirty tracking**: `sys_memory_map` grants `MAP_WRITE` on a
+  `FileObject` when requested and permitted, and a store faults in a writable PTE. **Nothing marks
+  anything dirty** — `CachePage` has no dirty bit (`TODO(page-dirty-tracking)`). This bullet said a
+  store "marks the `CachePage` dirty" until 2026-09-24, when the administration Part C detail pass
+  found no such state in the code.
+- **Writeback**: `FileObject::writeback` flushes **every resident page** by a block **write** IRP
+  from the cache frame to its `device_lba`, dirty or not, since it cannot tell. A page over a hole
+  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **The one trigger is
+  `sys_file_sync`** (an `msync`-style syscall). Unmapping a `MAP_WRITE` VMA does *not*
   write back, and when a `FileObject`'s last reference goes its `Drop` frees the cached frames
   without writing them — so data written through a mapping and never synced is **lost** when its
   writer lets go. Every file writer today syncs first (`libfs`'s write paths, `nxsh`), which is why

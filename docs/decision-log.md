@@ -28869,3 +28869,57 @@ change.
   class ownership: until Part C's storage service subscribes, any holder of the root namespace can
   take `block`, every disk, and hold it. Until the constructed-namespace fix, the storage service
   should be spawned by `init` before anything declared, as `input-server` is.
+
+## 2026-09-24 — Administration Part C's detail pass: a file cache, a namespace per mount, and a gate on the host
+
+Part C, storage, has its detail pass (`planning/administration.md` § *Part C in detail*). The spike
+found the plan's three kernel items bigger than they read:
+- **"Write back every `FileObject` under a registration" has nothing to enumerate.** A `FileObject`
+  frees its frames unwritten when its last reference goes, so a writer that exits takes its unsynced
+  data with it before any unmount runs. And every resolve builds its own object, so two mappers of
+  a file already disagree.
+- **Nothing is dirty-tracked**, and `filesystem-data-path.md` said a store marks a page dirty. It
+  never did; the claim is corrected with the pass.
+- **The server frees blocks the kernel cannot see it free** — unlink over a directory session, and a
+  replacing rename — so any cache that outlives its writers needs to be told.
+- **The pending lookup a `SUBNAMESPACE` continuation would start from does not keep the resolve's
+  operation.** The flags, a size change and a rename's destination went to the server and are not
+  stored. That was nearly written into the pass as the opposite; reading the struct before citing it
+  caught it.
+- **`fs-server-ext4` has no read-only mode**, no clean state after `mkfs`, and no way to flush a
+  drive. A binding's `"ro"` does not stop writes.
+
+**The maintainer's calls, 2026-09-24:**
+- **One cached `FileObject` per file**, keyed by the server's file id, shared by every resolve,
+  updated in place by growth, and kept while dirty. This is over keeping dirty objects to unmount
+  (which serves a later resolve stale data) and over writing back at last drop from a kernel thread
+  (which leaves two mappers incoherent).
+- **`SUBNAMESPACE` hands back a namespace.** The storage service builds one per mount and holds
+  `BIND_NAMESPACE` for them, over handing back an endpoint, whose registration's lifetime nothing
+  would own.
+- **Sessions get `/storage` by resolving it**, as they do `/svc/views/session`, rather than a
+  seventh courier through `init` and `service-mgr`.
+- **The gate is a test live image with a SATA disk, checked on the host**, over an in-guest check on
+  a RAM disk that no host can read.
+
+**Derived:**
+- **`File::Forget`**, from the server to the kernel, when an inode is freed.
+- **Per-object dirty state** until per-page bits exist.
+- **A read-only mode in the server.**
+- **`s_state` kept honestly.**
+- **An unmount that refuses while busy.**
+- **`IoOpcode::Flush`.**
+- **The storage service**, which reads `init.toml` to leave `init`'s mounts alone and treats a root on
+  a RAM disk as a live boot.
+- **`/storage` and `/dev/storage`**: one minted session endpoint, bound twice.
+- **A `storage` grant**, and a `disks` grant that asks what is in use first.
+
+Two consequences for earlier parts are written down. B.2's `boot-probe` check can no longer take
+`block`, which the storage service owns from boot, so it will assert the refusal instead. And a
+reinstall, Part G, meets a disk that is now auto-mounted, and so withheld from `disks` until it is
+unmounted.
+
+**The pass fixed two docs it found untrue**: `rsproto-namespace-ops.md` gains the `CHANNEL` and
+`FILE_BLOCKS` rows and the block reply's body layout, missing since their slices; and
+`filesystem-data-path.md` no longer claims dirty tracking. It suggests Part C may land as two PRs,
+the kernel and `fs-server-ext4` half first.
