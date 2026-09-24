@@ -28398,4 +28398,17 @@ Each part has a control that fails it:
 - `expect_after_pointer` without its flush times out;
 - a hold that never holds fails the first assertion ("this guard built nothing").
 
-The guard passes under TCG and KVM.
+**Its first push failed CI's `check-input --no-ps2-irq`**, a variant my local gate set did not run.
+A byte log in the driver found why. The setup click was a `click_at`, whose flush sends one more
+packet after the release's receipt can arrive. With the i8042's interrupts off, the guest reads
+only on the 10 ms tick, so that packet was still in QEMU's queue when F9 set the hold. The
+keyboard has priority at the controller, so the F9 byte split the packet. The hold then held the
+*press*. So each hold now starts from `settle`: a click with a receipt for both halves, after
+`click_at` has put the pointer somewhere known. With the release the last packet injected and its
+receipt seen, nothing is left in the queue.
+
+**The guard does not run under `--no-ps2-irq`.** There a click from an unknown position is itself
+unreliable. The pin's over-drive outruns what a flush can deliver, and the unpaced walk back
+arrives packed with the press, which is why that variant's own steps pace their injection. The
+guard tests the gate's flush, not the interrupt path. It passes under TCG and KVM, and the
+`--no-ps2-irq` variant passes and says it skipped the guard.

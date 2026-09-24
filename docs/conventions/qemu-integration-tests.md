@@ -186,7 +186,8 @@ driver read nothing from the i8042 for 300 ms. `check-input` uses it to build, o
 state behind the `lost-release` flake — QEMU holding a mouse release its sixteen-byte queue had no
 room for, until the next injected event — and to prove that the gates' flush delivers it
 (`expect_after_pointer` in `tools/xtask`). Nothing else presses F9, and a kernel without the
-feature has no hold at all.
+feature has no hold at all. `check-input --no-ps2-irq` does not run that step: with only the tick
+reading the controller, a click from an unknown position is not reliable enough to build on.
 
 ## Running it
 

@@ -2329,7 +2329,23 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
     // must *not* arrive on its own. Then the two flushes that deliver it — `expect_after_pointer`'s
     // and `click_at`'s — each against a hold of its own. Release lines are matched by position,
     // so the clicks that set each round up cannot satisfy them.
-    {
+    //
+    // **Each hold starts from an empty queue**, which `settle` makes certain: a click whose
+    // release is the last packet injected, with a receipt for it. A `click_at` would not do — its
+    // flush sends one more packet *after* the release's receipt can arrive, and with the i8042's
+    // interrupts off (`--no-ps2-irq`) the guest reads only on the 10 ms tick, so that packet was
+    // still in QEMU's queue when F9 set the hold. The hold then held the *press* instead of the
+    // release — a byte log in the driver showed the flush packet split around the F9 byte, the
+    // keyboard having priority at the controller.
+    //
+    // **Not under `--no-ps2-irq`.** There the guest reads only on the tick, and a click from an
+    // unknown position is itself unreliable: the pin's over-drive outruns what a flush can
+    // deliver, and the unpaced walk back arrives packed with the press — which is why that
+    // variant's own steps pace their injection. The guard is about the gate's flush, not the
+    // interrupt path, so the variant that exists for the interrupt path does not run it.
+    if no_ps2_irq {
+        println!("  note: the held-release guard runs only with the i8042's interrupts on");
+    } else {
         let hold = |qmp: &mut Qmp| -> R<()> {
             qmp.send_key("f9", true)?;
             qmp.send_key("f9", false)?;
@@ -2337,11 +2353,24 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
             std::thread::sleep(std::time::Duration::from_millis(50));
             Ok(())
         };
+        let settle = |qmp: &mut Qmp, session: &mut Session| -> R<()> {
+            move_pointer_to(qmp, 200, 200)?;
+            qmp.send_button("left", true)?;
+            expect_after_pointer(qmp, session, "compositor: press at x=200 y=200")?;
+            qmp.send_button("left", false)?;
+            expect_after_pointer(qmp, session, "compositor: release at x=200 y=200")?;
+            qmp.pointer = Some((200, 200));
+            Ok(())
+        };
         const HELD: &str = "compositor: release at x=500 y=200";
-        // From a known point, with nothing queued: the setup click's release has arrived.
+        // Somewhere known first, through `click_at` and its retry: from an unknown position the
+        // pin and the long walk back can overrun the queue on a guest that reads on the tick,
+        // and a press held with walk motion lands short (`expect_after_pointer`). `settle` then
+        // clicks where the pointer already is — no walk — so its release receipt is the last
+        // thing in the queue.
         qmp.pointer = None;
         click_at(&mut qmp, &mut session, 200, 200)?;
-        session.expect("compositor: release at x=200 y=200")?;
+        settle(&mut qmp, &mut session)?;
         hold(&mut qmp)?;
         for _ in 0..3 {
             qmp.send_motion(100, 0)?;
@@ -2361,8 +2390,7 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
         println!("  ok: expect_after_pointer's flush delivered the release QEMU held");
         qmp.pointer = Some((500, 200));
 
-        click_at(&mut qmp, &mut session, 200, 200)?;
-        session.expect("compositor: release at x=200 y=200")?;
+        settle(&mut qmp, &mut session)?;
         hold(&mut qmp)?;
         click_at(&mut qmp, &mut session, 500, 200)?;
         if !session.expect_within(HELD, std::time::Duration::from_secs(2))? {
