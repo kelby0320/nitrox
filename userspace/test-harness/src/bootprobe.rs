@@ -792,7 +792,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)
-        & view_broker_test(root_ns);
+        & view_broker_test(root_ns)
+        & registry_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -1313,6 +1314,151 @@ fn view_broker_test(root_ns: u64) -> bool {
     true
 }
 
+
+/// **The device registry, through its binding** (administration Part B.1). The kernel's host tests
+/// see its table as a value; this sees `/dev/registry` as a process does, and holds it to the
+/// paths it has to agree with:
+/// - the snapshot decodes, through the reader everything else will use;
+/// - **its block records are exactly what probing `/dev/blk` finds** — the same number, and each
+///   record's served index resolving to a device of the record's size, whose `info` gives the
+///   record's name;
+/// - **the keyboard is served at 0 and the mouse at 1**, each resolving under `/dev/input/raw`;
+/// - every record's `/dev/registry/<id>` is a device node, **and its id is its place** — which a
+///   phantom record read past the count, all zeros, cannot be.
+///
+/// The paths and the records read one field in the kernel, so a disagreement here would be a new
+/// path that stopped reading it.
+fn registry_test(root_ns: u64) -> bool {
+    use libkern::device::{DeviceKind, records};
+    use libkern::{RIGHT_INSPECT, RIGHT_READ};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: registry: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let stat = |h: u64| {
+        let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+        // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+        let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
+        (sr == 0).then_some(info)
+    };
+    let close = |h: u64| {
+        if h != 0 {
+            // SAFETY: closing a handle this process holds.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        }
+    };
+    // Map a read-only object and copy it out, so nothing borrows the mapping past this call.
+    let read_all = |h: u64| -> Option<alloc::vec::Vec<u8>> {
+        let size = stat(h)?.size;
+        // SAFETY: register-only syscall; `h` is a MemoryObject handle with MAP_READ.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ) };
+        if addr < 0 {
+            return None;
+        }
+        // SAFETY: `size` bytes are mapped read-only at `addr` until the unmap below.
+        let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) }.to_vec();
+        // SAFETY: unmapping what was mapped above; `bytes` is a copy.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+        Some(bytes)
+    };
+
+    let (st, snap) = ns_lookup(root_ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
+    if st != 0 || snap == 0 {
+        return fail(b"no /dev/registry in the root namespace");
+    }
+    let bytes = read_all(snap);
+    close(snap);
+    let Some(bytes) = bytes else {
+        return fail(b"the snapshot would not map");
+    };
+    let Ok(all) = records(&bytes) else {
+        return fail(b"the snapshot does not read");
+    };
+    let total = all.len();
+    let mut blocks = 0u32;
+    let (mut keyboard, mut mouse) = (false, false);
+    for (place, r) in all.enumerate() {
+        if r.id as usize != place {
+            Line::new().s(b"boot-probe: registry: record ").u(place as u64).s(b" says it is ").u(r.id as u64).end();
+            return fail(b"the records are not the table in order");
+        }
+        let path = alloc::format!("/dev/registry/{}", r.id);
+        let (st, node) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+        let kind_ok = st == 0 && stat(node).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
+        close(node);
+        if !kind_ok {
+            Line::new().s(b"boot-probe: registry: ").s(path.as_bytes()).s(b" is not a device node").end();
+            return fail(b"a record's id does not resolve to its node");
+        }
+        match r.kind() {
+            DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => {
+                blocks += 1;
+                let dev = alloc::format!("/dev/blk/{}", r.served);
+                let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+                let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
+                close(h);
+                let want = r.logical_block_size as u64 * r.block_count;
+                if size != Some(want) {
+                    Line::new().s(b"boot-probe: registry: ").s(dev.as_bytes()).s(b" is not the record's size").end();
+                    return fail(b"a block record's served index names another device");
+                }
+                let info_path = alloc::format!("/dev/blk/{}/info", r.served);
+                let (st, ih) = ns_lookup(root_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_INSPECT);
+                let info = if st == 0 { read_all(ih) } else { None };
+                close(ih);
+                // `BlockDeviceInfo`: `name_len` at 16, `name` from 24.
+                let named = info.is_some_and(|b| {
+                    let n = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) as usize;
+                    b.get(24..24 + n) == Some(r.name())
+                });
+                if !named {
+                    return fail(b"a block record's name is not its device's");
+                }
+            }
+            DeviceKind::Keyboard | DeviceKind::Mouse => {
+                let want = if r.kind() == DeviceKind::Keyboard { 0 } else { 1 };
+                let raw = alloc::format!("/dev/input/raw/{}", r.served);
+                let (st, h) = ns_lookup(root_ns, raw.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+                close(h);
+                if r.served != want || st != 0 {
+                    return fail(b"an input record is not at its raw index");
+                }
+                if r.kind() == DeviceKind::Keyboard {
+                    keyboard = true;
+                } else {
+                    mouse = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // What the probes find, the old way.
+    let mut probed = 0u32;
+    loop {
+        let dev = alloc::format!("/dev/blk/{probed}");
+        let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+        close(h);
+        if st != 0 {
+            break;
+        }
+        probed += 1;
+    }
+    if probed != blocks {
+        Line::new().s(b"boot-probe: registry: ").u(blocks as u64).s(b" block records, ").u(probed as u64).s(b" probed").end();
+        return fail(b"the block records are not what /dev/blk serves");
+    }
+    if !keyboard || !mouse {
+        return fail(b"no keyboard and mouse records");
+    }
+    Line::new()
+        .s(b"boot-probe: registry: ")
+        .u(total as u64)
+        .s(b" nodes, ")
+        .u(blocks as u64)
+        .s(b" block devices as /dev/blk serves them, keyboard and mouse at their raw indices ok")
+        .end();
+    true
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

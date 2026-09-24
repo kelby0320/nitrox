@@ -428,6 +428,10 @@ server's job is to *produce the right handle* for `suffix`:
 - `/dev/entropy` → an `EntropyObject` handle (the caller then `sys_entropy_read`s it).
 - `/proc/self/process` → the caller's own `Process` handle; `/proc/self/status` → a
   freshly-synthesized read-only `MemoryObject` snapshot; etc.
+- `/dev/registry` → a snapshot of the whole device table, and `/dev/registry/<id>` → that
+  device's `DeviceNode` (administration Part B; the layout is
+  [`device-node.md`](../spec/device-node.md) § "The registry"). One server, two leaves, as
+  `/dev/framebuffer` and its `info` are.
 
 **Registration is by the kernel at boot, not a handshake.** In-kernel servers are
 always present, so the kernel binds them into **pid 1's root namespace** during

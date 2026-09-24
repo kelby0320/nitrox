@@ -224,9 +224,11 @@ one process nothing else can construct:
 - Allocate the process and a notification channel, and a handle to it.
 - Allocate a namespace and bind the initial set: `/dev/entropy`, `/dev/console`,
   `/dev/log`, `/proc/self/*`, `/proc/cmdline`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`
-  (whole disks, their partitions and any module RAM disk, each with an `info` leaf), and
-  `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12 of
-  § 3).
+  (whole disks, their partitions and any module RAM disk, each with an `info` leaf),
+  `/dev/input/raw` (the i8042's keyboard and mouse), `/dev/registry` (the whole device table —
+  `docs/spec/device-node.md`), each partition's `/dev/disk/by-partuuid/*` and `by-partlabel/*`
+  name, and `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12
+  of § 3).
 - Spawn with exactly two handles — the notification channel and the namespace root.
 
 **init receives two handles and no more.** Everything else it obtains, it obtains by

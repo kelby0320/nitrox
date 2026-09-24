@@ -47,6 +47,16 @@ impl BlockKind {
         self as u32
     }
 
+    /// Decode a discriminant; one this kernel does not name is `Unknown`.
+    pub const fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::Disk,
+            2 => Self::Partition,
+            3 => Self::RamDisk,
+            _ => Self::Unknown,
+        }
+    }
+
     /// A word for a log line or a disk list.
     pub const fn name(self) -> &'static str {
         match self {

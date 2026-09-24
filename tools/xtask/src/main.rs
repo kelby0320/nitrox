@@ -11433,6 +11433,8 @@ enum AbiShape {
     RightsBit,
     /// `pub const NAME: u16 = <int>;` — the input event classes and codes.
     U16Const,
+    /// `pub const NAME: u32 = <int>;` — the device registry's constants.
+    U32Const,
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
@@ -11477,6 +11479,22 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
+    // The device registry (administration Part B): its own file on each side, so the
+    // enum-variant sweep sees `DeviceKind` and nothing else.
+    AbiFamily {
+        what: "device registry kinds",
+        kernel_file: "kernel/src/libkern/device.rs",
+        user_file: "userspace/libkern/src/device.rs",
+        shape: AbiShape::EnumVariant,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "device registry constants",
+        kernel_file: "kernel/src/libkern/device.rs",
+        user_file: "userspace/libkern/src/device.rs",
+        shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
 ];
 
 /// Individually-named constants that mirror across the boundary under *different* names or
@@ -11515,6 +11533,18 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 let Some((name, tail)) = rest.split_once(':') else { continue };
                 let Some((ty, val)) = tail.split_once('=') else { continue };
                 if ty.trim() != "u64" {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::U32Const => {
+                // pub const NAME: u32 = <int>;
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if ty.trim() != "u32" {
                     continue;
                 }
                 if let Some(v) = parse_int(val) {

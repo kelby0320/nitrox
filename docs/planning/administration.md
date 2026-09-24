@@ -837,7 +837,7 @@ namespace, with no login and no session.
 
 ### The pieces, in dependency order
 
-- [ ] **B.1 — the registry.** The i8042 driver's two nodes and the console's join the device table.
+- [x] **B.1 — the registry** *(2026-09-24)*. The i8042 driver's two nodes and the console's join the device table.
       The snapshot's header and `DeviceRecord` in `libkern`, mirrored in the kernel, with layout
       asserts; the `/dev/registry` kernel server — the snapshot and `<id>`; bound in the root
       namespace only; the ABI spec and `abi-sync-check`. Host tests:
@@ -848,8 +848,12 @@ namespace, with no login and no session.
         zeros after the last record, since a reader that divided the size would pass a round trip.
 
       **A `boot-probe` check through the binding**: the snapshot decodes; its block records are
-      exactly what probing `/dev/blk` finds; each input record's `/dev/registry/<id>` and
-      `/dev/input/raw/<served index>` are the same node; and no record is past the count.
+      exactly what probing `/dev/blk` finds — each served index resolving to a device of the
+      record's size, whose `info` gives the record's name; the keyboard and mouse sit at raw 0
+      and 1; every `/dev/registry/<id>` is a device node; and **each record's id is its place**,
+      which a phantom record read past the count cannot be. (That two paths give *the same node*
+      is the host tests' to show: a handle carries no object identity a process can compare, so
+      the probe compares what it can — size and name.)
 - [ ] **B.2 — `device-mgr`.** The `Devices` protocol (`0x0Fxx`) and `rsproto-devices-ops.md`: <!-- check-docs: allow-missing -->
       `Arrived`, `Settled`, `Departed`. The subscription and its replay; `info/` as a directory of
       `.tsm` files. Host-tested in its library: records to rows, names, replay order, and **the

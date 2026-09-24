@@ -26,6 +26,7 @@
 
 pub mod abi;
 pub mod debug;
+pub mod device;
 pub mod error;
 pub mod handle;
 pub mod syscall;

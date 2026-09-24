@@ -37,15 +37,18 @@ in-kernel Tier 1 drivers read the descriptor directly.
 ```rust
 #[repr(u32)]
 pub enum DeviceClass {
-    Other = 0,    // discovered but unclaimed / no Nitrox driver
+    Other = 0,    // a PCI function, claimed or not
     Block = 1,    // accepts block Read/Write IoOps via sys_io_submit
+    Char = 2,     // accepts byte-stream Read IoOps: the console, the i8042's devices
 }
 ```
 
 A **block-class** node is the resource a block `sys_io_submit` targets (see
-§ "Block devices"). Phase 2 defines only `Other` and `Block`; `Char`, `Net`, etc.
-are added with their first driver. The class is set by the driver that claims the
-node (AHCI marks its disk `Block`); an unclaimed node stays `Other`.
+§ "Block devices"). A driver publishes its own node with its class — AHCI a `Block` node per
+disk, the console and the i8042 a `Char` node each — and a PCI function stays `Other` whether a
+driver claims it or not. `Net` and others arrive with their first driver. The class is coarse:
+the console, the keyboard and the mouse are all `Char`, which is why the registry adds a
+**kind** (§ "The registry").
 
 ## Resource descriptor
 
@@ -151,10 +154,11 @@ enumeration — but the in-kernel resource-server registry
 `KernelServerId` enum. Bridging the two:
 
 - A **single** `KernelServerId::BlockDevice` variant is added. Its server
-  receives the lookup *suffix* (the path past the binding prefix) and consults a
-  **kernel block-device registry** — a small table populated at enumeration,
-  mapping a device name to its `DeviceNode` — returning a handle to the matching
-  node, or `NotFound`.
+  receives the lookup *suffix* (the path past the binding prefix) and consults the
+  **kernel device table** ([`device.rs`](../../kernel/src/device.rs)), returning the block node
+  whose **served index** is the suffix, or `NotFound`. A block node's served index is the number
+  of block nodes published before it, recorded when it is registered, and it is the same field
+  `/dev/registry` reports (§ "The registry").
 - The supervisor (init, via `BIND_NAMESPACE`) binds `KernelServerId::BlockDevice`
   at **`/dev/blk`** in the root namespace at boot. A lookup of `/dev/blk/0`
   resolves with suffix `0`; the server finds the disk registered under index `0`
@@ -186,10 +190,10 @@ enumeration — but the in-kernel resource-server registry
   or unknown), its logical block size and block count, and a **name** for a person to recognise it
   by: a disk's model and serial, a partition's label, a module's path. `sys_handle_stat` reports
   the same capacity as the handle's `size`.
-- **Content-stable names — `/dev/disk/by-partuuid/*`, `/dev/disk/by-partlabel/*`
-  — are slice 6.** They are derived from GPT partition metadata, so they are
-  order-independent and are what `init.toml` mount specs reference. The raw
-  `/dev/blk/N` whole-disk nodes are not what a manifest should name.
+- **Content-stable names — `/dev/disk/by-partuuid/*`, `/dev/disk/by-partlabel/*`**, since
+  slice 6. They are derived from GPT partition metadata, so they are order-independent and are
+  what `init.toml` mount specs reference. The raw `/dev/blk/N` nodes are not what a manifest
+  should name.
 
 `Char` devices now have both shapes: `/dev/console` is a **leaf** binding to the single
 serial console, and `/dev/input/raw/<n>` is the first **indexed char registry** — a subtree
@@ -209,6 +213,62 @@ and cannot be read. It means nothing on a `DeviceNode`, which is not mappable.
 **Reaching the binding at all is authority.** It lives in init's root namespace and
 `libsession::build_namespace` deliberately omits it, so an ordinary session cannot resolve
 `/dev/blk` however its rights read — see [`administration.md`](../planning/administration.md).
+
+## The registry: `/dev/registry`
+
+The whole device table, read from userspace — every `DeviceNode` the kernel has: the PCI functions
+enumeration found, then what drivers published after them (disks, partitions, the RAM disk, the
+console, the keyboard and the mouse), in that order. `KernelServerId::Registry`, bound by the
+kernel in **the root namespace only**, with `/dev/blk`'s rights. (Administration Part B.)
+
+- **`/dev/registry`** — a fresh read-only `MemoryObject`: a `RegistryHeader`, then `count`
+  `DeviceRecord`s, then zero padding to the page (`kernel/src/libkern/device.rs`, mirrored in
+  `userspace/libkern/src/device.rs`, whose `records` is the reader).
+- **`/dev/registry/<id>`** — node `id` itself, the handle `/dev/blk/<n>` or
+  `/dev/input/raw/<n>` would give for the same device.
+
+```rust
+#[repr(C)]
+pub struct RegistryHeader {   // 16 bytes
+    pub magic: u32,           // REGISTRY_MAGIC, "DREG" little-endian
+    pub version: u32,         // REGISTRY_VERSION = 1
+    pub count: u32,           // how many records follow: THE LENGTH
+    pub record_size: u32,     // size_of::<DeviceRecord>() = 144
+}
+
+#[repr(C)]
+pub struct DeviceRecord {     // 144 bytes, align 8
+    pub id: u32,              // its place in the table: /dev/registry/<id>
+    pub class: u32,           // DeviceClass
+    pub kind: u32,            // DeviceKind, below
+    pub served: u32,          // the <n> of /dev/blk/<n> or /dev/input/raw/<n>, else NOT_SERVED
+    pub parent: u32,          // the id it belongs to — a partition's disk, a disk's controller — else NO_PARENT
+    pub outcome: u32,         // for a PCI function: OUTCOME_NONE / _CLAIMED / _DECLINED
+    pub vendor: u16, pub device: u16,                       // 0xFFFF vendor: not a PCI function
+    pub pci_class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
+    pub seg: u16, pub bus: u8, pub dev: u8, pub func: u8, pub _pad: [u8; 3],
+    pub logical_block_size: u32,                            // block devices; else 0
+    pub name_len: u32,
+    pub block_count: u64,                                   // block devices; else 0
+    pub driver: [u8; 16],                                   // the publishing or claiming driver
+    pub name: [u8; 72],                                     // model and serial, label, module path, or "keyboard"
+}
+```
+
+`DeviceKind`: `Unknown` 0, `PciFunction` 1, `Disk` 2, `Partition` 3, `RamDisk` 4, `Keyboard` 5,
+`Mouse` 6, `Console` 7. A value a reader does not name reads as `Unknown`.
+
+**The count is the length, not the object's size.** The object is page-rounded, so its tail is
+zeros, which a reader dividing the size would take for records of class `Other` and kind
+`Unknown`. A reader must also refuse a header whose count the bytes cannot hold, and a magic,
+version or record size it does not know.
+
+**A record's served index and its path are one field.** `/dev/blk/<n>` resolves the block node
+whose served index is `n`, and `/dev/input/raw/<n>` the keyboard or mouse whose served index is
+`n` — the keyboard 0 and the mouse 1, the i8042 driver's own numbering, **not** a count within
+`Char`, where the console registered first. The console and PCI functions are served at no index.
+
+**Ids are stable for the life of a boot** and never reused, because the table only grows.
 
 ## Discovery and driver matching (Phase 2)
 
@@ -240,9 +300,6 @@ manager the administration phase builds (`docs/planning/phase-6-usb.md`).
 ## Deferred
 
 - `sys_device_map_mmio` / userspace drivers / IOMMU (with Tier 2).
-- Enumerating the device table from userspace — planned as `/dev/registry`, a
-  kernel server rather than a syscall, in the administration phase's Part B
-  (`docs/planning/administration.md`).
 - ACPI `_PRT`-based interrupt routing (needs AML; AHCI takes MSI, with the
   IOAPIC-routed line as its fallback).
 - Device classes beyond `Block`, `Char` and `Other` (`Net`, …).

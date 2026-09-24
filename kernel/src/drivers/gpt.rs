@@ -197,8 +197,9 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
             by_partlabel,
         });
     }
-    // The device table owns the node (it now also resolves at /dev/blk/<n>).
-    crate::device::register(node_ref);
+    // The device table owns the node (it now also resolves at /dev/blk/<n>), and records that it
+    // belongs to `disk`.
+    crate::device::register_partition(node_ref, disk, "gpt");
     true
 }
 

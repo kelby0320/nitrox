@@ -28491,3 +28491,58 @@ when it does not. `check-install` is on the list.
 - **Two optional items:** an old sentence in the device-manager section, and a Gates row that named
   other gates than the comparison list. The live boot's RAM disk gives `check-live` a line of its
   own.
+
+## 2026-09-24 — Administration B.1: `/dev/registry`, the device table read from userspace
+
+The first piece of Part B, and its only kernel work. `/dev/registry` is a kernel server bound in
+the root namespace. The bare path is a read-only snapshot: a header carrying the record count, then
+one 144-byte `DeviceRecord` per node. `/dev/registry/<id>` is that node.
+
+**The table now holds every node.** The console and the i8042's keyboard and mouse register
+beside the PCI functions and block devices. The i8042 driver's private table is gone: the table
+owns its two nodes, and `/dev/input/raw/<n>` resolves through it. **Each entry records what the
+node itself cannot say:**
+- its kind (disk, partition, RAM disk, keyboard, mouse, console, PCI function);
+- the index its path serves it at;
+- its parent;
+- the driver that published it.
+
+**The served index is the one field** that both `/dev/blk` and `/dev/input/raw` resolve through
+and that the record reports, so the two cannot disagree. A block node's index is the number of
+block nodes before it, the numbering `/dev/blk` has always had. The keyboard's and mouse's are the
+i8042 driver's own, 0 and 1. The console registers first, so a count within `Char` would have
+misnamed them, and a host test holds the console in front of them to show it.
+
+**The table became a value, `device::Registry`,** with the static a `SpinLock` around one. So host
+tests build a boot's worth of real nodes, host bridge included, and check each record's kind,
+served index and parent. A PCI parent is matched by address, and the RAM disk's all-zero
+descriptor would otherwise match the host bridge at 00:00.0. Five controls each fail their test:
+- no vendor sentinel;
+- a served index counted within `Char`;
+- a block index counted over every entry;
+- a partition without its parent;
+- a count off by one.
+
+**The reader lives in `userspace/libkern`.** Its consumers, `eshell` and `libsession`, sit below
+`libos`. It trusts the header's count and refuses a count its bytes cannot hold. Its test hands it
+a page as the kernel serves it, two records then zeros, and dividing by the size fails that test.
+`abi-sync-check` gains a `u32` constant shape and two families for the registry. A changed kind,
+decimal constant and underscored hex constant are each caught.
+
+**Through the binding, `boot-probe`** reads the snapshot and holds it to the paths:
+- the block records are exactly what probing `/dev/blk` finds, with each served device of the
+  record's size and name;
+- the keyboard and mouse are at raw 0 and 1;
+- every id is its place in the table.
+
+A handle carries no object identity a process can compare, so *same node* is the host tests' to
+show; the probe compares size and name. Three kernel mutations fail it at the matching assertion:
+a count one too high, the keyboard served at 1, and block records reporting their index plus one.
+
+**`device-node.md` had drifted further than PR #332 found:**
+- the class enum showed no `Char`;
+- the `/dev/blk` server was said to map names;
+- the partition names were future tense.
+
+It now specifies the registry, and enumeration leaves its *Deferred* list. `boot-flow.md`'s list of
+pid 1's bindings gains `/dev/input/raw`, the partition names and `/dev/registry`.

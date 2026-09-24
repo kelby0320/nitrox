@@ -276,6 +276,17 @@ pub fn init() {
             // lifetime. `device_ref` hands out counted references off this pointer.
             let ptr = KBox::into_raw(node).as_ptr() as *mut ();
             CONSOLE_NODE.store(ptr, Ordering::Release);
+            // **And in the device table**, with a counted reference of its own, so
+            // `/dev/registry` lists every node the kernel has (administration Part B). The
+            // console is served at `/dev/console`, which no index names.
+            if let Some(r) = device_ref() {
+                crate::device::register_char(
+                    r,
+                    crate::libkern::device::DeviceKind::Console,
+                    crate::libkern::device::NOT_SERVED,
+                    "console",
+                );
+            }
         }
         Err(_) => {
             crate::kprintln!("console: device-node alloc FAIL (no /dev/console)");
