@@ -162,6 +162,7 @@ pub fn dispatch_block_irp(
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
+        IoOpcode::Flush => return Err(KError::InvalidArgument), // not a transfer: `dispatch_block_flush`
     };
     let irp = Irp::new_block(
         op,
@@ -232,6 +233,7 @@ pub fn dispatch_block_irp_into_frame(
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
+        IoOpcode::Flush => return Err(KError::InvalidArgument), // not a transfer
     };
     let irp = Irp::new_block(
         op,
@@ -262,6 +264,37 @@ pub fn dispatch_block_irp_into_frame(
             count: bx.frags.len() as u32,
             frags: bx.frags.as_ptr() as u64,
         };
+        bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
+        &mut bx.irp as *mut Irp
+    };
+    (backend.submit)(irp_ptr, backend.ctx);
+    Ok(())
+}
+
+/// Dispatch a **flush** of the block `device`: an IRP with no buffer and no range that
+/// completes `po` once the device has written its volatile cache to its medium
+/// (administration Part C.2). A partition passes it to its disk, a RAM disk completes it at
+/// once, and AHCI issues `FLUSH CACHE EXT`. `Err` before anything starts: `Unsupported` if the
+/// node has no block backend, `OutOfMemory` if the IRP cannot be allocated.
+pub fn dispatch_block_flush(device: &ObjectRef, po: &ObjectRef) -> Result<(), KError> {
+    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
+    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+    let irp = Irp::new_block(IrpOp::Flush, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_ptr(), 0);
+    let bx = KBox::try_new(IrpBox {
+        irp,
+        frags: KVec::new(),
+        _po: po.clone(),
+        _buffer: device.clone(), // no buffer to pin; the slot holds the device again
+        _device: device.clone(),
+        reclaim_next: core::ptr::null_mut(),
+    })
+    .map_err(|_| KError::OutOfMemory)?;
+    let bx_ptr = KBox::into_raw(bx).as_ptr();
+    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`; arm the completion DPC at
+    // the box (`irp` is the first field). `irp.buffer` stays `NONE`: nothing to transfer.
+    let irp_ptr = unsafe {
+        let bx = &mut *bx_ptr;
         bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
         &mut bx.irp as *mut Irp
     };
@@ -436,6 +469,13 @@ unsafe impl Sync for Partition {}
 fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
     let p = unsafe { &*(ctx as *const Partition) };
+    // **A flush names no range**: it is the disk's cache, not the partition's blocks, so it
+    // goes down unchanged (administration Part C.2).
+    // SAFETY: `irp` is in flight and uniquely owned during submit.
+    if unsafe { (*irp).op } == IrpOp::Flush as u32 {
+        (p.disk.submit)(irp, p.disk.ctx);
+        return;
+    }
     let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
     match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
         Some(disk_offset) => {

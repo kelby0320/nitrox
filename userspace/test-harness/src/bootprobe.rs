@@ -720,6 +720,71 @@ fn unlinked_file_test(root_ns: u64) -> bool {
     }
 }
 
+/// **Administration Part C.2: a flush of the root disk completes.** `IoOpcode::Flush` on the
+/// root partition goes down to its disk — AHCI's `FLUSH CACHE EXT` in `test-qemu`, a RAM disk's
+/// answer at once in a live image — and its `PendingOperation` completes with status `0`.
+///
+/// Two refusals alongside, which a flush path that ignored its descriptor would fail: one that
+/// names a range is `InvalidArgument`, since a flush covers the whole device and must not look
+/// as if it covered less; and one on a read-only handle is `NoAccess`, since only a writer has
+/// anything to make durable.
+fn flush_test(root_ns: u64) -> bool {
+    use libkern::{IO_OPCODE_FLUSH, KError, RIGHT_WRITE};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: flush FAIL: ").s(why).end();
+        false
+    };
+    // The root partition, by the index `/dev/blk` serves it at: read-write, where the
+    // `by-partlabel` names are read-only.
+    let Some(records) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let labels: [&[u8]; 2] = [b"nitrox-root", b"nitrox-live"];
+    let Some(root) = records.iter().find(|r| labels.contains(&r.name())) else {
+        return fail(b"no root partition in the registry");
+    };
+    let Some(index) = root.block_index() else {
+        return fail(b"the root partition has no /dev/blk index");
+    };
+    let path = alloc::format!("/dev/blk/{index}");
+    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_WRITE);
+    if st != 0 || dev == 0 {
+        return fail(b"the root partition does not open read-write");
+    }
+    let flush = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    let submit = |h: u64, op: &IoOp| {
+        // SAFETY: `op` is a valid `IoOp`; `h` a handle this process holds.
+        unsafe { syscall2(SYS_IO_SUBMIT, h, (op as *const IoOp) as u64) }
+    };
+    let po = submit(dev, &flush);
+    let flushed = po >= 0 && po_wait(po as u64).0 == 0;
+    let ranged = IoOp { length: 512, ..flush };
+    let range_refused = submit(dev, &ranged) == KError::InvalidArgument.as_i32() as i64;
+    close(dev);
+    let read_only = [b"/dev/disk/by-partlabel/nitrox-root".as_slice(), b"/dev/disk/by-partlabel/nitrox-live"]
+        .iter()
+        .find_map(|p| match ns_lookup(root_ns, p, RIGHT_READ) {
+            (0, h) if h != 0 => Some(h),
+            _ => None,
+        });
+    let ro_refused = read_only.is_some_and(|h| {
+        let r = submit(h, &flush) == KError::NoAccess.as_i32() as i64;
+        close(h);
+        r
+    });
+    if !flushed {
+        return fail(b"the flush did not complete");
+    }
+    if !range_refused {
+        return fail(b"a flush naming a range was not refused");
+    }
+    if !ro_refused {
+        return fail(b"a flush on a read-only handle was not refused");
+    }
+    kprint(b"boot-probe: flush of the root disk completed, and a ranged or read-only one refused ok\n");
+    true
+}
+
 /// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
 /// a `MAP_WRITE` mapping, `sys_file_sync`, then read the block **off the device** and verify
 /// the change persisted — proving the Model A write data path (dirty pages → write IRPs →
@@ -1075,6 +1140,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & create_test(root_ns)
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
+        & flush_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)

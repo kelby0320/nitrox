@@ -89,12 +89,16 @@ carries everything down and back up.
 pub enum IrpOp {
     Read  = 0,
     Write = 1,
+    Flush = 2,   // no buffer, no range: the device's cache to its medium
 }
 ```
 
-The Phase 2 set mirrors [`IoOpcode`](io-operation.md#ioopcode) (the two are kept
-numerically aligned for a trivial translation). Internal-only ops (a future
-`Flush` barrier, partition-table re-read) are added here without necessarily
+The set mirrors [`IoOpcode`](io-operation.md#ioopcode) (the two are kept
+numerically aligned for a trivial translation). `Flush` carries an empty buffer
+(`count` `0`, a null `frags`), which a driver turns into an empty slice rather than
+one built from the null pointer. **A driver names every op it handles** and refuses
+the rest; one that read "a write, else a read" would take a flush for a read.
+Internal-only ops (a partition-table re-read) are added here without necessarily
 having an `IoOpcode` peer.
 
 ## IrpStatus

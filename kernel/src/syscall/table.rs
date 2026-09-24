@@ -2057,10 +2057,11 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     // Resolve the resource (a block device) and buffer with opcode-appropriate
     // rights: a read writes into the buffer (needs MAP_WRITE) and reads the
-    // device (needs READ); a write is the mirror.
+    // device (needs READ); a write is the mirror. A flush moves no data, and has its own path.
     let (dev_right, buf_right) = match opcode {
         IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
         IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
+        IoOpcode::Flush => return submit_flush(resource_h, &op, pid),
     };
     let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
     let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
@@ -2133,6 +2134,44 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
     };
     match dispatched {
+        Ok(()) => Ok(po_h.bits() as isize),
+        Err(e) => {
+            close_and_release(po_h, pid);
+            Err(e)
+        }
+    }
+}
+
+/// `sys_io_submit`'s **flush** (administration Part C.2): make what has been written to the
+/// block device `resource_h` durable, completing the returned `PendingOperation` once the
+/// device has written its cache to its medium. Needs `WRITE` on the device — only a writer has
+/// anything to make durable — and names no buffer and no range, so each of those fields must be
+/// `0`: a flush that seemed to cover a range would promise something it does not do. Not a
+/// zero-length transfer, so it never takes that path's pre-signalled no-op.
+fn submit_flush(resource_h: u64, op: &IoOp, pid: u32) -> SysResult {
+    if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
+        return Err(KError::InvalidArgument);
+    }
+    let dev_ok = lookup_typed(resource_h, pid, Rights::WRITE, KObjectType::DeviceNode)?;
+    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
+    if unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) }.class() != DeviceClass::Block {
+        return Err(KError::Unsupported);
+    }
+    let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: adopt the single creation reference.
+    let po_ref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation)
+    };
+    let (tptr, tty) = po_ref.clone().into_raw();
+    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt this reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            return Err(map_handle_err(e));
+        }
+    };
+    match crate::io::block::dispatch_block_flush(&dev_ok.object, &po_ref) {
         Ok(()) => Ok(po_h.bits() as isize),
         Err(e) => {
             close_and_release(po_h, pid);

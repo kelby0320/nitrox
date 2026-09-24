@@ -85,6 +85,8 @@ impl IrpStackFrame {
 pub enum IrpOp {
     Read = 0,
     Write = 1,
+    /// Write the device's volatile cache to its medium. Carries no buffer and no range.
+    Flush = 2,
 }
 
 /// `IrpStatus` — the in-flight sentinel and terminal status. A completed IRP
@@ -214,6 +216,10 @@ mod tests {
     fn irp_op_and_status_discriminants() {
         assert_eq!(IrpOp::Read as u32, 0);
         assert_eq!(IrpOp::Write as u32, 1);
+        assert_eq!(IrpOp::Flush as u32, 2);
+        // Kept numerically aligned with the userspace-facing opcode.
+        use crate::libkern::io_op::IoOpcode;
+        assert_eq!(IrpOp::Flush as u32, IoOpcode::Flush as u32);
         assert_eq!(IrpStatus::Success as i32, 0);
         assert_eq!(IrpStatus::Pending as i32, 1);
     }

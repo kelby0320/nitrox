@@ -1129,10 +1129,12 @@ namespace, with no login and no session.
       truncate and the grow, end to end. C.1b answers a `Forget` through the `Block` send's PO,
       counts reads in flight as well as writes, and frees an ext4 inode in two halves. The decision
       log has the reasons.
-- [ ] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
+- [x] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
       non-data path and FLUSH CACHE EXT; the RAM disk; a partition passing it to its disk.
       `boot-probe` flushes the root disk and the probe asserts completion.
-      `TODO(ahci-flush)` resolved.
+      `TODO(ahci-flush)` resolved. *(Landed 2026-09-24. Also: `nxinstall` flushes before "done"
+      and `check-install` asserts it; a drive without the 48-bit form gets `FLUSH CACHE`; both
+      drivers now name every op, where each inferred one from "not the other".)*
 - [ ] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
       read-only mark in the block-file reply; `s_state` cleared on a writable mount and set on
       `Meta::Unmount`. Host tests on the library: a read-only mount refuses each mutating op, and the

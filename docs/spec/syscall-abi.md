@@ -192,7 +192,8 @@ fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
 `PendingOperation` handle (positive value); it **never blocks**. In Phase 2
 `resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
-`Read`/`Write`. The operation's outcome is delivered through the PO: `sys_wait`
+`Read`/`Write`/`Flush`; a `Flush` names no buffer and no range and completes once the
+device's cache is on its medium. The operation's outcome is delivered through the PO: `sys_wait`
 writes `IoResult.status` (`0` = success, negative `KError` on a device/medium
 error) and `IoResult.result` (bytes transferred). A zero-length or cache-hit
 request returns a **pre-signalled** PO, so callers have one code path.

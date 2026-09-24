@@ -80,6 +80,33 @@ const PXIE_TFEE: u32 = 1 << 30; // task file error
 // ATA commands.
 const ATA_IDENTIFY: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
+const ATA_WRITE_DMA_EXT: u8 = 0x35;
+/// `FLUSH CACHE` — write the drive's volatile cache to its medium. Non-data.
+const ATA_FLUSH_CACHE: u8 = 0xE7;
+/// `FLUSH CACHE EXT` — the same for a drive with the 48-bit feature set, and able to report
+/// an LBA48 failure address. Non-data.
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
+
+/// **The ATA command for an IRP op, and whether it writes** — `None` for an op this driver has no
+/// command for. By name for every op: this read "a write, else a read" until administration Part
+/// C.2, which would have sent a flush out as a `READ DMA EXT` of count 0 — 65,536 sectors
+/// under LBA48 — with no PRDT to receive them.
+fn ata_command(op: u32, flush: u8) -> Option<(u8, bool)> {
+    use crate::io::irp::IrpOp;
+    match op {
+        o if o == IrpOp::Read as u32 => Some((ATA_READ_DMA_EXT, false)),
+        o if o == IrpOp::Write as u32 => Some((ATA_WRITE_DMA_EXT, true)),
+        o if o == IrpOp::Flush as u32 => Some((flush, false)),
+        _ => None,
+    }
+}
+
+/// **Which flush the drive takes**, from IDENTIFY word 83 (command sets supported): bit 13
+/// is `FLUSH CACHE EXT`. A drive without it gets `FLUSH CACHE`, which every ATA-6 drive has —
+/// mandatory since, and older than the 48-bit feature set this driver needs anyway.
+fn flush_command(word83: u16) -> u8 {
+    if word83 & (1 << 13) != 0 { ATA_FLUSH_CACHE_EXT } else { ATA_FLUSH_CACHE }
+}
 
 const SECTOR_SIZE: u32 = 512;
 
@@ -171,6 +198,8 @@ pub struct AhciDisk {
     _fis: DmaBuffer,      // 256 B received-FIS area
     cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
     sectors: u64,
+    /// The flush command the drive takes ([`flush_command`]), from IDENTIFY.
+    flush_command: u8,
     /// The IRP currently issued on slot 0 (`null` when idle), for the ISR to
     /// complete. One command runs at a time; further submits queue in [`pending`].
     /// Accessed under [`pending`]'s lock (the atomic type is retained for the
@@ -357,6 +386,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         _fis: fis,
         cmd_table,
         sectors: 0,
+        flush_command: ATA_FLUSH_CACHE,
         inflight: AtomicPtr::new(core::ptr::null_mut()),
         pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
         intr: intr_ptr,
@@ -370,7 +400,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     // IDENTIFY the disk (polled — bring-up runs with interrupts masked).
     // SAFETY: `disk` is the just-published live state.
     let mut name = [0u8; MAX_DEVICE_NAME];
-    let (sectors, name_len) = match unsafe { identify(&mut *disk, &mut name) } {
+    let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
         Some(s) => s,
         None => {
             crate::kprintln!("ahci: IDENTIFY failed on port {}", port);
@@ -378,7 +408,10 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     };
     // SAFETY: exclusive at bring-up (no IRQ, no other CPU).
-    unsafe { (*disk).sectors = sectors };
+    unsafe {
+        (*disk).sectors = sectors;
+        (*disk).flush_command = flush;
+    }
     crate::kprintln!(
         "ahci: port {} disk ready ({} sectors, {} MiB): {}",
         port,
@@ -387,6 +420,13 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         // The model is a fact about the machine, so it belongs in the report every boot logs
         // (Part D) as much as in the info a program reads.
         Printable(&name[..name_len])
+    );
+    // Its own line: the one above is matched by a gate, and this is a fact about the drive the
+    // hardware report should carry (administration Part C.2).
+    crate::kprintln!(
+        "ahci: port {} flushes with {}",
+        port,
+        if flush == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
     );
 
     // Prefer MSI: the device is told a vector and raises the interrupt itself,
@@ -501,11 +541,12 @@ fn wait_clear(pb: u64, off: u64, mask: u32) {
     }
 }
 
-/// Run `IDENTIFY DEVICE` (polled) and return the LBA48 sector count.
+/// Run `IDENTIFY DEVICE` (polled) and return the LBA48 sector count, the length of the
+/// identity written to `name`, and the flush command the drive takes.
 ///
 /// # Safety
 /// `disk` is the live, brought-up disk state; called at bring-up with no IRQ.
-unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize)> {
+unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
     let data = DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?;
     let frags = [PhysFrag {
         base: data.phys().as_u64(),
@@ -531,8 +572,10 @@ unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Opt
     // disk's contents confirms it by this string, so it is worth the twenty lines.
     // SAFETY: as above; words 10..=46 are inside the 512-byte result.
     let len = unsafe { format_identity(words, name) };
+    // SAFETY: as above; word 83 is inside the 512-byte result.
+    let flush = flush_command(unsafe { words.add(83).read() });
     // `data` drops here (IDENTIFY is one-shot); the command is complete.
-    if n == 0 { None } else { Some((n, len)) }
+    if n == 0 { None } else { Some((n, len, flush)) }
 }
 
 /// Write `model (serial)` from an IDENTIFY result into `out`, returning its length.
@@ -757,7 +800,11 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
         // Slot 0 is idle — issue immediately.
         d.inflight.store(irp, Ordering::Release);
         // SAFETY: slot 0 is free; `irp` is a live block IRP.
-        unsafe { issue_locked(d, irp) };
+        if !unsafe { issue_locked(d, irp) } {
+            d.inflight.store(core::ptr::null_mut(), Ordering::Release);
+            drop(q);
+            fail_irp(irp);
+        }
     } else if !q.push(irp) {
         // Slot busy and the queue is full — refuse this submit with backpressure
         // rather than clobber an in-flight request. Complete it with an error so its
@@ -773,31 +820,40 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
 }
 
 /// Build slot 0's command for `irp` and issue it. The caller holds [`AhciDisk::pending`]
-/// and has established that slot 0 is idle.
+/// and has established that slot 0 is idle. `false`, issuing nothing, for an op with no ATA
+/// command ([`ata_command`]): the caller takes the IRP back out of flight and fails it once it
+/// has let go of the lock, since completion cannot happen under it.
 ///
 /// # Safety
-/// `irp` is a live block IRP whose `buffer.frags` is a valid `[PhysFrag; count]`;
-/// slot 0 is idle (no other command building/running).
-unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) {
-    // SAFETY: `irp` is live; its `frags` array is owned by the IRP box.
-    let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
-    let frags = unsafe {
-        core::slice::from_raw_parts(
-            (*irp).buffer.frags as *const PhysFrag,
-            (*irp).buffer.count as usize,
-        )
+/// `irp` is a live block IRP whose `buffer.frags` is a valid `[PhysFrag; count]`, or has a
+/// count of `0` — a flush carries no buffer, and its pointer is null; slot 0 is idle (no other
+/// command building/running).
+unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
+    // SAFETY: `irp` is live.
+    let (op, offset, length, buffer) = unsafe { ((*irp).op, (*irp).offset, (*irp).length, (*irp).buffer) };
+    // **No buffer is an empty slice**, not one built from a null pointer, which
+    // `from_raw_parts` forbids at any length (a flush's first boot tripped it).
+    let frags: &[PhysFrag] = if buffer.count == 0 {
+        &[]
+    } else {
+        // SAFETY: a non-empty buffer's `frags` array is owned by the IRP box.
+        unsafe { core::slice::from_raw_parts(buffer.frags as *const PhysFrag, buffer.count as usize) }
     };
     let lba = offset / SECTOR_SIZE as u64;
     let count = (length / SECTOR_SIZE as u64) as u16;
-    let is_write = op == crate::io::irp::IrpOp::Write as u32;
-    let command = if is_write {
-        ATA_READ_DMA_EXT.wrapping_add(0x10) // WRITE DMA EXT = 0x35
-    } else {
-        ATA_READ_DMA_EXT
+    let Some((command, write)) = ata_command(op, d.flush_command) else {
+        return false;
     };
-    // Slot 0 is idle (caller established): build its command table + issue.
-    build_command(d, command, lba, count, frags, is_write);
+    // Slot 0 is idle (caller established): build its command table + issue. A flush is
+    // non-data — no LBA, no count, no PRDT — and completes with a D2H register FIS, which
+    // `PXIE_DHRE` already interrupts on.
+    if op == crate::io::irp::IrpOp::Flush as u32 {
+        build_command(d, command, 0, 0, &[], false);
+    } else {
+        build_command(d, command, lba, count, frags, write);
+    }
     issue(d);
+    true
 }
 
 /// Slot 0 has retired: under the port lock, take the completed IRP out of flight
@@ -817,14 +873,36 @@ fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
 /// from the completion DPC (and the boot poll path) — not the ISR — so issuing a new
 /// command is decoupled from the interrupt acknowledge.
 fn drain_queue(d: &AhciDisk) {
-    let mut q = d.pending.lock();
-    if d.inflight.load(Ordering::Acquire).is_null() {
-        let next = q.pop();
-        if !next.is_null() {
+    loop {
+        let refused = {
+            let mut q = d.pending.lock();
+            if !d.inflight.load(Ordering::Acquire).is_null() {
+                return;
+            }
+            let next = q.pop();
+            if next.is_null() {
+                return;
+            }
             d.inflight.store(next, Ordering::Release);
             // SAFETY: slot 0 is idle; `next` is a live queued IRP.
-            unsafe { issue_locked(d, next) };
-        }
+            if unsafe { issue_locked(d, next) } {
+                return;
+            }
+            d.inflight.store(core::ptr::null_mut(), Ordering::Release);
+            next
+        };
+        // Refused, and the slot still idle: fail it outside the lock and try the next.
+        fail_irp(refused);
+    }
+}
+
+/// Complete `irp` with `InvalidArgument` — an op this driver has no command for. Outside the
+/// port lock, like every completion here.
+fn fail_irp(irp: *mut Irp) {
+    // SAFETY: `irp` is a live IRP no longer in flight or queued, so uniquely ours.
+    unsafe {
+        (*irp).set_completion(crate::syscall::error::KError::InvalidArgument as i32, 0);
+        crate::dpc::enqueue(&(*irp).dpc);
     }
 }
 
@@ -936,6 +1014,24 @@ pub fn poll_complete_inflight() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_op_has_its_command_and_nothing_else_does() {
+        use crate::io::irp::IrpOp;
+        assert_eq!(ata_command(IrpOp::Read as u32, 0xEA), Some((ATA_READ_DMA_EXT, false)));
+        assert_eq!(ata_command(IrpOp::Write as u32, 0xEA), Some((ATA_WRITE_DMA_EXT, true)));
+        assert_eq!(ata_command(IrpOp::Flush as u32, 0xEA), Some((0xEA, false)), "the drive's flush");
+        assert_eq!(ata_command(IrpOp::Flush as u32, 0xE7), Some((0xE7, false)));
+        assert_eq!(ata_command(3, 0xEA), None, "not a read, which a count of 0 makes 65,536 sectors");
+    }
+
+    #[test]
+    fn a_drive_with_flush_cache_ext_is_flushed_with_it() {
+        assert_eq!(flush_command(1 << 13), ATA_FLUSH_CACHE_EXT);
+        assert_eq!(flush_command(0xFFFF), ATA_FLUSH_CACHE_EXT);
+        assert_eq!(flush_command(!(1 << 13)), ATA_FLUSH_CACHE, "every other bit set, not this one");
+        assert_eq!(flush_command(0), ATA_FLUSH_CACHE);
+    }
 
     /// The PRDT capacity is exactly what fits in a command table after the FIS area.
     ///

@@ -29079,3 +29079,53 @@ an answer keeps the inode: a leaked block can be repaired, and a block claimed t
 - Two boots, each failing only the new probe check: a server that frees without a `Forget`, and a
   kernel that answers without forgetting. In both, the unlinked file's pattern reached its freed
   block.
+
+## 2026-09-24 — Administration C.2: `IoOpcode::Flush`, and a drive's cache written before "done"
+
+**What landed.**
+- **`IoOpcode::Flush` (2), with `IrpOp::Flush` beside it.** It takes no buffer and no range, and
+  its PO completes once the device has written its volatile cache to its medium. It needs
+  `WRITE`: only a writer has anything to make durable.
+- **Per device.** A partition passes it to its disk unchanged, and a RAM disk completes it at once.
+  AHCI issues `FLUSH CACHE EXT` as a non-data command: no LBA, no count, no PRDT, and completion by
+  the D2H register FIS interrupt the port already enables. A drive whose IDENTIFY word 83 lacks the
+  48-bit form gets `FLUSH CACHE`.
+- **`nxinstall` flushes its target before it says "done"**, and `check-install` asserts that
+  milestone.
+- **The opcodes are in `abi-sync-check` for the first time.** The kernel states each as an
+  `IO_OPCODE_*` const and builds `IoOpcode` from them, so the names pair with `libkern`'s.
+- `TODO(ahci-flush)` is resolved.
+
+**The deferred entry said "a small new path rather than a new opcode", and it became an
+opcode.** The consumer is the storage service's unmount, a userspace program that reaches a device
+only through `sys_io_submit`. A driver-internal flush would have had no caller.
+
+**A flush is its own path in `sys_io_submit`, and refuses a descriptor that names anything.** A
+buffer, an offset or a length is `InvalidArgument`, because a flush covers the whole device, and a
+descriptor that seemed to cover less would promise what the flush does not do. It is dispatched
+before the zero-length early return, which would otherwise have answered it with a pre-signalled
+no-op that flushed nothing.
+
+**Three things the work found:**
+1. **Both drivers inferred an op from "not the other one".** AHCI read "a write, else a read",
+   which would have issued a flush as `READ DMA EXT` with a count of `0`: 65,536 sectors under
+   LBA48, with no PRDT to receive them. The RAM disk read "a read, else a write", and would have
+   copied a flush's buffer, had it one, onto the disk. Both now name every op and refuse the rest.
+   AHCI's decision is `ata_command`, host-tested. An op with no command is failed by `issue_locked`'s
+   callers once they have released the port lock. The first draft completed it under the lock,
+   which nests the DPC queue's lock in the port lock at the same rank.
+2. **Building a slice from a null pointer.** A flush's buffer is empty with a null `frags`, and
+   both drivers built their fragment slice with `slice::from_raw_parts` before looking at the op.
+   That is undefined at any length, and the first boot's precondition check panicked in AHCI. An
+   empty buffer is an empty slice now, in both drivers.
+3. **The completion alone proves only that the path ran.** A one-off `test-qemu` boot with
+   `-trace ide_bus_exec_cmd` showed QEMU's disk executing exactly one `0xEA`: the probe's flush.
+   The trace was a patch to `qemu_base_args`, restored afterwards; no gate carries it.
+
+**Controls:** two host tests fail without their guards: the RAM disk taking a flush for a write,
+and `ata_command` taking an unknown op for a read. Two boots fail the probe: a flush whose range
+goes unchecked, and one allowed on a read-only handle. `abi-sync-check` fails on a mismatched
+`IO_OPCODE_FLUSH`.
+
+**ABI hash:** `IoOpcode` and `IrpOp` each gained a variant, which changes the kernel ABI version
+hash (`abi-version-hash.md`).

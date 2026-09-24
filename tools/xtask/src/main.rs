@@ -3380,6 +3380,10 @@ fn run_install_steps(
         return Err(format!("the installer copied {files} files, which is not a root: {line}").into());
     }
     println!("  ok: the install finished —{}", line.trim_end());
+    // **Flushed before it said "done"** (administration Part C.2): a person powers the machine
+    // off next, and a drive may still hold the last sectors in its cache.
+    session.expect("nxinstall: flushed the disk's write cache")?;
+    println!("  ok: the installer flushed the disk before saying done");
     Ok(())
 }
 
@@ -11575,6 +11579,16 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         what: "device registry constants",
         kernel_file: "kernel/src/libkern/device.rs",
         user_file: "userspace/libkern/src/device.rs",
+        shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
+    // The `sys_io_submit` opcodes (administration Part C.2, which added `Flush`). The kernel
+    // states each value once as an `IO_OPCODE_*` const and builds `IoOpcode` from them, so the
+    // names pair with `libkern`'s; the other `u32` consts in `abi.rs` are never looked up.
+    AbiFamily {
+        what: "I/O opcodes",
+        kernel_file: "kernel/src/libkern/io_op.rs",
+        user_file: "userspace/libkern/src/abi.rs",
         shape: AbiShape::U32Const,
         one_sided: &[],
     },

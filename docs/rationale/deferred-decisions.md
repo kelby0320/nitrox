@@ -231,18 +231,20 @@ commands at once across the command list. The software queue's depth is already
 `PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
 workload (an SSD, or many concurrent readers).
 
-**No `FLUSH CACHE` after a write — `TODO(ahci-flush)`.** `kernel/src/drivers/ahci.rs` issues
-`IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing else; there is no `0xEA`. A drive is
-free to hold written sectors in its own volatile cache, and this system has no orderly shutdown
-that would flush them — a person powers the machine off. Every writer before Phase 5 Part H.1
-wrote through a filesystem on a machine that stayed running, so the gap cost nothing; `nxinstall`
-is the first writer that says "done, remove the medium and restart" with its last sectors
-possibly still in the drive. It survived the first real install, which is evidence that this
-drive's cache is either write-through or flushed by the firmware's reset, not that the next one
-will be. **Trigger: the first install that comes back with a corrupt tail**, or any writer that
-needs a durability point (a journal, a database). The command is a non-data ATA command, which
-this driver has no path for — `submit` is built around a PRDT — so it is a small new path rather
-than a new opcode. (PR #309 review, optional.)
+**No `FLUSH CACHE` after a write — resolved by administration Part C.2 (2026-09-24).**
+`kernel/src/drivers/ahci.rs` issued `IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing
+else, so a drive was free to hold written sectors in its volatile cache when a person powered the
+machine off. `nxinstall` was the first writer to say "done, remove the medium and restart" with
+its last sectors possibly still there. The first real install survived, which proved only that
+that drive's cache was write-through or flushed by the firmware's reset.
+
+The trigger that fired was the storage service's unmount, whose last step is this flush. It
+landed as `IoOpcode::Flush`, a new opcode after all rather than a driver-internal path. The
+unmount runs in userspace and reaches the device only through `sys_io_submit`. AHCI issues it as
+a non-data command (`FLUSH CACHE EXT`, or `FLUSH CACHE` if IDENTIFY lacks the 48-bit form), a
+partition passes it to its disk, and a RAM disk completes it at once. `nxinstall` flushes the
+target before it says "done", and `check-install` asserts the milestone
+([`drivers-and-irps.md`](../architecture/drivers-and-irps.md) § *Flush*).
 
 **Stateless `File::ReadRange` fill — Model B only, no shipping consumer.** Every
 filesystem shipping today is Model A (the kernel reads the device directly from a block
