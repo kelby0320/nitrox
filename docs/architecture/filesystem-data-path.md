@@ -69,7 +69,11 @@ BlockRun {
 - **`AllocRange(file, block-range) → [BlockRun]`** — allocate device blocks to back a range
   that is currently a hole / past EOF, and return their runs, for a flush that grows the file.
   **Mutates the filesystem's metadata** (its allocator + its block map + the inode/dir-entry
-  equivalent). The kernel calls this only when flushing dirty pages with no backing block.
+  equivalent). **Deferred, and nothing calls it**: no `AllocRange` exists in the kernel or any
+  server, and `writeback` skips a page over a hole rather than allocating for it — a file grows
+  through `sys_file_grow`'s resolve, whose reply carries the new blocks. The op is designed for a
+  write-back that allocates, which dirty tracking would make possible (the Part C review,
+  2026-09-24, found this line describing it as current).
 
 Naming is deliberately neutral: `MapRange`/`AllocRange`/`BlockRun`, not "extents." These are
 new **`Block`-category** ops (`0x03xx`) in the RS wire format (`docs/spec/rsproto-block-ops.md`).

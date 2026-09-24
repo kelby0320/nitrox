@@ -980,8 +980,8 @@ namespace, with no login and no session.
 - **`init` records its mounts as bindings only.** `sys_ns_enumerate` shows `/` as a mount and
   nothing names the device behind it. What does name it is `init.toml`: every `[[mount]]` is
   critical-path, so on a running system each one succeeded, and its source is a partition label
-  (the registry's partition name), a partition UUID (the parent disk's GPT), or a device path (a
-  served index).
+  (the registry's partition name) or a partition UUID (the parent disk's GPT) — the only two schemes
+  `init` accepts, whatever `init-toml-schema.md` said of `device-path` until this pass's review.
 - **Only one SATA disk is ever seen**: the AHCI driver takes the first implemented port with a disk
   (*Multiple disks*, deferred). A second disk can reach a boot only as a live image's module, a RAM
   disk — which is why Part C's gate uses the live topology.
@@ -1022,12 +1022,24 @@ namespace, with no login and no session.
   writable mapping of it until its next write-back, and stays dirty while a writable mapping remains.
   Write-back still writes every resident page of a dirty object. A clean object leaves the cache when
   its last user does, so the cache holds what is in use plus what is dirty — never the whole disk.
-- **The server tells the kernel when a file is gone.** `File::Forget(id)` goes from the server to the
-  kernel on its endpoint after an unlink, a replacing rename, or anything else that frees an inode.
-  The cached object is marked dead: its pages are never written back and a later resolve of the id
-  gets a new object. Truncation is kernel-mediated, so the kernel handles it in the resolve: pages
-  past the new size stay the object's, so a mapping of them stays valid, but they are never written
-  back.
+- **The server tells the kernel when a file is gone, and waits for the answer.** `File::Forget(id)`
+  goes from the server to the kernel on its endpoint when an unlink, a replacing rename, or anything
+  else is about to free an inode. The kernel marks the cached object dead at once — write-back checks
+  the mark **before each IRP**, not once per object — and answers when any write of it already in
+  flight has completed. **The server frees the inode's blocks only on that answer**, so no write the
+  kernel issued can land in a block the server has handed to something else — a directory block it
+  writes through, say. A later resolve of the id gets a new object.
+- **A size change keeps what a page says honest.** Truncation is kernel-mediated, so the kernel
+  handles it in the resolve. Pages wholly past the new size **leave the cache's index**: a mapping of
+  one stays valid, since the object keeps its frames until it dies, but no fault finds it again and
+  no write-back writes it. The partial last page is zeroed past the new size. A grow over a resident
+  partial last page zeroes it from the old size first, since a mapping may have written past the end
+  in between. So a regrown range reads as zero, which is what the filesystem says it holds —
+  `reserve` hits by page index regardless of size, so without this a truncate and a grow would serve
+  stale bytes and write them into the blocks the grow allocated.
+- **`File::Touch` names the file by id.** The post-write-back touch now fires long after the resolve
+  that named the file, at a sync or an unmount, by when a rename may have given that name to another
+  file; the id is what the reply now carries anyway.
 - **A read-only mount is the server's.** `fs-server-ext4` takes a read-only flag in its setup
   message, refuses every mutating operation with `NoAccess`, and marks the files it resolves
   read-only in the block-file reply, which the kernel installs without `MAP_WRITE`. It never writes
@@ -1053,8 +1065,8 @@ namespace, with no login and no session.
   the volume label), a FAT boot sector recognised and reported but not mounted, or nothing.
 - **`init`'s mounts stay `init`'s.** The service reads `/initramfs/etc/init.toml` and matches each
   `[[mount]]` source to a device: a label to a partition record's name, a UUID to the parent disk's
-  GPT, a device path to a served index. Those are reported with their mount points and never
-  mounted, auto or otherwise, or unmounted.
+  GPT. Those are reported with their mount points and never mounted, auto or otherwise, or
+  unmounted.
 - **Auto-mount** mounts every other device whose filesystem the service can serve. **A live boot is
   one whose root is on a RAM disk** — the fact that makes the machine's own disks the install
   target — and there it mounts read-only.
@@ -1102,8 +1114,11 @@ namespace, with no login and no session.
       registration, keyed by id; grow, create and truncate in place; the per-object dirty state;
       dirty objects kept past their last user and found again; `File::Forget`; `sys_ns_sync`.
       Kernel host tests: two resolves share one object; a dirty object outlives its last handle and
-      is found by the next resolve; a clean one does not; a forgotten one is never written back;
-      truncation keeps mapped pages valid and out of write-back. **A `boot-probe` check**: a file
+      is found by the next resolve; a clean one does not; a forgotten one is never written back, a
+      `Forget` during a write-back is answered only after the IRP in flight, and nothing is written
+      after it; **a truncate and then a grow read zero over the regrown range**, a whole page and a
+      partial tail — which a design that kept the pages would fail, where "mapped pages stay valid"
+      alone passes for both; `File::Touch` by id after a rename. **A `boot-probe` check**: a file
       written through one mapping is read through another without a sync, a write whose handle was
       closed unsynced reaches the device on `sys_ns_sync`, and an unlink's pages are not written back.
 - [ ] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
@@ -1137,7 +1152,9 @@ namespace, with no login and no session.
 - [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
       grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and
-      `/dev/storage/all.tsm` from a serial login, and `disk --mount` refused without the grant.
+      `/dev/storage/all.tsm` from a serial login, and `disk --mount` refused without the grant; step
+      20b(d) and `check-login`'s 9a2 re-aimed, and the *Gates* table's row A reworded
+      (*Consequences for earlier parts*).
 - [ ] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
 - [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
       packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
@@ -1156,8 +1173,11 @@ namespace, with no login and no session.
       boundary noted.
 
 **Part C may land as two PRs** — C.1–C.4, the kernel and `fs-server-ext4`, then C.5–C.8 — if one
-proves too large to review; each half is useful on its own, since C.1 fixes a data-loss path whatever
-uses it.
+proves too large to review. The first half is useful on its own, but less than it sounds: it makes
+two mappings of a file agree, and keeps an unsynced writer's pages until something syncs that file —
+a later `sys_file_sync` of it now carries them. Until C.5's unmount, or Part E's shutdown for
+`init`'s mounts where `/home` lives, nothing syncs a file whose writer forgot, so that data moves
+from "lost at exit" to "lost at power-off unless something syncs it".
 
 ### What to compare on the day
 
@@ -1166,12 +1186,35 @@ uses it.
 - **`test-interactive`**: `/storage` and `/dev/storage` in a serial session, and the grant's refusal.
 - **`check-live`** and **`check-install`**, unchanged: a live boot with no disk mounts nothing, and
   `nxinstall` still refuses the running root and writes a blank disk. **`check-install` on demand**,
-  because `disks` now asks `InUse` first: a blank disk holds no filesystem, so nothing is mounted and
-  the grant is unchanged, which the run confirms. Partitions are published only at boot, so the ones
-  the installer writes are never auto-mounted mid-install. **A reinstall is where this bites**: a disk
-  holding an install is auto-mounted on a live boot and so withheld from `disks` until it is
-  unmounted — Part G's gate, which reinstalls, is where that is designed.
+  because the storage service now runs through its whole boot: the blank disk holds no filesystem,
+  so nothing is auto-mounted, and partitions are published only at boot, so the ones the installer
+  writes are never auto-mounted mid-install. **Its disks do not come from `disks`** — the installer
+  session binds them itself, through `libsession`'s `bind_blk` — so `InUse` does not reach that path
+  (*Consequences for earlier parts*).
 - **`check-login`**: the graphical session's `/storage`.
+
+### Consequences for earlier parts
+
+- **Part A's `test-interactive` step 20b(d)** runs `with admin nxinstall` and expects `/dev/blk/0`.
+  On a release boot that is the disk holding `init`'s root, which `disks` withholds from C.6 on, so
+  `nxinstall` would list the ESP alone and the step would time out. **C.6 re-aims it**: under `with
+  admin`, `/dev/blk/0` is absent and the ESP present — which puts `InUse` in `test-interactive` too.
+  The *Gates* table's row A ("under `with admin` a program sees `/dev/blk/0`") changes with it, and
+  `check-login`'s step 9a2, which still passes on the ESP, is re-aimed the same way, since passing
+  on the ESP is a weaker claim than it was written for.
+- **B.2's `boot-probe` check** can no longer take `block`, which the storage service owns from boot;
+  it asserts the refusal instead (C.5).
+- **The installer session is a second raw path, and Part C leaves it unfiltered.** On an installer
+  boot, `libsession`'s `bind_blk` hands the session every device, a mounted one included. With Part
+  C, booting the stick's install entry on a machine that holds an install auto-mounts its
+  `nitrox-root` read-only **and** hands the same disk raw to `nxinstall`. That is confusion rather
+  than corruption, since a read-only mount writes nothing, and it closes with Part G, which makes the
+  installer session ordinary and routes `nxinstall` through `disks`.
+- **Part G meets two things when it does.** A reinstall's target disk is auto-mounted on the live
+  boot, and so withheld from `disks` until it is unmounted. And `InUse` withholds the RAM disk
+  holding a live boot's root, so `check-install`'s step 7 — `nxinstall` refusing `/dev/blk/1`
+  because "it is a ram disk" — becomes "not reachable" through `disks`. G's detail pass designs
+  both.
 
 ### Left alone
 

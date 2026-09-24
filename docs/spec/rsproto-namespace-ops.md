@@ -123,6 +123,11 @@ Body length = 8.
 These two rows were missing until the administration Part C detail pass (2026-09-24), which extends
 `FILE_BLOCKS`; the kinds were in use from their slices.
 
+For `MEMOBJ`, `content_len` is the exact byte length, so the client can trim the
+`MemoryObject`'s zero-padded tail precisely. Phase 2 caps the content at **64
+KiB**; a larger file replies with the error `TooLarge` (the page cache, slice 8,
+lifts the cap with lazy faulting).
+
 #### The `FILE_BLOCKS` body
 
 The 8-byte `ResolveReply` above, then:
@@ -132,11 +137,6 @@ The 8-byte `ResolveReply` above, then:
 | 8 | 4 | `block_size` — the filesystem's block size, in bytes |
 | 12 | 4 | `run_count` |
 | 16 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
-
-`content_len` is the exact byte length, so the client can trim the
-`MemoryObject`'s zero-padded tail precisely. Phase 2 caps the content at **64
-KiB**; a larger file replies with the error `TooLarge` (the page cache, slice 8,
-lifts the cap with lazy faulting).
 
 ### Reply body (error)
 

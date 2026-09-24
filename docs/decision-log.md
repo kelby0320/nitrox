@@ -28923,3 +28923,43 @@ unmounted.
 `FILE_BLOCKS` rows and the block reply's body layout, missing since their slices; and
 `filesystem-data-path.md` no longer claims dirty tracking. It suggests Part C may land as two PRs,
 the kernel and `fs-server-ext4` half first.
+
+## 2026-09-24 — Part C's detail pass, reviewed: what C breaks upstream, a stale page, and a Forget that waits
+
+PR #334's review had no blocking findings: four worth fixing and five optional, all taken. It
+checked every claim the spike made against the source and found them true, except one the pass
+had inherited.
+
+**Worth fixing:**
+1. **C.6 breaks Part A's `test-interactive` step 20b(d).** The step expects `/dev/blk/0` under
+   `with admin`, and on a release boot that is the disk holding `init`'s root, which `disks` will
+   withhold. The pass now has a *Consequences for earlier parts* section. C.6 re-aims the step to
+   assert that disk absent and the ESP present, rewords the *Gates* row A, and re-aims
+   `check-login`'s 9a2, which would still pass on the ESP but prove less.
+2. **`check-install` never uses `disks`.** Its installer session binds devices itself through
+   `libsession`'s `bind_blk`. So its conclusion ("unchanged") was right for the wrong reason, and the
+   plan's promise to refuse a raw grant of a mounted device has a second path Part C leaves open
+   until Part G. That path can hand an auto-mounted, read-only disk raw to `nxinstall`: confusion,
+   not corruption. G inherits it, and also the loss of `check-install`'s ram-disk refusal line once
+   `InUse` withholds the live root's RAM disk.
+3. **A truncate that keeps pages, and then a grow, would serve stale bytes and write them back.**
+   `reserve` hits by page index regardless of size. Now pages wholly past a new size leave the cache
+   index, a partial last page is zeroed past the end, and a grow zeroes it from the old size. The
+   test is truncate-then-grow-reads-zero, because "mapped pages stay valid" passes for both designs.
+4. **`AllocRange` was described as the kernel's current write-back path** in
+   `filesystem-data-path.md` and `rsproto-block-ops.md`. Neither it nor `MapRange` exists anywhere.
+   Both are marked deferred in both docs, and the block-ops spec's Status line now says what is live
+   (the `BlockRun` form inside the resolve reply).
+
+**Optional:**
+- `File::Touch` goes by file id, since a cached object's first suffix may have been renamed away.
+- `File::Forget` is acknowledged. The kernel marks the object dead, checks the mark before each
+  write IRP, and answers after any write in flight; the server frees blocks only on that answer.
+- `init.toml` accepts no `device-path`, so C.5 drops that match. `init-toml-schema.md` said it
+  "is supported", a current-behaviour spec bug the pass had inherited, and it is corrected.
+- The MEMOBJ paragraph moves out from under the new `FILE_BLOCKS` heading.
+- The two-PR rationale says what C.1–C.4 alone buy: coherent mappings, and unsynced data kept until
+  something syncs it, which for `init`'s mounts is Part E.
+
+A doc comment in `fs-server-ext4` still said its directory reply was `OBJECT_KIND_DIRECTORY`, and
+now matches the code.
