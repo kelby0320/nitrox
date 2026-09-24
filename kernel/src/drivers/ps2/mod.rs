@@ -111,6 +111,28 @@ static PS2_DPC: Dpc = Dpc::new(ps2_intr_dpc, core::ptr::null_mut());
 /// why an absent controller would otherwise be drained on every tick.
 static PRESENT: AtomicBool = AtomicBool::new(false);
 
+/// `ps2-hold-gate` only: nothing is drained from the controller before this monotonic time.
+#[cfg(feature = "ps2-hold-gate")]
+static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// How long an F9 press holds the drain, in a `ps2-hold-gate` kernel: long enough for the host to
+/// inject a walk and a click into it, short enough that a gate spends little time waiting.
+#[cfg(feature = "ps2-hold-gate")]
+const HOLD_NS: u64 = 300_000_000;
+
+/// Whether the drain is held at `now` — never, in a kernel without `ps2-hold-gate`.
+fn holding(now: u64) -> bool {
+    #[cfg(feature = "ps2-hold-gate")]
+    {
+        now < HOLD_UNTIL.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "ps2-hold-gate"))]
+    {
+        let _ = now;
+        false
+    }
+}
+
 /// Key presses decoded since boot; a held key counts each typematic repeat, as the keyboard sends
 /// each as a press. What the hardware report waits on (Phase 5 Part D.3): it needs to know *that*
 /// a key went down and nothing about which, so no keystroke is kept where a log could show it.
@@ -304,7 +326,10 @@ fn drain_controller() -> bool {
     // stays full forever. That sentence cost three investigations; the tick-driven sweep is
     // what actually recovers the byte.
     let mut budget = MAX_DRAIN_PER_IRQ;
+    // A `ps2-hold-gate` hold reads nothing at all, so everything injected meanwhile queues in
+    // the host's device — the condition that gate exists to build.
     while budget > 0
+        && !holding(now)
         && let Some((port, byte)) = crate::arch::ps2::read_byte()
     {
         budget -= 1;
@@ -324,6 +349,11 @@ fn drain_controller() -> bool {
                     }
                     if pressed {
                         KEY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // F9, the ninth of the consecutive function keys; F10 is `fbcon-gate`'s.
+                    #[cfg(feature = "ps2-hold-gate")]
+                    if pressed && code == crate::libkern::input::KEY_F1 + 8 {
+                        HOLD_UNTIL.store(now + HOLD_NS, Ordering::Relaxed);
                     }
                     let value = if pressed {
                         crate::libkern::input::KEY_PRESS

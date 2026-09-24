@@ -2318,6 +2318,62 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
 
     session.expect("input-testclient: PASSED")?;
 
+    // **A release QEMU is holding is delivered** — the `lost-release` fix's guard (PR #331). At
+    // the natural rate, about two runs in a hundred, deleting either flush passes every gate, so
+    // this builds the condition on purpose. F9 makes this kernel hold the i8042 drain for 300 ms
+    // (`ps2-hold-gate`, which `test-harness` implies), and inside the hold a three-step walk and a
+    // click fill QEMU's sixteen-byte queue to the last packet: the press fits and the release
+    // does not, so QEMU keeps it until the next injected event.
+    //
+    // **The condition is asserted first**, so the guard cannot pass for nothing: a raw release
+    // must *not* arrive on its own. Then the two flushes that deliver it — `expect_after_pointer`'s
+    // and `click_at`'s — each against a hold of its own. Release lines are matched by position,
+    // so the clicks that set each round up cannot satisfy them.
+    {
+        let hold = |qmp: &mut Qmp| -> R<()> {
+            qmp.send_key("f9", true)?;
+            qmp.send_key("f9", false)?;
+            // The key must reach the driver before the walk does.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(())
+        };
+        const HELD: &str = "compositor: release at x=500 y=200";
+        // From a known point, with nothing queued: the setup click's release has arrived.
+        qmp.pointer = None;
+        click_at(&mut qmp, &mut session, 200, 200)?;
+        session.expect("compositor: release at x=200 y=200")?;
+        hold(&mut qmp)?;
+        for _ in 0..3 {
+            qmp.send_motion(100, 0)?;
+        }
+        qmp.send_button("left", true)?;
+        qmp.send_button("left", false)?;
+        session.expect("compositor: press at x=500 y=200")?;
+        if session.expect_within(HELD, std::time::Duration::from_secs(1))? {
+            return Err("input gate FAILED: with the i8042 drain held, a three-step walk and a click \
+                        should fill QEMU's sixteen-byte queue so that the release waits — and it \
+                        arrived anyway, so this guard built nothing and proves nothing. Check that \
+                        the mouse still answers the wheel knock: a three-byte packet leaves room"
+                .into());
+        }
+        println!("  ok: with the drain held, QEMU kept the release back — the condition is real");
+        expect_after_pointer(&mut qmp, &mut session, HELD)?;
+        println!("  ok: expect_after_pointer's flush delivered the release QEMU held");
+        qmp.pointer = Some((500, 200));
+
+        click_at(&mut qmp, &mut session, 200, 200)?;
+        session.expect("compositor: release at x=200 y=200")?;
+        hold(&mut qmp)?;
+        click_at(&mut qmp, &mut session, 500, 200)?;
+        if !session.expect_within(HELD, std::time::Duration::from_secs(2))? {
+            return Err("input gate FAILED: `click_at` walked three steps and clicked inside a \
+                        held drain, and the release never arrived — its flush after the press \
+                        receipt is what sends a release QEMU held for want of room"
+                .into());
+        }
+        println!("  ok: click_at's flush delivered the release QEMU held");
+    }
+
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
 
@@ -2590,7 +2646,10 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
             // Seen in CI on 2026-08-31: `check-terminal` aimed at (397, 295) and the press
             // landed at (495, 351), exactly one step of (-98, -56) short. The sleep lets the
             // guest empty the queue; the flush then sends the held remainder into the corner,
-            // where it is clamped away, so the walk starts from nothing held. (This comment
+            // where it is clamped away. **One flush sends at most four packets** — the queue's
+            // worth, 508 px an axis — so a larger remainder survives it, and that rare case is
+            // what `click_at`'s retry absorbs. The same drain and flush, for the same reason, as
+            // `burst_holds_its_position` takes after its own pin. (This comment
             // said the queue *drops* a whole packet until 2026-09-23, when QEMU's `ps2.c` was
             // read — the sleep was right and the explanation was not.)
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4781,7 +4840,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     move_pointer_to(&mut qmp, thumb.0, thumb.1)?;
     qmp.pointer = Some(thumb);
     qmp.send_button("left", true)?;
-    session.expect("desktop-shell: dragging window ")?;
+    // The press is the last event injected, so QEMU may hold it — see `expect_after_pointer`.
+    expect_after_pointer(&mut qmp, &mut session, "desktop-shell: dragging window ")?;
     let (dx, dy) = size.card_click(1, cards);
     move_pointer_to(&mut qmp, dx, dy)?;
     qmp.pointer = Some((dx, dy));
@@ -5136,7 +5196,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     qmp.pointer = Some(grip_at);
     qmp.send_button("left", true)?;
     // `RESIZE_RIGHT | RESIZE_BOTTOM` is `2 | 8`.
-    session.expect(&format!("compositor: interactive resize of window {term_id} edges 10"))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!("compositor: interactive resize of window {term_id} edges 10"),
+    )?;
     for _ in 0..RESIZE_STEPS {
         qmp.send_motion(RESIZE_DX, RESIZE_DY)?;
     }
@@ -5188,7 +5252,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
-    session.expect("compositor: interactive move of window ")?;
+    expect_after_pointer(&mut qmp, &mut session, "compositor: interactive move of window ")?;
     // **The expectation is summed from what is injected**, not written out beside it: the first
     // version divided each leg into three and wrote the leg's total, which is two pixels away
     // from three times a truncated third.
@@ -5220,10 +5284,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
-    session.expect(&format!(
-        "compositor: press at x={} y={} win={term_id}",
-        press_at.0, press_at.1
-    ))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!("compositor: press at x={} y={} win={term_id}", press_at.0, press_at.1),
+    )?;
     // **On its title bar specifically**, which is the sharpest statement of where the window is:
     // a terminal that had snapped on the pass-through above sits at the work area's origin, so
     // this press lands on its *grid* — inside the window, and no drag at all. Without this line
@@ -7040,7 +7105,12 @@ fn select_papers(qmp: &mut Qmp, session: &mut Session) -> R<()> {
 /// by one event that moved nothing.
 ///
 /// So each second without `pat` sends [`Qmp::flush`], which delivers only what was already
-/// injected. Forty-five seconds in all, as [`Session::expect`].
+/// injected — and a later flush delivers what an earlier one had no room for. Forty-five seconds
+/// in all, as [`Session::expect`].
+///
+/// **A press held together with walk motion still lands short**: QEMU packs both into one packet
+/// and the guest's decoder emits the button before the motion. What this recovers is a button
+/// held on its own, which is the case a gate's last event is (PR #331 review, optional 2).
 fn expect_after_pointer(qmp: &mut Qmp, session: &mut Session, pat: &str) -> R<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_secs(1);
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -7173,7 +7243,14 @@ fn burst_holds_its_position(
     // state it can re-derive, and motion is the half it cannot. Flooding the ring and then
     // relying on a keystroke to survive it would be a gate that failed for the one reason the
     // system is entitled to.
+    //
+    // **Then flush, as `move_pointer_to` does after its own pin, and for its reason**: QEMU holds
+    // what its sixteen-byte queue could not take, and would add it to the burst's first motion.
+    // The chord below cannot send it — a key syncs only the keyboard — so without this the burst
+    // would start short by whatever the pin left, and the failure would blame `input-server` for
+    // a delta QEMU was holding (PR #331 review, finding 1).
     std::thread::sleep(std::time::Duration::from_millis(500));
+    qmp.flush()?;
 
     // Up and to the left, staying inside the screen the whole way: a burst that ran into a
     // clamp would hide exactly the loss this is looking for.
@@ -7513,18 +7590,19 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // first version of this gate clicked at (0, 0), inside the 64×32 scene window, and the
     // version after that sent one motion of (4000, 4000), which a 9-bit PS/2 delta turns into a
     // different, meaningless movement. What the helper adds is the retry, and the retry is what
-    // was missing: a dropped packet is not a lost pixel but a permanent offset, so asserting the
-    // position once turns one lost motion into a failed build.
+    // was missing: a misplaced press is not a lost pixel but a permanent offset, so asserting the
+    // position once turns one misplaced motion into a failed build.
     //
     // **Which is what happened, and the split assertion is why it can be said.** CI failed here
-    // with the press at (495, 351) — exactly one step of (-98, -56) short of its aim, the whole
-    // packet gone rather than a truncated one. The comment this replaces called the position
-    // "bit-identical over 40 loaded runs" and left the gate's one prior failure unexplained;
-    // both readings came from having no diagnosis to hang on it. It has one now: injection at
-    // this rate loses a packet occasionally, the guest cannot recover a relative delta it never
-    // received, and the drain in `move_pointer_to` is the half of the fix that stops it
-    // happening. The assertion is unchanged and still exact — a press that lands anywhere else
-    // is still a failure, and a systematic misplacement still fails all three attempts.
+    // with the press at (495, 351) — exactly one step of (-98, -56) short of its aim. The
+    // comment this replaces called the position "bit-identical over 40 loaded runs" and left the
+    // gate's one prior failure unexplained. It was read on 2026-08-31 as a packet lost, and on
+    // 2026-09-23, from QEMU's `ps2.c`, as a packet *held*: QEMU keeps what its sixteen-byte queue
+    // cannot take and adds it to the next injected event, so the pin's over-drive rode on the
+    // walk's first step and cancelled it. `move_pointer_to` drains the queue after its pin and
+    // then flushes what QEMU held into the corner (`expect_after_pointer` has the source). The
+    // assertion is unchanged and still exact — a press that lands anywhere else is still a
+    // failure, and a systematic misplacement still fails all three attempts.
     click_at(&mut qmp, &mut session, 397, 295)?;
 
     // **Wait for the click to land before typing.** Click-to-focus is what gives `nxterm` the
@@ -9502,9 +9580,10 @@ impl Qmp {
         Ok(())
     }
 
-    /// Make QEMU send any mouse packet it is holding: an event that moves nothing, which syncs
-    /// the device. **It cannot add input, only deliver it** — the one packet it can produce
-    /// carries buttons and motion that were already injected. See [`expect_after_pointer`].
+    /// Make QEMU send what mouse state it is holding: an event that moves nothing, which syncs
+    /// the device. **It cannot add input, only deliver it** — the packets it can produce carry
+    /// buttons and motion that were already injected, and as many as the queue has room for:
+    /// four at most, 508 px an axis. See [`expect_after_pointer`].
     fn flush(&mut self) -> R<()> {
         self.send_motion(0, 0)
     }

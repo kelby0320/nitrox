@@ -163,7 +163,8 @@ takes.
 
 ## The `test-harness` feature
 
-`test-qemu` builds the kernel with the **`test-harness`** cargo feature (`= ["selftest"]`),
+`test-qemu` builds the kernel with the **`test-harness`** cargo feature
+(`= ["selftest", "ps2-hold-gate"]`),
 which is distinct from `selftest` because it changes *terminal* behavior. No userspace program
 takes either: `init` was the last, until Phase 5 Part C.1 turned its one test-only branch into
 manifest data. What a test image's userspace does differently comes from its data — declarations,
@@ -179,6 +180,13 @@ the mount manifest, and the `test` store package. The two modes differ in:
 `test-harness` is compiled out of production kernels entirely: `SYS_TEST_EXIT`,
 `arch::debug_exit`, and the panic-handler exit path only exist under it — there is
 no emulator-exit backdoor in a shipping build, and it is not in the ABI hash.
+
+**It also implies `ps2-hold-gate`**, a gate hook rather than a mode: an F9 press makes the PS/2
+driver read nothing from the i8042 for 300 ms. `check-input` uses it to build, on purpose, the
+state behind the `lost-release` flake — QEMU holding a mouse release its sixteen-byte queue had no
+room for, until the next injected event — and to prove that the gates' flush delivers it
+(`expect_after_pointer` in `tools/xtask`). Nothing else presses F9, and a kernel without the
+feature has no hold at all.
 
 ## Running it
 
