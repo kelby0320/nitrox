@@ -169,6 +169,9 @@ pub const IPC_HEADER_SIZE: usize = 24;
 pub const IPC_HANDLE_MAX: usize = 8;
 /// Bytes of inline payload per message.
 pub const IPC_PAYLOAD_SIZE: usize = IPC_MSG_SIZE - IPC_HEADER_SIZE - IPC_HANDLE_MAX * 8;
+/// Largest per-direction queue depth `sys_channel_create` will honour; a deeper one is
+/// `InvalidArgument`.
+pub const IPC_MAX_QUEUE_DEPTH: u32 = 1024;
 
 // --- sys_wait --------------------------------------------------------------
 

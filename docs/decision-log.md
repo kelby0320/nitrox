@@ -28546,3 +28546,66 @@ a count one too high, the keyboard served at 1, and block records reporting thei
 
 It now specifies the registry, and enumeration leaves its *Deferred* list. `boot-flow.md`'s list of
 pid 1's bindings gains `/dev/input/raw`, the partition names and `/dev/registry`.
+
+## 2026-09-24 — Administration B.2: `device-mgr`, and the `Devices` protocol
+
+The device manager exists. `init` spawns it before the display arm and binds it at
+`/svc/devices`; it holds no syscaps. It reads `/dev/registry` once and takes each class device's
+node from `/dev/registry/<id>`. It then answers three kinds of resolve
+([`rsproto-devices-ops.md`](spec/rsproto-devices-ops.md), category `0x0Fxx`):
+- **`<class>` subscribes.** `input` or `block` answers a channel. On it, the manager sends an
+  `Arrived` per device of the class in registry order, each with the owner's own duplicate of the
+  node, then `Settled` with the count. `Departed` is specified and encoded, and sent by nothing
+  until Phase 6.
+- **`info` is a directory**, `all.tsm` and then a file per device.
+- **`info/<name>.tsm` is a TSM1 table**, minted as a fresh read-only memory object.
+
+Nothing subscribes yet: `input-server` does from B.3, and the storage service owns `block` from
+Part C. **A manager with no registry to read refuses** in place of `Ready`, the shape
+`fs-server-ext4` uses. A boot with its path broken printed
+`init: device-mgr refused: no /dev/registry it could read, so no devices to hand out` and went on
+without it.
+
+**One owner per class is kept at the manager.** A second subscription is refused with
+`AlreadyExists` while the first channel is open. The manager learns of a close from its own wait,
+so a subscription sent straight after one can still be refused. The spec says a caller retries,
+and the first green boot showed the case: the probe's first retry was refused, its second
+taken.
+
+**The replay is queued before the resolve completes.** The first version replied with the channel
+and then sent the replay. The second green boot logged `block owned, 0 device(s) sent` for the
+probe's retaken subscription, where the first had logged 3: the probe had closed its end between
+the reply and the sends. So an owner's `Settled` depended on how soon it read. The manager now
+fills the channel first, and a reply that fails takes the queued nodes with it, because the kernel
+releases an undelivered transfer with its endpoint. The probe now reads both replays without
+waiting, which **states the order without guarding it**: the reply-first order, as a control,
+passed, because its sends beat the probe's wake. The order is held by `subscribe`'s code.
+
+**A subscription channel is sized from its replay.** It was a fixed 64 deep, and sends do not
+block, so a class of more than 63 devices would have been cut short, with `Settled` counting only
+what fit. Writing the spec's sentence about depth is what showed it. The depth is now the replay,
+its `Settled` and 32 spare, capped at `IPC_MAX_QUEUE_DEPTH`. `libkern` now mirrors that constant,
+and `abi-sync-check` pairs it.
+
+**Controls:**
+- **The library's eight** each fail their test: a second claim allowed, a release that keeps
+  the class, a replay of every class, `blk-<id>` in place of the served index, a zero size for a
+  keyboard, an empty file name accepted, no `all.tsm`, and a declined driver unmarked.
+- **The padded-table test pins the reader.** A `Table::decode` that rejects bytes after the
+  terminator fails it, and only it.
+- **`boot-probe` catches five `device-mgr` mutations**, each at its own check, and did again
+  after its reads changed: a `Settled` off by one, the owner check skipped, a close ignored,
+  `all.tsm` short a row, and an `Arrived` with no handle.
+
+**The probe's retry nearly slept on nothing.** `sys_wait` with no handles and a deadline looked
+like a sleep. The kernel refuses an empty list with `InvalidArgument`, so the fifty retries would
+have spent microseconds. Reading `sys_wait` before trusting it found this; the probe sleeps on a
+one-shot timer. `boot-probe`'s stat, map-and-copy, close and registry read became module helpers,
+shared with B.1's check. The view-broker checks' receive loop became one `receive` that keeps the
+handles a message carries.
+
+**Two corrections found on the way:**
+- **Init's control reads had no `SAFETY` comment**, and `bind_device_mgr` copied the pattern. All
+  ten now have one.
+- **`boot-flow.md`'s overview still drew `auth-service` under `service-mgr`**, which §6 of the same
+  document says stopped at M7. Its list of init's bindings is now init's, in order.

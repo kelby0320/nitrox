@@ -854,14 +854,16 @@ namespace, with no login and no session.
       which a phantom record read past the count cannot be. (That two paths give *the same node*
       is the host tests' to show: a handle carries no object identity a process can compare, so
       the probe compares what it can — size and name.)
-- [ ] **B.2 — `device-mgr`.** The `Devices` protocol (`0x0Fxx`) and `rsproto-devices-ops.md`: <!-- check-docs: allow-missing -->
-      `Arrived`, `Settled`, `Departed`. The subscription and its replay; `info/` as a directory of
-      `.tsm` files. Host-tested in its library: records to rows, names, replay order, and **the
-      reader side of the table** — a padded buffer, as the kernel hands it over, decodes to the rows
-      (a round trip would only test the encoder), and one owner per class. `init` spawns it and binds
+- [x] **B.2 — `device-mgr`** *(2026-09-24)*. The `Devices` protocol (`0x0Fxx`) and
+      [`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md): `Arrived`, `Settled`,
+      `Departed`. The subscription and its replay; `info/` as a directory of `.tsm` files.
+      Host-tested in its library: records to rows, names, replay order, and **the reader side of
+      the table** — a padded buffer, as the kernel hands it over, decodes to the rows (a round
+      trip would only test the encoder), and one owner per class. `init` spawns it and binds
       `/svc/devices`. **A `boot-probe` check**: `/svc/devices/block` replays the disks and settles,
       a second subscription to `block` is refused while the first is held, and is taken once it
-      is closed. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
+      is closed; `info` lists `all.tsm` and a file per device, and `all.tsm` decodes to a row per
+      registry record. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
       without stalling the keyboard — which is the rule working.)
 - [ ] **B.3 — `input-server` from the manager.** Subscribe; a device table of up to eight; serve
       from `Settled`, with none or one; retire on `Departed`. Host tests on the library: arrivals

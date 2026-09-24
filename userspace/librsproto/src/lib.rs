@@ -32,6 +32,7 @@ pub mod path;
 pub mod session;
 pub mod surface;
 pub mod views;
+pub mod devices;
 
 // --- Envelope (RsMsgHeader) -------------------------------------------------
 

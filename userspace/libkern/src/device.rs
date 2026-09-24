@@ -159,6 +159,13 @@ const _: () = assert!(offset_of!(DeviceRecord, driver) == 56);
 const _: () = assert!(offset_of!(DeviceRecord, name) == 72);
 
 impl DeviceRecord {
+    /// The record's bytes, as the kernel wrote them — what a `Devices::Arrived` carries.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `DeviceRecord` is `repr(C)` with an explicit `_pad`, so every byte is
+        // initialised (the offset asserts above account for them all).
+        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+    }
+
     /// Its kind.
     pub fn kind(&self) -> DeviceKind {
         DeviceKind::from_u32(self.kind)

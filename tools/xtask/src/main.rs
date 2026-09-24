@@ -606,6 +606,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The view broker (administration Part A). `init` spawns it — only `init` can bind a server
     // into the root namespace — from here, as it does `auth-service`.
     "view-broker",
+    // The device manager (administration Part B). `init` spawns it before `input-server`, which
+    // takes its devices from it, and binds it at `/svc/devices`.
+    "device-mgr",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -668,6 +671,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The view broker (administration Part A). A lib + bin split like `auth-service`: who may
     // do what is host-tested, this builds the bare-target server.
     build_userspace_bin("view-broker", None)?;
+    // The device manager (administration Part B). A lib + bin split: names, classes, owners and
+    // the tables are host-tested, this builds the bare-target server.
+    build_userspace_bin("device-mgr", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -11178,6 +11184,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // device-mgr's library tests (names, classes and one owner each, the replay, the tables and
+    // the suffixes). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("device-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // logging-service's library tests (the log-path classifier). `--lib` skips the
     // `#![no_main]` server bin.
     run(Command::new("cargo")
@@ -11515,6 +11531,12 @@ const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
         "IPC_HANDLE_MAX",
         "userspace/libkern/src/abi.rs",
         "IPC_HANDLE_MAX",
+    ),
+    (
+        "kernel/src/libkern/ipc.rs",
+        "IPC_MAX_QUEUE_DEPTH",
+        "userspace/libkern/src/abi.rs",
+        "IPC_MAX_QUEUE_DEPTH",
     ),
 ];
 
