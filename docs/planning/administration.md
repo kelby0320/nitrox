@@ -465,7 +465,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       **one grant end to end, `disks`**; streams, and a stop handle for the shell; programs ended with
       their session; an audit record per request. The build images carry a seeded `views.toml` that
       makes the demo account an administrator.
-- [ ] **B — the device manager, with coldplug** — *detailed below, B.1–B.5.* `/dev/registry`;
+- [x] **B — the device manager, with coldplug** — *detailed below, B.1–B.5; built 2026-09-24.*
+      `/dev/registry`;
       `device-mgr`, with subscriptions by class that replay every present device (coldplug);
       `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
       can read, in place of listing `/dev/blk`.
@@ -892,14 +893,18 @@ namespace, with no login and no session.
       `eshell`. `unbind_block_devices` takes back what is bound rather than indices `0..16`.
       `check-live` asks the session's `/dev/devices` for the module's RAM disk, the one this
       Part's comparison list named.
-- [ ] **Docs**: a new architecture doc for the device manager; `input-subsystem.md` (devices from
+- [x] **Docs** *(2026-09-24)*: a new architecture doc for the device manager; `input-subsystem.md` (devices from
       the manager, and the hotplug premise corrected); `namespace-and-resource-servers.md` and the
       kernel-server list (`/dev/registry`); `libfs`'s limitation note; `device-node.md`, whose
       *Deferred* list still names a device-enumeration syscall and a `/dev` listing (B.1 delivers
       the first as a path). **`kernel_server.rs` says the `/dev` listing "is deferred", and it is
       resolved** — `deferred-decisions.md`'s Resolved table has it (Phase 4 D3), with the
       `/dev/blk` limitation noted as carried by Part B — so the comment becomes a pointer to
-      `/dev/devices`, which is how this pass answers that limitation.
+      `/dev/devices`, which is how this pass answers that limitation. All but the first landed
+      with the part that made them true (B.1, B.3, B.5);
+      [`device-manager.md`](../architecture/device-manager.md) is the last, and is linked from
+      the overview, `drivers-and-irps.md`, `input-subsystem.md`, `boot-flow.md`,
+      `session-and-auth.md`, `namespace-and-resource-servers.md` and the two specs.
 
 ### What to compare on the day
 

@@ -1,8 +1,9 @@
 # Nitrox — Architecture Overview
 
-**Status:** Phases 0–4 complete (Phase 4 closed 2026-09-10) — the kernel, capability
-substrate, boot to userspace, the service ecosystem **and a usable windowed desktop** are all
-built and running. A release image boots to a graphical greeter; a login starts a session with
+**Status:** Phases 0–5 complete (Phase 5 closed 2026-09-17) — the kernel, capability
+substrate, boot to userspace, the service ecosystem, **a usable windowed desktop** and bare metal
+are all built and running. A release image boots to a graphical greeter, under QEMU and on the
+target laptop from its own disk; a login starts a session with
 a compositor, a shared toolkit, and three applications (`nxterm`, `nxfiles`, `nxedit`). The
 typed shell is built through Milestone 5 and the display arm through Milestone 15.
 
@@ -17,15 +18,20 @@ still outrun their code and say so in their own Status lines** — `desktop-shel
 v2, and `ui-composition-model.md`'s ports are unscheduled — which is the pattern root
 `CLAUDE.md` describes rather than one to copy.
 
-**Phase 5 — bare metal — is active**: everything above has only ever run under QEMU, and the
-target is a real laptop. See [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
+**Phase 5 — bare metal — is complete** (2026-09-17): the target laptop boots from its own disk,
+installed from a live USB stick. See [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
+The desktop refresh followed, and **administration is the current work**
+([`administration.md`](../planning/administration.md)); its Part B built the
+[device manager](device-manager.md).
 
 **Re-checked 2026-09-10: the Status line, the division-of-the-system diagram, the runtime-library
 list, and the phase pointers.** Named rather than left as an unqualified "Verified", because an
 unqualified one is exactly what let this document keep a diagram reading "compositor TBD" three
 lines under a Status line saying the compositor was built (PR #292 review, blocking 1). The
 prose in the sections below has *not* been audited line by line since 2026-08-05; where it and
-the per-subsystem documents disagree, those win.
+the per-subsystem documents disagree, those win. **Re-checked 2026-09-24: the Status line and the
+phase pointers**, which still called Phase 5 active a week after it closed, and § *Drivers and
+IRPs*, which gained the device manager.
 
 Nitrox is a hobby operating system written in Rust. This document is the entry point to the project's architecture documentation. It's intended to be read in one sitting and to give you a working mental model of the system. It is not a specification — it is orientation.
 
@@ -183,7 +189,9 @@ The driver framework uses I/O Request Packets (IRPs) flowing through driver stac
 
 Userspace drivers are possible — the kernel can grant a userspace resource server an `InterruptObject` handle and program the IOMMU to constrain DMA to memory regions the driver legitimately holds.
 
-See: [drivers and IRP architecture](drivers-and-irps.md).
+What the drivers find is readable from userspace. The kernel's device table is served at `/dev/registry` in the root namespace, and a userspace **device manager** hands each device to the service that owns its class: the keyboard and mouse to the input server, as handles rather than paths. Everyone else reads the table as typed tables at `/dev/devices`. Phase 6's driver manager is that component extended.
+
+See: [drivers and IRP architecture](drivers-and-irps.md), [the device manager](device-manager.md).
 
 ## The major userspace concepts
 

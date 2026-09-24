@@ -28791,3 +28791,37 @@ from the source rather than a counter, so a gap cannot end its list.
 matched on `module 1 (/boot/root.img)`, which the command does not contain. That was the last
 item of Part B's comparison list without a gate. `libfs::ns_children`'s documented limitation now
 points at `/dev/devices`, and the deferral entry for a listable `/dev` records the Part as built.
+
+## 2026-09-24 — Administration Part B's docs: `device-manager.md`, and the Part built
+
+The last item of Part B's plan was its docs, and five of its six sub-items had already landed, each
+with the part that made it true. `input-subsystem.md` changed with B.3. The kernel-server list,
+`device-node.md`'s *Deferred* list and `kernel_server.rs`'s "deferred" comment changed with B.1.
+`libfs`'s limitation note changed with B.5. What remained was a document for the component itself.
+
+**[`device-manager.md`](architecture/device-manager.md) is written in current-behaviour terms**:
+- the pieces and where they live;
+- a boot end to end;
+- classes and owners, and why the replay is queued before the resolve completes;
+- the information side, and why the endpoint rather than the base is the boundary;
+- who can reach what;
+- how the rest of the system reads the table;
+- a gate-by-gate list of what is proved.
+
+Its last section says what is not built, and what that costs: no event source until Phase 6, no
+owner for `block` until Part C, and no supervision. If the manager exited, owners would keep their
+devices and every `/dev/devices` resolve would fail.
+
+**Linking it found two docs that no longer said what is true:**
+- **`overview.md`'s Status line still said Phases 0–4**, and a paragraph under it called Phase 5
+  active, a week after it closed on 2026-09-17. Both are corrected, and its re-check note says what
+  this pass looked at.
+- **`drivers-and-irps.md`** described the userspace driver manager only as deferred. Half of it now
+  exists: the device table is readable, and nodes reach their owners as handles. It says so and
+  points at the new doc.
+
+`namespace-and-resource-servers.md`'s registry-backed section gains the listing consequence: a
+subtree server answers lookups and cannot be listed, and what lists its table instead is
+`/dev/registry` in the root namespace and `/dev/devices` everywhere else.
+
+Part B is ticked as built, not complete: it becomes complete when its PR merges, as Part A did.

@@ -31,7 +31,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
 | — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | ✅ complete 2026-09-22 — all eleven parts (A–K) built |
-| — Administration | [administration.md](administration.md) | in progress — seven parts (A–G); **Part A complete 2026-09-23** (views, the broker and `with`); **Part B detailed 2026-09-23** (the device manager); **B.1 built 2026-09-24** (`/dev/registry`), **B.2 2026-09-24** (`device-mgr`), **B.3 2026-09-24** (`input-server` from the manager), **B.4 2026-09-24** (`/dev/devices` in every session), **B.5 2026-09-24** (the probes) |
+| — Administration | [administration.md](administration.md) | in progress — seven parts (A–G); **Part A complete 2026-09-23** (views, the broker and `with`); **Part B detailed 2026-09-23** and **built 2026-09-24** (the device manager: `/dev/registry`, `device-mgr`, `input-server` from the manager, `/dev/devices` in every session, the probes, and [`device-manager.md`](../architecture/device-manager.md)) |
 | 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
 | 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |

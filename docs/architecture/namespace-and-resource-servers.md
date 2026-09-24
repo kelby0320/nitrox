@@ -515,6 +515,14 @@ key into each binding, one binding per disk — was rejected because block devic
 grow sub-paths: partitions, `/dev/disk/by-partuuid/*`. A server owning a *subtree*
 is the on-design match to the umbrella definition above.)
 
+**A registry-backed subtree answers lookups and cannot be listed**: the kernel resolves its
+children on demand, and the namespace holds one binding for all of them, so `list /dev/blk` in
+the root namespace is empty. The table behind `/dev/blk` is read another way: `/dev/registry` is a
+server over the whole device table, in the root namespace, and the device manager serves it to
+everyone else as typed tables at `/dev/devices` ([`device-manager.md`](device-manager.md)).
+Outside the root namespace the question does not arise — a session or view is handed each device
+as a binding of its own, and those list.
+
 ### Liveness: what is "live", and what enables it
 
 Until the storage slice every Kernel Server is **unconditionally live** — bound

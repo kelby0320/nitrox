@@ -134,6 +134,7 @@ it is specified now so an owner is written against it from the start.
 
 ## References
 
+- [`device-manager.md`](../architecture/device-manager.md) — the manager, its owners and readers, and what the gates prove
 - [`device-node.md`](device-node.md) — the registry and the record
 - [`rsproto-wire-format.md`](rsproto-wire-format.md) — framing, request ids, error replies
 - [`rsproto-namespace-ops.md`](rsproto-namespace-ops.md) — how a resolve mints a channel or an object

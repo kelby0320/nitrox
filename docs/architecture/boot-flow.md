@@ -255,7 +255,7 @@ than an implementation detail.
    `logging-service` at `/log`, `tty-server` at `/dev/tty`, `clipboard-server` at
    `/dev/clipboard`, `view-broker` at `/svc/views`, and **`device-mgr` at `/svc/devices`**
    (administration Part B), which reads `/dev/registry` and hands each device to the owner of
-   its class ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)). The first three are
+   its class ([`device-manager.md`](device-manager.md)). The first three are
    critical-path.
 
    The rest are **non-fatal**: if the tty server fails, init logs "no terminal server; sessions

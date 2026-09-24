@@ -319,7 +319,8 @@ layers away.
 
   **Since administration Part B.3 the input server resolves none of them.** It subscribes to
   `/svc/devices/input`, also bound only in the root namespace, and the device manager hands it
-  each keyboard and mouse as a node ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+  each keyboard and mouse as a node ([`device-manager.md`](device-manager.md),
+  [`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
   The exclusivity is kept at the manager as well: **a class has one owner at a time**, so a
   second subscriber is refused while the input server holds `input`, where a second reader of a
   raw node would drain events meant for the first. The server serves from `Settled` with

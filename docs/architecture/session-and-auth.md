@@ -243,7 +243,7 @@ broker's. Both supervisors bind it at `/dev/devices` with the subtree base `/inf
 the manager as `info` — a directory of TSM1 tables, `all.tsm` and one per device — and
 `/dev/devices/all.tsm` as `info/all.tsm`, so `list /dev/devices` and
 `open /dev/devices/all.tsm | filter kind == "disk"` work with no device code in the shell
-([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+([`device-manager.md`](device-manager.md), [`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 **The endpoint is the boundary, not the base.** The base alone keeps an ordinary session's
 suffixes under `info`, but `desktop-shell` holds what is couriered and `BIND_NAMESPACE`, and could

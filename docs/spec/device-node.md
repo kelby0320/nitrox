@@ -295,7 +295,8 @@ driver-to-node matching graduates to a userspace **device manager** with Tier 2
 
 The userspace **driver manager** (matching nodes to Tier 2 modules, handing a
 driver process a `Handle<DeviceNode>`) is Phase 6's, and extends the device
-manager the administration phase builds (`docs/planning/phase-6-usb.md`).
+manager the administration phase builds (`docs/planning/phase-6-usb.md`) — whose first half,
+handing each node to the owner of its class, is [`device-manager.md`](../architecture/device-manager.md).
 
 ## Deferred
 
