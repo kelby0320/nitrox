@@ -9,8 +9,8 @@
 //! ## What it copies from, which had to be decided
 //!
 //! **The source's bytes on the device, not the running system's view of them.** The live root
-//! is a RAM disk this session has been writing to, and a write reaches the device only on
-//! `sys_file_sync` or unmap — so the two differ, and the difference is whatever the session
+//! is a RAM disk this session has been writing to, and a write reaches the device only when
+//! something syncs the file — so the two differ, and the difference is whatever the session
 //! has touched: a login writing under `/home`, a shell's history. Reading the device installs
 //! **the system as it shipped**, which is what an installer should produce; reading the live
 //! view would install a machine carrying one session's accidents.

@@ -42,6 +42,10 @@ use libkern::{
     SYS_NS_DERIVE, SYS_NS_UNBIND,
 };
 use libkern::{
+    IO_OPCODE_READ, IoOp, RIGHT_READ, SYS_FILE_TRUNCATE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
+    SYS_NS_SYNC,
+};
+use libkern::{
     RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
     SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT,
     TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS, exit, kprint, syscall1, syscall2, syscall4,
@@ -385,10 +389,269 @@ fn fill_byte(i: usize) -> u8 {
     (((i >> 12) ^ i) & 0xFF) as u8
 }
 
+// === what the device holds ==============================================================
+
+/// What the **device** holds, as opposed to what the page cache does — the root partition
+/// opened raw, read through the ext4 library `fs-server-ext4` is built on.
+///
+/// **Why the filesystem checks need it** (administration Part C.1). Every resolve of a file
+/// now shares the one page-cache object any other resolve of it holds, so re-resolving a file
+/// reads the cache, not the disk. The checks that used to prove a write "persisted" by
+/// re-resolving would pass with no write-back at all.
+struct RootDevice {
+    device: u64,
+    /// A page of scratch every read passes through, and its mapping.
+    mem: u64,
+    addr: u64,
+}
+
+impl RootDevice {
+    /// The root partition, by the label this boot mounted it by — the disk image's or the live
+    /// image's.
+    fn open(ns: u64) -> Option<RootDevice> {
+        let labels: [&[u8]; 2] =
+            [b"/dev/disk/by-partlabel/nitrox-root", b"/dev/disk/by-partlabel/nitrox-live"];
+        let device = labels.iter().find_map(|p| match ns_lookup(ns, p, RIGHT_READ) {
+            (0, h) if h != 0 => Some(h),
+            _ => None,
+        })?;
+        // SAFETY: register-only syscall.
+        let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+        if mem < 0 {
+            close(device);
+            return None;
+        }
+        // SAFETY: register-only syscall; `mem` is ours.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+        if addr < 0 {
+            close(mem as u64);
+            close(device);
+            return None;
+        }
+        Some(RootDevice { device, mem: mem as u64, addr: addr as u64 })
+    }
+
+    /// `len` bytes of the file at `path` from `offset`, as the device holds them. `None` if the
+    /// file is shorter or does not read.
+    fn read_file(&self, path: &[u8], offset: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut out = alloc::vec![0u8; len];
+        match fs_server_ext4::ext4::read_file_range(self, path, offset, len, &mut out) {
+            Ok(n) if n == len => Some(out),
+            _ => None,
+        }
+    }
+}
+
+impl fs_server_ext4::BlockReader for RootDevice {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), fs_server_ext4::FsError> {
+        const SECTOR: u64 = 512;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let start = at / SECTOR * SECTOR;
+            let intra = (at - start) as usize;
+            let take = (buf.len() - done).min(PAGE as usize - intra);
+            let span = (intra + take).div_ceil(SECTOR as usize) as u64 * SECTOR;
+            let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: self.mem, buf_offset: 0, offset: start, length: span };
+            // SAFETY: `device` is a block device handle this process holds; `&op` is a valid
+            // `IoOp` naming a `MemoryObject` it owns.
+            let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
+            if po < 0 || po_wait(po as u64) != (0, span) {
+                return Err(fs_server_ext4::FsError::Io);
+            }
+            // SAFETY: `span <= PAGE` bytes are mapped at `addr`, which nothing else borrows.
+            let src = unsafe { core::slice::from_raw_parts(self.addr as *const u8, span as usize) };
+            buf[done..done + take].copy_from_slice(&src[intra..intra + take]);
+            done += take;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RootDevice {
+    fn drop(&mut self) {
+        // SAFETY: unmapping this value's own mapping.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, self.addr, 0) };
+        close(self.mem);
+        close(self.device);
+    }
+}
+
+/// Wait for a `PendingOperation`, close it, and return its `(status, result)`; `(-1, 0)` if the
+/// wait itself failed.
+fn po_wait(po: u64) -> (i32, u64) {
+    let ok = wait_one(po);
+    // SAFETY: when the wait completed the kernel wrote a 24-byte `IoResult`.
+    let r = unsafe {
+        (
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+            u64::from_le_bytes([
+                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            ]),
+        )
+    };
+    close(po);
+    if ok { r } else { (-1, 0) }
+}
+
+/// A size-changing resolve — `SYS_FILE_CREATE`, `_GROW` or `_TRUNCATE` of `path` to `size` —
+/// returning the file's handle.
+fn file_resize(nr: u64, ns: u64, path: &[u8], size: u64) -> Option<u64> {
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall5(nr, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size)
+    };
+    if po < 0 {
+        return None;
+    }
+    match po_wait(po as u64) {
+        (0, h) if h != 0 => Some(h),
+        _ => None,
+    }
+}
+
+/// Map `len` bytes of file handle `h` with `rights`; the address, or `None`.
+fn map_file(h: u64, len: u64, rights: u64) -> Option<u64> {
+    // SAFETY: register-only syscall on a handle this process holds.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, len, rights) };
+    (addr >= 0).then_some(addr as u64)
+}
+
+/// The byte a pattern puts at `i` of page `p` — different per page, so a page served in the
+/// other's place is caught.
+fn c1_byte(p: u64, i: u64) -> u8 {
+    (0xC1 + p as u8) ^ (i as u8)
+}
+
+/// **Administration Part C.1, end to end: one object per file, and a dirty one kept until a
+/// sync.**
+///
+/// 1. **A write through one mapping is read through another without a sync** — two resolves of
+///    the file share its object. The device does not have the write yet, which is what makes
+///    the second read a reading of the cache.
+/// 2. **Unmapped and closed without a sync, the write is kept, and `sys_ns_sync` writes it** —
+///    a writer that forgot loses nothing. Checked on the device on both sides of the sync.
+/// 3. **A truncate and a grow of a file held open read zero over the regrown range** — a whole
+///    page and a partial tail — through a new mapping and on the device. The mapping reads the
+///    kernel's half (pages retired, the tail zeroed); the device reads the server's (what the
+///    grow allocated, and the tail it kept, zeroed).
+fn file_cache_test(root_ns: u64) -> bool {
+    let path = b"/system/c1-cache";
+    let size = 2 * PAGE;
+    let Some(dev) = RootDevice::open(root_ns) else {
+        kprint(b"boot-probe: c1 root device FAIL\n");
+        return false;
+    };
+    let on_device = |off: u64, n: usize| dev.read_file(path, off, n);
+    let pattern = |p: u64, n: u64| (0..n).map(|i| c1_byte(p, i)).collect::<alloc::vec::Vec<u8>>();
+    let zeroes = |n: usize| alloc::vec![0u8; n];
+
+    // 1. Two resolves, two mappings, one object.
+    let Some(w) = file_resize(SYS_FILE_CREATE, root_ns, path, size) else {
+        kprint(b"boot-probe: c1 create FAIL\n");
+        return false;
+    };
+    let (st, r) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+    let (Some(wa), Some(ra)) = (
+        map_file(w, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE),
+        if st == 0 { map_file(r, size, RIGHT_MAP_READ) } else { None },
+    ) else {
+        kprint(b"boot-probe: c1 map FAIL\n");
+        return false;
+    };
+    for p in 0..2 {
+        for i in 0..64 {
+            // SAFETY: inside the writable mapping of `size` bytes.
+            unsafe { ((wa + p * PAGE + i) as *mut u8).write_volatile(c1_byte(p, i)) };
+        }
+    }
+    let mut shared = true;
+    for p in 0..2 {
+        for i in 0..64 {
+            // SAFETY: inside the read-only mapping of `size` bytes.
+            shared &= unsafe { ((ra + p * PAGE + i) as *const u8).read_volatile() } == c1_byte(p, i);
+        }
+    }
+    let unwritten = on_device(0, 64) == Some(zeroes(64)) && on_device(PAGE, 64) == Some(zeroes(64));
+    if shared && unwritten {
+        kprint(b"boot-probe: c1 a write through one mapping reads through another, unsynced ok\n");
+    } else {
+        kprint(b"boot-probe: c1 shared-object MISMATCH\n");
+    }
+
+    // 2. Let go of everything without a sync; the write is kept, and `sys_ns_sync` writes it.
+    // SAFETY: unmapping our own mappings.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, wa, 0);
+        syscall2(SYS_MEMORY_UNMAP, ra, 0);
+    }
+    close(w);
+    close(r);
+    let kept = on_device(0, 64) == Some(zeroes(64));
+    let sync_path = b"/system";
+    // SAFETY: valid path pointer + namespace handle.
+    let written = unsafe { syscall4(SYS_NS_SYNC, root_ns, sync_path.as_ptr() as u64, sync_path.len() as u64, 0) };
+    let synced = written >= 1
+        && on_device(0, 64) == Some(pattern(0, 64))
+        && on_device(PAGE, 64) == Some(pattern(1, 64));
+    if kept && synced {
+        kprint(b"boot-probe: c1 an unsynced write closed reaches the device on sys_ns_sync ok\n");
+    } else {
+        kprint(b"boot-probe: c1 ns-sync MISMATCH\n");
+    }
+
+    // 3. Held open, with both pages resident: truncate into page 0, then grow back.
+    let (st, h) = ns_lookup(root_ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+    let Some(ha) = (if st == 0 { map_file(h, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) } else { None }) else {
+        kprint(b"boot-probe: c1 reopen FAIL\n");
+        return false;
+    };
+    // SAFETY: inside the mapping; faults both pages in.
+    let resident = unsafe { ((ha + 1) as *const u8).read_volatile() == c1_byte(0, 1)
+        && ((ha + PAGE + 1) as *const u8).read_volatile() == c1_byte(1, 1) };
+    let truncated = file_resize(SYS_FILE_TRUNCATE, root_ns, path, 10).map(close).is_some();
+    let g = file_resize(SYS_FILE_GROW, root_ns, path, size);
+    let ga = g.and_then(|g| map_file(g, size, RIGHT_MAP_READ));
+    let mut regrown = resident && truncated && ga.is_some();
+    if let Some(ga) = ga {
+        for i in 0..64 {
+            // SAFETY: inside the read-only mapping of the regrown file.
+            let (a, b) = unsafe {
+                (((ga + i) as *const u8).read_volatile(), ((ga + PAGE + i) as *const u8).read_volatile())
+            };
+            regrown &= a == if i < 10 { c1_byte(0, i) } else { 0 } && b == 0;
+        }
+    }
+    let mut kept_head = pattern(0, 10);
+    kept_head.extend_from_slice(&zeroes(54));
+    let regrown_on_device = on_device(0, 64) == Some(kept_head) && on_device(PAGE, 64) == Some(zeroes(64));
+    // Clean up: unmapped first, so the sync leaves the file clean and it goes with its handles.
+    // SAFETY: unmapping our own mappings; syncing our own writable handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, ha, 0);
+        if let Some(ga) = ga {
+            syscall2(SYS_MEMORY_UNMAP, ga, 0);
+        }
+        syscall1(SYS_FILE_SYNC, h);
+    }
+    close(h);
+    if let Some(g) = g {
+        close(g);
+    }
+    if regrown && regrown_on_device {
+        kprint(b"boot-probe: c1 a truncate then a grow reads zero, a page and a tail ok\n");
+    } else {
+        kprint(b"boot-probe: c1 truncate-grow MISMATCH\n");
+    }
+    shared && unwritten && kept && synced && regrown && regrown_on_device
+}
+
 /// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
-/// a `MAP_WRITE` mapping, `sys_file_sync`, then re-resolve (a fresh `FileObject` that reads
-/// the block from disk) and verify the change persisted — proving the Model A write data path
-/// (dirty pages → write IRPs → device) with no fs-server metadata write.
+/// a `MAP_WRITE` mapping, `sys_file_sync`, then read the block **off the device** and verify
+/// the change persisted — proving the Model A write data path (dirty pages → write IRPs →
+/// device) with no fs-server metadata write. (A re-resolve read the disk until administration
+/// Part C.1; it now shares this object, so the device is read directly — [`RootDevice`].)
 fn overwrite_test(root_ns: u64) -> bool {
     let path = b"/system/rwtest";
     let marker = [0xDEu8, 0xAD, 0xBE, 0xEF];
@@ -419,31 +682,12 @@ fn overwrite_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: rwtest sync FAIL\n");
     }
 
-    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the overwrite persisted
-    //    and the untouched byte is unchanged.
-    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
-    if st2 != 0 || fh2 == 0 {
-        kprint(b"boot-probe: rwtest re-read lookup FAIL\n");
-        return false;
-    }
-    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, PAGE, RIGHT_MAP_READ) };
-    if addr2 < 0 {
-        kprint(b"boot-probe: rwtest re-read map FAIL\n");
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
-        return false;
-    }
-    let base2 = addr2 as u64;
-    let mut ok = true;
-    for (i, m) in marker.iter().enumerate() {
-        // SAFETY: within the mapped page.
-        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
-            ok = false;
-        }
-    }
-    // SAFETY: byte 8 within the page — must be unchanged.
-    let reread8 = unsafe { ((base2 + 8) as *const u8).read_volatile() };
-    if ok && reread8 == orig8 {
+    // 3. Read the device and verify the overwrite persisted and the untouched byte did not
+    //    change.
+    let on_device = RootDevice::open(root_ns).and_then(|d| d.read_file(path, 0, 9));
+    let ok = on_device.as_deref().is_some_and(|b| b[..4] == marker);
+    let reread8 = on_device.as_deref().map(|b| b[8]);
+    if ok && reread8 == Some(orig8) {
         kprint(b"boot-probe: rwtest overwrite persisted + verified ok\n");
         true
     } else {
@@ -454,7 +698,7 @@ fn overwrite_test(root_ns: u64) -> bool {
 
 /// fs-server-rw Part D milestone (selftest): **grow** a file past EOF via `sys_file_grow`
 /// (the fs-server allocates a block + extends its extent tree + updates the inode), write
-/// into the newly-allocated region, `sys_file_sync`, then re-resolve and confirm the
+/// into the newly-allocated region, `sys_file_sync`, then read the device and confirm the
 /// appended data persisted — proving the write path's metadata mutation end to end.
 fn grow_test(root_ns: u64) -> bool {
     let path = b"/system/rwtest";
@@ -519,27 +763,11 @@ fn grow_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: grow sync FAIL\n");
     }
 
-    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the appended data.
-    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
-    if st2 != 0 || fh2 == 0 {
-        kprint(b"boot-probe: grow re-read FAIL\n");
-        return false;
-    }
-    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
-    if addr2 < 0 {
-        kprint(b"boot-probe: grow re-read map FAIL\n");
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
-        return false;
-    }
-    let base2 = addr2 as u64;
-    let mut ok = true;
-    for (i, m) in marker.iter().enumerate() {
-        // SAFETY: within the 2nd mapped page.
-        if unsafe { ((base2 + PAGE + i as u64) as *const u8).read_volatile() } != *m {
-            ok = false;
-        }
-    }
+    // 3. Read the device — through the file's new extent, so the metadata is checked too —
+    //    and verify the appended data.
+    let ok = RootDevice::open(root_ns)
+        .and_then(|d| d.read_file(path, PAGE, marker.len()))
+        .is_some_and(|b| b == marker);
     if ok {
         kprint(b"boot-probe: grow appended a block + persisted + verified ok\n");
         true
@@ -551,9 +779,9 @@ fn grow_test(root_ns: u64) -> bool {
 
 /// fs-server-rw Part E milestone (selftest): **create** a brand-new file via
 /// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
-/// parent, then grows it to the target size), write into it, `sys_file_sync`, then
-/// re-resolve with a plain lookup and confirm both that the new path now resolves and that
-/// its data persisted — proving inode allocation + directory-entry insertion end to end.
+/// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
+/// path off the device and confirm both that it resolves there and that its data persisted —
+/// proving inode allocation + directory-entry insertion end to end.
 fn create_test(root_ns: u64) -> bool {
     let path = b"/system/created";
     let marker = [0xABu8, 0xCD, 0xEFu8, 0x42];
@@ -616,28 +844,11 @@ fn create_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: create sync FAIL\n");
     }
 
-    // 3. Re-resolve with a **plain** lookup (proves the directory entry is on disk: a path
-    //    that did not exist before now resolves) and verify the data.
-    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
-    if st2 != 0 || fh2 == 0 {
-        kprint(b"boot-probe: create re-read FAIL\n");
-        return false;
-    }
-    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
-    if addr2 < 0 {
-        kprint(b"boot-probe: create re-read map FAIL\n");
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
-        return false;
-    }
-    let base2 = addr2 as u64;
-    let mut ok = true;
-    for (i, m) in marker.iter().enumerate() {
-        // SAFETY: within the mapped first page.
-        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
-            ok = false;
-        }
-    }
+    // 3. Read the device through the path: the directory entry is on disk (a path that did
+    //    not exist before now resolves there) and so is the data.
+    let ok = RootDevice::open(root_ns)
+        .and_then(|d| d.read_file(path, 0, marker.len()))
+        .is_some_and(|b| b == marker);
     if ok {
         kprint(b"boot-probe: create new file + persisted + verified ok\n");
         true
@@ -789,6 +1000,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & overwrite_test(root_ns)
         & grow_test(root_ns)
         & create_test(root_ns)
+        & file_cache_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)

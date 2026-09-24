@@ -428,6 +428,7 @@ dependencies = [
 name = "test-harness"
 version = "0.1.0"
 dependencies = [
+ "fs-server-ext4",
  "libdraw",
  "libheap",
  "libkern",

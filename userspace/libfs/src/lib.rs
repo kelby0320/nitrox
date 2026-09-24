@@ -190,15 +190,17 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
         );
     }
 
-    // Flush the written pages before dropping the mapping: without this the copy lives
-    // only in the page cache, and a reader that re-resolves the path sees a short file.
-    // SAFETY: `dst_handle` is our writable file handle.
-    let synced = unsafe { syscall1(SYS_FILE_SYNC, dst_handle) };
+    // Unmap, then flush through the handle: without the flush the copy lives only in the page
+    // cache until something syncs the file. **Unmapped first**, because a flush that begins
+    // with a writable mapping still in place leaves the file dirty — the mapping could write
+    // again — and the kernel keeps a dirty file's pages until the next flush of it.
     // SAFETY: unmapping our own mappings.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, dst_addr as u64, size);
         syscall2(SYS_MEMORY_UNMAP, src_addr as u64, size);
     }
+    // SAFETY: `dst_handle` is our writable file handle.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, dst_handle) };
     if synced != 0 {
         return Err(FileError::Io(synced as i32));
     }
@@ -322,15 +324,13 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     // SAFETY: `size` bytes are mapped at `addr`, `bytes` holds exactly that many, and a caller's
     // slice cannot alias a mapping this call just made.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, size as usize) };
-    // Flush before dropping the mapping, or the write lives only in the page cache and a reader
-    // that re-resolves the path sees a short file — `copy_file`'s hard-won line.
+    // Unmap, flush through the handle, then close — unmapped first, as in `copy_file`.
+    // SAFETY: unmapping our own mapping.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, size) };
     // SAFETY: `handle` is our writable file handle.
     let synced = unsafe { syscall1(SYS_FILE_SYNC, handle) };
-    // SAFETY: unmapping our own mapping and closing our own handle.
-    unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
-        syscall1(SYS_HANDLE_CLOSE, handle);
-    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
     if synced != 0 {
         return Err(FileError::Io(synced as i32));
     }

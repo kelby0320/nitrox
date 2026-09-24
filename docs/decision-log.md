@@ -28963,3 +28963,70 @@ had inherited.
 
 A doc comment in `fs-server-ext4` still said its directory reply was `OBJECT_KIND_DIRECTORY`, and
 now matches the code.
+
+## 2026-09-24 — Administration C.1a: one page-cache object per file, and a dirty one kept
+
+The first half of C.1. `File::Forget` is C.1b.
+
+**What landed, as the detail pass drew it:**
+- **The file id is in the block-file reply.** The `FILE_BLOCKS` body grew a 32-byte prefix, with
+  `file_id` at 16, `flags` at 24 and the runs at 32. `fs-server-ext4` sends the inode number. The
+  one flag, `FILE_BLOCKS_READ_ONLY`, is defined now and set by C.3. The kernel already honours it
+  by withholding `MAP_WRITE`.
+- **Each registration keeps a weak index of its files** (`UserspaceServerReg::files`, Registry
+  rank). `FileObject::cache_in` either enters a reply's new object or resizes the cached one to
+  the reply and drops the new one, so a grow, create or truncate of a file updates the object
+  everyone shares.
+- **Dirty is per object**, held as a reference the object has to itself. It is taken at a
+  writable mapping and let go by a write-back that cleans.
+- **`sys_ns_sync(ns, path)`**, syscall 38. It needs `LOOKUP` and blocks, the same exemption
+  `sys_file_sync` has. It writes every dirty object of the registration `path` resolves to and
+  returns how many.
+- **`File::Touch` names the file by inode.** `touch_file` stamps only a live regular file.
+
+**A decision the pass left open: when a write-back cleans.** The pass said "dirty until its next
+write-back, and stays dirty while a writable mapping remains". Checking for a mapping at the
+*end* of a write-back is not enough. A mapping present at the start can write after its page's
+IRP reads the frame, then go before the end, and the object would be called clean and dropped
+with the write unwritten. So a write-back cleans only if it *began* with no writable mapping and
+none was made during it; a generation each writable mapping bumps detects the second. The
+consequence is that a writer syncing while still mapped leaves its file dirty. `libfs` and `nxsh`
+synced before they unmapped, which would have pinned every file they wrote until an unmount, so
+they now unmap first.
+
+**Four things the work found:**
+1. **The deferred same-page fault spin stopped a boot.** Every process running one binary now
+   shares its image's object, so two faulting one page is ordinary. The second faulter
+   `yield_now`ed until the page was ready, from a fault handler with interrupts off, and
+   `yield_now` returns at once when nothing else is ready. `test-qemu` hung twice with three CPUs
+   in `tlb::shootdown` and the fourth in that loop. The fix is the one `deferred-decisions.md`
+   named: the page carries its fill's PO, a second faulter blocks on it, and whoever wakes first
+   settles the page, matched by the PO. It also closes a hole the spin hid: a filler whose fill
+   failed returned without releasing the page, and it stayed loading forever.
+2. **A grow did not zero what it allocated.** The pass reasoned that a regrown range "reads as
+   zero, which is what the filesystem says it holds". The kernel half of that is sound, but a page
+   nobody holds fills from the device, and `grow_file` left new blocks and the old last block's
+   tail as they were. A negative control that removed the zeroing failed the probe on a freshly
+   created file's blocks, not only after a truncate, so the exposure was real in practice: a new
+   file could read a deleted one's bytes. `grow_file` now zeroes the tail and every new block.
+3. **A lock-order bug a host test cannot see.** The first boot panicked in `cache_in`: a guard
+   made inside `resize`'s argument list lived to the end of the call, so two page-cache locks
+   nested. The rank tracker is inert under `cfg(test)`, and every host test passed.
+4. **The probe's persistence checks had stopped checking.** `overwrite`, `grow` and `create`
+   re-resolved to prove a write reached the disk, and a re-resolve now shares the cached object.
+   They read the device instead, through `fs-server-ext4`'s own library over the root partition
+   opened raw. That is also how the new C.1 check tells the cache from the device.
+
+`kernel/docs/lock-ordering.md` listed `DEVICES` and `PARTITIONS` as leaves when the code ranks
+them Registry, above the allocators. It is corrected, and names the file cache and `OUTCOMES`.
+
+**Recorded, not built:** `TODO(retired-frames)`, since a truncate's retired frames live as long
+as the object does, and `TODO(truncate-inflight-writeback)`, since a write-back in flight can
+land in blocks a concurrent truncate freed. The second is the truncate half of what C.1b's
+`Forget` does for an unlink.
+
+**Controls:**
+- 12 negative controls on the kernel's host tests and 5 on `fs-server-ext4`'s, each failing its
+  test.
+- Four boots, each failing the verdict: no sharing, a sync that writes nothing, a resize that
+  keeps pages, and a grow that zeroes nothing.

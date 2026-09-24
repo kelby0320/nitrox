@@ -3,7 +3,9 @@
 **Status:** Implemented — `userspace/fs-server-ext4`, read **and** write, with host tests
 that build an image with `mke2fs` and require `e2fsck -fn` to find it clean. Individual
 deferrals are marked inline. Verified 2026-09-17, when cross-group allocation landed and the
-deferred list was swept against the code.
+deferred list was swept against the code. Administration Part C.1 (2026-09-24): the block-file
+reply carries the inode number as the file's id, `File::Touch` names a file by it, and a grow
+zeroes on the device what it adds.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -91,19 +93,33 @@ Each part builds on proven machinery and is independently verifiable.
   A same-length rewrite goes from the page cache to the device with no resolve and no IPC,
   so before Slice C4 a file edited repeatedly in place still reported the timestamp of its
   last **size** change — usually its creation. Fixed by `File::Touch`: after a successful
-  `sys_file_sync` of a Model A file, the kernel sends the server the file's suffix, and the
+  write-back of a Model A file, the kernel sends the server the file's id, and the
   server stamps `mtime` **from its own clock** (no timestamp on the wire — a writer does
   not choose the time its write appears to have happened). It carries no reply and is
   registered as nothing pending: the data is already durable, so a dropped notification
   costs a stale timestamp rather than a failed sync. Ordering still holds where it matters,
   because it enters the same endpoint ring as forwarded resolves — a subsequent lookup of
-  that file is processed after it. To carry the file's name at all, Model A's producer had
-  to start holding its `(registration, suffix)`; those fields are used by nothing on the
-  data path, which is the point.
+  that file is processed after it. To name the file at all, Model A's producer had to start
+  holding the file's identity; it is used by nothing on the data path, which is the point.
+
+  **By inode since administration Part C.1**, and by suffix before. The kernel keeps one object
+  per file and writes a dirty one back at a sync or an unmount, long after the resolve that named
+  it, and a rename may have handed that name to another file by then. The id is the inode number,
+  which `map_file` reports and the block-file reply carries. `touch_file` stamps only a live
+  regular file, since the id comes off the wire and a touch can trail the unlink of what it names.
 - **Part D — file growth** ✅. `grow_file` (block-bitmap allocation + extent-tree extension +
   inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
   (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
   client writes the new region + syncs. The fs-server now holds a read-write device handle.
+
+  **A grow zeroes, on the device, everything it adds**: the old last block past the old size,
+  and every block it allocates (administration Part C.1). The kernel fills a page it does not
+  hold from the blocks the map names, so the device is what a reader of the new range sees.
+  Until then it saw whatever those blocks last held. After a truncate and a grow, that was the
+  file's own cut bytes, since the allocator's goal is the block the truncate just freed. On any
+  grow, it could be a deleted file's contents. A boot showed it on a freshly created file's
+  blocks. The cost is a write per block grown, which a writer then overwrites; unwritten extents
+  would avoid it, and nothing yet needs to.
 - **Part E — file creation** ✅. `create_file` (inode allocation via the inode bitmap +
   `ext4_dir_entry_2` insertion by splitting an existing entry's slack in the parent
   directory, then inode init as an extents regular file) — **`e2fsck`-verified**. Triggered

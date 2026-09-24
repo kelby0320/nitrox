@@ -46,7 +46,8 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
-use crate::libkern::{AllocError, KBox};
+use crate::libkern::lockrank::LockRank;
+use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
@@ -142,6 +143,14 @@ struct Inner {
     next_id: u64,
 }
 
+/// One file in a registration's cache: the id its server gave it, and its `FileObject`.
+struct CachedFile {
+    id: u64,
+    /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
+    /// entry out, by address, so an entry never outlives the memory it names.
+    obj: *mut (),
+}
+
 /// The kernel's registration record for one Userspace Server.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
@@ -152,6 +161,16 @@ pub struct UserspaceServerReg {
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
+    /// **The file cache: one `FileObject` per file this server's replies named**, keyed by
+    /// the file id a `FILE_BLOCKS` reply carries (administration Part C.1). Every resolve of a
+    /// file shares its one object, and a sync or an unmount can enumerate them. An index only
+    /// — the objects are held by their users, or by themselves while dirty.
+    ///
+    /// Its own lock, not `SCHED`, since the objects it hands out are cloned and dropped:
+    /// ranked [`Registry`](LockRank::Registry), above the page caches it indexes — it
+    /// allocates while held, and is never taken inside a `FileObject`'s lock. **No reference
+    /// is ever dropped under it**, since the last one would re-enter it from `FileObject::drop`.
+    files: SpinLock<KVec<CachedFile>>,
 }
 
 // SAFETY: identical reasoning to `IpcChannel` — the header refcount is atomic and
@@ -179,7 +198,62 @@ impl UserspaceServerReg {
                 pending_fill: core::array::from_fn(|_| None),
                 next_id: 1,
             }),
+            files: SpinLock::new(LockRank::Registry, KVec::new()),
         })
+    }
+
+    // --- The file cache (its own lock; never under `SCHED`) --------------
+
+    /// **The one object for file `id`, or `obj` becomes it.** If a live object for `id` is
+    /// cached, a new reference to it is returned and `obj` is left for the caller to drop —
+    /// outside this lock. Otherwise `obj` is entered under `id` (replacing an entry whose
+    /// object is mid-teardown) and `Ok(None)` returned. `Err` only if the index cannot grow.
+    pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
+        debug_assert_eq!(obj.object_type(), KObjectType::FileObject);
+        let mut g = self.files.lock();
+        if let Some(e) = g.iter_mut().find(|e| e.id == id) {
+            // SAFETY: the entry's object is live — its `Drop` removes the entry under this
+            // lock before its memory goes, so while the lock is held the pointer is readable.
+            if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+                return Ok(Some(existing));
+            }
+            // Mid-teardown (refcount zero): its `Drop` will look for its own address, which
+            // this overwrites, so it removes nothing.
+            e.obj = obj.as_ptr();
+            return Ok(None);
+        }
+        g.try_push(CachedFile { id, obj: obj.as_ptr() })?;
+        Ok(None)
+    }
+
+    /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
+    pub fn cache_forget_object(&self, obj: *mut ()) {
+        let mut g = self.files.lock();
+        if let Some(i) = g.iter().position(|e| e.obj == obj) {
+            g.remove(i);
+        }
+    }
+
+    /// Every live cached object, each a new reference the caller drops — outside this lock,
+    /// which it is by the time this returns. `Err` if the list cannot be built.
+    pub fn cache_objects(&self) -> Result<KVec<ObjectRef>, AllocError> {
+        let mut out = KVec::new();
+        let g = self.files.lock();
+        out.try_reserve(g.len())?;
+        for e in g.iter() {
+            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
+            if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+                // `try_reserve` above guarantees this push does not allocate.
+                let _ = out.try_push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// How many files the cache holds. Test/observability only.
+    #[cfg(test)]
+    pub(crate) fn cached_files(&self) -> usize {
+        self.files.lock().len()
     }
 
     /// `true` iff the self-check sentinel is intact.

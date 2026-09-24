@@ -231,6 +231,9 @@ pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// `sys_ns_derive` — create a namespace holding a copy of another's bindings, and return a
 /// full-rights handle to it.
 pub const SYS_NS_DERIVE: u64 = 37;
+/// `sys_ns_sync(ns, path, path_len)` — write back every dirty file under a mount
+/// (administration Part C.1).
+pub const SYS_NS_SYNC: u64 = 38;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -281,6 +284,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create()),
         SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
+        SYS_NS_SYNC => encode(sys_ns_sync(a0, a1, a2 as usize)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
@@ -2675,14 +2679,79 @@ fn complete_resolve_reply(
 fn sys_file_sync(handle: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
-    if !crate::object::FileObject::writeback(&ok.object) {
+    write_back(&ok.object)?;
+    Ok(0)
+}
+
+/// Write one file's pages back, tell its server, and — if no writable mapping of it existed
+/// at any point in between — let go of its dirty pin. The shared tail of `sys_file_sync` and
+/// `sys_ns_sync`.
+fn write_back(file_obj: &ObjectRef) -> Result<(), KError> {
+    use crate::object::FileObject;
+    // SAFETY: `file_obj` pins a live `FileObject` (both callers checked the type).
+    let mark = unsafe { &*(file_obj.as_ptr() as *const FileObject) }.clean_mark();
+    if !FileObject::writeback(file_obj) {
         return Err(KError::IoError);
     }
     // The data is on the device, but under Model A the *server* has no idea it happened:
     // an in-place, same-length overwrite never resolves anything, so nothing would move the
     // inode's `mtime`. Tell it. Best-effort and unwaited — see `us_forward_notify`.
-    notify_file_touched(&ok.object);
-    Ok(0)
+    notify_file_touched(file_obj);
+    if let Some(mark) = mark {
+        FileObject::unpin_if_clean(file_obj, mark);
+    }
+    Ok(())
+}
+
+/// `sys_ns_sync(ns, path, path_len)` — **write back every dirty file** cached under the
+/// registration `path` resolves through in `ns`: the files a filesystem's server has handed
+/// out, whether or not anything still holds them (administration Part C.1). A writer that
+/// exits without syncing leaves its file dirty and pinned in that cache, and this is what
+/// writes it: the storage service's unmount, and later shutdown, call it before a filesystem
+/// is marked clean.
+///
+/// Needs `LOOKUP` on `ns`, like resolving under the path would: it changes no file, it only
+/// makes what was already written durable. `path` must resolve to a userspace server's
+/// binding, else `Unsupported`. Returns how many files were written.
+///
+/// **Blocks** on the write IRPs, in the calling thread, as `sys_file_sync` does — the same
+/// documented exemption from async-first, for the same reason: it is a durability point, and a
+/// caller that asks for one wants to know when it is reached.
+fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
+    let mut buf = [0u8; NS_PATH_MAX];
+    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+    validate_path(path).map_err(|_| KError::InvalidArgument)?;
+    // SAFETY: `lookup_typed` verified the type; the refcount pins it for this call.
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    let reg = match ns.resolve(path) {
+        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
+        Some(_) => return Err(KError::Unsupported),
+        None => return Err(KError::NotFound),
+    };
+    // SAFETY: `reg` pins a live `UserspaceServerReg`.
+    let r: &crate::object::UserspaceServerReg =
+        unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
+    // The references are taken under the cache's lock and dropped after it is released —
+    // each may be the last, and its `Drop` takes that lock.
+    let files = r.cache_objects().map_err(|_| KError::OutOfMemory)?;
+    let mut written = 0isize;
+    let mut result = Ok(());
+    for f in files.iter() {
+        // SAFETY: `f` pins a live `FileObject`.
+        let fo: &crate::object::FileObject = unsafe { &*(f.as_ptr() as *const crate::object::FileObject) };
+        if !fo.is_dirty() {
+            continue;
+        }
+        match write_back(f) {
+            Ok(()) => written += 1,
+            Err(e) => result = Err(e),
+        }
+    }
+    drop(files);
+    drop(reg);
+    result.map(|()| written)
 }
 
 /// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.
@@ -2700,8 +2769,8 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     use crate::libkern::KBox;
     use crate::object::FileObject;
 
-    let Some((reg, suffix)) = FileObject::fs_server_name(file_obj) else {
-        return; // not a Model A file — nothing to notify
+    let Some((reg, file_id)) = FileObject::touch_target(file_obj) else {
+        return; // not a cached Model A file — nothing to notify
     };
     // Build in a heap-bounced message: a 4 KiB `StoredMsg` has no business on a kernel
     // stack whose budget is measured, not assumed (decision log, 2026-07-29).
@@ -2712,8 +2781,7 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     else {
         return;
     };
-    let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, suffix.as_bytes())
-    else {
+    let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, file_id) else {
         return;
     };
     msg.header.payload_len = body_len as u32;
@@ -2786,9 +2854,9 @@ fn build_and_install_file_blocks(
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
-    use crate::libkern::{KString, KVec};
-    use crate::object::{BlockRun, FileObject, Producer};
-    use crate::rsproto::{file_blocks_reply_header, file_blocks_run, reply_body};
+    use crate::libkern::KVec;
+    use crate::object::{BlockRun, FileObject};
+    use crate::rsproto::{FILE_BLOCKS_READ_ONLY, file_blocks_reply_header, file_blocks_run, reply_body};
 
     // The block device rides in handles[0].
     let device = match transfers[0].take() {
@@ -2799,18 +2867,18 @@ fn build_and_install_file_blocks(
         }
         None => return (KError::InvalidArgument as i32, 0), // success but no device
     };
-    // Parse the block size + BlockRun map from the reply body.
+    // Parse the header + BlockRun map from the reply body.
     let Some(body) = reply_body(reply_msg) else {
         return (KError::KernelError as i32, 0);
     };
-    let Some((block_size, run_count)) = file_blocks_reply_header(body) else {
+    let Some(header) = file_blocks_reply_header(body) else {
         return (KError::KernelError as i32, 0);
     };
     let mut runs: KVec<BlockRun> = KVec::new();
-    if runs.try_reserve(run_count as usize).is_err() {
+    if runs.try_reserve(header.run_count as usize).is_err() {
         return (KError::OutOfMemory as i32, 0);
     }
-    for i in 0..run_count as usize {
+    for i in 0..header.run_count as usize {
         let Some((file_block, device_lba, length, flags)) = file_blocks_run(body, i) else {
             return (KError::KernelError as i32, 0);
         };
@@ -2818,37 +2886,37 @@ fn build_and_install_file_blocks(
         let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
     }
 
-    // Name the file back to its server, for the post-writeback `File::Touch` (the data
-    // path never uses these — see `Producer::FsServerBlocks`).
-    let Some(suffix_bytes) = pl.suffix() else {
-        return (KError::TooLarge as i32, 0);
-    };
-    let Ok(suffix_str) = core::str::from_utf8(suffix_bytes) else {
-        return (KError::InvalidArgument as i32, 0);
-    };
-    let Ok(suffix) = KString::try_from_str(suffix_str) else {
-        return (KError::OutOfMemory as i32, 0);
-    };
     // SAFETY: `reg` addresses the live `UserspaceServerReg` this reply arrived through.
     let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) })
     else {
         return (KError::KernelError as i32, 0);
     };
+    // **One object per file** (administration Part C.1): a file this registration already
+    // caches is resized in place — a grow, create or truncate of it, or simply its size and
+    // map as the server now reports them — and every resolve of it shares that object. A file
+    // id of `0` names nothing, and gets an object of its own, uncached.
+    let candidate =
+        match new_block_file(content_len, device, header.block_size, reg_ref.clone(), header.file_id, runs) {
+            Ok(f) => f,
+            Err(e) => return (e as i32, 0),
+        };
+    let fref = if header.file_id == 0 {
+        candidate
+    } else {
+        match FileObject::cache_in(&reg_ref, candidate) {
+            Ok(f) => f,
+            Err(_) => return (KError::OutOfMemory as i32, 0),
+        }
+    };
+    drop(reg_ref);
 
-    let fobj = match FileObject::try_new(
-        content_len as usize,
-        Producer::FsServerBlocks { device, runs, block_size, reg: reg_ref, suffix },
-    ) {
-        Ok(f) => f,
-        Err(_) => return (KError::OutOfMemory as i32, 0),
-    };
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let fref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
-    };
     let (op, ot) = fref.into_raw();
-    // Grant `INSPECT` alongside the requested rights (a `sys_handle_stat` before mapping).
-    let rights = pl.requested | Rights::INSPECT;
+    // Grant `INSPECT` alongside the requested rights (a `sys_handle_stat` before mapping). A
+    // read-only mount's file is never writable, whatever was asked for (administration Part C.3).
+    let mut rights = pl.requested | Rights::INSPECT;
+    if header.flags & FILE_BLOCKS_READ_ONLY != 0 {
+        rights = rights.difference(Rights::MAP_WRITE);
+    }
     match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
         Err(e) => {
@@ -2857,6 +2925,28 @@ fn build_and_install_file_blocks(
             (map_handle_err(e) as i32, 0)
         }
     }
+}
+
+/// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: the file's size, its
+/// filesystem block size and run map, and its identity — the registration and file id — which
+/// a non-zero id means it is cached under. `Err(OutOfMemory)` on allocation failure.
+fn new_block_file(
+    size: u32,
+    device: ObjectRef,
+    block_size: u32,
+    reg: ObjectRef,
+    file_id: u64,
+    runs: crate::libkern::KVec<crate::object::BlockRun>,
+) -> Result<ObjectRef, KError> {
+    use crate::object::{FileObject, Producer};
+    let fobj = FileObject::try_new_with_runs(
+        size as usize,
+        Producer::FsServerBlocks { device, block_size, reg, file_id },
+        runs,
+    )
+    .map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    Ok(unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) })
 }
 
 /// Complete a forwarded `File::ReadRange` reply: correlate it to the registration's

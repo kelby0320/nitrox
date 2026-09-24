@@ -94,11 +94,11 @@ pub const OP_FILE_RMDIR: u16 = 0x0604;
 pub const OP_FILE_RENAME: u16 = 0x0605;
 /// `File::Touch` — stamp the named file's modification time as "now".
 ///
-/// The odd one out among the `File::*` ops: it is addressed by **suffix on the server's
-/// forwarding endpoint**, not by name on a directory session, and it carries **no reply**.
-/// Both follow from who sends it — the *kernel*, after flushing a Model A file's dirty
-/// pages, to tell the server about a write it structurally could not have seen. See
-/// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
+/// The odd one out among the `File::*` ops: from the kernel it is addressed by **file id on
+/// the server's forwarding endpoint**, not by name on a directory session, and it carries **no
+/// reply**. Both follow from who sends it — the *kernel*, after flushing a Model A file's
+/// dirty pages, to tell the server about a write it structurally could not have seen. See
+/// [`file::parse_touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
 ///

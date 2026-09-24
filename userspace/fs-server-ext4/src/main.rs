@@ -583,18 +583,17 @@ fn try_resolve_directory<R: BlockReader + BlockWriter>(reader: &R) -> Option<(u6
 /// the file's `mtime` would keep reporting its last *size* change — a file edited ten times
 /// in place would look untouched since it was created.
 ///
-/// The timestamp is [`now_secs`], our own clock read. The wire carries only the path, so a
-/// writer cannot pick the time its write appears to have happened.
+/// The timestamp is [`now_secs`], our own clock read. The wire carries only the file's id —
+/// its inode number, which this server's block-file reply gave the kernel — so a writer
+/// cannot pick the time its write appears to have happened.
 ///
 /// A failure is dropped silently: the data is already durable, and there is no caller
 /// waiting on this. The cost of losing one is a stale timestamp — exactly the behaviour
 /// this replaces.
 fn try_touch<RW: BlockReader + BlockWriter>(reader: &RW) -> bool {
-    let mut path = [0u8; MAX_SUFFIX + 1];
-    path[0] = b'/';
     // SAFETY: `RECV_MSG` holds a just-received message; the slice is bounded by the
     // recorded payload length, itself clamped to the buffer.
-    let len = unsafe {
+    let ino = unsafe {
         let payload_len =
             u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
@@ -610,15 +609,12 @@ fn try_touch<RW: BlockReader + BlockWriter>(reader: &RW) -> bool {
         // From here it *is* a touch, so every exit returns `true` (consumed) even on a
         // malformed body — falling through would hand it to the resolve path, which would
         // try to answer a message that has no pending lookup behind it.
-        match parse_touch_request(m.body) {
-            Some(s) if !s.is_empty() && s.len() <= MAX_SUFFIX => {
-                path[1..1 + s.len()].copy_from_slice(s);
-                s.len()
-            }
+        match parse_touch_request(m.body).and_then(|id| u32::try_from(id).ok()) {
+            Some(ino) => ino,
             _ => return true,
         }
     };
-    let _ = ext4::touch_path(reader, &path[..1 + len], now_secs());
+    let _ = ext4::touch_file(reader, ino, now_secs());
     true
 }
 

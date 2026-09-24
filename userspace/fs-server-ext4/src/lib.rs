@@ -302,30 +302,58 @@ mod tests {
     }
 
     #[test]
-    fn touch_path_moves_mtime_without_touching_content_and_stays_e2fsck_clean() {
+    fn touch_file_moves_mtime_without_touching_content_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
-        ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
         ext4::grow_file(&rw, b"/system/edited", 1500, TEST_NOW).unwrap();
         assert_eq!(entry_stat(&rw, b"/system", b"edited"), (TEST_NOW, 1500));
+        // The id the kernel will touch by is the one the block-file reply gave it.
+        let mut runs = [BlockRun::default(); 8];
+        assert_eq!(ext4::map_file(&rw, b"/system/edited", &mut runs).unwrap().ino, ino);
 
         // The Model A case: the kernel wrote the bytes itself and is telling us so. No
         // size change, no structural change — only the timestamp moves.
         const LATER: i64 = TEST_NOW + 100;
-        ext4::touch_path(&rw, b"/system/edited", LATER).unwrap();
+        ext4::touch_file(&rw, ino, LATER).unwrap();
 
         assert_eq!(
             entry_stat(&rw, b"/system", b"edited"),
             (LATER, 1500),
             "touch must move mtime and leave the size alone"
         );
-        // A touch of something that is not there is an error, not a silent no-op — the
-        // kernel names the file by the suffix it resolved, so a miss means they disagree.
-        assert_eq!(
-            ext4::touch_path(&rw, b"/system/no-such-file", LATER),
-            Err(FsError::NotFound)
-        );
-        assert_e2fsck_clean(&rw.0.into_inner(), "touch");
+        // **Only a live regular file is stamped** — the id comes off the wire. Not a
+        // directory, not a number past the table, not `0`.
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        assert_eq!(ext4::touch_file(&rw, sys, LATER + 1), Err(FsError::NotFound));
+        assert_eq!(ext4::touch_file(&rw, 0, LATER + 1), Err(FsError::NotFound));
+        assert_eq!(ext4::touch_file(&rw, u32::MAX, LATER + 1), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.borrow(), "touch");
+
+        // And not a file unlinked since — a touch can trail the unlink of what it names, and
+        // stamping a freed inode would give e2fsck something to find.
+        ext4::unlink_at(&rw, sys, b"edited", LATER).unwrap();
+        assert_eq!(ext4::touch_file(&rw, ino, LATER + 2), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-unlink");
+    }
+
+    /// **A touch follows the file, not its old name** — the reason it is by id. The kernel
+    /// flushes a cached file long after the resolve that named it; by then a rename has moved
+    /// it, and a new file has taken the name.
+    #[test]
+    fn a_touch_by_id_after_a_rename_stamps_the_renamed_file() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let ino = ext4::create_file(&rw, b"/system", b"draft", TEST_NOW).unwrap();
+        ext4::rename_path(&rw, b"/system/draft", b"/system/final", false, TEST_NOW).unwrap();
+        let other = ext4::create_file(&rw, b"/system", b"draft", TEST_NOW).unwrap();
+        assert_ne!(other, ino, "the name now belongs to another file");
+
+        const LATER: i64 = TEST_NOW + 100;
+        ext4::touch_file(&rw, ino, LATER).unwrap();
+        assert_eq!(entry_stat(&rw, b"/system", b"final").0, LATER, "the written file");
+        assert_eq!(entry_stat(&rw, b"/system", b"draft").0, TEST_NOW, "not the name's new owner");
+        assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-rename");
     }
 
     #[test]
@@ -1272,7 +1300,7 @@ mod tests {
 
         // 6000 bytes needs 2 blocks; the other 3 must have come back.
         let mut runs = [BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 6000);
         let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
         assert_eq!(covered, 2, "only the blocks holding live bytes are mapped");
@@ -1302,7 +1330,7 @@ mod tests {
         assert_eq!(ext4::truncate_file(&rw, path, 0, TEST_NOW), Ok(0));
         assert_eq!(ext4::stat_file(&rw, path), Ok(0));
         let mut runs = [crate::BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 0);
         assert_eq!(runs[..n].iter().map(|r| r.length as u64).sum::<u64>(), 0);
         assert_e2fsck_clean(&rw.0.into_inner(), "truncate-zero");
@@ -1349,6 +1377,44 @@ mod tests {
         u32::from_le_bytes(img[1024 + 12..1024 + 16].try_into().unwrap())
     }
 
+    /// **A truncate and then a grow read zero over the regrown range, on the device** — a whole
+    /// block and a partial tail. The kernel fills a page it does not hold from the blocks the
+    /// map names, so what the device holds there is what a reader sees. Both halves reuse what
+    /// the truncate left: the tail stays in the kept block, and the freed block is where the
+    /// allocator's goal points — asserted, since a test that grew into a fresh block would pass
+    /// with no zeroing at all.
+    #[test]
+    fn a_truncate_then_a_grow_reads_zero_over_the_regrown_range() {
+        use crate::BlockRun;
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let path = b"/system/current-generation";
+        // Two blocks of a pattern, written to the device as the kernel's write-back would.
+        ext4::grow_file(&rw, path, 8192, TEST_NOW).unwrap();
+        let mut runs = [BlockRun::default(); 8];
+        let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let lbas: std::vec::Vec<u64> =
+            runs[..m.runs].iter().flat_map(|r| (0..r.length as u64).map(move |i| r.device_lba + i)).collect();
+        assert_eq!(lbas.len(), 2);
+        for &lba in &lbas {
+            BlockWriter::write_at(&rw, lba * 4096, &[0xAB; 4096]).unwrap();
+        }
+
+        ext4::truncate_file(&rw, path, 10, TEST_NOW).unwrap();
+        ext4::grow_file(&rw, path, 8192, TEST_NOW).unwrap();
+        let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let regrown: std::vec::Vec<u64> =
+            runs[..m.runs].iter().flat_map(|r| (0..r.length as u64).map(move |i| r.device_lba + i)).collect();
+        assert_eq!(regrown, lbas, "the grow took back the block the truncate freed");
+
+        let mut out = [0x55u8; 8192];
+        assert_eq!(ext4::read_file_range(&rw, path, 0, 8192, &mut out), Ok(8192));
+        assert_eq!(&out[..10], &[0xAB; 10], "the kept bytes");
+        assert!(out[10..4096].iter().all(|&b| b == 0), "the partial tail reads zero");
+        assert!(out[4096..].iter().all(|&b| b == 0), "the whole regrown block reads zero");
+        assert_e2fsck_clean(&rw.0.into_inner(), "truncate-grow");
+    }
+
     #[test]
     fn grow_file_appends_blocks_and_stays_e2fsck_clean() {
         use crate::BlockRun;
@@ -1362,7 +1428,7 @@ mod tests {
 
         // The block map now covers 2 blocks, none sparse.
         let mut runs = [BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 5000);
         let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
         assert_eq!(covered, 2);

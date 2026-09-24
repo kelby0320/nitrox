@@ -110,6 +110,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `35` | `sys_file_rename` |
 | `36` | `sys_process_terminate` |
 | `37` | `sys_ns_derive` |
+| `38` | `sys_ns_sync` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -322,6 +323,25 @@ is how it hands its namespace to someone. **A snapshot**: targets are shared, so
 same paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
 `OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
 broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
+
+```rust
+fn sys_ns_sync(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
+```
+**Writes back every dirty file** in the page cache of the userspace server that `path` resolves
+to in `ns`, and returns how many it wrote. That includes files nothing holds any more: a file
+mapped writable stays cached and dirty until a write-back cleans it, so a writer that exits
+without `sys_file_sync` loses nothing until this runs
+([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*).
+An unmount calls it before it marks a filesystem clean, and so will shutdown.
+
+Requires `LOOKUP` on `ns`. It changes no file; it only makes what was already written durable.
+`Unsupported` if `path` resolves to anything but a userspace server, and `NotFound` if it
+resolves to nothing. `IoError` if a write failed; the other files are still written, and a file
+whose write failed stays dirty.
+
+**It blocks** until the writes complete, as `sys_file_sync` does. That is the one documented
+exemption from async-first, for the same reason: a durability point is something the caller
+wants to know it has reached. (Syscall number `38`.)
 
 ### Entropy
 

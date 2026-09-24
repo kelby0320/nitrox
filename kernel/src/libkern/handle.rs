@@ -212,6 +212,11 @@ impl Rights {
         Rights(self.0 & other.0)
     }
 
+    /// Every bit of `self` that is not in `other`.
+    pub const fn difference(self, other: Rights) -> Self {
+        Rights(self.0 & !other.0)
+    }
+
     /// `true` iff `self ⊆ other`, i.e. every bit set in `self` is also
     /// set in `other`. The spec's normative definition of "is a subset
     /// of".

@@ -98,6 +98,10 @@ pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// handle with full namespace rights (so it can be transferred, which a process's own root
 /// cannot). Requires `LOOKUP` on `ns`. A snapshot: later changes to either do not reach the other.
 pub const SYS_NS_DERIVE: u64 = 37;
+/// `sys_ns_sync(ns, path, path_len)` — write back every dirty file cached under the userspace
+/// server `path` resolves to in `ns`, returning how many were written. Requires `LOOKUP` on
+/// `ns`. **Blocks** until the writes complete, like `sys_file_sync` — a durability point.
+pub const SYS_NS_SYNC: u64 = 38;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to

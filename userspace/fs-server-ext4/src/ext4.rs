@@ -13,6 +13,10 @@ pub const MAX_FILE: usize = 64 * 1024;
 /// Largest filesystem block the reader supports (its block scratch buffer).
 const MAX_BLOCK: usize = 4096;
 
+/// A block of zeroes, for what a grow adds ([`grow_file`]). Static rather than on the stack,
+/// which is a server thread's and small.
+static ZERO_BLOCK: [u8; MAX_BLOCK] = [0; MAX_BLOCK];
+
 const SUPER_MAGIC: u16 = 0xEF53;
 const ROOT_INO: u32 = 2;
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -453,33 +457,15 @@ fn dir_lookup<R: BlockReader>(
     Err(FsError::NotFound)
 }
 
-/// Resolve an absolute path to `(inode_number, inode_bytes)`, walking directories
-/// from the root inode.
-fn resolve_path<R: BlockReader>(
-    r: &R,
-    sb: &Superblock,
-    path: &[u8],
-) -> Result<[u8; 256], FsError> {
-    let mut inode = read_inode(r, sb, ROOT_INO)?;
-    for comp in path.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
-        if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
-            return Err(FsError::NotFound); // a path component is not a directory
-        }
-        let ino = dir_lookup(r, sb, &inode, comp)?;
-        inode = read_inode(r, sb, ino)?;
-    }
-    Ok(inode)
-}
-
-/// Resolve `path` (absolute) to a **regular extent file**, returning its inode
-/// bytes and exact size. Errors: `NotFound` (missing path / not a regular file),
+/// Resolve `path` (absolute) to a **regular extent file**, returning its inode number,
+/// its inode bytes and its exact size. Errors: `NotFound` (missing path / not a regular file),
 /// `Unsupported` (non-extent or inline-data inode), `Corrupt` / `Io`.
 fn resolve_regular_file<R: BlockReader>(
     r: &R,
     sb: &Superblock,
     path: &[u8],
-) -> Result<([u8; 256], usize), FsError> {
-    let inode = resolve_path(r, sb, path)?;
+) -> Result<(u32, [u8; 256], usize), FsError> {
+    let (ino, inode) = resolve_path_ino(r, sb, path)?;
     if rd_u16(&inode, 0) & S_IFMT != S_IFREG {
         return Err(FsError::NotFound);
     }
@@ -489,7 +475,7 @@ fn resolve_regular_file<R: BlockReader>(
     }
     let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
     let size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
-    Ok((inode, size))
+    Ok((ino, inode, size))
 }
 
 /// Resolve `path` (absolute) to a regular file and return its **size** without
@@ -498,7 +484,7 @@ fn resolve_regular_file<R: BlockReader>(
 /// Errors as [`resolve_regular_file`].
 pub fn stat_file<R: BlockReader>(r: &R, path: &[u8]) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (_, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, _, size) = resolve_regular_file(r, &sb, path)?;
     Ok(size)
 }
 
@@ -662,7 +648,7 @@ pub fn read_file_range<R: BlockReader>(
     out: &mut [u8],
 ) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     if offset >= size as u64 {
         return Ok(0);
     }
@@ -702,7 +688,7 @@ pub fn map_range<R: BlockReader>(
     out: &mut [crate::BlockRun],
 ) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     let bs = sb.block_size as u64;
     let file_blocks = size.div_ceil(bs as usize) as u64;
     let hdr = &inode[40..100];
@@ -728,18 +714,32 @@ pub fn map_range<R: BlockReader>(
     Ok(n)
 }
 
+/// What [`map_file`] found: the file, and how many of its runs it wrote.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MappedFile {
+    /// The file's size in bytes.
+    pub size: usize,
+    /// The filesystem's block size.
+    pub block_size: u32,
+    /// How many `BlockRun`s were written to the caller's buffer.
+    pub runs: usize,
+    /// **The file's inode number — its id to the kernel**, which keeps one page-cache object
+    /// per id (administration Part C.1). Never `0`: ext4 numbers inodes from 1.
+    pub ino: u32,
+}
+
 /// Resolve `path` to a regular file and map its **entire** block range to device runs (the
-/// **Model A** resolve): returns `(size, block_size, run_count)` with the runs in `out`.
-/// Coalesces contiguous runs. `Err(TooLarge)` if the file needs more runs than `out` holds
-/// (too fragmented to inline in a resolve reply — the standalone `MapRange` op handles that,
-/// deferred). Errors otherwise as [`resolve_regular_file`].
+/// **Model A** resolve), with the runs in `out`. Coalesces contiguous runs. `Err(TooLarge)`
+/// if the file needs more runs than `out` holds (too fragmented to inline in a resolve reply
+/// — the standalone `MapRange` op handles that, deferred). Errors otherwise as
+/// [`resolve_regular_file`].
 pub fn map_file<R: BlockReader>(
     r: &R,
     path: &[u8],
     out: &mut [crate::BlockRun],
-) -> Result<(usize, u32, usize), FsError> {
+) -> Result<MappedFile, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (ino, inode, size) = resolve_regular_file(r, &sb, path)?;
     let bs = sb.block_size;
     let file_blocks = size.div_ceil(bs as usize) as u64;
     let hdr = &inode[40..100];
@@ -763,7 +763,7 @@ pub fn map_file<R: BlockReader>(
         n += 1;
         lb += len;
     }
-    Ok((size, bs, n))
+    Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 
 // --- write path: block allocation + file growth (Part D) --------------------
@@ -777,8 +777,9 @@ fn bit_set(map: &mut [u8], i: usize) {
     map[i / 8] |= 1 << (i % 8);
 }
 
-/// Resolve a path to `(inode_number, inode_bytes)` — like [`resolve_path`] but keeps the
-/// number (the write path needs it to locate the inode on disk for write-back).
+/// Resolve an absolute path to `(inode_number, inode_bytes)`, walking directories from the
+/// root inode. The number is what the write path needs to locate the inode on disk, and what
+/// names a file to the kernel.
 fn resolve_path_ino<R: BlockReader>(
     r: &R,
     sb: &Superblock,
@@ -796,26 +797,15 @@ fn resolve_path_ino<R: BlockReader>(
     Ok((ino, inode))
 }
 
-/// The absolute device byte offset of inode `ino` (for writing it back).
-/// Stamp `path`'s modification time as `now` — the `File::Touch` entry point.
-///
-/// The one filesystem mutation that changes **no** content and no structure. It exists
-/// because Model A puts the kernel, not this server, on the file-data path: a same-length
-/// in-place overwrite reaches the device without any resolve, so nothing here would
-/// otherwise learn the file changed and `mtime` would keep reporting the last *size*
-/// change. The kernel sends this after flushing such a write.
-///
-/// `now` comes from the server's own clock reading, never from the wire — a writer does not
-/// get to choose what time it wrote.
 /// Stamp the modification time of `name` inside `dir_ino`, the **session-scoped**
-/// counterpart of [`touch_path`].
+/// counterpart of [`touch_file`].
 ///
-/// The path form exists for the kernel, which names a file absolutely when it reports a
-/// Model A write it has just flushed. A client cannot use that: it holds a *session* on
-/// one directory, and the whole point of the session design is that a handle addresses
-/// entries **by name** inside it, so confinement is structural rather than checked. This
-/// is the same shape as [`mkdir_at`] / [`unlink_at`] / [`rmdir_at`] for exactly that
-/// reason.
+/// The inode form exists for the kernel, which names a file by the id its block-file reply
+/// carried when it reports a Model A write it has just flushed. A client cannot use that: it
+/// holds a *session* on one directory, and the whole point of the session design is that a
+/// handle addresses entries **by name** inside it, so confinement is structural rather than
+/// checked. This is the same shape as [`mkdir_at`] / [`unlink_at`] / [`rmdir_at`] for exactly
+/// that reason.
 ///
 /// `now` comes from the server, never from the caller — a timestamp a client could
 /// choose would be forgeable metadata.
@@ -834,13 +824,36 @@ pub fn touch_at<RW: BlockReader + BlockWriter>(
     touch_inode(rw, &sb, target_ino, now, Stamp::Modified)
 }
 
-pub fn touch_path<RW: BlockReader + BlockWriter>(
+/// Stamp inode `ino`'s modification time as `now` — the `File::Touch` entry point, naming the
+/// file by the id [`map_file`] gave the kernel.
+///
+/// The one filesystem mutation that changes **no** content and no structure. It exists
+/// because Model A puts the kernel, not this server, on the file-data path: a same-length
+/// in-place overwrite reaches the device without any resolve, so nothing here would
+/// otherwise learn the file changed and `mtime` would keep reporting the last *size*
+/// change. The kernel sends this after flushing such a write.
+///
+/// By inode, not path, since administration Part C.1: the kernel flushes a cached file at a
+/// sync or an unmount, long after the resolve that named it, when a rename may have given its
+/// name to another file. **Only a live regular file is stamped** — `NotFound` for a number out
+/// of range, a freed inode or anything else — since the id comes off the wire, and a touch can
+/// arrive after the file it names was unlinked.
+///
+/// `now` comes from the server's own clock reading, never from the wire — a writer does not
+/// get to choose what time it wrote.
+pub fn touch_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
-    path: &[u8],
+    ino: u32,
     now: i64,
 ) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
-    let (ino, _) = resolve_path_ino(rw, &sb, path)?;
+    if ino == 0 || ino > sb.inodes_count {
+        return Err(FsError::NotFound);
+    }
+    let inode = read_inode(rw, &sb, ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG || rd_u16(&inode, 26) == 0 {
+        return Err(FsError::NotFound);
+    }
     touch_inode(rw, &sb, ino, now, Stamp::Modified)
 }
 
@@ -864,6 +877,7 @@ fn touch_inode<RW: BlockReader + BlockWriter>(
     rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])
 }
 
+/// The absolute device byte offset of inode `ino` (for writing it back).
 fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64, FsError> {
     let group = (ino - 1) / sb.inodes_per_group;
     let index = (ino - 1) % sb.inodes_per_group;
@@ -958,6 +972,13 @@ fn alloc_block<RW: BlockReader + BlockWriter>(
 /// is added only if the inline `i_block` header has room — otherwise `Unsupported` (extent-
 /// tree splitting / index nodes are deferred). Returns the new size. Metadata is written via
 /// the `BlockWriter`. See `docs/architecture/ext4-fs-server-rw.md`.
+///
+/// **Everything the grow adds reads as zero, on the device** (administration Part C.1): the old
+/// last block past the old size, and every block allocated. The kernel fills a page it does not
+/// hold from the blocks the map names, so the device is what a reader of the new range sees.
+/// Without this it saw whatever those blocks last held — after a truncate and a grow, the
+/// file's own old bytes, since the allocator's goal is the block the truncate just freed; on
+/// any grow, a deleted file's.
 pub fn grow_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
     path: &[u8],
@@ -982,8 +1003,17 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let cur_blocks = cur_size.div_ceil(bs);
     let new_blocks = new_size.div_ceil(bs);
 
+    // The old last block past the old end: a truncate leaves the bytes it cut there.
+    let within = cur_size % bs;
+    if within != 0 {
+        let phys = extent_find(rw, &sb, &inode[40..100], (cur_blocks - 1) as u64)?;
+        if phys != 0 {
+            rw.write_at(phys * bs as u64 + within as u64, &ZERO_BLOCK[..bs - within])?;
+        }
+    }
     for lb in cur_blocks..new_blocks {
-        append_block(rw, &sb, &mut inode, lb as u64)?;
+        let phys = append_block(rw, &sb, &mut inode, lb as u64)?;
+        rw.write_at(phys * bs as u64, &ZERO_BLOCK[..bs])?;
     }
 
     // Update inode size (i_size_lo @4, hi @108) + block count (i_blocks_lo @28, 512-B units).
@@ -1969,7 +1999,7 @@ pub fn truncate_file<RW: BlockReader + BlockWriter>(
 /// [`resolve_regular_file`], plus `TooLarge` (file > [`MAX_FILE`] or > `out`).
 pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     if size > MAX_FILE || size > out.len() {
         return Err(FsError::TooLarge);
     }

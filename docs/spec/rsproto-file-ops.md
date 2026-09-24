@@ -162,8 +162,15 @@ session is scoped to one by construction.
 
 ### Touch (`0x0606`)
 
-Request body: `suffix_len: u16`, two reserved bytes, then the suffix naming the file under
-the mount. **No reply**, and `request_id` is `0` — nothing correlates it.
+Request body, from the kernel: `file_id: u64`, the id the file's `FILE_BLOCKS` reply carried
+([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md) § *The `FILE_BLOCKS` body*). **No
+reply**, and `request_id` is `0` — nothing correlates it. On a directory session, where a client
+sends it, the body is a name, like the session's other ops.
+
+**By id since administration Part C.1** (2026-09-24); it named the file by suffix before. The
+kernel now writes back a cached file at a sync or an unmount, long after the resolve that named
+it, and a rename may have given that name to another file by then. A server stamps only a live
+regular file, since the id comes off the wire and a touch can trail the unlink of what it names.
 
 The odd one out of the `File` ops on three counts, all following from who sends it. It
 comes from the **kernel**, on the **forwarding channel** rather than a directory session,

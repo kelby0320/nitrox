@@ -174,15 +174,40 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-**Concurrent same-page faults.** When a file page fault misses, the fault path reserves
-the frame (`Loading`), starts the producer fill, and parks the faulting thread on a
-per-*fault* `PendingOperation`. A *second* thread faulting the **same** page has no handle
-on that in-flight fill's PO, so it `yield_now`s and retries until the page is `Ready` — a
-spin, not a block. This was unreachable when written (single CPU, one faulter per
-`FileObject`); **under SMP it is reachable today**, and `std::thread` makes it ordinary.
-The fix — store the fill PO in the cache page so a second faulter blocks on it (one wakeup,
-no spin) — is scheduled as **B3 of the pre-CLI substrate-hardening pass**
-(`docs/planning/phase-4-desktop.md`).
+**Concurrent same-page faults — resolved by administration Part C.1 (2026-09-24).** When a
+file page fault missed, the fault path reserved the frame (`Loading`), started the producer
+fill, and parked the faulting thread on a per-*fault* `PendingOperation`. A *second* thread
+faulting the **same** page had no handle on that in-flight fill's PO, so it `yield_now`ed and
+retried until the page was `Ready` — a spin, not a block. The fix this entry named is what
+landed: the page carries the fill's PO, and a second faulter blocks on it. Whoever wakes first
+settles the page.
+
+It was scheduled as B3 of the pre-CLI substrate-hardening pass and did not land there. C.1 made
+it a prerequisite. With one object per file, every process running one binary shares its image,
+so concurrent faults on a page became ordinary. The spin then stopped a `test-qemu` boot
+outright: the fault handler runs with interrupts off, and `yield_now` returns at once when nothing
+else is ready, so the spinning CPU acknowledged no TLB shootdown. A faulter that finds the PO's
+waiter slots full (`PendingOperation::MAX_WAITERS`) parks for a millisecond and retries. It does
+not spin.
+
+**Retired page-cache frames live as long as their object — `TODO(retired-frames)`.** A truncate
+of a cached Model A file takes the pages past the new end out of the cache's index. No fault
+finds them again and no write-back writes them, but a mapping that faulted one in still points
+at its frame, and the kernel keeps no reverse map to say which page tables do. So the frames are
+freed only when the object drops. A long-lived object truncated and refilled over and over, a log
+rotated in place under a mapping held open, grows by the resident pages each truncate retires.
+The fix is a mapping count, which would let a truncate free the frames when nothing maps the
+object, or a reverse map, which would let it unmap them. Trigger: a workload that truncates a
+file held mapped, repeatedly.
+
+**A write-back in flight across a truncate — `TODO(truncate-inflight-writeback)`.** A write-back
+snapshots each resident page and its device block under the object's lock, then issues the IRPs
+unlocked. A truncate that arrives meanwhile frees blocks the snapshot names, and if the server
+hands one to something else before the IRP lands, the IRP overwrites it. `File::Forget`
+(administration Part C.1b) closes the same window for an unlinked file: the server waits for the
+kernel's answer before it frees anything. A truncate needs the same handshake for the blocks it
+frees, and the plan did not size it. Trigger: a truncate of a file being synced concurrently,
+which nothing does today: `libfs` truncates before it maps.
 
 **Kernel log buffer is keep-early, not keep-recent (slice 9 Part 5).** `klog`
 (`/dev/log`) is a **linear append** buffer: it captures kernel `kprint!` output from
@@ -236,7 +261,14 @@ axes. **(1) Per-file, not global.** Each `FileObject` owns a sparse page table; 
 processes that independently resolve the same path get separate caches. Global,
 inode-keyed sharing (one physical page shared across every mapping of a file) needs a
 stable file identity the fs-server exposes and is deferred — trigger: a workload that
-maps the same file hot from many processes. **(2) No eviction/reclaim.** The cache
+maps the same file hot from many processes. **Resolved for Model A by administration Part C.1
+(2026-09-24)**: a block filesystem's resolve reply carries the file's id (its inode, for ext4),
+and each registration keeps one object per id, which every resolve shares
+([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*).
+The trigger that fired was not a hot workload. Unmount and shutdown have to write back
+everything a filesystem handed out, which needs the objects to be enumerable. A Model B file
+still gets an object per resolve, since no Model B server exists to give an id. **(2) No
+eviction/reclaim.** The cache
 grows to the mapped extent and is freed only on unmap / `FileObject` drop; the
 clock-algorithm reclaim daemon + `Notification::MemoryPressure` is Phase 3+ — trigger:
 caches that can grow past comfortable bounds (large files, many mappings). **(3)
@@ -1176,6 +1208,12 @@ observable), which is the same machinery a periodic writeback daemon needs. Trig
 writeback daemon, a file large enough that flushing clean pages costs real time, or a
 consumer that actually depends on `mtime` meaning "content changed".
 
+Since administration Part C.1 (2026-09-24) there is **dirty per object**: a `FileObject` mapped
+writable is dirty, and holds a reference to itself, until a write-back that began with no
+writable mapping and saw none made. That is what keeps an unsynced writer's pages until a sync.
+It is coarser than this entry's fix and does not replace it. A write-back still writes every
+resident page of a dirty object.
+
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
 it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC
@@ -1896,10 +1934,11 @@ the others:
 
 **Shared read-only text is *not* in this bundle** — it needs no CoW (the existing
 `FileBacked` kind suffices) and is scheduled as **B4a of the pre-CLI substrate-hardening
-pass** (`docs/planning/phase-4-desktop.md`). One design constraint it exposes and this
-bundle inherits: every resolve mints a **fresh `FileObject` with its own page cache**, so
-sharing across instances requires the spawner to reuse one image handle per program (or,
-later, inode-keyed global caching).
+pass** (`docs/planning/phase-4-desktop.md`). One design constraint it exposed: every resolve
+minted a **fresh `FileObject` with its own page cache**, so sharing across instances required
+the spawner to reuse one image handle per program, or inode-keyed caching. The second arrived with
+administration Part C.1 (2026-09-24), for files on a block filesystem: every resolve of a binary
+now shares one object.
 
 **Trigger for the bundle:** the GUI toolkit / desktop-apps milestone — several apps linking
 one toolkit, with real `.data`/`.bss` and enough concurrent instances that private copies

@@ -614,10 +614,11 @@ impl Host for NitroxHost {
             core::slice::from_raw_parts_mut(addr as *mut u8, bytes.len())
                 .copy_from_slice(bytes);
         }
-        // SAFETY: flush, unmap and close what we created.
+        // SAFETY: unmap, flush and close what we created — unmapped before the flush, since
+        // one that begins with a writable mapping in place leaves the file dirty.
         unsafe {
-            syscall2(SYS_FILE_SYNC, fh, 0);
             syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+            syscall2(SYS_FILE_SYNC, fh, 0);
             syscall1(SYS_HANDLE_CLOSE, fh);
         }
         Ok(())

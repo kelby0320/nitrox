@@ -15,8 +15,8 @@ use crate::{BlockReader, FsError, ext4};
 use libkern::KError;
 use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
 use librsproto::namespace::{
-    OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY, RESOLVE_REPLY_LEN,
-    parse_resolve_request, resolve_reply,
+    BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY,
+    RESOLVE_REPLY_LEN, file_blocks_prefix, parse_resolve_request, resolve_reply,
 };
 use librsproto::{
     OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode,
@@ -112,11 +112,11 @@ pub fn serve_resolve<R: BlockReader>(
         // device handle).
         let mut runs = [crate::BlockRun::default(); MAX_RUNS];
         return match ext4::map_file(reader, path, &mut runs) {
-            Ok((size, _, _)) if size > u32::MAX as usize => {
+            Ok(m) if m.size > u32::MAX as usize => {
                 error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE)
             }
-            Ok((size, block_size, n)) => {
-                match model_a_reply(reply, request_id, size, block_size, &runs[..n]) {
+            Ok(m) => {
+                match model_a_reply(reply, request_id, &m, &runs[..m.runs]) {
                     Some(reply_len) => Served::LazyBlocks { reply_len },
                     None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
                 }
@@ -190,29 +190,25 @@ fn success_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Optio
 }
 
 /// Build a **Model A** lazy `ResolveReply` into `reply`: `OBJECT_KIND_FILE_BLOCKS` +
-/// `content_len` = file size, then `block_size` + the `BlockRun` map, with `handle_count = 1`
-/// (the caller transfers the device handle). Body layout matches `rsproto-block-ops.md` /
-/// the kernel's `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too
-/// small.
+/// `content_len` = file size, then the block size, the file's inode number as its id, and the
+/// `BlockRun` map, with `handle_count = 1` (the caller transfers the device handle). Body
+/// layout matches `rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body* and the kernel's
+/// `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too small.
 fn model_a_reply(
     reply: &mut [u8],
     request_id: u64,
-    size: usize,
-    block_size: u32,
+    m: &ext4::MappedFile,
     runs: &[crate::BlockRun],
 ) -> Option<usize> {
-    let mut body = [0u8; 16 + MAX_RUNS * 24];
-    // ResolveReply prefix (kind @0, _reserved @2, content_len @4) — 8 bytes.
-    resolve_reply(&mut body, OBJECT_KIND_FILE_BLOCKS, size as u32)?;
-    body[8..12].copy_from_slice(&block_size.to_le_bytes());
-    body[12..16].copy_from_slice(&(runs.len() as u32).to_le_bytes());
-    let mut off = 16;
+    let mut body = [0u8; FILE_BLOCKS_PREFIX_LEN + MAX_RUNS * BLOCK_RUN_WIRE_LEN];
+    let mut off =
+        file_blocks_prefix(&mut body, m.size as u32, m.block_size, runs.len() as u32, m.ino as u64, 0)?;
     for r in runs {
         body[off..off + 8].copy_from_slice(&r.file_block.to_le_bytes());
         body[off + 8..off + 16].copy_from_slice(&r.device_lba.to_le_bytes());
         body[off + 16..off + 20].copy_from_slice(&r.length.to_le_bytes());
         body[off + 20..off + 24].copy_from_slice(&r.flags.to_le_bytes());
-        off += 24;
+        off += BLOCK_RUN_WIRE_LEN;
     }
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
 }
@@ -462,10 +458,19 @@ mod tests {
                 let run_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
                 assert_eq!(block_size, 1024);
                 assert_eq!(run_count, 1);
-                // The single run covers file block 0, non-hole, length 1.
-                let file_block = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                let device_lba = u64::from_le_bytes(body[24..32].try_into().unwrap());
-                let length = u32::from_le_bytes(body[32..36].try_into().unwrap());
+                // The file's id is its inode — what the kernel keeps one object per, and what
+                // it will touch by. Nothing here is read-only.
+                let file_id = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                let flags = u32::from_le_bytes(body[24..28].try_into().unwrap());
+                let mut runs = [crate::BlockRun::default(); 4];
+                let ino = ext4::map_file(&r, b"/system/current-generation", &mut runs).unwrap().ino;
+                assert!(ino > 2, "a file's inode, not the root's");
+                assert_eq!(file_id, ino as u64);
+                assert_eq!(flags, 0);
+                // The single run, at 32, covers file block 0, non-hole, length 1.
+                let file_block = u64::from_le_bytes(body[32..40].try_into().unwrap());
+                let device_lba = u64::from_le_bytes(body[40..48].try_into().unwrap());
+                let length = u32::from_le_bytes(body[48..52].try_into().unwrap());
                 assert_eq!(file_block, 0);
                 assert_eq!(length, 1);
                 assert_ne!(device_lba, 0);

@@ -136,7 +136,16 @@ The 8-byte `ResolveReply` above, then:
 |---|---|---|
 | 8 | 4 | `block_size` — the filesystem's block size, in bytes |
 | 12 | 4 | `run_count` |
-| 16 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
+| 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`. `0` means none: the kernel gives such a file an object of its own, uncached |
+| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for |
+| 28 | 4 | reserved, zero |
+| 32 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
+
+`file_id` and `flags` arrived with administration Part C.1 (2026-09-24), moving the runs from
+offset 16 to 32. Both sides are in-tree and pre-stabilization, so this was a flag-day change
+(`librsproto::namespace::file_blocks_prefix` writes it, `kernel/src/rsproto.rs` reads it). Every
+resolve of a file with an id, a grow, create and truncate included, updates the one object to the
+size and map its reply carries.
 
 ### Reply body (error)
 

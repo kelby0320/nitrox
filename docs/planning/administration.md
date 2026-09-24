@@ -1121,6 +1121,13 @@ namespace, with no login and no session.
       alone passes for both; `File::Touch` by id after a rename. **A `boot-probe` check**: a file
       written through one mapping is read through another without a sync, a write whose handle was
       closed unsynced reaches the device on `sys_ns_sync`, and an unlink's pages are not written back.
+
+      **C.1a landed 2026-09-24: everything above but `File::Forget`**, which is C.1b, with its two
+      host tests and the unlink half of the probe check. Beyond the list, C.1a had to build two
+      things: a second faulter now waits on the fill's PO, since the old spin hung `test-qemu`,
+      and a grow zeroes on the device what it adds, since the regrown range's zeroes depended on
+      it. It also added a probe check for the truncate and the grow, end to end. The decision log
+      has the reasons.
 - [ ] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
       non-data path and FLUSH CACHE EXT; the RAM disk; a partition passing it to its disk.
       `boot-probe` flushes the root disk and the probe asserts completion.

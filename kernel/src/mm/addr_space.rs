@@ -58,7 +58,7 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
-use crate::object::{MemoryObject, ObjectRef};
+use crate::object::{FileObject, MemoryObject, ObjectRef};
 use crate::libkern::lockrank::LockRank;
 
 /// Base of the `hint == 0` ("anywhere") mapping window for
@@ -560,9 +560,24 @@ impl AddressSpace {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
+        // **A writable mapping is counted, and dirties the file, before the lock** — the file's
+        // own lock is never taken inside this one (administration Part C.1). The VMA's `Drop`
+        // lowers the count again; a mapping refused below undoes it here, since its VMA drops
+        // without its object.
+        let writable = prot.contains(Protection::WRITE);
+        if writable {
+            FileObject::writable_mapped(&object);
+        }
+        let refused = |object: ObjectRef, e: MapError| {
+            if writable {
+                FileObject::writable_unmapped(object.as_ptr());
+            }
+            Err((object, e))
+        };
         let mut guard = self.inner.lock();
         if guard.vma_tree.find_first_overlapping(range).is_some() {
-            return Err((object, MapError::Overlap));
+            drop(guard);
+            return refused(object, MapError::Overlap);
         }
         boxed.object = Some(object);
         // No PTEs — `fault_in` backs each page on demand from the page cache.
@@ -573,7 +588,8 @@ impl AddressSpace {
                     .object
                     .take()
                     .expect("file-backed VMA carries its ObjectRef");
-                Err((object, MapError::Overlap))
+                drop(guard);
+                refused(object, MapError::Overlap)
             }
         }
     }
@@ -1346,6 +1362,40 @@ mod tests {
         // The last reference drops → the object is destroyed and frees its frames.
         drop(keep);
         assert_eq!(test_probe::file_object_destroys(), 1);
+    }
+
+    /// **A writable mapping is counted for as long as its VMA exists** (administration Part
+    /// C.1), whichever way the VMA goes — an unmap, or its address space dropping — and a map
+    /// that is refused counts nothing. A read-only mapping is never counted. The count is what
+    /// keeps a dirty file from being called clean while something could still write it.
+    #[test]
+    fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let obj = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
+        let fo = || {
+            // SAFETY: `obj` pins a live `FileObject` for the whole test.
+            unsafe { &*(obj.as_ptr() as *const FileObject) }
+        };
+        asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+        assert_eq!(fo().writable_maps(), 1);
+        // Refused for overlapping the first: counted and uncounted again.
+        let (back, _) = asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap_err();
+        drop(back);
+        assert_eq!(fo().writable_maps(), 1, "a refused map leaves no count behind");
+        // Read-only: not counted.
+        asp.map_file(range(PAGE * 8, PAGE * 9), Protection::USER, obj.clone()).unwrap();
+        assert_eq!(fo().writable_maps(), 1);
+        // An unmap uncounts.
+        drop(asp.unmap_covering(va(PAGE * 4)).unwrap());
+        assert_eq!(fo().writable_maps(), 0);
+        // And so does an address space dropping with one still in place.
+        let asp2 = AddressSpace::new().unwrap();
+        asp2.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+        assert_eq!(fo().writable_maps(), 1);
+        drop(asp2);
+        assert_eq!(fo().writable_maps(), 0);
+        drop(asp);
     }
 
     // --- Demand paging: lazy reservation + on-fault backing --------------
