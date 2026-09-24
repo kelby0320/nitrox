@@ -263,8 +263,9 @@ than an implementation detail.
    **The device manager comes last in the step because the display arm depends on it**: from
    Part B.3 `input-server` takes its devices from `/svc/devices`.
 4. **Bring up the display arm** — `input-server` at `/dev/input/new`, then `compositor` at
-   `/dev/draw`. Both non-fatal: a machine with no i8042 has no raw input nodes, the server
-   says so and exits, and everything else comes up normally.
+   `/dev/draw`. Both non-fatal. The input server takes its devices from `/svc/devices/input`
+   (administration Part B.3) and serves with whatever arrived: a machine with no i8042, or a
+   boot without the device manager, has an input server with no devices, which says so.
 
    **The order within the step is load-bearing**: the compositor resolves `/dev/input/new`
    during its own startup, before it answers `Ready`. Spawned the other way round it would

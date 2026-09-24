@@ -28609,3 +28609,58 @@ handles a message carries.
   ten now have one.
 - **`boot-flow.md`'s overview still drew `auth-service` under `service-mgr`**, which §6 of the same
   document says stopped at M7. Its list of init's bindings is now init's, in order.
+
+## 2026-09-24 — Administration B.3: `input-server` takes its devices from the manager
+
+`input-server` no longer opens `/dev/input/raw/0` and `/1`. It subscribes to
+`/svc/devices/input`, and the device manager's replay hands it each keyboard and mouse as a node.
+The i8042's two nodes are registry ids 10 and 11 on a test boot.
+- **It keeps them in a table of up to eight slots.**
+- **It serves from `Settled` with whatever arrived.** With none, or with a keyboard alone, it
+  serves; it used to exit for want of either device.
+- **A `Departed` retires its device's slot.** Nothing sends one until Phase 6, so the handling is
+  host-tested.
+- **There is no fallback to the raw paths.** A boot pointed at the wrong subscription path came up
+  with an input server serving no devices, said so, and carried on.
+
+**The merge takes any number of devices.** It is ordered by group start, as before, and a tie goes
+to the lower slot. Coldplug arrives in registry order, so the keyboard still wins a tie, as it did
+when the merge took exactly two. **A wakeup's merge is forwarded as batches that end on group
+boundaries.** Eight devices' reads are 256 records, and one message's payload holds 248, so
+one wakeup's worth could no longer promise to fit one message. A batch stays at 65 records, two
+devices' worth, so today's machine still sends one message per wakeup. A group longer than a batch,
+which a read cannot produce, goes alone rather than split.
+
+**Three details of the loop:**
+- **`Settled` is bounded by five seconds.** The manager queues its replay before the resolve
+  completes (B.2), so `Settled` is waiting the moment the channel is. The bound is for a manager
+  that is not behaving, and anything arriving after it still joins.
+- **A departing device's parked read is safe to walk away from.** `ps2`'s `submit_read` clones its
+  own reference to the buffer object, so the kernel writes into memory it keeps alive. That was
+  read in the kernel before relying on it.
+- **The subscription is read after the harvest, not during it.** A departure closes a device's
+  read, and a later record in the same wait's results could name that handle.
+
+**`libkern`'s `DeviceRecord::read`** takes one record from exactly its bytes, at any alignment. The
+snapshot iterator now uses it, so the unsafe read exists once.
+
+**Controls.** Ten mutations of the library each fail a test:
+- a tie to the higher slot;
+- a merge of two sources only;
+- fixed-size chunks;
+- a long group split;
+- no duplicate check;
+- the highest free slot taken instead of the lowest;
+- a departure that keeps its slot;
+- an arrival accepted without its node;
+- any kind accepted as input;
+- a `MERGE_MAX` of two devices.
+
+The last one passed at first: the test asserted the merge returned `MERGE_MAX`, and a smaller
+`MERGE_MAX` shrank the buffer and the expectation together. It is now held to the harvest.
+
+**`boot-probe` asserts `input` is held.** A subscription to it must be refused, which is how a probe
+sees that the input server took its devices from the manager; the wrong-path boot fails it.
+
+`input-subsystem.md` §2, §4, §5 and §6, `rsproto-input-ops.md`, `boot-flow.md` and `init`'s comments
+no longer describe the input server resolving raw nodes or exiting without them.

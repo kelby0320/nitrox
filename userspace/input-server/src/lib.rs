@@ -1,9 +1,10 @@
 //! `input-server` — the merge, and nothing that needs a kernel.
 //!
-//! The half of the input server with all the behaviour and none of the syscalls: taking two
-//! devices' event streams and producing one ordered stream, and tracking what a consumer
-//! missed. `main.rs` is the part that cannot be host-tested — reading the raw nodes, serving
-//! `/dev/input/new`, and sending on channels.
+//! The half of the input server with all the behaviour and none of the syscalls: taking the
+//! devices' event streams and producing one ordered stream, tracking what a consumer missed, and
+//! keeping the set of devices the device manager hands over ([`devices`]). `main.rs` is the part
+//! that cannot be host-tested — subscribing, reading the device nodes, serving `/dev/input/new`,
+//! and sending on channels.
 //!
 //! See `docs/spec/rsproto-input-ops.md` for the contract this implements and
 //! `docs/architecture/input-subsystem.md` for why the server exists at all.
@@ -19,8 +20,22 @@ use libkern::abi::{EV_REL, EV_SYN, InputEvent, REL_WHEEL, REL_X, REL_Y, SYN_DROP
 /// whole scheduler quantum behind still has far fewer than this waiting.
 pub const PER_DEVICE: usize = 32;
 
-/// Events in one merged batch — both devices' worth.
+/// Devices read at once: a keyboard and a mouse today, with room for Phase 6's.
+pub const MAX_DEVICES: usize = 8;
+
+/// Events one wakeup can harvest — every device's read — and so what [`merge`] must hold.
+pub const MERGE_MAX: usize = PER_DEVICE * MAX_DEVICES;
+
+/// Events in one `Events` message's batch.
+///
+/// **Two devices' worth**, so a keyboard and a mouse — today's machine — always fit one message.
+/// A wakeup that harvested more is sent as consecutive batches, each ending on a group boundary
+/// ([`batches`]): one message cannot hold every device's worth, since eight devices' reads are
+/// more records than a message's payload.
 pub const BATCH_MAX: usize = PER_DEVICE * 2 + 1;
+
+// A group is at most one device's read, so every group fits in a batch.
+const _: () = assert!(PER_DEVICE < BATCH_MAX);
 
 /// The relative axes a deferred batch carries forward, in the order they are re-emitted.
 ///
@@ -46,10 +61,11 @@ fn axis_of(e: &InputEvent) -> Option<usize> {
     DEFERRED_AXES.iter().position(|&code| code == e.code)
 }
 
-/// Merge two devices' event streams into one batch, ordered by `time_ns`.
+/// Merge the devices' event streams into one run, ordered by `time_ns`. `sources` is each
+/// device's harvest, by slot; an empty one takes no part, and past [`MAX_DEVICES`] are ignored.
 ///
 /// **Groups move whole.** The merge advances a `SYN`-terminated group at a time rather than
-/// a record at a time, comparing the *first* record of each side's next group. Sorting
+/// a record at a time, comparing the *first* record of each source's next group. Sorting
 /// records individually would be wrong twice over: records within a group share a timestamp,
 /// so their relative order would depend on the sort's stability, and a group split across
 /// the output is exactly what `rsproto-input-ops.md` promises never happens.
@@ -61,24 +77,27 @@ fn axis_of(e: &InputEvent) -> Option<usize> {
 /// for.
 ///
 /// Returns the number of events written to `out`.
-pub fn merge(kbd: &[InputEvent], mouse: &[InputEvent], out: &mut [InputEvent]) -> usize {
-    let (mut i, mut j, mut n) = (0usize, 0usize, 0usize);
+pub fn merge(sources: &[&[InputEvent]], out: &mut [InputEvent]) -> usize {
+    let mut cursor = [0usize; MAX_DEVICES];
+    let mut n = 0usize;
     loop {
-        let ka = group_at(kbd, i);
-        let ma = group_at(mouse, j);
-        let take_kbd = match (ka, ma) {
-            (None, None) => break,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            // Ties go to the keyboard: arbitrary, but *deterministic*, which the display
-            // arm's determinism rule asks of anything a test hashes or matches on.
-            (Some(k), Some(m)) => kbd[k.0].time_ns <= mouse[m.0].time_ns,
-        };
-        let (src, span, cursor) = if take_kbd {
-            (kbd, ka.expect("checked"), &mut i)
-        } else {
-            (mouse, ma.expect("checked"), &mut j)
-        };
+        // The source whose next group starts earliest. **Ties go to the lower slot**: arbitrary,
+        // but *deterministic*, which the display arm's determinism rule asks of anything a test
+        // hashes or matches on. Coldplug arrives in registry order, so the keyboard holds the
+        // lower slot and wins a tie, as it did when this merged exactly two.
+        let mut best: Option<(usize, (usize, usize))> = None;
+        for (s, src) in sources.iter().enumerate().take(MAX_DEVICES) {
+            let Some(span) = group_at(src, cursor[s]) else { continue };
+            let earlier = match best {
+                None => true,
+                Some((b, bspan)) => src[span.0].time_ns < sources[b][bspan.0].time_ns,
+            };
+            if earlier {
+                best = Some((s, span));
+            }
+        }
+        let Some((s, span)) = best else { break };
+        let src = sources[s];
         // **All of the group or none of it.** Copying record-by-record and stopping when
         // `out` fills delivers a partial group — the one thing the protocol promises never
         // to do — and the caller cannot tell, because a short return looks like "that is all
@@ -89,9 +108,47 @@ pub fn merge(kbd: &[InputEvent], mouse: &[InputEvent], out: &mut [InputEvent]) -
         }
         out[n..n + len].copy_from_slice(&src[span.0..span.1]);
         n += len;
-        *cursor = span.1;
+        cursor[s] = span.1;
     }
     n
+}
+
+/// Split `events` into consecutive runs of at most `max` records, **each ending on a group
+/// boundary** — how a wakeup that harvested more than one message holds is sent, in order, as
+/// several. Together the runs are `events`, whole.
+///
+/// A group longer than `max` goes alone rather than split. A device's read cannot produce one — a
+/// group is at most one read, and a read at most [`PER_DEVICE`] — so this is the answer to a bug
+/// upstream, and it keeps the promise that matters to a consumer: a group is never split.
+pub fn batches(events: &[InputEvent], max: usize) -> Batches<'_> {
+    Batches { events, at: 0, max }
+}
+
+/// The runs [`batches`] yields, as ranges of its `events`.
+pub struct Batches<'a> {
+    events: &'a [InputEvent],
+    at: usize,
+    max: usize,
+}
+
+impl Iterator for Batches<'_> {
+    type Item = core::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<core::ops::Range<usize>> {
+        let start = self.at;
+        let mut end = start;
+        while let Some((_, next)) = group_at(self.events, end) {
+            if next - start > self.max && end > start {
+                break;
+            }
+            end = next;
+        }
+        if end == start {
+            return None;
+        }
+        self.at = end;
+        Some(start..end)
+    }
 }
 
 /// The half-open range of the group starting at `from`, or `None` at the end.
@@ -250,6 +307,131 @@ impl Consumer {
     }
 }
 
+pub mod devices {
+    //! **The devices this server reads are the device manager's to hand over** (administration
+    //! Part B.3). The server subscribes to `/svc/devices/input`; the manager replays every
+    //! keyboard and mouse as an `Arrived` carrying its node, then says `Settled`
+    //! (`docs/spec/rsproto-devices-ops.md`). This is what the server decides with: what each
+    //! message on that channel is, and which slot each device holds.
+    //!
+    //! **A slot is where a device lives in `main.rs`** — its node, its read buffer and its
+    //! outstanding read — and its place in the merge, where the lower slot wins a tie.
+
+    use super::MAX_DEVICES;
+    use libkern::device::{DeviceKind, DeviceRecord};
+    use librsproto::devices::{
+        OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed,
+        parse_settled,
+    };
+
+    /// A message on the subscription, classified.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Notice {
+        /// A keyboard or a mouse, whose node came with it.
+        Arrived {
+            /// Its registry id — what a `Departed` will name.
+            id: u32,
+            /// Keyboard or mouse.
+            kind: DeviceKind,
+        },
+        /// A device that is not input. The manager never sends one on this class; if it did,
+        /// reading a disk as input events would be worse than refusing it, so its node is closed.
+        NotInput {
+            /// Its registry id.
+            id: u32,
+            /// What it is instead.
+            kind: DeviceKind,
+        },
+        /// The replay is over: this many arrived.
+        Settled(u32),
+        /// The device with this registry id has gone.
+        Departed(u32),
+        /// Anything else: an op this category does not have, a body of the wrong size, or an
+        /// arrival without exactly one node.
+        Malformed,
+    }
+
+    /// Classify a message on the subscription: its `op`, its `body`, and how many handles came
+    /// with it.
+    pub fn notice(op: u16, body: &[u8], handles: usize) -> Notice {
+        match op {
+            OP_DEVICES_ARRIVED if handles == 1 => match parse_arrived(body).and_then(DeviceRecord::read) {
+                Some(r) if matches!(r.kind(), DeviceKind::Keyboard | DeviceKind::Mouse) => {
+                    Notice::Arrived { id: r.id, kind: r.kind() }
+                }
+                Some(r) => Notice::NotInput { id: r.id, kind: r.kind() },
+                None => Notice::Malformed,
+            },
+            OP_DEVICES_SETTLED if handles == 0 => parse_settled(body).map_or(Notice::Malformed, Notice::Settled),
+            OP_DEVICES_DEPARTED if handles == 0 => {
+                parse_departed(body).map_or(Notice::Malformed, Notice::Departed)
+            }
+            _ => Notice::Malformed,
+        }
+    }
+
+    /// What [`Table::arrive`] did with a device.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Arrival {
+        /// It holds this slot now.
+        Slot(usize),
+        /// It already held one. A second node for the same device would be a second reader,
+        /// which the kernel refuses, so the new node is closed.
+        Already,
+        /// Every slot is taken.
+        Full,
+    }
+
+    /// Which registry id holds each slot.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Table {
+        ids: [Option<u32>; MAX_DEVICES],
+    }
+
+    impl Table {
+        /// No devices.
+        pub const fn new() -> Table {
+            Table { ids: [None; MAX_DEVICES] }
+        }
+
+        /// Give device `id` the lowest free slot.
+        pub fn arrive(&mut self, id: u32) -> Arrival {
+            if self.ids.contains(&Some(id)) {
+                return Arrival::Already;
+            }
+            match self.ids.iter().position(Option::is_none) {
+                Some(slot) => {
+                    self.ids[slot] = Some(id);
+                    Arrival::Slot(slot)
+                }
+                None => Arrival::Full,
+            }
+        }
+
+        /// Free device `id`'s slot, and say which it was. `None` for a device it does not hold.
+        pub fn depart(&mut self, id: u32) -> Option<usize> {
+            let slot = self.ids.iter().position(|&s| s == Some(id))?;
+            self.ids[slot] = None;
+            Some(slot)
+        }
+
+        /// The device in `slot`, if any.
+        pub fn id(&self, slot: usize) -> Option<u32> {
+            self.ids.get(slot).copied().flatten()
+        }
+
+        /// How many devices it holds.
+        pub fn len(&self) -> usize {
+            self.ids.iter().filter(|s| s.is_some()).count()
+        }
+
+        /// Whether it holds none.
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,14 +450,14 @@ mod tests {
     #[test]
     fn an_empty_merge_produces_nothing() {
         let mut out = [InputEvent::default(); BATCH_MAX];
-        assert_eq!(merge(&[], &[], &mut out), 0);
+        assert_eq!(merge(&[], &mut out), 0);
     }
 
     #[test]
     fn one_device_passes_through_unchanged() {
         let kbd = [key(30, 10), syn(10)];
         let mut out = [InputEvent::default(); BATCH_MAX];
-        let n = merge(&kbd, &[], &mut out);
+        let n = merge(&[&kbd], &mut out);
         assert_eq!(&out[..n], &kbd);
     }
 
@@ -286,7 +468,7 @@ mod tests {
         let kbd = [key(30, 100), syn(100)];
         let mouse = [InputEvent { kind: EV_KEY, code: BTN_LEFT, value: 1, time_ns: 95 }, syn(95)];
         let mut out = [InputEvent::default(); BATCH_MAX];
-        let n = merge(&kbd, &mouse, &mut out);
+        let n = merge(&[&kbd, &mouse], &mut out);
         assert_eq!(n, 4);
         assert_eq!(out[0].code, BTN_LEFT, "the click was earlier, so it leads");
         assert_eq!(out[2].code, 30);
@@ -306,7 +488,7 @@ mod tests {
         let kbd = [key(30, 100), syn(110)];
         let mouse = [rel(5, 105), syn(106)];
         let mut out = [InputEvent::default(); BATCH_MAX];
-        let n = merge(&kbd, &mouse, &mut out);
+        let n = merge(&[&kbd, &mouse], &mut out);
         assert_eq!(n, 4);
         assert_eq!(out[0].kind, EV_KEY, "the keyboard group starts first");
         assert_eq!(out[1].kind, EV_SYN, "and its terminator follows immediately");
@@ -320,7 +502,7 @@ mod tests {
         let kbd = [key(30, 10), syn(10), key(31, 30), syn(30)];
         let mouse = [rel(1, 20), syn(20), rel(2, 40), syn(40)];
         let mut out = [InputEvent::default(); BATCH_MAX];
-        let n = merge(&kbd, &mouse, &mut out);
+        let n = merge(&[&kbd, &mouse], &mut out);
         let times: Vec<u64> = out[..n].iter().map(|e| e.time_ns).collect();
         assert_eq!(times, vec![10, 10, 20, 20, 30, 30, 40, 40]);
     }
@@ -333,8 +515,8 @@ mod tests {
         let mouse = [rel(1, 50), syn(50)];
         let mut a = [InputEvent::default(); BATCH_MAX];
         let mut b = [InputEvent::default(); BATCH_MAX];
-        let n1 = merge(&kbd, &mouse, &mut a);
-        let n2 = merge(&kbd, &mouse, &mut b);
+        let n1 = merge(&[&kbd, &mouse], &mut a);
+        let n2 = merge(&[&kbd, &mouse], &mut b);
         assert_eq!(&a[..n1], &b[..n2]);
         assert_eq!(a[0].kind, EV_KEY, "ties go to the keyboard");
     }
@@ -343,7 +525,7 @@ mod tests {
     fn a_full_output_truncates_at_a_group_boundary_not_inside_one() {
         let kbd = [key(30, 10), syn(10), key(31, 20), syn(20)];
         let mut out = [InputEvent::default(); 3];
-        let n = merge(&kbd, &[], &mut out);
+        let n = merge(&[&kbd], &mut out);
         assert_eq!(n, 2, "the first group fits; the second does not, so it is not started");
     }
 
@@ -353,7 +535,159 @@ mod tests {
         // losing the events.
         let kbd = [key(30, 10)];
         let mut out = [InputEvent::default(); BATCH_MAX];
-        assert_eq!(merge(&kbd, &[], &mut out), 1);
+        assert_eq!(merge(&[&kbd], &mut out), 1);
+    }
+
+    /// **More than two devices merge the same way**: by group start, whole groups, and a tie to
+    /// the lower slot — here the third device's group ties the second's and follows it.
+    #[test]
+    fn three_devices_merge_by_group_start_with_ties_to_the_lower_slot() {
+        let a = [key(30, 30), syn(30)];
+        let b = [rel(1, 10), syn(10), rel(2, 20), syn(20)];
+        let c = [rel(9, 20), syn(20)];
+        let mut out = [InputEvent::default(); MERGE_MAX];
+        let n = merge(&[&a, &b, &c], &mut out);
+        let order: Vec<(u64, i32)> = out[..n].iter().step_by(2).map(|e| (e.time_ns, e.value)).collect();
+        assert_eq!(order, vec![(10, 1), (20, 2), (20, 9), (30, KEY_PRESS)]);
+    }
+
+    /// **A slot with nothing harvested takes no part**, wherever it sits — a departed device's
+    /// slot between two live ones is an empty source.
+    #[test]
+    fn an_empty_source_between_two_takes_no_part() {
+        let kbd = [key(30, 10), syn(10)];
+        let mouse = [rel(1, 5), syn(5)];
+        let mut out = [InputEvent::default(); MERGE_MAX];
+        let n = merge(&[&kbd, &[], &mouse], &mut out);
+        assert_eq!(n, 4);
+        assert_eq!((out[0].kind, out[2].kind), (EV_REL, EV_KEY));
+    }
+
+    /// **Every device's worth fits one merge**: `MERGE_MAX` is what `main.rs` sizes its buffer
+    /// with, and a merge that ran out of room would drop the groups it did not reach. Held to the
+    /// harvest, not to `MERGE_MAX` — a buffer sized too small would fill exactly and agree with
+    /// itself.
+    #[test]
+    fn a_full_harvest_from_every_device_merges_whole() {
+        let one: Vec<InputEvent> = (0..PER_DEVICE as u64 / 2).flat_map(|t| [rel(1, t), syn(t)]).collect();
+        let sources: Vec<&[InputEvent]> = (0..MAX_DEVICES).map(|_| &one[..]).collect();
+        let harvest: usize = sources.iter().map(|s| s.len()).sum();
+        assert_eq!(harvest, PER_DEVICE * MAX_DEVICES, "every device read a full buffer");
+        let mut out = [InputEvent::default(); MERGE_MAX];
+        assert_eq!(merge(&sources, &mut out), harvest);
+    }
+
+    /// **A harvest is sent as batches that end on group boundaries**, in order, each at most a
+    /// message's worth, and together the whole harvest.
+    #[test]
+    fn a_long_harvest_is_split_only_between_groups() {
+        // Groups of three records: a batch of eight holds two, never two and two-thirds.
+        let events: Vec<InputEvent> =
+            (0..5u64).flat_map(|t| [rel(1, t), InputEvent { kind: EV_REL, code: REL_Y, value: 1, time_ns: t }, syn(t)]).collect();
+        let runs: Vec<core::ops::Range<usize>> = batches(&events, 8).collect();
+        assert_eq!(runs, vec![0..6, 6..12, 12..15]);
+        for r in &runs {
+            assert_eq!(events[r.end - 1].code, SYN_REPORT, "each ends a group");
+        }
+        assert_eq!(batches(&events, 15).collect::<Vec<_>>(), vec![0..15], "one batch when it fits");
+        assert_eq!(batches(&[], 8).count(), 0, "nothing to send, no batch");
+    }
+
+    /// **A group longer than a batch goes alone rather than split** — which a device's read cannot
+    /// produce, and which would otherwise be the one way to break the promise a consumer relies on.
+    #[test]
+    fn a_group_longer_than_a_batch_goes_whole_and_alone() {
+        let events = [rel(1, 1), rel(2, 1), rel(3, 1), syn(1), key(30, 2), syn(2)];
+        let runs: Vec<core::ops::Range<usize>> = batches(&events, 2).collect();
+        assert_eq!(runs, vec![0..4, 4..6]);
+    }
+
+    mod devices {
+        use crate::MAX_DEVICES;
+        use crate::devices::{Arrival, Notice, Table, notice};
+        use libkern::device::{DeviceKind, DeviceRecord};
+        use librsproto::devices::{
+            OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed,
+            build_settled,
+        };
+
+        fn arrived(id: u32, kind: DeviceKind) -> Vec<u8> {
+            let mut raw = [0u8; 144];
+            raw[0..4].copy_from_slice(&id.to_le_bytes());
+            raw[8..12].copy_from_slice(&kind.as_u32().to_le_bytes());
+            let r = DeviceRecord::read(&raw).unwrap();
+            let mut out = [0u8; 144];
+            let n = build_arrived(&mut out, r.as_bytes()).unwrap();
+            out[..n].to_vec()
+        }
+
+        /// **Each message is what it says, and nothing else is**: an arrival needs its node, a
+        /// `Settled` or `Departed` carries none, and a body of another size is refused.
+        #[test]
+        fn a_notice_is_classified_by_op_body_and_handles() {
+            let kbd = arrived(6, DeviceKind::Keyboard);
+            assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd, 1), Notice::Arrived { id: 6, kind: DeviceKind::Keyboard });
+            assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd, 0), Notice::Malformed, "no node");
+            assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd[..143], 1), Notice::Malformed, "a record short");
+            let disk = arrived(2, DeviceKind::Disk);
+            assert_eq!(notice(OP_DEVICES_ARRIVED, &disk, 1), Notice::NotInput { id: 2, kind: DeviceKind::Disk });
+            let mut w = [0u8; 4];
+            let n = build_settled(&mut w, 2).unwrap();
+            assert_eq!(notice(OP_DEVICES_SETTLED, &w[..n], 0), Notice::Settled(2));
+            assert_eq!(notice(OP_DEVICES_SETTLED, &w[..n], 1), Notice::Malformed, "a handle it does not carry");
+            let n = build_departed(&mut w, 7).unwrap();
+            assert_eq!(notice(OP_DEVICES_DEPARTED, &w[..n], 0), Notice::Departed(7));
+            assert_eq!(notice(OP_DEVICES_DEPARTED, &w[..3], 0), Notice::Malformed);
+            assert_eq!(notice(0x0F7F, &w[..n], 0), Notice::Malformed, "an op the category lacks");
+        }
+
+        /// **Arrivals in any order**: whichever comes first takes the lowest slot, and the set is
+        /// the same.
+        #[test]
+        fn arrivals_in_any_order_each_take_the_lowest_free_slot() {
+            let mut t = Table::new();
+            assert_eq!(t.arrive(7), Arrival::Slot(0), "the mouse, first this time");
+            assert_eq!(t.arrive(6), Arrival::Slot(1));
+            assert_eq!((t.id(0), t.id(1), t.len()), (Some(7), Some(6), 2));
+            assert_eq!(t.arrive(6), Arrival::Already, "a second node for one device is a second reader");
+            assert_eq!(t.len(), 2);
+        }
+
+        /// **A keyboard alone is a table of one** — where the server used to exit for want of a
+        /// mouse.
+        #[test]
+        fn a_keyboard_alone_is_served() {
+            let mut t = Table::new();
+            assert_eq!(t.arrive(6), Arrival::Slot(0));
+            assert_eq!(t.len(), 1);
+            assert!(Table::new().is_empty(), "and none is a table too");
+        }
+
+        /// **A departure mid-stream frees its slot for the next arrival**, and names nothing it
+        /// does not hold.
+        #[test]
+        fn a_departure_frees_its_slot_and_only_its_own() {
+            let mut t = Table::new();
+            t.arrive(6);
+            t.arrive(7);
+            t.arrive(9);
+            assert_eq!(t.depart(7), Some(1));
+            assert_eq!(t.depart(7), None, "already gone");
+            assert_eq!(t.depart(42), None, "never held");
+            assert_eq!((t.id(0), t.id(1), t.id(2), t.len()), (Some(6), None, Some(9), 2));
+            assert_eq!(t.arrive(11), Arrival::Slot(1), "the gap is reused");
+        }
+
+        /// **Past the last slot a device is refused**, and the table is unchanged.
+        #[test]
+        fn a_device_past_the_last_slot_is_refused() {
+            let mut t = Table::new();
+            for id in 0..MAX_DEVICES as u32 {
+                assert_eq!(t.arrive(id), Arrival::Slot(id as usize));
+            }
+            assert_eq!(t.arrive(99), Arrival::Full);
+            assert_eq!(t.len(), MAX_DEVICES);
+        }
     }
 
     #[test]

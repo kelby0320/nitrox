@@ -29,7 +29,7 @@ manager has no room for is `WouldBlock`**: it waits on every channel in one wait
 
 | Class | Kinds | Owner |
 |---|---|---|
-| `input` | keyboard, mouse | `input-server` (from Part B.3) |
+| `input` | keyboard, mouse | `input-server`, from boot on |
 | `block` | disk, partition, RAM disk | the storage service (Part C) |
 
 A console or a PCI function is in no class, and is only ever information.

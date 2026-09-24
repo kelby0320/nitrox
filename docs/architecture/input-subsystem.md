@@ -3,7 +3,8 @@
 **Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11),
 loss reworked so relative motion survives a slow consumer (2026-08-26), a key-press count for the
 hardware report (Phase 5 Part D, 2026-09-14), input routed only after the requests sent before
-it (2026-09-22) — and this document describes what exists.** The whole path from an interrupt to a keystroke
+it (2026-09-22), the input server's devices handed over by the device manager (administration
+Part B.3, 2026-09-24) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
@@ -12,6 +13,7 @@ arriving in a widget runs on every boot:
 | Per-device lossy ring with a `SYN_DROPPED` marker | `kernel/src/drivers/ps2/ring.rs` |
 | The `InputEvent` record crossing the kernel boundary | `kernel/src/libkern/input.rs` |
 | Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
+| Each keyboard and mouse handed to the input server | `userspace/device-mgr/` |
 | The merged stream at `/dev/input/new` | `userspace/input-server/` |
 | Device stream → logical events, and the keymap | `userspace/libinput/` |
 | Focus, hit-testing, implicit grab, key repeat | `userspace/compositor/src/input.rs` |
@@ -89,10 +91,11 @@ this system already does with the console.
   /dev/input/raw/0   /dev/input/raw/1              emitting InputEvent records
       │            │
       └──────┬─────┘
-             ▼
+             ▼  each node handed over by device-mgr, which the input server subscribes
+             ▼  to at /svc/devices/input: Arrived per device, then Settled (§5)
       ┌──────────────┐                             userspace resource server
-      │ input-server │   merge · policy · hotplug  holds every raw node exclusively
-      └──────┬───────┘
+      │ input-server │   merge · policy · devices  the input class's one owner: every
+      └──────┬───────┘                             keyboard and mouse, up to eight
              │  /dev/input/new  → a per-consumer channel
              ▼
       ┌──────────────┐                             holds /dev/input/new
@@ -243,7 +246,8 @@ wire break.
 |---|---|---|
 | Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; the i8042's one-byte output buffer needs a prompt ISR — *and* a tick-driven sweep for the bytes that buffer loses, see §2 |
 | Scancode → keycode | kernel driver | One small table every consumer would otherwise duplicate; getting it wrong is a bug, not a preference (`display-substrate.md` §5) |
-| Merging device streams; hotplug; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
+| Which devices exist, and handing each to the owner of its class | `device-mgr` | Coldplug is a replay of the registry, and Phase 6's hotplug follows on the same channel; one owner per class keeps the kernel's one reader per device |
+| Merging device streams; taking devices as they arrive and depart; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
 | Keycode + modifiers → text (layouts, dead keys, compose) | `libinput` | Policy and data; a layout must not be a rebuild of anything |
 | Focus, hit-testing, routing to a window | compositor | It owns stacking; routing anywhere else needs a second copy of that state |
@@ -294,7 +298,8 @@ layers away.
 
 | Path | Served by | Held by |
 |---|---|---|
-| `/dev/input/raw/<n>` | kernel, one char `DeviceNode` per device | `input-server`, exclusively |
+| `/dev/input/raw/<n>` | kernel, one char `DeviceNode` per device | the root namespace; nothing resolves it on the input path |
+| `/svc/devices/input` | `device-mgr` | `input-server`, the class's one owner — a second subscription is refused |
 | `/dev/input/new` | `input-server` | the compositor |
 | *(nothing)* | — | ordinary clients |
 
@@ -309,9 +314,18 @@ layers away.
   raw device into *every* session namespace unconditionally, a bind left vestigial when the
   shell moved to `/dev/tty`. Nothing in the mechanism prevented it. The keylogging argument
   below is only as true as the binding discipline, so the raw nodes are bound **only** into
-  the input-server's namespace, and a session's `/dev` projection does not carry them. That
-  holds today: the kernel binds `/dev/input/raw/<n>` into the root namespace at boot, and
-  `init` hands the input-server a namespace handle through which it resolves them.
+  the root namespace, and a session's `/dev` projection does not carry them. The kernel binds
+  `/dev/input/raw/<n>` there at boot.
+
+  **Since administration Part B.3 the input server resolves none of them.** It subscribes to
+  `/svc/devices/input`, also bound only in the root namespace, and the device manager hands it
+  each keyboard and mouse as a node ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+  The exclusivity is kept at the manager as well: **a class has one owner at a time**, so a
+  second subscriber is refused while the input server holds `input`, where a second reader of a
+  raw node would drain events meant for the first. The server serves from `Settled` with
+  whatever arrived — with no devices, or a keyboard alone, where it used to exit — and **there
+  is no fallback to the raw paths**: a path that runs only when the first is broken is a path
+  nobody tests.
 - Holding `/dev/input/new` is the authority to receive merged input for the whole machine.
   The compositor has it. Nothing else does, which is what makes keylogging a namespace
   question rather than a permission check.
@@ -332,9 +346,13 @@ sandboxed compositor a construction rather than a feature.
   is its own capability-model question. This design is what will later host such a driver
   without the compositor noticing, because the record format and `/dev/input/new` do not
   change.
-- **USB HID, hotplug, multitouch slots, gesture recognition.** All land in the
+- **USB HID, multitouch slots, gesture recognition.** All land in the
   `input-server` or `libinput` when there is hardware to justify them. None requires a
   kernel change, which is the point of the arrangement.
+- **A hotplug event source.** The input server already takes devices as they arrive and depart
+  — up to eight, each `Departed` retiring its slot — because the device manager's replay is how
+  it gets even the i8042's two. What is missing is anything that *produces* a later arrival or a
+  departure, which is Phase 6's USB driver.
 - **Key repeat.** ~~Belongs in `libinput`~~ — **decided 2026-08-10: the compositor generates
   it** (M4 Part C, [`widget-toolkit.md`](widget-toolkit.md) §9.2). It cannot live in
   `libinput`: that crate is pure and issues no syscalls, so it has nowhere to put a timer.

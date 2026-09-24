@@ -218,13 +218,15 @@ static mut SPAWN_DEVICES: SpawnArgs = SpawnArgs {
 };
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
-/// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
-/// `BIND_NAMESPACE`; init binds its endpoint on its behalf.
+/// `/svc/devices/input`, where the device manager hands it its devices (administration Part
+/// B.3). **No syscaps**: like every resource server, it does not hold `BIND_NAMESPACE`; init
+/// binds its endpoint on its behalf.
 ///
-/// **It is the only process that should ever resolve the raw nodes.** They are bound in the
-/// root namespace and nowhere else, and no session namespace projects them — reading one
-/// unfiltered is a keylogger, and the binding is the whole of that boundary
-/// (`docs/architecture/input-subsystem.md` §5).
+/// **It is the only process that should ever read the raw nodes**, and it is the input class's
+/// one owner at the manager, which refuses a second. The nodes' paths, `/dev/input/raw/*`, are
+/// bound in the root namespace and nowhere else, and no session namespace projects them or
+/// `/svc/devices` — reading one unfiltered is a keylogger, and the binding is the whole of that
+/// boundary (`docs/architecture/input-subsystem.md` §5).
 static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/input-server
     handle_count: 1,
@@ -232,8 +234,8 @@ static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
     arg0: 0,
     handles: [0; 4],
     // `TRANSFER` is the one that is easy to omit and fails late: `Meta::Ready` carries the
-    // forwarding endpoint as a handle transfer, so without it the server comes up, opens
-    // both devices, and only then cannot announce itself.
+    // forwarding endpoint as a handle transfer, so without it the server comes up, takes its
+    // devices, and only then cannot announce itself.
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
@@ -1241,8 +1243,9 @@ fn bind_clipboard_server(root_ns: u64) -> bool {
 /// for `Meta::Ready`, bind the forwarding endpoint it carries. The server never binds
 /// anything itself and holds no `BIND_NAMESPACE`.
 ///
-/// Returns `false` on any failure, which is not fatal to the boot: a machine with no i8042
-/// has no raw nodes, the server exits saying so, and everything else comes up normally.
+/// Returns `false` on any failure, which is not fatal to the boot. A machine with no i8042 is not
+/// one: the server takes its devices from `/svc/devices/input`, bound before it, and serves with
+/// none.
 fn bind_input_server(root_ns: u64) -> bool {
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
     let cr = unsafe {
@@ -1851,9 +1854,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // The input server first, and **the order is load-bearing**: the compositor resolves
     // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
     // other way round it would find nothing bound and serve the display with no input, for
-    // the life of the boot, with only a log line to say so. Not fatal either way — a machine
-    // with no i8042 has no raw nodes, the server says so and exits, and everything else
-    // comes up normally.
+    // the life of the boot, with only a log line to say so. Not fatal either way — the input
+    // server takes its devices from the device manager and serves with whatever arrived, so a
+    // machine with no i8042 has an input server with no devices, and everything else comes up
+    // normally.
     if !bind_input_server(root_ns) {
         kprint(b"init: no input server; /dev/input/new unavailable\n");
     }

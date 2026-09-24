@@ -11322,8 +11322,9 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
 
-    // `input-server`'s merge — two devices' streams into one ordered batch, and what a slow
-    // consumer is owed. Same split and the same reason: all the behaviour, no syscalls.
+    // `input-server`'s merge — the devices' streams into one ordered run, sent as batches that
+    // end on group boundaries — what a slow consumer is owed, and the set of devices the device
+    // manager hands over. Same split and the same reason: all the behaviour, no syscalls.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")

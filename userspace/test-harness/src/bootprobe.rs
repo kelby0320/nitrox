@@ -1514,10 +1514,10 @@ fn registry_test(root_ns: u64) -> bool {
 /// - **a second subscription is refused while the first is held**, and taken once it is closed —
 ///   one owner per class, the kernel's one reader per device kept at the manager;
 /// - **`info` lists `all.tsm` and a file per device, and `all.tsm` is a table** with a row per
-///   device the registry has.
-///
-/// `input` is `input-server`'s from boot on; subscribing to it here would stall the keyboard,
-/// which is the rule working, so the probe leaves it alone.
+///   device the registry has;
+/// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
+///   sees that the input server took its devices from the manager rather than from the raw paths.
+///   Were it not held, this resolve would take the class for a moment and give it back.
 fn devices_test(root_ns: u64) -> bool {
     use libkern::device::DeviceKind;
     use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived, parse_settled};
@@ -1612,6 +1612,15 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(what);
     }
 
+    // `input` has its owner from boot on: `init` waits for `input-server`'s `Ready`, which comes
+    // only after it has subscribed and settled.
+    let (st, input) = ns_lookup(root_ns, b"/svc/devices/input", chan);
+    close(input);
+    if st != libkern::KError::AlreadyExists.as_i32() {
+        Line::new().s(b"boot-probe: devices: a subscription to input answered ").i(st as i64).end();
+        return fail(b"input is not held, so input-server did not take its devices from the manager");
+    }
+
     // The information side.
     let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
     let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
@@ -1651,7 +1660,7 @@ fn devices_test(root_ns: u64) -> bool {
     Line::new()
         .s(b"boot-probe: devices: block replayed ")
         .u(block_ids.len() as u64)
-        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, all.tsm has ")
+        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, all.tsm has ")
         .u(rows as u64)
         .s(b" rows ok")
         .end();

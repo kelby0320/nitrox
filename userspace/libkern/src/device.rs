@@ -159,6 +159,18 @@ const _: () = assert!(offset_of!(DeviceRecord, driver) == 56);
 const _: () = assert!(offset_of!(DeviceRecord, name) == 72);
 
 impl DeviceRecord {
+    /// One record from exactly its size in bytes — a snapshot's slot, or what a
+    /// `Devices::Arrived` carries. `None` for any other length.
+    pub fn read(bytes: &[u8]) -> Option<DeviceRecord> {
+        if bytes.len() != size_of::<DeviceRecord>() {
+            return None;
+        }
+        // SAFETY: `bytes` is exactly `size_of::<DeviceRecord>()` long, and every bit pattern is a
+        // valid `DeviceRecord` (integers and byte arrays only). `read_unaligned` because neither a
+        // mapped snapshot nor a message body promises the struct's alignment.
+        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<DeviceRecord>()) })
+    }
+
     /// The record's bytes, as the kernel wrote them — what a `Devices::Arrived` carries.
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: `DeviceRecord` is `repr(C)` with an explicit `_pad`, so every byte is
@@ -214,12 +226,8 @@ impl Iterator for Records<'_> {
         }
         let off = size_of::<RegistryHeader>() + self.next * size_of::<DeviceRecord>();
         self.next += 1;
-        // `records` checked every counted record fits, so this slice is whole.
-        let raw = &self.bytes[off..off + size_of::<DeviceRecord>()];
-        // SAFETY: `raw` is exactly `size_of::<DeviceRecord>()` bytes, and every bit pattern is a
-        // valid `DeviceRecord` (integers and byte arrays only). `read_unaligned` because a mapped
-        // snapshot is only page-aligned by accident of how it was obtained.
-        Some(unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<DeviceRecord>()) })
+        // `records` checked every counted record fits, so this slice is whole and `read` takes it.
+        DeviceRecord::read(&self.bytes[off..off + size_of::<DeviceRecord>()])
     }
 }
 
@@ -321,5 +329,17 @@ mod tests {
         assert_eq!(records(&size).err(), Some(SnapshotError::BadRecordSize));
         assert_eq!(records(&[0u8; 15]).err(), Some(SnapshotError::Short));
         assert_eq!(records(&header(0)).unwrap().len(), 0, "an empty table reads");
+    }
+
+    /// **One record from exactly its bytes**, at an odd address — a message body promises no
+    /// alignment — and nothing from a body a byte short or a byte long.
+    #[test]
+    fn a_record_reads_from_exactly_its_bytes() {
+        let mut buf = [0u8; 1 + 145];
+        buf[1..145].copy_from_slice(&record(7, DeviceKind::Mouse));
+        let r = DeviceRecord::read(&buf[1..145]).unwrap();
+        assert_eq!((r.id, r.kind()), (7, DeviceKind::Mouse));
+        assert!(DeviceRecord::read(&buf[1..144]).is_none());
+        assert!(DeviceRecord::read(&buf[1..146]).is_none());
     }
 }

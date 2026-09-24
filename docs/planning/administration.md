@@ -865,10 +865,14 @@ namespace, with no login and no session.
       is closed; `info` lists `all.tsm` and a file per device, and `all.tsm` decodes to a row per
       registry record. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
       without stalling the keyboard — which is the rule working.)
-- [ ] **B.3 — `input-server` from the manager.** Subscribe; a device table of up to eight; serve
-      from `Settled`, with none or one; retire on `Departed`. Host tests on the library: arrivals
-      in any order, a keyboard alone, a departure mid-stream. `check-input` (and its
-      `--no-ps2-irq` variant) is the regression gate, unchanged.
+- [x] **B.3 — `input-server` from the manager** *(2026-09-24)*. Subscribe; a device table of up
+      to eight; serve from `Settled`, with none or one; retire on `Departed`. Host tests on the
+      library: arrivals in any order, a keyboard alone, a departure mid-stream — and the merge
+      over any number of devices, forwarded as batches that end on group boundaries, since eight
+      devices' reads are more than one message holds. `check-input` (and its `--no-ps2-irq`
+      variant) is the regression gate, unchanged. **`boot-probe` now asserts `input` is held**:
+      a subscription to it is refused, which is how a probe sees that the input server took its
+      devices from the manager.
 - [ ] **B.4 — `/dev/devices` for anyone.** The manager's endpoint couriered along Part A's chain;
       both login supervisors bind `/dev/devices` with the base `/info`, and `desktop-shell` binds
       it into application namespaces.
