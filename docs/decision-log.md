@@ -28825,3 +28825,47 @@ subtree server answers lookups and cannot be listed, and what lists its table in
 `/dev/registry` in the root namespace and `/dev/devices` everywhere else.
 
 Part B is ticked as built, not complete: it becomes complete when its PR merges, as Part A did.
+
+## 2026-09-24 — Administration Part B, reviewed: an exit, an order, and three lists caught up
+
+PR #333's review found nothing blocking: three findings worth fixing and three optional, all
+taken. It broke the production code under every new host test, 26 mutations, and 25 were caught;
+the one that was not is optional 4 below.
+
+**1. A root endpoint with no peer made `device-mgr` spin.** The event loop dropped
+`serve_resolve`'s `false` for the endpoint bound at `/svc/devices`. The kernel keeps a peer-closed
+channel signalled permanently (`IpcChannel::already_signaled`: `… || inner.peer.is_null()`, read to
+confirm), so if `init`'s bind failed, having already closed the only other handle, every wait
+returned at once and the manager held a CPU for the life of the boot. It now says
+`device-mgr: forwarding endpoint closed` and exits, as `input-server` does in the same place. The
+review traced this and did not boot it. A boot with `init`'s bind path made relative printed the
+bind failure, then the manager's exit line, then `init: no device manager`. Every other channel in
+the manager's wait set already closed or released on a closed peer.
+
+**2. The registration order stated in two docs and a test fixture was one no boot follows.**
+`drivers::probe` publishes the RAM disks before the GPT pass, so they come before every partition,
+their own included. On the laptop's live boot with Nitrox installed, `/dev/blk/1` is the RAM disk.
+`device-node.md` and `device-manager.md` now give the order the code has. The kernel fixture
+`booted()` is reordered to it rather than just re-commented, since a fixture named after the boot
+should be one. B.1's five controls were run again on the reordered fixture, and each still fails
+its test.
+
+**3. `session-mgr/CLAUDE.md` described a crate three parts out of date.** Its handoff list had three
+positional receives where there are six, the sixth this Part's info-only endpoint. Its sandbox list
+("That list is the sandbox. Nothing else is reachable") lacked `/dev/tty`, `/dev/clipboard`,
+`/dev/views`, `/dev/devices`, `/applications` and `/system/fonts`. Both are caught up, with each
+conditional member named by its flag. This is the rule that a crate's own rules file outlives the
+change.
+
+**Optional, all taken:**
+- **4. `Declined` → `OUTCOME_DECLINED` had no test.** The review swapped it for `OUTCOME_CLAIMED`
+  and all five `device::tests` passed. The outcome test now gives the fixture's third PCI function
+  a declined outcome, and that swap fails it.
+- **5. `input.yml`'s path filter** listed none of `kernel/src/device.rs`, `device-mgr`, the
+  registry's reader, the `Devices` protocol or `input-server`. The last had never been listed, so a
+  change confined to any of them did not schedule `check-input`. All five are added, and the
+  filter's comment says the table owns the i8042 nodes.
+- **6. `TODO(svc-auth-ungated)`** now has a paragraph for `/svc/devices`. Its cost is first-come
+  class ownership: until Part C's storage service subscribes, any holder of the root namespace can
+  take `block`, every disk, and hold it. Until the constructed-namespace fix, the storage service
+  should be spawned by `init` before anything declared, as `input-server` is.

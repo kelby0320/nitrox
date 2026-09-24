@@ -16,10 +16,23 @@ on:
       - 'kernel/src/drivers/ps2/**'
       - 'kernel/src/arch/x86_64/ps2.rs'
       - 'kernel/src/libkern/input.rs'
-      # The device nodes are published by the driver but *served* here, and bound in
-      # `main.rs`; either can make the raw nodes unresolvable without touching the driver.
+      # The device nodes are published by the driver, **owned by the device table** in
+      # `device.rs` since administration Part B — `/dev/input/raw/<n>` resolves through the
+      # table's served index — served in `kernel_server.rs`, and bound in `main.rs`. Any of the
+      # three can make the raw nodes unresolvable without touching the driver.
+      - 'kernel/src/device.rs'
       - 'kernel/src/object/kernel_server.rs'
       - 'kernel/src/main.rs'
+      # **Everything between the table and the merged stream** (administration Part B): the
+      # registry's reader, the device manager that hands each keyboard and mouse to the input
+      # server, the protocol it hands them over in, and the input server itself — which was never
+      # listed, so a change confined to it did not schedule the one gate that presses a key
+      # (PR #333 review, finding 5). `check-terminal` and `check-login` are unconditional and type
+      # through this path, which is coverage by luck rather than by the filter.
+      - 'userspace/libkern/src/device.rs'
+      - 'userspace/device-mgr/**'
+      - 'userspace/librsproto/src/devices.rs'
+      - 'userspace/input-server/**'
       # The DPC hands its parked read to thread context through `reap_pending`; a change to
       # either side can leave a reader blocked forever with the driver still reporting armed.
       - 'kernel/src/sched.rs'

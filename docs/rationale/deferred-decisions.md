@@ -508,6 +508,19 @@ the same fix closes both: supervisors given *constructed* namespaces, so that on
 supervisors hold `/svc/views/session` and nothing holds the unscoped `/svc/views`. Sessions are not
 on this boundary: their namespaces are built, and bind only `/dev/views` at their own base.
 
+**`/svc/devices` sits on it too, with a cost of its own: class ownership is first-come**
+(administration Part B, 2026-09-24; PR #333 review, optional 6). `init` binds the device manager at
+`/svc/devices` in the root namespace, and resolving `/svc/devices/<class>` makes the resolver that
+class's one owner, handed every device of it with write. `input` is taken at boot by
+`input-server`, before any declared service runs, so what is exposed is `block`, which has no owner
+until Part C's storage service subscribes: **any process holding the root namespace can take every
+disk first and hold it**, and the storage service would then be refused. It is the same trusted set
+and the same fix — a constructed namespace for supervisors and services, with `/svc/devices/block`
+bound only into the storage service's — and until then the storage service should be spawned by
+`init` before anything declared, as `input-server` is. Sessions are not on this boundary: their
+`/dev/devices` is an info-only endpoint the manager answers nothing but tables on
+([`device-manager.md`](../architecture/device-manager.md) §6).
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly

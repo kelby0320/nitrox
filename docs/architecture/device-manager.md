@@ -48,10 +48,11 @@ component extended: it hands a driver process a `Handle<DeviceNode>` the same wa
 
 ## 3. A boot, end to end
 
-1. **The drivers register their nodes.** The PCI functions come first, then the disks, partitions
-   and RAM disk as the drivers publish them, then the console and the i8042's keyboard and mouse.
-   The table is append-only, and a block node's served index is the number of block nodes before
-   it.
+1. **The drivers register their nodes.** The PCI functions come first, then each controller's
+   disks, then the RAM disks, then every block device's partitions — the GPT pass runs after the
+   RAM disks are published, so it scans them too — then the console and the i8042's keyboard and
+   mouse. The table is append-only, and a block node's served index is the number of block nodes
+   before it ([`device-node.md`](../spec/device-node.md) § *The registry* has the order whole).
 2. **`init` spawns `device-mgr`**, after the view broker and before the display arm. The manager
    reads `/dev/registry` once. Every node registers before userspace starts, so one read is
    complete coldplug. It then takes each class device's node from `/dev/registry/<id>` and answers

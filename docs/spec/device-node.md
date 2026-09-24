@@ -216,9 +216,17 @@ and cannot be read. It means nothing on a `DeviceNode`, which is not mappable.
 
 ## The registry: `/dev/registry`
 
-The whole device table, read from userspace — every `DeviceNode` the kernel has: the PCI functions
-enumeration found, then what drivers published after them (disks, partitions, the RAM disk, the
-console, the keyboard and the mouse), in that order. `KernelServerId::Registry`, bound by the
+The whole device table, read from userspace — every `DeviceNode` the kernel has, in the order
+`drivers::probe` and the boot publish them:
+1. the PCI functions enumeration found;
+2. each controller's disks;
+3. the RAM disks — published *before* the GPT pass, so it scans them as it scans a disk;
+4. every block device's partitions, from that pass, in table order — a RAM disk's own partitions
+   come after it, and after every disk's;
+5. the console, the keyboard and the mouse.
+
+So on a live USB boot of a machine with Nitrox installed, `/dev/blk/0` is the internal disk and
+`/dev/blk/1` the RAM disk, and the partitions start at 2. `KernelServerId::Registry`, bound by the
 kernel in **the root namespace only**, with `/dev/blk`'s rights. (Administration Part B.)
 
 - **`/dev/registry`** — a fresh read-only `MemoryObject`: a `RegistryHeader`, then `count`

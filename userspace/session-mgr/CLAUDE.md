@@ -8,9 +8,10 @@ Constraints for the session manager. Loaded when working under
 The Tier-5 supervisor that logs a user in and hands them a sandboxed shell: it
 authenticates a credential (via auth-service), constructs a **per-user namespace**,
 and spawns the user shell into it. It holds re-delegated `BIND_NAMESPACE` (from
-service-mgr) and the building-block endpoints it composes sessions from — the fs-server
-forwarding endpoint, the profile-server forwarding endpoint, and a channel to auth-service.
-See `docs/architecture/session-and-auth.md`.
+service-mgr) and the building-block endpoints it composes sessions from — the forwarding
+endpoints of the fs-server, the profile server, the tty server, the clipboard server and the view
+broker, and an info-only endpoint of the device manager's — and resolves a channel to auth-service
+itself. See `docs/architecture/session-and-auth.md`.
 
 ## The session loop
 
@@ -75,9 +76,19 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
 ## Boot handoff
 
 service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
-`BIND_NAMESPACE`, then transfers, in order: (1) the fs-server forwarding endpoint,
-(2) the **profile-server** forwarding endpoint, (3) the **tty-server** forwarding endpoint.
-session-mgr `recv`s all three before doing anything.
+`BIND_NAMESPACE`, then transfers, in order:
+1. the fs-server forwarding endpoint;
+2. the **profile-server** forwarding endpoint;
+3. the **tty-server** forwarding endpoint;
+4. the **clipboard server**'s forwarding endpoint (M12 Part E);
+5. the **view broker**'s forwarding endpoint (administration Part A.4);
+6. an **info-only endpoint of the device manager's** (administration Part B.4) — not the one bound
+   at `/svc/devices`, which could subscribe to a device class.
+
+session-mgr `recv`s all six before doing anything. The control channel is depth 8, and a seventh
+would fit; `service-mgr`'s `create_control_channel` says why the depth is a bound on the count
+rather than a round number. This list was three long until the PR #333 review, three parts after
+it had stopped being true.
 
 **There is no auth handoff as of M7 Part C.** This list said the third was the auth channel —
 wrong twice over, since the third has been the tty endpoint for some time and the auth channel
@@ -94,12 +105,23 @@ the tty endpoint where the profile endpoint belongs.
 
 ## What a session namespace contains
 
-`/home` (the user's home, a subtree of the fs-server), `/bin` (the profile server,
-whole-tree), `/session/user`, `/dev/console` — and, **on an installer boot only**, the machine's
-block devices, each bound individually with its `info` snapshot (Phase 5 Part H.1). That last is
-the conditional member, and it is a design decision like every other: it is selected by the live
-image's own boot-menu entry, never by an installed system's ordinary login, and it is what the
-elevation broker will one day grant after authenticating instead. Both server bindings **share** init's
+`libsession::build_namespace` builds it, for this column and the graphical one:
+- `/home` — the user's home, a subtree of the fs-server;
+- `/bin` — the profile server, whole-tree;
+- `/applications` — the profile server's projection of each package's desktop entries;
+- `/session/user` — who the session belongs to;
+- `/dev/tty` — the tty server;
+- `/dev/clipboard` — the clipboard server;
+- `/dev/views` — the view broker, at the session's base `/s/<id>`, which is its identity there;
+- `/dev/devices` — the device manager's tables, through an info-only endpoint at the base `/info`;
+- `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
+- `/system/fonts` — **the graphical column only** (`bind_fonts`);
+- **on an installer boot only**, the machine's block devices, each bound individually with its
+  `info` snapshot (Phase 5 Part H.1).
+
+The last is the conditional member that matters most, and it is a design decision like every
+other: it is selected by the live image's own boot-menu entry, never by an installed system's
+ordinary login, and it is what the view broker's `disks` grant gives instead. Both server bindings **share** init's
 registration rather than minting a rival — the kernel's bind-mount semantics, one server
 connection under many names.
 

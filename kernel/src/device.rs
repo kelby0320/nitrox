@@ -507,9 +507,11 @@ mod tests {
         adopt(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
     }
 
-    /// The boot's order: PCI functions — the host bridge at 00:00.0 first, as on every PC — then a
-    /// disk on the AHCI controller, its partition, a RAM disk, the console, and the i8042's
-    /// keyboard and mouse.
+    /// The boot's order, which `drivers::probe` sets: PCI functions — the host bridge at 00:00.0
+    /// first, as on every PC — then a disk on the AHCI controller, then a RAM disk (published
+    /// before the GPT pass, so it can be scanned like a disk), then the disk's partition from that
+    /// pass, then the console and the i8042's keyboard and mouse. It was disk, partition, RAM disk
+    /// until the PR #333 review found no boot does that.
     fn booted() -> (Registry, ObjectRef, ObjectRef) {
         let mut r = Registry::new();
         assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0, 0), BlockGeometry::ZERO).unwrap())));
@@ -517,8 +519,8 @@ mod tests {
         assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x02, 0), BlockGeometry::ZERO).unwrap())));
         let disk = block(pci_at(0, 0x1f, 2), BlockKind::Disk, b"QEMU HARDDISK (QM00001)", 1 << 20);
         assert!(r.add_block(disk.clone(), "ahci"));
-        assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19), &disk, "gpt"));
         assert!(r.add_block(block(ResourceDescriptor::ZERO, BlockKind::RamDisk, b"module 0 (root.img)", 64), "ramdisk"));
+        assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19), &disk, "gpt"));
         assert!(r.add_char(char_node(), DeviceKind::Console, NOT_SERVED, "console"));
         let keyboard = char_node();
         assert!(r.add_char(keyboard.clone(), DeviceKind::Keyboard, 0, "i8042"));
@@ -554,8 +556,8 @@ mod tests {
                 (1, DeviceKind::PciFunction, NOT_SERVED, NO_PARENT),
                 (2, DeviceKind::PciFunction, NOT_SERVED, NO_PARENT),
                 (3, DeviceKind::Disk, 0, 1),
-                (4, DeviceKind::Partition, 1, 3),
-                (5, DeviceKind::RamDisk, 2, NO_PARENT),
+                (4, DeviceKind::RamDisk, 1, NO_PARENT),
+                (5, DeviceKind::Partition, 2, 3),
                 (6, DeviceKind::Console, NOT_SERVED, NO_PARENT),
                 (7, DeviceKind::Keyboard, 0, NO_PARENT),
                 (8, DeviceKind::Mouse, 1, NO_PARENT),
@@ -563,9 +565,9 @@ mod tests {
         );
         assert_eq!(text(&recs[3].name, recs[3].name_len), "QEMU HARDDISK (QM00001)");
         assert_eq!((recs[3].logical_block_size, recs[3].block_count), (512, 1 << 20));
-        assert_eq!(text(&recs[4].driver, 3), "gpt");
+        assert_eq!(text(&recs[5].driver, 3), "gpt");
         assert_eq!(text(&recs[7].name, recs[7].name_len), "keyboard");
-        assert_eq!(recs[5].vendor, 0xFFFF, "the RAM disk is no PCI device");
+        assert_eq!(recs[4].vendor, 0xFFFF, "the RAM disk is no PCI device");
     }
 
     /// **The paths resolve through the same served index the records report.**
@@ -581,17 +583,29 @@ mod tests {
         assert!(r.node(9).is_none());
     }
 
-    /// **A PCI function carries what its driver did**, and a function with no outcome says so.
+    /// **A PCI function carries what its driver did** — claimed, declined, or nothing — and a
+    /// function with no outcome says so. Declined is what `/dev/devices` renders as
+    /// `ahci (declined)`, and until the PR #333 review nothing between the kernel's mapping and
+    /// that text was tested.
     #[test]
     fn a_pci_record_carries_its_drivers_outcome() {
         init_global_heap();
         let (r, _, _) = booted();
         let claimed = Outcome::Claimed { driver: "ahci", signal: Signal::Msi { vector: 0x32 } };
-        let recs = r.records(|d| (address(d) == (0, 0, 0x1f, 2)).then_some(claimed)).unwrap();
+        let declined = Outcome::Declined { driver: "nvme", why: "no namespace" };
+        let recs = r
+            .records(|d| match address(d) {
+                (0, 0, 0x1f, 2) => Some(claimed),
+                (0, 0, 0x02, 0) => Some(declined),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(recs[1].outcome, OUTCOME_CLAIMED);
         assert_eq!(text(&recs[1].driver, 4), "ahci");
-        assert_eq!(recs[2].outcome, OUTCOME_NONE);
-        assert_eq!(recs[2].driver[0], 0, "no driver, no name");
+        assert_eq!(recs[2].outcome, OUTCOME_DECLINED);
+        assert_eq!(text(&recs[2].driver, 4), "nvme", "the driver that declined it");
+        assert_eq!(recs[0].outcome, OUTCOME_NONE);
+        assert_eq!(recs[0].driver[0], 0, "no driver, no name");
     }
 
     /// **The header's count is the number of records**, and the bytes are exactly the header and

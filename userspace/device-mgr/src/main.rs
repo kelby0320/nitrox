@@ -492,7 +492,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
             };
             if h == m.serve_end {
-                m.serve_resolve(h, false);
+                // **A root endpoint with no peer is the end of this manager**, not a message to
+                // skip: the kernel keeps a peer-closed channel signalled, so going round again
+                // would spin a CPU for the life of the boot (PR #333 review, finding 1). It happens
+                // when `init`'s bind at `/svc/devices` fails — `init` has closed the only other
+                // handle — and then nothing can reach this manager to subscribe anyway. Exiting is
+                // what `input-server` does in the same place.
+                if !m.serve_resolve(h, false) {
+                    kprint(b"device-mgr: forwarding endpoint closed\n");
+                    exit(1);
+                }
             } else if let Some(i) = m.info_ends.iter().position(|&e| e == h) {
                 // Every holder of this endpoint has let it go — its bindings included.
                 if !m.serve_resolve(h, true) {
