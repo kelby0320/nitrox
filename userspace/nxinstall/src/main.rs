@@ -75,10 +75,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// stated and tested.
 const EXIT_FAILURE: i64 = 1;
 
-/// How far `/dev/blk/<n>` is scanned. The registry is dense, so the first miss ends the scan;
-/// this only bounds a kernel that grew a hole.
-const MAX_BLOCK_DEVICES: usize = 16;
-
 /// The transfer buffer, in bytes: 256 KiB, which is 64 pages and so 64 scatter-gather fragments
 /// — comfortably inside what one AHCI command can describe (`MAX_PRDT_ENTRIES` is 248). Copying
 /// 33 MiB one 4 KiB page at a time would be 8,500 round trips through the device and the
@@ -214,10 +210,10 @@ struct Device {
     index: usize,
     /// The device handle, with read **and** write.
     ///
-    /// Not "whatever the binding allowed": [`devices`] asks for both and stops at the first
-    /// index that does not resolve, so a device bound read-only would end the scan rather than
-    /// appear in the list read-only. `libsession` binds both today; a session that granted less
-    /// would need a second lookup here rather than a different comment (PR #309 review).
+    /// Not "whatever the binding allowed": [`devices`] asks for both, so a device bound read-only
+    /// is left out of the list rather than appearing in it read-only. `libsession` binds both
+    /// today; a session that granted less would need a second lookup here rather than a different
+    /// comment (PR #309 review).
     handle: u64,
     /// What it says it is.
     info: BlockDeviceInfo,
@@ -293,14 +289,22 @@ impl Io {
 
 /// Every block device in `ns`, in index order.
 ///
-/// The registry is dense, so the first index that does not resolve ends the scan — and an empty
-/// result is the ordinary answer in an ordinary session, not an error.
+/// **What `ns` holds, listed** (administration Part B.5): each device is a binding of its own
+/// under `/dev/blk`, made by whoever built this namespace, so enumerating them is the whole
+/// answer — where probing `/dev/blk/0`, `1`, … stopped at the first gap, and a view granted one
+/// disk has one. An empty result is the ordinary answer in an ordinary session, not an error.
 fn devices(ns: u64) -> Vec<Device> {
+    let mut indices: Vec<usize> = libfs::ns_children(ns, b"/dev/blk")
+        .iter()
+        .filter_map(|(name, _)| nxinstall::block_index(name))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
     let mut out = Vec::new();
-    for index in 0..MAX_BLOCK_DEVICES {
+    for index in indices {
         let path = format!("/dev/blk/{index}");
         let Some(handle) = lookup(ns, path.as_bytes(), RIGHT_READ | RIGHT_WRITE) else {
-            break;
+            continue;
         };
         // The info leaf is mapped, not read: it is a `MemoryObject` snapshot, the same shape
         // `/dev/framebuffer/info` uses.

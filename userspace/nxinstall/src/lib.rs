@@ -38,6 +38,21 @@ pub const ROOT_LABEL: &[u8] = b"nitrox-root";
 /// refused rather than written wrongly.
 pub const LOGICAL_BLOCK: u32 = 512;
 
+/// The index of a child of `/dev/blk` named `name`, if it names a device: decimal, with no
+/// leading zero but `0` itself, so one device has one spelling (administration Part B.5).
+///
+/// **The installer lists what its namespace holds** rather than probing `/dev/blk/0`, `1`, … for
+/// the first miss. It runs in a view (`with admin nxinstall`) or an installer session's
+/// application namespace, and in both, what it may write is exactly what is bound — so the
+/// listing is the whole answer, and a view granted one disk has a gap the probe stopped at.
+pub fn block_index(name: &str) -> Option<usize> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) || (bytes.len() > 1 && bytes[0] == b'0') {
+        return None;
+    }
+    name.parse().ok()
+}
+
 /// What a run of the installer did, and therefore what it exits with.
 ///
 /// **The status answers "did what you asked for happen", not "was anything written".** Asking
@@ -176,6 +191,18 @@ pub fn plan(
 mod tests {
     use super::*;
     use libgpt::table::{self, BACK_BYTES, FRONT_BYTES};
+
+    /// **A child of `/dev/blk` is a device only if its name is an index** — `info` is a device's
+    /// leaf, not a device, and `01` would be a second spelling of one.
+    #[test]
+    fn a_device_is_a_child_named_by_its_index() {
+        assert_eq!(block_index("0"), Some(0));
+        assert_eq!(block_index("2"), Some(2));
+        assert_eq!(block_index("15"), Some(15));
+        for not in ["", "info", "01", "1a", "-1", " 1"] {
+            assert_eq!(block_index(not), None, "{not:?}");
+        }
+    }
 
     /// A 1 GiB disk, a 33 MiB ESP and a 24 MiB root — the shape `check-install` boots.
     fn small_disk() -> Layout {

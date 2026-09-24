@@ -3537,6 +3537,15 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.expect("live-rows=3")?;
     println!("  ok: a file written under /home read back from the RAM disk");
 
+    // **And the device manager calls the module a RAM disk** (administration Part B). The live
+    // boot's module is the one RAM disk any gate has, so this is the only place that kind is seen
+    // on its way to a person. Asked of the session's own `/dev/devices`, and matched on the
+    // module's path — the ramdisk row's description, which the typed command does not contain.
+    s.send("open /dev/devices/all.tsm | filter kind == \"ramdisk\"")?;
+    s.expect("module 1 (/boot/root.img)")?;
+    s.expect("/home>")?;
+    println!("  ok: and /dev/devices lists it as a ramdisk");
+
     // **An ordinary live boot reaches no disk** (Phase 5 Part H.1). The live image's third menu
     // entry starts a session that can write every disk in the machine; this entry must not, and a
     // widened sandbox is exactly the kind of regression nothing fails on. Asserted over the whole
@@ -11362,6 +11371,18 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libinput")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    // `libsession`'s one pure decision: which namespace bindings are block devices, for the
+    // rebinding that reads a source's own bindings where it has no registry (administration Part
+    // B.5). The rest of the crate is syscalls, which the gates boot.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libsession")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

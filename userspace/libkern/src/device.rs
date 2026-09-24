@@ -59,6 +59,11 @@ impl DeviceKind {
             _ => Self::Unknown,
         }
     }
+
+    /// Whether `/dev/blk` serves this kind: a disk, a partition or a RAM disk.
+    pub const fn is_block(self) -> bool {
+        matches!(self, Self::Disk | Self::Partition | Self::RamDisk)
+    }
 }
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
@@ -181,6 +186,12 @@ impl DeviceRecord {
     /// Its kind.
     pub fn kind(&self) -> DeviceKind {
         DeviceKind::from_u32(self.kind)
+    }
+
+    /// The `<n>` of the `/dev/blk/<n>` that serves it, if it is a block device and served — what
+    /// a reader of the registry needs instead of probing `/dev/blk/0`, `1`, … for the first miss.
+    pub fn block_index(&self) -> Option<u32> {
+        (self.kind().is_block() && self.served != NOT_SERVED).then_some(self.served)
     }
 
     /// Its name's meaningful bytes.
@@ -329,6 +340,24 @@ mod tests {
         assert_eq!(records(&size).err(), Some(SnapshotError::BadRecordSize));
         assert_eq!(records(&[0u8; 15]).err(), Some(SnapshotError::Short));
         assert_eq!(records(&header(0)).unwrap().len(), 0, "an empty table reads");
+    }
+
+    /// **A block index is a block record's served index, and nothing else's**: the keyboard is
+    /// served at 0 too, by `/dev/input/raw`, and a disk the kernel registered but serves nowhere
+    /// has none.
+    #[test]
+    fn only_a_served_block_device_has_a_block_index() {
+        let rec = |kind: DeviceKind, served: u32| {
+            let mut raw = record(0, kind);
+            raw[12..16].copy_from_slice(&served.to_le_bytes());
+            DeviceRecord::read(&raw).unwrap()
+        };
+        assert_eq!(rec(DeviceKind::Disk, 0).block_index(), Some(0));
+        assert_eq!(rec(DeviceKind::Partition, 3).block_index(), Some(3));
+        assert_eq!(rec(DeviceKind::RamDisk, 2).block_index(), Some(2));
+        assert_eq!(rec(DeviceKind::Keyboard, 0).block_index(), None, "raw input's 0, not /dev/blk's");
+        assert_eq!(rec(DeviceKind::Console, NOT_SERVED).block_index(), None);
+        assert_eq!(rec(DeviceKind::Disk, NOT_SERVED).block_index(), None, "registered, served nowhere");
     }
 
     /// **One record from exactly its bytes**, at an odd address — a message body promises no

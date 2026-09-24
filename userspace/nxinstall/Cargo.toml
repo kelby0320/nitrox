@@ -25,6 +25,9 @@ libgpt = { path = "../libgpt" }
 fs-server-ext4 = { path = "../fs-server-ext4" }
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+# `ns_children`, to list the devices this namespace was given rather than probe for them
+# (administration Part B.5).
+libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
 
 [lib]

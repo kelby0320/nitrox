@@ -22,8 +22,6 @@ const PAGE: u64 = 4096;
 const LINE_MAX: usize = 128;
 /// Bytes requested per console read (matches the kernel console ring capacity).
 const READ_LEN: u64 = 256;
-/// Highest `/dev/blk/<n>` index `lsblk` probes before giving up.
-const LSBLK_MAX: usize = 16;
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -235,42 +233,72 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
     }
 }
 
-/// List block devices by probing `/dev/blk/0..` until one is not found.
+/// List the block devices from `/dev/registry` — every one the kernel serves under `/dev/blk`, by
+/// its index, with its kind, size and name (administration Part B.5).
+///
+/// **The registry, not a probe.** This probed `/dev/blk/0..` until one was not found, which could
+/// say that a device exists and nothing about it, and stopped at a gap. The registry is bound in
+/// the root namespace — this shell's — and says what exists: the recovery surface, on a boot whose
+/// mount failed, should show the disk and its partitions by name.
 fn cmd_lsblk(root_ns: u64) {
+    let (st, h) = ns_lookup_wait(root_ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
+    if st != 0 || h == 0 {
+        kprint(b"lsblk: no /dev/registry in this namespace\r\n");
+        return;
+    }
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&mut info as *mut HandleInfo) as u64) };
+    // SAFETY: `h` is a mappable snapshot with MAP_READ; the syscall rounds up to whole pages.
+    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    // SAFETY: closing our own handle; a mapping outlives it.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    if addr < 0 {
+        kprint(b"lsblk: /dev/registry would not map\r\n");
+        return;
+    }
+    // SAFETY: `addr..addr+size` maps `size` bytes of the snapshot until the unmap below.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
     let mut found = 0;
-    for i in 0..LSBLK_MAX {
-        let mut path = [0u8; 24];
-        let n = blk_path(i, &mut path);
-        let (st, h) = ns_lookup_wait(root_ns, &path[..n], RIGHT_READ);
-        if st != 0 || h == 0 {
-            break; // no more devices
+    match libkern::device::records(bytes) {
+        Ok(records) => {
+            for r in records {
+                let Some(n) = r.block_index() else { continue };
+                let kind: &[u8] = match r.kind() {
+                    libkern::device::DeviceKind::Disk => b"disk",
+                    libkern::device::DeviceKind::Partition => b"partition",
+                    _ => b"ramdisk",
+                };
+                let size = (r.logical_block_size as u64).saturating_mul(r.block_count);
+                let (amount, unit): (u64, &[u8]) =
+                    if size >= 1 << 20 { (size >> 20, b" MiB") } else { (size >> 10, b" KiB") };
+                // The name is the device's own — a disk's model, a partition's label — so it is
+                // printed as untrusted: it cannot end the line it is in.
+                Line::new()
+                    .s(b"/dev/blk/")
+                    .u(n as u64)
+                    .s(b"  ")
+                    .s(kind)
+                    .s(b"  ")
+                    .u(amount)
+                    .s(unit)
+                    .s(b"  ")
+                    .untrusted(r.name())
+                    .s(b"\r")
+                    .end();
+                found += 1;
+            }
         }
-        Line::new().s(&path[..n]).s(b"\r").end();
-        found += 1;
-        // SAFETY: closing the handle we just resolved.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        Err(_) => kprint(b"lsblk: /dev/registry does not read\r\n"),
     }
     if found == 0 {
         kprint(b"(no block devices)\r\n");
     }
+    // SAFETY: unmapping our mapping (eshell runs forever — don't leak); the records were printed.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
 }
 
 // --- small string helpers (no alloc) -----------------------------------------
-
-/// Write `/dev/blk/<i>` into `buf`, returning its length. `i < LSBLK_MAX`.
-fn blk_path(i: usize, buf: &mut [u8]) -> usize {
-    const PREFIX: &[u8] = b"/dev/blk/";
-    buf[..PREFIX.len()].copy_from_slice(PREFIX);
-    let mut n = PREFIX.len();
-    // Decimal i (i < 100 here).
-    if i >= 10 {
-        buf[n] = b'0' + (i / 10) as u8;
-        n += 1;
-    }
-    buf[n] = b'0' + (i % 10) as u8;
-    n += 1;
-    n
-}
 
 /// Trim leading/trailing ASCII spaces.
 fn trim(s: &[u8]) -> &[u8] {

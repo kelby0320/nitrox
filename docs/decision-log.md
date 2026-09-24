@@ -28746,3 +28746,48 @@ it, so the group's first anchor is now `init: auth-service bound at /svc/auth`, 
 the handout. The kernel's own lines are the early group's claim, and this group's is that
 `sys_kprint` output reaches the screen up to the handout, which any userspace line shows. Two runs
 pass.
+
+## 2026-09-24 — Administration B.5: the probes read what exists
+
+Three programs found block devices by probing `/dev/blk/0`, `1`, … and stopping at the first miss.
+They relied on the table being dense, and could say that a device existed but nothing about it.
+Each now reads what its source actually holds:
+- **`eshell`'s `lsblk` reads `/dev/registry`.** It runs in the root namespace, where the registry
+  is bound. It prints each block device's path, kind, size and name, the name through
+  `untrusted` because it is the device's own. No gate reaches `eshell`, which appears only when the
+  critical path fails, so it was checked on a one-off boot: a copy of the release disk with its
+  root's superblock zeroed. The mount was refused (`superblock magic 0x0000`), `eshell` came up,
+  and `lsblk` printed the disk, the ESP and `nitrox-root` by name and size.
+- **`libsession::rebind_block_devices` reads the registry when its source has one, and otherwise
+  enumerates the source's own `/dev/blk/<n>` bindings.** A session manager and the view broker
+  rebind from the root namespace, where `/dev/blk` is one kernel-server binding whose children no
+  enumeration can see. `desktop-shell` rebinds from an installer session, which has no registry,
+  deliberately, and a binding per device. A lookup that fails now skips its device instead of
+  ending the list. `unbind_block_devices` takes back what the namespace has bound, instead of
+  indices `0..16`, which would have left a higher index reachable after its session ended.
+- **`nxinstall` lists its own namespace** with `libfs::ns_children`. In a view or an installer
+  session's application, what it may write is exactly what is bound.
+
+**The pure halves are host-tested, and each has a control that fails it.**
+- `DeviceRecord::block_index` gives a served index for block records only; the keyboard is served
+  at 0 too, by `/dev/input/raw`.
+- `libsession`'s binding parser accepts exactly `/dev/blk/<n>`, not its `info` leaf and not a
+  second spelling. This is `libsession`'s first host test: the crate is now `no_std` outside
+  tests, and `cargo xtask test` runs it.
+- `nxinstall`'s name parser is the same rule for a listing's children.
+
+**Three boot controls:**
+- **R, the registry yielding no indices**, fails `test-qemu`: `nxinstall` in the view sees no
+  disks.
+- **N, `nxinstall` listing the wrong path**, fails `test-qemu` with the three devices bound.
+- **E, enumeration finding nothing**, fails `check-install`: the installer session gets its four
+  devices through the registry path, and the shell hands `nxterm` none.
+
+What is not gated is the gap itself: no boot has a namespace with a hole in `/dev/blk`, so the
+old probe and the new readers agree on every machine a gate boots. Either reader takes its indices
+from the source rather than a counter, so a gap cannot end its list.
+
+**`check-live` asks the session's `/dev/devices` for the RAM disk** — `filter kind == "ramdisk"`,
+matched on `module 1 (/boot/root.img)`, which the command does not contain. That was the last
+item of Part B's comparison list without a gate. `libfs::ns_children`'s documented limitation now
+points at `/dev/devices`, and the deferral entry for a listable `/dev` records the Part as built.

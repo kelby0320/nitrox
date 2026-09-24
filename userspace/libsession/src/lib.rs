@@ -28,7 +28,7 @@
 //! rule (`userspace/session-mgr/CLAUDE.md`). `alloc` is needed for the same reason it was
 //! allowed there on 2026-07-31: a session's environment is a TSM1 `Record` of `Vec`s.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
 extern crate alloc;
@@ -672,31 +672,36 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
 /// individually — finer-grained than the registry, and the shape an elevation broker will want
 /// when it grants one disk rather than all of them (`docs/planning/administration.md`).
 ///
-/// **Two callers, which is why it is here** (`userspace/CLAUDE.md` on where a helper lives once it
-/// has two): a session manager hands the devices to a session, and `desktop-shell` hands them on
-/// to the applications it launches. Without that second step the disks reach the shell and nothing
-/// a person can type into — and on the laptop, where there is no serial port, the graphical
-/// session is the only way to log in at all (PR #308 review, blocking 1).
+/// **Three callers, two kinds of source** (`userspace/CLAUDE.md` on where a helper lives once it
+/// has two): a session manager hands the devices to an installer session and the view broker to a
+/// view, both from the root namespace; and `desktop-shell` hands an installer session's on to the
+/// applications it launches — from the session's namespace, where each device is a binding of its
+/// own and there is no registry. [`block_indices`] reads whichever the source has. Without the
+/// shell's step the disks reach the shell and nothing a person can type into — and on the laptop,
+/// where there is no serial port, the graphical session is the only way to log in at all (PR #308
+/// review, blocking 1).
 ///
 /// Each device's `info` is a snapshot object, resolved once and bound beside its device: device
-/// facts do not change while a machine runs, and nothing here supports hot-plug.
+/// facts do not change while a machine runs.
 pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
     let mut bound = 0;
-    for n in 0..MAX_BLOCK_DEVICES {
-        let mut path = [0u8; 20];
-        let dev_len = write_blk_path(&mut path, n, false);
+    for n in block_indices(from_ns) {
+        let path = blk_path(n, false);
         let (st, dev) = ns_lookup(
             from_ns,
-            &path[..dev_len],
+            path.as_bytes(),
             RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER,
         );
         if st != 0 || dev == 0 {
-            break; // the registry is dense; the first miss is the end of it
+            // **Not the end of the list**, which the probe this replaced took it to be: a source
+            // granted one disk has a gap before it, and a device bound read-only here is one this
+            // cannot hand on with write, not a reason to stop at the next.
+            continue;
         }
         // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind,
         // so no subtree base.
         let br = unsafe {
-            syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, dev_len as u64, dev, 0, 0)
+            syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, path.len() as u64, dev, 0, 0)
         };
         // SAFETY: the bind took its own reference; close ours.
         unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
@@ -704,12 +709,12 @@ pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
             continue;
         }
         bound += 1;
-        let info_len = write_blk_path(&mut path, n, true);
-        let (ist, info) = ns_lookup(from_ns, &path[..info_len], RIGHT_MAP_READ | RIGHT_TRANSFER);
+        let info_path = blk_path(n, true);
+        let (ist, info) = ns_lookup(from_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_TRANSFER);
         if ist == 0 && info != 0 {
             // SAFETY: as above; the info snapshot binds as a direct handle too.
             let ir = unsafe {
-                syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, info_len as u64, info, 0, 0)
+                syscall6(SYS_NS_BIND, to_ns, info_path.as_ptr() as u64, info_path.len() as u64, info, 0, 0)
             };
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, info) };
@@ -735,45 +740,101 @@ pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
 /// It asks every program it started for the session to exit, and unbinds their grants so nothing
 /// new can be resolved through them. A handle a program already holds is not taken back — the
 /// kernel has no revocation — which is why this is half of ending a session rather than all of it.
+///
+/// **What is bound, read from `ns` itself**, not a fixed range of indices: a range would miss an
+/// index past its end, and leave that disk reachable after the session it was granted to.
 pub fn unbind_block_devices(ns: u64) -> usize {
     let mut unbound = 0;
-    for n in 0..MAX_BLOCK_DEVICES {
-        let mut path = [0u8; 20];
+    for n in bound_block_indices(ns) {
         // The leaf first, so the device's binding is never left without the one beside it —
         // and `NotFound` for a leaf that was never bound is no error.
-        let info_len = write_blk_path(&mut path, n, true);
+        let info_path = blk_path(n, true);
         // SAFETY: valid namespace handle and path.
-        unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, info_len as u64) };
-        let dev_len = write_blk_path(&mut path, n, false);
+        unsafe { syscall3(SYS_NS_UNBIND, ns, info_path.as_ptr() as u64, info_path.len() as u64) };
+        let dev_path = blk_path(n, false);
         // SAFETY: as above.
-        if unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, dev_len as u64) } == 0 {
+        if unsafe { syscall3(SYS_NS_UNBIND, ns, dev_path.as_ptr() as u64, dev_path.len() as u64) } == 0 {
             unbound += 1;
         }
     }
     unbound
 }
 
-/// Block devices a session may be handed. The registry is small — a disk, its partitions, any
-/// module — and a session that needed more than this would be a machine nothing here has seen.
-const MAX_BLOCK_DEVICES: usize = 16;
+/// The `/dev/blk/<n>` indices `ns` can reach, ascending (administration Part B.5).
+///
+/// **From the registry where `ns` has one** — the root namespace, where `/dev/blk` is one
+/// kernel-server binding whose children no enumeration can see — **and otherwise from `ns`'s own
+/// bindings**: a session, a view and an application namespace are each handed their devices one
+/// binding at a time, and deliberately have no registry.
+fn block_indices(ns: u64) -> alloc::vec::Vec<u32> {
+    registry_block_indices(ns).unwrap_or_else(|| bound_block_indices(ns))
+}
 
-/// Write `/dev/blk/<n>` (or `/dev/blk/<n>/info`) into `out`, returning its length.
-fn write_blk_path(out: &mut [u8; 20], n: usize, info: bool) -> usize {
-    let prefix = b"/dev/blk/";
-    out[..prefix.len()].copy_from_slice(prefix);
-    let mut len = prefix.len();
-    // One or two digits, which `MAX_BLOCK_DEVICES` bounds.
-    if n >= 10 {
-        out[len] = b'0' + (n / 10) as u8;
-        len += 1;
+/// The block devices `/dev/registry` lists, by their `/dev/blk` index. `None` if `ns` has no
+/// registry, or it does not read.
+fn registry_block_indices(ns: u64) -> Option<alloc::vec::Vec<u32>> {
+    let (st, snap) = ns_lookup(ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
+    if st != 0 || snap == 0 {
+        return None;
     }
-    out[len] = b'0' + (n % 10) as u8;
-    len += 1;
-    if info {
-        out[len..len + 5].copy_from_slice(b"/info");
-        len += 5;
+    let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
+    // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    // SAFETY: closing our own handle; a mapping outlives it.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, snap) };
+    if addr < 0 {
+        return None;
     }
-    len
+    // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
+    let mut out: alloc::vec::Vec<u32> = match libkern::device::records(bytes) {
+        Ok(records) => records.filter_map(|r| r.block_index()).collect(),
+        Err(_) => alloc::vec::Vec::new(),
+    };
+    // SAFETY: unmapping what was mapped above; `out` holds copies.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+/// The `/dev/blk/<n>` bindings `ns` itself holds, ascending. Enumeration is local — the kernel
+/// walks the namespace, nothing is forwarded — and sees each binding a supervisor made.
+fn bound_block_indices(ns: u64) -> alloc::vec::Vec<u32> {
+    let mut out = alloc::vec::Vec::new();
+    let mut entry = abi::NsEntry::zeroed();
+    for index in 0u64.. {
+        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut abi::NsEntry as u64) };
+        if r != 0 {
+            break; // NotFound ends the walk
+        }
+        let len = (entry.path_len as usize).min(abi::NS_ENTRY_PATH_MAX);
+        if let Some(n) = blk_binding_index(&entry.path[..len]) {
+            out.push(n);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The `<n>` of a binding at exactly `/dev/blk/<n>` — not its `info` leaf, not `/dev/blk` itself,
+/// and not a name that only starts with digits. Decimal, with no leading zero but `0` itself, so
+/// one device has one spelling.
+fn blk_binding_index(path: &[u8]) -> Option<u32> {
+    let digits = path.strip_prefix(b"/dev/blk/")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    core::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// `/dev/blk/<n>`, or `/dev/blk/<n>/info`.
+fn blk_path(n: u32, info: bool) -> alloc::string::String {
+    if info { alloc::format!("/dev/blk/{n}/info") } else { alloc::format!("/dev/blk/{n}") }
 }
 
 /// Whether this boot asked for an **installer session**: the word `install` on the kernel's
@@ -1262,6 +1323,34 @@ pub fn spawn_leader(
                 unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
                 return code;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blk_binding_index;
+
+    /// **A binding is a device only at exactly `/dev/blk/<n>`**: the `info` leaf beside it, the
+    /// kernel server's own `/dev/blk`, a lookalike prefix and a second spelling of an index are
+    /// not devices — each would otherwise be bound or unbound as one.
+    #[test]
+    fn a_device_binding_is_exactly_dev_blk_and_an_index() {
+        assert_eq!(blk_binding_index(b"/dev/blk/0"), Some(0));
+        assert_eq!(blk_binding_index(b"/dev/blk/12"), Some(12));
+        assert_eq!(blk_binding_index(b"/dev/blk/4294967295"), Some(u32::MAX));
+        for not in [
+            &b"/dev/blk/0/info"[..],
+            b"/dev/blk",
+            b"/dev/blk/",
+            b"/dev/blkx/0",
+            b"/dev/blk/01",
+            b"/dev/blk/1a",
+            b"/dev/blk/-1",
+            b"/dev/blk/4294967296",
+            b"/home/dev/blk/0",
+        ] {
+            assert_eq!(blk_binding_index(not), None, "{:?}", core::str::from_utf8(not));
         }
     }
 }

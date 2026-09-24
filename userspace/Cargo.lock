@@ -353,6 +353,7 @@ name = "nxinstall"
 version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
+ "libfs",
  "libgpt",
  "libheap",
  "libkern",

@@ -394,8 +394,10 @@ fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
 /// **Limitation, stated rather than hidden:** a kernel server that owns a *subtree*
 /// (`/dev/blk/<n>`) appears as one binding, so `blk` is reported as a directory that then
 /// lists as empty. The kernel generates those children on demand and the namespace has no
-/// way to ask "what would you serve?" — enumerating them needs a protocol that does not
-/// exist yet.
+/// way to ask "what would you serve?". That happens only in the root namespace — anywhere else
+/// each device is a binding of its own, and lists — and **what answers it is not this function
+/// but `/dev/devices`** (administration Part B): the device manager's tables, which name every
+/// device and the path that serves it. The root namespace reads the kernel's `/dev/registry`.
 pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
     // `path` with exactly one trailing slash, so a prefix test is unambiguous.
     let mut base = String::from_utf8_lossy(path).into_owned();

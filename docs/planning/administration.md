@@ -884,9 +884,14 @@ namespace, with no login and no session.
       and filters the tables from a serial login and finds `/dev/devices/block` and
       `/dev/registry` open nothing; `check-login` asserts the session and each application
       namespace reach `/dev/devices`; `boot-probe` sends `block` down an info-only endpoint.
-- [ ] **B.5 — the probes.** `eshell`'s `lsblk` reads the registry;
+- [x] **B.5 — the probes** *(2026-09-24)*. `eshell`'s `lsblk` reads the registry;
       `libsession::rebind_block_devices` reads the registry when its source has one and the
       source's own `/dev/blk` bindings when it does not; `nxinstall` lists its own namespace.
+      None stops at a gap any more. `lsblk` now names each device, its kind and size — shown on
+      a one-off boot of a release disk whose root would not mount, since no gate reaches
+      `eshell`. `unbind_block_devices` takes back what is bound rather than indices `0..16`.
+      `check-live` asks the session's `/dev/devices` for the module's RAM disk, the one this
+      Part's comparison list named.
 - [ ] **Docs**: a new architecture doc for the device manager; `input-subsystem.md` (devices from
       the manager, and the hotplug premise corrected); `namespace-and-resource-servers.md` and the
       kernel-server list (`/dev/registry`); `libfs`'s limitation note; `device-node.md`, whose
