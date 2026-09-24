@@ -53,10 +53,14 @@ Stable identifier for the block device to mount. Format: `<scheme>:<value>` wher
 |---|---|---|
 | `gpt-partuuid` | UUID string (lowercase hex with hyphens) | `/dev/disk/by-partuuid/<uuid>` |
 | `gpt-partlabel` | Partition label string (UTF-8) | `/dev/disk/by-partlabel/<label>` |
-| `fs-uuid` | Filesystem UUID (post-mount; not for boot use) | (not initially supported) |
-| `device-path` | Direct path under `/dev/` (e.g., `nvme0n1p2`) | `/dev/<path>` |
+| `fs-uuid` | Filesystem UUID (post-mount; not for boot use) | **not supported** |
+| `device-path` | Direct path under `/dev/` (e.g., `nvme0n1p2`) | **not supported** |
 
-For the initial implementation, `gpt-partuuid` and `gpt-partlabel` are the recommended schemes — they're stable across reboots and don't depend on enumeration order. `device-path` is supported but discouraged because device naming is enumeration-order-dependent and can change between reboots.
+**`gpt-partuuid` and `gpt-partlabel` are the only schemes `init` accepts** (`manifest::device_ns_path`);
+any other is logged as `unsupported device scheme` and the mount is dropped, which on the critical
+path means the emergency shell. They are also the right ones: stable across reboots, where a
+`device-path` depends on enumeration order. This section said `device-path` "is supported but
+discouraged" until 2026-09-24, when the administration Part C review found no code for it.
 
 If the device cannot be resolved, init drops to emergency shell.
 

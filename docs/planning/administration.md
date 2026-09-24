@@ -1,13 +1,14 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: in progress — Part A complete (2026-09-23), Part B detailed (2026-09-23); scoped
-2026-09-22 and revised after the PR #326 review.** Scheduled after
+**Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C detailed
+(2026-09-24); scoped 2026-09-22 and revised after the PR #326 review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**. **Part B has had
-its detail pass** (*Part B in detail*) and is next to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
+had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
+(*Part B in detail*, 2026-09-24). **Part C has had its detail pass** (*Part C in detail*) and is next
+to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -448,8 +449,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 | Deriving a namespace from an existing one | views without holding a session's ingredients | A |
 | `/dev/registry` — a snapshot of the device table, and each node by id | coldplug; `/dev/devices` | B |
 | `OBJECT_KIND_SUBNAMESPACE` — a resolve continuing in another namespace | `/storage` with nothing re-bound | C |
-| Writing back every `FileObject` under a registration | unmount and shutdown without losing mapped writes | C |
-| `FLUSH CACHE` in the AHCI driver (`TODO(ahci-flush)`) | the last link of every unmount | C |
+| One cached `FileObject` per file, keyed by the server's file id, kept while dirty; `File::Forget`; `sys_ns_sync` | unmount and shutdown without losing mapped writes, and two mappings of a file that agree | C |
+| `IoOpcode::Flush`, and `FLUSH CACHE` in the AHCI driver (`TODO(ahci-flush)`) | the last link of every unmount | C |
 | A system-control object in `init`'s boot grant, and a power operation | `shutdown` | E |
 | FADT parsing, and a reset (FADT → i8042 → triple fault) | `shutdown --reboot` | E |
 | `SYSTEM_CLOCK` wired, and the RTC written back | `date --set` | E |
@@ -465,15 +466,16 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       **one grant end to end, `disks`**; streams, and a stop handle for the shell; programs ended with
       their session; an audit record per request. The build images carry a seeded `views.toml` that
       makes the demo account an administrator.
-- [x] **B — the device manager, with coldplug** — *detailed below, B.1–B.5; built 2026-09-24.*
+- [x] **B — the device manager, with coldplug** — *detailed below, B.1–B.5; complete 2026-09-24.*
       `/dev/registry`;
       `device-mgr`, with subscriptions by class that replay every present device (coldplug);
       `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
       can read, in place of listing `/dev/blk`.
-- [ ] **C — storage.** Write-back of a registration's `FileObject`s; a whole-filesystem sync and
-      clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`; `OBJECT_KIND_SUBNAMESPACE`; the
-      storage service — mount, unmount, auto-mount (read-only on a live boot), `/storage` bound into
-      sessions and application namespaces, refusing a raw grant of a mounted device; `disk`.
+- [ ] **C — storage** — *detailed below, C.1–C.8.* Write-back of a registration's `FileObject`s;
+      a whole-filesystem sync and clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`;
+      `OBJECT_KIND_SUBNAMESPACE`; the storage service — mount, unmount, auto-mount (read-only on a
+      live boot), `/storage` bound into sessions and application namespaces, refusing a raw grant of
+      a mounted device; `disk`.
 - [ ] **D — accounts.** `auth-service`'s admin ops and atomic rewrite; `account`, including the
       offline mode; removal refused when the broker says it would leave no administrator; ending a
       removed account's sessions; **`with --edit` and the `views` grant** (moved here from A by its
@@ -933,13 +935,305 @@ namespace, with no login and no session.
   change to how services are spawned.
 - **The framebuffer**, which is not a `DeviceNode`, and whose owner `init` hands it to directly.
 
+## Part C in detail *(2026-09-24)*
+
+### The spike: what already exists, and what is missing
+
+- **The page cache writes back nothing on its own.** `FileObject::writeback` flushes every resident
+  page — there is **no dirty bit anywhere** (`TODO(page-dirty-tracking)`), and
+  `filesystem-data-path.md`'s claim that a store "marks the `CachePage` dirty" was untrue
+  (corrected with this pass).
+  `sys_file_sync` is the one trigger, and **a `FileObject`'s `Drop` frees its frames unwritten**, so
+  "write back every `FileObject` under a registration at unmount" cannot see a writer that has
+  already exited: its object is gone, and so is what it wrote.
+- **Every resolve builds its own `FileObject`.** `build_and_install_file_blocks` makes a fresh object
+  per lookup, so two processes mapping one file hold two caches of it, and neither sees the other's
+  writes — the page-cache deferral's "per-file, not global" (*Page-cache scope*), whose trigger was a
+  file mapped from many processes. Holding dirty objects until unmount would add a third copy that
+  a later resolve does not see either.
+- **The server frees a file's blocks without the kernel knowing.** Unlink and `rmdir` are
+  directory-session operations, a channel straight to the server; a rename that replaces its
+  destination frees that inode inside a resolve whose reply says nothing about it. A kernel cache
+  that outlives its writers would write a dead file's pages back into blocks that may already be
+  another file's.
+- **Growth replaces the object.** `sys_file_create`, `_grow` and `_truncate` are resolves with a
+  size, and each answers a new `FileObject` with the new size and run map. The block-file reply
+  (`OBJECT_KIND_FILE_BLOCKS`) carries a block size and runs and **nothing that names the file** — and
+  neither it nor `OBJECT_KIND_CHANNEL` appeared in `rsproto-namespace-ops.md`'s table of object
+  kinds; both rows, and the block reply's body, were added with this pass.
+- **`fs-server-ext4` writes metadata through.** Every block write goes to the device at once; there
+  is no server-side cache to sync. What it lacks is **state**: `mkfs` writes `s_state` clean and
+  nothing changes it, so a filesystem cannot say it was left mounted.
+- **It has no read-only mode**, and a binding cannot make one: `init.toml`'s `"ro"` narrows the
+  endpoint handle's rights, which forwarded resolves ignore (`TODO(mount-write-authority)`).
+- **No flush.** `IoOpcode` is `Read` and `Write`, and FLUSH CACHE is a non-data ATA command the AHCI
+  driver has no path for (`TODO(ahci-flush)`).
+- **`OBJECT_KIND_SUBNAMESPACE` is a constant.** No kernel code handles it. A continuation is
+  feasible where a forwarded reply is already completed — inline in the server's `sys_channel_send`,
+  holding the pending lookup, which carries the caller, its requested rights and the suffix. **It
+  does not keep the resolve's operation**: the flags, a size change and a rename's destination went
+  to the server in the request and are not stored, so a continuation has nothing to re-send them
+  from. And **a rename carries two paths**, and both have to continue.
+- **Building a namespace needs `BIND_NAMESPACE`**, even one the caller made (`sys_ns_bind`
+  requires the syscap), so a storage service that builds a namespace per mount joins `desktop-shell`
+  and the view broker as a process that constructs namespaces.
+- **`init` records its mounts as bindings only.** `sys_ns_enumerate` shows `/` as a mount and
+  nothing names the device behind it. What does name it is `init.toml`: every `[[mount]]` is
+  critical-path, so on a running system each one succeeded, and its source is a partition label
+  (the registry's partition name) or a partition UUID (the parent disk's GPT) — the only two schemes
+  `init` accepts, whatever `init-toml-schema.md` said of `device-path` until this pass's review.
+- **Only one SATA disk is ever seen**: the AHCI driver takes the first implemented port with a disk
+  (*Multiple disks*, deferred). A second disk can reach a boot only as a live image's module, a RAM
+  disk — which is why Part C's gate uses the live topology.
+- **No release program writes through a mapping without syncing.** `libfs`, `nxsh` and `nxedit` all
+  sync. A gate for the unsynced case needs a test program.
+- **The error codes have no `ReadOnly` or `Busy`.** A read-only refusal answers `NoAccess`, and a busy
+  unmount `WouldBlock`, each with a reason in the error body, rather than growing the error ABI for
+  one part.
+
+### The shape
+
+**The maintainer's calls:**
+
+- **One cached `FileObject` per file.** A registration keeps a file cache keyed by an identity the
+  server reports — the inode, for ext4 — and every resolve of a file shares its one object. A grow,
+  create or truncate updates that object in place. A **dirty** object, one mapped writable since its
+  last write-back, is kept by the cache when its last user lets go, and a later resolve of the file
+  finds it. Sync, unmount and shutdown write back every dirty object in the cache. This closes the
+  page-cache deferral's first axis and makes "every `FileObject` under a registration" a thing the
+  kernel can enumerate.
+- **`OBJECT_KIND_SUBNAMESPACE` hands back a namespace.** The storage service builds one namespace per
+  mounted filesystem, its server bound at `/`, and answers a resolve under a label with that
+  namespace and the rest of the path; the kernel continues the resolve there, so the file it
+  installs fills through the mounted server's own registration. The service holds `BIND_NAMESPACE`
+  for namespaces it created and binds into no other — the view broker's reconciliation — and an
+  unmount is dropping that namespace.
+- **Sessions get `/storage` by resolving it**, as they get `/svc/views/session`: each login
+  supervisor asks the root namespace for a session endpoint, and `desktop-shell` receives it as one
+  more leader extra. Nothing new travels `init`'s and `service-mgr`'s handoff channels.
+- **The gate is a test live image with a SATA disk**, checked on the host — the topology this plan's
+  *Gates* table gives Part C, with a test program to write through a mapping and not sync.
+
+**Derived from the spike and the calls:**
+
+- **What names a file is the server's file id**, carried by the block-file reply. A cache is per
+  registration, since ids are per filesystem.
+- **Dirty is per object, not per page**, until `TODO(page-dirty-tracking)`: an object is dirty from a
+  writable mapping of it until its next write-back, and stays dirty while a writable mapping remains.
+  Write-back still writes every resident page of a dirty object. A clean object leaves the cache when
+  its last user does, so the cache holds what is in use plus what is dirty — never the whole disk.
+- **The server tells the kernel when a file is gone, and waits for the answer.** `File::Forget(id)`
+  goes from the server to the kernel on its endpoint when an unlink, a replacing rename, or anything
+  else is about to free an inode. The kernel marks the cached object dead at once — write-back checks
+  the mark **before each IRP**, not once per object — and answers when any write of it already in
+  flight has completed. **The server frees the inode's blocks only on that answer**, so no write the
+  kernel issued can land in a block the server has handed to something else — a directory block it
+  writes through, say. A later resolve of the id gets a new object.
+- **A size change keeps what a page says honest.** Truncation is kernel-mediated, so the kernel
+  handles it in the resolve. Pages wholly past the new size **leave the cache's index**: a mapping of
+  one stays valid, since the object keeps its frames until it dies, but no fault finds it again and
+  no write-back writes it. The partial last page is zeroed past the new size. A grow over a resident
+  partial last page zeroes it from the old size first, since a mapping may have written past the end
+  in between. So a regrown range reads as zero, which is what the filesystem says it holds —
+  `reserve` hits by page index regardless of size, so without this a truncate and a grow would serve
+  stale bytes and write them into the blocks the grow allocated.
+- **`File::Touch` names the file by id.** The post-write-back touch now fires long after the resolve
+  that named the file, at a sync or an unmount, by when a rename may have given that name to another
+  file; the id is what the reply now carries anyway.
+- **A read-only mount is the server's.** `fs-server-ext4` takes a read-only flag in its setup
+  message, refuses every mutating operation with `NoAccess`, and marks the files it resolves
+  read-only in the block-file reply, which the kernel installs without `MAP_WRITE`. It never writes
+  the superblock.
+- **A filesystem knows how it was left.** A writable mount clears ext4's "cleanly unmounted" bit in
+  `s_state` before answering `Meta::Ready`, and an unmount sets it again as its last write. A
+  filesystem found not clean is reported, not refused; a repair tool stays deferred.
+- **Unmount is a chain, and it refuses while busy.**
+  1. The label leaves `/storage`, so nothing new resolves under it.
+  2. If any cached object of the registration is still held — a mapping, a handle — the unmount is
+     refused with `WouldBlock` and the label comes back. A lazy unmount is not built.
+  3. The kernel writes back every dirty object in the registration's cache: a new syscall,
+     `sys_ns_sync`, on the mounted server's endpoint.
+  4. The server marks the filesystem clean and exits, on a new `Meta::Unmount` on its control
+     channel.
+  5. The drive's cache is flushed: `IoOpcode::Flush` on the device, which a partition passes to its
+     disk, a RAM disk completes at once, and AHCI answers with FLUSH CACHE EXT.
+  6. The per-mount namespace is dropped.
+- **The storage service**, `storage-service`, is spawned by `init` after the device manager and before
+  anything declared, and bound at `/svc/storage`. It owns `block` — the first-come rule
+  `TODO(svc-auth-ungated)` records, met by spawning first — and for each device the replay hands it
+  it reads what is there: an ext4 superblock through `fs-server-ext4`'s library (`check_device`, and
+  the volume label), a FAT boot sector recognised and reported but not mounted, or nothing.
+- **`init`'s mounts stay `init`'s.** The service reads `/initramfs/etc/init.toml` and matches each
+  `[[mount]]` source to a device: a label to a partition record's name, a UUID to the parent disk's
+  GPT. Those are reported with their mount points and never mounted, auto or otherwise, or
+  unmounted.
+- **Auto-mount** mounts every other device whose filesystem the service can serve. **A live boot is
+  one whose root is on a RAM disk** — the fact that makes the machine's own disks the install
+  target — and there it mounts read-only.
+- **Names are labels.** The filesystem's own label, else the partition's, else `blk-<n>`; a clash
+  gets `-2`, `-3`, … Names beginning with `.` are refused as labels and fall back.
+- **One session endpoint, two bindings**, the device manager's shape again. The service mints an
+  endpoint on which it answers only the session side, and a supervisor binds it at `/storage` with
+  the base `/fs` — `/storage` is a directory of labels, and `/storage/<label>/…` continues into the
+  filesystem — and at `/dev/storage` with the base `/info`, the TSM1 table `disk --list` reads:
+  every block device, its filesystem, where it is mounted, by whom, and whether it was left clean.
+- **Mounting and unmounting are the `storage` grant.** The view broker resolves an admin endpoint the
+  service mints, once, at `/svc/storage/admin-endpoint`, and binds it at `/dev/storage/admin` in each
+  view with the grant; it speaks a small protocol, `Storage`
+  (`0x10xx`): `Mount`, `Unmount`, and `InUse` — the devices that must not be granted raw.
+- **The `disks` grant leaves out what is in use.** The broker asks `InUse` before binding devices: a
+  mounted filesystem's device, `init`'s included, and the disk that holds it, since raw writes to the
+  disk reach the partition. `nxinstall`'s own refusal of the running root stays.
+- **`disk`** is a coreutil: `--list` opens `/dev/storage/all.tsm`; `--mount <device> [<label>]` and
+  `--unmount <label>` speak `Storage` on `/dev/storage/admin`, so they work only in a view with the
+  grant. An explicit `--mount` is writable, on a live boot too — the auto-mount is what is careful,
+  not an administrator.
+
+### A mount, end to end
+
+1. The live image boots with a SATA disk attached, holding a Nitrox install. The kernel publishes the
+   RAM disk and its `nitrox-live` partition, the disk, and its ESP and `nitrox-root`.
+2. `init` mounts `/` from `gpt-partlabel:nitrox-live`, spawns the device manager, then the storage
+   service, which subscribes to `block` and receives the five devices. It reads `init.toml`, marks
+   `nitrox-live` as `init`'s, and sees that the root's parent is a RAM disk: a live boot.
+3. For `nitrox-root` it finds an ext4 superblock labelled `nitrox-root`, spawns `fs-server-ext4` over
+   it read-only, builds a namespace with that server bound at `/`, and adds the label.
+4. A person logs in. The supervisor resolves `/svc/storage/session-endpoint` and binds it at
+   `/storage` and `/dev/storage`.
+5. `open /storage/nitrox-root/home/alice/notes.txt` resolves through the session namespace to the
+   storage service with the suffix `fs/nitrox-root/home/alice/notes.txt`. The service answers
+   `SUBNAMESPACE` with the mount's namespace and `/home/alice/notes.txt`. The kernel continues there,
+   reaches the mounted server, and installs the cached `FileObject` for that inode.
+6. `with admin disk --unmount nitrox-root` runs the chain above, then
+   `with admin disk --mount /dev/blk/3` mounts it writable.
+
+### The pieces, in dependency order
+
+- [ ] **C.1 — one cached `FileObject` per file.** The file id in the block-file reply's body
+      (`rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*); a cache per
+      registration, keyed by id; grow, create and truncate in place; the per-object dirty state;
+      dirty objects kept past their last user and found again; `File::Forget`; `sys_ns_sync`.
+      Kernel host tests: two resolves share one object; a dirty object outlives its last handle and
+      is found by the next resolve; a clean one does not; a forgotten one is never written back, a
+      `Forget` during a write-back is answered only after the IRP in flight, and nothing is written
+      after it; **a truncate and then a grow read zero over the regrown range**, a whole page and a
+      partial tail — which a design that kept the pages would fail, where "mapped pages stay valid"
+      alone passes for both; `File::Touch` by id after a rename. **A `boot-probe` check**: a file
+      written through one mapping is read through another without a sync, a write whose handle was
+      closed unsynced reaches the device on `sys_ns_sync`, and an unlink's pages are not written back.
+- [ ] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
+      non-data path and FLUSH CACHE EXT; the RAM disk; a partition passing it to its disk.
+      `boot-probe` flushes the root disk and the probe asserts completion.
+      `TODO(ahci-flush)` resolved.
+- [ ] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
+      read-only mark in the block-file reply; `s_state` cleared on a writable mount and set on
+      `Meta::Unmount`. Host tests on the library: a read-only mount refuses each mutating op, and the
+      state round-trips — read back from bytes a writer produced, and from a superblock `mkfs` never
+      wrote, one left mounted.
+- [ ] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
+      its flags, size change and a rename's destination — so the kernel can continue a resolve in the
+      replied namespace with the replied path, for every operation — a rename continues both paths, and
+      one whose destination leaves the replied prefix is `Unsupported`, the cross-filesystem answer
+      — to a depth of four, past which it is `TooLarge`. Kernel host tests on the continuation's
+      path arithmetic; the storage service is the first server to use it, so its boot test is C.5's.
+- [ ] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
+      `init`'s mounts from `init.toml`; the live-boot test; auto-mount; labels; the per-mount
+      namespaces and the `SUBNAMESPACE` answer; the session and admin endpoints; the table; `Storage`
+      (`rsproto-storage-ops.md`, `0x10xx`, its row in the wire-format table); the unmount chain. <!-- check-docs: allow-missing -->
+      `init` spawns it after the device manager with `BIND_NAMESPACE`. Host tests on its library:
+      matching `init.toml` sources to records, the live-boot rule, labels and clashes, the table's
+      rows, and which devices are in use. **A `boot-probe` check**, through the root endpoint since the
+      probe runs in the root namespace: `/svc/storage/info/all.tsm` lists the root as `init`'s and has
+      a row per block record — which is the replay reaching its owner — and
+      nothing mounts the root twice. **B.2's subscription check changes with it**: it took `block` to
+      test the replay, the one-owner rule and a retake, and `block` is owned from boot now, so the
+      probe asserts `block` is refused, as it does `input`, and the retake stays the host tests' and
+      B.2's recorded controls'.
+- [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
+      `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
+      grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and
+      `/dev/storage/all.tsm` from a serial login, and `disk --mount` refused without the grant; step
+      20b(d) and `check-login`'s 9a2 re-aimed, and the *Gates* table's row A reworded
+      (*Consequences for earlier parts*).
+- [ ] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
+- [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
+      packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
+      its SATA disk; assert `nitrox-root` auto-mounted read-only and a write to it refused; log in on
+      serial and `with admin disk --unmount`, then `--mount` it writable; run a test program that
+      writes a pattern through a mapping, **exits without a sync**, and a second that reads it back
+      through `/storage` in the guest; unmount; stop the machine. On the host, carve `nitrox-root` from
+      the disk: `e2fsck -fn` clean, `s_state` clean, and the file's **contents** the pattern — read
+      with the same `fs-server-ext4` library `check-install` uses.
+- [ ] **Docs**: a storage architecture doc; `filesystem-data-path.md` (the cache, the triggers, the
+      dirty claim corrected); `ext4-fs-server-rw.md` (read-only mode, the state); the namespace-ops
+      spec (`SUBNAMESPACE` built, the file id and read-only mark in the block reply);
+      `rsproto-storage-ops.md`; `session-and-auth.md`'s <!-- check-docs: allow-missing -->
+      table; `boot-flow.md`; `deferred-decisions.md` — teardown write-back and `TODO(ahci-flush)`
+      resolved, the page cache's first axis resolved and its other two kept, the new `File::Forget`
+      boundary noted.
+
+**Part C may land as two PRs** — C.1–C.4, the kernel and `fs-server-ext4`, then C.5–C.8 — if one
+proves too large to review. The first half is useful on its own, but less than it sounds: it makes
+two mappings of a file agree, and keeps an unsynced writer's pages until something syncs that file —
+a later `sys_file_sync` of it now carries them. Until C.5's unmount, or Part E's shutdown for
+`init`'s mounts where `/home` lives, nothing syncs a file whose writer forgot, so that data moves
+from "lost at exit" to "lost at power-off unless something syncs it".
+
+### What to compare on the day
+
+- **`check-storage`**: the whole chain, with the host holding the result.
+- **`test-qemu`**: `boot-probe`'s cache, flush and storage checks.
+- **`test-interactive`**: `/storage` and `/dev/storage` in a serial session, and the grant's refusal.
+- **`check-live`** and **`check-install`**, unchanged: a live boot with no disk mounts nothing, and
+  `nxinstall` still refuses the running root and writes a blank disk. **`check-install` on demand**,
+  because the storage service now runs through its whole boot: the blank disk holds no filesystem,
+  so nothing is auto-mounted, and partitions are published only at boot, so the ones the installer
+  writes are never auto-mounted mid-install. **Its disks do not come from `disks`** — the installer
+  session binds them itself, through `libsession`'s `bind_blk` — so `InUse` does not reach that path
+  (*Consequences for earlier parts*).
+- **`check-login`**: the graphical session's `/storage`.
+
+### Consequences for earlier parts
+
+- **Part A's `test-interactive` step 20b(d)** runs `with admin nxinstall` and expects `/dev/blk/0`.
+  On a release boot that is the disk holding `init`'s root, which `disks` withholds from C.6 on, so
+  `nxinstall` would list the ESP alone and the step would time out. **C.6 re-aims it**: under `with
+  admin`, `/dev/blk/0` is absent and the ESP present — which puts `InUse` in `test-interactive` too.
+  The *Gates* table's row A ("under `with admin` a program sees `/dev/blk/0`") changes with it, and
+  `check-login`'s step 9a2, which still passes on the ESP, is re-aimed the same way, since passing
+  on the ESP is a weaker claim than it was written for.
+- **B.2's `boot-probe` check** can no longer take `block`, which the storage service owns from boot;
+  it asserts the refusal instead (C.5).
+- **The installer session is a second raw path, and Part C leaves it unfiltered.** On an installer
+  boot, `libsession`'s `bind_blk` hands the session every device, a mounted one included. With Part
+  C, booting the stick's install entry on a machine that holds an install auto-mounts its
+  `nitrox-root` read-only **and** hands the same disk raw to `nxinstall`. That is confusion rather
+  than corruption, since a read-only mount writes nothing, and it closes with Part G, which makes the
+  installer session ordinary and routes `nxinstall` through `disks`.
+- **Part G meets two things when it does.** A reinstall's target disk is auto-mounted on the live
+  boot, and so withheld from `disks` until it is unmounted. And `InUse` withholds the RAM disk
+  holding a live boot's root, so `check-install`'s step 7 — `nxinstall` refusing `/dev/blk/1`
+  because "it is a ram disk" — becomes "not reachable" through `disks`. G's detail pass designs
+  both.
+
+### Left alone
+
+- **Per-page dirty bits** (`TODO(page-dirty-tracking)`), eviction under memory pressure, and a
+  periodic write-back daemon: the cache writes a dirty object's resident pages, and holds what is in
+  use or dirty.
+- **A lazy unmount**, and unmounting what is busy.
+- **Multiple SATA disks**, FAT, formatting and partitioning — Phase 6.
+- **A repair tool**: an unclean filesystem is reported.
+- **Per-session visibility under `/storage`**: every account sees every mounted filesystem.
+- **`init`'s filesystems' clean state at shutdown** — Part E's `shutdown` runs the same chain on them.
+
 ## Gates
 
 | Part | What proves it |
 |---|---|
 | A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-login`: one `with` request from the terminal the Applications menu opens |
 | B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
-| C | **`check-install`'s topology**: a live boot, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync, unmounted — then `e2fsck` and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file |
+| C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **a shutdown gate**: write through a mapping without syncing, run `shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot |
 | G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |

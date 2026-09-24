@@ -751,9 +751,9 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
     send_reply(serve_end, count);
 }
 
-/// Reply `OBJECT_KIND_DIRECTORY` to a forwarded `RESOLVE_DIR_OPEN`, transferring
-/// `client_end` (the session channel's client side) in `handles[0]`. Mirrors the logging
-/// service's `OBJECT_KIND_CHANNEL` reply. `true` on a successful send.
+/// Reply `OBJECT_KIND_CHANNEL` to a forwarded `RESOLVE_DIR_OPEN`, transferring `client_end`
+/// (the session channel's client side) in `handles[0]` — the logging service's reply shape.
+/// `OBJECT_KIND_DIRECTORY` is reserved and never sent. `true` on a successful send.
 fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; RESOLVE_REPLY_LEN];
     // A directory handle is a live channel to the server (the kernel installs the

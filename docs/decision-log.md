@@ -28869,3 +28869,97 @@ change.
   class ownership: until Part C's storage service subscribes, any holder of the root namespace can
   take `block`, every disk, and hold it. Until the constructed-namespace fix, the storage service
   should be spawned by `init` before anything declared, as `input-server` is.
+
+## 2026-09-24 — Administration Part C's detail pass: a file cache, a namespace per mount, and a gate on the host
+
+Part C, storage, has its detail pass (`planning/administration.md` § *Part C in detail*). The spike
+found the plan's three kernel items bigger than they read:
+- **"Write back every `FileObject` under a registration" has nothing to enumerate.** A `FileObject`
+  frees its frames unwritten when its last reference goes, so a writer that exits takes its unsynced
+  data with it before any unmount runs. And every resolve builds its own object, so two mappers of
+  a file already disagree.
+- **Nothing is dirty-tracked**, and `filesystem-data-path.md` said a store marks a page dirty. It
+  never did; the claim is corrected with the pass.
+- **The server frees blocks the kernel cannot see it free** — unlink over a directory session, and a
+  replacing rename — so any cache that outlives its writers needs to be told.
+- **The pending lookup a `SUBNAMESPACE` continuation would start from does not keep the resolve's
+  operation.** The flags, a size change and a rename's destination went to the server and are not
+  stored. That was nearly written into the pass as the opposite; reading the struct before citing it
+  caught it.
+- **`fs-server-ext4` has no read-only mode**, no clean state after `mkfs`, and no way to flush a
+  drive. A binding's `"ro"` does not stop writes.
+
+**The maintainer's calls, 2026-09-24:**
+- **One cached `FileObject` per file**, keyed by the server's file id, shared by every resolve,
+  updated in place by growth, and kept while dirty. This is over keeping dirty objects to unmount
+  (which serves a later resolve stale data) and over writing back at last drop from a kernel thread
+  (which leaves two mappers incoherent).
+- **`SUBNAMESPACE` hands back a namespace.** The storage service builds one per mount and holds
+  `BIND_NAMESPACE` for them, over handing back an endpoint, whose registration's lifetime nothing
+  would own.
+- **Sessions get `/storage` by resolving it**, as they do `/svc/views/session`, rather than a
+  seventh courier through `init` and `service-mgr`.
+- **The gate is a test live image with a SATA disk, checked on the host**, over an in-guest check on
+  a RAM disk that no host can read.
+
+**Derived:**
+- **`File::Forget`**, from the server to the kernel, when an inode is freed.
+- **Per-object dirty state** until per-page bits exist.
+- **A read-only mode in the server.**
+- **`s_state` kept honestly.**
+- **An unmount that refuses while busy.**
+- **`IoOpcode::Flush`.**
+- **The storage service**, which reads `init.toml` to leave `init`'s mounts alone and treats a root on
+  a RAM disk as a live boot.
+- **`/storage` and `/dev/storage`**: one minted session endpoint, bound twice.
+- **A `storage` grant**, and a `disks` grant that asks what is in use first.
+
+Two consequences for earlier parts are written down. B.2's `boot-probe` check can no longer take
+`block`, which the storage service owns from boot, so it will assert the refusal instead. And a
+reinstall, Part G, meets a disk that is now auto-mounted, and so withheld from `disks` until it is
+unmounted.
+
+**The pass fixed two docs it found untrue**: `rsproto-namespace-ops.md` gains the `CHANNEL` and
+`FILE_BLOCKS` rows and the block reply's body layout, missing since their slices; and
+`filesystem-data-path.md` no longer claims dirty tracking. It suggests Part C may land as two PRs,
+the kernel and `fs-server-ext4` half first.
+
+## 2026-09-24 — Part C's detail pass, reviewed: what C breaks upstream, a stale page, and a Forget that waits
+
+PR #334's review had no blocking findings: four worth fixing and five optional, all taken. It
+checked every claim the spike made against the source and found them true, except one the pass
+had inherited.
+
+**Worth fixing:**
+1. **C.6 breaks Part A's `test-interactive` step 20b(d).** The step expects `/dev/blk/0` under
+   `with admin`, and on a release boot that is the disk holding `init`'s root, which `disks` will
+   withhold. The pass now has a *Consequences for earlier parts* section. C.6 re-aims the step to
+   assert that disk absent and the ESP present, rewords the *Gates* row A, and re-aims
+   `check-login`'s 9a2, which would still pass on the ESP but prove less.
+2. **`check-install` never uses `disks`.** Its installer session binds devices itself through
+   `libsession`'s `bind_blk`. So its conclusion ("unchanged") was right for the wrong reason, and the
+   plan's promise to refuse a raw grant of a mounted device has a second path Part C leaves open
+   until Part G. That path can hand an auto-mounted, read-only disk raw to `nxinstall`: confusion,
+   not corruption. G inherits it, and also the loss of `check-install`'s ram-disk refusal line once
+   `InUse` withholds the live root's RAM disk.
+3. **A truncate that keeps pages, and then a grow, would serve stale bytes and write them back.**
+   `reserve` hits by page index regardless of size. Now pages wholly past a new size leave the cache
+   index, a partial last page is zeroed past the end, and a grow zeroes it from the old size. The
+   test is truncate-then-grow-reads-zero, because "mapped pages stay valid" passes for both designs.
+4. **`AllocRange` was described as the kernel's current write-back path** in
+   `filesystem-data-path.md` and `rsproto-block-ops.md`. Neither it nor `MapRange` exists anywhere.
+   Both are marked deferred in both docs, and the block-ops spec's Status line now says what is live
+   (the `BlockRun` form inside the resolve reply).
+
+**Optional:**
+- `File::Touch` goes by file id, since a cached object's first suffix may have been renamed away.
+- `File::Forget` is acknowledged. The kernel marks the object dead, checks the mark before each
+  write IRP, and answers after any write in flight; the server frees blocks only on that answer.
+- `init.toml` accepts no `device-path`, so C.5 drops that match. `init-toml-schema.md` said it
+  "is supported", a current-behaviour spec bug the pass had inherited, and it is corrected.
+- The MEMOBJ paragraph moves out from under the new `FILE_BLOCKS` heading.
+- The two-PR rationale says what C.1–C.4 alone buy: coherent mappings, and unsynced data kept until
+  something syncs it, which for `init`'s mounts is Part E.
+
+A doc comment in `fs-server-ext4` still said its directory reply was `OBJECT_KIND_DIRECTORY`, and
+now matches the code.

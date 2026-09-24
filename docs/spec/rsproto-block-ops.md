@@ -8,8 +8,11 @@ block device. See [filesystem-data-path.md](../architecture/filesystem-data-path
 contract and [ext4-fs-server-rw.md](../architecture/ext4-fs-server-rw.md) for the first
 implementer.
 
-**Status:** Pre-stabilization. Introduced with the fs-server-ext4 read-write slice. A
-**kernel↔server ABI** — the kernel hand-codes the request/reply (`kernel/src/rsproto.rs`).
+**Status:** Pre-stabilization. Introduced with the fs-server-ext4 read-write slice. **Both ops are
+specified and deferred — nothing sends or answers them** (checked 2026-09-24, the administration
+Part C review). What is live is the **`BlockRun`** wire form, which the `FILE_BLOCKS` resolve reply
+carries ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md)). A
+**kernel↔server ABI** — the kernel hand-codes that run map (`kernel/src/rsproto.rs`).
 There is no `librsproto` mirror for these ops: the server side is implemented directly by
 the consumer, today `fs-server-ext4`'s `BlockReader`/`BlockWriter` traits over
 `sys_io_submit` (`userspace/fs-server-ext4/src/lib.rs`).
@@ -47,8 +50,12 @@ mount; it need not equal the device sector size (the kernel scales LBAs accordin
 
 ## MapRange (`op = 0x0300`) — read-only
 
+**Deferred — specified, not implemented**, like `AllocRange` below: the file's run map arrives
+inline in the `FILE_BLOCKS` resolve reply, and a file too fragmented to fit is answered `TooLarge`
+(`fs-server-ext4`'s `map_file`), which is the case this op exists for.
+
 Translate a range of a file's blocks to the device blocks that currently back it. **No side
-effects.** The kernel uses this to fill reads (Model A) and to locate existing blocks when
+effects.** The kernel would use this to fill reads (Model A) and to locate existing blocks when
 flushing an overwrite.
 
 > **Initial map via the resolve reply.** For a freshly resolved file the kernel does not need
@@ -93,8 +100,13 @@ the request and the kernel re-requests from the first uncovered block.
 
 ## AllocRange (`op = 0x0301`) — mutating
 
+**Deferred — specified, not implemented.** No `0x0301` exists in the kernel or any server: a file
+grows through `sys_file_grow`'s resolve, whose `FILE_BLOCKS` reply carries the new runs, and
+`writeback` skips a page over a hole. `MapRange` is likewise carried by the resolve reply today
+(`ext4-fs-server-rw.md` lists both standalone ops as deferred).
+
 Allocate device blocks to back a range that is currently a hole / past EOF, insert them into
-the file, and return their runs. The kernel calls this only when flushing dirty pages that
+the file, and return their runs. The kernel would call this when flushing dirty pages that
 have no backing block. **Mutates filesystem metadata** (the allocator + the file's block map +
 inode size/mtime). Per the data-path contract, the kernel writes the data blocks (write IRP)
 before this allocation's metadata is made durable.

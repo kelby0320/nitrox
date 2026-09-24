@@ -114,14 +114,29 @@ Body length = 8.
 |---|---|---|---|
 | `NONE` | `0` | **none** — the request mutated the filesystem and resolves to no object (`RESOLVE_RENAME`). `content_len` is unused. | ✅ |
 | `MEMOBJ` | `1` | a read-only `MemoryObject` of the file content | ✅ |
-| `DIRECTORY` | `2` | (a directory resource) | deferred |
-| `SUBNAMESPACE` | `3` | (a nested namespace) | deferred |
+| `DIRECTORY` | `2` | reserved — an open directory is answered as `CHANNEL` | — |
+| `SUBNAMESPACE` | `3` | (a nested namespace) | deferred — administration Part C builds it |
 | `FILE` | `4` | **none** — `content_len` is the total file size; the kernel builds a page-cache object filled via `File::ReadRange`. Paired with `RESOLVE_FILE_LAZY`. | ✅ (slice 8) |
+| `CHANNEL` | `5` | a live `IpcChannel` — a connection to the resolving server: a directory session, a per-principal log channel, a subscription. `content_len` is unused. | ✅ |
+| `FILE_BLOCKS` | `6` | the **block device** — a Model A file: `content_len` is the file size, and the body carries the block map below. The kernel fills each page zero-copy from the device. | ✅ (Phase 3) |
 
-`content_len` is the exact byte length, so the client can trim the
+These two rows were missing until the administration Part C detail pass (2026-09-24), which extends
+`FILE_BLOCKS`; the kinds were in use from their slices.
+
+For `MEMOBJ`, `content_len` is the exact byte length, so the client can trim the
 `MemoryObject`'s zero-padded tail precisely. Phase 2 caps the content at **64
 KiB**; a larger file replies with the error `TooLarge` (the page cache, slice 8,
 lifts the cap with lazy faulting).
+
+#### The `FILE_BLOCKS` body
+
+The 8-byte `ResolveReply` above, then:
+
+| Offset | Size | Field |
+|---|---|---|
+| 8 | 4 | `block_size` — the filesystem's block size, in bytes |
+| 12 | 4 | `run_count` |
+| 16 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
 
 ### Reply body (error)
 
