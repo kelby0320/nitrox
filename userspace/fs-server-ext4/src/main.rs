@@ -37,7 +37,8 @@ use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
 use librsproto::file::{
     DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, DIRENT_KIND_UNKNOWN, DirReplyWriter,
-    parse_name_request, parse_read_dir_request, parse_rename_request, parse_touch_request,
+    forget_request, parse_name_request, parse_read_dir_request, parse_rename_request,
+    parse_touch_request,
 };
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_CREATE, RESOLVE_GROW,
@@ -45,7 +46,7 @@ use librsproto::namespace::{
     parse_resolve_rename, parse_resolve_request, resolve_reply,
 };
 use librsproto::{
-    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
+    OP_FILE_FORGET, OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
     OP_FILE_UNLINK, OP_NS_RESOLVE,
     RS_FLAG_REPLY,
 };
@@ -75,6 +76,8 @@ static mut RECV_COUNT: usize = 0;
 /// Outbox for a reply (and the bootstrap Ready); the transferred handle in `[0]`.
 static mut REPLY_MSG: [u8; 4096] = [0; 4096];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
+/// Outbox for a `File::Forget` — its own, since one is sent while a reply may be half-staged.
+static mut FORGET_MSG: [u8; 4096] = [0; 4096];
 /// Scratch for the file content (the 64 KiB read-model cap).
 static mut CONTENT: [u8; ext4::MAX_FILE] = [0; ext4::MAX_FILE];
 /// `sys_wait` scratch: the forwarding endpoint plus every open directory session. One slot
@@ -618,6 +621,63 @@ fn try_touch<RW: BlockReader + BlockWriter>(reader: &RW) -> bool {
     true
 }
 
+/// **Free inode `ino`, which no name reaches any more, once the kernel says it may**
+/// (administration Part C.1b). The kernel may hold the file's pages and be writing them to its
+/// blocks. A `File::Forget` stops that, and its answer comes once no IRP of the file is in
+/// flight; only then are the blocks freed, so no write the kernel issued can land in a block
+/// this server has since handed to another file.
+///
+/// If the kernel cannot be asked, the inode is left unattached with its link counted. That
+/// leaks its blocks until `e2fsck` moves the file to `lost+found`, where freeing them could
+/// corrupt another file.
+fn forget_then_release<RW: BlockReader + BlockWriter>(reader: &RW, serve_end: u64, ino: u32) {
+    if !forget(serve_end, ino) {
+        kprint(b"fs-server-ext4: the kernel did not answer a forget; the inode is kept\n");
+        return;
+    }
+    if ext4::release_inode(reader, ino, now_secs()).is_err() {
+        kprint(b"fs-server-ext4: releasing an unlinked inode failed\n");
+    }
+}
+
+/// Send `File::Forget` for `ino` on the forwarding endpoint and wait for the kernel's answer
+/// — the send's `PendingOperation`, which is why it goes `SENDMODE_BLOCK`. `true` once
+/// answered.
+///
+/// **Waits on buffers of its own**, not `WAIT_HANDLES`/`WAIT_RESULTS`: this runs while
+/// `serve_loop` is still walking the batch of results a wait wrote there.
+fn forget(serve_end: u64, ino: u32) -> bool {
+    let mut body = [0u8; 8];
+    let Some(n) = forget_request(&mut body, ino as u64) else {
+        return false;
+    };
+    // SAFETY: FORGET_MSG is a valid buffer, written only here; the rsproto message goes at
+    // offset PAYLOAD_OFF.
+    let sent = unsafe {
+        let Some(rs_len) =
+            librsproto::encode(&mut FORGET_MSG[PAYLOAD_OFF..], OP_FILE_FORGET, 0, 0, &body[..n], 0)
+        else {
+            return false;
+        };
+        FORGET_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        FORGET_MSG[8] = 0;
+        syscall5(SYS_CHANNEL_SEND, serve_end, (&raw const FORGET_MSG) as u64, 0, 0, SENDMODE_BLOCK)
+    };
+    if sent < 0 {
+        return false;
+    }
+    let handles = [sent as u64];
+    let mut results = [0u8; WAIT_RESULT_SIZE];
+    // SAFETY: `handles` and `results` are valid local buffers for one waiter.
+    let waited = unsafe {
+        syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX)
+    };
+    let status = i32::from_le_bytes([results[8], results[9], results[10], results[11]]);
+    // SAFETY: closing the PendingOperation the send returned.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, sent as u64) };
+    waited == 1 && status == 0
+}
+
 /// If the forwarded request in `RECV_MSG` is a `RESOLVE_RENAME`, perform the rename and
 /// reply. `true` if it was handled — the caller must not fall through to the paths that
 /// resolve to an object.
@@ -690,7 +750,14 @@ fn try_resolve_rename<RW: BlockReader + BlockWriter>(reader: &RW, serve_end: u64
         now_secs(),
     );
     match done {
-        Ok(()) => reply_resolve_none(serve_end, request_id),
+        Ok(replaced) => {
+            // A replaced file's blocks are freed before the rename is answered, once the
+            // kernel has forgotten it.
+            if let Some(ino) = replaced {
+                forget_then_release(reader, serve_end, ino);
+            }
+            reply_resolve_none(serve_end, request_id)
+        }
         Err(e) => reply_resolve_error(serve_end, request_id, fs_kerror(e)),
     }
     true
@@ -821,7 +888,7 @@ fn open_dir_session(serve_end: u64, request_id: u64, dir_ino: u32) {
 /// Serve requests that arrived on an open directory session `session_ch`. Drains the
 /// channel: each `File::ReadDir` enumerates the bound directory into a batch reply sent
 /// back on the same channel; a `PeerClosed` frees the session.
-fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
+fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64, serve_end: u64) {
     // SAFETY: single-threaded scan.
     let Some(slot) = (unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == session_ch) }) else {
         return; // already freed (e.g. an earlier result in this batch closed it)
@@ -872,7 +939,13 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
                 let r = match parse_name_request(body) {
                     Some(name) => match op {
                         OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name, now_secs()),
-                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name, now_secs()),
+                        // The last name's removal frees the file only once the kernel has
+                        // forgotten it, and before the client hears it is gone.
+                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name, now_secs()).map(|orphan| {
+                            if let Some(ino) = orphan {
+                                forget_then_release(reader, serve_end, ino);
+                            }
+                        }),
                         OP_FILE_RMDIR => ext4::rmdir_at(reader, dir_ino, name, now_secs()),
                         // Session-scoped touch. The *path*-scoped form on the control
                         // channel stays as it is: that one is the kernel reporting a
@@ -1091,7 +1164,7 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
                 };
                 match (pass, h == serve_end) {
                     // Pass 0: session traffic, including the `PeerClosed` that frees a slot.
-                    (0, false) => serve_session(reader, h),
+                    (0, false) => serve_session(reader, h, serve_end),
                     // Pass 1: drain every queued forwarded request on the kernel endpoint.
                     (1, true) => {
                         while recv_on(serve_end) == 0 {

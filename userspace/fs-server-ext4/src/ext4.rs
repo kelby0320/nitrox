@@ -1597,15 +1597,21 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
 }
 
 /// Remove the **regular file** `name` from directory inode `dir_ino`: unlink the directory
-/// entry, decrement the target's link count, and — when it reaches zero — free the target's
-/// data blocks and inode. Name-addressed. `NotFound` if absent; `Unsupported` if `name` is a
-/// directory (use [`rmdir_at`]).
+/// entry and decrement the target's link count. Name-addressed. `NotFound` if absent;
+/// `Unsupported` if `name` is a directory (use [`rmdir_at`]).
+///
+/// **The last name's removal frees nothing yet**: it returns the inode, still counting that
+/// link and holding its blocks, and [`release_inode`] frees it (administration Part C.1b).
+/// The kernel may hold the file's pages and be writing them to those blocks, so a server
+/// frees them only after `File::Forget` has been answered — else a write the kernel had
+/// already issued could land in a block handed to another file. `None` when another name
+/// still reaches the inode.
 pub fn unlink_at<RW: BlockReader + BlockWriter>(
     rw: &RW,
     dir_ino: u32,
     name: &[u8],
     now: i64,
-) -> Result<(), FsError> {
+) -> Result<Option<u32>, FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
     if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
@@ -1618,22 +1624,54 @@ pub fn unlink_at<RW: BlockReader + BlockWriter>(
     }
 
     dir_remove(rw, &sb, &parent, name)?;
-
-    let links = rd_u16(&target, 26).wrapping_sub(1);
-    if links == 0 {
-        free_inode_blocks(rw, &sb, &target)?;
-        free_inode(rw, &sb, target_ino, false, now)?;
-    } else {
-        let off = inode_offset(rw, &sb, target_ino)?;
-        let mut t = target;
-        t[26..28].copy_from_slice(&links.to_le_bytes());
-        // A surviving hard link: the file's *contents* did not change, only its
-        // link count — so ctime moves and mtime does not.
-        stamp(&mut t, now, sb.inode_size, Stamp::MetadataOnly);
-        rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
-    }
+    let orphan = drop_link(rw, &sb, target_ino, &target, now)?;
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
-    Ok(())
+    Ok(orphan)
+}
+
+/// Take away one of `ino`'s names. With others left, its link count drops now; for its last,
+/// nothing is written, and `Some(ino)` says it waits for [`release_inode`].
+fn drop_link<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    ino: u32,
+    inode: &[u8; 256],
+    now: i64,
+) -> Result<Option<u32>, FsError> {
+    let links = rd_u16(inode, 26);
+    if links <= 1 {
+        return Ok(Some(ino));
+    }
+    let off = inode_offset(rw, sb, ino)?;
+    let mut t = *inode;
+    t[26..28].copy_from_slice(&(links - 1).to_le_bytes());
+    // A surviving hard link: the file's *contents* did not change, only its link count — so
+    // ctime moves and mtime does not.
+    stamp(&mut t, now, sb.inode_size, Stamp::MetadataOnly);
+    rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
+    Ok(None)
+}
+
+/// **Free an inode no name reaches any more** — its data blocks, then the inode itself: the
+/// second half of [`unlink_at`], or of a [`rename_path`] that replaced a file. A server calls
+/// it only once the kernel has answered `File::Forget` for the inode, so nothing the kernel
+/// issued can still land in these blocks (administration Part C.1b).
+///
+/// Between the halves the inode is unattached with its link still counted. A crash there
+/// leaves what `rename_path` already could — `e2fsck` moves the file to `lost+found` — and
+/// never a block claimed twice. `NotFound` unless `ino` is a regular file with a link counted,
+/// since a server passes back only what a removal returned.
+pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    if ino == 0 || ino > sb.inodes_count {
+        return Err(FsError::NotFound);
+    }
+    let inode = read_inode(rw, &sb, ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG || rd_u16(&inode, 26) == 0 {
+        return Err(FsError::NotFound);
+    }
+    free_inode_blocks(rw, &sb, &inode)?;
+    free_inode(rw, &sb, ino, false, now)
 }
 
 /// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds
@@ -1748,11 +1786,13 @@ fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
 /// 1. Point the destination name at the source inode — repointing an existing entry when
 ///    replacing, otherwise inserting a new one.
 /// 2. Remove the source's old entry.
-/// 3. Release the replaced inode's link (freeing it if that was the last).
+/// 3. Drop the replaced inode's link. If it was the last, the inode is returned rather than
+///    freed, for [`release_inode`] once `File::Forget` has been answered — as [`unlink_at`]
+///    does, and for its reason.
 ///
-/// A crash between 1 and 2 leaves the file reachable under *both* names; between 2 and 3 it
-/// leaves the replaced inode unreferenced with a positive link count. `e2fsck` repairs both
-/// (the latter into `lost+found`), and neither loses the file being moved.
+/// A crash between 1 and 2 leaves the file reachable under *both* names; after 2 it can leave
+/// the replaced inode unreferenced with a positive link count. `e2fsck` repairs both (the
+/// latter into `lost+found`), and neither loses the file being moved.
 ///
 /// Moving a **directory** additionally repoints its `..` and shifts one link from the old
 /// parent to the new. Replacing a directory is refused (`Unsupported`) — that needs the
@@ -1763,7 +1803,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     new_path: &[u8],
     replace: bool,
     now: i64,
-) -> Result<(), FsError> {
+) -> Result<Option<u32>, FsError> {
     let sb = read_superblock(rw)?;
     let (old_parent_path, old_name) = split_parent(old_path).ok_or(FsError::Unsupported)?;
     let (new_parent_path, new_name) = split_parent(new_path).ok_or(FsError::Unsupported)?;
@@ -1774,7 +1814,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     }
     // A no-op rename must not unlink anything.
     if old_dir_ino == new_dir_ino && old_name == new_name {
-        return Ok(());
+        return Ok(None);
     }
 
     let src_ino = dir_lookup(rw, &sb, &old_dir, old_name)?;
@@ -1815,21 +1855,14 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     let (_, old_dir) = resolve_path_ino(rw, &sb, old_parent_path)?;
     dir_remove(rw, &sb, &old_dir, old_name)?;
 
-    // Step 3: release the inode the destination name used to hold.
-    if let Some(dest_ino) = replaced {
-        let dest = read_inode(rw, &sb, dest_ino)?;
-        let links = rd_u16(&dest, 26).wrapping_sub(1);
-        if links == 0 {
-            free_inode_blocks(rw, &sb, &dest)?;
-            free_inode(rw, &sb, dest_ino, false, now)?;
-        } else {
-            let off = inode_offset(rw, &sb, dest_ino)?;
-            let mut d = dest;
-            d[26..28].copy_from_slice(&links.to_le_bytes());
-            stamp(&mut d, now, sb.inode_size, Stamp::MetadataOnly);
-            rw.write_at(off, &d[..(sb.inode_size as usize).min(256)])?;
+    // Step 3: drop the link the destination name held.
+    let orphan = match replaced {
+        Some(dest_ino) => {
+            let dest = read_inode(rw, &sb, dest_ino)?;
+            drop_link(rw, &sb, dest_ino, &dest, now)?
         }
-    }
+        None => None,
+    };
 
     // A directory carries a link to its parent through `..`, so a move between parents
     // shifts one link and rewrites that entry.
@@ -1844,7 +1877,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     if new_dir_ino != old_dir_ino {
         touch_inode(rw, &sb, new_dir_ino, now, Stamp::Modified)?;
     }
-    Ok(())
+    Ok(orphan)
 }
 
 /// Rename `old` to `new` **within** directory inode `dir_ino` (the session's bound

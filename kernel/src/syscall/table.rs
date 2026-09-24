@@ -2436,6 +2436,17 @@ pub fn sys_channel_send(
     // kernel receives that ring. The reply is consumed regardless of `send_mode`
     // (servers reply `NoBlock`). See `docs/spec/rsproto-namespace-ops.md`.
     if let Some(reg) = crate::sched::us_forward_reg_for_send(ok.object.as_ptr()) {
+        // The one request a server sends the kernel: `File::Forget`, answered through the
+        // blocking send's `PendingOperation` (administration Part C.1b).
+        let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
+        if let Some(file_id) = crate::rsproto::forget_request(&bounce.payload[..payload_len]) {
+            // Only `Block`: its result is a PO, and no deadline could apply — the answer waits
+            // on I/O already issued, which nothing can call back.
+            if send_mode != SendMode::Block || count != 0 {
+                return Err(KError::InvalidArgument);
+            }
+            return answer_forget(reg, file_id, pid);
+        }
         return complete_forwarded_reply(reg, &bounce, &mut transfers, &h_raw, count, pid);
     }
 
@@ -2516,6 +2527,56 @@ pub fn sys_channel_send(
                     Err(KError::PeerClosed)
                 }
             }
+        }
+    }
+}
+
+/// **Answer a server's `File::Forget`** (administration Part C.1b): the file `file_id` is
+/// about to be freed, and the server frees its blocks only once the kernel says nothing of it
+/// is in flight. The file's cached object, if any, leaves the cache and is forgotten — it
+/// starts no more device I/O — and the answer is a `PendingOperation` installed in the
+/// server's table: complete already if nothing was in flight, otherwise completed when the
+/// last IRP ends ([`FileObject::end_io`]). The server `sys_wait`s on it, which is why a
+/// `Forget` must be sent `Block`: it is the send mode whose result is a PO.
+fn answer_forget(reg: *mut (), file_id: u64, pid: u32) -> SysResult {
+    use crate::object::{FileObject, Forgotten, UserspaceServerReg};
+    let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    let answer =
+        unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    // SAFETY: `reg` addresses the live registration the send arrived through.
+    let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }) else {
+        return Err(KError::KernelError);
+    };
+    // SAFETY: `reg_ref` pins the registration.
+    let r: &UserspaceServerReg = unsafe { &*(reg_ref.as_ptr() as *const UserspaceServerReg) };
+    let cached = r.cache_take(file_id);
+    let wait_on = match &cached {
+        Some(obj) => {
+            // SAFETY: `obj` pins a live `FileObject`.
+            let fo: &FileObject = unsafe { &*(obj.as_ptr() as *const FileObject) };
+            match fo.forget(&answer) {
+                Forgotten::Now => None,
+                Forgotten::Later(po) => Some(po),
+            }
+        }
+        None => None,
+    };
+    let wait_on = match wait_on {
+        Some(po) => po,
+        None => {
+            crate::sched::complete_pending_op(answer.as_ptr(), 0, 0);
+            answer.clone()
+        }
+    };
+    drop((cached, answer, reg_ref));
+    let (op, ot) = wait_on.into_raw();
+    match global::get().allocate(pid, op, ot, pending_op_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+            Err(map_handle_err(e))
         }
     }
 }

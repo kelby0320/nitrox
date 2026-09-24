@@ -503,6 +503,8 @@ Sends `handles[0..count]` along with the message (always **move**; a sender that
 
 **Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` is `Block` with a delivery deadline (the 6th arg, absolute monotonic ns): identical to `Block`, except a held (undelivered) message is cancelled when the deadline elapses — its PO completes `TimedOut` and the message is reclaimed. The `deadline` arg is ignored for `NoBlock`/`Block`.
 
+**A send on a userspace server's forwarding endpoint reaches the kernel**, which holds its peer, and is consumed inline rather than queued. It is normally a reply to a request the kernel forwarded ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md)), and returns `0` whatever the mode. **One request travels that way: `File::Forget`** ([`rsproto-file-ops.md`](rsproto-file-ops.md) § *Forget*), a server saying it is about to free a file. It must be sent `Block` and carry no handles, else `InvalidArgument`. It returns a `PendingOperation` handle that completes once no device I/O of the file is in flight, which is when the server may free the file's blocks (administration Part C.1b).
+
 ```rust
 fn sys_channel_recv(
     ch:      RawHandle,

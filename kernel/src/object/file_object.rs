@@ -204,6 +204,36 @@ struct Inner {
     /// Raised by every writable mapping. A write-back that began with no writable mapping
     /// cleans the object only if this has not moved by its end ([`clean_mark`](FileObject::clean_mark)).
     map_gen: u64,
+    /// **The file's server is freeing it** ([`forget`](FileObject::forget), administration Part
+    /// C.1b). No device I/O of the object starts once this is set: a write-back stops, and a
+    /// fill reads as a hole, since the blocks are about to be someone else's.
+    dead: bool,
+    /// Device IRPs of this object issued and not yet ended — write-backs and Model A fills.
+    /// Raised under this lock, with `dead` checked, as each is issued; lowered by the thread
+    /// that issued it once it completes ([`end_io`](FileObject::end_io)).
+    io_in_flight: u32,
+    /// The `File::Forget` answer waiting for `io_in_flight` to reach zero.
+    forget_answer: Option<ObjectRef>,
+}
+
+/// What [`FileObject::begin_write`] says to do with one page of a write-back.
+enum WriteStep {
+    /// Write `frame` to this device block; the IRP is counted in flight.
+    Go(PhysAddr, u64),
+    /// Nothing to write for this page — gone from the cache, past the end, or over a hole.
+    Skip,
+    /// The file is being freed: write nothing more of it.
+    Dead,
+}
+
+/// The outcome of [`FileObject::forget`].
+pub enum Forgotten {
+    /// Nothing of the file is in flight: the server may be answered now.
+    Now,
+    /// I/O of the file is in flight. The server is answered by completing this PO, which
+    /// [`end_io`](FileObject::end_io) hands back when the last of it ends — the caller's own
+    /// answer, or the one an earlier `Forget` of the same file already waits on.
+    Later(ObjectRef),
 }
 
 /// Page-cache fill counters — the measurement behind the read-ahead decision (Slice B2).
@@ -219,6 +249,9 @@ struct Inner {
 enum FillStart {
     /// A producer request was issued; the faulter will park until it completes.
     Io,
+    /// A Model A block IRP was issued and **counted in the object's I/O in flight**, so the
+    /// faulter that issued it ends it ([`FileObject::finish_io`]) once it completes.
+    DeviceIo,
     /// A hole / unmapped range: the zeroed frame is already correct and the PO was
     /// completed synchronously.
     Hole,
@@ -302,7 +335,16 @@ impl FileObject {
             producer,
             inner: SpinLock::new(
                 LockRank::KernelObject,
-                Inner { pages: KVec::new(), retired: KVec::new(), runs, self_pin: None, map_gen: 0 },
+                Inner {
+                    pages: KVec::new(),
+                    retired: KVec::new(),
+                    runs,
+                    self_pin: None,
+                    map_gen: 0,
+                    dead: false,
+                    io_in_flight: 0,
+                    forget_answer: None,
+                },
             ),
         })
     }
@@ -351,7 +393,8 @@ impl FileObject {
         let mut g = fo.inner.lock();
         fo.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
-        if g.self_pin.is_none() && fo.file_id().is_some() {
+        // A forgotten object is out of the cache, so a pin on it is one nothing could find.
+        if g.self_pin.is_none() && fo.file_id().is_some() && !g.dead {
             g.self_pin = Some(file_obj.clone());
         }
     }
@@ -410,9 +453,9 @@ impl FileObject {
     /// A retired frame is freed only with the object, since no reverse map says which page
     /// tables still point at it (`TODO(retired-frames)` in `deferred-decisions.md`).
     ///
-    /// A write-back already in flight is not stopped by this: it snapshotted its pages' device
-    /// blocks before, and writes them after, blocks the truncate may have freed
-    /// (`TODO(truncate-inflight-writeback)`).
+    /// A write-back decides each page as it issues the page's IRP, so every IRP after this
+    /// respects the new size. An IRP already in flight is not stopped, and can land in a block
+    /// the truncate freed (`TODO(truncate-inflight-writeback)`).
     ///
     /// `Err` only if `retired` cannot grow, in which case nothing changed.
     pub fn resize(&self, new_size: usize, runs: KVec<BlockRun>) -> Result<(), AllocError> {
@@ -474,11 +517,98 @@ impl FileObject {
         }
     }
 
-    /// The device block holding file block `file_block`, from the run map; `0` for a hole or
-    /// a block past the map.
-    fn device_block(&self, file_block: u64) -> u64 {
-        let g = self.inner.lock();
-        device_block_in(&g.runs, file_block)
+    /// **A fill is about to read file block `file_block`**: its device block, counted in flight
+    /// — or `0`, counting nothing, for a hole, a block past the map, or a forgotten file,
+    /// whose blocks may already be another file's.
+    fn begin_read(&self, file_block: u64) -> u64 {
+        let mut g = self.inner.lock();
+        if g.dead {
+            return 0;
+        }
+        let block = device_block_in(&g.runs, file_block);
+        if block != 0 {
+            g.io_in_flight += 1;
+        }
+        block
+    }
+
+    /// **A write-back is about to write page `index`**, decided afresh under the lock for each
+    /// page, so a `Forget` or a resize that lands mid-write-back governs every page after it.
+    /// A page to write is counted in flight.
+    fn begin_write(&self, index: usize, block_size: u32) -> WriteStep {
+        let mut g = self.inner.lock();
+        if g.dead {
+            return WriteStep::Dead;
+        }
+        let Some(frame) = g
+            .pages
+            .iter()
+            .find(|p| p.index == index && p.state == PageState::Ready)
+            .map(|p| p.frame)
+        else {
+            return WriteStep::Skip;
+        };
+        if index >= self.npages() {
+            return WriteStep::Skip;
+        }
+        let block = device_block_in(&g.runs, (index * PAGE_SIZE) as u64 / block_size as u64);
+        if block == 0 {
+            return WriteStep::Skip; // a hole: growth goes through a resolve, not write-back
+        }
+        g.io_in_flight += 1;
+        WriteStep::Go(frame, block)
+    }
+
+    /// **An IRP counted by [`begin_read`](Self::begin_read) or
+    /// [`begin_write`](Self::begin_write) has completed.** If it was the last in flight of a
+    /// forgotten file, the `Forget` answer comes back for the caller to complete — outside
+    /// this lock, since completing takes the scheduler's.
+    pub fn end_io(&self) -> Option<ObjectRef> {
+        let mut g = self.inner.lock();
+        g.io_in_flight = g.io_in_flight.saturating_sub(1);
+        if g.dead && g.io_in_flight == 0 { g.forget_answer.take() } else { None }
+    }
+
+    /// [`end_io`](Self::end_io), completing a `Forget` answer it hands back.
+    fn finish_io(&self) {
+        if let Some(answer) = self.end_io() {
+            crate::sched::complete_pending_op(answer.as_ptr(), 0, 0);
+        }
+    }
+
+    /// **The file's server is about to free it** (`File::Forget`, administration Part C.1b).
+    /// From now on no device I/O of the object starts: a write-back stops before its next
+    /// page, and a fill reads as a hole — the `dead` mark alone decides both, so the run map is
+    /// left as it was. The dirty pin is released, so the object goes when its users do, its
+    /// pages unwritten. The caller has already taken it
+    /// out of its registration's cache, so a later resolve of the id gets a new object, and
+    /// the caller's reference keeps it alive across this call, whatever the pin was.
+    ///
+    /// `answer` is the server's: [`Forgotten::Now`] if nothing is in flight, else the PO to
+    /// hand the server, completed when the last I/O ends ([`end_io`](Self::end_io)).
+    pub fn forget(&self, answer: &ObjectRef) -> Forgotten {
+        let (outcome, pin) = {
+            let mut g = self.inner.lock();
+            g.dead = true;
+            let pin = g.self_pin.take();
+            let outcome = if g.io_in_flight == 0 {
+                Forgotten::Now
+            } else if let Some(waiting) = &g.forget_answer {
+                Forgotten::Later(waiting.clone())
+            } else {
+                g.forget_answer = Some(answer.clone());
+                Forgotten::Later(answer.clone())
+            };
+            (outcome, pin)
+        };
+        drop(pin);
+        outcome
+    }
+
+    /// Whether the file's server has forgotten it. Test/observability only.
+    #[cfg(test)]
+    pub(crate) fn is_dead(&self) -> bool {
+        self.inner.lock().dead
     }
 
     /// The number of pages currently resident in the cache. Test/observability only.
@@ -675,6 +805,9 @@ impl FileObject {
                         return None;
                     }
                     let ok = wait_for_fill(&po);
+                    if started_kind == FillStart::DeviceIo {
+                        fo.finish_io();
+                    }
                     fo.settle(index, &po, ok);
                     if !ok {
                         return None;
@@ -721,34 +854,32 @@ impl FileObject {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
             _ => return false,
         };
-        // Snapshot the resident pages `(frame, device block)` under the lock; do I/O unlocked.
-        // Only pages inside the file, and only those a block backs: a hole is skipped, since
-        // growth goes through `sys_file_grow`'s resolve rather than write-back.
-        let mut pages: KVec<(PhysAddr, u64)> = KVec::new();
+        // Which pages are resident, under the lock; each is then looked at again as its IRP is
+        // issued ([`begin_write`](Self::begin_write)), so a `Forget` stops the write-back
+        // before its next page and a resize redirects it.
+        let mut indices: KVec<usize> = KVec::new();
         {
             let inner = fo.inner.lock();
-            if pages.try_reserve(inner.pages.len()).is_err() {
+            if indices.try_reserve(inner.pages.len()).is_err() {
                 return false;
             }
-            let npages = fo.npages();
-            for p in inner.pages.iter() {
-                if p.state != PageState::Ready || p.index >= npages {
-                    continue;
-                }
-                let file_block = (p.index * PAGE_SIZE) as u64 / block_size as u64;
-                let dev_block = device_block_in(&inner.runs, file_block);
-                if dev_block != 0 {
-                    let _ = pages.try_push((p.frame, dev_block));
-                }
+            for p in inner.pages.iter().filter(|p| p.state == PageState::Ready) {
+                let _ = indices.try_push(p.index);
             }
         }
-        for (frame, dev_block) in pages.iter().copied() {
+        for index in indices.iter().copied() {
             let po = match PendingOperation::try_new() {
                 // SAFETY: adopt the single creation reference.
                 Ok(p) => unsafe {
                     ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
                 },
                 Err(_) => return false,
+            };
+            let (frame, dev_block) = match fo.begin_write(index, block_size) {
+                WriteStep::Go(frame, dev_block) => (frame, dev_block),
+                WriteStep::Skip => continue,
+                // Forgotten: what is unwritten stays so — its blocks are about to be freed.
+                WriteStep::Dead => return true,
             };
             let dev_offset = dev_block * block_size as u64;
             if crate::io::block::dispatch_block_irp_into_frame(
@@ -762,9 +893,12 @@ impl FileObject {
             )
             .is_err()
             {
+                fo.finish_io();
                 return false;
             }
-            if !block_on_po(&po) {
+            let ok = block_on_po(&po);
+            fo.finish_io();
+            if !ok {
                 return false;
             }
         }
@@ -782,6 +916,10 @@ impl FileObject {
         debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        // A forgotten file's id may already name another file.
+        if fo.inner.lock().dead {
+            return None;
+        }
         match &fo.producer {
             Producer::FsServerBlocks { reg, file_id, .. } if *file_id != 0 => Some((reg.clone(), *file_id)),
             _ => None,
@@ -873,8 +1011,9 @@ impl FileObject {
         // so this is `index`; the general form handles bs | PAGE where a page's blocks are
         // contiguous within one run).
         let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
-        // Locate the run covering `file_block` → its device block (0 = hole).
-        match self.device_block(file_block) {
+        // Locate the run covering `file_block` → its device block (0 = hole, or a forgotten
+        // file). A block to read is counted in flight until the faulter ends it.
+        match self.begin_read(file_block) {
             0 => {
                 // Hole or unmapped: the zeroed frame is already correct. Complete the PO
                 // synchronously so the parked faulter wakes at once (no IRP).
@@ -885,7 +1024,7 @@ impl FileObject {
                 let dev_offset = dev_block * block_size as u64;
                 // One page of data (one block when block_size == PAGE). `file_obj` pins the
                 // FileObject (hence the frame) for the IRP's lifetime.
-                crate::io::block::dispatch_block_irp_into_frame(
+                match crate::io::block::dispatch_block_irp_into_frame(
                     device,
                     frame,
                     file_obj.clone(),
@@ -893,8 +1032,13 @@ impl FileObject {
                     crate::libkern::io_op::IoOpcode::Read,
                     dev_offset,
                     PAGE_SIZE as u64,
-                )
-                .map_or(FillStart::Failed, |()| FillStart::Io)
+                ) {
+                    Ok(()) => FillStart::DeviceIo,
+                    Err(_) => {
+                        self.finish_io(); // never issued, so never in flight
+                        FillStart::Failed
+                    }
+                }
             }
         }
     }
@@ -1425,6 +1569,109 @@ mod tests {
             Reserve::New(fr) => assert_eq!(frame_byte(fr, 0), 0),
             o => panic!("{o:?}"),
         }
+    }
+
+    // --- `File::Forget` (administration Part C.1b) --------------------------
+
+    fn po() -> ObjectRef {
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
+                KObjectType::PendingOperation,
+            )
+        }
+    }
+
+    /// File `id` of `reg`, two pages over device blocks 100 and 101, both resident and ready.
+    fn two_block_file(reg: &ObjectRef, id: u64) -> ObjectRef {
+        let f = resolve(reg, id, 2 * PAGE_SIZE);
+        let mut runs = KVec::new();
+        runs.try_push(BlockRun { file_block: 0, device_lba: 100, length: 2, flags: 0 }).unwrap();
+        file_of(&f).resize(2 * PAGE_SIZE, runs).unwrap();
+        fill(file_of(&f), 0, 0xA0);
+        fill(file_of(&f), 1, 0xA1);
+        f
+    }
+
+    /// **A forgotten file is never written back**, is out of the cache — so the next resolve
+    /// of its id, which after an unlink may be another file, gets a new object — and lets go
+    /// of its dirty pin, so it goes with its users.
+    #[test]
+    fn a_forgotten_file_is_never_written_back_and_leaves_the_cache() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        let first = a.as_ptr();
+        FileObject::writable_mapped(&a);
+        FileObject::writable_unmapped(a.as_ptr());
+        assert!(file_of(&a).is_dirty());
+        assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Go(_, 100)));
+        assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
+
+        let taken = reg_of(&reg).cache_take(7).expect("cached");
+        assert!(matches!(file_of(&taken).forget(&po()), Forgotten::Now), "nothing in flight");
+        drop(taken);
+        assert!(file_of(&a).is_dead());
+        assert!(!file_of(&a).is_dirty(), "the pin is gone");
+        assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Dead));
+        assert_eq!(file_of(&a).begin_read(0), 0, "a fill reads a hole, not a freed block");
+        assert_eq!(FileObject::touch_target(&a).map(|(_, id)| id), None, "and no touch names it");
+        let again = resolve(&reg, 7, PAGE_SIZE);
+        assert_ne!(again.as_ptr(), first, "a new object for the id");
+        test_probe::reset();
+        drop(a);
+        assert_eq!(test_probe::file_object_destroys(), 1, "unpinned: it went with its user");
+    }
+
+    /// **A `Forget` during a write-back is answered only after the IRP in flight, and nothing
+    /// is written after it.** The answer comes back from the `end_io` of that IRP.
+    #[test]
+    fn a_forget_mid_write_back_is_answered_after_the_irp_in_flight() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        let fo = file_of(&a);
+        assert!(matches!(fo.begin_write(0, 4096), WriteStep::Go(_, 100)), "page 0's IRP is issued");
+        let answer = po();
+        let Forgotten::Later(wait_on) = fo.forget(&answer) else { panic!("an IRP is in flight") };
+        assert_eq!(wait_on.as_ptr(), answer.as_ptr());
+        assert!(matches!(fo.begin_write(1, 4096), WriteStep::Dead), "page 1 is not written");
+        // A second `Forget` of the file waits on the same answer.
+        let Forgotten::Later(second) = fo.forget(&po()) else { panic!() };
+        assert_eq!(second.as_ptr(), answer.as_ptr());
+        let done = fo.end_io().expect("the last IRP ending hands the answer back");
+        assert_eq!(done.as_ptr(), answer.as_ptr());
+        assert!(fo.end_io().is_none(), "and only once");
+    }
+
+    /// **A fill in flight holds the answer too**: its read was issued against a block the
+    /// server has not freed yet, and must land before it does.
+    #[test]
+    fn a_fill_in_flight_holds_the_forget_answer() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        let fo = file_of(&a);
+        assert_eq!(fo.begin_read(1), 101);
+        let answer = po();
+        assert!(matches!(fo.forget(&answer), Forgotten::Later(_)));
+        assert_eq!(fo.begin_read(0), 0, "no read starts after it");
+        assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
+    }
+
+    /// A forgotten object is out of the cache, so a writable mapping must not pin it: nothing
+    /// could ever find it to clean.
+    #[test]
+    fn a_forgotten_file_is_never_pinned() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        drop(reg_of(&reg).cache_take(7));
+        let _ = file_of(&a).forget(&po());
+        FileObject::writable_mapped(&a);
+        assert!(!file_of(&a).is_dirty());
+        FileObject::writable_unmapped(a.as_ptr());
     }
 
     /// The fault path's reservation, as a test can read it: the frame, and the PO to wait on

@@ -5,7 +5,8 @@ that build an image with `mke2fs` and require `e2fsck -fn` to find it clean. Ind
 deferrals are marked inline. Verified 2026-09-17, when cross-group allocation landed and the
 deferred list was swept against the code. Administration Part C.1 (2026-09-24): the block-file
 reply carries the inode number as the file's id, `File::Touch` names a file by it, and a grow
-zeroes on the device what it adds.
+zeroes on the device what it adds. C.1b (2026-09-24): an unlink or a replacing rename frees the
+file only after the kernel has answered `File::Forget` for it.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -55,6 +56,18 @@ read-write device handle** (`sys_io_submit` Write), never by the kernel:
 | Inode | read mode/size/flags/`i_block` | update size (off 4/108), mtime/ctime, block count |
 | Directory block | linear lookup (`dir_lookup`) | insert an `ext4_dir_entry_2` (split `rec_len` / new dir block) |
 | Group desc + superblock | read a few fields | update free-block / free-inode counts |
+
+**A file is freed in two halves** (administration Part C.1b). `unlink_at`, and a `rename_path`
+that replaces a file, remove the name and return the inode whose last link is going. Its link is
+still counted and its blocks still allocated. `release_inode` frees them, and the server calls it
+only once the kernel has answered `File::Forget` for the inode
+([`filesystem-data-path.md`](filesystem-data-path.md) § *One object per file*). The kernel may be
+writing the file's pages to those blocks, and a block this server freed and handed to another
+file before that write landed would be overwritten with a dead file's bytes. Between the halves the
+inode is unattached with its link counted, the state `rename_path` could already leave on a crash,
+and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
+since it asks from inside `serve_loop`'s walk of a batch of wait results. If the kernel cannot
+be asked, the inode is not freed: a leaked block can be repaired, a block claimed twice cannot.
 
 **No checksums.** The fixtures are `^metadata_csum`, so there is nothing to maintain. Enabling
 `metadata_csum` (group-desc / inode / extent / dir / bitmap checksums across every write above)

@@ -16,6 +16,7 @@ transports differ:
 |---|---|---|
 | `ReadRange` (`0x0600`) | the **kernel** (page-cache fill) | the server's forwarding channel; the kernel hand-codes the request/reply in `kernel/src/rsproto.rs` |
 | `Touch` (`0x0606`) | the **kernel** (post-writeback `mtime`) | the server's forwarding channel; **no reply** |
+| `Forget` (`0x0607`) | the **server**, to the kernel: a file is about to be freed | the server's forwarding channel, sent `Block`; answered by the send's `PendingOperation` |
 | `ReadDir` (`0x0601`), `Mkdir` (`0x0602`), `Unlink` (`0x0603`), `Rmdir` (`0x0604`), `Rename` (`0x0605`) | an ordinary **userspace process** | a **directory session channel** — direct client↔server RPC, no kernel involvement |
 
 `librsproto` (`userspace/librsproto/src/file.rs`) is the userspace mirror for both
@@ -195,6 +196,33 @@ Two properties are deliberate:
 
 The stamp is applied on **sync**, not on the individual write, because the kernel keeps no
 per-page dirty bit (`TODO(page-dirty-tracking)`).
+
+### Forget (`0x0607`)
+
+Request body: `file_id: u64`, the id the file's `FILE_BLOCKS` replies carried. Sent by a
+**server** to the kernel, on its forwarding channel, `SENDMODE_BLOCK`, with `request_id` `0` and
+no handles. The only request that travels in that direction. *(Administration Part C.1b,
+2026-09-24.)*
+
+**A server sends it before freeing a file's blocks** — the last name's unlink, or a rename that
+replaces a file — and frees them **only once it is answered**. The kernel may hold the file's
+pages and be writing them to those blocks. Freeing them first would let a write it had already
+issued land in a block the server has since given to something else: another file, or a
+directory block the server writes through.
+
+**The answer is the send's result**: a `PendingOperation` the server `sys_wait`s on, as a
+`Block` send's result always is. On a `Forget`, the kernel:
+1. takes the file's object, if it caches one, out of its cache, so a later resolve of the id,
+   which after a free may name a new file, gets a new object;
+2. marks the object so no device I/O of it starts: a write-back stops before its next page,
+   and a fill reads as a hole;
+3. releases the object's dirty pin, so it goes when its users do, with its pages unwritten;
+4. completes the PO at once if none of the file's I/O is in flight, or when the last IRP in
+   flight ends. A second `Forget` of the file while the first waits gets the same PO.
+
+Sent `NoBlock` or `BlockBounded`, or with handles, it is refused with `InvalidArgument`. A
+server that cannot get an answer leaves the file unfreed, since a leaked block is repaired by
+`e2fsck` and a block claimed twice is not.
 
 ## Versioning
 

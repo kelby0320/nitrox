@@ -100,6 +100,12 @@ pub const OP_FILE_RENAME: u16 = 0x0605;
 /// dirty pages, to tell the server about a write it structurally could not have seen. See
 /// [`file::parse_touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
+/// `File::Forget` — a **server telling the kernel** that a file is about to be freed, and the
+/// one request that travels that way on a forwarding endpoint (administration Part C.1b).
+/// Sent `SENDMODE_BLOCK`, it is answered by the send's `PendingOperation`, which completes
+/// once no I/O of the file is in flight; the server frees the file's blocks only then. See
+/// [`file::forget_request`] and `docs/spec/rsproto-file-ops.md`.
+pub const OP_FILE_FORGET: u16 = 0x0607;
 /// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
 ///
 /// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch

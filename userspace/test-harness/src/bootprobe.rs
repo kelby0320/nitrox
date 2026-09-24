@@ -647,6 +647,79 @@ fn file_cache_test(root_ns: u64) -> bool {
     shared && unwritten && kept && synced && regrown && regrown_on_device
 }
 
+/// **Administration Part C.1b: an unlinked file's pages are not written back.** A file
+/// written through a mapping and let go without a sync stays dirty in the kernel's cache.
+/// When it is unlinked, the server's `File::Forget` takes it out of that cache before the
+/// server frees its block. So a `sys_ns_sync` after the unlink finds nothing of it to write,
+/// and the block the file had does not receive its bytes — which, after a free, could be
+/// another file's.
+///
+/// The block is found before the unlink, through the ext4 library over the raw partition,
+/// and read raw after the sync.
+fn unlinked_file_test(root_ns: u64) -> bool {
+    let path = b"/system/c1-unlinked";
+    let Some(dev) = RootDevice::open(root_ns) else {
+        kprint(b"boot-probe: c1b root device FAIL\n");
+        return false;
+    };
+    let Some(w) = file_resize(SYS_FILE_CREATE, root_ns, path, PAGE) else {
+        kprint(b"boot-probe: c1b create FAIL\n");
+        return false;
+    };
+    let Some(wa) = map_file(w, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
+        close(w);
+        kprint(b"boot-probe: c1b map FAIL\n");
+        return false;
+    };
+    let pattern: alloc::vec::Vec<u8> = (0..64u64).map(|i| 0xF0 ^ i as u8).collect();
+    for (i, b) in pattern.iter().enumerate() {
+        // SAFETY: inside the writable mapping of one page.
+        unsafe { ((wa + i as u64) as *mut u8).write_volatile(*b) };
+    }
+    // Let go without a sync: dirty, and kept by the kernel.
+    // SAFETY: unmapping our own mapping.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, wa, 0) };
+    close(w);
+
+    // Where the file's one block is, and that it does not hold the bytes yet.
+    let mut runs = [fs_server_ext4::BlockRun::default(); 4];
+    let block_at = fs_server_ext4::ext4::map_file(&dev, path, &mut runs)
+        .ok()
+        .filter(|m| m.runs == 1 && runs[0].device_lba != 0)
+        .map(|m| runs[0].device_lba * m.block_size as u64);
+    let raw = |at: u64| {
+        let mut b = [0u8; 64];
+        fs_server_ext4::BlockReader::read_at(&dev, at, &mut b).ok().map(|()| b)
+    };
+    let Some(block_at) = block_at else {
+        kprint(b"boot-probe: c1b block FAIL\n");
+        return false;
+    };
+    let unwritten = raw(block_at).is_some_and(|b| b[..] != pattern[..]);
+
+    // Unlink it through a session on its directory, then sync the mount.
+    let mut buf = [0u8; 4096];
+    let unlinked = match librsproto::session::Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(mut dir) => {
+            let r = dir.unlink(b"c1-unlinked").is_ok();
+            dir.close();
+            r
+        }
+        Err(_) => false,
+    };
+    let sync_path = b"/system";
+    // SAFETY: valid path pointer + namespace handle.
+    let synced = unsafe { syscall4(SYS_NS_SYNC, root_ns, sync_path.as_ptr() as u64, sync_path.len() as u64, 0) } >= 0;
+    let not_written = raw(block_at).is_some_and(|b| b[..] != pattern[..]);
+    if unwritten && unlinked && synced && not_written {
+        kprint(b"boot-probe: c1b an unlinked file's pages are not written back ok\n");
+        true
+    } else {
+        kprint(b"boot-probe: c1b unlinked-file MISMATCH\n");
+        false
+    }
+}
+
 /// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
 /// a `MAP_WRITE` mapping, `sys_file_sync`, then read the block **off the device** and verify
 /// the change persisted — proving the Model A write data path (dirty pages → write IRPs →
@@ -1001,6 +1074,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & grow_test(root_ns)
         & create_test(root_ns)
         & file_cache_test(root_ns)
+        & unlinked_file_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)

@@ -29030,3 +29030,52 @@ land in blocks a concurrent truncate freed. The second is the truncate half of w
   test.
 - Four boots, each failing the verdict: no sharing, a sync that writes nothing, a resize that
   keeps pages, and a grow that zeroes nothing.
+
+## 2026-09-24 — Administration C.1b: `File::Forget`, and a file freed in two halves
+
+The second half of C.1. A server frees a file's blocks only after the kernel has said nothing of
+the file is in flight, and nothing more will be.
+
+**How the answer travels was open, and is the send's own result.** `fs-server-ext4` is
+single-threaded and unlinks inline, inside a directory session. An answer arriving as a message on
+its forwarding endpoint would sit in the ring with forwarded requests, and the server would have to
+pick it out mid-session. A new syscall would be ABI for one message. A `Block` send already returns
+a `PendingOperation` that completes when the message is delivered. So a `Forget` must be sent
+`Block`, and the kernel, which consumes it inline, completes that PO once the file's I/O has
+ended. `NoBlock` and `BlockBounded` are refused: the first has no PO, and the second's deadline
+could not apply to I/O already issued.
+
+**What the kernel does.** It takes the object out of the registration's cache, so a later resolve
+of the id gets a new object; the id may name a new file once its inode is reused. It marks the
+object dead, releases its dirty pin, and answers when its count of IRPs in flight reaches zero.
+- **Reads are counted as well as writes.** A fill queued before the `Forget` must land before the
+  block becomes another file's, or a mapping of the dead file could read that file's bytes. A FIFO
+  device queue happens to prevent it today; NCQ would not.
+- **A write-back no longer snapshots its pages' blocks up front.** It decides each page as it
+  issues the IRP, under the object's lock: dead stops it, and a resize redirects it. That also
+  narrows `TODO(truncate-inflight-writeback)` to an IRP already in flight when a truncate lands.
+
+**ext4 frees in two halves.** `unlink_at`, and a `rename_path` that replaces a file, remove the
+name and return the inode whose last link is going, with its link still counted and its blocks
+allocated. `release_inode` frees it after the answer. A crash in between leaves an unattached inode
+that `e2fsck` moves to `lost+found`, which `rename_path` could already do. A server that cannot get
+an answer keeps the inode: a leaked block can be repaired, and a block claimed twice cannot.
+
+**Three things the work found:**
+1. **Two guards for one thing.** `forget` first cleared the run map as well as marking the object
+   dead, so a fill read a hole either way. The control deleting the dead check from `begin_read`
+   passed. The mark alone governs I/O now, and the run map is left as it was.
+2. **The server's wait would have corrupted its loop.** `po_wait` shares
+   `WAIT_HANDLES`/`WAIT_RESULTS` with `serve_loop`, which is still walking a batch of results when
+   it calls into a session or a rename. A `Forget` waited on there would overwrite the batch. It
+   waits on buffers of its own. This was found by reading, and no failure showed it.
+3. **The crate's rules file forbade C.1a.** `fs-server-ext4/CLAUDE.md` said the server writes
+   metadata only, and C.1a's grow writes zeroes into the blocks it allocates. The rule now names
+   that exception and why, and forbids freeing before a `Forget` is answered.
+
+**Controls:**
+- 10 on the kernel's host tests and 2 on `fs-server-ext4`'s, each failing its test once the
+  runs were left alone.
+- Two boots, each failing only the new probe check: a server that frees without a `Forget`, and a
+  kernel that answers without forgetting. In both, the unlinked file's pattern reached its freed
+  block.

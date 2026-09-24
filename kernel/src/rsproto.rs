@@ -396,6 +396,28 @@ const READ_RANGE_REPLY_LEN: usize = 8;
 
 /// `File::Touch` — stamp the named file's modification time as "now".
 const OP_FILE_TOUCH: u16 = 0x0606;
+/// `File::Forget` — a server telling the kernel a file is about to be freed.
+const OP_FILE_FORGET: u16 = 0x0607;
+/// Bytes of a `File::Forget` body: the file id.
+const FORGET_LEN: usize = 8;
+
+/// The file id a **`File::Forget`** request names, if `buf` is one — the one message a server
+/// sends the kernel that is not a reply (administration Part C.1b). A server sends it on its
+/// forwarding endpoint before it frees a file's blocks, and frees them only once the kernel
+/// has answered: by then nothing of the file is in flight, and nothing more will be written.
+/// `None` for anything else, a reply included, so the caller routes it as before.
+pub fn forget_request(buf: &[u8]) -> Option<u64> {
+    if buf.len() < RS_HEADER_LEN + FORGET_LEN || get_u32(buf, 0) != RS_MAGIC {
+        return None;
+    }
+    if get_u16(buf, 6) != OP_FILE_FORGET || get_u32(buf, 16) & RS_FLAG_REPLY != 0 {
+        return None;
+    }
+    if (get_u32(buf, 20) as usize) < FORGET_LEN {
+        return None;
+    }
+    Some(get_u64(buf, RS_HEADER_LEN))
+}
 /// Bytes of a kernel-sent `File::Touch` body: the file id.
 const TOUCH_BY_ID_LEN: usize = 8;
 
@@ -709,6 +731,28 @@ mod tests {
         assert_eq!(file_blocks_run(&body, 0), Some((0, 777, 2, 0)));
         assert_eq!(file_blocks_run(&body, 1), None, "one run, not two");
         assert_eq!(file_blocks_reply_header(&body[..31]), None, "a prefix a byte short");
+    }
+
+    /// **A forget is read at the offsets a server writes** — laid out by hand here, since the
+    /// writer is `librsproto`'s — and only a request: a reply with the same op is not one.
+    #[test]
+    fn a_forget_is_a_request_carrying_the_file_id() {
+        let mut buf = [0u8; RS_HEADER_LEN + 8];
+        put_u32(&mut buf, 0, RS_MAGIC);
+        put_u16(&mut buf, 6, 0x0607);
+        put_u32(&mut buf, 20, 8);
+        put_u64(&mut buf, RS_HEADER_LEN, 0x1_0000_002a);
+        assert_eq!(forget_request(&buf), Some(0x1_0000_002a));
+        let mut reply = buf;
+        put_u32(&mut reply, 16, RS_FLAG_REPLY);
+        assert_eq!(forget_request(&reply), None, "a reply is not a forget");
+        let mut touch = buf;
+        put_u16(&mut touch, 6, OP_FILE_TOUCH);
+        assert_eq!(forget_request(&touch), None);
+        let mut short = buf;
+        put_u32(&mut short, 20, 7);
+        assert_eq!(forget_request(&short), None, "a body a byte short");
+        assert_eq!(forget_request(&buf[..RS_HEADER_LEN + 7]), None);
     }
 
     /// **The kernel's touch names the file by id**, eight bytes at the start of the body.

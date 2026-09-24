@@ -4,8 +4,8 @@
 with deferrals (a periodic writeback daemon, per-page dirty tracking) marked inline. Verified
 2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty tracking that the
 code never had corrected 2026-09-24. **One object per file, dirty objects kept until a sync, and
-`sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*); a file
-the server frees under the kernel (`File::Forget`) is not yet built.
+`sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*), with
+`File::Forget` for a file its server frees.
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -148,10 +148,16 @@ sync and a fresh resolve.
   yield became a spin: the fault handler runs with interrupts off and `yield_now` returns at once
   when nothing else is ready, so the CPU acknowledged no TLB shootdown and the machine stopped.
   A failed fill fails every faulter waiting on it and leaves the page out of the cache.
-- **Not built yet:** `File::Forget`, so the server can free a file's blocks only after the kernel
-  has stopped writing them (administration Part C.1b). Until then an unlinked file's cached object
-  can be written back to blocks the server has freed. A write-back in flight across a truncate can
-  do the same (`TODO(truncate-inflight-writeback)`).
+- **A server frees a file only after the kernel has forgotten it** (`File::Forget`, Part C.1b).
+  The last name's unlink, or a rename that replaces a file, sends the kernel the file's id and
+  waits for the answer before freeing a block. The kernel takes the object out of the cache and
+  marks it so no device I/O of it starts, and releases its dirty pin. It answers once the last
+  IRP of the file in flight has ended, reads included, so a fill queued before the `Forget` cannot
+  read a block after it has become another file's. For that each object counts its IRPs in
+  flight, and **a write-back decides each page as it issues its IRP**, under the object's lock,
+  rather than from a snapshot taken at its start. The same per-page decision means a truncate's
+  resize governs every page after it. Only an IRP already in flight when a truncate lands can
+  reach a block it freed (`TODO(truncate-inflight-writeback)`).
 
 ## Consistency ordering (filesystem-neutral)
 

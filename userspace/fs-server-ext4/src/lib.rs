@@ -332,7 +332,8 @@ mod tests {
 
         // And not a file unlinked since — a touch can trail the unlink of what it names, and
         // stamping a freed inode would give e2fsck something to find.
-        ext4::unlink_at(&rw, sys, b"edited", LATER).unwrap();
+        let orphan = ext4::unlink_at(&rw, sys, b"edited", LATER).unwrap().unwrap();
+        ext4::release_inode(&rw, orphan, LATER).unwrap();
         assert_eq!(ext4::touch_file(&rw, ino, LATER + 2), Err(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-unlink");
     }
@@ -391,11 +392,17 @@ mod tests {
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(3000));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Ok(1200));
 
-        // With it, the destination becomes the source and the replaced inode is freed.
+        // With it, the destination becomes the source, and the replaced inode is handed back —
+        // unfreed until the kernel has forgotten it — then freed by `release_inode`.
         let free_before = free_inodes(&rw);
-        ext4::rename_path(&rw, b"/system/src", b"/system/victim", true, TEST_NOW).unwrap();
+        let mut runs = [crate::BlockRun::default(); 4];
+        let victim = ext4::map_file(&rw, b"/system/victim", &mut runs).unwrap().ino;
+        let replaced = ext4::rename_path(&rw, b"/system/src", b"/system/victim", true, TEST_NOW).unwrap();
+        assert_eq!(replaced, Some(victim), "the replaced inode waits for its release");
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(1200));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Err(FsError::NotFound));
+        assert_eq!(free_inodes(&rw), free_before, "not freed before the release");
+        ext4::release_inode(&rw, victim, TEST_NOW).unwrap();
         assert_eq!(
             free_inodes(&rw),
             free_before + 1,
@@ -1224,11 +1231,20 @@ mod tests {
         ext4::grow_file(&rw, b"/system/scratch", 4096, TEST_NOW).unwrap();
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
 
-        ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW).unwrap();
+        // **Two halves** (administration Part C.1b): the name goes at once, but the inode and
+        // its block stay allocated until `release_inode` — which a server calls only once the
+        // kernel has answered `File::Forget`, since it may still be writing that block.
+        let (blocks, inodes) = (free_blocks(&rw), free_inodes(&rw));
+        assert_eq!(ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW), Ok(Some(ino)));
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
-        // The name is gone; the inode was freed (a fresh create can reuse it).
         assert_eq!(ext4::stat_file(&rw, b"/system/scratch"), Err(FsError::NotFound));
-        let _ = ino;
+        assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks, inodes), "nothing freed yet");
+        ext4::release_inode(&rw, ino, TEST_NOW).unwrap();
+        assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks + 1, inodes + 1), "freed on release");
+        // A second release, or one of a live file, is refused rather than freeing twice.
+        assert_eq!(ext4::release_inode(&rw, ino, TEST_NOW), Err(FsError::NotFound));
+        let sys_ino = ext4::resolve_dir(&rw, b"/system").unwrap();
+        assert_eq!(ext4::release_inode(&rw, sys_ino, TEST_NOW), Err(FsError::NotFound));
 
         // Unlink of a directory is rejected (use rmdir); missing name is NotFound.
         ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();

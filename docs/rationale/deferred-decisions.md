@@ -200,14 +200,16 @@ The fix is a mapping count, which would let a truncate free the frames when noth
 object, or a reverse map, which would let it unmap them. Trigger: a workload that truncates a
 file held mapped, repeatedly.
 
-**A write-back in flight across a truncate — `TODO(truncate-inflight-writeback)`.** A write-back
-snapshots each resident page and its device block under the object's lock, then issues the IRPs
-unlocked. A truncate that arrives meanwhile frees blocks the snapshot names, and if the server
-hands one to something else before the IRP lands, the IRP overwrites it. `File::Forget`
-(administration Part C.1b) closes the same window for an unlinked file: the server waits for the
-kernel's answer before it frees anything. A truncate needs the same handshake for the blocks it
-frees, and the plan did not size it. Trigger: a truncate of a file being synced concurrently,
-which nothing does today: `libfs` truncates before it maps.
+**An IRP in flight across a truncate — `TODO(truncate-inflight-writeback)`.** A truncate frees
+blocks in the server and then answers the resolve, and only the answer reaches the kernel. Since
+administration Part C.1b a write-back decides each page as it issues the page's IRP, under the
+object's lock, so every IRP issued after the kernel resizes the object respects the new size. What
+is left is an IRP already in flight when that happens. If the server hands one of the freed blocks
+to another file before the IRP lands, the IRP overwrites it. `File::Forget` closes the same window
+for a freed file, because the server waits for the kernel's answer before it frees anything. A
+truncate needs the same handshake for the blocks it frees, and the plan did not size it. Trigger: a
+truncate of a file being synced concurrently, which nothing does today: `libfs` truncates before
+it maps.
 
 **Kernel log buffer is keep-early, not keep-recent (slice 9 Part 5).** `klog`
 (`/dev/log`) is a **linear append** buffer: it captures kernel `kprint!` output from

@@ -226,6 +226,18 @@ impl UserspaceServerReg {
         Ok(None)
     }
 
+    /// **Take file `id` out of the cache**, returning its object if it is live — a
+    /// `File::Forget`. The entry goes either way, so a later resolve of the id, which after an
+    /// unlink may name a new file, gets a new object. The reference is the caller's to drop,
+    /// outside this lock.
+    pub fn cache_take(&self, id: u64) -> Option<ObjectRef> {
+        let mut g = self.files.lock();
+        let i = g.iter().position(|e| e.id == id)?;
+        let e = g.remove(i);
+        // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
+        unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) }
+    }
+
     /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
     pub fn cache_forget_object(&self, obj: *mut ()) {
         let mut g = self.files.lock();

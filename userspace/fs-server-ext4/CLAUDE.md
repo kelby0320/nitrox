@@ -52,7 +52,11 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   else: it is the one resolve that mutates the tree and replies with no object at all
   (`OBJECT_KIND_NONE`), and it must run ahead of the directory-session path, which infers
   "directory open" from the suffix naming a directory — renaming a directory names one too.
-  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+  **A file is freed only after the kernel has forgotten it** (administration Part C.1b): an
+  unlink's last name, or a rename's replaced file, sends `File::Forget` on the forwarding
+  endpoint `SENDMODE_BLOCK`, waits for the answer on buffers of its own — never
+  `WAIT_HANDLES`/`WAIT_RESULTS`, which `serve_loop` is still walking — and only then calls
+  `release_inode`. **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
 
 ## Scope
 
@@ -77,7 +81,8 @@ allocators walk every block group, so a filesystem is as large as the disk rathe
 large as group 0; the trigger was the installer making a 931 GiB root that held 112 MiB.
 **Test fixtures default to a single group** (4,096 blocks against 8,192 per group), which is
 why nothing caught it: use `fixture_blocks` when what you are changing can run out of one.
-Also truncate (2026-07-24), rename, delete, and
+Also truncate (2026-07-24), rename, delete (in two halves since 2026-09-24: `unlink_at` and a
+replacing `rename_path` return the inode, `release_inode` frees it), and
 **growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
 another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
 
@@ -104,7 +109,12 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
   names every module because a rules file that enumerates three of four is one that permits the
   fourth by omission (PR #310 review).
 - Touching **file data** — the kernel owns the data path (Model A); the server writes
-  only metadata (bitmaps, extent tree, inode, superblock).
+  only metadata (bitmaps, extent tree, inode, superblock). **One exception, deliberate**
+  (administration Part C.1): `grow_file` writes zeroes over what it adds — the old last block's
+  tail and every block it allocates — since a page the kernel does not hold fills from the device,
+  and a new range must read as zero rather than as whatever those blocks last held. It writes no
+  byte a file ever held.
+- Freeing a file's blocks before the kernel has answered `File::Forget` for it.
 - Binding itself into a namespace, or holding `BIND_NAMESPACE`.
 - Trusting on-disk structures without bounds-checking (a malformed image must
   yield `FsError`, never a panic or OOB read).
