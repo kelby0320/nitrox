@@ -3,7 +3,8 @@
 **Status:** Implemented — `kernel/src/object/namespace.rs`, with userspace resource servers
 (fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
 Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
-to "enforced" 2026-09-23.
+to "enforced" 2026-09-23; a server minting a narrower endpoint on request (the device manager's
+info-only one) described 2026-09-24.
 
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
@@ -428,6 +429,10 @@ server's job is to *produce the right handle* for `suffix`:
 - `/dev/entropy` → an `EntropyObject` handle (the caller then `sys_entropy_read`s it).
 - `/proc/self/process` → the caller's own `Process` handle; `/proc/self/status` → a
   freshly-synthesized read-only `MemoryObject` snapshot; etc.
+- `/dev/registry` → a snapshot of the whole device table, and `/dev/registry/<id>` → that
+  device's `DeviceNode` (administration Part B; the layout is
+  [`device-node.md`](../spec/device-node.md) § "The registry"). One server, two leaves, as
+  `/dev/framebuffer` and its `info` are.
 
 **Registration is by the kernel at boot, not a handshake.** In-kernel servers are
 always present, so the kernel binds them into **pid 1's root namespace** during
@@ -510,6 +515,14 @@ key into each binding, one binding per disk — was rejected because block devic
 grow sub-paths: partitions, `/dev/disk/by-partuuid/*`. A server owning a *subtree*
 is the on-design match to the umbrella definition above.)
 
+**A registry-backed subtree answers lookups and cannot be listed**: the kernel resolves its
+children on demand, and the namespace holds one binding for all of them, so `list /dev/blk` in
+the root namespace is empty. The table behind `/dev/blk` is read another way: `/dev/registry` is a
+server over the whole device table, in the root namespace, and the device manager serves it to
+everyone else as typed tables at `/dev/devices` ([`device-manager.md`](device-manager.md)).
+Outside the root namespace the question does not arise — a session or view is handed each device
+as a binding of its own, and those list.
+
 ### Liveness: what is "live", and what enables it
 
 Until the storage slice every Kernel Server is **unconditionally live** — bound
@@ -568,6 +581,19 @@ themselves** (`why-supervisor-registration.md`). A supervisor:
 
 The control channel persists as the supervisor↔RS management channel (shutdown,
 reload, health, swap-in-place).
+
+**A narrower endpoint, minted on request** (administration Part B.4). A resolve answered with a
+channel hands the caller a channel end, and **any channel end binds as a forwarding endpoint** —
+`sys_ns_bind` adopts an `IpcChannel` whatever its origin. So a server can mint a second endpoint of
+its own and answer a resolve with it: resolves through wherever that is bound arrive on a
+serving end the server knows, and it can answer a narrower set there. The device manager is the
+first. On the endpoint `init` binds at `/svc/devices` it hands devices to their owners; on the
+**info-only** endpoint `init` resolves at `/svc/devices/info-endpoint` and couriers to the login
+supervisors, it answers only its tables. That is **attenuation by construction**, for authority no
+right on a handle can express: a process that holds the info-only endpoint with `BIND_NAMESPACE` can
+bind it with any base and still reach nothing but the tables. It is not self-registration — the
+server mints, and a supervisor still decides where it is bound
+([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 ## Kernel vs userspace split
 

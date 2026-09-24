@@ -76,8 +76,12 @@ pub enum KernelServerId {
     /// server with **two leaves**: the bound path itself resolves to the mappable
     /// aperture, and the `info` suffix to its geometry.
     Framebuffer,
-    // The `/dev` directory listing is deferred — see
-    // `docs/rationale/deferred-decisions.md`.
+    /// `/dev/registry` — the device table (see [`registry_server`]): the bound path is a
+    /// read-only snapshot of every node's record, and `<id>` is that node. **Root namespace only.**
+    /// It is how the `/dev` listing's last limitation is answered — a kernel server owning a
+    /// subtree lists as empty, so the table is read here instead, and served to anyone else by the
+    /// device manager at `/dev/devices` (administration Part B).
+    Registry,
 }
 
 /// The outcome of a resource-server lookup — the umbrella RS contract's return.
@@ -127,6 +131,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::Log => log_server(suffix, requested),
         KernelServerId::Framebuffer => framebuffer_server(suffix, requested),
         KernelServerId::SchedStats => sched_stats_server(suffix, requested),
+        KernelServerId::Registry => registry_server(suffix, requested),
     }
 }
 
@@ -336,7 +341,38 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     let Some(index) = parse_index(suffix) else {
         return OpStatus::Rejected(KError::NotFound);
     };
-    match crate::drivers::ps2::device_ref(index) {
+    match crate::device::find_input_device(index) {
+        Some(obj) => OpStatus::Completed(obj),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/dev/registry` — the device table, and the one way to read it outside the kernel.
+///
+/// - `""` → a fresh read-only [`MemoryObject`]: a `RegistryHeader` whose **count** is the number
+///   of records, then that many `DeviceRecord`s (`crate::libkern::device`), then zero padding to
+///   the page. The count is the length: the object's size is page-rounded.
+/// - `"<id>"` → node `id` itself, a [`DeviceNode`](crate::object::DeviceNode) handle, so the
+///   device manager can hand a class owner the device it read a record of.
+///
+/// **Authority is the binding**, which the kernel makes in the root namespace only: `<id>` is
+/// every raw device there is. `requested` is ignored — the binding's rights cap what the caller
+/// obtains, applied by the lookup syscall.
+fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if suffix.is_empty() {
+        let bytes = match crate::device::registry_snapshot() {
+            Ok(b) => b,
+            Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
+        };
+        return match MemoryObject::try_new_filled(&bytes) {
+            Ok(obj) => complete_with_memobj(obj),
+            Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+        };
+    }
+    let Some(id) = parse_index(suffix) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    match crate::device::node(id as u32) {
         Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
     }

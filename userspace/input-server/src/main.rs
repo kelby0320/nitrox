@@ -9,10 +9,13 @@
 //!
 //! Modelled on `tty-server`, which sits over `/dev/console` the same way:
 //!
-//! 1. Open `/dev/input/raw/<n>` — **authority is the binding**, so the input server is
-//!    simply the process whose namespace contains them, and nothing else's should
-//!    (`input-subsystem.md` §5: that is a constraint on the supervisor, not on this code).
-//! 2. Mint a forwarding channel pair; send `Meta::Ready` on the control channel transferring
+//! 1. **Subscribe to `/svc/devices/input`** (administration Part B.3). The device manager
+//!    replays every keyboard and mouse as an `Arrived` carrying its node, then says `Settled`
+//!    (`docs/spec/rsproto-devices-ops.md`). The class has one owner, and this is it: a second
+//!    reader of a raw device would drain events meant for the first (`input-subsystem.md` §5).
+//! 2. **Serve from `Settled`, with whatever arrived** — none included. A machine without a
+//!    mouse, or without the manager, still has an input server, and later arrivals join it.
+//!    Mint a forwarding channel pair; send `Meta::Ready` on the control channel transferring
 //!    the kernel end, which the supervisor binds at `/dev/input/new`.
 //! 3. Serve. A forwarded resolve of `new` mints a **consumer channel**: the server keeps its
 //!    end and hands the other back as the resolve's answer, the directory-session shape
@@ -20,25 +23,31 @@
 //!
 //! ## The read loop is the interesting part
 //!
-//! Both devices are read with `sys_io_submit(Read)`, which returns a `PendingOperation` —
-//! and a PO is waitable, so one `sys_wait` covers the forwarding endpoint, both outstanding
-//! reads and every consumer channel. There is no polling and no thread per device.
+//! Every device is read with `sys_io_submit(Read)`, which returns a `PendingOperation` —
+//! and a PO is waitable, so one `sys_wait` covers the forwarding endpoint, the subscription,
+//! every outstanding read and every consumer channel. There is no polling and no thread per
+//! device.
 //!
 //! Each wakeup harvests whatever completed, merges it (`input_server::merge`), and forwards
-//! one batch. Ordering is **batch-scoped** — see `docs/spec/rsproto-input-ops.md`, which
+//! it — one batch for a keyboard and a mouse, more for more devices, each ending on a group
+//! boundary. Ordering is **batch-scoped** — see `docs/spec/rsproto-input-ops.md`, which
 //! states it normatively and says why a global order is not on offer.
 
 #![no_std]
 #![no_main]
 
-use input_server::{BATCH_MAX, Consumer, FRAME_MAX, PER_DEVICE, merge};
+use input_server::devices::{Arrival, Notice, Table, notice};
+use input_server::{BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, merge};
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
+use libkern::debug::Line;
+use libkern::device::DeviceKind;
 use libkern::error::KError;
 use libkern::{
-    CLOCK_MONOTONIC, IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ,
-    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
-    SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT,
-    exit, kprint, syscall2, syscall4, syscall5,
+    CLOCK_MONOTONIC, IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV,
+    RIGHT_SEND, RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV,
+    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
+    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
+    syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -55,12 +64,15 @@ const PAYLOAD_OFF: usize = 24;
 /// One page for each device's read buffer.
 const PAGE: u64 = 4096;
 
-/// Raw device nodes this server reads.
-const DEVICES: [&[u8]; 2] = [b"/dev/input/raw/0", b"/dev/input/raw/1"];
-/// Index of the keyboard within [`DEVICES`].
-const KBD: usize = 0;
-/// Index of the mouse.
-const MOUSE: usize = 1;
+/// Where the device manager hands over input devices: resolving it is the subscription.
+const SUBSCRIPTION: &[u8] = b"/svc/devices/input";
+
+/// How long to wait for the manager's `Settled` before serving with what has arrived.
+///
+/// The manager queues the whole replay before the subscription's resolve completes, so `Settled`
+/// is waiting the moment the channel is; this bounds a manager that is not behaving, well inside
+/// the thirty seconds `init` gives a `Ready`. Anything that arrives after it still joins.
+const SETTLE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// Consumers served at once.
 ///
@@ -133,7 +145,15 @@ static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
     [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-/// One raw device: its node, its read buffer, and the read currently outstanding on it.
+/// Close `h` if it is a handle at all.
+fn close(h: u64) {
+    if h != 0 {
+        // SAFETY: closing a handle this process owns and will not use again.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, h, 0, 0, 0) };
+    }
+}
+
+/// One device: its node, its read buffer, and the read currently outstanding on it.
 struct Device {
     node: u64,
     buf_h: u64,
@@ -143,12 +163,13 @@ struct Device {
 }
 
 impl Device {
-    /// Open `path` and map a read buffer for it.
-    fn open(root_ns: u64, path: &[u8]) -> Option<Self> {
-        let node = lookup(root_ns, path, RIGHT_READ)?;
+    /// Take `node` — the handle an `Arrived` carried — and map a read buffer for it. `None`, with
+    /// the node closed, if the buffer cannot be had.
+    fn adopt(node: u64) -> Option<Self> {
         // SAFETY: register-only syscall.
         let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
         if buf_h <= 0 {
+            close(node);
             return None;
         }
         // SAFETY: a fresh `MemoryObject` handle with full MAP rights.
@@ -156,9 +177,24 @@ impl Device {
             syscall4(SYS_MEMORY_MAP, buf_h as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
         };
         if addr <= 0 {
+            close(buf_h as u64);
+            close(node);
             return None;
         }
         Some(Self { node, buf_h: buf_h as u64, buf_addr: addr as u64, po: 0 })
+    }
+
+    /// Let the device go: its read, its buffer and its node.
+    ///
+    /// **A read still parked in the kernel is safe to walk away from**: the driver holds its own
+    /// reference to the buffer object (`ps2`'s `submit_read` clones it), so what it writes lands
+    /// in memory the kernel keeps alive, not in this process's freed mapping.
+    fn retire(self) {
+        close(self.po);
+        // SAFETY: unmapping this device's own read buffer, which nothing here reads again.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, self.buf_addr, PAGE) };
+        close(self.buf_h);
+        close(self.node);
     }
 
     /// Submit a read if none is outstanding. Idempotent, so the caller can call it after
@@ -440,7 +476,12 @@ fn send_events(channel: u64, events: &[InputEvent]) -> bool {
 
 /// Everything the serve loop owns.
 struct Server {
-    devices: [Device; 2],
+    /// The devices, by slot — `table` says which registry id holds each.
+    devices: [Option<Device>; MAX_DEVICES],
+    table: Table,
+    /// The subscription to [`SUBSCRIPTION`], or `0` when there is none: the manager was not
+    /// there, or has gone. The devices already read stay read either way.
+    subscription: u64,
     /// Consumer channel handles, `0` for a free slot.
     channels: [u64; MAX_CONSUMERS],
     /// What each consumer is owed, parallel to `channels`.
@@ -536,6 +577,149 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
     }
 }
 
+/// The word for `kind` in a log line.
+fn kind_word(kind: DeviceKind) -> &'static [u8] {
+    match kind {
+        DeviceKind::Keyboard => b"keyboard",
+        DeviceKind::Mouse => b"mouse",
+        _ => b"device",
+    }
+}
+
+/// Act on one message from the device manager, whose `handles` came with it. Returns whether it
+/// was `Settled`.
+fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
+    let say = |id: u32, kind: DeviceKind, what: &[u8]| {
+        Line::new().s(b"input-server: ").s(kind_word(kind)).s(b" ").u(id as u64).s(what).end();
+    };
+    match n {
+        // `notice` classifies an arrival as one only with exactly one handle: its node.
+        Notice::Arrived { id, kind } => match srv.table.arrive(id) {
+            Arrival::Slot(slot) => match Device::adopt(handles[0]) {
+                Some(d) => {
+                    srv.devices[slot] = Some(d);
+                    Line::new()
+                        .s(b"input-server: reading ")
+                        .s(kind_word(kind))
+                        .s(b" ")
+                        .u(id as u64)
+                        .s(b" in slot ")
+                        .u(slot as u64)
+                        .end();
+                }
+                None => {
+                    srv.table.depart(id);
+                    say(id, kind, b" has no read buffer; not read");
+                }
+            },
+            Arrival::Already => {
+                close(handles[0]);
+                say(id, kind, b" arrived again; the second node closed");
+            }
+            Arrival::Full => {
+                close(handles[0]);
+                say(id, kind, b": every slot is taken; not read");
+            }
+        },
+        Notice::NotInput { id, kind } => {
+            handles.iter().for_each(|&h| close(h));
+            Line::new()
+                .s(b"input-server: device ")
+                .u(id as u64)
+                .s(b" of kind ")
+                .u(kind.as_u32() as u64)
+                .s(b" is not input; refused")
+                .end();
+        }
+        Notice::Settled(_) => return true,
+        Notice::Departed(id) => {
+            if let Some(slot) = srv.table.depart(id) {
+                if let Some(d) = srv.devices[slot].take() {
+                    d.retire();
+                }
+                Line::new().s(b"input-server: device ").u(id as u64).s(b" departed from slot ").u(slot as u64).end();
+            }
+        }
+        Notice::Malformed => {
+            handles.iter().for_each(|&h| close(h));
+            kprint(b"input-server: a malformed message from the device manager; ignored\n");
+        }
+    }
+    false
+}
+
+/// Take every message waiting on the subscription. Returns whether one of them was `Settled`.
+///
+/// **A manager that has gone takes nothing with it**: the devices already read keep being read,
+/// and only arrivals stop — which is all the manager was for.
+fn take_notices(srv: &mut Server) -> bool {
+    let mut settled = false;
+    while srv.subscription != 0 {
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(
+                SYS_CHANNEL_RECV,
+                srv.subscription,
+                (&raw mut RECV_MSG) as u64,
+                (&raw mut RECV_HANDLES) as u64,
+                (&raw mut RECV_COUNT) as u64,
+            )
+        };
+        if rr == KError::PeerClosed.as_i32() as i64 {
+            kprint(b"input-server: the device manager has gone; the devices already read stay read\n");
+            close(srv.subscription);
+            srv.subscription = 0;
+            break;
+        }
+        if rr != 0 {
+            break;
+        }
+        let mut handles = [0u64; libkern::abi::IPC_HANDLE_MAX];
+        // SAFETY: the kernel wrote the count, the header and that many handles, and this process
+        // is single-threaded, so nothing writes the buffers while they are read here. The payload
+        // read is bounded by the buffer.
+        let (n, count) = unsafe {
+            let count = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+            let received: &[u64; libkern::abi::IPC_HANDLE_MAX] = &*(&raw const RECV_HANDLES);
+            handles[..count].copy_from_slice(&received[..count]);
+            let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload = core::slice::from_raw_parts(
+                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
+                len.min(MSG_LEN - PAYLOAD_OFF),
+            );
+            let n = match decode(payload) {
+                Ok(m) => notice(m.op, m.body, count),
+                Err(_) => Notice::Malformed,
+            };
+            (n, count)
+        };
+        settled |= apply(srv, n, &handles[..count]);
+    }
+    settled
+}
+
+/// Take the manager's replay — every keyboard and mouse it has — until `Settled`, or until
+/// [`SETTLE_TIMEOUT_NS`] says to serve with what came. Returns whether it settled.
+fn settle(srv: &mut Server) -> bool {
+    let deadline = now_ns().map(|t| t.saturating_add(SETTLE_TIMEOUT_NS));
+    while srv.subscription != 0 {
+        if take_notices(srv) {
+            return true;
+        }
+        // No clock, no deadline to wait against: take what was queued and serve.
+        let (Some(deadline), true) = (deadline, srv.subscription != 0) else { break };
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with a deadline.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = srv.subscription;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
+        };
+        if waited < 1 {
+            break;
+        }
+    }
+    false
+}
+
 /// Handle a forwarded resolve on the serving endpoint. Returns `false` if the endpoint died.
 fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
     // SAFETY: valid recv out-params.
@@ -587,24 +771,28 @@ fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
     true
 }
 
-/// The serve loop: the forwarding endpoint, both device reads, and every consumer channel,
-/// all under one `sys_wait`.
+/// The serve loop: the forwarding endpoint, the subscription, every device's read, and every
+/// consumer channel, all under one `sys_wait`.
 fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
     kprint(b"input-server: serving /dev/input/new\n");
-    let mut kbd_buf = [InputEvent::default(); PER_DEVICE];
-    let mut mouse_buf = [InputEvent::default(); PER_DEVICE];
-    let mut batch = [InputEvent::default(); BATCH_MAX];
+    let mut harvested = [[InputEvent::default(); PER_DEVICE]; MAX_DEVICES];
+    let mut merged = [InputEvent::default(); MERGE_MAX];
 
     loop {
-        srv.devices[KBD].arm();
-        srv.devices[MOUSE].arm();
+        for d in srv.devices.iter_mut().flatten() {
+            d.arm();
+        }
 
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // 1 + 2 + MAX_CONSUMERS, far inside it.
+        // 1 + 1 + MAX_DEVICES + MAX_CONSUMERS, inside it.
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
-            for d in &srv.devices {
+            if srv.subscription != 0 {
+                WAIT_HANDLES[n] = srv.subscription;
+                n += 1;
+            }
+            for d in srv.devices.iter().flatten() {
                 if d.po != 0 {
                     WAIT_HANDLES[n] = d.po;
                     n += 1;
@@ -652,8 +840,10 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
         }
 
         let mut forward_pending = false;
-        let mut kbd_n = 0usize;
-        let mut mouse_n = 0usize;
+        // **The subscription is read after the harvest, not during it.** A departure closes a
+        // device's read, and a later record in this same wait's results could name that handle.
+        let mut notices_pending = false;
+        let mut counts = [0usize; MAX_DEVICES];
         for j in 0..(waited as usize) {
             let off = j * 24;
             // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
@@ -671,10 +861,12 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             };
             if h == serve_end {
                 forward_pending = true;
-            } else if h == srv.devices[KBD].po {
-                kbd_n = srv.devices[KBD].harvest(&mut kbd_buf);
-            } else if h == srv.devices[MOUSE].po {
-                mouse_n = srv.devices[MOUSE].harvest(&mut mouse_buf);
+            } else if srv.subscription != 0 && h == srv.subscription {
+                notices_pending = true;
+            } else if let Some(slot) = srv.devices.iter().position(|d| d.as_ref().is_some_and(|d| d.po == h)) {
+                if let Some(d) = srv.devices[slot].as_mut() {
+                    counts[slot] = d.harvest(&mut harvested[slot]);
+                }
             } else if let Some(slot) = srv.channels.iter().position(|&c| c == h && c != 0) {
                 // **A signal here means one of two things, and they must be told apart.**
                 // The kernel signals an endpoint when its receive queue is non-empty *or*
@@ -696,8 +888,7 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                     )
                 };
                 if rr == KError::PeerClosed.as_i32() as i64 {
-                    // SAFETY: closing our end of a channel whose peer is gone.
-                    unsafe { syscall4(SYS_HANDLE_CLOSE, srv.channels[slot], 0, 0, 0) };
+                    close(srv.channels[slot]);
                     srv.channels[slot] = 0;
                     // **And what it was owed goes with it.** A debt outlives its consumer
                     // otherwise: nothing can deliver it, and `owes_send` would keep arming the
@@ -712,9 +903,12 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             }
         }
 
-        if kbd_n > 0 || mouse_n > 0 {
-            let n = merge(&kbd_buf[..kbd_n], &mouse_buf[..mouse_n], &mut batch);
-            if n > 0 {
+        if counts.iter().any(|&c| c > 0) {
+            let sources: [&[InputEvent]; MAX_DEVICES] = core::array::from_fn(|i| &harvested[i][..counts[i]]);
+            let n = merge(&sources, &mut merged);
+            // **One batch for a keyboard and a mouse; more, in order, for more devices** — each
+            // ends on a group boundary, so no group is split across messages.
+            for run in batches(&merged[..n], BATCH_MAX) {
                 // The stamp on the loss marker and on recovered motion only: every real event
                 // already carries the time its interrupt fired, which is the point of `time_ns`.
                 //
@@ -725,13 +919,16 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                 // batch, the one placement `frame` documents as wrong. Nothing reads `time_ns`
                 // today; that is a reason to fix it cheaply, not to leave it (PR #246 review,
                 // optional 8).
-                let stamp = batch[0].time_ns;
-                forward(srv, &batch[..n], stamp);
+                let stamp = merged[run.start].time_ns;
+                forward(srv, &merged[run], stamp);
             }
         } else if owes_send(srv) {
             // Woken by something else — a resolve, a consumer's message — with motion still
             // owed. Sending it now costs one message and saves a whole flush interval.
             forward(srv, &[], now_ns().unwrap_or(0));
+        }
+        if notices_pending {
+            take_notices(srv);
         }
         if forward_pending && !serve_forward(serve_end, srv) {
             kprint(b"input-server: forwarding endpoint closed\n");
@@ -748,22 +945,29 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
 pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     kprint(b"input-server: up\n");
 
-    // Authority is the binding: this server is the process whose namespace holds the raw
-    // nodes. If they are absent there is nothing to serve — a machine with no i8042 boots
-    // without an input server rather than with a broken one.
-    let Some(kbd) = Device::open(root_ns, DEVICES[KBD]) else {
-        kprint(b"input-server: no /dev/input/raw/0 -- cannot serve\n");
-        exit(1);
-    };
-    let Some(mouse) = Device::open(root_ns, DEVICES[MOUSE]) else {
-        kprint(b"input-server: no /dev/input/raw/1 -- cannot serve\n");
-        exit(1);
-    };
     let mut srv = Server {
-        devices: [kbd, mouse],
+        devices: [const { None }; MAX_DEVICES],
+        table: Table::new(),
+        subscription: 0,
         channels: [0; MAX_CONSUMERS],
         consumers: [Consumer::new(); MAX_CONSUMERS],
     };
+    // **Devices come from the manager, and there is no fallback to the raw paths**
+    // (administration Part B): a second path that runs only when the first is broken is a path
+    // nobody tests. Without a manager, or with no devices, this still serves — a consumer gets a
+    // stream with nothing in it, which is the truth — where it used to exit for want of a mouse.
+    srv.subscription = lookup(root_ns, SUBSCRIPTION, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).unwrap_or(0);
+    if srv.subscription == 0 {
+        Line::new().s(b"input-server: could not subscribe at ").s(SUBSCRIPTION).s(b" -- serving no devices").end();
+    } else {
+        let settled = settle(&mut srv);
+        Line::new()
+            .s(b"input-server: ")
+            .u(srv.table.len() as u64)
+            .s(b" device(s) from the device manager")
+            .s(if settled { b"" } else { b", which did not settle; serving them" })
+            .end();
+    }
 
     let Some((kernel_end, serve_end)) = make_channel(CONTROL_QUEUE_DEPTH) else {
         kprint(b"input-server: channel create FAIL\n");

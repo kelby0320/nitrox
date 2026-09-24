@@ -792,7 +792,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)
-        & view_broker_test(root_ns);
+        & view_broker_test(root_ns)
+        & registry_test(root_ns)
+        & devices_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -953,14 +955,15 @@ fn views_call(
     handles: &[u64],
     exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<(bool, alloc::vec::Vec<u8>)> {
-    if !views_send(ch, op, request_id, body, handles) {
+    if !rs_send(ch, op, request_id, body, handles) {
         return None;
     }
     views_receive(ch, request_id, exited)
 }
 
-/// Send one message to the broker without waiting for its answer.
-fn views_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
+/// Send one rsproto message on `ch`, moving `handles`, without waiting for an answer — to the view
+/// broker, or down an endpoint as the kernel would forward a resolve.
+fn rs_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
     let mut msg = [0u8; 4096];
     let Some(n) = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16) else {
         return false;
@@ -989,6 +992,33 @@ fn views_receive(
     exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<(bool, alloc::vec::Vec<u8>)> {
     let deadline = clock_ns() + 10_000_000_000;
+    loop {
+        let m = receive(ch, deadline)?;
+        if m.op == librsproto::views::OP_VIEWS_EXITED && m.request_id == 0 {
+            if request_id == 0 {
+                return Some((false, m.body));
+            }
+            exited.push(m.body);
+            continue;
+        }
+        if m.request_id == request_id {
+            return Some((m.error, m.body));
+        }
+    }
+}
+
+/// One rsproto message, received and copied out, with the handles that came with it.
+struct Received {
+    op: u16,
+    request_id: u64,
+    error: bool,
+    body: alloc::vec::Vec<u8>,
+    handles: alloc::vec::Vec<u64>,
+}
+
+/// The next message on `ch`, waiting until `deadline` on the monotonic clock — `0` only looks.
+/// `None` if nothing came by then, or if what came is not rsproto.
+fn receive(ch: u64, deadline: u64) -> Option<Received> {
     let mut buf = [0u8; 4096];
     let mut hs = [0u64; 8];
     loop {
@@ -1006,17 +1036,13 @@ fn views_receive(
         if rr == 0 {
             let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
             let m = librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok()?;
-            if m.op == librsproto::views::OP_VIEWS_EXITED && m.request_id == 0 {
-                if request_id == 0 {
-                    return Some((false, m.body.to_vec()));
-                }
-                exited.push(m.body.to_vec());
-                continue;
-            }
-            if m.request_id == request_id {
-                return Some((m.is_error(), m.body.to_vec()));
-            }
-            continue;
+            return Some(Received {
+                op: m.op,
+                request_id: m.request_id,
+                error: m.is_error(),
+                body: m.body.to_vec(),
+                handles: hs[..count.min(hs.len())].to_vec(),
+            });
         }
         if clock_ns() >= deadline {
             return None;
@@ -1027,6 +1053,63 @@ fn views_receive(
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline);
         }
     }
+}
+
+/// What the kernel says of handle `h`. `None` if it is not one this process holds.
+fn stat(h: u64) -> Option<HandleInfo> {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
+    (sr == 0).then_some(info)
+}
+
+/// Map a read-only object and copy it out, so nothing borrows the mapping past this call.
+fn read_all(h: u64) -> Option<alloc::vec::Vec<u8>> {
+    let size = stat(h)?.size;
+    // SAFETY: register-only syscall; `h` is a MemoryObject handle with MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ) };
+    if addr < 0 {
+        return None;
+    }
+    // SAFETY: `size` bytes are mapped read-only at `addr` until the unmap below.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) }.to_vec();
+    // SAFETY: unmapping what was mapped above; `bytes` is a copy.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    Some(bytes)
+}
+
+/// Sleep `ms` milliseconds on a one-shot timer — `sys_wait` refuses an empty handle list, so a
+/// deadline alone is not a sleep. Returns at once if no timer can be made.
+fn sleep_ms(ms: u64) {
+    // SAFETY: register-only syscall; returns a handle or a negative KError.
+    let th = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
+    if th < 0 {
+        return;
+    }
+    let fire_at = clock_ns() + ms * 1_000_000;
+    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
+    unsafe { syscall4(libkern::SYS_TIMER_SET, th as u64, fire_at, 0, 0) };
+    wait_one(th as u64);
+    close(th as u64);
+}
+
+/// Close `h` if it is a handle at all.
+fn close(h: u64) {
+    if h != 0 {
+        // SAFETY: closing a handle this process holds.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
+}
+
+/// `/dev/registry`'s records, read through `ns`. `None` if it is not bound there or does not read.
+fn registry_records(ns: u64) -> Option<alloc::vec::Vec<libkern::device::DeviceRecord>> {
+    let (st, snap) = ns_lookup(ns, b"/dev/registry", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+    if st != 0 || snap == 0 {
+        return None;
+    }
+    let bytes = read_all(snap);
+    close(snap);
+    Some(libkern::device::records(&bytes?).ok()?.collect())
 }
 
 /// **The view broker, through its own protocol** (administration Part A.3), before any shell or
@@ -1221,7 +1304,7 @@ fn view_broker_test(root_ns: u64) -> bool {
         return fail(b"the paced pair's first wrong password");
     }
     let t0 = clock_ns();
-    if !views_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !views_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
+    if !rs_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !rs_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
         return fail(b"send the paced pair's passwords");
     }
     if !retry(views_receive(b, 21, &mut exited)) {
@@ -1313,6 +1396,332 @@ fn view_broker_test(root_ns: u64) -> bool {
     true
 }
 
+
+/// **The device registry, through its binding** (administration Part B.1). The kernel's host tests
+/// see its table as a value; this sees `/dev/registry` as a process does, and holds it to the
+/// paths it has to agree with:
+/// - the snapshot decodes, through the reader everything else will use;
+/// - **its block records are exactly what probing `/dev/blk` finds** — the same number, and each
+///   record's served index resolving to a device of the record's size, whose `info` gives the
+///   record's name;
+/// - **the keyboard is served at 0 and the mouse at 1**, each resolving under `/dev/input/raw`;
+/// - every record's `/dev/registry/<id>` is a device node, **and its id is its place** — which a
+///   phantom record read past the count, all zeros, cannot be.
+///
+/// The paths and the records read one field in the kernel, so a disagreement here would be a new
+/// path that stopped reading it.
+fn registry_test(root_ns: u64) -> bool {
+    use libkern::device::DeviceKind;
+    use libkern::{RIGHT_INSPECT, RIGHT_READ};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: registry: ").s(what).s(b" FAIL").end();
+        false
+    };
+
+    let Some(all) = registry_records(root_ns) else {
+        return fail(b"no /dev/registry in the root namespace that reads");
+    };
+    let total = all.len();
+    let mut blocks = 0u32;
+    let (mut keyboard, mut mouse) = (false, false);
+    for (place, r) in all.iter().enumerate() {
+        if r.id as usize != place {
+            Line::new().s(b"boot-probe: registry: record ").u(place as u64).s(b" says it is ").u(r.id as u64).end();
+            return fail(b"the records are not the table in order");
+        }
+        let path = alloc::format!("/dev/registry/{}", r.id);
+        let (st, node) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+        let kind_ok = st == 0 && stat(node).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
+        close(node);
+        if !kind_ok {
+            Line::new().s(b"boot-probe: registry: ").s(path.as_bytes()).s(b" is not a device node").end();
+            return fail(b"a record's id does not resolve to its node");
+        }
+        match r.kind() {
+            DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => {
+                blocks += 1;
+                let dev = alloc::format!("/dev/blk/{}", r.served);
+                let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+                let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
+                close(h);
+                let want = r.logical_block_size as u64 * r.block_count;
+                if size != Some(want) {
+                    Line::new().s(b"boot-probe: registry: ").s(dev.as_bytes()).s(b" is not the record's size").end();
+                    return fail(b"a block record's served index names another device");
+                }
+                let info_path = alloc::format!("/dev/blk/{}/info", r.served);
+                let (st, ih) = ns_lookup(root_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_INSPECT);
+                let info = if st == 0 { read_all(ih) } else { None };
+                close(ih);
+                // `BlockDeviceInfo`: `name_len` at 16, `name` from 24.
+                let named = info.is_some_and(|b| {
+                    let n = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) as usize;
+                    b.get(24..24 + n) == Some(r.name())
+                });
+                if !named {
+                    return fail(b"a block record's name is not its device's");
+                }
+            }
+            DeviceKind::Keyboard | DeviceKind::Mouse => {
+                let want = if r.kind() == DeviceKind::Keyboard { 0 } else { 1 };
+                let raw = alloc::format!("/dev/input/raw/{}", r.served);
+                let (st, h) = ns_lookup(root_ns, raw.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+                close(h);
+                if r.served != want || st != 0 {
+                    return fail(b"an input record is not at its raw index");
+                }
+                if r.kind() == DeviceKind::Keyboard {
+                    keyboard = true;
+                } else {
+                    mouse = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // What the probes find, the old way.
+    let mut probed = 0u32;
+    loop {
+        let dev = alloc::format!("/dev/blk/{probed}");
+        let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+        close(h);
+        if st != 0 {
+            break;
+        }
+        probed += 1;
+    }
+    if probed != blocks {
+        Line::new().s(b"boot-probe: registry: ").u(blocks as u64).s(b" block records, ").u(probed as u64).s(b" probed").end();
+        return fail(b"the block records are not what /dev/blk serves");
+    }
+    if !keyboard || !mouse {
+        return fail(b"no keyboard and mouse records");
+    }
+    Line::new()
+        .s(b"boot-probe: registry: ")
+        .u(total as u64)
+        .s(b" nodes, ")
+        .u(blocks as u64)
+        .s(b" block devices as /dev/blk serves them, keyboard and mouse at their raw indices ok")
+        .end();
+    true
+}
+
+/// **The device manager, through its own paths** (administration Part B.2), before any owner but
+/// `input-server` exists. `block` has no owner until Part C's storage service, so the probe takes
+/// it:
+/// - **the subscription replays every block device as `Arrived`, each with its node, then
+///   `Settled`** with the count — the same devices `/dev/registry` lists as block;
+/// - **a second subscription is refused while the first is held**, and taken once it is closed —
+///   one owner per class, the kernel's one reader per device kept at the manager;
+/// - **`info` lists `all.tsm` and a file per device, and `all.tsm` is a table** with a row per
+///   device the registry has;
+/// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
+///   sees that the input server took its devices from the manager rather than from the raw paths.
+///   Were it not held, this resolve would take the class for a moment and give it back;
+/// - **the info-only endpoint answers the tables and nothing else** (Part B.4): `block` and
+///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
+///   and `info` opens the directory.
+fn devices_test(root_ns: u64) -> bool {
+    use libkern::device::DeviceKind;
+    use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived, parse_settled};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: devices: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+
+    // What the registry says, to hold the manager to.
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let block_ids: alloc::vec::Vec<u32> = registry
+        .iter()
+        .filter(|r| matches!(r.kind(), DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk))
+        .map(|r| r.id)
+        .collect();
+
+    // A subscription's replay: the ids that arrived, each with a device node, and what `Settled`
+    // counted. **Read without waiting**, because the manager queues all of it before the resolve
+    // completes. This states the property rather than guarding it: a manager that replied first
+    // and sent after passes whenever its sends beat this process's wake, as they did in the boot
+    // that tried it. `subscribe`'s order is what holds it.
+    let read_replay = |owner: u64| -> Result<(alloc::vec::Vec<u32>, Option<u32>), &'static [u8]> {
+        let mut arrived = alloc::vec::Vec::new();
+        loop {
+            let Some(m) = receive(owner, 0) else {
+                return Err(b"the replay was not queued when the subscription completed");
+            };
+            let node_ok = m.handles.len() == 1
+                && stat(m.handles[0]).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
+            m.handles.iter().for_each(|&h| close(h));
+            if m.op == OP_DEVICES_SETTLED {
+                return Ok((arrived, parse_settled(&m.body)));
+            }
+            if m.op != OP_DEVICES_ARRIVED || !node_ok {
+                return Err(b"a replay message was not an arrival carrying a device node");
+            }
+            let Some(rec) = parse_arrived(&m.body) else {
+                return Err(b"an arrival's body is not a record");
+            };
+            arrived.push(u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]));
+        }
+    };
+    let replayed_the_registry = |owner: u64| match read_replay(owner) {
+        Ok((arrived, settled)) if arrived == block_ids && settled == Some(block_ids.len() as u32) => Ok(()),
+        Ok((arrived, _)) => {
+            Line::new().s(b"boot-probe: devices: ").u(arrived.len() as u64).s(b" arrived, ").u(block_ids.len() as u64).s(b" block records").end();
+            Err(&b"the replay is not the registry's block devices"[..])
+        }
+        Err(what) => Err(what),
+    };
+
+    // Subscribe, and read the replay.
+    let (st, owner) = ns_lookup(root_ns, b"/svc/devices/block", chan);
+    if st != 0 || owner == 0 {
+        return fail(b"/svc/devices/block would not subscribe");
+    }
+    if let Err(what) = replayed_the_registry(owner) {
+        close(owner);
+        return fail(what);
+    }
+
+    // One owner at a time.
+    let (st, second) = ns_lookup(root_ns, b"/svc/devices/block", chan);
+    close(second);
+    if st != libkern::KError::AlreadyExists.as_i32() {
+        close(owner);
+        Line::new().s(b"boot-probe: devices: a second subscription answered ").i(st as i64).end();
+        return fail(b"a second owner was not refused");
+    }
+    close(owner);
+    // The manager notices the close in its own time; a subscription sent before it has is refused
+    // like any other, so ask a few times.
+    let mut retaken = 0;
+    for _ in 0..50 {
+        let (st, again) = ns_lookup(root_ns, b"/svc/devices/block", chan);
+        if st == 0 {
+            retaken = again;
+            break;
+        }
+        sleep_ms(20);
+    }
+    if retaken == 0 {
+        return fail(b"the class was not taken again once its owner closed");
+    }
+    // A new owner is sent the whole class again, not what the last one left.
+    let again = replayed_the_registry(retaken);
+    close(retaken);
+    if let Err(what) = again {
+        return fail(what);
+    }
+
+    // `input` has its owner from boot on: `init` waits for `input-server`'s `Ready`, which comes
+    // only after it has subscribed and settled.
+    let (st, input) = ns_lookup(root_ns, b"/svc/devices/input", chan);
+    close(input);
+    if st != libkern::KError::AlreadyExists.as_i32() {
+        Line::new().s(b"boot-probe: devices: a subscription to input answered ").i(st as i64).end();
+        return fail(b"input is not held, so input-server did not take its devices from the manager");
+    }
+
+    // **The endpoint a session is given answers the tables and nothing else** (Part B.4). `init`
+    // couriers one of these for every session's `/dev/devices`, and `desktop-shell` holds it with
+    // `BIND_NAMESPACE`, so it could bind it with no base — where the root endpoint would take
+    // `block` as a subscription to every disk. The probe cannot bind (it holds no syscaps), but a
+    // forwarding endpoint is a channel and the manager answers whatever resolve arrives on it, so
+    // the probe sends the resolves a namespace would forward, as the kernel would.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/devices/info-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no info-only endpoint at /svc/devices/info-endpoint");
+    }
+    let forward = |request_id: u64, suffix: &[u8]| -> Option<Received> {
+        let mut body = [0u8; 64];
+        let n = librsproto::namespace::resolve_request(&mut body, chan, 0, suffix)?;
+        if !rs_send(endpoint, librsproto::OP_NS_RESOLVE, request_id, &body[..n], &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 5_000_000_000;
+        loop {
+            let m = receive(endpoint, deadline)?;
+            if m.request_id == request_id {
+                return Some(m);
+            }
+            m.handles.iter().for_each(|&h| close(h));
+        }
+    };
+    let refused = |m: &Option<Received>| {
+        m.as_ref().is_some_and(|m| {
+            m.error
+                && m.handles.is_empty()
+                && librsproto::error::parse_error(&m.body)
+                    .is_some_and(|e| e.kerror == libkern::KError::NotFound.as_i32())
+        })
+    };
+    let block = forward(1, b"block");
+    let minted = forward(2, b"info-endpoint");
+    let listing = forward(3, b"info");
+    close(endpoint);
+    for m in [&block, &minted, &listing] {
+        if let Some(m) = m {
+            m.handles.iter().for_each(|&h| close(h));
+        }
+    }
+    if !refused(&block) {
+        return fail(b"the info-only endpoint answered `block` as something other than NotFound");
+    }
+    if !refused(&minted) {
+        return fail(b"the info-only endpoint minted another");
+    }
+    if !listing.as_ref().is_some_and(|m| !m.error && m.handles.len() == 1) {
+        return fail(b"the info-only endpoint would not open its directory");
+    }
+
+    // The information side.
+    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
+        return fail(b"/svc/devices/info is not a directory");
+    };
+    let mut names = 0usize;
+    let mut has_all = false;
+    let listed = dir.read_dir(|e| {
+        if e.name != b"." && e.name != b".." {
+            names += 1;
+            has_all |= e.name == b"all.tsm";
+        }
+        true
+    });
+    dir.close();
+    if listed.is_err() {
+        return fail(b"the directory would not list");
+    }
+    if !has_all || names != registry.len() + 1 {
+        Line::new().s(b"boot-probe: devices: ").u(names as u64).s(b" entries for ").u(registry.len() as u64).s(b" devices").end();
+        return fail(b"the directory is not all.tsm and a file per device");
+    }
+    let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+    let tbytes = if st == 0 { read_all(table) } else { None };
+    close(table);
+    let Some(tbytes) = tbytes else {
+        return fail(b"all.tsm would not map");
+    };
+    // The object is page-sized; the decoder stops at the table's terminator.
+    let rows = match libstream::wire::Table::decode(&tbytes) {
+        Ok(t) => t.rows.len(),
+        Err(_) => return fail(b"all.tsm is not a TSM1 table"),
+    };
+    if rows != registry.len() {
+        return fail(b"all.tsm has not a row per device");
+    }
+    Line::new()
+        .s(b"boot-probe: devices: block replayed ")
+        .u(block_ids.len() as u64)
+        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
+        .u(rows as u64)
+        .s(b" rows ok")
+        .end();
+    true
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

@@ -171,9 +171,9 @@ impl ResourceDescriptor {
 
 /// What a device node is and which operations it accepts.
 ///
-/// `#[repr(u32)]`. A `Block` node accepts block read/write through the I/O core;
-/// `Other` is discovered-but-unclaimed. Other classes (`Char`, `Net`, …) arrive
-/// with their first driver.
+/// `#[repr(u32)]`. A `Block` node accepts block read/write through the I/O core; a `Char` node
+/// a byte-stream read — the console and the i8042's devices; `Other` is a PCI function, claimed
+/// or not. `Net` and the rest arrive with their first driver.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceClass {

@@ -347,7 +347,7 @@ pub fn publish_modules() {
         let node_ref = unsafe {
             ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
         };
-        crate::device::register(node_ref);
+        crate::device::register(node_ref, "ramdisk");
         crate::kprintln!(
             "ramdisk: module {} ({}), {} bytes, as a block device",
             disk.index,

@@ -606,6 +606,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The view broker (administration Part A). `init` spawns it — only `init` can bind a server
     // into the root namespace — from here, as it does `auth-service`.
     "view-broker",
+    // The device manager (administration Part B). `init` spawns it before `input-server`, which
+    // takes its devices from it, and binds it at `/svc/devices`.
+    "device-mgr",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -668,6 +671,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The view broker (administration Part A). A lib + bin split like `auth-service`: who may
     // do what is host-tested, this builds the bare-target server.
     build_userspace_bin("view-broker", None)?;
+    // The device manager (administration Part B). A lib + bin split: names, classes, owners and
+    // the tables are host-tested, this builds the bare-target server.
+    build_userspace_bin("device-mgr", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -1371,6 +1377,15 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let mut steps = 0usize;
 
     // 1. The machine reaches a login prompt at all — the release image's first claim.
+    //
+    //    **And `init` asked the device manager for an info-only endpoint** (administration Part
+    //    B.4) — the one it couriers for every session's `/dev/devices`. This is the only place a
+    //    gate sees that: the sessions below would list the same tables through a duplicate of the
+    //    root endpoint, and only an info-only one keeps `desktop-shell`, which could bind it with
+    //    no base, from subscribing through it. The manager logs before replying, so the order is
+    //    causal: `init`'s bind, the mint, then everything after, the login included.
+    s.expect("init: device-mgr bound at /svc/devices")?;
+    s.expect("device-mgr: an info-only endpoint minted")?;
     s.expect("nitrox login:")?;
     steps += 1;
 
@@ -1412,6 +1427,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let built = s.rest_of_line()?;
     if !built.contains("/dev/views") {
         return Err(format!("the serial session was built without /dev/views: ({built}").into());
+    }
+    // **And the device manager's tables** (administration Part B.4), on the same line.
+    if !built.contains("/dev/devices") {
+        return Err(format!("the serial session was built without /dev/devices: ({built}").into());
     }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
@@ -1458,6 +1477,31 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //     anyway — a count of one passes on a home holding some *other* file.
     s.send("list .")?;
     s.expect("nx-login.txt")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 5d. **The machine's devices, as typed tables** (administration Part B.4). The session's
+    //     `/dev/devices` is the device manager at the base `/info`: `list` names a file per
+    //     device — the disk and both input devices among them, in whatever order it sorts — and
+    //     `open` decodes one into a table that a pipeline filters with no device code of its own.
+    //     The disk is matched on its **model**, which the command does not contain, so the echo
+    //     of what was typed cannot satisfy it.
+    s.send("list /dev/devices")?;
+    s.expect_all(&["all.tsm", "blk-0.tsm", "input-0.tsm", "input-1.tsm"])?;
+    s.expect("/home>")?;
+    s.send("open /dev/devices/all.tsm | filter kind == \"disk\"")?;
+    s.expect("QEMU HARDDISK")?;
+    s.expect("/home>")?;
+    // **And nothing to take a device with.** The base `/info` means `/dev/devices/block` reaches
+    //     the manager as `info/block` — a table name without `.tsm`, which it refuses — rather
+    //     than as `block`, the subscription that would hand this session every disk. And
+    //     `/dev/registry` is bound in the root namespace only: what a session may know of the
+    //     devices is the manager's tables, never the kernel's nodes.
+    s.send("open /dev/devices/block")?;
+    s.expect("nxsh: cannot open /dev/devices/block")?;
+    s.expect("/home>")?;
+    s.send("open /dev/registry")?;
+    s.expect("nxsh: cannot open /dev/registry")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -3493,6 +3537,15 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.expect("live-rows=3")?;
     println!("  ok: a file written under /home read back from the RAM disk");
 
+    // **And the device manager calls the module a RAM disk** (administration Part B). The live
+    // boot's module is the one RAM disk any gate has, so this is the only place that kind is seen
+    // on its way to a person. Asked of the session's own `/dev/devices`, and matched on the
+    // module's path — the ramdisk row's description, which the typed command does not contain.
+    s.send("open /dev/devices/all.tsm | filter kind == \"ramdisk\"")?;
+    s.expect("module 1 (/boot/root.img)")?;
+    s.expect("/home>")?;
+    println!("  ok: and /dev/devices lists it as a ramdisk");
+
     // **An ordinary live boot reaches no disk** (Phase 5 Part H.1). The live image's third menu
     // entry starts a session that can write every disk in the machine; this entry must not, and a
     // widened sandbox is exactly the kind of regression nothing fails on. Asserted over the whole
@@ -3936,12 +3989,15 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     };
 
     // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
+    //
+    // **The handout group's first line is `init`'s auth-service bind, not the kernel's last line**
+    // (administration Part B.4). It was the kernel's last line until the boot grew past what one
+    // frame shows: Part B's device manager put 41 lines between it and `compositor: up`, against
+    // the 36 a held frame guarantees. The kernel's own lines are the early group's claim; this
+    // group's is that `sys_kprint` lines reach the screen up to the handout, which any userspace
+    // line proves. 25 lines before the handout today, so eleven more fit before it moves again.
     const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
-    const HANDOUT: &[&str] = &[
-        "init: spawned init (pid 1); handing off to userspace",
-        "init: mounted fs-server-ext4 at /",
-        "compositor: up",
-    ];
+    const HANDOUT: &[&str] = &["init: auth-service bound at /svc/auth", "compositor: up"];
     let (mut early, mut handout, mut console_seen) = (false, false, false);
     let mut rows = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -3981,17 +4037,17 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: held after the timer, with no serial port — the kernel's first line, em dash and all, before PCI");
     if !handout {
         return Err(format!(
-            "no single frame showed {HANDOUT:?} together — the kernel's last line, a userspace line \
-             and the last before the handout. The hold at the handout keeps that frame up for a \
-             second, and it shows at least the last {} lines ({rows} rows less a quarter-screen \
-             jump), so a boot that now prints more than that after the kernel's last line needs a \
+            "no single frame showed {HANDOUT:?} together — a line `init` printed as it brought its \
+             services up, and the last before the handout. The hold at the handout keeps that frame \
+             up for a second, and it shows at least the last {} lines ({rows} rows less a \
+             quarter-screen jump), so a boot that now prints more than that after the first needs a \
              nearer one here. Read {} distinct row(s)",
             rows - rows / 4,
             seen.len()
         )
         .into());
     }
-    println!("  ok: held at the handout — the kernel's last line, a line userspace printed, and \"compositor: up\", on one screen");
+    println!("  ok: held at the handout — a line init printed bringing its services up, and \"compositor: up\", on one screen");
 
     // 2. The console let go. Every service keeps printing through all of this — the greeter's
     //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
@@ -4221,6 +4277,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **And the view broker's `/dev/views`, at the session's base** (administration Part A.4).
     // Printed before the leader is spawned, so it is ordered against the next line, not racing it.
     session.expect("desktop-session-mgr: session has /dev/views")?;
+    // **And the device manager's tables, at the base `/info`** (administration Part B.4) — printed
+    // right after, from what was bound. The application namespaces the shell builds carry them too,
+    // which the shell checks by resolving the binding and says on its `grants` line below.
+    session.expect("desktop-session-mgr: session has /dev/devices")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and
@@ -4313,7 +4373,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
-    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -4435,7 +4495,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the menu, so an `expect` between the two is a race between processes —
@@ -11178,6 +11238,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // device-mgr's library tests (names, classes and one owner each, the replay, the tables and
+    // the suffixes). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("device-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // logging-service's library tests (the log-path classifier). `--lib` skips the
     // `#![no_main]` server bin.
     run(Command::new("cargo")
@@ -11306,8 +11376,21 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
 
-    // `input-server`'s merge — two devices' streams into one ordered batch, and what a slow
-    // consumer is owed. Same split and the same reason: all the behaviour, no syscalls.
+    // `libsession`'s one pure decision: which namespace bindings are block devices, for the
+    // rebinding that reads a source's own bindings where it has no registry (administration Part
+    // B.5). The rest of the crate is syscalls, which the gates boot.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libsession")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    // `input-server`'s merge — the devices' streams into one ordered run, sent as batches that
+    // end on group boundaries — what a slow consumer is owed, and the set of devices the device
+    // manager hands over. Same split and the same reason: all the behaviour, no syscalls.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
@@ -11433,6 +11516,8 @@ enum AbiShape {
     RightsBit,
     /// `pub const NAME: u16 = <int>;` — the input event classes and codes.
     U16Const,
+    /// `pub const NAME: u32 = <int>;` — the device registry's constants.
+    U32Const,
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
@@ -11477,6 +11562,22 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
+    // The device registry (administration Part B): its own file on each side, so the
+    // enum-variant sweep sees `DeviceKind` and nothing else.
+    AbiFamily {
+        what: "device registry kinds",
+        kernel_file: "kernel/src/libkern/device.rs",
+        user_file: "userspace/libkern/src/device.rs",
+        shape: AbiShape::EnumVariant,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "device registry constants",
+        kernel_file: "kernel/src/libkern/device.rs",
+        user_file: "userspace/libkern/src/device.rs",
+        shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
 ];
 
 /// Individually-named constants that mirror across the boundary under *different* names or
@@ -11498,6 +11599,12 @@ const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
         "userspace/libkern/src/abi.rs",
         "IPC_HANDLE_MAX",
     ),
+    (
+        "kernel/src/libkern/ipc.rs",
+        "IPC_MAX_QUEUE_DEPTH",
+        "userspace/libkern/src/abi.rs",
+        "IPC_MAX_QUEUE_DEPTH",
+    ),
 ];
 
 /// Pull `name -> value` pairs of one `shape` out of a source file.
@@ -11515,6 +11622,18 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 let Some((name, tail)) = rest.split_once(':') else { continue };
                 let Some((ty, val)) = tail.split_once('=') else { continue };
                 if ty.trim() != "u64" {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::U32Const => {
+                // pub const NAME: u32 = <int>;
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if ty.trim() != "u32" {
                     continue;
                 }
                 if let Some(v) = parse_int(val) {

@@ -175,6 +175,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // The view broker's forwarding endpoint (administration Part A.4), bound into every session
     // at `/dev/views` with that session's base. `0` on a boot without a broker.
     let views_endpoint = recv_handoff(control);
+    // An info-only endpoint of the device manager's (administration Part B.4), bound into every
+    // session at `/dev/devices` with the base `/info`. `0` on a boot without a manager.
+    let devices_endpoint = recv_handoff(control);
     // **The auth channel is resolved, not couriered** (M7 Part C). **`init`** binds
     // `auth-service` at `/svc/auth` — not `service-mgr`, which spawned it and cannot bind,
     // because a declared service holds an inherited LOOKUP-only root — and every supervisor
@@ -262,6 +265,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 bind_blk: libsession::installer_boot(root_ns),
                 views_endpoint: if views.is_some() { views_endpoint } else { 0 },
                 views_base: &views_base[..views.map_or(0, |v| v.1)],
+                devices_endpoint,
             });
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");
@@ -284,6 +288,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             if libsession::session_has_views() {
                 kprint(b" + /dev/views");
+            }
+            if libsession::session_has_devices() {
+                kprint(b" + /dev/devices");
             }
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.

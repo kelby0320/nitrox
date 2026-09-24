@@ -660,6 +660,7 @@ fn build_app_namespace(
     clipboard: u64,
     views: u64,
     views_base: &str,
+    devices: u64,
 ) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -877,6 +878,29 @@ fn build_app_namespace(
             kprint(b"desktop-shell: application /dev/views bind FAIL\n");
         }
     }
+
+    // **`/dev/devices`, at the base `/info`** (administration Part B.4) — the same bind the session
+    // got, so `list /dev/devices` in a terminal launched here lists the machine's devices. The
+    // endpoint is info-only, so no path under it reaches a class to subscribe to.
+    if devices != 0 {
+        let dpath = b"/dev/devices";
+        let base = b"/info";
+        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
+        let dr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                dpath.as_ptr() as u64,
+                dpath.len() as u64,
+                devices,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if dr != 0 {
+            kprint(b"desktop-shell: application /dev/devices bind FAIL\n");
+        }
+    }
     ns
 }
 
@@ -891,7 +915,12 @@ fn build_app_namespace(
 /// application that *can* reach `manage` simply never says so.
 ///
 /// Returns `false` if the namespace is not what it should be; the caller declines to launch.
-fn verify_app_namespace(ns: u64, expect_home: bool, expect_desktop: bool) -> bool {
+fn verify_app_namespace(
+    ns: u64,
+    expect_home: bool,
+    expect_desktop: bool,
+    expect_devices: bool,
+) -> bool {
     let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if new_h != 0 {
         // SAFETY: closing a session this check minted; the application will make its own.
@@ -965,7 +994,31 @@ fn verify_app_namespace(ns: u64, expect_home: bool, expect_desktop: bool) -> boo
         kprint(b"desktop-shell: application namespace has no /dev/desktop -- refusing\n");
         return false;
     }
-    kprint(b"desktop-shell: application namespace grants new + /home, withholds manage\n");
+    // **`/dev/devices` is reported, not required** (administration Part B.4). It is information —
+    // an application that cannot list the machine's devices still runs — so its absence is said
+    // and the launch goes on. Resolved rather than enumerated: it is the device manager that
+    // answers, not this shell, so there is no deadlock to avoid, and a resolve proves the binding
+    // reaches a manager serving the tables, where a binding's presence would not.
+    let devices = expect_devices && {
+        let (st, dir) = ns_lookup(ns, b"/dev/devices", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+        if dir != 0 {
+            // SAFETY: closing a directory session this check minted.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, dir) };
+        }
+        if st != 0 || dir == 0 {
+            Line::new()
+                .s(b"desktop-shell: application namespace cannot reach /dev/devices (status ")
+                .i(st as i64)
+                .s(b")")
+                .end();
+        }
+        st == 0 && dir != 0
+    };
+    Line::new()
+        .s(b"desktop-shell: application namespace grants new + /home")
+        .s(if devices { b" + /dev/devices" } else { b"" })
+        .s(b", withholds manage")
+        .end();
     true
 }
 
@@ -1125,6 +1178,8 @@ struct Launcher<'a> {
     views: u64,
     /// The session's view base, `/s/<id>`; empty binds no `/dev/views`.
     views_base: &'a str,
+    /// The device manager, bound at `/dev/devices` with the base `/info` (administration Part B).
+    devices: u64,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
     /// The environment record an application reads its `HOME` from.
@@ -1154,13 +1209,14 @@ impl Launcher<'_> {
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
         (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
-    let (views, views_base) = (l.views, l.views_base);
+    let (views, views_base, devices) = (l.views, l.views_base, l.devices);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns =
-        build_app_namespace(draw, fs, tty, profile, home, desktop, clipboard, views, views_base);
+    let app_ns = build_app_namespace(
+        draw, fs, tty, profile, home, desktop, clipboard, views, views_base, devices,
+    );
     if app_ns == 0 {
         return false;
     }
@@ -1186,7 +1242,7 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
             .s(b"'s namespace (installer session)")
             .end();
     }
-    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0) {
+    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
@@ -1608,6 +1664,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // absent means the session has no `/dev/views`, and applications get none.
     let views_endpoint = recv_handle(setup);
     let views_base: &str = argv.get(2).map(|s| s.as_str()).unwrap_or("");
+    // An info-only endpoint of the device manager's (administration Part B.4), bound at
+    // `/dev/devices` with the base `/info` in every application namespace — info-only, so that
+    // however this shell binds it, nothing reached through it can subscribe to a device. Absent
+    // means applications get no device listing.
+    let devices_endpoint = recv_handle(setup);
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
     }
@@ -1745,9 +1806,15 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 clipboard_endpoint,
                 views_endpoint,
                 views_base,
+                devices_endpoint,
             );
         if app_ns != 0 {
-            may_launch = verify_app_namespace(app_ns, !home.is_empty(), desktop_endpoint != 0);
+            may_launch = verify_app_namespace(
+                app_ns,
+                !home.is_empty(),
+                desktop_endpoint != 0,
+                devices_endpoint != 0,
+            );
             // SAFETY: closing the namespace; nothing has been launched into it yet.
             unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         }
@@ -1765,6 +1832,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         clipboard: clipboard_endpoint,
         views: views_endpoint,
         views_base,
+        devices: devices_endpoint,
         home,
         env: &env,
         enabled: may_launch,

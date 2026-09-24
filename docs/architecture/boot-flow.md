@@ -1,6 +1,6 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -27,12 +27,15 @@ UEFI firmware (OVMF under QEMU)
                           ├─ read /initramfs/etc/init.toml
                           ├─ mount critical path (spawn fs-server per mount)
                           ├─ bind profile-server at /bin
+                          ├─ bind auth-service at /svc/auth
                           ├─ bind logging-service at /log
                           ├─ bind tty-server at /dev/tty
+                          ├─ bind clipboard-server at /dev/clipboard
+                          ├─ bind view-broker at /svc/views
+                          ├─ bind device-mgr at /svc/devices
                           ├─ bind input-server at /dev/input/new
                           ├─ bind compositor at /dev/draw
                           └─► service-mgr
-                                ├─► auth-service
                                 └─► session-mgr ─► login ─► nxsh
 ```
 
@@ -224,9 +227,11 @@ one process nothing else can construct:
 - Allocate the process and a notification channel, and a handle to it.
 - Allocate a namespace and bind the initial set: `/dev/entropy`, `/dev/console`,
   `/dev/log`, `/proc/self/*`, `/proc/cmdline`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`
-  (whole disks, their partitions and any module RAM disk, each with an `info` leaf), and
-  `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12 of
-  § 3).
+  (whole disks, their partitions and any module RAM disk, each with an `info` leaf),
+  `/dev/input/raw` (the i8042's keyboard and mouse), `/dev/registry` (the whole device table —
+  `docs/spec/device-node.md`), each partition's `/dev/disk/by-partuuid/*` and `by-partlabel/*`
+  name, and `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12
+  of § 3).
 - Spawn with exactly two handles — the notification channel and the namespace root.
 
 **init receives two handles and no more.** Everything else it obtains, it obtains by
@@ -246,14 +251,21 @@ than an implementation detail.
    it cannot serve gets a refusal instead, which init prints:
    `init: fs-server-ext4 for / on gpt-partlabel:nitrox-live refused: no ext4 filesystem: …`.
 3. **Bind the system servers**, each by the same spawn → `Ready` → bind handshake:
-   `profile-server` at `/bin` (projecting the store), `logging-service` at `/log`, and
-   `tty-server` at `/dev/tty`.
+   `profile-server` at `/bin` (projecting the store), `auth-service` at `/svc/auth`,
+   `logging-service` at `/log`, `tty-server` at `/dev/tty`, `clipboard-server` at
+   `/dev/clipboard`, `view-broker` at `/svc/views`, and **`device-mgr` at `/svc/devices`**
+   (administration Part B), which reads `/dev/registry` and hands each device to the owner of
+   its class ([`device-manager.md`](device-manager.md)). The first three are
+   critical-path.
 
-   The tty server is the one **non-fatal** binding: if it fails, init logs "no terminal
-   server; sessions will have no `/dev/tty`" and continues.
+   The rest are **non-fatal**: if the tty server fails, init logs "no terminal server; sessions
+   will have no `/dev/tty`" and continues, and each of the others says what goes without it.
+   **The device manager comes last in the step because the display arm depends on it**: from
+   Part B.3 `input-server` takes its devices from `/svc/devices`.
 4. **Bring up the display arm** — `input-server` at `/dev/input/new`, then `compositor` at
-   `/dev/draw`. Both non-fatal: a machine with no i8042 has no raw input nodes, the server
-   says so and exits, and everything else comes up normally.
+   `/dev/draw`. Both non-fatal. The input server takes its devices from `/svc/devices/input`
+   (administration Part B.3) and serves with whatever arrived: a machine with no i8042, or a
+   boot without the device manager, has an input server with no devices, which says so.
 
    **The order within the step is load-bearing**: the compositor resolves `/dev/input/new`
    during its own startup, before it answers `Ready`. Spawned the other way round it would

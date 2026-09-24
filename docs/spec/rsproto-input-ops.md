@@ -13,21 +13,24 @@ enumeration are later milestones and will extend this category. The design is
 
 ## Where it sits
 
-The `input-server` is a **userspace resource server bound at `/dev/input/new`**. It holds
-every raw device node (`/dev/input/raw/<n>`, served by the kernel's i8042 driver)
-**exclusively**, merges their streams, and forwards the result.
+The `input-server` is a **userspace resource server bound at `/dev/input/new`**. It reads
+every keyboard and mouse — the kernel's i8042 driver's two today, up to eight — **as the
+input class's one owner**: it subscribes to `/svc/devices/input`, and the device manager hands
+it each device's node ([rsproto-devices-ops.md](rsproto-devices-ops.md)), refusing a second
+subscriber while it holds them. It merges their streams and forwards the result.
 
 **Authority is the binding**, as everywhere else:
 
 | Path | Held by | What it authorises |
 |---|---|---|
-| `/dev/input/raw/<n>` | the `input-server`, alone | reading one device unfiltered |
+| `/dev/input/raw/<n>` | the root namespace, and nothing on the input path resolves it | reading one device unfiltered |
+| `/svc/devices/input` | the `input-server`, the class's one owner | being handed every keyboard and mouse as a node |
 | `/dev/input/new` | the compositor, once M3 Part C lands routing; `input-testclient` today | receiving merged input for the whole machine |
 | *(nothing)* | ordinary clients | input arrives only via their Surface session |
 
-That the raw nodes reach nothing but the server is a **constraint on the supervisor**, not a
-consequence of this protocol — see `input-subsystem.md` §5, which records the same gap in
-`tty-server`'s precedent.
+That the raw nodes and the subscription reach nothing but the server is a **constraint on the
+supervisor**, not a consequence of this protocol — see `input-subsystem.md` §5, which records the
+same gap in `tty-server`'s precedent.
 
 ## How a consumer obtains a stream
 
@@ -94,13 +97,20 @@ breaks the wire.
 `REL_Y`, `SYN`) is always delivered whole, so a consumer accumulating until `SYN_REPORT`
 never has to carry state across messages.
 
+**A message carries at most 65 of a wakeup's records** — two devices' worth, so a keyboard and a
+mouse always fit one — plus, when one is owed, the loss marker and recovered motion group of
+[Loss](#loss) in front of them. A wakeup that harvested more, from more devices, is forwarded as
+consecutive messages, in order, each ending on a group boundary.
+
 ## Ordering
 
 **Events are ordered within a batch, not globally.**
 
-Each time the server wakes it drains whatever both devices have ready, sorts that set by
+Each time the server wakes it drains whatever every device has ready, sorts that set by
 `time_ns` — the kernel's stamp taken *at the interrupt* — and forwards it. Events already
-forwarded are never reordered.
+forwarded are never reordered. **A tie goes to the device in the lower slot** — the one that
+arrived first, until a departure frees a slot for a later one — which for the i8042 is the
+keyboard: arbitrary, but the same on every run.
 
 This is deliberately weaker than "the server decides the order", and the difference matters:
 

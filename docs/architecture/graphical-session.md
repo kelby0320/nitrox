@@ -2,8 +2,10 @@
 
 ## Status
 
-**Built, and checked 2026-09-21** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2. Two things changed under it since: the session namespace also binds
+**Built, and checked 2026-09-24** — Milestone 7 (Parts A–F). Graduated from `design/` on
+2026-08-25, revision 2. On 2026-09-24 administration Part B.4 gave sessions and applications
+`/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+supervisor is now handed. Two things changed under it before that: the session namespace also binds
 `/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
 records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
 restyled the greeter's card and moved its pure half — the state, the keys it acts on itself and
@@ -134,13 +136,15 @@ profile lookup in session construction today — per-user overlays are deferred
 kernel ─spawns→ init (full SysCaps)
   init ─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
   init ─spawns with BIND_NAMESPACE, binds /svc/views→ view-broker (builds views; see below)
+  init ─spawns, binds /svc/devices→ device-mgr (no caps; hands devices to their class's owner)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
-    │      + fs ep, profile ep, tty ep;  auth resolved from /svc/auth
+    │      + fs, profile, tty, clipboard and view-broker endpoints, and an info-only
+    │        device endpoint;  auth resolved from /svc/auth
     │      └─on login→ session ns ─spawns→ nxsh
     │
     └─spawns, re-delegates BIND_NAMESPACE→ desktop-session-mgr        ← new
-           + fs ep, profile ep, tty ep, auth channel, /dev/draw
+           + the same, and /dev/draw
            └─on login→ desktop session ns ─spawns, re-delegates
                        BIND_NAMESPACE→ desktop-shell                   ← new
                           └─per application→ app ns ─spawns→ nxterm, …
@@ -232,6 +236,15 @@ raw disks, and whatever the domain services will do on request.
 session's base, and with `BIND_NAMESPACE` it could bind any base — so the graphical session's
 identity with the broker rests on the shell, where no program in a serial session can choose its
 base at all. That trusts it with nothing new: it already holds the whole-tree filesystem endpoint.
+
+**The device manager's endpoint is where that argument stopped holding, so the shell is not given
+it** (administration Part B.4). It binds `/dev/devices` into each application at the base `/info`,
+and with `BIND_NAMESPACE` it could bind any base too; on the endpoint bound at `/svc/devices`, a
+bare `block` is a subscription to every disk — raw write access to the ESP and every partition,
+which the whole-tree filesystem endpoint does not give. So `init` asks the manager for an
+**info-only endpoint**, on which only the tables are answered whatever suffix arrives, and that is
+what travels down this chain. The shell can bind it however it likes and reach nothing but the
+tables ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 ## 4. The session recipe, and what the two supervisors share
 

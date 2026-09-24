@@ -28491,3 +28491,381 @@ when it does not. `check-install` is on the list.
 - **Two optional items:** an old sentence in the device-manager section, and a Gates row that named
   other gates than the comparison list. The live boot's RAM disk gives `check-live` a line of its
   own.
+
+## 2026-09-24 — Administration B.1: `/dev/registry`, the device table read from userspace
+
+The first piece of Part B, and its only kernel work. `/dev/registry` is a kernel server bound in
+the root namespace. The bare path is a read-only snapshot: a header carrying the record count, then
+one 144-byte `DeviceRecord` per node. `/dev/registry/<id>` is that node.
+
+**The table now holds every node.** The console and the i8042's keyboard and mouse register
+beside the PCI functions and block devices. The i8042 driver's private table is gone: the table
+owns its two nodes, and `/dev/input/raw/<n>` resolves through it. **Each entry records what the
+node itself cannot say:**
+- its kind (disk, partition, RAM disk, keyboard, mouse, console, PCI function);
+- the index its path serves it at;
+- its parent;
+- the driver that published it.
+
+**The served index is the one field** that both `/dev/blk` and `/dev/input/raw` resolve through
+and that the record reports, so the two cannot disagree. A block node's index is the number of
+block nodes before it, the numbering `/dev/blk` has always had. The keyboard's and mouse's are the
+i8042 driver's own, 0 and 1. The console registers first, so a count within `Char` would have
+misnamed them, and a host test holds the console in front of them to show it.
+
+**The table became a value, `device::Registry`,** with the static a `SpinLock` around one. So host
+tests build a boot's worth of real nodes, host bridge included, and check each record's kind,
+served index and parent. A PCI parent is matched by address, and the RAM disk's all-zero
+descriptor would otherwise match the host bridge at 00:00.0. Five controls each fail their test:
+- no vendor sentinel;
+- a served index counted within `Char`;
+- a block index counted over every entry;
+- a partition without its parent;
+- a count off by one.
+
+**The reader lives in `userspace/libkern`.** Its consumers, `eshell` and `libsession`, sit below
+`libos`. It trusts the header's count and refuses a count its bytes cannot hold. Its test hands it
+a page as the kernel serves it, two records then zeros, and dividing by the size fails that test.
+`abi-sync-check` gains a `u32` constant shape and two families for the registry. A changed kind,
+decimal constant and underscored hex constant are each caught.
+
+**Through the binding, `boot-probe`** reads the snapshot and holds it to the paths:
+- the block records are exactly what probing `/dev/blk` finds, with each served device of the
+  record's size and name;
+- the keyboard and mouse are at raw 0 and 1;
+- every id is its place in the table.
+
+A handle carries no object identity a process can compare, so *same node* is the host tests' to
+show; the probe compares size and name. Three kernel mutations fail it at the matching assertion:
+a count one too high, the keyboard served at 1, and block records reporting their index plus one.
+
+**`device-node.md` had drifted further than PR #332 found:**
+- the class enum showed no `Char`;
+- the `/dev/blk` server was said to map names;
+- the partition names were future tense.
+
+It now specifies the registry, and enumeration leaves its *Deferred* list. `boot-flow.md`'s list of
+pid 1's bindings gains `/dev/input/raw`, the partition names and `/dev/registry`.
+
+## 2026-09-24 — Administration B.2: `device-mgr`, and the `Devices` protocol
+
+The device manager exists. `init` spawns it before the display arm and binds it at
+`/svc/devices`; it holds no syscaps. It reads `/dev/registry` once and takes each class device's
+node from `/dev/registry/<id>`. It then answers three kinds of resolve
+([`rsproto-devices-ops.md`](spec/rsproto-devices-ops.md), category `0x0Fxx`):
+- **`<class>` subscribes.** `input` or `block` answers a channel. On it, the manager sends an
+  `Arrived` per device of the class in registry order, each with the owner's own duplicate of the
+  node, then `Settled` with the count. `Departed` is specified and encoded, and sent by nothing
+  until Phase 6.
+- **`info` is a directory**, `all.tsm` and then a file per device.
+- **`info/<name>.tsm` is a TSM1 table**, minted as a fresh read-only memory object.
+
+Nothing subscribes yet: `input-server` does from B.3, and the storage service owns `block` from
+Part C. **A manager with no registry to read refuses** in place of `Ready`, the shape
+`fs-server-ext4` uses. A boot with its path broken printed
+`init: device-mgr refused: no /dev/registry it could read, so no devices to hand out` and went on
+without it.
+
+**One owner per class is kept at the manager.** A second subscription is refused with
+`AlreadyExists` while the first channel is open. The manager learns of a close from its own wait,
+so a subscription sent straight after one can still be refused. The spec says a caller retries,
+and the first green boot showed the case: the probe's first retry was refused, its second
+taken.
+
+**The replay is queued before the resolve completes.** The first version replied with the channel
+and then sent the replay. The second green boot logged `block owned, 0 device(s) sent` for the
+probe's retaken subscription, where the first had logged 3: the probe had closed its end between
+the reply and the sends. So an owner's `Settled` depended on how soon it read. The manager now
+fills the channel first, and a reply that fails takes the queued nodes with it, because the kernel
+releases an undelivered transfer with its endpoint. The probe now reads both replays without
+waiting, which **states the order without guarding it**: the reply-first order, as a control,
+passed, because its sends beat the probe's wake. The order is held by `subscribe`'s code.
+
+**A subscription channel is sized from its replay.** It was a fixed 64 deep, and sends do not
+block, so a class of more than 63 devices would have been cut short, with `Settled` counting only
+what fit. Writing the spec's sentence about depth is what showed it. The depth is now the replay,
+its `Settled` and 32 spare, capped at `IPC_MAX_QUEUE_DEPTH`. `libkern` now mirrors that constant,
+and `abi-sync-check` pairs it.
+
+**Controls:**
+- **The library's eight** each fail their test: a second claim allowed, a release that keeps
+  the class, a replay of every class, `blk-<id>` in place of the served index, a zero size for a
+  keyboard, an empty file name accepted, no `all.tsm`, and a declined driver unmarked.
+- **The padded-table test pins the reader.** A `Table::decode` that rejects bytes after the
+  terminator fails it, and only it.
+- **`boot-probe` catches five `device-mgr` mutations**, each at its own check, and did again
+  after its reads changed: a `Settled` off by one, the owner check skipped, a close ignored,
+  `all.tsm` short a row, and an `Arrived` with no handle.
+
+**The probe's retry nearly slept on nothing.** `sys_wait` with no handles and a deadline looked
+like a sleep. The kernel refuses an empty list with `InvalidArgument`, so the fifty retries would
+have spent microseconds. Reading `sys_wait` before trusting it found this; the probe sleeps on a
+one-shot timer. `boot-probe`'s stat, map-and-copy, close and registry read became module helpers,
+shared with B.1's check. The view-broker checks' receive loop became one `receive` that keeps the
+handles a message carries.
+
+**Two corrections found on the way:**
+- **Init's control reads had no `SAFETY` comment**, and `bind_device_mgr` copied the pattern. All
+  ten now have one.
+- **`boot-flow.md`'s overview still drew `auth-service` under `service-mgr`**, which §6 of the same
+  document says stopped at M7. Its list of init's bindings is now init's, in order.
+
+## 2026-09-24 — Administration B.3: `input-server` takes its devices from the manager
+
+`input-server` no longer opens `/dev/input/raw/0` and `/1`. It subscribes to
+`/svc/devices/input`, and the device manager's replay hands it each keyboard and mouse as a node.
+The i8042's two nodes are registry ids 10 and 11 on a test boot.
+- **It keeps them in a table of up to eight slots.**
+- **It serves from `Settled` with whatever arrived.** With none, or with a keyboard alone, it
+  serves; it used to exit for want of either device.
+- **A `Departed` retires its device's slot.** Nothing sends one until Phase 6, so the handling is
+  host-tested.
+- **There is no fallback to the raw paths.** A boot pointed at the wrong subscription path came up
+  with an input server serving no devices, said so, and carried on.
+
+**The merge takes any number of devices.** It is ordered by group start, as before, and a tie goes
+to the lower slot. Coldplug arrives in registry order, so the keyboard still wins a tie, as it did
+when the merge took exactly two. **A wakeup's merge is forwarded as batches that end on group
+boundaries.** Eight devices' reads are 256 records, and one message's payload holds 248, so
+one wakeup's worth could no longer promise to fit one message. A batch stays at 65 records, two
+devices' worth, so today's machine still sends one message per wakeup. A group longer than a batch,
+which a read cannot produce, goes alone rather than split.
+
+**Three details of the loop:**
+- **`Settled` is bounded by five seconds.** The manager queues its replay before the resolve
+  completes (B.2), so `Settled` is waiting the moment the channel is. The bound is for a manager
+  that is not behaving, and anything arriving after it still joins.
+- **A departing device's parked read is safe to walk away from.** `ps2`'s `submit_read` clones its
+  own reference to the buffer object, so the kernel writes into memory it keeps alive. That was
+  read in the kernel before relying on it.
+- **The subscription is read after the harvest, not during it.** A departure closes a device's
+  read, and a later record in the same wait's results could name that handle.
+
+**`libkern`'s `DeviceRecord::read`** takes one record from exactly its bytes, at any alignment. The
+snapshot iterator now uses it, so the unsafe read exists once.
+
+**Controls.** Ten mutations of the library each fail a test:
+- a tie to the higher slot;
+- a merge of two sources only;
+- fixed-size chunks;
+- a long group split;
+- no duplicate check;
+- the highest free slot taken instead of the lowest;
+- a departure that keeps its slot;
+- an arrival accepted without its node;
+- any kind accepted as input;
+- a `MERGE_MAX` of two devices.
+
+The last one passed at first: the test asserted the merge returned `MERGE_MAX`, and a smaller
+`MERGE_MAX` shrank the buffer and the expectation together. It is now held to the harvest.
+
+**`boot-probe` asserts `input` is held.** A subscription to it must be refused, which is how a probe
+sees that the input server took its devices from the manager; the wrong-path boot fails it.
+
+`input-subsystem.md` §2, §4, §5 and §6, `rsproto-input-ops.md`, `boot-flow.md` and `init`'s comments
+no longer describe the input server resolving raw nodes or exiting without them.
+
+## 2026-09-24 — Administration B.4: `/dev/devices` in every session, through an info-only endpoint
+
+Every session, and every application `desktop-shell` launches, now binds `/dev/devices`. It lists
+the machine's devices as TSM1 tables: `list /dev/devices`, and
+`open /dev/devices/all.tsm | filter kind == "disk"` prints the disk row with its model, with no
+device code in the shell.
+
+**The endpoint travels Part A's chain, as a seventh handoff:**
+- `init` couriers it to `service-mgr`, the seventh of the handoff channel's eight;
+- `service-mgr` passes it on to both supervisors: sixth to `session-mgr` and seventh to
+  `desktop-session-mgr`, each channel of depth 8;
+- `desktop-session-mgr` passes it to `desktop-shell` in its seventh leader extra;
+- `libsession` binds it with the base `/info`;
+- `desktop-shell` binds it the same way into each application namespace.
+
+**What travels is not the endpoint bound at `/svc/devices`.** The plan said to courier "the
+manager's endpoint" and bind it with the base `/info`, so that a session reaches the tables and
+nothing else. That holds for a session: its suffixes all begin `info`. It does not hold for
+`desktop-shell`, which is handed the endpoint and holds `BIND_NAMESPACE`. It could bind the
+endpoint with no base into a namespace of its own, and on that endpoint a bare `block` is a
+subscription to every disk. That is raw write access to the ESP and every partition, which the
+whole-tree filesystem endpoint the shell already holds does not give. The supervisors are no
+different from before: they hold the root namespace, and can resolve `/svc/devices/block`
+themselves, the same ungated boundary `/svc/auth` and `/svc/views` have.
+
+**The fix is an endpoint that cannot subscribe.**
+- Resolving `/svc/devices/info-endpoint` answers a channel that is itself a forwarding endpoint;
+  `sys_ns_bind` adopts any `IpcChannel`.
+- The manager answers resolves arriving on it with `suffix::info_only`: the directory and the
+  tables as asked, and a class or another `info-endpoint` as `NotFound`.
+- `init` resolves one after binding `/svc/devices`, with `TRANSFER | DUPLICATE`, and that is what
+  it couriers.
+- The manager keeps at most two, and drops one when every holder has let it go.
+
+`namespace-and-resource-servers.md` records the shape: attenuation by construction, for authority
+no right on a handle expresses.
+
+**Proved, each with a control that fails it:**
+- `test-interactive` step 5d, from a serial login: the listing, the filter, and
+  `/dev/devices/block` and `/dev/registry` opening nothing. Its step 1 now expects the manager's
+  `an info-only endpoint minted` between `init`'s bind and the login prompt; the manager logs it
+  before replying, so the order is causal.
+- `check-login`: the session's `/dev/devices`, and each application namespace. The shell now
+  resolves `/dev/devices` in the namespace it built, and its `grants` line names what it reached.
+- `boot-probe`, which cannot bind: it sends `block`, `info-endpoint` and `info` down an info-only
+  endpoint itself, as the kernel would forward them.
+
+**Controls against the first design**, which couriered a duplicate of the root endpoint:
+- **D, a parser that took `info/block` for a subscription.** It failed `test-interactive`, and the
+  manager logged `block owned, 3 device(s) sent`: one line of parsing from handing a session every
+  disk. That is what showed the base was not enough.
+- **B, the registry snapshot bound into sessions**, failed at `/dev/registry`.
+- **S, `session-mgr` passing no endpoint**, failed on the namespace line.
+- **E, the shell not binding `/dev/devices`**, failed `check-login` on the `grants` line.
+
+**Controls against this one:**
+- **F, the manager ignoring `info_only`**, failed the probe at `block`. The manager's log shows the
+  subscription going through.
+- **G, `init` couriering a duplicate again**, failed `test-interactive` at the mint line. It is
+  the only line a gate has that tells the two designs apart.
+
+Under the info-only endpoint, D's parser bug no longer reaches a session, so its guard is the
+library's suffix test.
+
+**Stale on the way:**
+- `init`'s `send_handle` said its ring was depth 4, and it is 8.
+- `desktop-session-mgr` said "five endpoints" over a list of six.
+- `graphical-session.md` §3's diagram showed neither supervisor's clipboard or view-broker
+  endpoint.
+
+`test-interactive` is 29 steps, and `CLAUDE.md` says so.
+
+**`check-fbcon`'s handout group outgrew its frame, as its doc said it would.** It needed
+`init: spawned init (pid 1)`, the kernel's last line, on one held screen with `compositor: up`.
+The doc recorded that line 29 lines before the handout, against at least 36 visible. Part B put 41
+there: seven device-manager and input-server lines, and this part's mint line was the one that
+failed the gate. B.3's run had passed at 40 on a favourable scroll. Trimming lines would only defer
+it, so the group's first anchor is now `init: auth-service bound at /svc/auth`, 25 lines before
+the handout. The kernel's own lines are the early group's claim, and this group's is that
+`sys_kprint` output reaches the screen up to the handout, which any userspace line shows. Two runs
+pass.
+
+## 2026-09-24 — Administration B.5: the probes read what exists
+
+Three programs found block devices by probing `/dev/blk/0`, `1`, … and stopping at the first miss.
+They relied on the table being dense, and could say that a device existed but nothing about it.
+Each now reads what its source actually holds:
+- **`eshell`'s `lsblk` reads `/dev/registry`.** It runs in the root namespace, where the registry
+  is bound. It prints each block device's path, kind, size and name, the name through
+  `untrusted` because it is the device's own. No gate reaches `eshell`, which appears only when the
+  critical path fails, so it was checked on a one-off boot: a copy of the release disk with its
+  root's superblock zeroed. The mount was refused (`superblock magic 0x0000`), `eshell` came up,
+  and `lsblk` printed the disk, the ESP and `nitrox-root` by name and size.
+- **`libsession::rebind_block_devices` reads the registry when its source has one, and otherwise
+  enumerates the source's own `/dev/blk/<n>` bindings.** A session manager and the view broker
+  rebind from the root namespace, where `/dev/blk` is one kernel-server binding whose children no
+  enumeration can see. `desktop-shell` rebinds from an installer session, which has no registry,
+  deliberately, and a binding per device. A lookup that fails now skips its device instead of
+  ending the list. `unbind_block_devices` takes back what the namespace has bound, instead of
+  indices `0..16`, which would have left a higher index reachable after its session ended.
+- **`nxinstall` lists its own namespace** with `libfs::ns_children`. In a view or an installer
+  session's application, what it may write is exactly what is bound.
+
+**The pure halves are host-tested, and each has a control that fails it.**
+- `DeviceRecord::block_index` gives a served index for block records only; the keyboard is served
+  at 0 too, by `/dev/input/raw`.
+- `libsession`'s binding parser accepts exactly `/dev/blk/<n>`, not its `info` leaf and not a
+  second spelling. This is `libsession`'s first host test: the crate is now `no_std` outside
+  tests, and `cargo xtask test` runs it.
+- `nxinstall`'s name parser is the same rule for a listing's children.
+
+**Three boot controls:**
+- **R, the registry yielding no indices**, fails `test-qemu`: `nxinstall` in the view sees no
+  disks.
+- **N, `nxinstall` listing the wrong path**, fails `test-qemu` with the three devices bound.
+- **E, enumeration finding nothing**, fails `check-install`: the installer session gets its four
+  devices through the registry path, and the shell hands `nxterm` none.
+
+What is not gated is the gap itself: no boot has a namespace with a hole in `/dev/blk`, so the
+old probe and the new readers agree on every machine a gate boots. Either reader takes its indices
+from the source rather than a counter, so a gap cannot end its list.
+
+**`check-live` asks the session's `/dev/devices` for the RAM disk** — `filter kind == "ramdisk"`,
+matched on `module 1 (/boot/root.img)`, which the command does not contain. That was the last
+item of Part B's comparison list without a gate. `libfs::ns_children`'s documented limitation now
+points at `/dev/devices`, and the deferral entry for a listable `/dev` records the Part as built.
+
+## 2026-09-24 — Administration Part B's docs: `device-manager.md`, and the Part built
+
+The last item of Part B's plan was its docs, and five of its six sub-items had already landed, each
+with the part that made it true. `input-subsystem.md` changed with B.3. The kernel-server list,
+`device-node.md`'s *Deferred* list and `kernel_server.rs`'s "deferred" comment changed with B.1.
+`libfs`'s limitation note changed with B.5. What remained was a document for the component itself.
+
+**[`device-manager.md`](architecture/device-manager.md) is written in current-behaviour terms**:
+- the pieces and where they live;
+- a boot end to end;
+- classes and owners, and why the replay is queued before the resolve completes;
+- the information side, and why the endpoint rather than the base is the boundary;
+- who can reach what;
+- how the rest of the system reads the table;
+- a gate-by-gate list of what is proved.
+
+Its last section says what is not built, and what that costs: no event source until Phase 6, no
+owner for `block` until Part C, and no supervision. If the manager exited, owners would keep their
+devices and every `/dev/devices` resolve would fail.
+
+**Linking it found two docs that no longer said what is true:**
+- **`overview.md`'s Status line still said Phases 0–4**, and a paragraph under it called Phase 5
+  active, a week after it closed on 2026-09-17. Both are corrected, and its re-check note says what
+  this pass looked at.
+- **`drivers-and-irps.md`** described the userspace driver manager only as deferred. Half of it now
+  exists: the device table is readable, and nodes reach their owners as handles. It says so and
+  points at the new doc.
+
+`namespace-and-resource-servers.md`'s registry-backed section gains the listing consequence: a
+subtree server answers lookups and cannot be listed, and what lists its table instead is
+`/dev/registry` in the root namespace and `/dev/devices` everywhere else.
+
+Part B is ticked as built, not complete: it becomes complete when its PR merges, as Part A did.
+
+## 2026-09-24 — Administration Part B, reviewed: an exit, an order, and three lists caught up
+
+PR #333's review found nothing blocking: three findings worth fixing and three optional, all
+taken. It broke the production code under every new host test, 26 mutations, and 25 were caught;
+the one that was not is optional 4 below.
+
+**1. A root endpoint with no peer made `device-mgr` spin.** The event loop dropped
+`serve_resolve`'s `false` for the endpoint bound at `/svc/devices`. The kernel keeps a peer-closed
+channel signalled permanently (`IpcChannel::already_signaled`: `… || inner.peer.is_null()`, read to
+confirm), so if `init`'s bind failed, having already closed the only other handle, every wait
+returned at once and the manager held a CPU for the life of the boot. It now says
+`device-mgr: forwarding endpoint closed` and exits, as `input-server` does in the same place. The
+review traced this and did not boot it. A boot with `init`'s bind path made relative printed the
+bind failure, then the manager's exit line, then `init: no device manager`. Every other channel in
+the manager's wait set already closed or released on a closed peer.
+
+**2. The registration order stated in two docs and a test fixture was one no boot follows.**
+`drivers::probe` publishes the RAM disks before the GPT pass, so they come before every partition,
+their own included. On the laptop's live boot with Nitrox installed, `/dev/blk/1` is the RAM disk.
+`device-node.md` and `device-manager.md` now give the order the code has. The kernel fixture
+`booted()` is reordered to it rather than just re-commented, since a fixture named after the boot
+should be one. B.1's five controls were run again on the reordered fixture, and each still fails
+its test.
+
+**3. `session-mgr/CLAUDE.md` described a crate three parts out of date.** Its handoff list had three
+positional receives where there are six, the sixth this Part's info-only endpoint. Its sandbox list
+("That list is the sandbox. Nothing else is reachable") lacked `/dev/tty`, `/dev/clipboard`,
+`/dev/views`, `/dev/devices`, `/applications` and `/system/fonts`. Both are caught up, with each
+conditional member named by its flag. This is the rule that a crate's own rules file outlives the
+change.
+
+**Optional, all taken:**
+- **4. `Declined` → `OUTCOME_DECLINED` had no test.** The review swapped it for `OUTCOME_CLAIMED`
+  and all five `device::tests` passed. The outcome test now gives the fixture's third PCI function
+  a declined outcome, and that swap fails it.
+- **5. `input.yml`'s path filter** listed none of `kernel/src/device.rs`, `device-mgr`, the
+  registry's reader, the `Devices` protocol or `input-server`. The last had never been listed, so a
+  change confined to any of them did not schedule `check-input`. All five are added, and the
+  filter's comment says the table owns the i8042 nodes.
+- **6. `TODO(svc-auth-ungated)`** now has a paragraph for `/svc/devices`. Its cost is first-come
+  class ownership: until Part C's storage service subscribes, any holder of the root namespace can
+  take `block`, every disk, and hold it. Until the constructed-namespace fix, the storage service
+  should be spawned by `init` before anything declared, as `input-server` is.

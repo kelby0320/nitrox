@@ -97,6 +97,15 @@ static mut CLIPBOARD_ENDPOINT: u64 = 0;
 /// both login supervisors (administration Part A.4): each binds it into every session it builds, at
 /// `/dev/views` with that session's base, which is how the broker knows whose request it is.
 static mut VIEWS_ENDPOINT: u64 = 0;
+/// **An info-only endpoint of the device manager's**, resolved at `/svc/devices/info-endpoint` and
+/// retained for the handoff to `service-mgr` and on to both login supervisors (administration
+/// Part B.4): each binds it into every session at `/dev/devices` with the base `/info`.
+///
+/// **Not a duplicate of the endpoint bound at `/svc/devices`**, which is the difference between a
+/// capability and a convention. The manager answers only its tables on this one, whatever suffix
+/// arrives — and `desktop-shell`, which holds what is couriered and `BIND_NAMESPACE`, could bind it
+/// with no base, where a suffix like `block` would otherwise subscribe to every disk.
+static mut DEVICES_ENDPOINT: u64 = 0;
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -203,15 +212,30 @@ static mut SPAWN_VIEWS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
+/// Spawn args for the `device-mgr` (administration Part B): the control endpoint, moved. **No
+/// syscaps**: it binds nothing — `init` binds it at `/svc/devices` — and it reads the device table
+/// through `/dev/registry`, which the root namespace it inherits already holds.
+static mut SPAWN_DEVICES: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/device-mgr
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0,
+};
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
-/// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
-/// `BIND_NAMESPACE`; init binds its endpoint on its behalf.
+/// `/svc/devices/input`, where the device manager hands it its devices (administration Part
+/// B.3). **No syscaps**: like every resource server, it does not hold `BIND_NAMESPACE`; init
+/// binds its endpoint on its behalf.
 ///
-/// **It is the only process that should ever resolve the raw nodes.** They are bound in the
-/// root namespace and nowhere else, and no session namespace projects them — reading one
-/// unfiltered is a keylogger, and the binding is the whole of that boundary
-/// (`docs/architecture/input-subsystem.md` §5).
+/// **It is the only process that should ever read the raw nodes**, and it is the input class's
+/// one owner at the manager, which refuses a second. The nodes' paths, `/dev/input/raw/*`, are
+/// bound in the root namespace and nowhere else, and no session namespace projects them or
+/// `/svc/devices` — reading one unfiltered is a keylogger, and the binding is the whole of that
+/// boundary (`docs/architecture/input-subsystem.md` §5).
 static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/input-server
     handle_count: 1,
@@ -219,8 +243,8 @@ static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
     arg0: 0,
     handles: [0; 4],
     // `TRANSFER` is the one that is easy to omit and fails late: `Meta::Ready` carries the
-    // forwarding endpoint as a handle transfer, so without it the server comes up, opens
-    // both devices, and only then cannot announce itself.
+    // forwarding endpoint as a handle transfer, so without it the server comes up, takes its
+    // devices, and only then cannot announce itself.
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
@@ -540,6 +564,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         unsafe { syscall1(SYS_HANDLE_CLOSE, device) };
         return None;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 3. Spawn the fs-server, moving the control endpoint into it (delivered in rdx).
@@ -730,6 +755,7 @@ fn bind_profile_server(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 2. Spawn the profile server, moving the control endpoint into it (in rdx). No
@@ -831,6 +857,7 @@ fn bind_logging_service(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 2. Spawn the logging service, moving the control endpoint into it (in rdx).
@@ -895,6 +922,7 @@ fn bind_auth_service(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 2. Spawn it, moving the control endpoint into it (in rdx).
@@ -961,6 +989,7 @@ fn bind_view_broker(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
     // SAFETY: SPAWN_VIEWS is a valid writable arg block; spawn_program resolves the ELF, stamps
     // it, spawns, and closes the image handle.
@@ -1013,6 +1042,71 @@ fn bind_view_broker(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the device manager and bind its forwarding endpoint at `/svc/devices` (administration
+/// Part B). Before `input-server`, which takes its devices from it. Non-critical: without it a
+/// machine has no devices handed to anyone, which `input-server` reports; nothing else is
+/// stopped.
+fn bind_device_mgr(root_ns: u64) -> bool {
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+    // SAFETY: SPAWN_DEVICES is a valid writable arg block; spawn_program resolves the ELF,
+    // stamps it, spawns, and closes the image handle.
+    let dm_h = unsafe {
+        SPAWN_DEVICES.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/device-mgr", &raw mut SPAWN_DEVICES)
+    };
+    if dm_h < 0 {
+        kprint(b"init: device-mgr spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+    let endpoint = match wait_ready(ctrl_init, &[b"device-mgr".as_slice()]) {
+        Some(e) => e,
+        None => {
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+    let path = b"/svc/devices";
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
+    };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: device-mgr bind FAIL at /svc/devices\n");
+        return false;
+    }
+    kprint(b"init: device-mgr bound at /svc/devices\n");
+    // **What the sessions get is asked for, not duplicated** (administration Part B.4): an
+    // endpoint on which the manager answers its tables and nothing else. `TRANSFER | DUPLICATE`
+    // is what the courier needs and all it needs — the supervisors only bind it. Non-fatal: the
+    // manager still hands devices to their owners, and sessions go without a listing.
+    let (st, info) =
+        ns_lookup_wait(root_ns, b"/svc/devices/info-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
+    if st == 0 && info != 0 {
+        // SAFETY: single-threaded init.
+        unsafe { DEVICES_ENDPOINT = info };
+    } else {
+        kprint(b"init: no info-only device endpoint; sessions will have no /dev/devices\n");
+    }
+    // init keeps `dm_h` (the long-lived server's process handle).
+    let _ = dm_h;
+    true
+}
+
 /// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
 ///
 /// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
@@ -1030,6 +1124,7 @@ fn bind_tty_server(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 2. Spawn the tty server, moving the control endpoint into it (in rdx).
@@ -1111,6 +1206,7 @@ fn bind_clipboard_server(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // SAFETY: SPAWN_CLIPBOARD is a valid writable arg block.
@@ -1168,8 +1264,9 @@ fn bind_clipboard_server(root_ns: u64) -> bool {
 /// for `Meta::Ready`, bind the forwarding endpoint it carries. The server never binds
 /// anything itself and holds no `BIND_NAMESPACE`.
 ///
-/// Returns `false` on any failure, which is not fatal to the boot: a machine with no i8042
-/// has no raw nodes, the server exits saying so, and everything else comes up normally.
+/// Returns `false` on any failure, which is not fatal to the boot. A machine with no i8042 is not
+/// one: the server takes its devices from `/svc/devices/input`, bound before it, and serves with
+/// none.
 fn bind_input_server(root_ns: u64) -> bool {
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
     let cr = unsafe {
@@ -1178,6 +1275,7 @@ fn bind_input_server(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // SAFETY: SPAWN_INPUT_SERVER is a valid writable arg block.
@@ -1236,6 +1334,7 @@ fn bind_compositor(root_ns: u64) -> bool {
     if cr != 0 {
         return false;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 2. Spawn, moving the control endpoint in.
@@ -1400,6 +1499,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
             && DRAW_ENDPOINT == 0
             && CLIPBOARD_ENDPOINT == 0
             && VIEWS_ENDPOINT == 0
+            && DEVICES_ENDPOINT == 0
     } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
@@ -1414,7 +1514,9 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // The handoff channel. **Depth 8, and the number is the send count's bound rather than a
     // round one**: the sends below are `SENDMODE_NOBLOCK` against a child that has not run yet,
     // so a ring shorter than the number of handoffs drops the last one silently. It was 4 for
-    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth.
+    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth. **Seven since
+    // administration Part B.4**, so one slot is left: an eighth handoff fits, a ninth needs this
+    // raised in the same change.
     // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
     let cr = unsafe {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 8, 0)
@@ -1462,6 +1564,10 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         // The sixth (administration Part A.4): the view broker's, which both supervisors bind.
         send_handle(init_end, VIEWS_ENDPOINT);
         VIEWS_ENDPOINT = 0;
+        // The seventh (administration Part B.4): the device manager's, which both supervisors
+        // bind at `/dev/devices`. Seven of the channel's eight.
+        send_handle(init_end, DEVICES_ENDPOINT);
+        DEVICES_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1478,7 +1584,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn send_handle(ctrl: u64, handle: u64) {
     let count = if handle == 0 { 0 } else { 1 };
     // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring `count` handles with an
-    // empty payload. NoBlock: the ring is depth 4 and holds at most two handoffs.
+    // empty payload. NoBlock: `spawn_service_mgr`'s ring is sized to hold every handoff.
     let sr = unsafe {
         IPC_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
         IPC_HANDLES[0] = handle;
@@ -1537,6 +1643,10 @@ unsafe fn close_retained_endpoints() {
         if VIEWS_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, VIEWS_ENDPOINT);
             VIEWS_ENDPOINT = 0;
+        }
+        if DEVICES_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, DEVICES_ENDPOINT);
+            DEVICES_ENDPOINT = 0;
         }
     }
 }
@@ -1752,6 +1862,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
         kprint(b"init: no view broker; `with` will have nothing to ask\n");
     }
 
+    // The device manager (administration Part B), **before the display arm**: `input-server`
+    // takes its devices from it, so it has to be bound at `/svc/devices` before the input server
+    // resolves it — the display arm's order-is-load-bearing reason, one step earlier. Not
+    // critical-path: without it no device is handed to its owner, which the owner reports.
+    if !bind_device_mgr(root_ns) {
+        kprint(b"init: no device manager; no device will be handed to its owner\n");
+    }
+
     // ---- the display arm ----
     //
     // **After `/bin`, since 2026-08-11.** The compositor and the input server used to come up
@@ -1768,9 +1886,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // The input server first, and **the order is load-bearing**: the compositor resolves
     // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
     // other way round it would find nothing bound and serve the display with no input, for
-    // the life of the boot, with only a log line to say so. Not fatal either way — a machine
-    // with no i8042 has no raw nodes, the server says so and exits, and everything else
-    // comes up normally.
+    // the life of the boot, with only a log line to say so. Not fatal either way — the input
+    // server takes its devices from the device manager and serves with whatever arrived, so a
+    // machine with no i8042 has an input server with no devices, and everything else comes up
+    // normally.
     if !bind_input_server(root_ns) {
         kprint(b"init: no input server; /dev/input/new unavailable\n");
     }

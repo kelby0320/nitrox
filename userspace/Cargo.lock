@@ -110,6 +110,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "device-mgr"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+ "libstream",
+]
+
+[[package]]
 name = "eshell"
 version = "0.1.0"
 dependencies = [
@@ -343,6 +353,7 @@ name = "nxinstall"
 version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
+ "libfs",
  "libgpt",
  "libheap",
  "libkern",

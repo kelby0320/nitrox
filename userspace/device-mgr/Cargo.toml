@@ -1,0 +1,23 @@
+[package]
+name = "device-mgr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream" }
+
+# The library/binary split every resource server here uses: the library is what can be wrong
+# about a device — its name, its class, which owner it goes to, its row in `/dev/devices` — and is
+# host-tested; the binary is the bare-target event loop, which cannot build on host
+# (`#![no_main]`). Not alloc-free: the table is sized by the machine, so `main.rs` registers
+# `libheap` as the `#[global_allocator]`.
+[lib]
+name = "device_mgr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "device-mgr"
+path = "src/main.rs"

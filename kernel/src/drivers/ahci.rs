@@ -716,7 +716,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
                     KObjectType::DeviceNode,
                 )
             };
-            crate::device::register(r);
+            crate::device::register(r, "ahci");
             true
         }
         Err(_) => false,

@@ -25,7 +25,7 @@ pub mod mouse;
 pub mod ring;
 pub mod scancode;
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
@@ -137,22 +137,6 @@ fn holding(now: u64) -> bool {
 /// each as a press. What the hardware report waits on (Phase 5 Part D.3): it needs to know *that*
 /// a key went down and nothing about which, so no keystroke is kept where a log could show it.
 static KEY_PRESSES: AtomicU64 = AtomicU64::new(0);
-
-/// The leaked-`'static` device nodes, indexed by `DEV_*`. `device_ref` hands out counted
-/// references for `/dev/input/raw/<n>` lookups.
-static NODES: [AtomicPtr<()>; DEV_COUNT] =
-    [AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut())];
-
-/// A counted reference to raw input device `index`, or `None` if absent.
-pub fn device_ref(index: usize) -> Option<ObjectRef> {
-    let p = NODES.get(index)?.load(Ordering::Acquire);
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: `NODES[index]` points at a leaked-`'static` `DeviceNode` whose creation
-    // reference is never released, so the object is live.
-    unsafe { ObjectRef::try_acquire(p, KObjectType::DeviceNode) }
-}
 
 /// Copy `src` into `buffer`'s frames starting at byte `buf_offset`, via the HHDM. The
 /// caller has bounds-checked the range (`sys_io_submit` does). Runs outside the lock.
@@ -427,7 +411,7 @@ pub fn key_presses() -> u64 {
 /// `true` once a keyboard has answered and its interrupt is armed — the only case in which
 /// [`key_presses`] can ever move.
 pub fn keyboard_present() -> bool {
-    PRESENT.load(Ordering::Acquire) && !NODES[DEV_KEYBOARD].load(Ordering::Acquire).is_null()
+    PRESENT.load(Ordering::Acquire) && crate::device::has(crate::libkern::device::DeviceKind::Keyboard)
 }
 
 /// Throw away every keyboard event waiting in the ring. Returns how many bytes of records went.
@@ -494,10 +478,19 @@ pub fn init() {
         let backend = CharBackend { submit_read, ctx: index as *mut () };
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
-                // Leaked: the controller lives for the kernel's lifetime, and `device_ref`
-                // hands out counted references off this pointer.
-                let ptr = KBox::into_raw(node).as_ptr() as *mut ();
-                NODES[index].store(ptr, Ordering::Release);
+                // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through:
+                // the index is this driver's, and the table records it as the node's served
+                // index, which is also what `/dev/registry` reports (administration Part B).
+                // SAFETY: `into_raw` yields the single creation reference; the table adopts it.
+                let r = unsafe {
+                    ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
+                };
+                let kind = if index == DEV_KEYBOARD {
+                    crate::libkern::device::DeviceKind::Keyboard
+                } else {
+                    crate::libkern::device::DeviceKind::Mouse
+                };
+                crate::device::register_char(r, kind, index as u32, "i8042");
             }
             Err(_) => crate::kprintln!("ps2: device-node alloc FAIL for index {}", index),
         }

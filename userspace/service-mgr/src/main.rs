@@ -255,7 +255,8 @@ fn create_control_channel() -> Option<(u64, u64)> {
     // shorter than the number of them does not block — it **drops the last handle silently**.
     // This was 4 while the graphical column sent four; M12 Part E's clipboard made it five, and
     // the symptom was a session whose namespace had no `/dev/clipboard` and a copy that failed
-    // two processes away, with the send reporting success. `libsession::spawn_leader` carries
+    // two processes away, with the send reporting success. **Seven since administration Part
+    // B.4** go to `desktop-session-mgr`, so one slot is left. `libsession::spawn_leader` carries
     // the same warning from the same failure in M7 Part F — which is what named this one on
     // sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
@@ -638,11 +639,16 @@ fn bring_up_login_chain(
     draw_endpoint: u64,
     clip_endpoint: u64,
     views_endpoint: u64,
+    devices_endpoint: u64,
 ) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
-        // SAFETY: closing our own handle — the broker's endpoint is no use without a session.
-        unsafe { close_one(views_endpoint) };
+        // SAFETY: closing our own handles — the broker's and the device manager's endpoints are
+        // no use without a session.
+        unsafe {
+            close_one(views_endpoint);
+            close_one(devices_endpoint);
+        }
         // A profile endpoint without an fs endpoint is no more usable — a session with
         // programs but no home is not a session. Don't retain it.
         if profile_endpoint != 0 {
@@ -671,14 +677,16 @@ fn bring_up_login_chain(
     // session has no compositor; the clipboard is reachable as a path precisely so a pipeline
     // can use it (M12 decision 4), and pipelines run in both.
     // **And the view broker's** (administration Part A.4), for the clipboard's reason: both
-    // columns open sessions with it, since `with` is typed at a shell in either.
-    let (fs_dup, profile_dup, tty_dup, clip_dup, views_dup) = unsafe {
+    // columns open sessions with it, since `with` is typed at a shell in either. **And the device
+    // manager's** (Part B.4): both columns bind `/dev/devices`.
+    let (fs_dup, profile_dup, tty_dup, clip_dup, views_dup, devices_dup) = unsafe {
         (
             dup_endpoint(fs_endpoint),
             dup_endpoint(profile_endpoint),
             dup_endpoint(tty_endpoint),
             dup_endpoint(clip_endpoint),
             dup_endpoint(views_endpoint),
+            dup_endpoint(devices_endpoint),
         )
     };
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
@@ -696,6 +704,8 @@ fn bring_up_login_chain(
             close_one(clip_dup);
             close_one(views_endpoint);
             close_one(views_dup);
+            close_one(devices_endpoint);
+            close_one(devices_dup);
         }
         return;
     }
@@ -711,6 +721,8 @@ fn bring_up_login_chain(
     send_handle(sess_ctrl, clip_endpoint);
     // (5) the view broker's forwarding endpoint (administration Part A.4).
     send_handle(sess_ctrl, views_endpoint);
+    // (6) the device manager's forwarding endpoint (administration Part B.4).
+    send_handle(sess_ctrl, devices_endpoint);
     // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
     // session of its own, and so will `desktop-session-mgr`.
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
@@ -732,6 +744,7 @@ fn bring_up_login_chain(
         draw_endpoint,
         clip_dup,
         views_dup,
+        devices_dup,
     ) {
         // Non-fatal by design. A machine with a serial login and no graphical one is
         // degraded; a machine with neither is unreachable, and the serial column is already
@@ -754,6 +767,7 @@ fn bring_up_desktop_session(
     draw: u64,
     clip: u64,
     views: u64,
+    devices: u64,
 ) -> bool {
     if fs == 0 {
         // The duplicates are this function's to release once it declines to use them.
@@ -764,6 +778,7 @@ fn bring_up_desktop_session(
             close_one(draw);
             close_one(clip);
             close_one(views);
+            close_one(devices);
         }
         return false;
     }
@@ -778,6 +793,7 @@ fn bring_up_desktop_session(
             close_one(draw);
             close_one(clip);
             close_one(views);
+            close_one(devices);
         }
         return false;
     }
@@ -791,6 +807,9 @@ fn bring_up_desktop_session(
     send_handle(ctrl, clip);
     // The sixth: the view broker's, which both columns get too (administration Part A.4).
     send_handle(ctrl, views);
+    // The seventh: the device manager's, which both columns bind at `/dev/devices` (Part B.4).
+    // Seven of the control channel's eight — see `create_control_channel`.
+    send_handle(ctrl, devices);
     // SAFETY: closing our own handles; the twin runs independently from here.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, ctrl);
@@ -838,26 +857,35 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     kprint(b"service-mgr: up\n");
     // The handoffs, in init's send order: the fs-server endpoint, then the profile
     // server's. Positional — see `bring_up_login_chain`.
-    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint, clip_endpoint, views_endpoint) =
-        if handoff == 0 {
-            (0, 0, 0, 0, 0, 0)
-        } else {
-            let fs = recv_handoff(handoff);
-            let profile = recv_handoff(handoff);
-            let tty = recv_handoff(handoff);
-            // The compositor's forwarding endpoint. Only the graphical column takes it: a
-            // serial session has no use for `/dev/draw`, and handing it one would be authority
-            // for nothing.
-            let draw = recv_handoff(handoff);
-            // The clipboard's, which **both** columns take — M12 decision 4 makes it reachable
-            // as a path so a pipeline can use it, and a pipeline runs in either.
-            let clip = recv_handoff(handoff);
-            // The view broker's, which both columns take as well (administration Part A.4).
-            let views = recv_handoff(handoff);
-            // SAFETY: closing our own handoff-channel end; every handoff is in hand.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
-            (fs, profile, tty, draw, clip, views)
-        };
+    let (
+        fs_endpoint,
+        profile_endpoint,
+        tty_endpoint,
+        draw_endpoint,
+        clip_endpoint,
+        views_endpoint,
+        devices_endpoint,
+    ) = if handoff == 0 {
+        (0, 0, 0, 0, 0, 0, 0)
+    } else {
+        let fs = recv_handoff(handoff);
+        let profile = recv_handoff(handoff);
+        let tty = recv_handoff(handoff);
+        // The compositor's forwarding endpoint. Only the graphical column takes it: a
+        // serial session has no use for `/dev/draw`, and handing it one would be authority
+        // for nothing.
+        let draw = recv_handoff(handoff);
+        // The clipboard's, which **both** columns take — M12 decision 4 makes it reachable
+        // as a path so a pipeline can use it, and a pipeline runs in either.
+        let clip = recv_handoff(handoff);
+        // The view broker's, which both columns take as well (administration Part A.4).
+        let views = recv_handoff(handoff);
+        // The device manager's, which both columns take too (administration Part B.4).
+        let devices = recv_handoff(handoff);
+        // SAFETY: closing our own handoff-channel end; every handoff is in hand.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
+        (fs, profile, tty, draw, clip, views, devices)
+    };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
     bring_up_login_chain(
         root_ns,
@@ -867,6 +895,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
         draw_endpoint,
         clip_endpoint,
         views_endpoint,
+        devices_endpoint,
     );
     supervise(notif, root_ns, load_declarations(root_ns));
 }

@@ -1321,6 +1321,18 @@ fn run_first_userspace() {
         return;
     }
 
+    // `/dev/registry` — the device table: a snapshot of every node's record, and each node by id
+    // (administration Part B). **The root namespace only**, like `/dev/input/raw`: `<id>` is every
+    // raw device the kernel has, so it is the union of the two subtree bindings' authority —
+    // `/dev/blk`'s rights, whose `MAP_READ` is what lets the snapshot be read.
+    if ns
+        .bind_kernel_server(b"/dev/registry", KernelServerId::Registry, block_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/registry failed");
+        return;
+    }
+
     // `/dev/disk/by-partuuid/<uuid>` + `/dev/disk/by-partlabel/<label>` — stable
     // direct-handle bindings for each GPT partition the drivers discovered (the
     // content-derived names `init.toml` mount specs reference). Read-only.

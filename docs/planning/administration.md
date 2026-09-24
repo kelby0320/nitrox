@@ -465,7 +465,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       **one grant end to end, `disks`**; streams, and a stop handle for the shell; programs ended with
       their session; an audit record per request. The build images carry a seeded `views.toml` that
       makes the demo account an administrator.
-- [ ] **B — the device manager, with coldplug** — *detailed below, B.1–B.5.* `/dev/registry`;
+- [x] **B — the device manager, with coldplug** — *detailed below, B.1–B.5; built 2026-09-24.*
+      `/dev/registry`;
       `device-mgr`, with subscriptions by class that replay every present device (coldplug);
       `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
       can read, in place of listing `/dev/blk`.
@@ -837,7 +838,7 @@ namespace, with no login and no session.
 
 ### The pieces, in dependency order
 
-- [ ] **B.1 — the registry.** The i8042 driver's two nodes and the console's join the device table.
+- [x] **B.1 — the registry** *(2026-09-24)*. The i8042 driver's two nodes and the console's join the device table.
       The snapshot's header and `DeviceRecord` in `libkern`, mirrored in the kernel, with layout
       asserts; the `/dev/registry` kernel server — the snapshot and `<id>`; bound in the root
       namespace only; the ABI spec and `abi-sync-check`. Host tests:
@@ -848,35 +849,62 @@ namespace, with no login and no session.
         zeros after the last record, since a reader that divided the size would pass a round trip.
 
       **A `boot-probe` check through the binding**: the snapshot decodes; its block records are
-      exactly what probing `/dev/blk` finds; each input record's `/dev/registry/<id>` and
-      `/dev/input/raw/<served index>` are the same node; and no record is past the count.
-- [ ] **B.2 — `device-mgr`.** The `Devices` protocol (`0x0Fxx`) and `rsproto-devices-ops.md`: <!-- check-docs: allow-missing -->
-      `Arrived`, `Settled`, `Departed`. The subscription and its replay; `info/` as a directory of
-      `.tsm` files. Host-tested in its library: records to rows, names, replay order, and **the
-      reader side of the table** — a padded buffer, as the kernel hands it over, decodes to the rows
-      (a round trip would only test the encoder), and one owner per class. `init` spawns it and binds
+      exactly what probing `/dev/blk` finds — each served index resolving to a device of the
+      record's size, whose `info` gives the record's name; the keyboard and mouse sit at raw 0
+      and 1; every `/dev/registry/<id>` is a device node; and **each record's id is its place**,
+      which a phantom record read past the count cannot be. (That two paths give *the same node*
+      is the host tests' to show: a handle carries no object identity a process can compare, so
+      the probe compares what it can — size and name.)
+- [x] **B.2 — `device-mgr`** *(2026-09-24)*. The `Devices` protocol (`0x0Fxx`) and
+      [`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md): `Arrived`, `Settled`,
+      `Departed`. The subscription and its replay; `info/` as a directory of `.tsm` files.
+      Host-tested in its library: records to rows, names, replay order, and **the reader side of
+      the table** — a padded buffer, as the kernel hands it over, decodes to the rows (a round
+      trip would only test the encoder), and one owner per class. `init` spawns it and binds
       `/svc/devices`. **A `boot-probe` check**: `/svc/devices/block` replays the disks and settles,
       a second subscription to `block` is refused while the first is held, and is taken once it
-      is closed. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
+      is closed; `info` lists `all.tsm` and a file per device, and `all.tsm` decodes to a row per
+      registry record. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
       without stalling the keyboard — which is the rule working.)
-- [ ] **B.3 — `input-server` from the manager.** Subscribe; a device table of up to eight; serve
-      from `Settled`, with none or one; retire on `Departed`. Host tests on the library: arrivals
-      in any order, a keyboard alone, a departure mid-stream. `check-input` (and its
-      `--no-ps2-irq` variant) is the regression gate, unchanged.
-- [ ] **B.4 — `/dev/devices` for anyone.** The manager's endpoint couriered along Part A's chain;
-      both login supervisors bind `/dev/devices` with the base `/info`, and `desktop-shell` binds
-      it into application namespaces.
-- [ ] **B.5 — the probes.** `eshell`'s `lsblk` reads the registry;
+- [x] **B.3 — `input-server` from the manager** *(2026-09-24)*. Subscribe; a device table of up
+      to eight; serve from `Settled`, with none or one; retire on `Departed`. Host tests on the
+      library: arrivals in any order, a keyboard alone, a departure mid-stream — and the merge
+      over any number of devices, forwarded as batches that end on group boundaries, since eight
+      devices' reads are more than one message holds. `check-input` (and its `--no-ps2-irq`
+      variant) is the regression gate, unchanged. **`boot-probe` now asserts `input` is held**:
+      a subscription to it is refused, which is how a probe sees that the input server took its
+      devices from the manager.
+- [x] **B.4 — `/dev/devices` for anyone** *(2026-09-24)*. The manager's endpoint couriered
+      along Part A's chain; both login supervisors bind `/dev/devices` with the base `/info`, and
+      `desktop-shell` binds it into application namespaces. **What travels is an info-only
+      endpoint, not the one bound at `/svc/devices`** — found while building it: the base keeps an
+      ordinary session's suffixes under `info`, but `desktop-shell` holds what is couriered and
+      `BIND_NAMESPACE`, so it could bind it with no base and subscribe to `block`, every disk. The
+      manager mints an endpoint on which it answers only its tables, `init` resolves one at
+      `/svc/devices/info-endpoint`, and that is what the chain carries. `test-interactive` lists
+      and filters the tables from a serial login and finds `/dev/devices/block` and
+      `/dev/registry` open nothing; `check-login` asserts the session and each application
+      namespace reach `/dev/devices`; `boot-probe` sends `block` down an info-only endpoint.
+- [x] **B.5 — the probes** *(2026-09-24)*. `eshell`'s `lsblk` reads the registry;
       `libsession::rebind_block_devices` reads the registry when its source has one and the
       source's own `/dev/blk` bindings when it does not; `nxinstall` lists its own namespace.
-- [ ] **Docs**: a new architecture doc for the device manager; `input-subsystem.md` (devices from
+      None stops at a gap any more. `lsblk` now names each device, its kind and size — shown on
+      a one-off boot of a release disk whose root would not mount, since no gate reaches
+      `eshell`. `unbind_block_devices` takes back what is bound rather than indices `0..16`.
+      `check-live` asks the session's `/dev/devices` for the module's RAM disk, the one this
+      Part's comparison list named.
+- [x] **Docs** *(2026-09-24)*: a new architecture doc for the device manager; `input-subsystem.md` (devices from
       the manager, and the hotplug premise corrected); `namespace-and-resource-servers.md` and the
       kernel-server list (`/dev/registry`); `libfs`'s limitation note; `device-node.md`, whose
       *Deferred* list still names a device-enumeration syscall and a `/dev` listing (B.1 delivers
       the first as a path). **`kernel_server.rs` says the `/dev` listing "is deferred", and it is
       resolved** — `deferred-decisions.md`'s Resolved table has it (Phase 4 D3), with the
       `/dev/blk` limitation noted as carried by Part B — so the comment becomes a pointer to
-      `/dev/devices`, which is how this pass answers that limitation.
+      `/dev/devices`, which is how this pass answers that limitation. All but the first landed
+      with the part that made them true (B.1, B.3, B.5);
+      [`device-manager.md`](../architecture/device-manager.md) is the last, and is linked from
+      the overview, `drivers-and-irps.md`, `input-subsystem.md`, `boot-flow.md`,
+      `session-and-auth.md`, `namespace-and-resource-servers.md` and the two specs.
 
 ### What to compare on the day
 
