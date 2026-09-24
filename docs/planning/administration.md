@@ -320,9 +320,9 @@ the matching and the USB event source to the component this phase builds.
 anyone**: `disk --list` needs no view, and only the raw device does. It is also the one component
 whose bugs reach every device, so it should do as little as possible.
 
-**Kernel work:** a way to enumerate the device registry — which is also what finally lists
-`/dev/blk`'s children — and, with its first event source in Phase 6, a notification when a device
-node is published or withdrawn.
+**Kernel work:** a way to enumerate the device registry — `/dev/registry`, which Part B's detail
+pass chose over making `/dev/blk`'s children listable — and, with its first event source in
+Phase 6, a notification when a device node is published or withdrawn.
 
 ## Storage
 
@@ -728,7 +728,10 @@ namespace, with no login and no session.
   the hardware report and `drivers:` lines read it from inside.
 - **Every enumeration today is a probe.** `eshell`'s `lsblk`, `nxinstall`'s scan and
   `libsession::rebind_block_devices` each look up `/dev/blk/0`, `1`, … until the first miss,
-  relying on the table being dense. A kernel server answers lookups only, so `list /dev/blk` in
+  relying on the table being dense. **The last has three callers and two kinds of source**:
+  `build_namespace` (for an installer boot's session) and the view broker rebind from the root
+  namespace, and `desktop-shell` rebinds from an **installer session's** namespace into each
+  application it launches — the laptop's only install path, since it has no serial port. A kernel server answers lookups only, so `list /dev/blk` in
   the root namespace shows an empty directory — `libfs::ns_children` says so and says why.
   **Inside a view it already lists**, because the broker binds each device and its `info` one by
   one; only the root namespace is blind.
@@ -758,9 +761,12 @@ namespace, with no login and no session.
 **The maintainer's calls:**
 
 - **The table is read through `/dev/registry`**, a kernel server bound in the root namespace only.
-  The bare path is a read-only snapshot — one fixed-size `DeviceRecord` per node: its id, class,
-  kind, index within its class, parent, size, PCI identity, what its driver did with it, and a
-  name. `/dev/registry/<id>` is that node's handle. It is `/dev/log`'s shape: no syscall, and the
+  The bare path is a read-only snapshot: **a header carrying the record count**, then one
+  fixed-size `DeviceRecord` per node — its id, its `DeviceClass`, **its kind** (disk, partition,
+  RAM disk, keyboard, mouse, console, PCI function), **the index its path serves it at**, parent,
+  size, PCI identity, what its driver did with it, and a name. The count is what a reader
+  trusts, not the object's size: a memory object is page-rounded, and zero padding read as
+  records would be phantom devices of class `Other`. `/dev/registry/<id>` is that node's handle. It is `/dev/log`'s shape: no syscall, and the
   binding is the authority. **The keyboard, the mouse and the console join the table**, so the
   snapshot is every `DeviceNode` the kernel has.
 - **A class owner subscribes by path.** The device manager is bound at `/svc/devices`, and a
@@ -785,13 +791,21 @@ namespace, with no login and no session.
   `input-server` and binds `/svc/devices`**, as it binds `/svc/auth` and `/svc/views`. It needs no
   syscap: it binds nothing. It reads the registry once at start, and holds each node's handle to
   hand out.
-- **A device's name is its class path's**: `blk-<n>` is `/dev/blk/<n>`, and `input-<n>` is
-  `/dev/input/raw/<n>`, so a name in `/dev/devices` says which binding a view would need. The
-  registry id is stable within a boot and is what `Departed` will name.
-- **A subscription gets its own duplicate of each handle**, so two subscribers to one class — a
-  gate's probe and `input-server` — do not share a read cursor they did not agree to. Exclusivity
-  stays what `input-subsystem.md` §5 says it is: a constraint on who holds the path, and
-  `/svc/devices/input` is bound where `/dev/input/raw` is, in the root namespace only.
+- **A device's name is its path's**: `blk-<n>` is `/dev/blk/<n>`, and `input-<n>` is
+  `/dev/input/raw/<n>`, so a name in `/dev/devices` says which binding a view would need. **The
+  `<n>` is the record's served index, set by the kernel from the same source its server resolves
+  through** — not a count within `DeviceClass`, where the console and both i8042 nodes are all
+  `Char` and the console registers first, so counting would call the keyboard `input-1`. **The
+  manager's classes are its own**, derived from the kind: `input` is keyboards and mice, `block`
+  is disks, partitions and RAM disks. The registry id is stable within a boot and is what
+  `Departed` will name.
+- **A class has one owner at a time.** A second subscription is refused while the first is held,
+  and taken once it goes. That is the kernel's rule, not a policy: each raw input device has one
+  ring and one parked reader, so a second reader would drain events meant for the first, and its
+  own read would stall the owner's (`ps2`'s `submit_read` answers `WouldBlock` to a second).
+  **The owner gets a duplicate of each handle**, so an owner that exits cannot take a device from
+  the next one. `/svc/devices/input` is bound where `/dev/input/raw` is, in the root namespace
+  only, which is `input-subsystem.md` §5's exclusivity kept at the manager as well.
 - **`input-server` takes a changing set of devices.** It subscribes to `/svc/devices/input`, reads
   up to eight devices, and serves from `Settled` on — **including with none, or a keyboard alone**,
   where today it exits. `Departed` retires a device's slot; nothing sends one until Phase 6, so its
@@ -799,9 +813,14 @@ namespace, with no login and no session.
 - **No fallback to the raw paths.** If the manager does not start, `input-server` has no devices
   and says so. A second path that only runs when the first is broken is a path nobody tests, and
   the manager is small enough to be as reliable as `input-server` itself.
-- **The probes move to the registry** wherever the registry is bound: `eshell`'s `lsblk` and
-  `libsession::rebind_block_devices`. `nxinstall` runs in a view, where what it may write is
-  exactly what is bound, so it lists its own namespace (`libfs::ns_children`) instead of probing.
+- **The probes read what their source can see.** `eshell`'s `lsblk` runs in the root namespace
+  and reads the registry. `libsession::rebind_block_devices` reads the registry when its source
+  has one, and otherwise **enumerates the source's own `/dev/blk/<n>` bindings**
+  (`sys_ns_enumerate`) — which is `desktop-shell`'s case, rebinding from an installer session,
+  where the registry is deliberately absent and each device is bound one by one. Unlike the probe,
+  that survives a gap. `nxinstall` runs in a view (`with admin nxinstall`) or in an installer
+  session's application namespace; in both, what it may write is exactly what is bound, so it
+  lists its own namespace (`libfs::ns_children`) instead of probing.
 
 ### A device, end to end
 
@@ -819,19 +838,27 @@ namespace, with no login and no session.
 ### The pieces, in dependency order
 
 - [ ] **B.1 — the registry.** The i8042 driver's two nodes and the console's join the device table.
-      `DeviceRecord` in `libkern`, mirrored in the kernel, with layout asserts; the `/dev/registry`
-      kernel server — the snapshot and `<id>`; bound in the root namespace only; the ABI spec and
-      `abi-sync-check`. Host tests: a record per node, in table order, with class, kind, index in
-      class and parent right for a disk and its partition. **A `boot-probe` check through the
-      binding**: the snapshot decodes, its block records are exactly what probing `/dev/blk` finds,
-      and `<id>` resolves a node.
+      The snapshot's header and `DeviceRecord` in `libkern`, mirrored in the kernel, with layout
+      asserts; the `/dev/registry` kernel server — the snapshot and `<id>`; bound in the root
+      namespace only; the ABI spec and `abi-sync-check`. Host tests:
+      - a record per node in table order, with kind, served index and parent right for a disk and
+        its partition, **and for the console, the keyboard and the mouse**: the keyboard's served
+        index is 0 and the mouse's 1, with the console registered before them;
+      - **a padded snapshot reads exactly the header's count** — the reader handed a page with
+        zeros after the last record, since a reader that divided the size would pass a round trip.
+
+      **A `boot-probe` check through the binding**: the snapshot decodes; its block records are
+      exactly what probing `/dev/blk` finds; each input record's `/dev/registry/<id>` and
+      `/dev/input/raw/<served index>` are the same node; and no record is past the count.
 - [ ] **B.2 — `device-mgr`.** The `Devices` protocol (`0x0Fxx`) and `rsproto-devices-ops.md`: <!-- check-docs: allow-missing -->
       `Arrived`, `Settled`, `Departed`. The subscription and its replay; `info/` as a directory of
       `.tsm` files. Host-tested in its library: records to rows, names, replay order, and **the
       reader side of the table** — a padded buffer, as the kernel hands it over, decodes to the rows
-      (a round trip would only test the encoder). `init` spawns it and binds `/svc/devices`. **A
-      `boot-probe` check**: `/svc/devices/block` replays the disks and settles, and a second
-      subscriber gets the same replay.
+      (a round trip would only test the encoder), and one owner per class. `init` spawns it and binds
+      `/svc/devices`. **A `boot-probe` check**: `/svc/devices/block` replays the disks and settles,
+      a second subscription to `block` is refused while the first is held, and is taken once it
+      is closed. (`input` is `input-server`'s from boot on, so a probe cannot subscribe to it
+      without stalling the keyboard — which is the rule working.)
 - [ ] **B.3 — `input-server` from the manager.** Subscribe; a device table of up to eight; serve
       from `Settled`, with none or one; retire on `Departed`. Host tests on the library: arrivals
       in any order, a keyboard alone, a departure mid-stream. `check-input` (and its
@@ -839,14 +866,17 @@ namespace, with no login and no session.
 - [ ] **B.4 — `/dev/devices` for anyone.** The manager's endpoint couriered along Part A's chain;
       both login supervisors bind `/dev/devices` with the base `/info`, and `desktop-shell` binds
       it into application namespaces.
-- [ ] **B.5 — the probes.** `eshell`'s `lsblk` and `libsession::rebind_block_devices` read the
-      registry; `nxinstall` lists its own namespace.
+- [ ] **B.5 — the probes.** `eshell`'s `lsblk` reads the registry;
+      `libsession::rebind_block_devices` reads the registry when its source has one and the
+      source's own `/dev/blk` bindings when it does not; `nxinstall` lists its own namespace.
 - [ ] **Docs**: a new architecture doc for the device manager; `input-subsystem.md` (devices from
       the manager, and the hotplug premise corrected); `namespace-and-resource-servers.md` and the
-      kernel-server list (`/dev/registry`); `libfs`'s limitation note. **`kernel_server.rs` says
-      "the `/dev` directory listing is deferred — see `deferred-decisions.md`", and that file has
-      no such entry**: the comment becomes a pointer to `/dev/devices`, which answers it for
-      devices.
+      kernel-server list (`/dev/registry`); `libfs`'s limitation note; `device-node.md`, whose
+      *Deferred* list still names a device-enumeration syscall and a `/dev` listing (B.1 delivers
+      the first as a path). **`kernel_server.rs` says the `/dev` listing "is deferred", and it is
+      resolved** — `deferred-decisions.md`'s Resolved table has it (Phase 4 D3), with the
+      `/dev/blk` limitation noted as carried by Part B — so the comment becomes a pointer to
+      `/dev/devices`, which is how this pass answers that limitation.
 
 ### What to compare on the day
 
@@ -856,8 +886,14 @@ namespace, with no login and no session.
   model the command does not contain; and `/dev/registry` does not resolve in a session.
 - **`check-input`** and **`check-input --no-ps2-irq`**, unchanged: every key and click in them now
   arrives through the manager.
+- **`check-live`**: the live boot's module disk is the one RAM disk any gate has, and
+  `device-mgr` reports it with that kind.
 - **`check-login`**: `desktop-session-mgr` says its session has `/dev/devices`, as it does for
   `/dev/views`.
+- **`check-install`**, on demand and not in CI, **because B.5 changes the path it drives**:
+  `desktop-shell` passing an installer session's disks on to the terminal a person opens, and
+  `nxinstall` finding them by listing its own namespace. It is the laptop's only install path,
+  and nothing else boots it.
 
 ### Left alone
 
@@ -874,7 +910,7 @@ namespace, with no login and no session.
 | Part | What proves it |
 |---|---|
 | A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-login`: one `with` request from the terminal the Applications menu opens |
-| B | every boot device announced as an arrival, in `test-qemu` and `check-live`, and keyboard and mouse still reaching a window |
+| B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
 | C | **`check-install`'s topology**: a live boot, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync, unmounted — then `e2fsck` and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **a shutdown gate**: write through a mapping without syncing, run `shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot |

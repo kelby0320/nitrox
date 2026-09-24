@@ -7,8 +7,8 @@ Design context: [`drivers-and-irps.md`](../architecture/drivers-and-irps.md)
 § "Device discovery and enumeration".
 
 **Status:** Pre-stabilization. Introduced with the storage slice (Phase 2
-slice 5). PCI(e) is the only discovery source in Phase 2; partitions become
-DeviceNodes in slice 6.
+slice 5). PCI(e) is the only discovery source in Phase 2; partitions became
+DeviceNodes in slice 6, and `Char` nodes arrived with the console and the i8042.
 
 ## The DeviceNode object
 
@@ -234,18 +234,18 @@ driver-to-node matching graduates to a userspace **device manager** with Tier 2
 (deferred); see `namespace-and-resource-servers.md` § "Liveness".
 
 The userspace **driver manager** (matching nodes to Tier 2 modules, handing a
-driver process a `Handle<DeviceNode>`) is deferred with the module loader
-(`deferred-decisions.md`).
+driver process a `Handle<DeviceNode>`) is Phase 6's, and extends the device
+manager the administration phase builds (`docs/planning/phase-6-usb.md`).
 
 ## Deferred
 
-- `/dev/disk/by-partuuid/*` and partition DeviceNodes (slice 6).
 - `sys_device_map_mmio` / userspace drivers / IOMMU (with Tier 2).
-- A device-enumeration syscall (`ENUMERATE`) and a `/dev` directory listing —
-  there is no consumer yet (`deferred-decisions.md` § "Resource servers").
-- ACPI `_PRT`-based interrupt routing (needs AML; the legacy line suffices for
-  QEMU AHCI).
-- Non-block device classes (`Char`, `Net`, …).
+- Enumerating the device table from userspace — planned as `/dev/registry`, a
+  kernel server rather than a syscall, in the administration phase's Part B
+  (`docs/planning/administration.md`).
+- ACPI `_PRT`-based interrupt routing (needs AML; AHCI takes MSI, with the
+  IOAPIC-routed line as its fallback).
+- Device classes beyond `Block`, `Char` and `Other` (`Net`, …).
 
 ## Where to read more
 

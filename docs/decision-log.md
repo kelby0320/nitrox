@@ -28428,8 +28428,10 @@ Part B is the device manager, and this pass began by reading the code it plugs i
   a fixed keyboard and mouse and exits without either, so a machine with no aux port would lose
   its keyboard as well. The sentence is corrected where it stood, and this is the premise the pass
   exists to check.
-- **`kernel_server.rs` points to a `/dev` listing deferral that `deferred-decisions.md` does not
-  have.**
+- **`kernel_server.rs` still calls the `/dev` listing deferred.** `deferred-decisions.md` resolved
+  it in Phase 4 D3 and noted the `/dev/blk` limitation as carried by Part B, so the comment is stale.
+  This entry first called it dangling, because a search for the row missed the backtick inside
+  `` `/dev` directory ``; PR #332's review found it.
 
 **The maintainer's calls:**
 - **`/dev/registry`**, a kernel server bound in the root namespace only. The bare path is a
@@ -28448,8 +28450,44 @@ Part B is the device manager, and this pass began by reading the code it plugs i
 
 **Derived:**
 - `device-mgr` is spawned by `init` before `input-server` and needs no syscap.
-- Each subscriber gets its own duplicate of each handle.
+- A class has one owner at a time, and a second subscription is refused while the first is held.
+  The kernel gives each raw input device one ring and one parked reader, so a second reader would
+  drain the owner's events. The owner gets a duplicate of each handle, so an owner that exits
+  cannot take a device from the next one.
 - `input-server` serves with none, one or up to eight devices.
 - There is no fallback to the raw paths, because a second path that runs only when the first is
   broken is one nobody tests.
-- The root-namespace probes move to the registry, and `nxinstall` lists its own view.
+- The probes read what their source can see. In the root namespace that is the registry. From an
+  installer session, which `desktop-shell` rebinds from, it is the session's own `/dev/blk`
+  bindings. `nxinstall` lists its own namespace.
+
+## 2026-09-23 — Part B's detail pass, reviewed: the installer's path, one owner per class, and a count
+
+PR #332's review checked the spike's claims against the source. Most held, including that every
+node registers before userspace starts, so one read of the registry at start is complete coldplug.
+
+**Blocking: B.5 would have broken the installer's graphical path.**
+`libsession::rebind_block_devices` has a caller whose source has no registry: `desktop-shell`
+rebinds an installer session's disks into the terminal a person opens, and that is the laptop's
+only install path. Moving the function to the registry would have bound nothing there. The one gate
+that drives this path, `check-install`, runs on demand and was not in the comparison list. The
+function now reads the registry when its source has one, and the source's own `/dev/blk` bindings
+when it does not. `check-install` is on the list.
+
+**Worth fixing:**
+- **A duplicated handle is not a separate read cursor.** The kernel gives each raw input device one
+  ring and one parked reader, and a second reader stalls the first. So a class has one owner at a
+  time, the kernel's rule kept at the manager, and the boot probe tests the refusal on `block`
+  rather than reading `input`.
+- **`input` is not a kernel class, and a count within `DeviceClass` misnames the keyboard.** The
+  console and both i8042 nodes are `Char`, and the console registers first. So a record carries its
+  kind and the index its path serves it at, and the manager's classes derive from the kind.
+- **The snapshot has a header carrying a count.** A memory object is page-rounded, so padding would
+  otherwise read as phantom devices of class `Other`, which the probe's block comparison would not
+  notice. There is a reader test on a padded page.
+- **The `/dev` listing "dangling pointer" was stale, not dangling.** The Resolved row exists, and
+  this entry's own earlier entry was corrected in place. The dangling reference was in
+  `device-node.md`, whose *Deferred* list was out of date in four places, and it is fixed.
+- **Two optional items:** an old sentence in the device-manager section, and a Gates row that named
+  other gates than the comparison list. The live boot's RAM disk gives `check-live` a line of its
+  own.
