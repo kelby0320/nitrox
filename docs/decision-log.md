@@ -28412,3 +28412,44 @@ unreliable. The pin's over-drive outruns what a flush can deliver, and the unpac
 arrives packed with the press, which is why that variant's own steps pace their injection. The
 guard tests the gate's flush, not the interrupt path. It passes under TCG and KVM, and the
 `--no-ps2-irq` variant passes and says it skipped the guard.
+
+## 2026-09-23 — Administration Part B's detail pass: a registry, subscriptions by class, and typed device tables
+
+Part B is the device manager, and this pass began by reading the code it plugs into
+(`administration.md` § *Part B in detail*).
+
+**What the code said.**
+- **The kernel's device table is half the devices.** It holds the PCI functions and the block
+  devices drivers registered. The keyboard, the mouse and the console live in tables of their
+  own.
+- **Nothing reads the table outside the kernel.** Every userspace enumeration probes `/dev/blk/0`,
+  `1`, … to the first miss.
+- **`input-server` has no hotplug.** The plan said it "already owns input hotplug". In fact it opens
+  a fixed keyboard and mouse and exits without either, so a machine with no aux port would lose
+  its keyboard as well. The sentence is corrected where it stood, and this is the premise the pass
+  exists to check.
+- **`kernel_server.rs` points to a `/dev` listing deferral that `deferred-decisions.md` does not
+  have.**
+
+**The maintainer's calls:**
+- **`/dev/registry`**, a kernel server bound in the root namespace only. The bare path is a
+  snapshot of fixed-size records; `/<id>` is that node's handle. This is `/dev/log`'s shape, with
+  no syscall. The keyboard, the mouse and the console join the table.
+- **Subscription by path.** Resolving `/svc/devices/<class>` returns a channel that replays every
+  present device of the class as `Arrived`, with its handle, then `Settled`. That replay is
+  coldplug, and Phase 6's arrivals follow on the same channel, so `init` wires nothing.
+- **`/dev/devices` for anyone.** The maintainer asked whether it could come through as a typed
+  TSM1 table, and it can with no new shell code: the directory's entries are `.tsm` files,
+  `all.tsm` and one per device. `open` decodes a `.tsm` path into a `Table`, and `Table::decode`
+  stops at the terminator, so a page-padded memory object reads cleanly. A reader test is to pin
+  that, since a round trip would test only the encoder.
+- **Listing `/dev/blk` is replaced by `/dev/devices`.** `/dev/blk` already lists inside a view. It
+  lists empty only in the root namespace, where nothing needs it once the probes read the registry.
+
+**Derived:**
+- `device-mgr` is spawned by `init` before `input-server` and needs no syscap.
+- Each subscriber gets its own duplicate of each handle.
+- `input-server` serves with none, one or up to eight devices.
+- There is no fallback to the raw paths, because a second path that runs only when the first is
+  broken is one nobody tests.
+- The root-namespace probes move to the registry, and `nxinstall` lists its own view.

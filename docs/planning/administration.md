@@ -1,13 +1,13 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: in progress — Part A complete (2026-09-23); scoped 2026-09-22 and revised after the
-PR #326 review.** Scheduled after
+**Status: in progress — Part A complete (2026-09-23), Part B detailed (2026-09-23); scoped
+2026-09-22 and revised after the PR #326 review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, so **Part B's
-detail pass is next**; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
+had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**. **Part B has had
+its detail pass** (*Part B in detail*) and is next to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -105,7 +105,8 @@ them.
   `librsproto` and marked deferred in the namespace-ops spec, with no kernel handling. And a lazily
   filled `FileObject` fills through *the registration it was resolved through*.
 - **`input-server`** already owns input hotplug by design (`input-subsystem.md` §2: "merge ·
-  policy · hotplug", holding every raw node). Today it only sees what exists at boot.
+  policy · hotplug", holding every raw node). Today it only sees what exists at boot — **and needs
+  both**: it opens a fixed keyboard and mouse and exits without either (*Part B in detail*).
 - **`logging-service`** receives and does not serve: **no read-back op**.
 - **`SysCaps::SYSTEM_CLOCK` and `AUDIT_CONTROL` are defined and not wired.**
 - **No power syscall, no system-control handle, and FADT is not parsed** (`rtc.rs` says so). No
@@ -300,8 +301,10 @@ not claim it. If one ever must, `nxsh`'s force-external prefix still reaches the
 ## The device manager
 
 **It learns that a device arrived or left, and hands it to whatever owns that class.** It does not
-drive devices. A keyboard or mouse goes to `input-server`, which already owns input hotplug and keeps
-one merged stream while devices come and go. A disk goes to the storage service. Each class's
+drive devices. A keyboard or mouse goes to `input-server`, which keeps one merged stream while
+devices come and go — **once Part B gives it a changing set of devices**: today it opens a fixed
+keyboard and mouse and exits without both (*Part B in detail*; this sentence said it already
+owned hotplug until that pass read the code). A disk goes to the storage service. Each class's
 lifetime logic stays with that class's owner.
 
 **Coldplug, built now.** At startup, every device present is announced as an arrival — how Linux's
@@ -443,7 +446,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 | Work | For | Part |
 |---|---|---|
 | Deriving a namespace from an existing one | views without holding a session's ingredients | A |
-| Enumerating the device registry | coldplug; listing `/dev/blk` | B |
+| `/dev/registry` — a snapshot of the device table, and each node by id | coldplug; `/dev/devices` | B |
 | `OBJECT_KIND_SUBNAMESPACE` — a resolve continuing in another namespace | `/storage` with nothing re-bound | C |
 | Writing back every `FileObject` under a registration | unmount and shutdown without losing mapped writes | C |
 | `FLUSH CACHE` in the AHCI driver (`TODO(ahci-flush)`) | the last link of every unmount | C |
@@ -462,9 +465,10 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       **one grant end to end, `disks`**; streams, and a stop handle for the shell; programs ended with
       their session; an audit record per request. The build images carry a seeded `views.toml` that
       makes the demo account an administrator.
-- [ ] **B — the device manager, with coldplug.** Enumeration of the device registry; arrivals
-      announced for everything present at boot; `input-server` taking its devices from it; read-only
-      device information for anyone; `/dev/blk`'s children listable at last.
+- [ ] **B — the device manager, with coldplug** — *detailed below, B.1–B.5.* `/dev/registry`;
+      `device-mgr`, with subscriptions by class that replay every present device (coldplug);
+      `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
+      can read, in place of listing `/dev/blk`.
 - [ ] **C — storage.** Write-back of a registration's `FileObject`s; a whole-filesystem sync and
       clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`; `OBJECT_KIND_SUBNAMESPACE`; the
       storage service — mount, unmount, auto-mount (read-only on a live boot), `/storage` bound into
@@ -711,6 +715,159 @@ namespace, with no login and no session.
 - **Showing the view in `nxsh`'s prompt.** The environment carries it from A.3 on. A `#`-style
   marker is a small follow-up once someone wants it.
 - **Groups, argument constraints, `deny` rules, and prompt caching.**
+
+## Part B in detail *(2026-09-23)*
+
+### The spike: what already exists, and what is missing
+
+- **The kernel's device table is half the devices.** `kernel/src/device.rs` holds the PCI
+  functions `device::init` enumerated and the block devices drivers registered after them —
+  disks, partitions and the RAM disk — in discovery order, append-only. **The keyboard, the mouse
+  and the console are not in it**: the i8042 driver keeps its two nodes in a table of its own,
+  and the console's node is the console driver's. Nothing lists the table outside the kernel;
+  the hardware report and `drivers:` lines read it from inside.
+- **Every enumeration today is a probe.** `eshell`'s `lsblk`, `nxinstall`'s scan and
+  `libsession::rebind_block_devices` each look up `/dev/blk/0`, `1`, … until the first miss,
+  relying on the table being dense. A kernel server answers lookups only, so `list /dev/blk` in
+  the root namespace shows an empty directory — `libfs::ns_children` says so and says why.
+  **Inside a view it already lists**, because the broker binds each device and its `info` one by
+  one; only the root namespace is blind.
+- **`input-server` has no hotplug.** This plan said it "already owns input hotplug and keeps one
+  merged stream while devices come and go". It does not: it opens `/dev/input/raw/0` and `/1` at
+  fixed paths into a fixed pair, and **exits if either is missing** — so a machine whose i8042
+  has no aux port would lose its keyboard too. The merge itself is per-device and would take more
+  devices; the device set is what is fixed. (The laptop does have an aux port — its firmware
+  exposes the trackpad there, `ps2: keyboard mouse armed` — so this is latent, not live.)
+- **Phase 6 says how devices should move.** Its driver manager is this component extended, and it
+  hands a driver process a `Handle<DeviceNode>`. So a class owner should receive its devices **as
+  handles**, not as paths to go and look up.
+- **A userspace server can already serve a read-only file and a directory.** A resolve answered
+  `OBJECT_KIND_MEMOBJ` hands over a memory object — the kind of object `/dev/log` and
+  `/session/user` already are — which `libfs::read_file` looks up, maps and reads by its size; and
+  a directory is a channel answering `File::ReadDir`, as `profile-server` does for `/bin`.
+- **The shell already opens a typed file.** `open` decodes a path ending `.tsm` as a TSM1 stream
+  into a `Table` (`nxsh`'s `decode_from`), and `Table::decode` stops at the terminator, so the
+  zero padding of a page-sized memory object is harmless.
+- **The endpoint chain Part A extended reaches every namespace a person uses**: `init` →
+  `service-mgr` → both login supervisors → `desktop-shell`, positionally.
+- **Missing:** a way to read the table from userspace, the device manager itself, an rsproto
+  category (`0x0Fxx` is free), and `input-server` taking a changing set of devices.
+
+### The shape
+
+**The maintainer's calls:**
+
+- **The table is read through `/dev/registry`**, a kernel server bound in the root namespace only.
+  The bare path is a read-only snapshot — one fixed-size `DeviceRecord` per node: its id, class,
+  kind, index within its class, parent, size, PCI identity, what its driver did with it, and a
+  name. `/dev/registry/<id>` is that node's handle. It is `/dev/log`'s shape: no syscall, and the
+  binding is the authority. **The keyboard, the mouse and the console join the table**, so the
+  snapshot is every `DeviceNode` the kernel has.
+- **A class owner subscribes by path.** The device manager is bound at `/svc/devices`, and a
+  resolve of `/svc/devices/<class>` — `input`, `block` — *is* the subscription: the channel it
+  returns replays every present device of that class as `Arrived`, each carrying its handle, then
+  `Settled`. That replay is coldplug. Phase 6's arrivals and departures follow on the same channel,
+  so no consumer changes when a real event source appears. `init` wires nothing, and the manager
+  knows no consumers.
+- **Anyone can read `/dev/devices`, as typed tables.** The manager serves a directory of `.tsm`
+  files: `all.tsm`, every device a row, and one per device — `blk-0.tsm`, `input-1.tsm`,
+  `console.tsm`, `pci-00.1f.2.tsm`. So `list /dev/devices` lists them and
+  `open /dev/devices/all.tsm | filter kind == "disk"` is a typed query with no new shell code. It
+  reaches sessions and applications through Part A's endpoint chain, bound with the base `/info`,
+  so a session can reach the information and nothing else. Part C's `disk --list` reads it.
+- **"`/dev/blk`'s children listable" is replaced by `/dev/devices`.** The root namespace is the
+  only one where `/dev/blk` lists empty, and nothing there needs it once the probes read the
+  registry. `libfs` keeps its documented limitation, now pointing at `/dev/devices`.
+
+**Derived from the spike and the calls:**
+
+- **`device-mgr`**, a lib and bin split like `view-broker`. **`init` spawns it before
+  `input-server` and binds `/svc/devices`**, as it binds `/svc/auth` and `/svc/views`. It needs no
+  syscap: it binds nothing. It reads the registry once at start, and holds each node's handle to
+  hand out.
+- **A device's name is its class path's**: `blk-<n>` is `/dev/blk/<n>`, and `input-<n>` is
+  `/dev/input/raw/<n>`, so a name in `/dev/devices` says which binding a view would need. The
+  registry id is stable within a boot and is what `Departed` will name.
+- **A subscription gets its own duplicate of each handle**, so two subscribers to one class — a
+  gate's probe and `input-server` — do not share a read cursor they did not agree to. Exclusivity
+  stays what `input-subsystem.md` §5 says it is: a constraint on who holds the path, and
+  `/svc/devices/input` is bound where `/dev/input/raw` is, in the root namespace only.
+- **`input-server` takes a changing set of devices.** It subscribes to `/svc/devices/input`, reads
+  up to eight devices, and serves from `Settled` on — **including with none, or a keyboard alone**,
+  where today it exits. `Departed` retires a device's slot; nothing sends one until Phase 6, so its
+  handling is host-tested in the library rather than left unwritten.
+- **No fallback to the raw paths.** If the manager does not start, `input-server` has no devices
+  and says so. A second path that only runs when the first is broken is a path nobody tests, and
+  the manager is small enough to be as reliable as `input-server` itself.
+- **The probes move to the registry** wherever the registry is bound: `eshell`'s `lsblk` and
+  `libsession::rebind_block_devices`. `nxinstall` runs in a view, where what it may write is
+  exactly what is bound, so it lists its own namespace (`libfs::ns_children`) instead of probing.
+
+### A device, end to end
+
+1. At boot the drivers register their nodes; the i8042 driver and the console now register too.
+2. `init` spawns `device-mgr`, which reads `/dev/registry`, takes each node's handle from
+   `/dev/registry/<id>`, and answers `Meta::Ready`. `init` binds `/svc/devices`.
+3. `init` spawns `input-server`, which resolves `/svc/devices/input`. The manager replays the
+   keyboard and the mouse as `Arrived`, each with a duplicated handle, then `Settled`.
+   `input-server` arms a read on each and answers `Meta::Ready`, and `init` binds
+   `/dev/input/new` as today.
+4. A person types `open /dev/devices/all.tsm | filter kind == "disk"`. The resolve reaches the
+   manager as `info/all.tsm`, it mints the snapshot as a memory object, and the shell decodes and
+   filters the table.
+
+### The pieces, in dependency order
+
+- [ ] **B.1 — the registry.** The i8042 driver's two nodes and the console's join the device table.
+      `DeviceRecord` in `libkern`, mirrored in the kernel, with layout asserts; the `/dev/registry`
+      kernel server — the snapshot and `<id>`; bound in the root namespace only; the ABI spec and
+      `abi-sync-check`. Host tests: a record per node, in table order, with class, kind, index in
+      class and parent right for a disk and its partition. **A `boot-probe` check through the
+      binding**: the snapshot decodes, its block records are exactly what probing `/dev/blk` finds,
+      and `<id>` resolves a node.
+- [ ] **B.2 — `device-mgr`.** The `Devices` protocol (`0x0Fxx`) and `rsproto-devices-ops.md`: <!-- check-docs: allow-missing -->
+      `Arrived`, `Settled`, `Departed`. The subscription and its replay; `info/` as a directory of
+      `.tsm` files. Host-tested in its library: records to rows, names, replay order, and **the
+      reader side of the table** — a padded buffer, as the kernel hands it over, decodes to the rows
+      (a round trip would only test the encoder). `init` spawns it and binds `/svc/devices`. **A
+      `boot-probe` check**: `/svc/devices/block` replays the disks and settles, and a second
+      subscriber gets the same replay.
+- [ ] **B.3 — `input-server` from the manager.** Subscribe; a device table of up to eight; serve
+      from `Settled`, with none or one; retire on `Departed`. Host tests on the library: arrivals
+      in any order, a keyboard alone, a departure mid-stream. `check-input` (and its
+      `--no-ps2-irq` variant) is the regression gate, unchanged.
+- [ ] **B.4 — `/dev/devices` for anyone.** The manager's endpoint couriered along Part A's chain;
+      both login supervisors bind `/dev/devices` with the base `/info`, and `desktop-shell` binds
+      it into application namespaces.
+- [ ] **B.5 — the probes.** `eshell`'s `lsblk` and `libsession::rebind_block_devices` read the
+      registry; `nxinstall` lists its own namespace.
+- [ ] **Docs**: a new architecture doc for the device manager; `input-subsystem.md` (devices from
+      the manager, and the hotplug premise corrected); `namespace-and-resource-servers.md` and the
+      kernel-server list (`/dev/registry`); `libfs`'s limitation note. **`kernel_server.rs` says
+      "the `/dev` directory listing is deferred — see `deferred-decisions.md`", and that file has
+      no such entry**: the comment becomes a pointer to `/dev/devices`, which answers it for
+      devices.
+
+### What to compare on the day
+
+- **`test-qemu`**: `boot-probe`'s registry and subscription checks, above.
+- **`test-interactive`**, in a serial session: `list /dev/devices` names the disks and the input
+  devices; `open /dev/devices/all.tsm | filter kind == "disk"` prints a disk row, matched on a
+  model the command does not contain; and `/dev/registry` does not resolve in a session.
+- **`check-input`** and **`check-input --no-ps2-irq`**, unchanged: every key and click in them now
+  arrives through the manager.
+- **`check-login`**: `desktop-session-mgr` says its session has `/dev/devices`, as it does for
+  `/dev/views`.
+
+### Left alone
+
+- **A real event source**, and with it `Departed` ever being sent — Phase 6.
+- **The storage service**, the block class's owner — Part C. Until then nothing subscribes to
+  `block` but the probe.
+- **Narrowing `/dev/input/raw` and `/dev/registry` to the manager's own namespace.** Every
+  service shares `init`'s root today; giving the manager a namespace of its own is a separate
+  change to how services are spawned.
+- **The framebuffer**, which is not a `DeviceNode`, and whose owner `init` hands it to directly.
 
 ## Gates
 
