@@ -38,12 +38,20 @@ no-ps2-irq = []
 #   as the compositor takes to draw — milliseconds (PR #296 review). A held frame is read on
 #   every run.
 fbcon-gate = []
+# **Hold the i8042 drain for 300 ms after an F9 press**, for `cargo xtask check-input`. Nothing is
+# read from the controller while the hold is on, so what the host injects meanwhile queues up in
+# QEMU's sixteen-byte PS/2 queue — which is how the gate builds, on purpose, the state in which
+# QEMU holds a mouse release for want of room and sends it only on the next injected event (the
+# `lost-release` cause, 2026-09-23). Exists so the gates' flush has a guard: at the natural rate,
+# about two runs in a hundred, deleting it passes everything. Implied by `test-harness`, since
+# `check-input` boots that kernel; never in a production kernel.
+ps2-hold-gate = []
 # Integration-test build (`cargo xtask test-qemu`): everything `selftest` runs,
 # plus the `isa-debug-exit` primitive + `SYS_DEBUG_EXIT` gated syscall, and boot
 # failures/panics terminate QEMU with a fail verdict instead of dropping to eshell
 # or halting. Never in a production kernel. See
 # `docs/conventions/qemu-integration-tests.md`.
-test-harness = ["selftest"]
+test-harness = ["selftest", "ps2-hold-gate"]
 
 [dependencies]
 

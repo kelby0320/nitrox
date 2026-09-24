@@ -28310,3 +28310,105 @@ shell's `placed dialog` line comes after the compositor has placed the window.
 still types into the parent, as the compositor's comment on `focus_candidate` says. The receipt
 makes the gate wait; making a dialog own the keyboard from the moment it is asked for is still
 that deferral's job.
+
+## 2026-09-23 — Main's red CI: QEMU holds a mouse packet, and an event can precede its greeting
+
+PR #330's review noted that main had gone red three times. None of the three involved a dialog.
+
+**`check-login --kvm`, twice: the `lost-release` deferral's second and third occurrences, and its
+trigger.** Both logged `compositor: press at …` on a bar button with no `release` after it, and
+the shell never answered. The deferral had already ruled out the guest correctly: nothing hit the
+diagnostic cap, there was no `SYN_DROPPED`, and both halves are logged. The cause was one layer
+further down, in QEMU. Its PS/2 queue is sixteen bytes, and `ps2_mouse_send_packet` returns
+without queuing a packet that will not fit, leaving the buttons and motion in the device's state
+until the next sync. Only an injected event causes a sync. I read this in QEMU 11.0.2's source
+and checked that 8.2, which CI runs, is the same. `click_at` walks, presses and releases back to
+back, and then waits. After a walk that filled the queue, the press went and the release waited
+for ever.
+
+**Proven before fixed.** Neither a slower guest nor a KVM guest pinned to one host CPU lost a
+release in 60 clicks. The window is narrow: the queue needs room for exactly the press. So the
+state was built on purpose. A kernel probe stopped the i8042 drain for 300 ms after F9, and inside
+that window the host sent a 3-step walk (twelve bytes of 4-byte packets), a press and a release.
+Ten releases out of ten were held. One event that moved nothing delivered each of them. QEMU's
+`ps2_mouse_send_packet` and `input_event_*` trace showed that no button-up packet was queued until
+that event, which separates "QEMU held it" from "the guest lost it". A zero-motion packet would
+have recovered a guest loss just as well, so the trace was needed.
+
+**The fix is in the gate, because only the gate knows it has stopped injecting.**
+- `Qmp::flush` sends an event that moves nothing. The packets it can produce carry only what was
+  already injected, so it cannot add input. It sends at most four, one queue's worth (508 px per
+  axis), so a larger remainder needs a later flush.
+- `click_at` flushes after the press receipt, which proves the guest drained through the press.
+  It still waits for nothing: PR #280 found that waiting for the release line broke the drag step.
+- `middle_click_at` does the same.
+- Every drag's post-release wait, and the `shot` tool's click, use `expect_after_pointer`, which
+  flushes each second it goes without its line.
+
+Under the probe, the real `click_at` delivered ten releases out of ten, and none with its flush
+removed. `expect_after_pointer` delivered five out of five at its first flush, 1017 ms in.
+
+**It also explains an older note.** `move_pointer_to` said QEMU's queue *drops* a packet it cannot
+fit. Its own evidence, from 2026-08-31, was a walk landing exactly one step of (−98, −56) short.
+That is the pin's held over-drive riding on the walk's first step and cancelling it. The pin is
+now drained and then flushed, so the held remainder goes into the corner, where the pointer is
+clamped. `check-input`'s paced-burst comment made the same misreading, and both now say "held".
+Merged decision-log entries that say "drops" stay as they are, because they record what was
+believed on their date.
+
+**The Display gate, once: an event before QMP's greeting.** `Qmp::connect` read a `RESUME` event as
+the first line on the socket and refused it as a greeting. It connects the moment the socket
+exists, and QEMU had started the guest before greeting that connection. It now reads past up to
+eight events, as `execute` already skips them, and still fails on a socket that never greets. A
+host test drives it against a stand-in socket at the bound and one past it, and a connect that
+skips nothing fails the test.
+
+## 2026-09-23 — Main's red CI, reviewed: a second pin, and a guard for the flush
+
+PR #331's review had no blocking findings. It reproduced the QEMU reading and confirmed that the
+new host test catches all four of its mutations.
+
+**Worth fixing: `burst_holds_its_position` pins the same way and had no flush.** It drains after
+its pin and then sends a key chord, and a key syncs only QEMU's keyboard. So whatever the pin left
+held would ride on the burst's first motion, and the failure would blame `input-server` for a
+delta QEMU was holding. It now flushes after the drain, as `move_pointer_to` does, and the
+sentence that linked the two pins is back.
+
+**The four drag presses now wait with `expect_after_pointer`.** In each, the press is the last
+event injected before the wait. This recovers a press held on its own. A press held together with
+walk motion still lands short, because QEMU packs both into one packet and the guest's decoder
+emits the button first. `expect_after_pointer`'s doc says so.
+
+**Two wording fixes.** One flush sends at most four packets, a queue's worth: 508 px per axis. So
+"the one packet it can produce" and "the walk starts from nothing held" overstated it, and a
+larger remainder is `click_at`'s retry to absorb. `check-terminal` had a third comment describing
+the 2026-08-31 miss as a lost packet; it now says held.
+
+**The flush has a guard.** At the natural rate, about two runs in a hundred, deleting either flush
+passed every gate. The new kernel feature `ps2-hold-gate`, implied by `test-harness` as
+`no-ps2-irq`'s precedent suggested, makes an F9 press hold the i8042 drain for 300 ms. On every run,
+`check-input` uses it to build the held release and asserts three things:
+- the condition first, so the guard cannot pass for nothing: a raw release must *not* arrive on
+  its own within a second;
+- `expect_after_pointer` delivers it;
+- `click_at` delivers it, inside a hold of its own.
+
+Each part has a control that fails it:
+- `click_at` without its flush fails the `click_at` step;
+- `expect_after_pointer` without its flush times out;
+- a hold that never holds fails the first assertion ("this guard built nothing").
+
+**Its first push failed CI's `check-input --no-ps2-irq`**, a variant my local gate set did not run.
+A byte log in the driver found why. The setup click was a `click_at`, whose flush sends one more
+packet after the release's receipt can arrive. With the i8042's interrupts off, the guest reads
+only on the 10 ms tick, so that packet was still in QEMU's queue when F9 set the hold. The
+keyboard has priority at the controller, so the F9 byte split the packet. The hold then held the
+*press*. So each hold now starts from `settle`: a click with a receipt for both halves, after
+`click_at` has put the pointer somewhere known. With the release the last packet injected and its
+receipt seen, nothing is left in the queue.
+
+**The guard does not run under `--no-ps2-irq`.** There a click from an unknown position is itself
+unreliable. The pin's over-drive outruns what a flush can deliver, and the unpaced walk back
+arrives packed with the press, which is why that variant's own steps pace their injection. The
+guard tests the gate's flush, not the interrupt path. It passes under TCG and KVM, and the
+`--no-ps2-irq` variant passes and says it skipped the guard.

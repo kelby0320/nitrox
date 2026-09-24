@@ -1388,16 +1388,14 @@ fn route_one_batch(
                         _ if meta_change == Some(false) => {
                             pl.s(b"compositor: Super up");
                         }
-                        // **A press whose release never appears here is `TODO(lost-release)`.**
-                        // Seen once in CI on 2026-09-08 (M14 Part D): `check-login --kvm` logged
-                        // `press at x=571 y=205 win=27` and no release, so the click never
-                        // completed and the editor's close button did nothing. Both halves are
-                        // logged since PR #280 precisely so that "delivered and ignored" and
-                        // "never arrived" are different sentences — this is the second — and the
-                        // diagnostic cap was nowhere near reached (133 of 256 at that point in a
-                        // local run), so the absence is real rather than truncation. No
-                        // `SYN_DROPPED` either, so the ring did not overflow: the event went
-                        // missing below this, not above it.
+                        // **A press whose release never appears here was QEMU holding it**, not
+                        // this path losing it (2026-09-23). Both halves are logged since PR #280
+                        // so that "delivered and ignored" and "never arrived" are different
+                        // sentences; `check-login --kvm` said the second three times. QEMU's PS/2
+                        // queue is sixteen bytes and holds a packet that will not fit until the
+                        // next injected event — and a gate's release is its last. The gates flush
+                        // (`expect_after_pointer` in `tools/xtask`), and this line is what
+                        // told the two apart.
                         libinput::Logical::Dropped { .. } => {
                             pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
                         }
