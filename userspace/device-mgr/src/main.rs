@@ -8,7 +8,9 @@
 //!    node registers before userspace starts, so one read is complete coldplug.
 //! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `init` binds it at `/svc/devices`.
 //! 3. Serve. `<class>` makes the resolver that class's owner and replays its devices; `info` is a
-//!    directory session; `info/<name>.tsm` is a table, as a fresh read-only memory object.
+//!    directory session; `info/<name>.tsm` is a table, as a fresh read-only memory object; and
+//!    `info-endpoint` is a forwarding endpoint of the manager's own, on which only the last two
+//!    are answered — what `init` couriers to the supervisors for a session's `/dev/devices`.
 
 #![no_std]
 #![no_main]
@@ -40,8 +42,12 @@ const MSG_LEN: usize = 4096;
 /// the owner is busy. The replay itself is always room made: sends do not block, so a channel
 /// shallower than the replay would cut it short, and `Settled` would count what fit.
 const SUBSCRIPTION_HEADROOM: usize = 32;
-/// Directory sessions open at once: the wait set, less the endpoint and an owner per class.
-const MAX_DIRS: usize = MAX_WAIT_HANDLES - 1 - Class::ALL.len();
+/// Info-only endpoints at once. `init` asks for one at boot and couriers it for every session;
+/// the second is headroom, not a use.
+const MAX_INFO_ENDPOINTS: usize = 2;
+/// Directory sessions open at once: the wait set, less the endpoint, the info-only endpoints and
+/// an owner per class.
+const MAX_DIRS: usize = MAX_WAIT_HANDLES - 1 - MAX_INFO_ENDPOINTS - Class::ALL.len();
 /// What the manager takes each node with, and hands its owner: `/dev/blk`'s authority, which is
 /// the most any class needs — the storage service writes.
 const NODE_RIGHTS: u64 = RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
@@ -217,42 +223,76 @@ struct Manager {
     nodes: Vec<(u32, u64)>,
     owners: Owners,
     dirs: Vec<u64>,
+    /// The manager's ends of the info-only endpoints it has minted: resolves arriving here are
+    /// [`suffix::info_only`].
+    info_ends: Vec<u64>,
 }
 
 impl Manager {
-    fn serve_resolve(&mut self) {
-        let Ok(Some((op, request_id, body))) = recv(self.serve_end) else {
-            return;
+    /// Answer one forwarded resolve from `from` — the endpoint bound at `/svc/devices`, or, when
+    /// `info_only`, one of the info-only endpoints — replying on the endpoint it came from.
+    /// `false` if that endpoint has gone.
+    fn serve_resolve(&mut self, from: u64, info_only: bool) -> bool {
+        let (op, request_id, body) = match recv(from) {
+            Ok(Some(m)) => m,
+            Ok(None) => return true,
+            Err(()) => return false,
         };
         let asked = match parse_resolve_request(&body) {
             Some(r) if op == OP_NS_RESOLVE => suffix::parse(r.suffix),
             _ => Asked::Unknown,
         };
+        let asked = if info_only { suffix::info_only(asked) } else { asked };
         match asked {
-            Asked::Subscribe(class) => self.subscribe(request_id, class),
-            Asked::Directory => self.open_dir(request_id),
+            Asked::Subscribe(class) => self.subscribe(from, request_id, class),
+            Asked::InfoEndpoint => self.mint_info_endpoint(from, request_id),
+            Asked::Directory => self.open_dir(from, request_id),
             Asked::File(name) => {
                 let bytes = if name == "all" { Some(table::all(&self.records)) } else { table::one(&self.records, name) };
                 match bytes {
-                    Some(b) => reply_with_object(self.serve_end, request_id, &b),
-                    None => reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::NotFound),
+                    Some(b) => reply_with_object(from, request_id, &b),
+                    None => reply_error(from, OP_NS_RESOLVE, request_id, KError::NotFound),
                 }
             }
-            Asked::Unknown => reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::NotFound),
+            Asked::Unknown => reply_error(from, OP_NS_RESOLVE, request_id, KError::NotFound),
+        }
+        true
+    }
+
+    /// Answer with a forwarding endpoint of the manager's own, on which only the information is
+    /// answered. **Minted only on the root endpoint**: `info_only` refuses this suffix on an
+    /// info-only one, so its holder cannot make more.
+    fn mint_info_endpoint(&mut self, reply_to: u64, request_id: u64) {
+        if self.info_ends.len() >= MAX_INFO_ENDPOINTS {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+        }
+        let Some((client_end, ours)) = make_channel(4) else {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        };
+        // **Said before the reply, not after**, so the line is ordered against what the asker
+        // does next rather than racing it: a gate reads it as `init` having asked for the endpoint
+        // it couriers, before any login exists.
+        kprint(b"device-mgr: an info-only endpoint minted\n");
+        if reply_channel(reply_to, request_id, client_end) {
+            self.info_ends.push(ours);
+        } else {
+            kprint(b"device-mgr: ...and not delivered\n");
+            close(client_end);
+            close(ours);
         }
     }
 
     /// Make the resolver `class`'s owner, and replay the class's devices to it.
-    fn subscribe(&mut self, request_id: u64, class: Class) {
+    fn subscribe(&mut self, reply_to: u64, request_id: u64, class: Class) {
         if self.owners.owner(class).is_some() {
             // One owner at a time — the kernel gives a raw device one reader.
             Line::new().s(b"device-mgr: ").s(class.name().as_bytes()).s(b" is owned; refused a second").end();
-            return reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::AlreadyExists);
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::AlreadyExists);
         }
         let devices = replay(&self.records, class);
         let depth = (devices.len() + 1 + SUBSCRIPTION_HEADROOM).min(IPC_MAX_QUEUE_DEPTH as usize);
         let Some((client_end, ours)) = make_channel(depth as u64) else {
-            return reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::KernelError);
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
         // **The replay is queued before the owner has the channel**, so a completed resolve is a
         // whole subscription: `Settled` is already waiting, and what it counts cannot depend on
@@ -280,7 +320,7 @@ impl Manager {
         let mut body = [0u8; 4];
         let n = build_settled(&mut body, sent).unwrap_or(0);
         let _ = send(ours, OP_DEVICES_SETTLED, 0, 0, &body[..n], &[]);
-        if !reply_channel(self.serve_end, request_id, client_end) {
+        if !reply_channel(reply_to, request_id, client_end) {
             // The queued nodes go with the channel: the kernel releases an undelivered transfer
             // when its endpoint is destroyed.
             close(client_end);
@@ -291,14 +331,14 @@ impl Manager {
         Line::new().s(b"device-mgr: ").s(class.name().as_bytes()).s(b" owned, ").u(sent as u64).s(b" device(s) sent").end();
     }
 
-    fn open_dir(&mut self, request_id: u64) {
+    fn open_dir(&mut self, reply_to: u64, request_id: u64) {
         if self.dirs.len() >= MAX_DIRS {
-            return reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
         }
         let Some((client_end, ours)) = make_channel(4) else {
-            return reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::KernelError);
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        if reply_channel(self.serve_end, request_id, client_end) {
+        if reply_channel(reply_to, request_id, client_end) {
             self.dirs.push(ours);
         } else {
             close(client_end);
@@ -413,10 +453,18 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         .u(count(Class::Block))
         .s(b" block")
         .end();
-    let mut m = Manager { serve_end, records, nodes, owners: Owners::new(), dirs: Vec::new() };
+    let mut m = Manager {
+        serve_end,
+        records,
+        nodes,
+        owners: Owners::new(),
+        dirs: Vec::new(),
+        info_ends: Vec::new(),
+    };
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, an owner per class,
-        // and at most MAX_DIRS sessions, which `open_dir` refuses past.
+        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the info-only
+        // endpoints, an owner per class, and at most MAX_DIRS sessions — `mint_info_endpoint`
+        // and `open_dir` refuse past their bounds.
         let waited = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -426,6 +474,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 }
             };
             push(m.serve_end);
+            for &e in &m.info_ends {
+                push(e);
+            }
             for c in m.owners.channels() {
                 push(c);
             }
@@ -441,7 +492,13 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
             };
             if h == m.serve_end {
-                m.serve_resolve();
+                m.serve_resolve(h, false);
+            } else if let Some(i) = m.info_ends.iter().position(|&e| e == h) {
+                // Every holder of this endpoint has let it go — its bindings included.
+                if !m.serve_resolve(h, true) {
+                    close(h);
+                    m.info_ends.remove(i);
+                }
             } else if m.owners.channels().any(|c| c == h) {
                 m.serve_owner(h);
             } else if let Some(i) = m.dirs.iter().position(|&d| d == h) {

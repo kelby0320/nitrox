@@ -955,14 +955,15 @@ fn views_call(
     handles: &[u64],
     exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<(bool, alloc::vec::Vec<u8>)> {
-    if !views_send(ch, op, request_id, body, handles) {
+    if !rs_send(ch, op, request_id, body, handles) {
         return None;
     }
     views_receive(ch, request_id, exited)
 }
 
-/// Send one message to the broker without waiting for its answer.
-fn views_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
+/// Send one rsproto message on `ch`, moving `handles`, without waiting for an answer — to the view
+/// broker, or down an endpoint as the kernel would forward a resolve.
+fn rs_send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> bool {
     let mut msg = [0u8; 4096];
     let Some(n) = librsproto::encode(&mut msg[24..], op, request_id, 0, body, handles.len() as u16) else {
         return false;
@@ -1303,7 +1304,7 @@ fn view_broker_test(root_ns: u64) -> bool {
         return fail(b"the paced pair's first wrong password");
     }
     let t0 = clock_ns();
-    if !views_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !views_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
+    if !rs_send(b, OP_VIEWS_PASSWORD, 21, b"wrong again", &[]) || !rs_send(c, OP_VIEWS_PASSWORD, 22, b"wrong", &[]) {
         return fail(b"send the paced pair's passwords");
     }
     if !retry(views_receive(b, 21, &mut exited)) {
@@ -1517,7 +1518,10 @@ fn registry_test(root_ns: u64) -> bool {
 ///   device the registry has;
 /// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
 ///   sees that the input server took its devices from the manager rather than from the raw paths.
-///   Were it not held, this resolve would take the class for a moment and give it back.
+///   Were it not held, this resolve would take the class for a moment and give it back;
+/// - **the info-only endpoint answers the tables and nothing else** (Part B.4): `block` and
+///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
+///   and `info` opens the directory.
 fn devices_test(root_ns: u64) -> bool {
     use libkern::device::DeviceKind;
     use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived, parse_settled};
@@ -1621,6 +1625,58 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"input is not held, so input-server did not take its devices from the manager");
     }
 
+    // **The endpoint a session is given answers the tables and nothing else** (Part B.4). `init`
+    // couriers one of these for every session's `/dev/devices`, and `desktop-shell` holds it with
+    // `BIND_NAMESPACE`, so it could bind it with no base — where the root endpoint would take
+    // `block` as a subscription to every disk. The probe cannot bind (it holds no syscaps), but a
+    // forwarding endpoint is a channel and the manager answers whatever resolve arrives on it, so
+    // the probe sends the resolves a namespace would forward, as the kernel would.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/devices/info-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no info-only endpoint at /svc/devices/info-endpoint");
+    }
+    let forward = |request_id: u64, suffix: &[u8]| -> Option<Received> {
+        let mut body = [0u8; 64];
+        let n = librsproto::namespace::resolve_request(&mut body, chan, 0, suffix)?;
+        if !rs_send(endpoint, librsproto::OP_NS_RESOLVE, request_id, &body[..n], &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 5_000_000_000;
+        loop {
+            let m = receive(endpoint, deadline)?;
+            if m.request_id == request_id {
+                return Some(m);
+            }
+            m.handles.iter().for_each(|&h| close(h));
+        }
+    };
+    let refused = |m: &Option<Received>| {
+        m.as_ref().is_some_and(|m| {
+            m.error
+                && m.handles.is_empty()
+                && librsproto::error::parse_error(&m.body)
+                    .is_some_and(|e| e.kerror == libkern::KError::NotFound.as_i32())
+        })
+    };
+    let block = forward(1, b"block");
+    let minted = forward(2, b"info-endpoint");
+    let listing = forward(3, b"info");
+    close(endpoint);
+    for m in [&block, &minted, &listing] {
+        if let Some(m) = m {
+            m.handles.iter().for_each(|&h| close(h));
+        }
+    }
+    if !refused(&block) {
+        return fail(b"the info-only endpoint answered `block` as something other than NotFound");
+    }
+    if !refused(&minted) {
+        return fail(b"the info-only endpoint minted another");
+    }
+    if !listing.as_ref().is_some_and(|m| !m.error && m.handles.len() == 1) {
+        return fail(b"the info-only endpoint would not open its directory");
+    }
+
     // The information side.
     let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
     let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
@@ -1660,7 +1716,7 @@ fn devices_test(root_ns: u64) -> bool {
     Line::new()
         .s(b"boot-probe: devices: block replayed ")
         .u(block_ids.len() as u64)
-        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, all.tsm has ")
+        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
         .u(rows as u64)
         .s(b" rows ok")
         .end();

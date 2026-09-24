@@ -28664,3 +28664,85 @@ sees that the input server took its devices from the manager; the wrong-path boo
 
 `input-subsystem.md` §2, §4, §5 and §6, `rsproto-input-ops.md`, `boot-flow.md` and `init`'s comments
 no longer describe the input server resolving raw nodes or exiting without them.
+
+## 2026-09-24 — Administration B.4: `/dev/devices` in every session, through an info-only endpoint
+
+Every session, and every application `desktop-shell` launches, now binds `/dev/devices`. It lists
+the machine's devices as TSM1 tables: `list /dev/devices`, and
+`open /dev/devices/all.tsm | filter kind == "disk"` prints the disk row with its model, with no
+device code in the shell.
+
+**The endpoint travels Part A's chain, as a seventh handoff:**
+- `init` couriers it to `service-mgr`, the seventh of the handoff channel's eight;
+- `service-mgr` passes it on to both supervisors: sixth to `session-mgr` and seventh to
+  `desktop-session-mgr`, each channel of depth 8;
+- `desktop-session-mgr` passes it to `desktop-shell` in its seventh leader extra;
+- `libsession` binds it with the base `/info`;
+- `desktop-shell` binds it the same way into each application namespace.
+
+**What travels is not the endpoint bound at `/svc/devices`.** The plan said to courier "the
+manager's endpoint" and bind it with the base `/info`, so that a session reaches the tables and
+nothing else. That holds for a session: its suffixes all begin `info`. It does not hold for
+`desktop-shell`, which is handed the endpoint and holds `BIND_NAMESPACE`. It could bind the
+endpoint with no base into a namespace of its own, and on that endpoint a bare `block` is a
+subscription to every disk. That is raw write access to the ESP and every partition, which the
+whole-tree filesystem endpoint the shell already holds does not give. The supervisors are no
+different from before: they hold the root namespace, and can resolve `/svc/devices/block`
+themselves, the same ungated boundary `/svc/auth` and `/svc/views` have.
+
+**The fix is an endpoint that cannot subscribe.**
+- Resolving `/svc/devices/info-endpoint` answers a channel that is itself a forwarding endpoint;
+  `sys_ns_bind` adopts any `IpcChannel`.
+- The manager answers resolves arriving on it with `suffix::info_only`: the directory and the
+  tables as asked, and a class or another `info-endpoint` as `NotFound`.
+- `init` resolves one after binding `/svc/devices`, with `TRANSFER | DUPLICATE`, and that is what
+  it couriers.
+- The manager keeps at most two, and drops one when every holder has let it go.
+
+`namespace-and-resource-servers.md` records the shape: attenuation by construction, for authority
+no right on a handle expresses.
+
+**Proved, each with a control that fails it:**
+- `test-interactive` step 5d, from a serial login: the listing, the filter, and
+  `/dev/devices/block` and `/dev/registry` opening nothing. Its step 1 now expects the manager's
+  `an info-only endpoint minted` between `init`'s bind and the login prompt; the manager logs it
+  before replying, so the order is causal.
+- `check-login`: the session's `/dev/devices`, and each application namespace. The shell now
+  resolves `/dev/devices` in the namespace it built, and its `grants` line names what it reached.
+- `boot-probe`, which cannot bind: it sends `block`, `info-endpoint` and `info` down an info-only
+  endpoint itself, as the kernel would forward them.
+
+**Controls against the first design**, which couriered a duplicate of the root endpoint:
+- **D, a parser that took `info/block` for a subscription.** It failed `test-interactive`, and the
+  manager logged `block owned, 3 device(s) sent`: one line of parsing from handing a session every
+  disk. That is what showed the base was not enough.
+- **B, the registry snapshot bound into sessions**, failed at `/dev/registry`.
+- **S, `session-mgr` passing no endpoint**, failed on the namespace line.
+- **E, the shell not binding `/dev/devices`**, failed `check-login` on the `grants` line.
+
+**Controls against this one:**
+- **F, the manager ignoring `info_only`**, failed the probe at `block`. The manager's log shows the
+  subscription going through.
+- **G, `init` couriering a duplicate again**, failed `test-interactive` at the mint line. It is
+  the only line a gate has that tells the two designs apart.
+
+Under the info-only endpoint, D's parser bug no longer reaches a session, so its guard is the
+library's suffix test.
+
+**Stale on the way:**
+- `init`'s `send_handle` said its ring was depth 4, and it is 8.
+- `desktop-session-mgr` said "five endpoints" over a list of six.
+- `graphical-session.md` §3's diagram showed neither supervisor's clipboard or view-broker
+  endpoint.
+
+`test-interactive` is 29 steps, and `CLAUDE.md` says so.
+
+**`check-fbcon`'s handout group outgrew its frame, as its doc said it would.** It needed
+`init: spawned init (pid 1)`, the kernel's last line, on one held screen with `compositor: up`.
+The doc recorded that line 29 lines before the handout, against at least 36 visible. Part B put 41
+there: seven device-manager and input-server lines, and this part's mint line was the one that
+failed the gate. B.3's run had passed at 40 on a favourable scroll. Trimming lines would only defer
+it, so the group's first anchor is now `init: auth-service bound at /svc/auth`, 25 lines before
+the handout. The kernel's own lines are the early group's claim, and this group's is that
+`sys_kprint` output reaches the screen up to the handout, which any userspace line shows. Two runs
+pass.

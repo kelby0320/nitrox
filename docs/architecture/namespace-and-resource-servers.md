@@ -3,7 +3,8 @@
 **Status:** Implemented — `kernel/src/object/namespace.rs`, with userspace resource servers
 (fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
 Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
-to "enforced" 2026-09-23.
+to "enforced" 2026-09-23; a server minting a narrower endpoint on request (the device manager's
+info-only one) described 2026-09-24.
 
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
@@ -572,6 +573,19 @@ themselves** (`why-supervisor-registration.md`). A supervisor:
 
 The control channel persists as the supervisor↔RS management channel (shutdown,
 reload, health, swap-in-place).
+
+**A narrower endpoint, minted on request** (administration Part B.4). A resolve answered with a
+channel hands the caller a channel end, and **any channel end binds as a forwarding endpoint** —
+`sys_ns_bind` adopts an `IpcChannel` whatever its origin. So a server can mint a second endpoint of
+its own and answer a resolve with it: resolves through wherever that is bound arrive on a
+serving end the server knows, and it can answer a narrower set there. The device manager is the
+first. On the endpoint `init` binds at `/svc/devices` it hands devices to their owners; on the
+**info-only** endpoint `init` resolves at `/svc/devices/info-endpoint` and couriers to the login
+supervisors, it answers only its tables. That is **attenuation by construction**, for authority no
+right on a handle can express: a process that holds the info-only endpoint with `BIND_NAMESPACE` can
+bind it with any base and still reach nothing but the tables. It is not self-registration — the
+server mints, and a supervisor still decides where it is bound
+([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 ## Kernel vs userspace split
 

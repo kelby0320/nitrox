@@ -1,8 +1,9 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-23, when each session gained a view-broker session and `/dev/views` — administration
-Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document described
+2026-09-24, when each session gained `/dev/devices`, the device manager's tables at the base
+`/info` — administration Part B.4; before that 2026-09-23, when each session gained a
+view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document described
 before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
 under "Credential validation" is the current shape; the history is kept because a doc that
 quietly starts being right again teaches nobody why it was wrong. The full
@@ -171,6 +172,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/bin` | the system profile endpoint | read-only (program names resolve) |
 | `/store` | the store | read-only (shared artifacts) |
 | `/dev/views` | the view broker's forwarding endpoint, **scoped to `/s/<session>`** | the session's identity to the broker — see below |
+| `/dev/devices` | an **info-only** endpoint of the device manager's, scoped to `/info` | the machine's devices as typed tables, and nothing to take one with — see below |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
@@ -230,6 +232,27 @@ identity rests on it.
 the signal: a program the broker started in a view still binds the session's `/dev/views`, so the
 registration outlives the login. Ids are never reused — the same lingering program still holds the
 old base. A boot without the broker builds sessions without `/dev/views`, and says so.
+
+### The device manager's tables
+
+**Every session can read what devices the machine has; none can take one** (administration Part
+B.4). `init` asks the device manager for an **info-only endpoint** — one on which it answers its
+tables and nothing else, whatever suffix arrives — and couriers it down the same chain as the view
+broker's. Both supervisors bind it at `/dev/devices` with the subtree base `/info`, and
+`desktop-shell` binds it the same way into every application. A resolve of `/dev/devices` reaches
+the manager as `info` — a directory of TSM1 tables, `all.tsm` and one per device — and
+`/dev/devices/all.tsm` as `info/all.tsm`, so `list /dev/devices` and
+`open /dev/devices/all.tsm | filter kind == "disk"` work with no device code in the shell
+([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+
+**The endpoint is the boundary, not the base.** The base alone keeps an ordinary session's
+suffixes under `info`, but `desktop-shell` holds what is couriered and `BIND_NAMESPACE`, and could
+bind it with no base: on the endpoint bound at `/svc/devices`, `block` is a subscription to every
+disk. On the info-only one it is `NotFound`, however it is bound. The kernel's own `/dev/registry`
+is not bound in a session at all. `test-interactive` asserts from a serial login that the tables
+list and filter, and that `/dev/devices/block` and `/dev/registry` open nothing; `boot-probe`
+sends `block` down an info-only endpoint directly. A boot without the manager builds sessions
+without `/dev/devices`, and says so.
 
 ### Where the building-block endpoints come from
 

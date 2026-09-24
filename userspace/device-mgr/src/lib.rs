@@ -273,10 +273,16 @@ pub mod table {
 }
 
 pub mod suffix {
-    //! What a resolve that reached the manager asked for. A session's `/dev/devices` is the
-    //! manager's endpoint bound with the base `/info`, so anything resolved from a session arrives
-    //! as `info` or `info/…` — **the information and nothing else**; a class is reachable only
-    //! through `/svc/devices`, which is bound in the root namespace.
+    //! What a resolve that reached the manager asked for, and what it may ask for where it came
+    //! from.
+    //!
+    //! **A session reaches the manager through an endpoint of its own**, not the one bound at
+    //! `/svc/devices` (administration Part B.4). `init` resolves `info-endpoint` once and the
+    //! supervisors bind what it gets at `/dev/devices`, with the base `/info`; a resolve arriving
+    //! there is [`info_only`] — **the information and nothing else**, whatever its suffix. The
+    //! base alone would not be enough: `desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so
+    //! it could bind it with no base, and a suffix like `block` would then be a subscription to
+    //! every disk. An endpoint that cannot subscribe is a capability the shell can be handed.
 
     use crate::classes::Class;
 
@@ -285,6 +291,9 @@ pub mod suffix {
     pub enum Asked<'a> {
         /// `<class>`: become its owner.
         Subscribe(Class),
+        /// `info-endpoint`: a forwarding endpoint of its own, every resolve on which is
+        /// [`info_only`] — what `init` couriers to the supervisors for `/dev/devices`.
+        InfoEndpoint,
         /// `info`: the directory.
         Directory,
         /// `info/<name>.tsm`: one file — `all`, or a device's name.
@@ -298,6 +307,9 @@ pub mod suffix {
         if suffix == b"info" {
             return Asked::Directory;
         }
+        if suffix == b"info-endpoint" {
+            return Asked::InfoEndpoint;
+        }
         if let Some(file) = suffix.strip_prefix(b"info/") {
             return match file.strip_suffix(b".tsm").map(core::str::from_utf8) {
                 Some(Ok(name)) if !name.is_empty() && !name.contains('/') => Asked::File(name),
@@ -309,13 +321,23 @@ pub mod suffix {
             None => Asked::Unknown,
         }
     }
+
+    /// What a resolve that arrived on an info-only endpoint gets: the directory and the tables
+    /// as asked, and **anything else answered as if it did not exist** — a subscription, and
+    /// another endpoint, whose holder could then mint more.
+    pub fn info_only(asked: Asked<'_>) -> Asked<'_> {
+        match asked {
+            Asked::Subscribe(_) | Asked::InfoEndpoint => Asked::Unknown,
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::classes::{Class, Owners, replay};
     use super::names::{name, path};
-    use super::suffix::{self, Asked};
+    use super::suffix::{self, Asked, info_only};
     use super::table;
     use libkern::device::{
         DeviceKind, DeviceRecord, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED,
@@ -480,8 +502,25 @@ mod tests {
         assert_eq!(suffix::parse(b"info"), Asked::Directory);
         assert_eq!(suffix::parse(b"info/all.tsm"), Asked::File("all"));
         assert_eq!(suffix::parse(b"info/blk-0.tsm"), Asked::File("blk-0"));
+        assert_eq!(suffix::parse(b"info-endpoint"), Asked::InfoEndpoint);
         for bad in [&b""[..], b"inputs", b"info/", b"info/.tsm", b"info/blk-0", b"info/a/b.tsm", b"info/input"] {
             assert_eq!(suffix::parse(bad), Asked::Unknown, "{:?}", core::str::from_utf8(bad));
         }
+    }
+
+    /// **An info-only endpoint answers the information and nothing else** — whatever suffix
+    /// reaches it, which is what makes it safe to hand to a process that could bind it with any
+    /// base. Every suffix the root endpoint would subscribe or mint on is refused here, and the
+    /// information passes as asked.
+    #[test]
+    fn an_info_only_endpoint_answers_the_information_and_nothing_else() {
+        for asked in [b"input".as_slice(), b"block", b"info-endpoint"] {
+            let whole = suffix::parse(asked);
+            assert_ne!(whole, Asked::Unknown, "the root endpoint would act on {:?}", core::str::from_utf8(asked));
+            assert_eq!(info_only(whole), Asked::Unknown, "{:?}", core::str::from_utf8(asked));
+        }
+        assert_eq!(info_only(suffix::parse(b"info")), Asked::Directory);
+        assert_eq!(info_only(suffix::parse(b"info/all.tsm")), Asked::File("all"));
+        assert_eq!(info_only(suffix::parse(b"nonsense")), Asked::Unknown);
     }
 }

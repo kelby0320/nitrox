@@ -97,6 +97,15 @@ static mut CLIPBOARD_ENDPOINT: u64 = 0;
 /// both login supervisors (administration Part A.4): each binds it into every session it builds, at
 /// `/dev/views` with that session's base, which is how the broker knows whose request it is.
 static mut VIEWS_ENDPOINT: u64 = 0;
+/// **An info-only endpoint of the device manager's**, resolved at `/svc/devices/info-endpoint` and
+/// retained for the handoff to `service-mgr` and on to both login supervisors (administration
+/// Part B.4): each binds it into every session at `/dev/devices` with the base `/info`.
+///
+/// **Not a duplicate of the endpoint bound at `/svc/devices`**, which is the difference between a
+/// capability and a convention. The manager answers only its tables on this one, whatever suffix
+/// arrives — and `desktop-shell`, which holds what is couriered and `BIND_NAMESPACE`, could bind it
+/// with no base, where a suffix like `block` would otherwise subscribe to every disk.
+static mut DEVICES_ENDPOINT: u64 = 0;
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -1081,6 +1090,18 @@ fn bind_device_mgr(root_ns: u64) -> bool {
         return false;
     }
     kprint(b"init: device-mgr bound at /svc/devices\n");
+    // **What the sessions get is asked for, not duplicated** (administration Part B.4): an
+    // endpoint on which the manager answers its tables and nothing else. `TRANSFER | DUPLICATE`
+    // is what the courier needs and all it needs — the supervisors only bind it. Non-fatal: the
+    // manager still hands devices to their owners, and sessions go without a listing.
+    let (st, info) =
+        ns_lookup_wait(root_ns, b"/svc/devices/info-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
+    if st == 0 && info != 0 {
+        // SAFETY: single-threaded init.
+        unsafe { DEVICES_ENDPOINT = info };
+    } else {
+        kprint(b"init: no info-only device endpoint; sessions will have no /dev/devices\n");
+    }
     // init keeps `dm_h` (the long-lived server's process handle).
     let _ = dm_h;
     true
@@ -1478,6 +1499,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
             && DRAW_ENDPOINT == 0
             && CLIPBOARD_ENDPOINT == 0
             && VIEWS_ENDPOINT == 0
+            && DEVICES_ENDPOINT == 0
     } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
@@ -1492,7 +1514,9 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // The handoff channel. **Depth 8, and the number is the send count's bound rather than a
     // round one**: the sends below are `SENDMODE_NOBLOCK` against a child that has not run yet,
     // so a ring shorter than the number of handoffs drops the last one silently. It was 4 for
-    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth.
+    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth. **Seven since
+    // administration Part B.4**, so one slot is left: an eighth handoff fits, a ninth needs this
+    // raised in the same change.
     // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
     let cr = unsafe {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 8, 0)
@@ -1540,6 +1564,10 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         // The sixth (administration Part A.4): the view broker's, which both supervisors bind.
         send_handle(init_end, VIEWS_ENDPOINT);
         VIEWS_ENDPOINT = 0;
+        // The seventh (administration Part B.4): the device manager's, which both supervisors
+        // bind at `/dev/devices`. Seven of the channel's eight.
+        send_handle(init_end, DEVICES_ENDPOINT);
+        DEVICES_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1556,7 +1584,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn send_handle(ctrl: u64, handle: u64) {
     let count = if handle == 0 { 0 } else { 1 };
     // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring `count` handles with an
-    // empty payload. NoBlock: the ring is depth 4 and holds at most two handoffs.
+    // empty payload. NoBlock: `spawn_service_mgr`'s ring is sized to hold every handoff.
     let sr = unsafe {
         IPC_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
         IPC_HANDLES[0] = handle;
@@ -1615,6 +1643,10 @@ unsafe fn close_retained_endpoints() {
         if VIEWS_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, VIEWS_ENDPOINT);
             VIEWS_ENDPOINT = 0;
+        }
+        if DEVICES_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, DEVICES_ENDPOINT);
+            DEVICES_ENDPOINT = 0;
         }
     }
 }

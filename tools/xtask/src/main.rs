@@ -1377,6 +1377,15 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let mut steps = 0usize;
 
     // 1. The machine reaches a login prompt at all — the release image's first claim.
+    //
+    //    **And `init` asked the device manager for an info-only endpoint** (administration Part
+    //    B.4) — the one it couriers for every session's `/dev/devices`. This is the only place a
+    //    gate sees that: the sessions below would list the same tables through a duplicate of the
+    //    root endpoint, and only an info-only one keeps `desktop-shell`, which could bind it with
+    //    no base, from subscribing through it. The manager logs before replying, so the order is
+    //    causal: `init`'s bind, the mint, then everything after, the login included.
+    s.expect("init: device-mgr bound at /svc/devices")?;
+    s.expect("device-mgr: an info-only endpoint minted")?;
     s.expect("nitrox login:")?;
     steps += 1;
 
@@ -1418,6 +1427,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let built = s.rest_of_line()?;
     if !built.contains("/dev/views") {
         return Err(format!("the serial session was built without /dev/views: ({built}").into());
+    }
+    // **And the device manager's tables** (administration Part B.4), on the same line.
+    if !built.contains("/dev/devices") {
+        return Err(format!("the serial session was built without /dev/devices: ({built}").into());
     }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
@@ -1464,6 +1477,31 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //     anyway — a count of one passes on a home holding some *other* file.
     s.send("list .")?;
     s.expect("nx-login.txt")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 5d. **The machine's devices, as typed tables** (administration Part B.4). The session's
+    //     `/dev/devices` is the device manager at the base `/info`: `list` names a file per
+    //     device — the disk and both input devices among them, in whatever order it sorts — and
+    //     `open` decodes one into a table that a pipeline filters with no device code of its own.
+    //     The disk is matched on its **model**, which the command does not contain, so the echo
+    //     of what was typed cannot satisfy it.
+    s.send("list /dev/devices")?;
+    s.expect_all(&["all.tsm", "blk-0.tsm", "input-0.tsm", "input-1.tsm"])?;
+    s.expect("/home>")?;
+    s.send("open /dev/devices/all.tsm | filter kind == \"disk\"")?;
+    s.expect("QEMU HARDDISK")?;
+    s.expect("/home>")?;
+    // **And nothing to take a device with.** The base `/info` means `/dev/devices/block` reaches
+    //     the manager as `info/block` — a table name without `.tsm`, which it refuses — rather
+    //     than as `block`, the subscription that would hand this session every disk. And
+    //     `/dev/registry` is bound in the root namespace only: what a session may know of the
+    //     devices is the manager's tables, never the kernel's nodes.
+    s.send("open /dev/devices/block")?;
+    s.expect("nxsh: cannot open /dev/devices/block")?;
+    s.expect("/home>")?;
+    s.send("open /dev/registry")?;
+    s.expect("nxsh: cannot open /dev/registry")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -3942,12 +3980,15 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     };
 
     // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
+    //
+    // **The handout group's first line is `init`'s auth-service bind, not the kernel's last line**
+    // (administration Part B.4). It was the kernel's last line until the boot grew past what one
+    // frame shows: Part B's device manager put 41 lines between it and `compositor: up`, against
+    // the 36 a held frame guarantees. The kernel's own lines are the early group's claim; this
+    // group's is that `sys_kprint` lines reach the screen up to the handout, which any userspace
+    // line proves. 25 lines before the handout today, so eleven more fit before it moves again.
     const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
-    const HANDOUT: &[&str] = &[
-        "init: spawned init (pid 1); handing off to userspace",
-        "init: mounted fs-server-ext4 at /",
-        "compositor: up",
-    ];
+    const HANDOUT: &[&str] = &["init: auth-service bound at /svc/auth", "compositor: up"];
     let (mut early, mut handout, mut console_seen) = (false, false, false);
     let mut rows = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -3987,17 +4028,17 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: held after the timer, with no serial port — the kernel's first line, em dash and all, before PCI");
     if !handout {
         return Err(format!(
-            "no single frame showed {HANDOUT:?} together — the kernel's last line, a userspace line \
-             and the last before the handout. The hold at the handout keeps that frame up for a \
-             second, and it shows at least the last {} lines ({rows} rows less a quarter-screen \
-             jump), so a boot that now prints more than that after the kernel's last line needs a \
+            "no single frame showed {HANDOUT:?} together — a line `init` printed as it brought its \
+             services up, and the last before the handout. The hold at the handout keeps that frame \
+             up for a second, and it shows at least the last {} lines ({rows} rows less a \
+             quarter-screen jump), so a boot that now prints more than that after the first needs a \
              nearer one here. Read {} distinct row(s)",
             rows - rows / 4,
             seen.len()
         )
         .into());
     }
-    println!("  ok: held at the handout — the kernel's last line, a line userspace printed, and \"compositor: up\", on one screen");
+    println!("  ok: held at the handout — a line init printed bringing its services up, and \"compositor: up\", on one screen");
 
     // 2. The console let go. Every service keeps printing through all of this — the greeter's
     //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
@@ -4227,6 +4268,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **And the view broker's `/dev/views`, at the session's base** (administration Part A.4).
     // Printed before the leader is spawned, so it is ordered against the next line, not racing it.
     session.expect("desktop-session-mgr: session has /dev/views")?;
+    // **And the device manager's tables, at the base `/info`** (administration Part B.4) — printed
+    // right after, from what was bound. The application namespaces the shell builds carry them too,
+    // which the shell checks by resolving the binding and says on its `grants` line below.
+    session.expect("desktop-session-mgr: session has /dev/devices")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and
@@ -4319,7 +4364,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
-    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -4441,7 +4486,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the menu, so an `expect` between the two is a race between processes —

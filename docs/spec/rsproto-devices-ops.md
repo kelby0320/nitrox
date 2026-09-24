@@ -2,8 +2,9 @@
 
 **Status: normative for what is built (2026-09-24).** `Arrived` and `Settled` are implemented in
 `userspace/device-mgr/` and encoded by `userspace/librsproto/src/devices.rs`; `Departed` is
-encoded there and **sent by nothing until Phase 6** gives the kernel an event source. Written with
-administration Part B.2; see [`administration.md`](../planning/administration.md) § *Part B in
+encoded there and **sent by nothing until Phase 6** gives the kernel an event source. `input-server`
+subscribes to `input` from boot on (Part B.3), and every session reads the tables at `/dev/devices`
+through an info-only endpoint (Part B.4). Written with administration Part B.2; see [`administration.md`](../planning/administration.md) § *Part B in
 detail* for the design and why each piece is shaped as it is.
 
 ## The shape
@@ -19,10 +20,12 @@ at `/svc/devices` in the root namespace.
 | class owner | `/svc/devices/<class>`, from the root namespace | `input` or `block` | a channel; receives `Arrived`, `Settled`, `Departed` |
 | directory | `/svc/devices/info` | `info` | a channel answering `File::ReadDir` |
 | table | `/svc/devices/info/<name>.tsm` | `info/<name>.tsm` | a read-only memory object: a TSM1 table |
+| info-only endpoint | `/svc/devices/info-endpoint`, asked for once by `init` | `info-endpoint` | a forwarding endpoint of the manager's own — see below |
 
 Any other suffix is `NotFound`, as is a table for a name no device has. **A directory session the
 manager has no room for is `WouldBlock`**: it waits on every channel in one wait set of
-`MAX_WAIT_HANDLES`, less its endpoint and a slot per class.
+`MAX_WAIT_HANDLES`, less its endpoint, two info-only endpoints and a slot per class. A third
+info-only endpoint is `WouldBlock` too.
 
 **The classes are the manager's**, derived from a record's kind rather than the kernel's
 `DeviceClass`, which calls the console, the keyboard and the mouse all `Char`:
@@ -63,9 +66,19 @@ handle it carries is closed unread.
 ### The information side
 
 `info` is a directory of TSM1 tables ([typed-stream-format](typed-stream-format.md)), for anyone
-to read: `all.tsm`, every device a row in registry order, then one `<name>.tsm` per device. A
-session reaches it as `/dev/devices`, bound with the subtree base `/info` (Part B.4), so a session
-can resolve the information and nothing else — a class is a bare name, outside the base.
+to read: `all.tsm`, every device a row in registry order, then one `<name>.tsm` per device.
+
+**A session reaches it through an info-only endpoint** (Part B.4). Resolving `info-endpoint` on
+the root endpoint answers a channel that is itself a **forwarding endpoint**: bound in a namespace,
+the kernel forwards resolves on it to the manager like any server's. **On it the manager answers
+the directory and the tables, and nothing else** — a class, or `info-endpoint` again, is
+`NotFound` whatever the suffix — so its holder cannot subscribe and cannot mint an endpoint that
+could. `init` asks for one at boot and couriers it down Part A's chain; both login supervisors bind
+it at `/dev/devices` with the subtree base `/info`, and `desktop-shell` binds it the same way into
+each application. The base names what a session reaches — `/dev/devices` is the directory,
+`/dev/devices/all.tsm` a table — and **the endpoint is the boundary**. The base alone would not be:
+`desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so it could bind it with no base, where
+`block` on the root endpoint is a subscription to every disk.
 
 **A device's name is its path's**, so a name says which binding would reach it:
 

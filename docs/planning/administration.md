@@ -873,9 +873,17 @@ namespace, with no login and no session.
       variant) is the regression gate, unchanged. **`boot-probe` now asserts `input` is held**:
       a subscription to it is refused, which is how a probe sees that the input server took its
       devices from the manager.
-- [ ] **B.4 — `/dev/devices` for anyone.** The manager's endpoint couriered along Part A's chain;
-      both login supervisors bind `/dev/devices` with the base `/info`, and `desktop-shell` binds
-      it into application namespaces.
+- [x] **B.4 — `/dev/devices` for anyone** *(2026-09-24)*. The manager's endpoint couriered
+      along Part A's chain; both login supervisors bind `/dev/devices` with the base `/info`, and
+      `desktop-shell` binds it into application namespaces. **What travels is an info-only
+      endpoint, not the one bound at `/svc/devices`** — found while building it: the base keeps an
+      ordinary session's suffixes under `info`, but `desktop-shell` holds what is couriered and
+      `BIND_NAMESPACE`, so it could bind it with no base and subscribe to `block`, every disk. The
+      manager mints an endpoint on which it answers only its tables, `init` resolves one at
+      `/svc/devices/info-endpoint`, and that is what the chain carries. `test-interactive` lists
+      and filters the tables from a serial login and finds `/dev/devices/block` and
+      `/dev/registry` open nothing; `check-login` asserts the session and each application
+      namespace reach `/dev/devices`; `boot-probe` sends `block` down an info-only endpoint.
 - [ ] **B.5 — the probes.** `eshell`'s `lsblk` reads the registry;
       `libsession::rebind_block_devices` reads the registry when its source has one and the
       source's own `/dev/blk` bindings when it does not; `nxinstall` lists its own namespace.

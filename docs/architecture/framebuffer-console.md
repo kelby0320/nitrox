@@ -1,7 +1,8 @@
 # The framebuffer console
 
-**Status: built with Phase 5 Part B; last checked 2026-09-22, when the decoder learned to swallow
-a string sequence whole.** Everything COM1 receives is also
+**Status: built with Phase 5 Part B; last checked 2026-09-24, when the gate's handout group moved
+from the kernel's last line to a nearer one because the boot outgrew a frame; before that
+2026-09-22, when the decoder learned to swallow a string sequence whole.** Everything COM1 receives is also
 drawn on the screen from the first line of `kernel_main` until a client is handed
 `/dev/framebuffer`, and again when the machine stops. Gated by `cargo xtask check-fbcon`, which
 boots with no serial port and reads the screen back as text, and by `cargo xtask check-report`,
@@ -155,12 +156,16 @@ runs passed; with both holds removed, 2 of 3 failed the handout group.
 
 1. **The boot is on the screen.** Held after the timer: `Nitrox kernel — diagnostics online` (the
    first line, and an em dash from the Unicode table) with `allocators up`, both before PCI. Held
-   at the handout: `init: spawned init (pid 1); handing off to userspace` (the kernel's last line),
-   `init: mounted fs-server-ext4 at /` (a `sys_kprint` line) and `compositor: up`. The handout
-   frame shows at least the last 36 lines at the gates' 1360×768 — 48 rows less a quarter-screen
-   jump; 38 of 50 at QEMU's 1280×800, where the gate ran until Phase 5 Part E — and the kernel's
-   last line was 29 lines before the handout when that part re-counted it, so a boot that grows
-   past that fails this group deterministically and says why.
+   at the handout: `init: auth-service bound at /svc/auth` (a `sys_kprint` line from `init`'s
+   bring-up) and `compositor: up`. The handout frame shows at least the last 36 lines at the gates'
+   1360×768 — 48 rows less a quarter-screen jump; 38 of 50 at QEMU's 1280×800, where the gate ran
+   until Phase 5 Part E — and the auth-service line is 25 lines before the handout, so a boot that
+   grows past that fails this group deterministically and says why. **It was the kernel's last
+   line** (`init: spawned init (pid 1); handing off to userspace`) with `init: mounted
+   fs-server-ext4 at /` until administration Part B.4, when the device manager and the input
+   server's devices put 41 lines between that and the handout. The kernel's own lines are the early
+   group's claim; this group's is that `sys_kprint` lines reach the screen up to the handout, which
+   any userspace line shows.
 2. **The console lets go**: once a frame with no console glyph anywhere appears, six seconds of
    screendumps — while every service keeps printing — contain not one ink-on-paper glyph cell.
 3. **A stop takes the screen back**: F10 panics the kernel from inside the i8042 driver, **with its

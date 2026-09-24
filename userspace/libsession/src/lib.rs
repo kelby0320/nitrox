@@ -163,6 +163,16 @@ pub struct NamespaceSpec<'a> {
     pub views_endpoint: u64,
     /// `/s/<session>`, from [`views_open_session`]. Empty binds nothing.
     pub views_base: &'a [u8],
+    /// An **info-only** endpoint of the device manager's, bound at `/dev/devices` with the
+    /// subtree base `/info` (administration Part B.4). `0` binds nothing — a boot where the
+    /// manager did not start, whose sessions simply have no device listing.
+    ///
+    /// **The endpoint, not the base, is what keeps a session from taking a device.** `init`
+    /// resolves it at `/svc/devices/info-endpoint`, and the manager answers only its tables on it,
+    /// whatever suffix arrives; a class to subscribe to is reachable only through `/svc/devices`
+    /// in the root namespace. The base names what a session reaches: `/dev/devices` is the
+    /// directory, `/dev/devices/all.tsm` a table.
+    pub devices_endpoint: u64,
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -344,6 +354,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         bind_blk,
         views_endpoint,
         views_base,
+        devices_endpoint,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
@@ -543,6 +554,33 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         has_views = vr == 0;
     }
 
+    // `/dev/devices` → the device manager's info-only endpoint, **at the base `/info`**
+    // (administration Part B.4): `/dev/devices` reaches it as `info`, the directory of tables, and
+    // `/dev/devices/all.tsm` as `info/all.tsm`. The manager answers nothing but the tables on this
+    // endpoint, so nothing here can subscribe to a keyboard or a disk. Non-fatal, like the
+    // clipboard: a session without it has no device listing, and nothing else in it notices.
+    let mut has_devices = false;
+    if devices_endpoint != 0 {
+        let dev = b"/dev/devices";
+        let base = b"/info";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let dvr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                dev.as_ptr() as u64,
+                dev.len() as u64,
+                devices_endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if dvr != 0 {
+            kprint(b"libsession: /dev/devices bind FAIL (no device listing in this session)\n");
+        }
+        has_devices = dvr == 0;
+    }
+
     // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
     // uses. Read-only by construction: a subtree bind forwards to the same registration, and
     // nothing in the session has a writable handle to it.
@@ -620,6 +658,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         SESSION_HAS_CONSOLE = has_console;
         SESSION_HAS_CLIPBOARD = has_clipboard;
         SESSION_HAS_VIEWS = has_views;
+        SESSION_HAS_DEVICES = has_devices;
     }
     ns
 }
@@ -853,6 +892,16 @@ pub fn session_has_views() -> bool {
 
 /// Set by [`build_namespace`]; see [`session_has_views`].
 static mut SESSION_HAS_VIEWS: bool = false;
+
+/// Whether the last [`build_namespace`] bound `/dev/devices` — reported, for the log line that
+/// has to be able to say "no".
+pub fn session_has_devices() -> bool {
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe { SESSION_HAS_DEVICES }
+}
+
+/// Set by [`build_namespace`]; see [`session_has_devices`].
+static mut SESSION_HAS_DEVICES: bool = false;
 
 /// See [`session_has_console`].
 static mut SESSION_HAS_CONSOLE: bool = false;
