@@ -8,7 +8,7 @@ use libkern::device::{DeviceKind, DeviceRecord, NO_PARENT};
 use libstream::wire::{Table, Value};
 
 use crate::probe::{Found, fat_label, probe};
-use crate::sources::{DiskTable, InitMount, TableEntry, init_mounts, live_boot, partuuid, source_device};
+use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::labels;
 use crate::mounts::{Plan, Refusal, at, automount, explicit, in_use};
 use crate::suffix::{self, Asked, session_only};
@@ -414,16 +414,41 @@ fn a_clash_takes_the_next_free_suffix() {
 fn a_boot_mounts_every_ext4_that_is_not_inits() {
     let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
     assert_eq!(
-        automount(&devices(), &init, false),
+        automount(&devices(), &init, false, true),
         [Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw }]
     );
-    assert_eq!(automount(&devices(), &[], false).len(), 2, "with no init mount, both ext4s");
+    assert_eq!(automount(&devices(), &[], false, true).len(), 2, "with no init mount, both ext4s");
+}
+
+/// **`init`'s mounts are known only if the manifest read, named a mount, and every mount it named
+/// matched a device** (PR #336 review, finding 2). Anything less could leave `init`'s root
+/// looking free.
+#[test]
+fn inits_mounts_are_known_only_when_every_one_matched() {
+    let at = |device: Option<u32>| InitMount {
+        mount_point: String::from("/"),
+        source: String::from("gpt-partlabel:nitrox-root"),
+        mode: Mode::Rw,
+        device,
+    };
+    assert!(init_known(Some(&[at(Some(7))])));
+    assert!(!init_known(None), "the manifest did not read");
+    assert!(!init_known(Some(&[])), "it named no mount, so nothing says which is the root");
+    assert!(!init_known(Some(&[at(Some(7)), at(None)])), "one mount matched no device");
+}
+
+/// **Nothing is auto-mounted while `init`'s mounts are not known**: the case above that plans
+/// both ext4s writable is the one this prevents, since one of them would be the running root.
+#[test]
+fn a_boot_that_cannot_place_inits_mounts_mounts_nothing() {
+    assert_eq!(automount(&devices(), &[], false, false), []);
+    assert_eq!(automount(&devices(), &[], true, false), [], "a live boot neither");
 }
 
 /// **A live boot mounts read-only.**
 #[test]
 fn a_live_boot_mounts_read_only() {
-    let plan = automount(&devices(), &[], true);
+    let plan = automount(&devices(), &[], true, true);
     assert!(plan.iter().all(|p| p.mode == Mode::Ro));
 }
 
@@ -433,7 +458,7 @@ fn two_filesystems_with_one_label_are_told_apart() {
     let mut ds = devices();
     ds[3].found = Found::Ext4 { label: String::from("data"), clean: Some(true) };
     ds[4].found = Found::Ext4 { label: String::from("data"), clean: Some(true) };
-    let labels: Vec<String> = automount(&ds, &[], false).into_iter().map(|p| p.label).collect();
+    let labels: Vec<String> = automount(&ds, &[], false, true).into_iter().map(|p| p.label).collect();
     assert_eq!(labels, ["data", "data-2"]);
 }
 
@@ -478,16 +503,17 @@ fn init_root() -> Vec<Mounted> {
 #[test]
 fn an_administrator_mounts_by_name() {
     let ds = devices();
-    let plan = explicit(&ds, &init_root(), &[], true, "blk-4", "").unwrap();
+    let plan = explicit(&ds, &init_root(), &[], true, true, "blk-4", "").unwrap();
     assert_eq!(plan, Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw });
-    let plan = explicit(&ds, &init_root(), &[], true, "blk-4", "stick").unwrap();
+    let plan = explicit(&ds, &init_root(), &[], true, true, "blk-4", "stick").unwrap();
     assert_eq!(plan.label, "stick");
     let taken = [String::from("nitrox-live")];
-    assert_eq!(explicit(&ds, &init_root(), &taken, true, "blk-4", "").unwrap().label, "nitrox-live-2");
+    assert_eq!(explicit(&ds, &init_root(), &taken, true, true, "blk-4", "").unwrap().label, "nitrox-live-2");
 }
 
 /// **Each refusal, for its own reason**: no such device, one already mounted (`init`'s
-/// included), one holding nothing this service serves, a bad label, a taken one, and no room.
+/// included), one holding nothing this service serves, a bad label, a taken one, no room, and
+/// `init`'s mounts not all known.
 #[test]
 fn an_administrators_mount_is_refused_for_each_reason() {
     let ds = devices();
@@ -496,14 +522,20 @@ fn an_administrators_mount_is_refused_for_each_reason() {
         init_root()[0].clone(),
         Mounted { device: 8, at: String::from("/storage/nitrox-live"), by: By::Storage, mode: Mode::Ro },
     ];
-    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-9", ""), Err(Refusal::NoSuchDevice));
-    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-3", ""), Err(Refusal::AlreadyMounted), "init's root");
-    assert_eq!(explicit(&ds, &mounted, &[], true, "blk-4", ""), Err(Refusal::AlreadyMounted), "the service's own");
-    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-2", ""), Err(Refusal::NothingToServe), "FAT");
-    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-0", ""), Err(Refusal::NothingToServe), "a disk");
-    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-4", ".x"), Err(Refusal::BadLabel));
-    assert_eq!(explicit(&ds, &init_root(), &taken, true, "blk-4", "taken"), Err(Refusal::LabelTaken));
-    assert_eq!(explicit(&ds, &init_root(), &[], false, "blk-4", ""), Err(Refusal::Full));
+    assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-9", ""), Err(Refusal::NoSuchDevice));
+    assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-3", ""), Err(Refusal::AlreadyMounted), "init's root");
+    assert_eq!(explicit(&ds, &mounted, &[], true, true, "blk-4", ""), Err(Refusal::AlreadyMounted), "the service's own");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-2", ""), Err(Refusal::NothingToServe), "FAT");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-0", ""), Err(Refusal::NothingToServe), "a disk");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-4", ".x"), Err(Refusal::BadLabel));
+    assert_eq!(explicit(&ds, &init_root(), &taken, true, true, "blk-4", "taken"), Err(Refusal::LabelTaken));
+    assert_eq!(explicit(&ds, &init_root(), &[], false, true, "blk-4", ""), Err(Refusal::Full));
+    assert_eq!(
+        explicit(&ds, &init_root(), &[], true, false, "blk-4", ""),
+        Err(Refusal::InitUnknown),
+        "a device that could be init's root, however free it looks"
+    );
+    assert_eq!(Refusal::InitUnknown.kerror(), libkern::KError::NoAccess);
 }
 
 /// **What is in use is every mounted device and the disk that holds it** — never a partition's

@@ -53,7 +53,7 @@ names its line.
 
 | Grant | What it binds | Since |
 |---|---|---|
-| `disks` | every block device **not in use**, raw: `/dev/blk/<n>` and its `info`, one binding each. The broker asks the storage service's `InUse` first, and leaves out a mounted filesystem's device, `init`'s root included, and the disk under it; if the service cannot answer, the request is refused rather than granted blind | Part A; `InUse` since Part C.6 |
+| `disks` | every block device **not in use when the view is built**, raw: `/dev/blk/<n>` and its `info`, one binding each. The broker asks the storage service's `InUse` first, and leaves out a mounted filesystem's device, `init`'s root included, and the disk under it; if the service cannot answer, the request is refused rather than granted blind. **Asked once, at the start**: a device mounted later in the view's life stays bound raw. That is the administrator's own doing in a view with `storage` too, such as `disk --mount` from `with admin nxsh` | Part A; `InUse` since Part C.6 |
 | `storage` | the storage service's admin endpoint at `/dev/storage/admin`: mounting and unmounting ([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) | Part C.6 |
 
 Each later part of the administration phase adds its grant to this table.

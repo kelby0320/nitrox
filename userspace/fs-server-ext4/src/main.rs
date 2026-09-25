@@ -1292,6 +1292,12 @@ fn serve_control<R: BlockReader + BlockWriter>(reader: &R) {
             }
         };
         send_reply(control, count);
+        // **A read-only mount records nothing**, and says so: the filesystem is as it was found,
+        // clean or not, and a line saying "recorded clean" would claim otherwise.
+        if marked.is_ok() && reader.read_only() {
+            kprint(b"fs-server: unmounted; a read-only mount wrote nothing, so the filesystem is as it was found\n");
+            exit(0);
+        }
         if marked.is_ok() {
             kprint(b"fs-server: unmounted, and the filesystem recorded clean\n");
             exit(0);

@@ -283,7 +283,9 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
                 .field("unmounted", TypeTag::Bool, TypeModifiers::NONE);
             write_table(stage, h, &schema, &[alloc::vec![Value::Str(String::from(label)), Value::Bool(true)]]);
         }
-        None => stage.diag(format!("{label} unmounted, and left clean\n").as_bytes()),
+        // Not "and left clean": a read-only mount leaves a filesystem as it found it. `--list`
+        // says how each was left.
+        None => stage.diag(format!("{label} unmounted\n").as_bytes()),
     }
     Line::new().s(b"disk: unmounted ").untrusted(label.as_bytes()).end();
     EXIT_OK

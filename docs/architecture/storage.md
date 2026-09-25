@@ -109,6 +109,13 @@ source names a partition by one of the two schemes `init` accepts
 
 **`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted.
 
+**If they cannot all be placed, this service mounts nothing.** Sometimes `init.toml` does not read,
+names no mount, or names one that matches no device. Then a device this service takes for free
+could be the running root. So it auto-mounts nothing, refuses an administrator's `Mount`
+(`NoAccess`), and does not answer `InUse`, which makes the view broker refuse `disks` (PR #336
+review, finding 2). Every image names its root by partition label, so a boot that gets here has
+already gone wrong somewhere.
+
 **A live boot is one whose root is on a RAM disk**, through a partition of one or as the disk
 itself. That is the fact that makes the machine's own disks the install target, and it is what
 makes the auto-mount read-only (§6). A root matched to no device is not a live boot.
@@ -190,7 +197,9 @@ answers every request on a session.
   3. **Refused while a file is still held**: `sys_ns_held`, asked after the sync, when what is
      left is someone's. A handle or a mapping could write after the filesystem is marked clean.
      A refusal here puts the label back and changes nothing.
-  4. `Meta::Unmount`: the server records the filesystem clean and exits.
+  4. `Meta::Unmount`: the server records the filesystem clean and exits. A read-only mount records
+     nothing, since it never marked the filesystem mounted, and leaves it as it was found. The
+     service's line says what the device says, read again after the server has gone.
   5. `IoOpcode::Flush` on the device, for a writable mount.
   6. The namespace is dropped.
 
@@ -224,6 +233,14 @@ it answers Ready ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md)), so that state
 because it is, and nothing about how the filesystem was left. The service's log line follows the
 same rule.
 
+**A table reads the disks again.** When a table is read, and before an administrator's mount,
+every device nothing has mounted is probed afresh. Anything may have written it since the boot:
+this service's own mounts, or a raw writer through the `disks` grant. Until PR #336's review the
+boot's probe was the only one, so a disk unmounted clean went on reading as not clean, and one
+whose writable server exited read as it had at boot. A read-only mount writes nothing, so a
+filesystem it found not clean is still not clean after it. `check-storage` starts from a disk
+marked not clean to show both.
+
 ## 10. Who can reach what
 
 | Holder | Reaches |
@@ -255,7 +272,7 @@ service itself at `/svc/storage`.
 | Gate | What it asserts |
 |---|---|
 | `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real |
-| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller. The disk's `nitrox-root` is auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. `with admin disk` unmounts it and mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs` |
+| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller, **its root marked not cleanly unmounted first**, as an installed machine's is. The disk's `nitrox-root` is reported not clean and auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. **The table's `clean` says no, and still says no after the read-only unmount**, which the service logs as "not left clean (read-only, so as it was found)". `with admin disk` mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain, **after which the table says clean**. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs` |
 | `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
@@ -278,8 +295,10 @@ how, and what each suffix asks for where it arrives.
   unmount starts. A lazy unmount, which would drain those, is not built.
 - **An open directory session is not a held file.** A client holding one when its filesystem is
   unmounted finds the channel closed.
-- **Nothing unmounts `init`'s mounts**, so nothing syncs them before the machine stops. That is
-  Part E's `shutdown`.
+- **Nothing unmounts `init`'s mounts, or this service's own**, so nothing syncs them before the
+  machine stops. On a boot that is not a live one, every ext4 `init` did not mount is auto-mounted
+  writable. It is left not clean, with its dirty files unwritten, exactly as `/` and `/home` are.
+  Both are Part E's `shutdown`, which runs the unmount chain on everything mounted.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

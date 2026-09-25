@@ -55,7 +55,7 @@ use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_
 use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use, parse_mount};
 use storage_service::mounts::{self, Plan, automount, explicit, in_use};
 use storage_service::probe::{Found, probe};
-use storage_service::sources::{DiskTable, InitMount, TableEntry, init_mounts, live_boot};
+use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
 
@@ -595,16 +595,26 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
         close(control);
         return Err(b"fs-server-ext4 would not spawn");
     };
+    // **From here a failure ends the server too** (PR #336 review, finding 3): it is terminated
+    // and its handle closed, so a refused or unanswered mount leaves no server running over the
+    // device and no handle held for one. A server that refused `Ready` has exited already, and
+    // terminating it is a no-op.
+    let abandon = |control: u64| {
+        close(control);
+        // SAFETY: the Process handle the spawn returned, with SIGNAL.
+        unsafe { syscall1(SYS_PROCESS_TERMINATE, process) };
+        close(process);
+    };
     let flags = if plan.mode == Mode::Ro { FS_SETUP_READ_ONLY } else { 0 };
     if !send_setup(control, device, flags) {
         close(device);
-        close(control);
+        abandon(control);
         return Err(b"the device could not be handed to its server");
     }
     let endpoint = match wait_ready(control) {
         Ok(e) => e,
         Err(why) => {
-            close(control);
+            abandon(control);
             return Err(why);
         }
     };
@@ -612,7 +622,7 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns <= 0 {
         close(endpoint);
-        close(control);
+        abandon(control);
         return Err(b"no namespace for it");
     }
     let ns = ns as u64;
@@ -622,7 +632,7 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
     close(endpoint);
     if bound != 0 {
         close(ns);
-        close(control);
+        abandon(control);
         return Err(b"its server would not bind into its namespace");
     }
     Ok(Mount { device: plan.device, label: plan.label.clone(), mode: plan.mode, ns, control, process })
@@ -649,7 +659,14 @@ struct Service {
     nodes: Vec<(u32, u64)>,
     /// `init`'s mounts, as the table reports them. This service's own are [`mounted`](Self::mounted).
     init: Vec<Mounted>,
+    /// Whether every one of `init`'s mounts was placed on a device ([`init_known`]). Without it
+    /// this service mounts nothing and does not answer `InUse`: a device it took for free could
+    /// be the running root.
+    init_known: bool,
     mounted: Vec<Mount>,
+    /// The buffer every device read passes through, kept past the boot's probe for a device read
+    /// again ([`refresh`](Self::refresh)).
+    scratch: Scratch,
     /// This service's ends of the session endpoints it has minted: resolves arriving here are
     /// [`session_only`].
     session_ends: Vec<u64>,
@@ -662,6 +679,42 @@ struct Service {
 }
 
 impl Service {
+    /// **Read device `id` again**: what it holds, and how an ext4 was left. The boot's probe goes
+    /// stale as soon as anything writes the device, whether this service's own mounts or a raw
+    /// writer through the `disks` grant. So what reads a device's `found` refreshes it first: a
+    /// table, and an administrator's mount (PR #336 review, finding 1).
+    ///
+    /// **This is the one place `found` changes after the boot.** The unmount reads the device for
+    /// its own line with [`read_found`](Self::read_found), which stores nothing, so a table that
+    /// failed to refresh would show it rather than being kept right by some other path.
+    fn refresh(&mut self, id: u32) {
+        let Some(found) = self.read_found(id) else {
+            return;
+        };
+        if let Some(d) = self.devices.iter_mut().find(|d| d.record.id == id) {
+            d.found = found;
+        }
+    }
+
+    /// What device `id` holds now, read through its node; `None` if this service holds no node
+    /// for it.
+    fn read_found(&self, id: u32) -> Option<Found> {
+        let &(_, node) = self.nodes.iter().find(|(d, _)| *d == id)?;
+        let d = self.devices.iter().find(|d| d.record.id == id)?;
+        Some(probe(&DeviceIo::new(node, &d.record, &self.scratch)))
+    }
+
+    /// [`refresh`](Self::refresh) every device nothing has mounted. A mounted one is left to its
+    /// server: a writable mount's state reads "in use" and the table says nothing of it, and a
+    /// read-only one's cannot change under it.
+    fn refresh_unmounted(&mut self) {
+        let mounted: Vec<u32> = self.all_mounts().iter().map(|m| m.device).collect();
+        let ids: Vec<u32> = self.devices.iter().map(|d| d.record.id).filter(|id| !mounted.contains(id)).collect();
+        for id in ids {
+            self.refresh(id);
+        }
+    }
+
     /// Every mount, `init`'s and this service's, as the table reports them.
     fn all_mounts(&self) -> Vec<Mounted> {
         let mut all = self.init.clone();
@@ -692,6 +745,7 @@ impl Service {
             Asked::Directory => self.open_dir(from, m.request_id, Listing::Tables),
             Asked::Mounts => self.open_dir(from, m.request_id, Listing::Mounts),
             Asked::File(name) => {
+                self.refresh_unmounted();
                 let mounts = self.all_mounts();
                 let bytes = if name == "all" {
                     Some(table::all(&self.devices, &mounts))
@@ -823,6 +877,12 @@ impl Service {
                 }
             }
             OP_STORAGE_IN_USE => {
+                // **Not answered unless `init`'s mounts are known**: an answer would leave out a
+                // root it could not place, and the view broker would hand that disk over raw. The
+                // broker refuses `disks` when this goes unanswered.
+                if !self.init_known {
+                    return refuse(KError::NoAccess, b"init's mounts are not all known, so what is in use cannot be said");
+                }
                 let ids = in_use(&self.devices, &self.all_mounts());
                 let mut body = alloc::vec![0u8; 4 + 4 * ids.len()];
                 match build_in_use(&mut body, &ids) {
@@ -838,9 +898,10 @@ impl Service {
 
     /// An administrator's `Mount`: the label it went under, or why not.
     fn mount_explicit(&mut self, device: &str, label: &str) -> Result<String, (KError, &'static [u8])> {
+        self.refresh_unmounted();
         let taken: Vec<String> = self.mounted.iter().map(|x| x.label.clone()).collect();
         let room = self.mounted.len() < MAX_MOUNTS;
-        let plan = explicit(&self.devices, &self.all_mounts(), &taken, room, device, label)
+        let plan = explicit(&self.devices, &self.all_mounts(), &taken, room, self.init_known, device, label)
             .map_err(|r| (r.kerror(), r.why()))?;
         let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == plan.device) else {
             return Err((KError::NotFound, b"this service holds no node for it"));
@@ -925,8 +986,17 @@ impl Service {
         {
             return Err((KError::IoError, b"the drive's cache could not be flushed"));
         }
-        // 6. The namespace went with the handle closed above.
-        Line::new().s(b"storage-service: unmounted ").untrusted(x.label.as_bytes()).s(b", left clean").end();
+        // 6. The namespace went with the handle closed above. **What is said of the filesystem is
+        //    what the device says**, read again now: a read-only mount wrote nothing, so one it
+        //    found not clean is not clean still, whatever its server answered.
+        let clean = matches!(self.read_found(x.device), Some(Found::Ext4 { clean: Some(true), .. }));
+        let mut l = Line::new();
+        l.s(b"storage-service: unmounted ").untrusted(x.label.as_bytes());
+        l.s(if clean { b", left clean".as_slice() } else { b", not left clean" });
+        if x.mode == Mode::Ro {
+            l.s(b" (read-only, so as it was found)");
+        }
+        l.end();
         Ok(())
     }
 
@@ -1134,15 +1204,19 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();
 
-    let init_list: Vec<InitMount> = match read_manifest(root_ns) {
-        Ok(m) => init_mounts(&m, &records, &tables),
+    let init_list: Option<Vec<InitMount>> = match read_manifest(root_ns) {
+        Ok(m) => Some(init_mounts(&m, &records, &tables)),
         Err(why) => {
-            Line::new().s(b"storage-service: init.toml could not be read (").s(why).s(b"), so no device is init's").end();
-            Vec::new()
+            Line::new()
+                .s(b"storage-service: init.toml could not be read (")
+                .s(why)
+                .s(b"), so which devices are init's cannot be said")
+                .end();
+            None
         }
     };
     let mut init = Vec::new();
-    for m in &init_list {
+    for m in init_list.iter().flatten() {
         match m.device {
             Some(device) => init.push(Mounted { device, at: m.mount_point.clone(), by: By::Init, mode: m.mode }),
             None => Line::new()
@@ -1154,11 +1228,15 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 .end(),
         }
     }
-    let live = live_boot(&init_list, &records);
+    let known = init_known(init_list.as_deref());
+    if !known {
+        kprint(b"storage-service: init's mounts are not all known, so this service mounts nothing and does not say what is in use\n");
+    }
+    let live = live_boot(init_list.as_deref().unwrap_or(&[]), &records);
 
     // Mount what can be served. A mount hands its server a duplicate of the node; the service
     // keeps every node, for an administrator's mount and for an unmount's flush.
-    let mut plan = automount(&devices, &init, live);
+    let mut plan = automount(&devices, &init, live, known);
     plan.truncate(MAX_MOUNTS);
     let mut mounted = Vec::new();
     for &(id, node) in &nodes {
@@ -1183,7 +1261,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         devices,
         nodes,
         init,
+        init_known: known,
         mounted,
+        scratch,
         session_ends: Vec::new(),
         admin_ends: Vec::new(),
         admin_sessions: Vec::new(),

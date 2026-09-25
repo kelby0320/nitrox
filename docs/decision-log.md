@@ -29727,3 +29727,71 @@ more file on the test stick's root, and one more in its initramfs.
 
 **Part C is complete**: C.1–C.8, and its Docs box, whose items landed with the pieces that built
 them.
+
+## 2026-09-25 — PR #336 review: the table reads the disk, and an unplaced `init` mount stops all mounting
+
+The review found one blocking bug and two worth fixing, and made three optional points. All six
+are addressed.
+
+**1 (blocking): the table's `clean` was the boot's, forever.** `Device.found` was probed once at
+boot, so `disk --list` was wrong both ways:
+- a root unmounted clean went on reading "not clean", which is the laptop's flow, since its
+  installed root is never cleanly unmounted before Part E;
+- a disk whose writable server exited read "clean", as it had at boot.
+
+**The fix reads the disks where their state is read.** When a table is resolved, and before an
+administrator's mount, every device nothing has mounted is probed afresh. That covers raw writers
+through `disks` too, which the review did not name. `refresh` is the only thing that changes
+`found` after the boot.
+
+**That last point came from a control that passed.** The first fix also stored a re-read at the
+unmount, for the service's log line. With it, the control that removed the table's refresh passed,
+because the unmount's write kept the table right. The unmount now reads with `read_found`, which
+stores nothing, and the same control fails at `clean-now=true`.
+
+**The same false claim was in three log lines.** A read-only mount's `Meta::Unmount` answers Ok
+without writing, yet:
+- `fs-server-ext4` printed "the filesystem recorded clean";
+- the service logged "left clean";
+- `disk`'s text said "and left clean".
+
+The server now says a read-only mount wrote nothing. The service's line says what the device
+says, read again, plus "(read-only, so as it was found)". `disk` says only "unmounted".
+
+**The gate:** `check-storage` now clears the clean bit on its disk copy before booting, modelling
+an installed root. It asserts the report line says "not left clean", and reads `clean` from the
+table three times: no at boot, no after the read-only unmount, and yes after the writable one.
+The host's final `s_state` check now starts from a not-clean disk, so it says more than before.
+Filtering on `label` matched nothing, because the release root has no filesystem label, so the
+gate filters on the device's name.
+
+**2: when `init`'s mounts cannot all be placed, the service mounts nothing.** That covers a
+manifest that did not read, one that names no mount, and a mount that matches no device. The new
+library function `init_known` decides it, and `automount` and `explicit` take its answer:
+- the service plans nothing, and refuses an administrator's `Mount` with `NoAccess`;
+- the service refuses `InUse` too, which the review did not name. An answer would leave out a
+  root it could not place, and the broker would then have granted that disk raw. The broker
+  already refuses `disks` when `InUse` is unanswered.
+
+This is host-tested only. No gate can build a boot whose `init` mounts a root the service cannot
+match.
+
+**3: a failed `mount()` terminates and closes its server.** Every failure arm after the spawn
+goes through one `abandon`, so the process handle no longer leaks, and a server that timed out
+before `Ready` no longer runs on unmanaged. This is not tested on a boot, since no gate can make a
+server refuse after the service's probe has accepted its device.
+
+**Optional points:**
+- 4: `views-toml-schema.md`'s `disks` row says "not in use **when the view is built**".
+- 5: `storage.md` §12 names the service's own writable auto-mounts beside `init`'s as never synced
+  before power-off.
+- 6: `syscall-abi.md` states that `sys_ns_sync` and `sys_ns_held` act on the whole server, so a
+  session's count covers its whole root filesystem, and it describes the finished-IRP window that
+  `rsproto-storage-ops.md` cites.
+
+**Controls:**
+- 3 on host tests, each failing its own test: `init_known` accepting an unmatched mount,
+  `automount` ignoring it, and `explicit` ignoring it.
+- 2 `check-storage --kvm` boots, each failing at its check: the table not refreshed (after the
+  single-writer change above), and the unmount's line saying "left clean" whatever the device
+  says (run before that change, which left the line's logic as it was).

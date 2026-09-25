@@ -345,6 +345,10 @@ whose write failed stays dirty.
 exemption from async-first, for the same reason: a durability point is something the caller
 wants to know it has reached. (Syscall number `38`.)
 
+**Its scope is the whole server, not the path.** A namespace that reaches only a subtree of a
+filesystem, such as a session's `/home`, writes back every dirty file that server holds, wherever
+it lies.
+
 ```rust
 fn sys_ns_held(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
 ```
@@ -358,6 +362,19 @@ lets go of its pin, so what is left is held by someone. That is the storage serv
 before an unmount, which it refuses while the answer is not zero
 ([`storage.md`](../architecture/storage.md)). A filesystem is marked clean as the last step of an
 unmount, and a file still mapped writable could otherwise be written after it.
+
+**A count taken straight after I/O can include a finished IRP.** An IRP holds the file whose
+frames it moves until its box is freed in thread context. The kernel frees finished IRPs before
+it counts. But an IRP whose completion is still running on another CPU has already woken its
+waiter, before parking its box, so for that moment its file counts. So the storage service asks
+again after a few milliseconds before it believes a non-zero answer. A real holder is still
+holding then.
+
+**Its scope is the whole server, as `sys_ns_sync`'s is.** A namespace that reaches only a
+subtree of a filesystem, such as a session's `/home`, counts every file of that filesystem held
+anywhere. So any session learns how many files other processes hold open on its root filesystem:
+a count, not which files or whose. Nothing narrows it, since the unmount that needs it holds the
+whole mount.
 
 Requires `LOOKUP` on `ns`. `Unsupported` if `path` resolves to anything but a userspace server,
 and `NotFound` if it resolves to nothing. It does not block. (Syscall number `39`,

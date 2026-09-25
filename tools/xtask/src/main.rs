@@ -3676,14 +3676,20 @@ fn storage_pattern_byte(i: usize) -> u8 {
 /// second disk the host can read afterwards, since the only other second disk a boot can have is a
 /// RAM disk, whose writes never reach a host file.
 ///
-/// On the serial console: the storage service auto-mounts the disk's `nitrox-root` read-only, it
-/// being a live boot, and a write there is refused. `with admin disk` unmounts it and mounts it
-/// writable. `test-pattern` writes a pattern through a mapping and **exits without a sync**, and
-/// the host sees the file on the disk without the pattern. `test-pattern --check` reads it back
-/// through `/storage`, and `with admin disk --unmount` runs the chain. Then the machine is stopped,
-/// and the host carves `nitrox-root` out of the disk: `e2fsck -fn` clean, the superblock marked
-/// clean, and the file holding the pattern — read with `debugfs`, not with the library that wrote
-/// it.
+/// The copy's root is first marked **not cleanly unmounted**, as an installed machine's is until
+/// Part E's `shutdown`. On the serial console:
+/// - the storage service reports it so and auto-mounts it read-only, it being a live boot, and a
+///   write there is refused;
+/// - the table's `clean` column says no, and still says no after the read-only unmount, which
+///   wrote nothing;
+/// - `with admin disk` mounts it writable, and `test-pattern` writes a pattern through a mapping
+///   and **exits without a sync**. The host sees the file on the disk without the pattern;
+/// - `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount`
+///   runs the chain, after which the table says clean.
+///
+/// Then the machine is stopped, and the host carves `nitrox-root` out of the disk: `e2fsck -fn`
+/// clean, the superblock marked clean, and the file holding the pattern — read with `debugfs`,
+/// not with the library that wrote it.
 fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
@@ -3697,6 +3703,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     let disk = work.join("disk.img");
     let _ = fs::remove_file(&disk);
     fs::copy(image_path(), &disk)?;
+    mark_root_not_clean(&disk)?;
     cmd_image_live_for(BuildMode::Selftest)?;
 
     let ovmf = locate_ovmf()?;
@@ -3740,6 +3747,24 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
          unmount, and the filesystem was left clean ✓"
     );
+    Ok(())
+}
+
+/// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
+/// nothing unmounts `init`'s root until Part E's `shutdown`, so a live boot on the laptop finds its
+/// disk this way. It is also what makes the table's `clean` column mean something here: after the
+/// read-only unmount it must still say no, and only the writable one may make it say yes
+/// (PR #336 review, finding 1).
+fn mark_root_not_clean(disk: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (lba, _) = partition_extent(disk, 2)?;
+    let at = lba * 512 + 1024 + 58;
+    let mut f = fs::OpenOptions::new().read(true).write(true).open(disk)?;
+    let mut b = [0u8; 2];
+    f.seek(SeekFrom::Start(at))?;
+    f.read_exact(&mut b)?;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(&(u16::from_le_bytes(b) & !EXT4_VALID_FS).to_le_bytes())?;
     Ok(())
 }
 
@@ -3806,15 +3831,19 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
         .ok_or_else(|| format!("no `blk-<n>` in {line:?}"))?
         .to_string();
     let index = name.trim_start_matches("blk-").to_string();
-    if !line.contains(&format!("mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
+    if !line.contains(&format!("ext4, not left clean; mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
         return Err(format!(
-            "the disk's {ROOT_PARTLABEL} is not auto-mounted read-only: {line:?}. A live boot \
-             mounts the machine's own disks read-only, and this is one"
+            "the disk's {ROOT_PARTLABEL} is not reported not clean and auto-mounted read-only: \
+             {line:?}. The gate cleared its clean bit, and a live boot mounts the machine's own \
+             disks read-only"
         )
         .into());
     }
     s.expect("storage-service: a live boot")?;
-    println!("  ok: {name}, the disk's {ROOT_PARTLABEL}, auto-mounted read-only on a live boot");
+    println!(
+        "  ok: {name}, the disk's {ROOT_PARTLABEL}, not left clean and auto-mounted read-only on a \
+         live boot"
+    );
 
     // 2. A serial login. The prompt is searched for in the whole transcript, as `check-live`
     //    does: it and the greeter come up together.
@@ -3829,6 +3858,18 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
+    // **The table's `clean` column, as a session reads it** — a token the typed command does not
+    // contain, so the match is the answer and not the echo. The row is found by the device's name:
+    // `label` is the filesystem's own, and this one has none.
+    let clean_now = |s: &mut Session, expected: bool| -> R<()> {
+        s.send(&format!(
+            "disk --list | filter name == \"{name}\" | map {{ |r| format(\"clean-now={{}}\", r.clean) }}"
+        ))?;
+        s.expect(&format!("clean-now={expected}"))?;
+        s.expect("/home>")?;
+        Ok(())
+    };
+    clean_now(s, false)?;
 
     // 3. **A write there is refused**, by the read-only mount: named, rather than any failure.
     s.send(&format!("test-pattern --write {at}"))?;
@@ -3844,8 +3885,14 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
         Ok(())
     };
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect("fs-server: unmounted; a read-only mount wrote nothing")?;
+    s.expect(&format!(
+        "storage-service: unmounted {ROOT_PARTLABEL}, not left clean (read-only, so as it was found)"
+    ))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
+    // **Still not clean**, and the table says so: it reads the device, not the unmount's word.
+    clean_now(s, false)?;
     admin(s, &format!("disk --mount /dev/blk/{index}"))?;
     s.expect(&format!("storage-service: mounted {ROOT_PARTLABEL} (rw), as asked"))?;
     s.expect(&format!("disk: mounted {name} at /storage/{ROOT_PARTLABEL}"))?;
@@ -3919,7 +3966,9 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
-    println!("  ok: `with admin disk --unmount` ran the chain");
+    // And the table, which said no after the read-only unmount, now says yes.
+    clean_now(s, true)?;
+    println!("  ok: `with admin disk --unmount` ran the chain, and the table says clean");
     Ok(())
 }
 

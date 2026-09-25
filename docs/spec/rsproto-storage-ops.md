@@ -62,6 +62,7 @@ nobody chose it; an administrator's mount is a choice.
 | `InvalidArgument` | the label is not a valid one ([`storage.md`](../architecture/storage.md) §6), or the body is malformed |
 | `WouldBlock` | every mount slot is in use |
 | `IoError` | the filesystem's server did not come up; the reason says how |
+| `NoAccess` | `init`'s mounts are not all known, so the device could be `init`'s root ([`storage.md`](../architecture/storage.md) §5) |
 
 ### `Unmount` (`0x1001`)
 
@@ -76,7 +77,8 @@ and each link runs only once the one before it held:
    its file until its completion ends (`syscall-abi.md` § `sys_ns_held`). **A refusal here leaves
    the mount exactly as it was.**
 4. **The server records the filesystem clean and exits**, on
-   [`Meta::Unmount`](rsproto-wire-format.md). From here the mount is gone, whatever the answer.
+   [`Meta::Unmount`](rsproto-wire-format.md). From here the mount is gone, whatever the answer. A
+   read-only mount records nothing and leaves the filesystem as it was found, clean or not.
 5. **The drive's cache is flushed** (`IoOpcode::Flush`), for a writable mount. A read-only mount
    wrote nothing.
 6. **The mount's namespace is dropped.**
@@ -99,4 +101,6 @@ and each link runs only once the one before it held:
 Every mounted filesystem's device, `init`'s included, **and the disk that holds it**, since a raw
 write to a disk reaches its partitions. A RAM disk holding a partition counts as its disk. The view
 broker asks this before it binds the `disks` grant's devices (C.6), so a view cannot be handed the
-root's disk raw.
+root's disk raw. **Refused `NoAccess` when `init`'s mounts are not all known**: an answer would
+leave out a root the service could not place, and the broker refuses `disks` when this is not
+answered.

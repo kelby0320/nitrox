@@ -221,6 +221,14 @@ pub mod sources {
         out
     }
 
+    /// **Whether `init`'s mounts are known**: its manifest was read (`Some`), named a mount, and
+    /// every mount it named matched a device. Anything less, and a device this service took for
+    /// free could be `init`'s root, so it mounts nothing, refuses an administrator's mount, and
+    /// does not answer `InUse` (PR #336 review, finding 2).
+    pub fn init_known(mounts: Option<&[InitMount]>) -> bool {
+        mounts.is_some_and(|l| !l.is_empty() && l.iter().all(|m| m.device.is_some()))
+    }
+
     /// Whether this is a **live boot**: `init`'s root is on a RAM disk.
     pub fn live_boot(mounts: &[InitMount], records: &[DeviceRecord]) -> bool {
         let Some(root) = mounts.iter().find(|m| m.mount_point == "/").and_then(|m| m.device) else {
@@ -481,6 +489,9 @@ pub mod mounts {
         LabelTaken,
         /// Every mount slot is in use.
         Full,
+        /// `init`'s mounts are not all known ([`init_known`](crate::sources::init_known)), so the
+        /// device could be `init`'s root.
+        InitUnknown,
     }
 
     impl Refusal {
@@ -493,6 +504,7 @@ pub mod mounts {
                 Refusal::NothingToServe => KError::Unsupported,
                 Refusal::BadLabel => KError::InvalidArgument,
                 Refusal::Full => KError::WouldBlock,
+                Refusal::InitUnknown => KError::NoAccess,
             }
         }
 
@@ -505,22 +517,30 @@ pub mod mounts {
                 Refusal::BadLabel => b"that is not a valid label",
                 Refusal::LabelTaken => b"another mount has that label",
                 Refusal::Full => b"no more filesystems can be mounted at once",
+                Refusal::InitUnknown => {
+                    b"init's mounts are not all known, so this service mounts nothing: the device could be init's root"
+                }
             }
         }
     }
 
     /// **An administrator's mount** of the device called `name` (`blk-<n>`), under `label`, or
     /// under the label the service would choose if `label` is empty. `mounted` is everything
-    /// mounted, `init`'s included; `taken` is the labels in use; `room` is whether a slot is free.
-    /// **Always writable**, on a live boot too: the auto-mount is the careful one.
+    /// mounted, `init`'s included; `taken` is the labels in use; `room` is whether a slot is free;
+    /// `init_known` is [`init_known`](crate::sources::init_known)'s answer, and nothing is mounted
+    /// without it. **Always writable**, on a live boot too: the auto-mount is the careful one.
     pub fn explicit(
         devices: &[Device],
         mounted: &[Mounted],
         taken: &[String],
         room: bool,
+        init_known: bool,
         name: &str,
         label: &str,
     ) -> Result<Plan, Refusal> {
+        if !init_known {
+            return Err(Refusal::InitUnknown);
+        }
         let d = devices.iter().find(|d| crate::table::name(&d.record) == name).ok_or(Refusal::NoSuchDevice)?;
         if mounted.iter().any(|m| m.device == d.record.id) {
             return Err(Refusal::AlreadyMounted);
@@ -573,8 +593,13 @@ pub mod mounts {
     }
 
     /// The boot's auto-mounts, in registry order. `already` is what is mounted, `init`'s mounts
-    /// among it, and none of those devices is mounted again.
-    pub fn automount(devices: &[Device], already: &[Mounted], live: bool) -> Vec<Plan> {
+    /// among it, and none of those devices is mounted again. **None at all without
+    /// `init_known`**: a device whose `init` mount went unmatched would look free here, and it could
+    /// be the running root.
+    pub fn automount(devices: &[Device], already: &[Mounted], live: bool, init_known: bool) -> Vec<Plan> {
+        if !init_known {
+            return Vec::new();
+        }
         let mode = if live { Mode::Ro } else { Mode::Rw };
         let mut taken: Vec<String> = Vec::new();
         let mut plan = Vec::new();
