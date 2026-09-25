@@ -28994,7 +28994,7 @@ consequence is that a writer syncing while still mapped leaves its file dirty. `
 synced before they unmapped, which would have pinned every file they wrote until an unmount, so
 they now unmap first.
 
-**Four things the work found:**
+**Five things the work found:**
 1. **The deferred same-page fault spin stopped a boot.** Every process running one binary now
    shares its image's object, so two faulting one page is ordinary. The second faulter
    `yield_now`ed until the page was ready, from a fault handler with interrupts off, and
@@ -29016,6 +29016,19 @@ they now unmap first.
    re-resolved to prove a write reached the disk, and a re-resolve now shares the cached object.
    They read the device instead, through `fs-server-ext4`'s own library over the root partition
    opened raw. That is also how the new C.1 check tells the cache from the device.
+5. **A display-gate race lost its margin, and only CI saw it.** `check-display --kvm` failed on
+   the PR at about 4 boots in 6. Main passed 6 of 6. The gate composes three reference windows
+   at the origin over `nxterm`'s larger one, and the stack was creation order. `nxterm` starts
+   just before `ui-testclient`, and both load the same two fonts before opening a window. Once a
+   file is one shared object, the process behind rides the other's fills instead of doing its
+   own reads. So the head start that kept `nxterm`'s window at the bottom is gone. In each
+   failing boot the toolkit reference was window 2 and `nxterm` window 3. Now `ui-testclient`
+   `Raise`s its three windows over the manager channel, bottom to top, as its last change to the
+   stack. `nxterm` only has to have created its window before that, which comes after three
+   windows' frames and a 200 ms configure deadline. A later window would cover the compared
+   region and fail the gate, so the failure is not hidden. Every local gate had passed, because
+   the local set ran `check-display` under TCG only. It now runs each of CI's `--kvm` variants
+   too.
 
 `kernel/docs/lock-ordering.md` listed `DEVICES` and `PARTITIONS` as leaves when the code ranks
 them Registry, above the allocators. It is corrected, and names the file cache and `OUTCOMES`.

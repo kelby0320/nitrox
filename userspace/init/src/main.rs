@@ -1903,10 +1903,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // The display self-test, the GUI terminal and the two test clients used to be spawned
     // here under `selftest`. They are **service declarations** now (retrofit Part C2), started
     // by `service-mgr` from `/initramfs/etc/services.toml` — which carries them only in a test
-    // image, so this file is byte-identical in both. Their order is the file's order, which is
-    // what preserves the one constraint that mattered: `nxterm` before `ui-testclient`,
-    // because windows stack in creation order at the origin and the display gate compares the
-    // top-left, so the largest window has to be at the bottom.
+    // image, so this file is byte-identical in both. Their order is the file's order: `nxterm`
+    // before `ui-testclient`, so that the terminal's window exists by the time `ui-testclient`
+    // raises its reference windows over it. (Creation order was the stacking until
+    // administration C.1 showed it to be a race; the raise is what stacks them now.)
     //
     // **And the real answer arrived (M7 Part F, 2026-08-25.)** The comment this file carried
     // from 2026-08-12 — *"Until Milestone 7 there is nothing to launch `nxterm` from"* — is

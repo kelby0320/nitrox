@@ -597,6 +597,18 @@ fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) -> bool
     mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_ok()
 }
 
+/// Raise `window` to the top of the stack through the manager channel. `false` if the request
+/// did not succeed.
+fn raise_window(mgr: &mut ChannelTransport, window: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_RAISE};
+    let mut body = [0u8; 8];
+    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 8];
+    mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
+}
+
 /// Drive the three desktop requests over the real manager channel and read each back.
 ///
 /// **What this covers that a host unit test cannot.** `compose_into`, `hit` and
@@ -1476,7 +1488,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // **After the placements, before the scene is declared presented.** It restores every
         // attribute it touches, so it leaves the screen exactly as the placements left it.
         verify_desktop_requests(&mut mgr, root_ns, win.id());
-        kprint(b"ui-testclient: reference windows placed via /dev/draw/manage\n");
+
+        // **Then stack them, bottom to top, in the order the gate composes them** — the last
+        // thing this client does to the stack, so nothing above can reorder it afterwards.
+        //
+        // Creation order used to be the stacking, and it was a race: `nxterm`, started just
+        // before this client and larger than all three, had to open its window before this
+        // client opened its first. Both load the same two fonts first, and administration C.1
+        // made the race a coin flip — once a file is one shared cache object, whichever process
+        // is behind rides the other's fills instead of doing its own reads, so neither keeps a
+        // head start. `nxterm` landed above the toolkit reference in 4 KVM boots of 6.
+        //
+        // What is still assumed is that `nxterm`'s window *exists* by now, after three windows'
+        // frames and a configure this client lets time out. A window opened later would sit on
+        // top and cover the region the gate compares, so that failure is loud, not hidden.
+        for id in [_ui_window.id(), _term_window.id(), win.id()] {
+            if !raise_window(&mut mgr, id) {
+                fail(b"ui-testclient: a manager Raise was refused\n");
+            }
+        }
+        kprint(b"ui-testclient: reference windows placed and stacked via /dev/draw/manage\n");
 
         // **Exercise the one-manager rule, which is the whole of B1's contract.** The
         // compositor refuses a second resolve rather than deposing the first, because two
