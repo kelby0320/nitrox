@@ -66,6 +66,8 @@ cargo xtask image --live   # the live image: release root as a RAM-disk module, 
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
 cargo xtask check-install  # install to a blank disk from the live menu, then boot that disk
+cargo xtask image --live --selftest # the test live image: the live stick with the test packages
+cargo xtask check-storage  # that stick beside a copy of the release disk; the host checks the disk
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
 ```
 
@@ -114,7 +116,8 @@ a release image carry the same `init`.
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
 image start differing in anything new. It holds the **live image** to the same rule: its initramfs
 may differ from the release one only in `etc/init.toml`, and the filesystem inside its `root.img`
-must be the release root partition's, file for file.
+must be the release root partition's, file for file. The **test live image** `check-storage` boots
+is held the same way to a `--selftest` image.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
@@ -176,6 +179,18 @@ group 0**, done with the allocator the guest runs because a size assertion passe
 with allocation confined to the first group. The file goes to a copy, so the disk that boots is
 the one the installer made. The second boot is that disk alone, with no stick, and a greeter on
 it.
+
+`cargo xtask check-storage` is the **storage gate** (administration Part C.8), and the one whose
+verdict is a disk. It boots the **test live image** (`image --live --selftest`: the live stick with
+the test packages on its root) as a USB stick beside **a copy of the release disk** on the AHCI
+controller — the laptop with Nitrox installed and a stick in it, and the one topology with a second
+disk the host can read afterwards. On serial, the disk's `nitrox-root` is auto-mounted read-only
+and refuses a write, `with admin disk` remounts it writable, and `test-pattern` writes a pattern
+through a mapping and **exits without a sync**. The host reads the disk mid-run and finds the file
+without the pattern, so what it finds after `with admin disk --unmount`, the unmount put there.
+With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock's
+`s_state` clean, and the file holding the pattern, read with `debugfs` rather than the library
+that wrote it. It runs in CI's QEMU job.
 
 `cargo xtask check-report` is the **hardware report gate** (Phase 5 Part D). Every boot logs what it
 found — the bootloader handoff, the CPU, every ACPI table and MADT entry, each PCI function's

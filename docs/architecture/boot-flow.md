@@ -1,6 +1,6 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-25, when administration Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -97,6 +97,11 @@ filesystem inside `install-esp.img` to the **release image's own ESP**, file for
 is what catches a module built with the live `limine.conf` or the live initramfs — an installed
 machine that mounts the stick it was installed from, which boots once, on the desk, and never
 again.
+
+**A test live image** (`cargo xtask image --live --selftest`, administration Part C.8) is the same
+stick built with the test data a `--selftest` image carries: its kernel, its initramfs and a root
+with the test packages. `check-storage` boots it. `check-images` holds its first two claims to a
+`--selftest` image; the third is the release stick's alone, since nobody installs from a test one.
 
 The initramfs holds **four programs and two manifests**, and the rule is narrow: a program is
 in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads it),

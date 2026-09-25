@@ -29662,3 +29662,68 @@ And 2 on the broker's host tests, each failing its own test:
 - a stale life taking a code.
 
 The service-mgr fix's control is the code before it: 3 `check-terminal` failures in 9 runs.
+
+## 2026-09-25 — Administration C.8: `check-storage`, and Part C is complete
+
+**What landed:**
+- **`cargo xtask image --live --selftest`**, the test live image. It is the live stick built in
+  `--selftest` mode: that kernel, that initramfs with the live root's label, and a `root.img` with
+  the test packages, 29 MiB against the 64 MiB ceiling. It gets its own file, so it never stands in
+  for the release stick.
+- **`cargo xtask check-storage`**, in CI's QEMU job. It boots the test stick as a USB stick beside a
+  copy of the release disk on the AHCI controller. On serial:
+  - the disk's `nitrox-root` is auto-mounted read-only on a live boot, and a write there is refused
+    `NoAccess`;
+  - `with admin disk` unmounts it and mounts it writable;
+  - `test-pattern --write` writes 13,522 bytes through a mapping and exits without a sync;
+  - `test-pattern --check` reads them back through `/storage`;
+  - `with admin disk --unmount` runs the chain.
+
+  With the machine stopped, the host carves the partition out and checks it: `e2fsck -fn` clean,
+  `s_state` clean, and the file holding the pattern.
+- **`test-pattern`**, a test program: one binary with `--write` and `--check`. No release program
+  writes through a mapping and lets go without a sync.
+- **`check-images` holds the test stick to a `--selftest` image**, as it holds the release stick to
+  the release image: the initramfs differs only in `etc/init.toml`, and `root.img` matches the
+  ordinary root partition file for file. The installable-ESP claim stays the release stick's
+  alone; nobody installs from a test stick.
+
+**Where the gate departs from the plan's wording, and why:**
+- **The host reads the disk mid-run as well**, after the write and before the unmount. The file is
+  there at its size without the pattern, and the superblock says mounted. Without this, a writer
+  that synced, or a background write-back, would pass the final check just as well. With it, what
+  the host finds at the end is the unmount's doing. The mid-run read is safe because QEMU writes
+  the image file as the guest writes the disk, and nothing on the filesystem moves between steps.
+- **The contents are read with `debugfs`, and `s_state` from the superblock's bytes.** The plan
+  said to read with the `fs-server-ext4` library `check-install` uses. That library is the code
+  that wrote the file, and a gate should not take its aim from the code under test. The pattern is
+  written down a second time in `xtask` for the same reason.
+- **One test program, run twice**, where the plan said "a test program … and a second". The
+  pattern is defined once in the guest.
+- **The refused write is `test-pattern --write`**, which names the kernel's status. `touch` says
+  only "cannot create file", which a refusal for any other reason would also print.
+
+**The test services run on this boot too**, since it is a `--selftest` one. `boot-probe` would fail
+its storage checks without touching `nitrox-root`, because it finds no `nitrox-scratch` and stops.
+It never started on the runs measured: it waits for `test-harness`, which was still running its
+demos when the gate ended, under both TCG and KVM.
+
+**Measured:** KVM passed 3 of 3 runs and TCG 2 of 2, the full gate set's included.
+
+**Controls**, each a `check-storage --kvm` boot, each failing at its own check:
+- the writer syncs: the mid-run host read finds the pattern already on the disk;
+- the machine stops before the final unmount: `s_state` is `0x0000`;
+- the unmount writes nothing back: the unmount is refused, because the dirty file still counts as
+  held, and the gate times out waiting for it. That is defence in depth, but it means this control
+  never reaches the contents check, hence the next control but one;
+- the server records nothing clean but says it did: only the host's `s_state` read sees it;
+- a live boot mounts the disk writable: the report line says `(rw)`;
+- the unmount writes nothing back **and** does not ask what is held. The filesystem is recorded
+  clean and its dirty pages are dropped. `e2fsck` and `s_state` pass, and only the contents check
+  fails, differing at byte 0.
+
+And 2 on `check-images`, each failing its own claim while the release stick's still passed: one
+more file on the test stick's root, and one more in its initramfs.
+
+**Part C is complete**: C.1–C.8, and its Docs box, whose items landed with the pieces that built
+them.

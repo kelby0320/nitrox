@@ -471,7 +471,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `device-mgr`, with subscriptions by class that replay every present device (coldplug);
       `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
       can read, in place of listing `/dev/blk`.
-- [ ] **C — storage** — *detailed below, C.1–C.8.* Write-back of a registration's `FileObject`s;
+- [x] **C — storage** — *detailed below, C.1–C.8; complete 2026-09-25.* Write-back of a registration's `FileObject`s;
       a whole-filesystem sync and clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`;
       `OBJECT_KIND_SUBNAMESPACE`; the storage service — mount, unmount, auto-mount (read-only on a
       live boot), `/storage` bound into sessions and application namespaces, refusing a raw grant of
@@ -1223,21 +1223,33 @@ namespace, with no login and no session.
         `WouldBlock`, not the grant. `test-interactive`'s 20c runs `--list` in a session with no grant, `--mount`
         refused there, and `with admin disk --mount` on the ESP refused by the service for
         holding FAT.)*
-- [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
+- [x] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
       packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
       its SATA disk; assert `nitrox-root` auto-mounted read-only and a write to it refused; log in on
       serial and `with admin disk --unmount`, then `--mount` it writable; run a test program that
       writes a pattern through a mapping, **exits without a sync**, and a second that reads it back
       through `/storage` in the guest; unmount; stop the machine. On the host, carve `nitrox-root` from
       the disk: `e2fsck -fn` clean, `s_state` clean, and the file's **contents** the pattern — read
-      with the same `fs-server-ext4` library `check-install` uses.
-- [ ] **Docs**: a storage architecture doc; `filesystem-data-path.md` (the cache, the triggers, the
+      with the same `fs-server-ext4` library `check-install` uses. *(Landed 2026-09-25.*
+      - *The writer and the reader are one test program, `test-pattern`, with `--write` and
+        `--check`, so the pattern is written down once in the guest. `xtask` has its own copy.*
+      - *A write refused on the read-only mount is `test-pattern --write`, and the gate matches
+        the kernel's `NoAccess` rather than `touch`'s "cannot create file".*
+      - ***Added**: the host reads the disk mid-run, after the write and before the unmount. The
+        file is there at its size without the pattern, and the superblock says mounted. So what
+        the host finds at the end, the unmount put there.*
+      - ***Changed**: the contents are read with `debugfs`, not the `fs-server-ext4` library,
+        which is the code that wrote them. `s_state` is read from the superblock's bytes, not with
+        `was_left_clean`.*
+      - *`check-images` holds the test stick to the ordinary `--selftest` image as it holds the
+        release stick to the release image.)*
+- [x] **Docs**: a storage architecture doc; `filesystem-data-path.md` (the cache, the triggers, the
       dirty claim corrected); `ext4-fs-server-rw.md` (read-only mode, the state); the namespace-ops
       spec (`SUBNAMESPACE` built, the file id and read-only mark in the block reply);
       `rsproto-storage-ops.md`; `session-and-auth.md`'s <!-- check-docs: allow-missing -->
       table; `boot-flow.md`; `deferred-decisions.md` — teardown write-back and `TODO(ahci-flush)`
       resolved, the page cache's first axis resolved and its other two kept, the new `File::Forget`
-      boundary noted.
+      boundary noted. *(Each landed with the piece that built it, C.1–C.8.)*
 
 **Part C may land as two PRs** — C.1–C.4, the kernel and `fs-server-ext4`, then C.5–C.8 — if one
 proves too large to review. The first half is useful on its own, but less than it sounds: it makes

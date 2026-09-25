@@ -1,6 +1,6 @@
 # Storage
 
-**Status: built as administration Parts C.5 to C.7 drew it — 2026-09-25; last checked
+**Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; last checked
 2026-09-25.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
@@ -21,9 +21,7 @@ What exists:
 - **`disk`** (C.7), the coreutil a person runs: `disk --list` from any session, and `disk --mount`
   and `disk --unmount` in a view with the `storage` grant
   ([`shell-language.md`](../spec/shell-language.md) §10d).
-
-What does not exist yet ([`administration.md`](../planning/administration.md) § *Part C in
-detail*): **`check-storage`** (C.8).
+- **`check-storage`** (C.8), the gate whose verdict is a disk the host reads (§11).
 
 ## 1. What it is for
 
@@ -257,6 +255,7 @@ service itself at `/svc/storage`.
 | Gate | What it asserts |
 |---|---|
 | `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real |
+| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller. The disk's `nitrox-root` is auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. `with admin disk` unmounts it and mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs` |
 | `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
@@ -281,8 +280,6 @@ how, and what each suffix asks for where it arrives.
   unmounted finds the channel closed.
 - **Nothing unmounts `init`'s mounts**, so nothing syncs them before the machine stops. That is
   Part E's `shutdown`.
-- **A live boot's read-only auto-mount has no gate yet.** `check-live` has nothing to mount, and
-  `check-storage`, which boots a live image beside a SATA disk, is C.8's.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

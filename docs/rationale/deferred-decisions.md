@@ -1582,7 +1582,9 @@ registration (`filesystem-data-path.md` § *One object per file*).
 refuses while a file is still held (`sys_ns_held`), and only then has the server record the
 filesystem clean ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md) § `Unmount`).
 `boot-probe` proves it on every run: a file written through a mapping and never synced is on the
-device after the unmount.
+device after the unmount. **C.8's `check-storage` proves it where the host can read the result**: a
+real SATA disk, unmounted in the guest and then checked on the host. The file holds its pattern,
+`e2fsck -fn` finds the filesystem clean, and the superblock says so.
 
 **What is still owed:**
 - **`init`'s mounts are never unmounted, so nothing syncs them before the machine stops.**

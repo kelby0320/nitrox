@@ -357,6 +357,7 @@ fn main() -> ExitCode {
         "check-login",
         "check-fbcon",
         "check-live",
+        "check-storage",
         "check-report",
         "check-install",
         "shot",
@@ -408,7 +409,7 @@ fn main() -> ExitCode {
 
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
-        Some("image") if live => cmd_image_live(),
+        Some("image") if live => cmd_image_live_for(mode),
         Some("image") => cmd_image(mode),
         Some("qemu") => cmd_qemu(false, mode, accel, grab, size, &qargs),
         Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, size, &qargs),
@@ -440,6 +441,7 @@ fn main() -> ExitCode {
         Some("check-login") => cmd_check_login(accel, gate_size),
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
+        Some("check-storage") => cmd_check_storage(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
@@ -634,6 +636,9 @@ const TEST_PROGRAMS: &[&str] = &[
     // The M13 Part A measurement. In the same package as the rest: it is a test program, and a
     // package per binary would claim an independence it does not have.
     "compose-bench",
+    // `check-storage`'s writer and reader (administration Part C.8): no release program writes
+    // through a mapping and lets go without a sync.
+    "test-pattern",
 ];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
@@ -3648,6 +3653,320 @@ fn run_live_steps(s: &mut Session) -> R<()> {
         .into());
     }
     println!("  ok: and no session on this boot could reach a disk");
+    Ok(())
+}
+
+/// The file `check-storage` writes, at the root of the SATA disk's `nitrox-root`.
+const STORAGE_PATTERN_FILE: &str = "check-storage.bin";
+/// The pattern `test-pattern` writes, **written down a second time here** so the gate does not
+/// take its aim from the program under test: `userspace/test-harness/src/pattern.rs`'s `LEN` and
+/// `byte` must match these.
+const STORAGE_PATTERN_LEN: usize = 3 * 4096 + 1234;
+
+/// Byte `i` of [`STORAGE_PATTERN_LEN`]'s pattern.
+fn storage_pattern_byte(i: usize) -> u8 {
+    ((i >> 12) as u8).wrapping_mul(0x5B) ^ (i as u8) ^ 0xA5
+}
+
+/// `cargo xtask check-storage` — **the storage chain, with the host holding the result**
+/// (administration Part C.8).
+///
+/// The test live image boots as a USB stick beside **a copy of the release disk** on the AHCI
+/// controller: the laptop with Nitrox installed and a stick in it. That is the one topology with a
+/// second disk the host can read afterwards, since the only other second disk a boot can have is a
+/// RAM disk, whose writes never reach a host file.
+///
+/// On the serial console: the storage service auto-mounts the disk's `nitrox-root` read-only, it
+/// being a live boot, and a write there is refused. `with admin disk` unmounts it and mounts it
+/// writable. `test-pattern` writes a pattern through a mapping and **exits without a sync**, and
+/// the host sees the file on the disk without the pattern. `test-pattern --check` reads it back
+/// through `/storage`, and `with admin disk --unmount` runs the chain. Then the machine is stopped,
+/// and the host carves `nitrox-root` out of the disk: `e2fsck -fn` clean, the superblock marked
+/// clean, and the file holding the pattern — read with `debugfs`, not with the library that wrote
+/// it.
+fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    require_tool("e2fsck")?;
+    require_tool("debugfs")?;
+    // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
+    // wrote. The release image is built first: building the test stick rebuilds the programs
+    // for its own mode.
+    cmd_image(BuildMode::Normal)?;
+    let work = build_cache().join("check-storage");
+    fs::create_dir_all(&work)?;
+    let disk = work.join("disk.img");
+    let _ = fs::remove_file(&disk);
+    fs::copy(image_path(), &disk)?;
+    cmd_image_live_for(BuildMode::Selftest)?;
+
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_test_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-drive")
+        .arg(format!("if=none,id=disk,format=raw,file={}", disk.display()))
+        .arg("-device")
+        .arg("ide-hd,drive=disk,bus=ide.0")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!(
+        "xtask: storage gate — booting the test live image beside a copy of the release disk…\n"
+    );
+    let mut session = Session::spawn(cmd, "check-storage")?;
+    let result = run_storage_steps(&mut session, &disk, &work);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    println!("\nxtask: the machine is stopped; the disk, on the host:");
+    check_storage_disk(&disk, &work)?;
+    println!(
+        "\nxtask: a file written through a mapping and never synced reached the disk through an \
+         unmount, and the filesystem was left clean ✓"
+    );
+    Ok(())
+}
+
+/// The SATA disk's `nitrox-root`, as it stands in the disk image `disk`, carved into `work`.
+fn storage_root_fs(disk: &Path, work: &Path) -> R<PathBuf> {
+    let fs_img = work.join("nitrox-root.ext4");
+    carve_partition(disk, 2, &fs_img)?;
+    Ok(fs_img)
+}
+
+/// `path`'s bytes in the ext4 image `fs_img`, read with `debugfs`; `None` if it is not there.
+fn debugfs_cat(fs_img: &Path, path: &str) -> R<Option<Vec<u8>>> {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("cat {path}"))
+        .arg(fs_img)
+        .output()
+        .map_err(|e| format!("run debugfs: {e}"))?;
+    if String::from_utf8_lossy(&out.stderr).contains("not found") {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        return Err(format!("debugfs could not read {path} in {}", fs_img.display()).into());
+    }
+    Ok(Some(out.stdout))
+}
+
+/// The superblock's `s_state` in the ext4 image `fs_img`: bytes 58–59 of the superblock at 1024.
+/// Read here rather than through `fs_server_ext4::ext4::was_left_clean`, which is the code under
+/// test.
+fn ext4_s_state(fs_img: &Path) -> R<u16> {
+    let bytes = fs::read(fs_img)?;
+    let at = 1024 + 58;
+    bytes
+        .get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or_else(|| format!("{} has no superblock", fs_img.display()).into())
+}
+
+/// `s_state`'s "cleanly unmounted" bit (`EXT4_VALID_FS`) and its error bit (`EXT4_ERROR_FS`).
+const EXT4_VALID_FS: u16 = 0x0001;
+const EXT4_ERROR_FS: u16 = 0x0002;
+
+fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
+    let at = format!("/storage/{ROOT_PARTLABEL}/{STORAGE_PATTERN_FILE}");
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+
+    // 0. The menu's countdown boots its first entry, the ordinary one.
+    s.expect(", cmdline \"\"")?;
+
+    // 1. **The disk's root is auto-mounted read-only**, the boot being a live one. Its name is
+    //    what the storage service calls it, read off the line that reports it.
+    let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
+    s.expect(&reported)?;
+    let line = s
+        .transcript()
+        .lines()
+        .find(|l| l.contains(&reported))
+        .map(str::to_string)
+        .ok_or("the report line went missing from the transcript")?;
+    let name = line
+        .split_whitespace()
+        .find(|w| w.starts_with("blk-"))
+        .ok_or_else(|| format!("no `blk-<n>` in {line:?}"))?
+        .to_string();
+    let index = name.trim_start_matches("blk-").to_string();
+    if !line.contains(&format!("mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
+        return Err(format!(
+            "the disk's {ROOT_PARTLABEL} is not auto-mounted read-only: {line:?}. A live boot \
+             mounts the machine's own disks read-only, and this is one"
+        )
+        .into());
+    }
+    s.expect("storage-service: a live boot")?;
+    println!("  ok: {name}, the disk's {ROOT_PARTLABEL}, auto-mounted read-only on a live boot");
+
+    // 2. A serial login. The prompt is searched for in the whole transcript, as `check-live`
+    //    does: it and the greeter come up together.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !s.transcript().contains("nitrox login:") {
+        if std::time::Instant::now() > deadline {
+            return Err("no `nitrox login:` prompt on the serial column".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+
+    // 3. **A write there is refused**, by the read-only mount: named, rather than any failure.
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: {at} refused: NoAccess (-2)"))?;
+    s.expect("/home>")?;
+    println!("  ok: a write to it is refused NoAccess");
+
+    // 4. Unmounted, and mounted writable, through the `storage` grant.
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    admin(s, &format!("disk --mount /dev/blk/{index}"))?;
+    s.expect(&format!("storage-service: mounted {ROOT_PARTLABEL} (rw), as asked"))?;
+    s.expect(&format!("disk: mounted {name} at /storage/{ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: `with admin disk` unmounted it and mounted it writable");
+
+    // 5. **Written through a mapping, and not synced.**
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!(
+        "test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not \
+         sync"
+    ))?;
+    s.expect("/home>")?;
+
+    // 6. **On the host, the file is on the disk and the pattern is not** — so what the last step
+    //    finds, the unmount put there. Read while the guest runs: QEMU writes the image file as
+    //    the guest writes the disk, and nothing on this filesystem is moving between steps. The
+    //    file's being there, at its size, is what makes the pattern's absence mean something:
+    //    this is the live filesystem the host is reading, and its data has not been written yet.
+    //    And the superblock says it is mounted writable, so a clean one at the end is the
+    //    unmount's doing.
+    let fs_img = storage_root_fs(disk, work)?;
+    let path = format!("/{STORAGE_PATTERN_FILE}");
+    match debugfs_cat(&fs_img, &path)? {
+        None => {
+            return Err(format!(
+                "{path} is not on the disk at all after `test-pattern --write`: the server's \
+                 create did not reach it, so the absence of the pattern would prove nothing"
+            )
+            .into())
+        }
+        Some(b) if b.len() != STORAGE_PATTERN_LEN => {
+            return Err(format!(
+                "{path} is on the disk at {} bytes, not the {STORAGE_PATTERN_LEN} it was created \
+                 with",
+                b.len()
+            )
+            .into())
+        }
+        Some(b) if b == pattern => {
+            return Err(format!(
+                "{path} already holds the pattern before any sync or unmount — something wrote it \
+                 back, so this gate cannot show that the unmount does"
+            )
+            .into())
+        }
+        Some(_) => {}
+    }
+    let state = ext4_s_state(&fs_img)?;
+    if state & EXT4_VALID_FS != 0 {
+        return Err(format!(
+            "the superblock says clean (s_state {state:#06x}) while the filesystem is mounted \
+             writable, so a clean one at the end would not be the unmount's doing"
+        )
+        .into());
+    }
+    println!(
+        "  ok: on the host meanwhile: the file is there at {STORAGE_PATTERN_LEN} bytes without the \
+         pattern, and the superblock says mounted"
+    );
+
+    // 7. Read back through `/storage` in the guest: from the kernel's cache, the one object.
+    s.send(&format!("test-pattern --check {at}"))?;
+    s.expect(&format!("test-pattern: {at} holds the pattern, {STORAGE_PATTERN_LEN} bytes ok"))?;
+    s.expect("/home>")?;
+    println!("  ok: test-pattern reads it back through /storage");
+
+    // 8. **The unmount**: written back, marked clean, the drive flushed.
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: `with admin disk --unmount` ran the chain");
+    Ok(())
+}
+
+/// The disk, once the machine has stopped: `e2fsck -fn` clean, the superblock marked clean, and
+/// the file holding the pattern.
+fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
+    let fs_img = storage_root_fs(disk, work)?;
+    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
+    // `check_installed_root` reads it.
+    let out = Command::new("e2fsck")
+        .args(["-fn", &fs_img.display().to_string()])
+        .output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
+    }
+    println!("  ok: e2fsck -fn finds it clean");
+    let state = ext4_s_state(&fs_img)?;
+    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
+        return Err(format!(
+            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
+             set. The unmount's `Meta::Unmount` is what records it clean"
+        )
+        .into());
+    }
+    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    let path = format!("/{STORAGE_PATTERN_FILE}");
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+    match debugfs_cat(&fs_img, &path)? {
+        Some(b) if b == pattern => {}
+        Some(b) => {
+            let first = (0..STORAGE_PATTERN_LEN).find(|&i| b.get(i) != Some(&pattern[i]));
+            return Err(format!(
+                "{path} on the disk is {} bytes and is not the pattern (first difference at \
+                 byte {first:?}): the unmount did not write the mapped pages back",
+                b.len()
+            )
+            .into());
+        }
+        None => return Err(format!("{path} is not on the disk").into()),
+    }
+    println!("  ok: {path} holds the pattern, {STORAGE_PATTERN_LEN} bytes, read by debugfs");
     Ok(())
 }
 
@@ -12179,23 +12498,29 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// `check-images`' live half: the live image differs from the release image **only in data**.
+/// `check-images`' live half: the live image differs from the image of its mode **only in data** —
+/// the release stick from the release image, and the test stick (`image --live --selftest`) from a
+/// `--selftest` image.
 ///
 /// Three claims, each checked against what the builds produced rather than against the functions
 /// that produced them — a live build that called `stage_rootfs` and then wrote one file more would
 /// pass a check on the function (PR #297 review):
 ///
-/// 1. the live initramfs carries the release initramfs's files, byte-identical except
+/// 1. the live initramfs carries the ordinary initramfs's files, byte-identical except
 ///    `etc/init.toml`, which must differ — it names `nitrox-live`;
 /// 2. the ext4 filesystem inside the built stick's `root.img` holds the same entries as the
-///    release image's root partition — names, kinds, sizes and contents — read back out of both
+///    ordinary image's root partition — names, kinds, sizes and contents — read back out of both
 ///    with `debugfs`;
-/// 3. the FAT filesystem inside the stick's `install-esp.img` module — the ESP the installer
-///    writes to a disk — holds the same entries as the release image's own ESP. The first two
-///    are about the stick booting; this one is about the machine booting once the stick is gone.
-fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
-    let live_cpio = dir.join("live.cpio");
-    build_initramfs_for(&live_cpio, BuildMode::Normal, RootDevice::Live)?;
+/// 3. for the release stick, the FAT filesystem inside its `install-esp.img` module — the ESP the
+///    installer writes to a disk — holds the same entries as the release image's own ESP. The
+///    first two are about the stick booting; this one is about the machine booting once the stick
+///    is gone. Nobody installs from a test stick, so it is not asked of that one.
+fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
+    let tag = if mode.stages_test_data() { "live-test" } else { "live" };
+    let what = if mode.stages_test_data() { "the test live" } else { "the live" };
+    let base = if mode.stages_test_data() { "a --selftest" } else { "the release" };
+    let live_cpio = dir.join(format!("{tag}.cpio"));
+    build_initramfs_for(&live_cpio, mode, RootDevice::Live)?;
     let r = cpio_entries(&fs::read(release_cpio)?);
     let l = cpio_entries(&fs::read(&live_cpio)?);
     let mut names: Vec<&String> = r.keys().chain(l.keys()).collect();
@@ -12210,60 +12535,65 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     const MARKER: &str = "etc/install-allowed";
     if !l.contains_key(MARKER) {
         return Err(format!(
-            "the live initramfs must carry `{MARKER}`: it is what permits an installer session, \
+            "{what} initramfs must carry `{MARKER}`: it is what permits an installer session, \
              and without it the live image's own install entry does nothing"
         )
         .into());
     }
     if r.contains_key(MARKER) {
         return Err(format!(
-            "a release initramfs must not carry `{MARKER}` — it is what keeps an installer \
-             session a live-image thing rather than something any boot can ask for"
+            "{base} initramfs must not carry `{MARKER}` — it is what keeps an installer session \
+             a live-image thing rather than something any boot can ask for"
         )
         .into());
     }
     let differ: Vec<&String> = differ.into_iter().filter(|k| k.as_str() != MARKER).collect();
     if differ != ["etc/init.toml"] {
         return Err(format!(
-            "the live initramfs must differ from the release one in `etc/init.toml` alone — the \
-             root's partition label — and it differs in {differ:?}. A live image is the release \
-             image with its root in RAM; a program or a declaration that differs is a live-only \
+            "{what} initramfs must differ from {base} one in `etc/init.toml` alone — the root's \
+             partition label — and it differs in {differ:?}. A live image is the image of its \
+             mode with its root in RAM; a program or a declaration that differs is a live-only \
              build, which Part C's discipline rules out."
         )
         .into());
     }
     println!(
-        "check-images: the live initramfs is the release one but for etc/init.toml ({} files) ✓",
+        "check-images: {what} initramfs is {base} one but for etc/init.toml ({} files) ✓",
         r.len()
     );
 
     require_tool("debugfs")?;
-    cmd_image(BuildMode::Normal)?;
-    cmd_image_live()?;
-    let release_fs = dir.join("release-root.ext4");
+    cmd_image(mode)?;
+    cmd_image_live_for(mode)?;
+    let stick = if mode.stages_test_data() { live_test_image_path() } else { live_image_path() };
+    let release_fs = dir.join(format!("{tag}-base-root.ext4"));
     carve_partition(&image_path(), 2, &release_fs)?;
-    let esp = dir.join("live-esp.img");
-    carve_partition(&live_image_path(), 1, &esp)?;
-    let root_img = dir.join("live-root.img");
+    let esp = dir.join(format!("{tag}-esp.img"));
+    carve_partition(&stick, 1, &esp)?;
+    let root_img = dir.join(format!("{tag}-root.img"));
     let _ = fs::remove_file(&root_img);
     run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/root.img").arg(&root_img))?;
-    let live_fs = dir.join("live-root.ext4");
+    let live_fs = dir.join(format!("{tag}-root.ext4"));
     carve_partition(&root_img, 1, &live_fs)?;
 
-    let release_tree = ext4_tree(&release_fs, &dir.join("release-root"))?;
-    let live_tree = ext4_tree(&live_fs, &dir.join("live-root"))?;
-    let problems = tree_problems(&release_tree, &live_tree, "the live root");
+    let release_tree = ext4_tree(&release_fs, &dir.join(format!("{tag}-base-root")))?;
+    let live_tree = ext4_tree(&live_fs, &dir.join(format!("{tag}-root")))?;
+    let problems = tree_problems(&release_tree, &live_tree, &format!("{what} root"));
     if !problems.is_empty() {
         return Err(format!(
-            "the filesystem inside the live image's root.img is not the release root: {problems:?}. \
-             The live root is built from `stage_rootfs` for a release image and nothing else."
+            "the filesystem inside {what} image's root.img is not {base} image's root: \
+             {problems:?}. The live root is built from `stage_rootfs` for the image's mode and \
+             nothing else."
         )
         .into());
     }
     println!(
-        "check-images: the live root.img holds the release root's {} entries, byte for byte ✓",
+        "check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓",
         release_tree.len()
     );
+    if mode.stages_test_data() {
+        return Ok(());
+    }
 
     // **The installable ESP is the release ESP** (Phase 5 Part H.1, PR #307 review finding 6).
     // The two claims above compare the parts of the live image that boot the *stick*; this module
@@ -12459,7 +12789,15 @@ fn cmd_check_images() -> R<()> {
     // **The third mode, the live image** (Phase 5 Part C), while the release programs are the
     // ones built: its initramfs may differ from the release one in the root's label and nothing
     // else, and the filesystem inside its `root.img` must be the release root's.
-    check_live_image(&dir, &release)?;
+    check_live_image(&dir, &release, BuildMode::Normal)?;
+
+    // **And the test live image** (administration Part C.8), held to a `--selftest` image as the
+    // release stick is held to the release image: `check-storage` boots it, and what it proves
+    // about the storage chain holds for the release stick only while the two differ in data.
+    let selftest = dir.join("selftest.cpio");
+    cmd_build(BuildMode::Selftest)?;
+    build_initramfs(&selftest, BuildMode::Selftest)?;
+    check_live_image(&dir, &selftest, BuildMode::Selftest)?;
 
     cmd_build(BuildMode::TestHarness)?;
     build_initramfs(&test, BuildMode::TestHarness)?;
@@ -13702,6 +14040,18 @@ fn live_initramfs_path() -> PathBuf {
     build_cache().join("initramfs-live.cpio")
 }
 
+/// The **test** live image (administration Part C.8): the live image built with `--selftest`, for
+/// `check-storage`. A file of its own, so a test stick never stands in for the release one that
+/// `check-live`, `check-report` and `check-install` boot.
+fn live_test_image_path() -> PathBuf {
+    build_cache().join("nitrox-live-test.img")
+}
+
+/// The test live image's initramfs.
+fn live_test_initramfs_path() -> PathBuf {
+    build_cache().join("initramfs-live-test.cpio")
+}
+
 /// The root partition's label on a disk.
 const ROOT_PARTLABEL: &str = "nitrox-root";
 
@@ -14221,21 +14571,37 @@ fn test_limine_conf(base: &str) -> R<String> {
 /// with the release root filesystem riding along as a second Limine module, so a machine boots to
 /// a desktop without a storage driver.
 fn cmd_image_live() -> R<()> {
-    let mode = BuildMode::Normal;
+    cmd_image_live_for(BuildMode::Normal)
+}
+
+/// The live image built in `mode`: the release one, or with `--selftest` the **test live image**
+/// (administration Part C.8) — the same stick with the test data a `--selftest` image carries,
+/// its test packages on the root in RAM. `check-images` holds each to its own ordinary image.
+fn cmd_image_live_for(mode: BuildMode) -> R<()> {
     cmd_build(mode)?;
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
-    let initramfs = live_initramfs_path();
+    let (initramfs, out) = if mode.stages_test_data() {
+        (live_test_initramfs_path(), live_test_image_path())
+    } else {
+        (live_initramfs_path(), live_image_path())
+    };
     build_initramfs_for(&initramfs, mode, RootDevice::Live)?;
-    assemble_live_image(&bootx64, &kernel_elf(), &initramfs, &live_image_path())?;
-    println!("xtask: live image at {}", live_image_path().display());
+    assemble_live_image(&bootx64, &kernel_elf(), &initramfs, &out, mode)?;
+    println!("xtask: live image at {}", out.display());
     Ok(())
 }
 
 /// Assemble the live image at `out`: a GPT disk with one ESP holding everything, `root.img`
 /// included. `root.img` is itself a GPT image with one `nitrox-live` partition, whose ext4
-/// filesystem is built from [`stage_rootfs`] for a release image — the release root, in RAM.
-fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Path) -> R<()> {
+/// filesystem is built from [`stage_rootfs`] for `mode` — the release root, in RAM, or a test one.
+fn assemble_live_image(
+    bootx64: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    out: &Path,
+    mode: BuildMode,
+) -> R<()> {
     const MIB: u64 = 1024 * 1024;
     require_tool("sgdisk")?;
     require_tool("mformat")?;
@@ -14251,7 +14617,7 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
 
     // 1. `root.img`: a partition sized to the staged tree plus room to write, under its ceiling.
     let staging = work.join("rootfs");
-    stage_rootfs(&staging, BuildMode::Normal)?;
+    stage_rootfs(&staging, mode)?;
     let staged = tree_bytes(&staging)?;
     let part_mib = staged.div_ceil(MIB) + LIVE_ROOT_SLACK_MIB;
     let root_img_mib = part_mib + 2; // a MiB before the partition, room for the backup GPT after
@@ -14300,9 +14666,13 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
     //    `check_live_image` reads this filesystem back out of the built stick and holds every
     //    file in it against the release ESP, because the mistake is invisible until a real
     //    machine reboots without the stick.
+    //
+    //    **In a test live image it is built in the same mode as the rest**, so the kernel beside it
+    //    and its initramfs agree. Nobody installs from a test stick; `check-images` compares only
+    //    the release stick's installable ESP with a release image's.
     let install_esp = work.join("install-esp.img");
     let install_initramfs = work.join("initramfs");
-    build_initramfs_for(&install_initramfs, BuildMode::Normal, RootDevice::Disk)?;
+    build_initramfs_for(&install_initramfs, mode, RootDevice::Disk)?;
     let esp_payload = [bootx64, kernel, install_initramfs.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))

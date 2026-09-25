@@ -26,6 +26,8 @@ libterm = { path = "../libterm" }
 # The ext4 library, for `boot-probe` to read what the root partition holds rather than what the
 # page cache does (administration Part C.1) — as `nxinstall` reads a source filesystem.
 fs-server-ext4 = { path = "../fs-server-ext4" }
+# Whole-file reads, for `test-pattern --check`.
+libfs = { path = "../libfs" }
 
 [[bin]]
 name = "test-harness"
@@ -55,6 +57,12 @@ path = "src/inputclient.rs"
 [[bin]]
 name = "boot-probe"
 path = "src/bootprobe.rs"
+
+# `check-storage`'s writer (administration Part C.8): a pattern written through a mapping and let
+# go without a sync, which no release program does, and read back.
+[[bin]]
+name = "test-pattern"
+path = "src/pattern.rs"
 
 # The M13 Part A measurement: what composing a drag costs, and where. Its own binary because it
 # owns the screen for the length of a run — the bench image carries it *instead of* `boot-probe`,
