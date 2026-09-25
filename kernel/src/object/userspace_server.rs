@@ -49,8 +49,8 @@ use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
-use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+use crate::object::{FileObject, Forgotten, ObjectRef};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (so a lazy `File`
 /// resolve can name the file in its page-cache producer without allocating under
@@ -193,6 +193,10 @@ struct CachedFile {
     /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
     /// entry out, by address, so an entry never outlives the memory it names.
     obj: *mut (),
+    /// **Its server forgot it with I/O of it in flight** (`File::Forget`). The entry stays so a
+    /// second `Forget` of the id finds the object and waits on the first one's answer. No
+    /// resolve or sync sees it, and it goes with the object.
+    forgotten: bool,
 }
 
 /// The kernel's registration record for one Userspace Server.
@@ -252,10 +256,11 @@ impl UserspaceServerReg {
     /// cached, a new reference to it is returned and `obj` is left for the caller to drop —
     /// outside this lock. Otherwise `obj` is entered under `id` (replacing an entry whose
     /// object is mid-teardown) and `Ok(None)` returned. `Err` only if the index cannot grow.
+    /// A forgotten entry is passed by: its file has been freed, or is about to be.
     pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
         debug_assert_eq!(obj.object_type(), KObjectType::FileObject);
         let mut g = self.files.lock();
-        if let Some(e) = g.iter_mut().find(|e| e.id == id) {
+        if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
             // SAFETY: the entry's object is live — its `Drop` removes the entry under this
             // lock before its memory goes, so while the lock is held the pointer is readable.
             if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
@@ -266,20 +271,54 @@ impl UserspaceServerReg {
             e.obj = obj.as_ptr();
             return Ok(None);
         }
-        g.try_push(CachedFile { id, obj: obj.as_ptr() })?;
+        g.try_push(CachedFile { id, obj: obj.as_ptr(), forgotten: false })?;
         Ok(None)
     }
 
-    /// **Take file `id` out of the cache**, returning its object if it is live — a
-    /// `File::Forget`. The entry goes either way, so a later resolve of the id, which after an
-    /// unlink may name a new file, gets a new object. The reference is the caller's to drop,
-    /// outside this lock.
-    pub fn cache_take(&self, id: u64) -> Option<ObjectRef> {
-        let mut g = self.files.lock();
-        let i = g.iter().position(|e| e.id == id)?;
-        let e = g.remove(i);
-        // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-        unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) }
+    /// **`File::Forget` of file `id`**, with `answer` the PO its server waits on if it has to.
+    ///
+    /// A live entry is the file the server means. Failing that, the entry an earlier `Forget`
+    /// left because I/O of the file was in flight: this is a second `Forget` while the first
+    /// waits, and [`FileObject::forget`] hands it the first one's PO. The entry is marked
+    /// forgotten, so no later resolve of the id — which after a free may name a new file —
+    /// and no sync finds the object. It goes now if nothing is in flight, else with the object.
+    ///
+    /// The first version took the entry out on every `Forget`. A second then found nothing and
+    /// was answered at once, with the first one's IRP still in flight (PR #335 review).
+    /// [`Forgotten::Now`] if the id is not cached.
+    pub fn forget_file(&self, id: u64, answer: &ObjectRef) -> Forgotten {
+        let obj = {
+            let mut g = self.files.lock();
+            let Some(i) = g
+                .iter()
+                .position(|e| e.id == id && !e.forgotten)
+                .or_else(|| g.iter().rposition(|e| e.id == id))
+            else {
+                return Forgotten::Now;
+            };
+            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
+            match unsafe { ObjectRef::try_acquire(g[i].obj, KObjectType::FileObject) } {
+                Some(obj) => {
+                    g[i].forgotten = true;
+                    obj
+                }
+                // Mid-teardown, so nothing of it is in flight: an IRP pins its object.
+                None => {
+                    g.remove(i);
+                    return Forgotten::Now;
+                }
+            }
+        };
+        // Outside the files lock: the object's own lock ranks below it.
+        // SAFETY: `obj` pins a live `FileObject`.
+        let fo: &FileObject = unsafe { &*(obj.as_ptr() as *const FileObject) };
+        let outcome = fo.forget(answer);
+        if matches!(outcome, Forgotten::Now) {
+            self.cache_forget_object(obj.as_ptr());
+        }
+        // Dropped here, outside the lock, since it may be the last reference.
+        drop(obj);
+        outcome
     }
 
     /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
@@ -291,12 +330,13 @@ impl UserspaceServerReg {
     }
 
     /// Every live cached object, each a new reference the caller drops — outside this lock,
-    /// which it is by the time this returns. `Err` if the list cannot be built.
+    /// which it is by the time this returns. Forgotten ones are left out: nothing of theirs is
+    /// written again. `Err` if the list cannot be built.
     pub fn cache_objects(&self) -> Result<KVec<ObjectRef>, AllocError> {
         let mut out = KVec::new();
         let g = self.files.lock();
         out.try_reserve(g.len())?;
-        for e in g.iter() {
+        for e in g.iter().filter(|e| !e.forgotten) {
             // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
             if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
                 // `try_reserve` above guarantees this push does not allocate.

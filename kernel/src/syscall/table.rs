@@ -2595,13 +2595,15 @@ pub fn sys_channel_send(
 
 /// **Answer a server's `File::Forget`** (administration Part C.1b): the file `file_id` is
 /// about to be freed, and the server frees its blocks only once the kernel says nothing of it
-/// is in flight. The file's cached object, if any, leaves the cache and is forgotten — it
-/// starts no more device I/O — and the answer is a `PendingOperation` installed in the
-/// server's table: complete already if nothing was in flight, otherwise completed when the
-/// last IRP ends ([`FileObject::end_io`]). The server `sys_wait`s on it, which is why a
-/// `Forget` must be sent `Block`: it is the send mode whose result is a PO.
+/// is in flight. The file's cached object, if any, is forgotten
+/// ([`UserspaceServerReg::forget_file`](crate::object::UserspaceServerReg::forget_file)): it starts
+/// no more device I/O, and no resolve or sync finds it again. The answer is a
+/// `PendingOperation` installed in the server's table. It is complete already if nothing was
+/// in flight, and otherwise completed when the last IRP ends ([`FileObject::end_io`]); a second
+/// `Forget` meanwhile gets the same one. The server `sys_wait`s on it, which is why a `Forget`
+/// must be sent `Block`: it is the send mode whose result is a PO.
 fn answer_forget(reg: *mut (), file_id: u64, pid: u32) -> SysResult {
-    use crate::object::{FileObject, Forgotten, UserspaceServerReg};
+    use crate::object::{Forgotten, UserspaceServerReg};
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
     let answer =
@@ -2612,26 +2614,14 @@ fn answer_forget(reg: *mut (), file_id: u64, pid: u32) -> SysResult {
     };
     // SAFETY: `reg_ref` pins the registration.
     let r: &UserspaceServerReg = unsafe { &*(reg_ref.as_ptr() as *const UserspaceServerReg) };
-    let cached = r.cache_take(file_id);
-    let wait_on = match &cached {
-        Some(obj) => {
-            // SAFETY: `obj` pins a live `FileObject`.
-            let fo: &FileObject = unsafe { &*(obj.as_ptr() as *const FileObject) };
-            match fo.forget(&answer) {
-                Forgotten::Now => None,
-                Forgotten::Later(po) => Some(po),
-            }
-        }
-        None => None,
-    };
-    let wait_on = match wait_on {
-        Some(po) => po,
-        None => {
+    let wait_on = match r.forget_file(file_id, &answer) {
+        Forgotten::Later(po) => po,
+        Forgotten::Now => {
             crate::sched::complete_pending_op(answer.as_ptr(), 0, 0);
             answer.clone()
         }
     };
-    drop((cached, answer, reg_ref));
+    drop((answer, reg_ref));
     let (op, ot) = wait_on.into_raw();
     match global::get().allocate(pid, op, ot, pending_op_rights()) {
         Ok(h) => Ok(h.bits() as isize),

@@ -29245,3 +29245,43 @@ refused up front, each with a control.
 Two doc comments had drifted onto the wrong items and are back where they belong:
 `forward_userspace_lookup`'s had been sitting on `join_subtree`, and `OBJECT_KIND_MEMOBJ`'s on
 `OBJECT_KIND_NONE`.
+
+## 2026-09-24 — Administration C.1–C.4, reviewed: a second `Forget`, and a deferral half paid
+
+PR #335's review found one blocking item, CI's red `check-display --kvm`, and two worth fixing.
+It broke the code under 11 of the new host tests, and each failed.
+
+**CI.** This is C.1a's fifth finding above: the display gate's stack was a race that C.1's shared
+cache made a coin flip. The review measured the same thing from the other side. In its failing
+screendumps the toolkit reference was "missing, shadow included" with `nxterm` showing through,
+which is `nxterm`'s window stacked between the toolkit and the terminal reference. Its guest
+transcript "showed nothing" because it was not that boot's: `check-display` saves
+`guest-transcript-check-display.log` only on a timeout. So a pixel failure leaves the last
+timeout's file under a current-looking name. The copy both sessions read dated from 2026-09-16.
+
+**1. A second `Forget` was answered at once.** The spec said a second `Forget` of a file while the
+first waits gets the same PO. `FileObject::forget` did that, but `answer_forget` never reached it
+twice: the first `Forget` took the cache entry out, so a second found nothing and was completed
+with the first one's IRP still in flight. A server that sent `Forget` twice could then free a block
+the IRP was about to write. `fs-server-ext4` is single-threaded and blocks on the first answer, so
+nothing reaches it today. The test that claimed the property called the object directly, a path no
+send takes.
+
+The spec's promise is the one kept. `UserspaceServerReg::forget_file` replaces `cache_take`:
+- It marks the entry **forgotten** instead of removing it.
+- It removes the entry at once only when the answer is immediate. Otherwise the entry goes with
+  the object.
+- A forgotten entry is passed by every resolve and every sync, and a live entry of the id is
+  preferred over it.
+
+Two host tests go through the registration. Five controls each fail one:
+- removing the entry at every `Forget`;
+- a resolve finding a forgotten entry;
+- a sync listing one;
+- keeping the entry after an immediate answer;
+- preferring a forgotten entry over a live one.
+
+**2. `deferred-decisions.md` still said `sys_file_sync` was the only writeback trigger.** The
+entry now records what C.1 built: the self-pin, and `sys_ns_sync`. It also says what is owed. C.5's
+unmount and Part E's shutdown must call it, and a file served with id `0` is still uncached. No
+in-tree server sends a zero id, so that part carries its own trigger.

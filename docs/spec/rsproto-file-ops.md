@@ -212,8 +212,10 @@ directory block the server writes through.
 
 **The answer is the send's result**: a `PendingOperation` the server `sys_wait`s on, as a
 `Block` send's result always is. On a `Forget`, the kernel:
-1. takes the file's object, if it caches one, out of its cache, so a later resolve of the id,
-   which after a free may name a new file, gets a new object;
+1. marks the file's cached object, if it has one, forgotten. No later resolve of the id finds
+   it, since after a free the id may name a new file and gets a new object. No sync writes it
+   either. The entry goes at once if none of the file's I/O is in flight; otherwise it stays
+   until the object goes, so that a second `Forget` of the id can find the object;
 2. marks the object so no device I/O of it starts: a write-back stops before its next page,
    and a fill reads as a hole;
 3. releases the object's dirty pin, so it goes when its users do, with its pages unwritten;

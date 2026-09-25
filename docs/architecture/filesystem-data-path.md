@@ -150,14 +150,16 @@ sync and a fresh resolve.
   A failed fill fails every faulter waiting on it and leaves the page out of the cache.
 - **A server frees a file only after the kernel has forgotten it** (`File::Forget`, Part C.1b).
   The last name's unlink, or a rename that replaces a file, sends the kernel the file's id and
-  waits for the answer before freeing a block. The kernel takes the object out of the cache and
-  marks it so no device I/O of it starts, and releases its dirty pin. It answers once the last
-  IRP of the file in flight has ended, reads included, so a fill queued before the `Forget` cannot
-  read a block after it has become another file's. For that each object counts its IRPs in
-  flight, and **a write-back decides each page as it issues its IRP**, under the object's lock,
-  rather than from a snapshot taken at its start. The same per-page decision means a truncate's
-  resize governs every page after it. Only an IRP already in flight when a truncate lands can
-  reach a block it freed (`TODO(truncate-inflight-writeback)`).
+  waits for the answer before freeing a block. The kernel marks the object's cache entry
+  forgotten, which puts it out of reach of any resolve or sync. It also stops the object from
+  starting device I/O and releases its dirty pin. It answers once the last IRP of the file in
+  flight has ended, reads included, so a fill queued before the `Forget` cannot read a block
+  after it has become another file's. For that each object counts its IRPs in flight, and **a
+  write-back decides each page as it issues its IRP**, under the object's lock, rather than from a
+  snapshot taken at its start. The same per-page decision means a truncate's resize governs every
+  page after it. Only an IRP already in flight when a truncate lands can reach a block it freed
+  (`TODO(truncate-inflight-writeback)`). Until the answer the entry stays, so a second `Forget` of
+  the id waits on the same one (`UserspaceServerReg::forget_file`).
 
 ## Consistency ordering (filesystem-neutral)
 

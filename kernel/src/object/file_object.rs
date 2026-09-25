@@ -393,7 +393,7 @@ impl FileObject {
         let mut g = fo.inner.lock();
         fo.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
-        // A forgotten object is out of the cache, so a pin on it is one nothing could find.
+        // No sync writes a forgotten object, so a pin on it is one nothing would ever clean.
         if g.self_pin.is_none() && fo.file_id().is_some() && !g.dead {
             g.self_pin = Some(file_obj.clone());
         }
@@ -580,9 +580,9 @@ impl FileObject {
     /// From now on no device I/O of the object starts: a write-back stops before its next
     /// page, and a fill reads as a hole — the `dead` mark alone decides both, so the run map is
     /// left as it was. The dirty pin is released, so the object goes when its users do, its
-    /// pages unwritten. The caller has already taken it
-    /// out of its registration's cache, so a later resolve of the id gets a new object, and
-    /// the caller's reference keeps it alive across this call, whatever the pin was.
+    /// pages unwritten. Its registration has already marked its cache entry forgotten
+    /// ([`UserspaceServerReg::forget_file`]), so a later resolve of the id gets a new object.
+    /// The caller's reference keeps it alive across this call, whatever the pin was.
     ///
     /// `answer` is the server's: [`Forgotten::Now`] if nothing is in flight, else the PO to
     /// hand the server, completed when the last I/O ends ([`end_io`](Self::end_io)).
@@ -1609,9 +1609,8 @@ mod tests {
         assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Go(_, 100)));
         assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
 
-        let taken = reg_of(&reg).cache_take(7).expect("cached");
-        assert!(matches!(file_of(&taken).forget(&po()), Forgotten::Now), "nothing in flight");
-        drop(taken);
+        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "nothing in flight");
+        assert_eq!(reg_of(&reg).cached_files(), 0, "so its entry went at once");
         assert!(file_of(&a).is_dead());
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
         assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Dead));
@@ -1645,6 +1644,55 @@ mod tests {
         assert!(fo.end_io().is_none(), "and only once");
     }
 
+    /// **A second `Forget` through the registration waits on the first one's answer** — the
+    /// path a server's sends take, which the test above does not. The first `Forget` used to
+    /// take the entry out, so a second found nothing and was answered at once with the IRP
+    /// still in flight (PR #335 review, finding 1).
+    #[test]
+    fn a_second_forget_waits_on_the_first_ones_answer() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        let fo = file_of(&a);
+        assert!(matches!(fo.begin_write(0, 4096), WriteStep::Go(_, 100)), "page 0's IRP is issued");
+        let answer = po();
+        let Forgotten::Later(first) = reg_of(&reg).forget_file(7, &answer) else { panic!("an IRP is in flight") };
+        assert_eq!(first.as_ptr(), answer.as_ptr());
+        let Forgotten::Later(second) = reg_of(&reg).forget_file(7, &po()) else {
+            panic!("a second Forget found nothing to wait on")
+        };
+        assert_eq!(second.as_ptr(), answer.as_ptr(), "the first one's answer");
+        assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
+        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "nothing in flight now");
+        assert_eq!(reg_of(&reg).cached_files(), 0, "and the entry has gone");
+    }
+
+    /// **A file forgotten mid-I/O is found by `Forget` alone.** A resolve of its id gets a new
+    /// object and a sync passes it by. A `Forget` after that means the new file, while the old
+    /// one's answer still waits for its IRP.
+    #[test]
+    fn a_file_forgotten_mid_io_is_found_by_no_resolve_or_sync() {
+        init_global_heap();
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        assert_eq!(file_of(&a).begin_read(1), 101);
+        let answer = po();
+        assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
+        assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 0, "no sync sees it");
+        let again = resolve(&reg, 7, PAGE_SIZE);
+        assert_ne!(again.as_ptr(), a.as_ptr(), "a resolve gets a new object");
+        assert!(
+            matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now),
+            "the new file has nothing in flight"
+        );
+        assert!(file_of(&again).is_dead(), "and it is the one forgotten");
+        assert_eq!(
+            file_of(&a).end_io().map(|p| p.as_ptr()),
+            Some(answer.as_ptr()),
+            "the old answer still waited for its IRP"
+        );
+    }
+
     /// **A fill in flight holds the answer too**: its read was issued against a block the
     /// server has not freed yet, and must land before it does.
     #[test]
@@ -1660,15 +1708,14 @@ mod tests {
         assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
     }
 
-    /// A forgotten object is out of the cache, so a writable mapping must not pin it: nothing
-    /// could ever find it to clean.
+    /// No sync writes a forgotten object, so a writable mapping must not pin it: nothing would
+    /// ever clean it.
     #[test]
     fn a_forgotten_file_is_never_pinned() {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        drop(reg_of(&reg).cache_take(7));
-        let _ = file_of(&a).forget(&po());
+        let _ = reg_of(&reg).forget_file(7, &po());
         FileObject::writable_mapped(&a);
         assert!(!file_of(&a).is_dirty());
         FileObject::writable_unmapped(a.as_ptr());

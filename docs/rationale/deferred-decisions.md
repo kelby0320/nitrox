@@ -1541,15 +1541,29 @@ place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
-**Writeback when a `FileObject` is torn down.** `sys_file_sync` is the only writeback trigger:
-unmapping a `MAP_WRITE` VMA writes nothing back, and a `FileObject`'s `Drop` frees its cached frames
-unwritten, so data written through a mapping and never synced is lost when its writer lets go.
-Nothing loses data today, because every file writer (`libfs`, `nxsh`) syncs before letting go — but
-that is a convention held by each writer, not a property of the system, and
-`filesystem-data-path.md` claimed otherwise until 2026-09-22. **Trigger, and it is scheduled**: the
-administration plan's unmount and shutdown (`docs/planning/administration.md`, Part C), which must
-write back every `FileObject` under a registration before tearing its server down, or lose whatever
-a writer left unsynced while still marking the filesystem clean.
+**Writeback when a `FileObject` is torn down — half built by administration C.1.**
+
+**Before C.1 (2026-09-24)**, `sys_file_sync` was the only writeback trigger. Unmapping a
+`MAP_WRITE` VMA wrote nothing back, and a `FileObject`'s `Drop` freed its cached frames unwritten.
+So data written through a mapping and never synced was lost when its writer let go. Nothing lost
+data, because every file writer (`libfs`, `nxsh`) synced before letting go. But that was a
+convention each writer held, not a property of the system, and `filesystem-data-path.md` claimed
+otherwise until 2026-09-22.
+
+**What C.1 built: the data now outlives its writer.** A file its server caches holds a reference to
+itself while dirty, so its pages outlive whoever wrote them. Such a file has a nonzero file id,
+which is every file `fs-server-ext4` serves. `sys_ns_sync` writes every such object under a
+registration (`filesystem-data-path.md` § *One object per file*).
+
+**What is still owed:**
+- **Nothing calls `sys_ns_sync` before a server goes.** **Trigger, and it is scheduled**: C.5's
+  unmount and Part E's shutdown (`docs/planning/administration.md`). Each must sync before tearing
+  its server down. Otherwise it loses whatever a writer left unsynced, while still marking the
+  filesystem clean.
+- **A file its server gives id `0` is uncached.** It has no self-pin and no sync can find it, so
+  its unsynced mapped writes are still lost when its writer lets go. No in-tree server sends a
+  zero id: `fs-server-ext4` sends the inode number. **Trigger**: the first server that serves a
+  writable file without an id.
 
 ### Userspace
 
