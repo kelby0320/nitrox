@@ -110,6 +110,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `35` | `sys_file_rename` |
 | `36` | `sys_process_terminate` |
 | `37` | `sys_ns_derive` |
+| `38` | `sys_ns_sync` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -191,7 +192,8 @@ fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
 `PendingOperation` handle (positive value); it **never blocks**. In Phase 2
 `resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
-`Read`/`Write`. The operation's outcome is delivered through the PO: `sys_wait`
+`Read`/`Write`/`Flush`; a `Flush` names no buffer and no range and completes once the
+device's cache is on its medium. The operation's outcome is delivered through the PO: `sys_wait`
 writes `IoResult.status` (`0` = success, negative `KError` on a device/medium
 error) and `IoResult.result` (bytes transferred). A zero-length or cache-hit
 request returns a **pre-signalled** PO, so callers have one code path.
@@ -322,6 +324,25 @@ is how it hands its namespace to someone. **A snapshot**: targets are shared, so
 same paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
 `OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
 broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
+
+```rust
+fn sys_ns_sync(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
+```
+**Writes back every dirty file** in the page cache of the userspace server that `path` resolves
+to in `ns`, and returns how many it wrote. That includes files nothing holds any more: a file
+mapped writable stays cached and dirty until a write-back cleans it, so a writer that exits
+without `sys_file_sync` loses nothing until this runs
+([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*).
+An unmount calls it before it marks a filesystem clean, and so will shutdown.
+
+Requires `LOOKUP` on `ns`. It changes no file; it only makes what was already written durable.
+`Unsupported` if `path` resolves to anything but a userspace server, and `NotFound` if it
+resolves to nothing. `IoError` if a write failed; the other files are still written, and a file
+whose write failed stays dirty.
+
+**It blocks** until the writes complete, as `sys_file_sync` does. That is the one documented
+exemption from async-first, for the same reason: a durability point is something the caller
+wants to know it has reached. (Syscall number `38`.)
 
 ### Entropy
 
@@ -482,6 +503,8 @@ Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel st
 Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability.
 
 **Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` is `Block` with a delivery deadline (the 6th arg, absolute monotonic ns): identical to `Block`, except a held (undelivered) message is cancelled when the deadline elapses — its PO completes `TimedOut` and the message is reclaimed. The `deadline` arg is ignored for `NoBlock`/`Block`.
+
+**A send on a userspace server's forwarding endpoint reaches the kernel**, which holds its peer, and is consumed inline rather than queued. It is normally a reply to a request the kernel forwarded ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md)), and returns `0` whatever the mode. **One request travels that way: `File::Forget`** ([`rsproto-file-ops.md`](rsproto-file-ops.md) § *Forget*), a server saying it is about to free a file. It must be sent `Block` and carry no handles, else `InvalidArgument`. It returns a `PendingOperation` handle that completes once no device I/O of the file is in flight, which is when the server may free the file's blocks (administration Part C.1b).
 
 ```rust
 fn sys_channel_recv(

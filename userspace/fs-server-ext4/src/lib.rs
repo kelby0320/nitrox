@@ -33,6 +33,13 @@ pub trait BlockReader {
     /// Fill `buf` with the bytes at device byte `offset`. `Err` on any short or
     /// failed read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError>;
+
+    /// Whether this is a **read-only mount** — `true` only for [`ReadOnly`]. What the block-file
+    /// reply marks a file with comes from here, so the mark and the refusal of every write are
+    /// one fact, the type the server serves through.
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// A read failure.
@@ -54,6 +61,9 @@ pub enum FsError {
     Exists,
     /// An `rmdir` target directory is not empty (POSIX `ENOTEMPTY`).
     NotEmpty,
+    /// A write to a **read-only mount** ([`ReadOnly`], administration Part C.3). What the
+    /// server answers is `NoAccess`.
+    ReadOnly,
 }
 
 /// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
@@ -63,6 +73,31 @@ pub enum FsError {
 /// `sys_io_submit` writes.
 pub trait BlockWriter {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
+}
+
+/// **A read-only mount** (administration Part C.3): reads pass through to the device, and every
+/// write is refused with [`FsError::ReadOnly`] before it reaches it.
+///
+/// The server serves a read-only mount through this type, so read-only is not a check each
+/// mutating operation has to remember. Any mutation, reached any way, fails at its first write
+/// having changed nothing: a mutation only reads before it writes, and none of its writes
+/// happen. The host tests hold every mutating operation to that against this same type.
+pub struct ReadOnly<'a, R: BlockReader>(pub &'a R);
+
+impl<R: BlockReader> BlockReader for ReadOnly<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+}
+
+impl<R: BlockReader> BlockWriter for ReadOnly<'_, R> {
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
 }
 
 /// One contiguous mapping from a file's blocks to the device, for the **Model A** data
@@ -302,30 +337,204 @@ mod tests {
     }
 
     #[test]
-    fn touch_path_moves_mtime_without_touching_content_and_stays_e2fsck_clean() {
+    fn touch_file_moves_mtime_without_touching_content_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
-        ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
         ext4::grow_file(&rw, b"/system/edited", 1500, TEST_NOW).unwrap();
         assert_eq!(entry_stat(&rw, b"/system", b"edited"), (TEST_NOW, 1500));
+        // The id the kernel will touch by is the one the block-file reply gave it.
+        let mut runs = [BlockRun::default(); 8];
+        assert_eq!(ext4::map_file(&rw, b"/system/edited", &mut runs).unwrap().ino, ino);
 
         // The Model A case: the kernel wrote the bytes itself and is telling us so. No
         // size change, no structural change — only the timestamp moves.
         const LATER: i64 = TEST_NOW + 100;
-        ext4::touch_path(&rw, b"/system/edited", LATER).unwrap();
+        ext4::touch_file(&rw, ino, LATER).unwrap();
 
         assert_eq!(
             entry_stat(&rw, b"/system", b"edited"),
             (LATER, 1500),
             "touch must move mtime and leave the size alone"
         );
-        // A touch of something that is not there is an error, not a silent no-op — the
-        // kernel names the file by the suffix it resolved, so a miss means they disagree.
-        assert_eq!(
-            ext4::touch_path(&rw, b"/system/no-such-file", LATER),
-            Err(FsError::NotFound)
-        );
-        assert_e2fsck_clean(&rw.0.into_inner(), "touch");
+        // **Only a live regular file is stamped** — the id comes off the wire. Not a
+        // directory, not a number past the table, not `0`.
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        assert_eq!(ext4::touch_file(&rw, sys, LATER + 1), Err(FsError::NotFound));
+        assert_eq!(ext4::touch_file(&rw, 0, LATER + 1), Err(FsError::NotFound));
+        assert_eq!(ext4::touch_file(&rw, u32::MAX, LATER + 1), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.borrow(), "touch");
+
+        // And not a file unlinked since — a touch can trail the unlink of what it names, and
+        // stamping a freed inode would give e2fsck something to find.
+        let orphan = ext4::unlink_at(&rw, sys, b"edited", LATER).unwrap().unwrap();
+        ext4::release_inode(&rw, orphan, LATER).unwrap();
+        assert_eq!(ext4::touch_file(&rw, ino, LATER + 2), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-unlink");
+    }
+
+    /// **A read-only mount refuses every mutation the server can reach, and writes nothing**
+    /// (administration Part C.3). Each operation is run twice: through [`ReadOnly`], where it
+    /// must fail with `ReadOnly`, and on a writable copy of the same image, where it must
+    /// succeed — so read-only is the only thing that stopped it, not a missing name or a full
+    /// directory. The image is byte-for-byte what it was afterwards.
+    #[test]
+    fn a_read_only_mount_refuses_every_mutation_and_writes_nothing() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        let victim = ext4::create_file(&rw, b"/system", b"victim", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/victim", 5000, TEST_NOW).unwrap();
+        ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();
+        let orphan_ino = ext4::create_file(&rw, b"/system", b"orphan", TEST_NOW).unwrap();
+        let orphan = ext4::unlink_at(&rw, sys, b"orphan", TEST_NOW).unwrap().unwrap();
+        assert_eq!(orphan, orphan_ino);
+        let before = rw.0.borrow().clone();
+
+        const NOW: i64 = TEST_NOW + 50;
+        type Op<'a> = &'a dyn Fn(&dyn Mutate) -> Result<(), FsError>;
+        let ops: [(&str, Op); 13] = [
+            ("mark_mounted", &|m| m.mark_mounted()),
+            ("mark_clean", &|m| m.mark_clean()),
+            ("touch_at", &|m| m.touch_at(sys, b"victim", NOW)),
+            ("touch_file", &|m| m.touch_file(victim, NOW)),
+            ("grow_file", &|m| m.grow_file(b"/system/victim", 9000, NOW)),
+            ("truncate_file", &|m| m.truncate_file(b"/system/victim", 10, NOW)),
+            ("create_file", &|m| m.create_file(b"/system", b"newfile", NOW)),
+            ("mkdir_at", &|m| m.mkdir_at(sys, b"newdir", NOW)),
+            ("unlink_at", &|m| m.unlink_at(sys, b"victim", NOW)),
+            ("release_inode", &|m| m.release_inode(orphan, NOW)),
+            ("rmdir_at", &|m| m.rmdir_at(sys, b"adir", NOW)),
+            ("rename_path", &|m| m.rename_path(b"/system/victim", b"/system/moved", NOW)),
+            ("rename_at", &|m| m.rename_at(sys, b"victim", b"renamed", NOW)),
+        ];
+        for (name, op) in ops {
+            let ro = crate::ReadOnly(&rw);
+            assert_eq!(op(&ro), Err(FsError::ReadOnly), "{name} through a read-only mount");
+            let copy = RwImage(RefCell::new(before.clone()));
+            assert_eq!(op(&copy), Ok(()), "{name} on a writable copy — else read-only is not what stopped it");
+        }
+        assert!(*rw.0.borrow() == before, "a read-only mount wrote nothing");
+        // Reading through it still works.
+        let ro = crate::ReadOnly(&rw);
+        let mut out = [0u8; 4];
+        assert_eq!(ext4::read_file_range(&ro, b"/system/current-generation", 0, 4, &mut out), Ok(4));
+        assert!(ro.read_only() && !rw.read_only());
+    }
+
+    /// Every mutating operation, callable through one object-safe face so the test above can
+    /// list them. Each discards what its operation returns on success.
+    trait Mutate {
+        fn mark_mounted(&self) -> Result<(), FsError>;
+        fn mark_clean(&self) -> Result<(), FsError>;
+        fn touch_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn touch_file(&self, ino: u32, now: i64) -> Result<(), FsError>;
+        fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError>;
+        fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError>;
+        fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError>;
+        fn mkdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn unlink_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn release_inode(&self, ino: u32, now: i64) -> Result<(), FsError>;
+        fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError>;
+        fn rename_at(&self, dir: u32, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError>;
+    }
+
+    impl<T: BlockReader + BlockWriter> Mutate for T {
+        fn mark_mounted(&self) -> Result<(), FsError> {
+            ext4::mark_mounted(self)
+        }
+        fn mark_clean(&self) -> Result<(), FsError> {
+            ext4::mark_clean(self)
+        }
+        fn touch_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::touch_at(self, dir, name, now)
+        }
+        fn touch_file(&self, ino: u32, now: i64) -> Result<(), FsError> {
+            ext4::touch_file(self, ino, now)
+        }
+        fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+            ext4::grow_file(self, path, size, now).map(drop)
+        }
+        fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+            ext4::truncate_file(self, path, size, now).map(drop)
+        }
+        fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::create_file(self, parent, name, now).map(drop)
+        }
+        fn mkdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::mkdir_at(self, dir, name, now)
+        }
+        fn unlink_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::unlink_at(self, dir, name, now).map(drop)
+        }
+        fn release_inode(&self, ino: u32, now: i64) -> Result<(), FsError> {
+            ext4::release_inode(self, ino, now)
+        }
+        fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rmdir_at(self, dir, name, now)
+        }
+        fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rename_path(self, from, to, false, now).map(drop)
+        }
+        fn rename_at(&self, dir: u32, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rename_at(self, dir, from, to, now)
+        }
+    }
+
+    /// **How the filesystem was left round-trips** through the writer, and preserves the rest of
+    /// `s_state` — a filesystem with its error bit set keeps it across a mount and an unmount.
+    #[test]
+    fn the_state_round_trips_through_a_mount_and_an_unmount() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        assert_eq!(ext4::was_left_clean(&rw), Ok(true), "mke2fs leaves it clean");
+        ext4::mark_mounted(&rw).unwrap();
+        assert_eq!(ext4::was_left_clean(&rw), Ok(false));
+        ext4::mark_clean(&rw).unwrap();
+        assert_eq!(ext4::was_left_clean(&rw), Ok(true));
+        assert_e2fsck_clean(&rw.0.borrow(), "state-round-trip");
+        // The error bit (`EXT4_ERROR_FS`, 0x2) survives both, set by hand.
+        rw.0.borrow_mut()[1024 + 58] |= 0x2;
+        ext4::mark_mounted(&rw).unwrap();
+        assert_eq!(rw.0.borrow()[1024 + 58], 0x2, "the clean bit cleared, the error bit kept");
+        ext4::mark_clean(&rw).unwrap();
+        assert_eq!(rw.0.borrow()[1024 + 58], 0x3);
+    }
+
+    /// **The state is read from bytes this writer never produced**: a superblock left mounted
+    /// by someone else — `s_state` written by hand — reads as not clean, and one with only the
+    /// clean bit reads as clean. A reader tested only on its own writer's output could share
+    /// that writer's mistake.
+    #[test]
+    fn a_superblock_left_mounted_reads_as_not_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        for (state, clean) in [(0x0000u16, false), (0x0002, false), (0x0004, false), (0x0001, true), (0x0005, true)] {
+            rw.0.borrow_mut()[1024 + 58..1024 + 60].copy_from_slice(&state.to_le_bytes());
+            assert_eq!(ext4::was_left_clean(&rw), Ok(clean), "s_state {state:#06x}");
+        }
+        rw.0.borrow_mut()[1024 + 56] = 0; // the magic: not ext4 at all
+        assert!(ext4::was_left_clean(&rw).is_err());
+    }
+
+    /// **A touch follows the file, not its old name** — the reason it is by id. The kernel
+    /// flushes a cached file long after the resolve that named it; by then a rename has moved
+    /// it, and a new file has taken the name.
+    #[test]
+    fn a_touch_by_id_after_a_rename_stamps_the_renamed_file() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let ino = ext4::create_file(&rw, b"/system", b"draft", TEST_NOW).unwrap();
+        ext4::rename_path(&rw, b"/system/draft", b"/system/final", false, TEST_NOW).unwrap();
+        let other = ext4::create_file(&rw, b"/system", b"draft", TEST_NOW).unwrap();
+        assert_ne!(other, ino, "the name now belongs to another file");
+
+        const LATER: i64 = TEST_NOW + 100;
+        ext4::touch_file(&rw, ino, LATER).unwrap();
+        assert_eq!(entry_stat(&rw, b"/system", b"final").0, LATER, "the written file");
+        assert_eq!(entry_stat(&rw, b"/system", b"draft").0, TEST_NOW, "not the name's new owner");
+        assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-rename");
     }
 
     #[test]
@@ -363,11 +572,17 @@ mod tests {
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(3000));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Ok(1200));
 
-        // With it, the destination becomes the source and the replaced inode is freed.
+        // With it, the destination becomes the source, and the replaced inode is handed back —
+        // unfreed until the kernel has forgotten it — then freed by `release_inode`.
         let free_before = free_inodes(&rw);
-        ext4::rename_path(&rw, b"/system/src", b"/system/victim", true, TEST_NOW).unwrap();
+        let mut runs = [crate::BlockRun::default(); 4];
+        let victim = ext4::map_file(&rw, b"/system/victim", &mut runs).unwrap().ino;
+        let replaced = ext4::rename_path(&rw, b"/system/src", b"/system/victim", true, TEST_NOW).unwrap();
+        assert_eq!(replaced, Some(victim), "the replaced inode waits for its release");
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(1200));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Err(FsError::NotFound));
+        assert_eq!(free_inodes(&rw), free_before, "not freed before the release");
+        ext4::release_inode(&rw, victim, TEST_NOW).unwrap();
         assert_eq!(
             free_inodes(&rw),
             free_before + 1,
@@ -1196,11 +1411,20 @@ mod tests {
         ext4::grow_file(&rw, b"/system/scratch", 4096, TEST_NOW).unwrap();
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
 
-        ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW).unwrap();
+        // **Two halves** (administration Part C.1b): the name goes at once, but the inode and
+        // its block stay allocated until `release_inode` — which a server calls only once the
+        // kernel has answered `File::Forget`, since it may still be writing that block.
+        let (blocks, inodes) = (free_blocks(&rw), free_inodes(&rw));
+        assert_eq!(ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW), Ok(Some(ino)));
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
-        // The name is gone; the inode was freed (a fresh create can reuse it).
         assert_eq!(ext4::stat_file(&rw, b"/system/scratch"), Err(FsError::NotFound));
-        let _ = ino;
+        assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks, inodes), "nothing freed yet");
+        ext4::release_inode(&rw, ino, TEST_NOW).unwrap();
+        assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks + 1, inodes + 1), "freed on release");
+        // A second release, or one of a live file, is refused rather than freeing twice.
+        assert_eq!(ext4::release_inode(&rw, ino, TEST_NOW), Err(FsError::NotFound));
+        let sys_ino = ext4::resolve_dir(&rw, b"/system").unwrap();
+        assert_eq!(ext4::release_inode(&rw, sys_ino, TEST_NOW), Err(FsError::NotFound));
 
         // Unlink of a directory is rejected (use rmdir); missing name is NotFound.
         ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();
@@ -1272,7 +1496,7 @@ mod tests {
 
         // 6000 bytes needs 2 blocks; the other 3 must have come back.
         let mut runs = [BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 6000);
         let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
         assert_eq!(covered, 2, "only the blocks holding live bytes are mapped");
@@ -1302,7 +1526,7 @@ mod tests {
         assert_eq!(ext4::truncate_file(&rw, path, 0, TEST_NOW), Ok(0));
         assert_eq!(ext4::stat_file(&rw, path), Ok(0));
         let mut runs = [crate::BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 0);
         assert_eq!(runs[..n].iter().map(|r| r.length as u64).sum::<u64>(), 0);
         assert_e2fsck_clean(&rw.0.into_inner(), "truncate-zero");
@@ -1349,6 +1573,44 @@ mod tests {
         u32::from_le_bytes(img[1024 + 12..1024 + 16].try_into().unwrap())
     }
 
+    /// **A truncate and then a grow read zero over the regrown range, on the device** — a whole
+    /// block and a partial tail. The kernel fills a page it does not hold from the blocks the
+    /// map names, so what the device holds there is what a reader sees. Both halves reuse what
+    /// the truncate left: the tail stays in the kept block, and the freed block is where the
+    /// allocator's goal points — asserted, since a test that grew into a fresh block would pass
+    /// with no zeroing at all.
+    #[test]
+    fn a_truncate_then_a_grow_reads_zero_over_the_regrown_range() {
+        use crate::BlockRun;
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let path = b"/system/current-generation";
+        // Two blocks of a pattern, written to the device as the kernel's write-back would.
+        ext4::grow_file(&rw, path, 8192, TEST_NOW).unwrap();
+        let mut runs = [BlockRun::default(); 8];
+        let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let lbas: std::vec::Vec<u64> =
+            runs[..m.runs].iter().flat_map(|r| (0..r.length as u64).map(move |i| r.device_lba + i)).collect();
+        assert_eq!(lbas.len(), 2);
+        for &lba in &lbas {
+            BlockWriter::write_at(&rw, lba * 4096, &[0xAB; 4096]).unwrap();
+        }
+
+        ext4::truncate_file(&rw, path, 10, TEST_NOW).unwrap();
+        ext4::grow_file(&rw, path, 8192, TEST_NOW).unwrap();
+        let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let regrown: std::vec::Vec<u64> =
+            runs[..m.runs].iter().flat_map(|r| (0..r.length as u64).map(move |i| r.device_lba + i)).collect();
+        assert_eq!(regrown, lbas, "the grow took back the block the truncate freed");
+
+        let mut out = [0x55u8; 8192];
+        assert_eq!(ext4::read_file_range(&rw, path, 0, 8192, &mut out), Ok(8192));
+        assert_eq!(&out[..10], &[0xAB; 10], "the kept bytes");
+        assert!(out[10..4096].iter().all(|&b| b == 0), "the partial tail reads zero");
+        assert!(out[4096..].iter().all(|&b| b == 0), "the whole regrown block reads zero");
+        assert_e2fsck_clean(&rw.0.into_inner(), "truncate-grow");
+    }
+
     #[test]
     fn grow_file_appends_blocks_and_stays_e2fsck_clean() {
         use crate::BlockRun;
@@ -1362,7 +1624,7 @@ mod tests {
 
         // The block map now covers 2 blocks, none sparse.
         let mut runs = [BlockRun::default(); 8];
-        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 5000);
         let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
         assert_eq!(covered, 2);

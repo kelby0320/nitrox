@@ -74,6 +74,11 @@ pub const OP_QUERY_CAPS: u16 = 0x0002;
 pub const OP_PING: u16 = 0x0003;
 /// `Meta::Ready` — startup signal on the control channel.
 pub const OP_READY: u16 = 0x0004;
+/// `Meta::Unmount` — a supervisor telling a filesystem server, on its control channel, to
+/// record the filesystem cleanly unmounted and exit (administration Part C.3). Empty body; the
+/// server answers with a reply — empty on success, an error body if the state could not be
+/// written — then exits.
+pub const OP_UNMOUNT: u16 = 0x0005;
 /// `Namespace::Resolve` — resolve a path suffix to a resource handle.
 pub const OP_NS_RESOLVE: u16 = 0x0100;
 /// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
@@ -94,12 +99,18 @@ pub const OP_FILE_RMDIR: u16 = 0x0604;
 pub const OP_FILE_RENAME: u16 = 0x0605;
 /// `File::Touch` — stamp the named file's modification time as "now".
 ///
-/// The odd one out among the `File::*` ops: it is addressed by **suffix on the server's
-/// forwarding endpoint**, not by name on a directory session, and it carries **no reply**.
-/// Both follow from who sends it — the *kernel*, after flushing a Model A file's dirty
-/// pages, to tell the server about a write it structurally could not have seen. See
-/// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
+/// The odd one out among the `File::*` ops: from the kernel it is addressed by **file id on
+/// the server's forwarding endpoint**, not by name on a directory session, and it carries **no
+/// reply**. Both follow from who sends it — the *kernel*, after flushing a Model A file's
+/// dirty pages, to tell the server about a write it structurally could not have seen. See
+/// [`file::parse_touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
+/// `File::Forget` — a **server telling the kernel** that a file is about to be freed, and the
+/// one request that travels that way on a forwarding endpoint (administration Part C.1b).
+/// Sent `SENDMODE_BLOCK`, it is answered by the send's `PendingOperation`, which completes
+/// once no I/O of the file is in flight; the server frees the file's blocks only then. See
+/// [`file::forget_request`] and `docs/spec/rsproto-file-ops.md`.
+pub const OP_FILE_FORGET: u16 = 0x0607;
 /// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
 ///
 /// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch

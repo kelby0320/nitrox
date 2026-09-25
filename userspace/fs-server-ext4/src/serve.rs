@@ -15,8 +15,8 @@ use crate::{BlockReader, FsError, ext4};
 use libkern::KError;
 use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
 use librsproto::namespace::{
-    OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY, RESOLVE_REPLY_LEN,
-    parse_resolve_request, resolve_reply,
+    BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, FILE_BLOCKS_READ_ONLY, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY,
+    RESOLVE_REPLY_LEN, file_blocks_prefix, parse_resolve_request, resolve_reply,
 };
 use librsproto::{
     OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode,
@@ -112,11 +112,14 @@ pub fn serve_resolve<R: BlockReader>(
         // device handle).
         let mut runs = [crate::BlockRun::default(); MAX_RUNS];
         return match ext4::map_file(reader, path, &mut runs) {
-            Ok((size, _, _)) if size > u32::MAX as usize => {
+            Ok(m) if m.size > u32::MAX as usize => {
                 error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE)
             }
-            Ok((size, block_size, n)) => {
-                match model_a_reply(reply, request_id, size, block_size, &runs[..n]) {
+            Ok(m) => {
+                // A read-only mount's files are marked so: the kernel installs them without
+                // `MAP_WRITE` (administration Part C.3).
+                let flags = if reader.read_only() { FILE_BLOCKS_READ_ONLY } else { 0 };
+                match model_a_reply(reply, request_id, &m, &runs[..m.runs], flags) {
                     Some(reply_len) => Served::LazyBlocks { reply_len },
                     None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
                 }
@@ -190,29 +193,26 @@ fn success_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Optio
 }
 
 /// Build a **Model A** lazy `ResolveReply` into `reply`: `OBJECT_KIND_FILE_BLOCKS` +
-/// `content_len` = file size, then `block_size` + the `BlockRun` map, with `handle_count = 1`
-/// (the caller transfers the device handle). Body layout matches `rsproto-block-ops.md` /
-/// the kernel's `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too
-/// small.
+/// `content_len` = file size, then the block size, the file's inode number as its id, and the
+/// `BlockRun` map, with `handle_count = 1` (the caller transfers the device handle). Body
+/// layout matches `rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body* and the kernel's
+/// `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too small.
 fn model_a_reply(
     reply: &mut [u8],
     request_id: u64,
-    size: usize,
-    block_size: u32,
+    m: &ext4::MappedFile,
     runs: &[crate::BlockRun],
+    flags: u32,
 ) -> Option<usize> {
-    let mut body = [0u8; 16 + MAX_RUNS * 24];
-    // ResolveReply prefix (kind @0, _reserved @2, content_len @4) — 8 bytes.
-    resolve_reply(&mut body, OBJECT_KIND_FILE_BLOCKS, size as u32)?;
-    body[8..12].copy_from_slice(&block_size.to_le_bytes());
-    body[12..16].copy_from_slice(&(runs.len() as u32).to_le_bytes());
-    let mut off = 16;
+    let mut body = [0u8; FILE_BLOCKS_PREFIX_LEN + MAX_RUNS * BLOCK_RUN_WIRE_LEN];
+    let mut off =
+        file_blocks_prefix(&mut body, m.size as u32, m.block_size, runs.len() as u32, m.ino as u64, flags)?;
     for r in runs {
         body[off..off + 8].copy_from_slice(&r.file_block.to_le_bytes());
         body[off + 8..off + 16].copy_from_slice(&r.device_lba.to_le_bytes());
         body[off + 16..off + 20].copy_from_slice(&r.length.to_le_bytes());
         body[off + 20..off + 24].copy_from_slice(&r.flags.to_le_bytes());
-        off += 24;
+        off += BLOCK_RUN_WIRE_LEN;
     }
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
 }
@@ -228,17 +228,19 @@ fn range_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Option<
 /// Build an error reply (`REPLY | ERROR`, an `ErrorBody` carrying `err`) for `op`
 /// into `reply`. The body has no message (replies stay minimal).
 fn error_reply(reply: &mut [u8], request_id: u64, err: KError, op: u16) -> Served {
-    Served::Error { reply_len: encode_error(reply, request_id, err.as_i32(), op) }
+    Served::Error { reply_len: encode_error(reply, request_id, err.as_i32(), op, b"") }
 }
 
 /// Encode a standalone error reply (`REPLY | ERROR`) for `request_id` / `op`
-/// carrying the `kerror` discriminant into `reply`, returning its length. The `op`
+/// carrying the `kerror` discriminant — and `reason`, up to 64 bytes, for a person reading the
+/// error — into `reply`, returning its length. The `op`
 /// must match the request's so the kernel routes the error to the right pending
 /// operation (a lookup vs a fill). Exposed for the server loop's fallback (e.g. if
 /// it cannot materialise an object it already resolved).
-pub fn encode_error(reply: &mut [u8], request_id: u64, kerror: i32, op: u16) -> usize {
-    let mut body = [0u8; ERROR_BODY_LEN];
-    let body_len = error_body(&mut body, kerror, 0, b"").unwrap_or(0);
+pub fn encode_error(reply: &mut [u8], request_id: u64, kerror: i32, op: u16, reason: &[u8]) -> usize {
+    let mut body = [0u8; ERROR_BODY_LEN + 64];
+    let reason = &reason[..reason.len().min(64)];
+    let body_len = error_body(&mut body, kerror, 0, reason).unwrap_or(0);
     encode(
         reply,
         op,
@@ -301,6 +303,8 @@ fn fs_error_to_kerror(e: FsError) -> KError {
         FsError::TooLarge => KError::TooLarge,
         // A create/rename onto an existing name, or a non-empty rmdir.
         FsError::Exists | FsError::NotEmpty => KError::InvalidArgument,
+        // A mutation of a read-only mount (administration Part C.3).
+        FsError::ReadOnly => KError::NoAccess,
     }
 }
 
@@ -462,16 +466,47 @@ mod tests {
                 let run_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
                 assert_eq!(block_size, 1024);
                 assert_eq!(run_count, 1);
-                // The single run covers file block 0, non-hole, length 1.
-                let file_block = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                let device_lba = u64::from_le_bytes(body[24..32].try_into().unwrap());
-                let length = u32::from_le_bytes(body[32..36].try_into().unwrap());
+                // The file's id is its inode — what the kernel keeps one object per, and what
+                // it will touch by. Nothing here is read-only.
+                let file_id = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                let flags = u32::from_le_bytes(body[24..28].try_into().unwrap());
+                let mut runs = [crate::BlockRun::default(); 4];
+                let ino = ext4::map_file(&r, b"/system/current-generation", &mut runs).unwrap().ino;
+                assert!(ino > 2, "a file's inode, not the root's");
+                assert_eq!(file_id, ino as u64);
+                assert_eq!(flags, 0);
+                // The single run, at 32, covers file block 0, non-hole, length 1.
+                let file_block = u64::from_le_bytes(body[32..40].try_into().unwrap());
+                let device_lba = u64::from_le_bytes(body[40..48].try_into().unwrap());
+                let length = u32::from_le_bytes(body[48..52].try_into().unwrap());
                 assert_eq!(file_block, 0);
                 assert_eq!(length, 1);
                 assert_ne!(device_lba, 0);
             }
             _ => panic!("expected a LazyBlocks reply"),
         }
+    }
+
+    /// **A read-only mount marks what it resolves** — the flag at 24 of the block-file body,
+    /// which the kernel installs without `MAP_WRITE` — and a writable one does not. The mark
+    /// comes from the reader the server serves through, the same one that refuses its writes.
+    #[test]
+    fn a_read_only_mount_marks_its_files_read_only() {
+        let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n"));
+        let flags_of = |served: Served, reply: &[u8]| match served {
+            Served::LazyBlocks { reply_len } => {
+                let body = decode(&reply[..reply_len]).unwrap().body;
+                u32::from_le_bytes(body[24..28].try_into().unwrap())
+            }
+            _ => panic!("expected a LazyBlocks reply"),
+        };
+        let (req, req_len) = make_lazy_request(12, b"system/current-generation");
+        let mut content = [0u8; ext4::MAX_FILE];
+        let mut reply = [0u8; 4096];
+        let served = serve(&crate::ReadOnly(&r), &req[..req_len], &mut content, &mut reply);
+        assert_eq!(flags_of(served, &reply), librsproto::namespace::FILE_BLOCKS_READ_ONLY);
+        let served = serve(&r, &req[..req_len], &mut content, &mut reply);
+        assert_eq!(flags_of(served, &reply), 0);
     }
 
     #[test]
@@ -564,6 +599,7 @@ mod tests {
             Unservable::ZeroField("s_inodes_per_group"),
             Unservable::RootUnreadable,
             Unservable::RootNotDirectory { mode: 0xFFFF },
+            Unservable::StateUnwritable,
         ];
         for why in all {
             let text = format!("{why}");

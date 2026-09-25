@@ -325,13 +325,18 @@ const _: () = assert!(offset_of!(IoResult, result) == 16);
 pub const IO_OPCODE_READ: u32 = 0;
 /// `IoOpcode::Write` — buffer → device.
 pub const IO_OPCODE_WRITE: u32 = 1;
+/// `IoOpcode::Flush` — make what has been written to the device durable: its volatile cache
+/// written to its medium. No buffer and no range (`buffer`, `buf_offset`, `offset`, `length`
+/// all `0`), and needs `WRITE` on the device.
+pub const IO_OPCODE_FLUSH: u32 = 2;
 
 /// The `sys_io_submit` operation descriptor — the userspace mirror of the
 /// kernel's `IoOp` (`docs/spec/io-operation.md`). 40 bytes, 8-byte aligned.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct IoOp {
-    /// Operation selector ([`IO_OPCODE_READ`] / [`IO_OPCODE_WRITE`]) — offset 0.
+    /// Operation selector ([`IO_OPCODE_READ`] / [`IO_OPCODE_WRITE`] / [`IO_OPCODE_FLUSH`]) —
+    /// offset 0.
     pub opcode: u32,
     /// Reserved; must be 0 — offset 4.
     pub flags: u32,

@@ -23,6 +23,9 @@ libsurface = { path = "../libsurface" }
 # window: element -> layout -> diff -> route -> handler, with real events from the compositor.
 libui = { path = "../libui" }
 libterm = { path = "../libterm" }
+# The ext4 library, for `boot-probe` to read what the root partition holds rather than what the
+# page cache does (administration Part C.1) — as `nxinstall` reads a source filesystem.
+fs-server-ext4 = { path = "../fs-server-ext4" }
 
 [[bin]]
 name = "test-harness"

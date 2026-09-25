@@ -3,7 +3,11 @@
 **Status:** Implemented — `userspace/fs-server-ext4`, read **and** write, with host tests
 that build an image with `mke2fs` and require `e2fsck -fn` to find it clean. Individual
 deferrals are marked inline. Verified 2026-09-17, when cross-group allocation landed and the
-deferred list was swept against the code.
+deferred list was swept against the code. Administration Part C.1 (2026-09-24): the block-file
+reply carries the inode number as the file's id, `File::Touch` names a file by it, and a grow
+zeroes on the device what it adds. C.1b (2026-09-24): an unlink or a replacing rename frees the
+file only after the kernel has answered `File::Forget` for it. C.3 (2026-09-24): a read-only mode,
+and `s_state` kept — § *Read-only mounts, and how a filesystem was left*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -54,9 +58,50 @@ read-write device handle** (`sys_io_submit` Write), never by the kernel:
 | Directory block | linear lookup (`dir_lookup`) | insert an `ext4_dir_entry_2` (split `rec_len` / new dir block) |
 | Group desc + superblock | read a few fields | update free-block / free-inode counts |
 
+**A file is freed in two halves** (administration Part C.1b). `unlink_at`, and a `rename_path`
+that replaces a file, remove the name and return the inode whose last link is going. Its link is
+still counted and its blocks still allocated. `release_inode` frees them, and the server calls it
+only once the kernel has answered `File::Forget` for the inode
+([`filesystem-data-path.md`](filesystem-data-path.md) § *One object per file*). The kernel may be
+writing the file's pages to those blocks, and a block this server freed and handed to another
+file before that write landed would be overwritten with a dead file's bytes. Between the halves the
+inode is unattached with its link counted, the state `rename_path` could already leave on a crash,
+and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
+since it asks from inside `serve_loop`'s walk of a batch of wait results. If the kernel cannot
+be asked, the inode is not freed: a leaked block can be repaired, a block claimed twice cannot.
+
 **No checksums.** The fixtures are `^metadata_csum`, so there is nothing to maintain. Enabling
 `metadata_csum` (group-desc / inode / extent / dir / bitmap checksums across every write above)
 is a feature-gated later addition.
+
+## Read-only mounts, and how a filesystem was left
+
+*(Administration Part C.3, 2026-09-24.)*
+
+**A read-only mount is the server's.** Its supervisor sets `FS_SETUP_READ_ONLY` in the setup
+message (`init` does for `init.toml`'s `"ro"`), and the server serves through
+`fs_server_ext4::ReadOnly`, a `BlockReader`/`BlockWriter` whose every write is refused with
+`FsError::ReadOnly`. So read-only isn't a check each mutation has to remember: whichever
+mutation is reached, by a session or a resolve, it fails at its first write having changed
+nothing, and the server answers `NoAccess` with the reason `read-only mount`. A grow or create
+that arrives as a resolve is refused, rather than falling through to the file's current size as
+other grow failures do. The same type answers `read_only()`, from which the block-file reply
+takes its `FILE_BLOCKS_READ_ONLY` mark, so the kernel installs the files without `MAP_WRITE`;
+the mark and the refusal are one fact. It never writes the superblock.
+
+**A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
+(`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
+change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An
+unmount sets the bit again as its last write (`mark_clean`), on `Meta::Unmount` from its
+supervisor on the control channel. The server then replies and exits
+([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
+not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
+a repair tool is `TODO(fs-repair)`. `init`'s mounts are never unmounted, so until Part E's
+shutdown every boot of an installed machine reports it.
+
+**The control channel stays open after `Ready`**, and takes a wait slot while it is. A directory
+session may use the last slot only once it has closed. `init` closes its end as soon as a mount
+is bound, so its mounts keep every session slot, and a closed control channel is ordinary.
 
 ## Journaling (jbd2) — deferred
 
@@ -91,19 +136,33 @@ Each part builds on proven machinery and is independently verifiable.
   A same-length rewrite goes from the page cache to the device with no resolve and no IPC,
   so before Slice C4 a file edited repeatedly in place still reported the timestamp of its
   last **size** change — usually its creation. Fixed by `File::Touch`: after a successful
-  `sys_file_sync` of a Model A file, the kernel sends the server the file's suffix, and the
+  write-back of a Model A file, the kernel sends the server the file's id, and the
   server stamps `mtime` **from its own clock** (no timestamp on the wire — a writer does
   not choose the time its write appears to have happened). It carries no reply and is
   registered as nothing pending: the data is already durable, so a dropped notification
   costs a stale timestamp rather than a failed sync. Ordering still holds where it matters,
   because it enters the same endpoint ring as forwarded resolves — a subsequent lookup of
-  that file is processed after it. To carry the file's name at all, Model A's producer had
-  to start holding its `(registration, suffix)`; those fields are used by nothing on the
-  data path, which is the point.
+  that file is processed after it. To name the file at all, Model A's producer had to start
+  holding the file's identity; it is used by nothing on the data path, which is the point.
+
+  **By inode since administration Part C.1**, and by suffix before. The kernel keeps one object
+  per file and writes a dirty one back at a sync or an unmount, long after the resolve that named
+  it, and a rename may have handed that name to another file by then. The id is the inode number,
+  which `map_file` reports and the block-file reply carries. `touch_file` stamps only a live
+  regular file, since the id comes off the wire and a touch can trail the unlink of what it names.
 - **Part D — file growth** ✅. `grow_file` (block-bitmap allocation + extent-tree extension +
   inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
   (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
   client writes the new region + syncs. The fs-server now holds a read-write device handle.
+
+  **A grow zeroes, on the device, everything it adds**: the old last block past the old size,
+  and every block it allocates (administration Part C.1). The kernel fills a page it does not
+  hold from the blocks the map names, so the device is what a reader of the new range sees.
+  Until then it saw whatever those blocks last held. After a truncate and a grow, that was the
+  file's own cut bytes, since the allocator's goal is the block the truncate just freed. On any
+  grow, it could be a deleted file's contents. A boot showed it on a freshly created file's
+  blocks. The cost is a write per block grown, which a writer then overwrites; unwritten extents
+  would avoid it, and nothing yet needs to.
 - **Part E — file creation** ✅. `create_file` (inode allocation via the inode bitmap +
   `ext4_dir_entry_2` insertion by splitting an existing entry's slack in the parent
   directory, then inode init as an extents regular file) — **`e2fsck`-verified**. Triggered

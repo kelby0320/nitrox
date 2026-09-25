@@ -29,6 +29,7 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > as the fallback. § "Interrupts" and the ramdisk re-checked 2026-09-14, when Phase 5 Part C
 > made a Limine module a block device and gave it a completion interrupt of its own; § "Device
 > discovery" the same day, when Part D made drivers report what they did with each function.
+> § "Flush" added 2026-09-24, with administration Part C.2.
 
 ## Three concepts, kept distinct
 
@@ -326,6 +327,30 @@ this way.
 - **Concurrency.** A lock around each transfer, so a read racing a write of the same block sees one
   or the other and never a torn block.
 - **Writes** land in the module's memory and are gone at power-off.
+
+### Flush
+
+*(Administration Part C.2, 2026-09-24.)* `IoOpcode::Flush` asks a device to write what it holds
+in a volatile cache to its medium, and its PO completes once it has. It is an IRP with no buffer
+and no range (`IrpOp::Flush`, `count` `0`), built by `io::block::dispatch_block_flush`.
+- **A partition passes it to its disk unchanged.** The cache is the disk's, not the partition's
+  blocks, so there is no offset to re-base.
+- **A RAM disk completes it at once**: its memory is its medium.
+- **AHCI issues it as a non-data command**: a command FIS with no LBA, no count and no PRDT,
+  completed by the D2H register FIS interrupt the port already enables. The command is `FLUSH
+  CACHE EXT` (`0xEA`), or `FLUSH CACHE` (`0xE7`) on a drive whose IDENTIFY word 83 lacks bit 13,
+  and the boot log names which (`ahci: port N flushes with …`).
+
+**Every driver names each op it handles, and refuses the rest.** AHCI used to read "a write,
+else a read", which would have issued a flush as `READ DMA EXT` with a count of `0`, which LBA48
+reads as 65,536 sectors, and no PRDT to receive them. The RAM disk read "a read, else a write".
+`ata_command` and the RAM disk's `transfer` now match every op, and an op with no command is
+failed outside the port lock, where every completion here happens. A flush's first boot also
+found both drivers building their fragment slice from the IRP's null buffer pointer, which
+`slice::from_raw_parts` forbids at any length. An empty buffer is an empty slice now.
+
+`test-qemu`'s probe flushes the root partition, which reaches the AHCI disk. A one-off QEMU trace
+of that boot (`-trace ide_bus_exec_cmd`) showed the drive executing exactly one `0xEA`.
 
 **This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds
 `buf_offset + length` against the buffer's size and nothing else, so before 2026-09-11

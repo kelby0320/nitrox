@@ -46,10 +46,11 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
-use crate::libkern::{AllocError, KBox};
+use crate::libkern::lockrank::LockRank;
+use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
-use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+use crate::object::{FileObject, Forgotten, ObjectRef};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (so a lazy `File`
 /// resolve can name the file in its page-cache producer without allocating under
@@ -58,6 +59,37 @@ use crate::object::header::KObjectHeader;
 /// but a `FILE` reply for such a path fails `TooLarge` (see the completion path).
 /// 256 bytes covers every milestone path; a heap-backed suffix is a later concern.
 pub const LOOKUP_SUFFIX_MAX: usize = 256;
+
+/// **What a forwarded resolve asks its server to do**, kept with the pending lookup so a
+/// `SUBNAMESPACE` reply can send the same request on into another namespace (administration Part
+/// C.4). By then the syscall that started it is gone, and with it the user pointers its
+/// `ResolveOp` carried; these are values.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ForwardOp {
+    /// A plain lookup.
+    Plain,
+    /// A size change first (`sys_file_create` / `_grow` / `_truncate`).
+    Size(u32, crate::rsproto::SizeChange),
+    /// A rename to the lookup's `dest`, with its `RENAME_*` flags.
+    Rename {
+        /// The rename's flags.
+        flags: u16,
+    },
+}
+
+/// A forwarded resolve's request, beyond its suffix: the operation, a rename's destination —
+/// mount-relative, as sent — and how many `SUBNAMESPACE` replies it has already followed.
+#[derive(Copy, Clone)]
+pub struct Forward<'a> {
+    pub op: ForwardOp,
+    pub dest: &'a [u8],
+    pub depth: u8,
+}
+
+impl Forward<'_> {
+    /// A plain lookup's: no destination, never continued.
+    pub const PLAIN: Forward<'static> = Forward { op: ForwardOp::Plain, dest: b"", depth: 0 };
+}
 
 /// One outstanding forwarded lookup: everything needed to complete its
 /// `PendingOperation` when the server's reply arrives. Moved out of the table by
@@ -83,9 +115,22 @@ pub struct PendingLookup {
     /// reply fails `TooLarge`).
     pub(crate) suffix: [u8; LOOKUP_SUFFIX_MAX],
     pub(crate) suffix_len: u16,
+    /// What the request asked for, so a `SUBNAMESPACE` reply can ask it again elsewhere.
+    pub(crate) op: ForwardOp,
+    /// A rename's destination as sent, inline like `suffix`, with its true length.
+    pub(crate) dest: [u8; LOOKUP_SUFFIX_MAX],
+    pub(crate) dest_len: u16,
+    /// How many `SUBNAMESPACE` replies this lookup has already followed.
+    pub(crate) depth: u8,
 }
 
 impl PendingLookup {
+    /// A rename's stored destination, or `None` if it overran [`LOOKUP_SUFFIX_MAX`].
+    pub(crate) fn dest(&self) -> Option<&[u8]> {
+        let n = self.dest_len as usize;
+        if n > LOOKUP_SUFFIX_MAX { None } else { Some(&self.dest[..n]) }
+    }
+
     /// The stored suffix bytes, or `None` if the true length overran
     /// [`LOOKUP_SUFFIX_MAX`] (the inline buffer is then incomplete — a `FILE` reply
     /// for it cannot recover the path).
@@ -142,6 +187,18 @@ struct Inner {
     next_id: u64,
 }
 
+/// One file in a registration's cache: the id its server gave it, and its `FileObject`.
+struct CachedFile {
+    id: u64,
+    /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
+    /// entry out, by address, so an entry never outlives the memory it names.
+    obj: *mut (),
+    /// **Its server forgot it with I/O of it in flight** (`File::Forget`). The entry stays so a
+    /// second `Forget` of the id finds the object and waits on the first one's answer. No
+    /// resolve or sync sees it, and it goes with the object.
+    forgotten: bool,
+}
+
 /// The kernel's registration record for one Userspace Server.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
@@ -152,6 +209,16 @@ pub struct UserspaceServerReg {
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
+    /// **The file cache: one `FileObject` per file this server's replies named**, keyed by
+    /// the file id a `FILE_BLOCKS` reply carries (administration Part C.1). Every resolve of a
+    /// file shares its one object, and a sync or an unmount can enumerate them. An index only
+    /// — the objects are held by their users, or by themselves while dirty.
+    ///
+    /// Its own lock, not `SCHED`, since the objects it hands out are cloned and dropped:
+    /// ranked [`Registry`](LockRank::Registry), above the page caches it indexes — it
+    /// allocates while held, and is never taken inside a `FileObject`'s lock. **No reference
+    /// is ever dropped under it**, since the last one would re-enter it from `FileObject::drop`.
+    files: SpinLock<KVec<CachedFile>>,
 }
 
 // SAFETY: identical reasoning to `IpcChannel` — the header refcount is atomic and
@@ -179,7 +246,110 @@ impl UserspaceServerReg {
                 pending_fill: core::array::from_fn(|_| None),
                 next_id: 1,
             }),
+            files: SpinLock::new(LockRank::Registry, KVec::new()),
         })
+    }
+
+    // --- The file cache (its own lock; never under `SCHED`) --------------
+
+    /// **The one object for file `id`, or `obj` becomes it.** If a live object for `id` is
+    /// cached, a new reference to it is returned and `obj` is left for the caller to drop —
+    /// outside this lock. Otherwise `obj` is entered under `id` (replacing an entry whose
+    /// object is mid-teardown) and `Ok(None)` returned. `Err` only if the index cannot grow.
+    /// A forgotten entry is passed by: its file has been freed, or is about to be.
+    pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
+        debug_assert_eq!(obj.object_type(), KObjectType::FileObject);
+        let mut g = self.files.lock();
+        if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
+            // SAFETY: the entry's object is live — its `Drop` removes the entry under this
+            // lock before its memory goes, so while the lock is held the pointer is readable.
+            if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+                return Ok(Some(existing));
+            }
+            // Mid-teardown (refcount zero): its `Drop` will look for its own address, which
+            // this overwrites, so it removes nothing.
+            e.obj = obj.as_ptr();
+            return Ok(None);
+        }
+        g.try_push(CachedFile { id, obj: obj.as_ptr(), forgotten: false })?;
+        Ok(None)
+    }
+
+    /// **`File::Forget` of file `id`**, with `answer` the PO its server waits on if it has to.
+    ///
+    /// A live entry is the file the server means. Failing that, the entry an earlier `Forget`
+    /// left because I/O of the file was in flight: this is a second `Forget` while the first
+    /// waits, and [`FileObject::forget`] hands it the first one's PO. The entry is marked
+    /// forgotten, so no later resolve of the id — which after a free may name a new file —
+    /// and no sync finds the object. It goes now if nothing is in flight, else with the object.
+    ///
+    /// The first version took the entry out on every `Forget`. A second then found nothing and
+    /// was answered at once, with the first one's IRP still in flight (PR #335 review).
+    /// [`Forgotten::Now`] if the id is not cached.
+    pub fn forget_file(&self, id: u64, answer: &ObjectRef) -> Forgotten {
+        let obj = {
+            let mut g = self.files.lock();
+            let Some(i) = g
+                .iter()
+                .position(|e| e.id == id && !e.forgotten)
+                .or_else(|| g.iter().rposition(|e| e.id == id))
+            else {
+                return Forgotten::Now;
+            };
+            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
+            match unsafe { ObjectRef::try_acquire(g[i].obj, KObjectType::FileObject) } {
+                Some(obj) => {
+                    g[i].forgotten = true;
+                    obj
+                }
+                // Mid-teardown, so nothing of it is in flight: an IRP pins its object.
+                None => {
+                    g.remove(i);
+                    return Forgotten::Now;
+                }
+            }
+        };
+        // Outside the files lock: the object's own lock ranks below it.
+        // SAFETY: `obj` pins a live `FileObject`.
+        let fo: &FileObject = unsafe { &*(obj.as_ptr() as *const FileObject) };
+        let outcome = fo.forget(answer);
+        if matches!(outcome, Forgotten::Now) {
+            self.cache_forget_object(obj.as_ptr());
+        }
+        // Dropped here, outside the lock, since it may be the last reference.
+        drop(obj);
+        outcome
+    }
+
+    /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
+    pub fn cache_forget_object(&self, obj: *mut ()) {
+        let mut g = self.files.lock();
+        if let Some(i) = g.iter().position(|e| e.obj == obj) {
+            g.remove(i);
+        }
+    }
+
+    /// Every live cached object, each a new reference the caller drops — outside this lock,
+    /// which it is by the time this returns. Forgotten ones are left out: nothing of theirs is
+    /// written again. `Err` if the list cannot be built.
+    pub fn cache_objects(&self) -> Result<KVec<ObjectRef>, AllocError> {
+        let mut out = KVec::new();
+        let g = self.files.lock();
+        out.try_reserve(g.len())?;
+        for e in g.iter().filter(|e| !e.forgotten) {
+            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
+            if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+                // `try_reserve` above guarantees this push does not allocate.
+                let _ = out.try_push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// How many files the cache holds. Test/observability only.
+    #[cfg(test)]
+    pub(crate) fn cached_files(&self) -> usize {
+        self.files.lock().len()
     }
 
     /// `true` iff the self-check sentinel is intact.
@@ -245,19 +415,38 @@ impl UserspaceServerReg {
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
-    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
-    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
-    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
-    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
+    /// A plain lookup's [`begin_forward`](Self::begin_forward) — the tests' shorthand.
     ///
     /// # Safety
-    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    /// As [`begin_forward`](Self::begin_forward).
+    #[cfg(test)]
     pub(crate) unsafe fn begin(
         reg: *mut (),
         po: &ObjectRef,
         owner_pid: u32,
         requested: Rights,
         suffix: &[u8],
+    ) -> Option<u64> {
+        // SAFETY: the caller's contract, passed through.
+        unsafe { Self::begin_forward(reg, po, owner_pid, requested, suffix, Forward::PLAIN) }
+    }
+
+    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
+    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
+    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
+    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
+    ///
+    /// `fwd` is what the request asked for, kept so a `SUBNAMESPACE` reply can send it on.
+    ///
+    /// # Safety
+    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    pub(crate) unsafe fn begin_forward(
+        reg: *mut (),
+        po: &ObjectRef,
+        owner_pid: u32,
+        requested: Rights,
+        suffix: &[u8],
+        fwd: Forward<'_>,
     ) -> Option<u64> {
         let inner = unsafe { Self::inner(reg) };
         // First free slot, or `None` when the table is full (all in flight).
@@ -269,6 +458,9 @@ impl UserspaceServerReg {
         let mut sbuf = [0u8; LOOKUP_SUFFIX_MAX];
         let n = suffix.len().min(LOOKUP_SUFFIX_MAX);
         sbuf[..n].copy_from_slice(&suffix[..n]);
+        let mut dbuf = [0u8; LOOKUP_SUFFIX_MAX];
+        let d = fwd.dest.len().min(LOOKUP_SUFFIX_MAX);
+        dbuf[..d].copy_from_slice(&fwd.dest[..d]);
         inner.pending[slot] = Some(PendingLookup {
             request_id,
             po: po.clone(),
@@ -276,6 +468,10 @@ impl UserspaceServerReg {
             requested,
             suffix: sbuf,
             suffix_len: suffix.len() as u16,
+            op: fwd.op,
+            dest: dbuf,
+            dest_len: fwd.dest.len() as u16,
+            depth: fwd.depth,
         });
         Some(request_id)
     }
@@ -546,6 +742,32 @@ mod tests {
         assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
         // Drain the rest before dropping.
         while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
+        drop(po);
+        drop(r);
+    }
+
+    /// **A pending lookup keeps what it asked for** (administration Part C.4): the operation, a
+    /// rename's destination and the depth come back with it, so a `SUBNAMESPACE` reply can send
+    /// the same request on. A destination longer than the inline buffer reads as absent rather
+    /// than as a truncated path, which would continue somewhere else.
+    #[test]
+    fn a_pending_lookup_keeps_its_operation_for_a_continuation() {
+        init_global_heap();
+        let r = reg();
+        let po = make_po();
+        let fwd = Forward { op: ForwardOp::Rename { flags: 1 }, dest: b"fs/l1/b", depth: 2 };
+        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"fs/l1/a", fwd) }
+            .unwrap();
+        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        assert_eq!((pl.op, pl.dest(), pl.depth), (ForwardOp::Rename { flags: 1 }, Some(&b"fs/l1/b"[..]), 2));
+        assert_eq!(pl.suffix(), Some(&b"fs/l1/a"[..]));
+        drop(pl);
+        let long = [b'a'; LOOKUP_SUFFIX_MAX + 1];
+        let fwd = Forward { op: ForwardOp::Rename { flags: 0 }, dest: &long, depth: 0 };
+        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"a", fwd) }.unwrap();
+        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        assert_eq!(pl.dest(), None, "an overlong destination is absent, not truncated");
+        drop(pl);
         drop(po);
         drop(r);
     }

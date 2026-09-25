@@ -28963,3 +28963,325 @@ had inherited.
 
 A doc comment in `fs-server-ext4` still said its directory reply was `OBJECT_KIND_DIRECTORY`, and
 now matches the code.
+
+## 2026-09-24 — Administration C.1a: one page-cache object per file, and a dirty one kept
+
+The first half of C.1. `File::Forget` is C.1b.
+
+**What landed, as the detail pass drew it:**
+- **The file id is in the block-file reply.** The `FILE_BLOCKS` body grew a 32-byte prefix, with
+  `file_id` at 16, `flags` at 24 and the runs at 32. `fs-server-ext4` sends the inode number. The
+  one flag, `FILE_BLOCKS_READ_ONLY`, is defined now and set by C.3. The kernel already honours it
+  by withholding `MAP_WRITE`.
+- **Each registration keeps a weak index of its files** (`UserspaceServerReg::files`, Registry
+  rank). `FileObject::cache_in` either enters a reply's new object or resizes the cached one to
+  the reply and drops the new one, so a grow, create or truncate of a file updates the object
+  everyone shares.
+- **Dirty is per object**, held as a reference the object has to itself. It is taken at a
+  writable mapping and let go by a write-back that cleans.
+- **`sys_ns_sync(ns, path)`**, syscall 38. It needs `LOOKUP` and blocks, the same exemption
+  `sys_file_sync` has. It writes every dirty object of the registration `path` resolves to and
+  returns how many.
+- **`File::Touch` names the file by inode.** `touch_file` stamps only a live regular file.
+
+**A decision the pass left open: when a write-back cleans.** The pass said "dirty until its next
+write-back, and stays dirty while a writable mapping remains". Checking for a mapping at the
+*end* of a write-back is not enough. A mapping present at the start can write after its page's
+IRP reads the frame, then go before the end, and the object would be called clean and dropped
+with the write unwritten. So a write-back cleans only if it *began* with no writable mapping and
+none was made during it; a generation each writable mapping bumps detects the second. The
+consequence is that a writer syncing while still mapped leaves its file dirty. `libfs` and `nxsh`
+synced before they unmapped, which would have pinned every file they wrote until an unmount, so
+they now unmap first.
+
+**Five things the work found:**
+1. **The deferred same-page fault spin stopped a boot.** Every process running one binary now
+   shares its image's object, so two faulting one page is ordinary. The second faulter
+   `yield_now`ed until the page was ready, from a fault handler with interrupts off, and
+   `yield_now` returns at once when nothing else is ready. `test-qemu` hung twice with three CPUs
+   in `tlb::shootdown` and the fourth in that loop. The fix is the one `deferred-decisions.md`
+   named: the page carries its fill's PO, a second faulter blocks on it, and whoever wakes first
+   settles the page, matched by the PO. It also closes a hole the spin hid: a filler whose fill
+   failed returned without releasing the page, and it stayed loading forever.
+2. **A grow did not zero what it allocated.** The pass reasoned that a regrown range "reads as
+   zero, which is what the filesystem says it holds". The kernel half of that is sound, but a page
+   nobody holds fills from the device, and `grow_file` left new blocks and the old last block's
+   tail as they were. A negative control that removed the zeroing failed the probe on a freshly
+   created file's blocks, not only after a truncate, so the exposure was real in practice: a new
+   file could read a deleted one's bytes. `grow_file` now zeroes the tail and every new block.
+3. **A lock-order bug a host test cannot see.** The first boot panicked in `cache_in`: a guard
+   made inside `resize`'s argument list lived to the end of the call, so two page-cache locks
+   nested. The rank tracker is inert under `cfg(test)`, and every host test passed.
+4. **The probe's persistence checks had stopped checking.** `overwrite`, `grow` and `create`
+   re-resolved to prove a write reached the disk, and a re-resolve now shares the cached object.
+   They read the device instead, through `fs-server-ext4`'s own library over the root partition
+   opened raw. That is also how the new C.1 check tells the cache from the device.
+5. **A display-gate race lost its margin, and only CI saw it.** `check-display --kvm` failed on
+   the PR at about 4 boots in 6. Main passed 6 of 6. The gate composes three reference windows
+   at the origin over `nxterm`'s larger one, and the stack was creation order. `nxterm` starts
+   just before `ui-testclient`, and both load the same two fonts before opening a window. Once a
+   file is one shared object, the process behind rides the other's fills instead of doing its
+   own reads. So the head start that kept `nxterm`'s window at the bottom is gone. In each
+   failing boot the toolkit reference was window 2 and `nxterm` window 3. Now `ui-testclient`
+   `Raise`s its three windows over the manager channel, bottom to top, as its last change to the
+   stack. `nxterm` only has to have created its window before that, which comes after three
+   windows' frames and a 200 ms configure deadline. A later window would cover the compared
+   region and fail the gate, so the failure is not hidden. Every local gate had passed, because
+   the local set ran `check-display` under TCG only. It now runs each of CI's `--kvm` variants
+   too.
+
+`kernel/docs/lock-ordering.md` listed `DEVICES` and `PARTITIONS` as leaves when the code ranks
+them Registry, above the allocators. It is corrected, and names the file cache and `OUTCOMES`.
+
+**Recorded, not built:** `TODO(retired-frames)`, since a truncate's retired frames live as long
+as the object does, and `TODO(truncate-inflight-writeback)`, since a write-back in flight can
+land in blocks a concurrent truncate freed. The second is the truncate half of what C.1b's
+`Forget` does for an unlink.
+
+**Controls:**
+- 12 negative controls on the kernel's host tests and 5 on `fs-server-ext4`'s, each failing its
+  test.
+- Four boots, each failing the verdict: no sharing, a sync that writes nothing, a resize that
+  keeps pages, and a grow that zeroes nothing.
+
+## 2026-09-24 — Administration C.1b: `File::Forget`, and a file freed in two halves
+
+The second half of C.1. A server frees a file's blocks only after the kernel has said nothing of
+the file is in flight, and nothing more will be.
+
+**How the answer travels was open, and is the send's own result.** `fs-server-ext4` is
+single-threaded and unlinks inline, inside a directory session. An answer arriving as a message on
+its forwarding endpoint would sit in the ring with forwarded requests, and the server would have to
+pick it out mid-session. A new syscall would be ABI for one message. A `Block` send already returns
+a `PendingOperation` that completes when the message is delivered. So a `Forget` must be sent
+`Block`, and the kernel, which consumes it inline, completes that PO once the file's I/O has
+ended. `NoBlock` and `BlockBounded` are refused: the first has no PO, and the second's deadline
+could not apply to I/O already issued.
+
+**What the kernel does.** It takes the object out of the registration's cache, so a later resolve
+of the id gets a new object; the id may name a new file once its inode is reused. It marks the
+object dead, releases its dirty pin, and answers when its count of IRPs in flight reaches zero.
+- **Reads are counted as well as writes.** A fill queued before the `Forget` must land before the
+  block becomes another file's, or a mapping of the dead file could read that file's bytes. A FIFO
+  device queue happens to prevent it today; NCQ would not.
+- **A write-back no longer snapshots its pages' blocks up front.** It decides each page as it
+  issues the IRP, under the object's lock: dead stops it, and a resize redirects it. That also
+  narrows `TODO(truncate-inflight-writeback)` to an IRP already in flight when a truncate lands.
+
+**ext4 frees in two halves.** `unlink_at`, and a `rename_path` that replaces a file, remove the
+name and return the inode whose last link is going, with its link still counted and its blocks
+allocated. `release_inode` frees it after the answer. A crash in between leaves an unattached inode
+that `e2fsck` moves to `lost+found`, which `rename_path` could already do. A server that cannot get
+an answer keeps the inode: a leaked block can be repaired, and a block claimed twice cannot.
+
+**Three things the work found:**
+1. **Two guards for one thing.** `forget` first cleared the run map as well as marking the object
+   dead, so a fill read a hole either way. The control deleting the dead check from `begin_read`
+   passed. The mark alone governs I/O now, and the run map is left as it was.
+2. **The server's wait would have corrupted its loop.** `po_wait` shares
+   `WAIT_HANDLES`/`WAIT_RESULTS` with `serve_loop`, which is still walking a batch of results when
+   it calls into a session or a rename. A `Forget` waited on there would overwrite the batch. It
+   waits on buffers of its own. This was found by reading, and no failure showed it.
+3. **The crate's rules file forbade C.1a.** `fs-server-ext4/CLAUDE.md` said the server writes
+   metadata only, and C.1a's grow writes zeroes into the blocks it allocates. The rule now names
+   that exception and why, and forbids freeing before a `Forget` is answered.
+
+**Controls:**
+- 10 on the kernel's host tests and 2 on `fs-server-ext4`'s, each failing its test once the
+  runs were left alone.
+- Two boots, each failing only the new probe check: a server that frees without a `Forget`, and a
+  kernel that answers without forgetting. In both, the unlinked file's pattern reached its freed
+  block.
+
+## 2026-09-24 — Administration C.2: `IoOpcode::Flush`, and a drive's cache written before "done"
+
+**What landed.**
+- **`IoOpcode::Flush` (2), with `IrpOp::Flush` beside it.** It takes no buffer and no range, and
+  its PO completes once the device has written its volatile cache to its medium. It needs
+  `WRITE`: only a writer has anything to make durable.
+- **Per device.** A partition passes it to its disk unchanged, and a RAM disk completes it at once.
+  AHCI issues `FLUSH CACHE EXT` as a non-data command: no LBA, no count, no PRDT, and completion by
+  the D2H register FIS interrupt the port already enables. A drive whose IDENTIFY word 83 lacks the
+  48-bit form gets `FLUSH CACHE`.
+- **`nxinstall` flushes its target before it says "done"**, and `check-install` asserts that
+  milestone.
+- **The opcodes are in `abi-sync-check` for the first time.** The kernel states each as an
+  `IO_OPCODE_*` const and builds `IoOpcode` from them, so the names pair with `libkern`'s.
+- `TODO(ahci-flush)` is resolved.
+
+**The deferred entry said "a small new path rather than a new opcode", and it became an
+opcode.** The consumer is the storage service's unmount, a userspace program that reaches a device
+only through `sys_io_submit`. A driver-internal flush would have had no caller.
+
+**A flush is its own path in `sys_io_submit`, and refuses a descriptor that names anything.** A
+buffer, an offset or a length is `InvalidArgument`, because a flush covers the whole device, and a
+descriptor that seemed to cover less would promise what the flush does not do. It is dispatched
+before the zero-length early return, which would otherwise have answered it with a pre-signalled
+no-op that flushed nothing.
+
+**Three things the work found:**
+1. **Both drivers inferred an op from "not the other one".** AHCI read "a write, else a read",
+   which would have issued a flush as `READ DMA EXT` with a count of `0`: 65,536 sectors under
+   LBA48, with no PRDT to receive them. The RAM disk read "a read, else a write", and would have
+   copied a flush's buffer, had it one, onto the disk. Both now name every op and refuse the rest.
+   AHCI's decision is `ata_command`, host-tested. An op with no command is failed by `issue_locked`'s
+   callers once they have released the port lock. The first draft completed it under the lock,
+   which nests the DPC queue's lock in the port lock at the same rank.
+2. **Building a slice from a null pointer.** A flush's buffer is empty with a null `frags`, and
+   both drivers built their fragment slice with `slice::from_raw_parts` before looking at the op.
+   That is undefined at any length, and the first boot's precondition check panicked in AHCI. An
+   empty buffer is an empty slice now, in both drivers.
+3. **The completion alone proves only that the path ran.** A one-off `test-qemu` boot with
+   `-trace ide_bus_exec_cmd` showed QEMU's disk executing exactly one `0xEA`: the probe's flush.
+   The trace was a patch to `qemu_base_args`, restored afterwards; no gate carries it.
+
+**Controls:** two host tests fail without their guards: the RAM disk taking a flush for a write,
+and `ata_command` taking an unknown op for a read. Two boots fail the probe: a flush whose range
+goes unchecked, and one allowed on a read-only handle. `abi-sync-check` fails on a mismatched
+`IO_OPCODE_FLUSH`.
+
+**ABI hash:** `IoOpcode` and `IrpOp` each gained a variant, which changes the kernel ABI version
+hash (`abi-version-hash.md`).
+
+## 2026-09-24 — Administration C.3: a read-only mount is the server's, and a filesystem knows how it was left
+
+**Read-only is a type the server serves through, not a check per operation.**
+`fs_server_ext4::ReadOnly` is a reader whose every write is refused with `FsError::ReadOnly`.
+- **Whatever mutation is reached, by a session or a resolve, fails at its first write having
+  written nothing**, since a mutation only reads before it writes. A per-operation check would
+  have to be remembered by every future operation. This one can't be forgotten short of
+  bypassing the reader, which the crate's rules file now forbids.
+- **The same type answers `read_only()`**, from which the block-file reply takes its
+  `FILE_BLOCKS_READ_ONLY` mark. The mark and the refusal are one fact.
+- **The host test runs each of the 13 mutations the server can reach twice.** Through
+  `ReadOnly` it must fail with `ReadOnly`, and on a writable copy of the same image it must
+  succeed, so the mount is the only thing that stopped it. The image is byte-identical after.
+- **One path needed more than the type.** A grow or create that arrives as a resolve ignored its
+  errors, so the reply fell through to the file's current size. That answers a create with a
+  file that never changed. `maybe_grow` now reports a `ReadOnly` refusal, and only that, and the
+  resolve is answered `NoAccess` with the reason `read-only mount`. Other grow failures fall
+  through as before.
+
+**The flag travels in the setup message**, as one flags byte; an empty payload is writable, as
+before. `init` sets it for `init.toml`'s `"ro"`, which until now only narrowed the binding's
+rights, and forwarded resolves ignore those. `init` does not link `librsproto`, so it states the
+byte itself (`Mode::setup_flags`), and a host test holds the two equal.
+`TODO(mount-write-authority)` is narrowed accordingly: a read-only mount now exists, and what
+stays open is one mount writable to some and read-only to others.
+
+**`s_state`.**
+- **A writable mount clears the clean bit before `Ready`**, and a mount that cannot write it is
+  refused (`Unservable::StateUnwritable`), since a filesystem that changed while looking clean
+  would be worse than one not mounted.
+- **`Meta::Unmount` (`0x0005`) on the control channel sets it again as the last write**, then
+  the server replies and exits.
+- **Not clean at mount is reported, not refused**, with the repair tool that would do better
+  recorded as `TODO(fs-repair)`. Until Part E's shutdown, every boot of an installed machine will
+  report it, because `init`'s mounts are never unmounted.
+- **On a boot:** after a `test-qemu` boot, the root partition's `s_state` in the image read
+  `0x0`.
+- **Host-tested from bytes this writer never produced as well as its own**: `s_state` values
+  set by hand read as they should, and a set error bit survives a mount and an unmount.
+
+**The control channel costs a wait slot while it is open**, so a session may take the last slot
+only once it has closed. `init` closes its end at the first chance, so its mounts keep all 31;
+a supervisor that keeps the channel for `Meta::Unmount` gets 30.
+
+**Not exercised on a boot yet:** no image mounts anything read-only, and nothing sends
+`Meta::Unmount`. The storage service's live-boot auto-mount (C.5) and `check-storage` (C.8) are
+where both first run. What does run on every boot is the control channel's new life: `init`
+closing it after `Ready`, and the server dropping it and serving on.
+
+**Controls:** seven negative controls fail their tests: `ReadOnly` letting writes through or
+not marking replies; a mount that keeps the clean bit or clobbers the other bits; a reader that
+calls any nonzero state clean; `init`'s flag for `"ro"` zeroed; and an empty setup payload read
+as read-only.
+
+## 2026-09-24 — Administration C.4: a resolve continues in a namespace a server hands back
+
+**What the reply says was left open, and it names a prefix, not a path.** The detail pass's
+example has the storage service reply with a namespace and the rest of the path. That is enough
+for one path. A rename carries two, and from a returned path alone the kernel could map the
+destination only by inferring the server's prefix, which breaks as soon as a server maps into a
+subdirectory. So the `SUBNAMESPACE` body says `consumed`, how many bytes of the suffix the server
+answered for, and `base`, what they stand for in the namespace it returns. Every path of the
+operation continues as `base` plus its own remainder, and a destination whose first `consumed`
+bytes differ has left the answer and is `Unsupported`.
+
+**The continuation is `sys_ns_lookup`'s second half, run again.** `resolve_and_start` is the
+resolve and dispatch the syscall does after its own checks, now called by the syscall at depth
+`0` and by a `SUBNAMESPACE` reply one deeper. So a continued resolve dispatches exactly as a first
+one does. A pending lookup now keeps a `ForwardOp` (plain, size change, or rename with its flags)
+and a rename's destination, since the user pointers the syscall had are gone by the reply.
+
+**A continuation that lands on a kernel server is refused.** It runs in the replying server's
+`sys_channel_send`, and `/proc/self` answers for whoever is calling. A server could otherwise
+have handed its caller the server's own process, thread or namespace. This was found while
+designing, before any code: the plan had said "continue for every operation". A direct binding is
+still installed, and a userspace server still forwarded.
+
+**Four deep.** A fifth `SUBNAMESPACE` reply is `TooLarge`, so a server answering into itself ends.
+
+**Tested on a boot now, not only in C.5.** The plan left the boot test to the storage service.
+But the two properties a host test cannot reach are safety properties, the kernel-server refusal
+and the depth cap, so `boot-probe` gained `BIND_NAMESPACE` in the test image and acts as its own
+server: a channel bound at `/cont` in a namespace it made, answering each lookup with a copy of
+the root namespace. It checks six things:
+- a lookup comes back with the root filesystem's file;
+- a create carries its size on;
+- a rename continues both paths;
+- a rename leaving the prefix is refused with nothing moved;
+- a server answering into itself is refused after exactly five replies;
+- `/proc/self` is refused.
+
+Three boots, each failing only that check: no depth cap, the kernel-server refusal removed, and
+the operation not carried past the first server.
+
+**One guard per invariant, again.** The first draft validated `base` and then the joined path.
+A control that removed the first check passed, because every bad base also made a bad path. The
+join's validation is the guard now, and the only base it could let through, the empty one, is
+refused up front, each with a control.
+
+Two doc comments had drifted onto the wrong items and are back where they belong:
+`forward_userspace_lookup`'s had been sitting on `join_subtree`, and `OBJECT_KIND_MEMOBJ`'s on
+`OBJECT_KIND_NONE`.
+
+## 2026-09-24 — Administration C.1–C.4, reviewed: a second `Forget`, and a deferral half paid
+
+PR #335's review found one blocking item, CI's red `check-display --kvm`, and two worth fixing.
+It broke the code under 11 of the new host tests, and each failed.
+
+**CI.** This is C.1a's fifth finding above: the display gate's stack was a race that C.1's shared
+cache made a coin flip. The review measured the same thing from the other side. In its failing
+screendumps the toolkit reference was "missing, shadow included" with `nxterm` showing through,
+which is `nxterm`'s window stacked between the toolkit and the terminal reference. Its guest
+transcript "showed nothing" because it was not that boot's: `check-display` saves
+`guest-transcript-check-display.log` only on a timeout. So a pixel failure leaves the last
+timeout's file under a current-looking name. The copy both sessions read dated from 2026-09-16.
+
+**1. A second `Forget` was answered at once.** The spec said a second `Forget` of a file while the
+first waits gets the same PO. `FileObject::forget` did that, but `answer_forget` never reached it
+twice: the first `Forget` took the cache entry out, so a second found nothing and was completed
+with the first one's IRP still in flight. A server that sent `Forget` twice could then free a block
+the IRP was about to write. `fs-server-ext4` is single-threaded and blocks on the first answer, so
+nothing reaches it today. The test that claimed the property called the object directly, a path no
+send takes.
+
+The spec's promise is the one kept. `UserspaceServerReg::forget_file` replaces `cache_take`:
+- It marks the entry **forgotten** instead of removing it.
+- It removes the entry at once only when the answer is immediate. Otherwise the entry goes with
+  the object.
+- A forgotten entry is passed by every resolve and every sync, and a live entry of the id is
+  preferred over it.
+
+Two host tests go through the registration. Five controls each fail one:
+- removing the entry at every `Forget`;
+- a resolve finding a forgotten entry;
+- a sync listing one;
+- keeping the entry after an immediate answer;
+- preferring a forgotten entry over a live one.
+
+**2. `deferred-decisions.md` still said `sys_file_sync` was the only writeback trigger.** The
+entry now records what C.1 built: the self-pin, and `sys_ns_sync`. It also says what is owed. C.5's
+unmount and Part E's shutdown must call it, and a file served with id `0` is still uncached. No
+in-tree server sends a zero id, so that part carries its own trigger.

@@ -13,7 +13,17 @@ pub const MAX_FILE: usize = 64 * 1024;
 /// Largest filesystem block the reader supports (its block scratch buffer).
 const MAX_BLOCK: usize = 4096;
 
+/// A block of zeroes, for what a grow adds ([`grow_file`]). Static rather than on the stack,
+/// which is a server thread's and small.
+static ZERO_BLOCK: [u8; MAX_BLOCK] = [0; MAX_BLOCK];
+
 const SUPER_MAGIC: u16 = 0xEF53;
+
+/// Byte offset of `s_state` from the device's start: the superblock at 1024, `s_state` at 58
+/// within it.
+const S_STATE_AT: u64 = 1024 + 58;
+/// `s_state`'s "cleanly unmounted" bit (`EXT4_VALID_FS`).
+const STATE_CLEAN: u16 = 0x0001;
 const ROOT_INO: u32 = 2;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const INCOMPAT_64BIT: u32 = 0x80;
@@ -205,13 +215,17 @@ pub enum Unservable {
         /// The inode's `i_mode`.
         mode: u16,
     },
+    /// A writable mount could not record that it is mounted (administration Part C.3): the
+    /// superblock's state would not write, so neither would anything else, and a filesystem
+    /// that changed while looking clean would be worse than one not mounted.
+    StateUnwritable,
 }
 
 impl Unservable {
     /// The [`FsError`] a request fails with for the same reason.
     pub fn fs_error(self) -> FsError {
         match self {
-            Unservable::Unreadable | Unservable::RootUnreadable => FsError::Io,
+            Unservable::Unreadable | Unservable::RootUnreadable | Unservable::StateUnwritable => FsError::Io,
             Unservable::NoMagic { .. }
             | Unservable::ZeroField(_)
             | Unservable::RootNotDirectory { .. } => FsError::Corrupt,
@@ -246,6 +260,9 @@ impl core::fmt::Display for Unservable {
                 "inode 2 is not a directory (mode {mode:#06o}): the group descriptors or the inode \
                  table are not what the superblock describes"
             ),
+            Unservable::StateUnwritable => {
+                write!(f, "the superblock could not be written to record the filesystem mounted")
+            }
         }
     }
 }
@@ -453,33 +470,15 @@ fn dir_lookup<R: BlockReader>(
     Err(FsError::NotFound)
 }
 
-/// Resolve an absolute path to `(inode_number, inode_bytes)`, walking directories
-/// from the root inode.
-fn resolve_path<R: BlockReader>(
-    r: &R,
-    sb: &Superblock,
-    path: &[u8],
-) -> Result<[u8; 256], FsError> {
-    let mut inode = read_inode(r, sb, ROOT_INO)?;
-    for comp in path.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
-        if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
-            return Err(FsError::NotFound); // a path component is not a directory
-        }
-        let ino = dir_lookup(r, sb, &inode, comp)?;
-        inode = read_inode(r, sb, ino)?;
-    }
-    Ok(inode)
-}
-
-/// Resolve `path` (absolute) to a **regular extent file**, returning its inode
-/// bytes and exact size. Errors: `NotFound` (missing path / not a regular file),
+/// Resolve `path` (absolute) to a **regular extent file**, returning its inode number,
+/// its inode bytes and its exact size. Errors: `NotFound` (missing path / not a regular file),
 /// `Unsupported` (non-extent or inline-data inode), `Corrupt` / `Io`.
 fn resolve_regular_file<R: BlockReader>(
     r: &R,
     sb: &Superblock,
     path: &[u8],
-) -> Result<([u8; 256], usize), FsError> {
-    let inode = resolve_path(r, sb, path)?;
+) -> Result<(u32, [u8; 256], usize), FsError> {
+    let (ino, inode) = resolve_path_ino(r, sb, path)?;
     if rd_u16(&inode, 0) & S_IFMT != S_IFREG {
         return Err(FsError::NotFound);
     }
@@ -489,7 +488,7 @@ fn resolve_regular_file<R: BlockReader>(
     }
     let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
     let size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
-    Ok((inode, size))
+    Ok((ino, inode, size))
 }
 
 /// Resolve `path` (absolute) to a regular file and return its **size** without
@@ -498,7 +497,7 @@ fn resolve_regular_file<R: BlockReader>(
 /// Errors as [`resolve_regular_file`].
 pub fn stat_file<R: BlockReader>(r: &R, path: &[u8]) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (_, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, _, size) = resolve_regular_file(r, &sb, path)?;
     Ok(size)
 }
 
@@ -662,7 +661,7 @@ pub fn read_file_range<R: BlockReader>(
     out: &mut [u8],
 ) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     if offset >= size as u64 {
         return Ok(0);
     }
@@ -702,7 +701,7 @@ pub fn map_range<R: BlockReader>(
     out: &mut [crate::BlockRun],
 ) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     let bs = sb.block_size as u64;
     let file_blocks = size.div_ceil(bs as usize) as u64;
     let hdr = &inode[40..100];
@@ -728,18 +727,32 @@ pub fn map_range<R: BlockReader>(
     Ok(n)
 }
 
+/// What [`map_file`] found: the file, and how many of its runs it wrote.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MappedFile {
+    /// The file's size in bytes.
+    pub size: usize,
+    /// The filesystem's block size.
+    pub block_size: u32,
+    /// How many `BlockRun`s were written to the caller's buffer.
+    pub runs: usize,
+    /// **The file's inode number — its id to the kernel**, which keeps one page-cache object
+    /// per id (administration Part C.1). Never `0`: ext4 numbers inodes from 1.
+    pub ino: u32,
+}
+
 /// Resolve `path` to a regular file and map its **entire** block range to device runs (the
-/// **Model A** resolve): returns `(size, block_size, run_count)` with the runs in `out`.
-/// Coalesces contiguous runs. `Err(TooLarge)` if the file needs more runs than `out` holds
-/// (too fragmented to inline in a resolve reply — the standalone `MapRange` op handles that,
-/// deferred). Errors otherwise as [`resolve_regular_file`].
+/// **Model A** resolve), with the runs in `out`. Coalesces contiguous runs. `Err(TooLarge)`
+/// if the file needs more runs than `out` holds (too fragmented to inline in a resolve reply
+/// — the standalone `MapRange` op handles that, deferred). Errors otherwise as
+/// [`resolve_regular_file`].
 pub fn map_file<R: BlockReader>(
     r: &R,
     path: &[u8],
     out: &mut [crate::BlockRun],
-) -> Result<(usize, u32, usize), FsError> {
+) -> Result<MappedFile, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (ino, inode, size) = resolve_regular_file(r, &sb, path)?;
     let bs = sb.block_size;
     let file_blocks = size.div_ceil(bs as usize) as u64;
     let hdr = &inode[40..100];
@@ -763,7 +776,7 @@ pub fn map_file<R: BlockReader>(
         n += 1;
         lb += len;
     }
-    Ok((size, bs, n))
+    Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 
 // --- write path: block allocation + file growth (Part D) --------------------
@@ -777,8 +790,9 @@ fn bit_set(map: &mut [u8], i: usize) {
     map[i / 8] |= 1 << (i % 8);
 }
 
-/// Resolve a path to `(inode_number, inode_bytes)` — like [`resolve_path`] but keeps the
-/// number (the write path needs it to locate the inode on disk for write-back).
+/// Resolve an absolute path to `(inode_number, inode_bytes)`, walking directories from the
+/// root inode. The number is what the write path needs to locate the inode on disk, and what
+/// names a file to the kernel.
 fn resolve_path_ino<R: BlockReader>(
     r: &R,
     sb: &Superblock,
@@ -796,26 +810,49 @@ fn resolve_path_ino<R: BlockReader>(
     Ok((ino, inode))
 }
 
-/// The absolute device byte offset of inode `ino` (for writing it back).
-/// Stamp `path`'s modification time as `now` — the `File::Touch` entry point.
-///
-/// The one filesystem mutation that changes **no** content and no structure. It exists
-/// because Model A puts the kernel, not this server, on the file-data path: a same-length
-/// in-place overwrite reaches the device without any resolve, so nothing here would
-/// otherwise learn the file changed and `mtime` would keep reporting the last *size*
-/// change. The kernel sends this after flushing such a write.
-///
-/// `now` comes from the server's own clock reading, never from the wire — a writer does not
-/// get to choose what time it wrote.
+// --- how the filesystem was left (administration Part C.3) --------------------
+
+/// **Whether the filesystem was left clean**: `s_state`'s "cleanly unmounted" bit. A writable
+/// mount clears it ([`mark_mounted`]) and an unmount sets it again as its last write
+/// ([`mark_clean`]), so a filesystem found without it was mounted writable and never
+/// unmounted — a crash, a power cut, or a shutdown this system does not have yet. `Err` if
+/// the device holds no ext4 filesystem.
+pub fn was_left_clean<R: BlockReader>(r: &R) -> Result<bool, FsError> {
+    read_superblock(r)?;
+    let mut s = [0u8; 2];
+    r.read_at(S_STATE_AT, &mut s)?;
+    Ok(u16::from_le_bytes(s) & STATE_CLEAN != 0)
+}
+
+/// Record that the filesystem is **mounted writable**: clear the "cleanly unmounted" bit,
+/// leaving the rest of `s_state` (the error and orphan bits) as it was. A writable mount does
+/// this before it answers `Meta::Ready`, so a filesystem never looks clean while it can change.
+pub fn mark_mounted<RW: BlockReader + BlockWriter>(rw: &RW) -> Result<(), FsError> {
+    set_state(rw, |s| s & !STATE_CLEAN)
+}
+
+/// Record that the filesystem was **cleanly unmounted**: set the bit — the last write of an
+/// unmount, after everything else it wrote.
+pub fn mark_clean<RW: BlockReader + BlockWriter>(rw: &RW) -> Result<(), FsError> {
+    set_state(rw, |s| s | STATE_CLEAN)
+}
+
+fn set_state<RW: BlockReader + BlockWriter>(rw: &RW, f: impl Fn(u16) -> u16) -> Result<(), FsError> {
+    read_superblock(rw)?;
+    let mut s = [0u8; 2];
+    rw.read_at(S_STATE_AT, &mut s)?;
+    rw.write_at(S_STATE_AT, &f(u16::from_le_bytes(s)).to_le_bytes())
+}
+
 /// Stamp the modification time of `name` inside `dir_ino`, the **session-scoped**
-/// counterpart of [`touch_path`].
+/// counterpart of [`touch_file`].
 ///
-/// The path form exists for the kernel, which names a file absolutely when it reports a
-/// Model A write it has just flushed. A client cannot use that: it holds a *session* on
-/// one directory, and the whole point of the session design is that a handle addresses
-/// entries **by name** inside it, so confinement is structural rather than checked. This
-/// is the same shape as [`mkdir_at`] / [`unlink_at`] / [`rmdir_at`] for exactly that
-/// reason.
+/// The inode form exists for the kernel, which names a file by the id its block-file reply
+/// carried when it reports a Model A write it has just flushed. A client cannot use that: it
+/// holds a *session* on one directory, and the whole point of the session design is that a
+/// handle addresses entries **by name** inside it, so confinement is structural rather than
+/// checked. This is the same shape as [`mkdir_at`] / [`unlink_at`] / [`rmdir_at`] for exactly
+/// that reason.
 ///
 /// `now` comes from the server, never from the caller — a timestamp a client could
 /// choose would be forgeable metadata.
@@ -834,13 +871,36 @@ pub fn touch_at<RW: BlockReader + BlockWriter>(
     touch_inode(rw, &sb, target_ino, now, Stamp::Modified)
 }
 
-pub fn touch_path<RW: BlockReader + BlockWriter>(
+/// Stamp inode `ino`'s modification time as `now` — the `File::Touch` entry point, naming the
+/// file by the id [`map_file`] gave the kernel.
+///
+/// The one filesystem mutation that changes **no** content and no structure. It exists
+/// because Model A puts the kernel, not this server, on the file-data path: a same-length
+/// in-place overwrite reaches the device without any resolve, so nothing here would
+/// otherwise learn the file changed and `mtime` would keep reporting the last *size*
+/// change. The kernel sends this after flushing such a write.
+///
+/// By inode, not path, since administration Part C.1: the kernel flushes a cached file at a
+/// sync or an unmount, long after the resolve that named it, when a rename may have given its
+/// name to another file. **Only a live regular file is stamped** — `NotFound` for a number out
+/// of range, a freed inode or anything else — since the id comes off the wire, and a touch can
+/// arrive after the file it names was unlinked.
+///
+/// `now` comes from the server's own clock reading, never from the wire — a writer does not
+/// get to choose what time it wrote.
+pub fn touch_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
-    path: &[u8],
+    ino: u32,
     now: i64,
 ) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
-    let (ino, _) = resolve_path_ino(rw, &sb, path)?;
+    if ino == 0 || ino > sb.inodes_count {
+        return Err(FsError::NotFound);
+    }
+    let inode = read_inode(rw, &sb, ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG || rd_u16(&inode, 26) == 0 {
+        return Err(FsError::NotFound);
+    }
     touch_inode(rw, &sb, ino, now, Stamp::Modified)
 }
 
@@ -864,6 +924,7 @@ fn touch_inode<RW: BlockReader + BlockWriter>(
     rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])
 }
 
+/// The absolute device byte offset of inode `ino` (for writing it back).
 fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64, FsError> {
     let group = (ino - 1) / sb.inodes_per_group;
     let index = (ino - 1) % sb.inodes_per_group;
@@ -958,6 +1019,13 @@ fn alloc_block<RW: BlockReader + BlockWriter>(
 /// is added only if the inline `i_block` header has room — otherwise `Unsupported` (extent-
 /// tree splitting / index nodes are deferred). Returns the new size. Metadata is written via
 /// the `BlockWriter`. See `docs/architecture/ext4-fs-server-rw.md`.
+///
+/// **Everything the grow adds reads as zero, on the device** (administration Part C.1): the old
+/// last block past the old size, and every block allocated. The kernel fills a page it does not
+/// hold from the blocks the map names, so the device is what a reader of the new range sees.
+/// Without this it saw whatever those blocks last held — after a truncate and a grow, the
+/// file's own old bytes, since the allocator's goal is the block the truncate just freed; on
+/// any grow, a deleted file's.
 pub fn grow_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
     path: &[u8],
@@ -982,8 +1050,17 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let cur_blocks = cur_size.div_ceil(bs);
     let new_blocks = new_size.div_ceil(bs);
 
+    // The old last block past the old end: a truncate leaves the bytes it cut there.
+    let within = cur_size % bs;
+    if within != 0 {
+        let phys = extent_find(rw, &sb, &inode[40..100], (cur_blocks - 1) as u64)?;
+        if phys != 0 {
+            rw.write_at(phys * bs as u64 + within as u64, &ZERO_BLOCK[..bs - within])?;
+        }
+    }
     for lb in cur_blocks..new_blocks {
-        append_block(rw, &sb, &mut inode, lb as u64)?;
+        let phys = append_block(rw, &sb, &mut inode, lb as u64)?;
+        rw.write_at(phys * bs as u64, &ZERO_BLOCK[..bs])?;
     }
 
     // Update inode size (i_size_lo @4, hi @108) + block count (i_blocks_lo @28, 512-B units).
@@ -1567,15 +1644,21 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
 }
 
 /// Remove the **regular file** `name` from directory inode `dir_ino`: unlink the directory
-/// entry, decrement the target's link count, and — when it reaches zero — free the target's
-/// data blocks and inode. Name-addressed. `NotFound` if absent; `Unsupported` if `name` is a
-/// directory (use [`rmdir_at`]).
+/// entry and decrement the target's link count. Name-addressed. `NotFound` if absent;
+/// `Unsupported` if `name` is a directory (use [`rmdir_at`]).
+///
+/// **The last name's removal frees nothing yet**: it returns the inode, still counting that
+/// link and holding its blocks, and [`release_inode`] frees it (administration Part C.1b).
+/// The kernel may hold the file's pages and be writing them to those blocks, so a server
+/// frees them only after `File::Forget` has been answered — else a write the kernel had
+/// already issued could land in a block handed to another file. `None` when another name
+/// still reaches the inode.
 pub fn unlink_at<RW: BlockReader + BlockWriter>(
     rw: &RW,
     dir_ino: u32,
     name: &[u8],
     now: i64,
-) -> Result<(), FsError> {
+) -> Result<Option<u32>, FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
     if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
@@ -1588,22 +1671,54 @@ pub fn unlink_at<RW: BlockReader + BlockWriter>(
     }
 
     dir_remove(rw, &sb, &parent, name)?;
-
-    let links = rd_u16(&target, 26).wrapping_sub(1);
-    if links == 0 {
-        free_inode_blocks(rw, &sb, &target)?;
-        free_inode(rw, &sb, target_ino, false, now)?;
-    } else {
-        let off = inode_offset(rw, &sb, target_ino)?;
-        let mut t = target;
-        t[26..28].copy_from_slice(&links.to_le_bytes());
-        // A surviving hard link: the file's *contents* did not change, only its
-        // link count — so ctime moves and mtime does not.
-        stamp(&mut t, now, sb.inode_size, Stamp::MetadataOnly);
-        rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
-    }
+    let orphan = drop_link(rw, &sb, target_ino, &target, now)?;
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
-    Ok(())
+    Ok(orphan)
+}
+
+/// Take away one of `ino`'s names. With others left, its link count drops now; for its last,
+/// nothing is written, and `Some(ino)` says it waits for [`release_inode`].
+fn drop_link<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    ino: u32,
+    inode: &[u8; 256],
+    now: i64,
+) -> Result<Option<u32>, FsError> {
+    let links = rd_u16(inode, 26);
+    if links <= 1 {
+        return Ok(Some(ino));
+    }
+    let off = inode_offset(rw, sb, ino)?;
+    let mut t = *inode;
+    t[26..28].copy_from_slice(&(links - 1).to_le_bytes());
+    // A surviving hard link: the file's *contents* did not change, only its link count — so
+    // ctime moves and mtime does not.
+    stamp(&mut t, now, sb.inode_size, Stamp::MetadataOnly);
+    rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
+    Ok(None)
+}
+
+/// **Free an inode no name reaches any more** — its data blocks, then the inode itself: the
+/// second half of [`unlink_at`], or of a [`rename_path`] that replaced a file. A server calls
+/// it only once the kernel has answered `File::Forget` for the inode, so nothing the kernel
+/// issued can still land in these blocks (administration Part C.1b).
+///
+/// Between the halves the inode is unattached with its link still counted. A crash there
+/// leaves what `rename_path` already could — `e2fsck` moves the file to `lost+found` — and
+/// never a block claimed twice. `NotFound` unless `ino` is a regular file with a link counted,
+/// since a server passes back only what a removal returned.
+pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    if ino == 0 || ino > sb.inodes_count {
+        return Err(FsError::NotFound);
+    }
+    let inode = read_inode(rw, &sb, ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG || rd_u16(&inode, 26) == 0 {
+        return Err(FsError::NotFound);
+    }
+    free_inode_blocks(rw, &sb, &inode)?;
+    free_inode(rw, &sb, ino, false, now)
 }
 
 /// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds
@@ -1718,11 +1833,13 @@ fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
 /// 1. Point the destination name at the source inode — repointing an existing entry when
 ///    replacing, otherwise inserting a new one.
 /// 2. Remove the source's old entry.
-/// 3. Release the replaced inode's link (freeing it if that was the last).
+/// 3. Drop the replaced inode's link. If it was the last, the inode is returned rather than
+///    freed, for [`release_inode`] once `File::Forget` has been answered — as [`unlink_at`]
+///    does, and for its reason.
 ///
-/// A crash between 1 and 2 leaves the file reachable under *both* names; between 2 and 3 it
-/// leaves the replaced inode unreferenced with a positive link count. `e2fsck` repairs both
-/// (the latter into `lost+found`), and neither loses the file being moved.
+/// A crash between 1 and 2 leaves the file reachable under *both* names; after 2 it can leave
+/// the replaced inode unreferenced with a positive link count. `e2fsck` repairs both (the
+/// latter into `lost+found`), and neither loses the file being moved.
 ///
 /// Moving a **directory** additionally repoints its `..` and shifts one link from the old
 /// parent to the new. Replacing a directory is refused (`Unsupported`) — that needs the
@@ -1733,7 +1850,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     new_path: &[u8],
     replace: bool,
     now: i64,
-) -> Result<(), FsError> {
+) -> Result<Option<u32>, FsError> {
     let sb = read_superblock(rw)?;
     let (old_parent_path, old_name) = split_parent(old_path).ok_or(FsError::Unsupported)?;
     let (new_parent_path, new_name) = split_parent(new_path).ok_or(FsError::Unsupported)?;
@@ -1744,7 +1861,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     }
     // A no-op rename must not unlink anything.
     if old_dir_ino == new_dir_ino && old_name == new_name {
-        return Ok(());
+        return Ok(None);
     }
 
     let src_ino = dir_lookup(rw, &sb, &old_dir, old_name)?;
@@ -1785,21 +1902,14 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     let (_, old_dir) = resolve_path_ino(rw, &sb, old_parent_path)?;
     dir_remove(rw, &sb, &old_dir, old_name)?;
 
-    // Step 3: release the inode the destination name used to hold.
-    if let Some(dest_ino) = replaced {
-        let dest = read_inode(rw, &sb, dest_ino)?;
-        let links = rd_u16(&dest, 26).wrapping_sub(1);
-        if links == 0 {
-            free_inode_blocks(rw, &sb, &dest)?;
-            free_inode(rw, &sb, dest_ino, false, now)?;
-        } else {
-            let off = inode_offset(rw, &sb, dest_ino)?;
-            let mut d = dest;
-            d[26..28].copy_from_slice(&links.to_le_bytes());
-            stamp(&mut d, now, sb.inode_size, Stamp::MetadataOnly);
-            rw.write_at(off, &d[..(sb.inode_size as usize).min(256)])?;
+    // Step 3: drop the link the destination name held.
+    let orphan = match replaced {
+        Some(dest_ino) => {
+            let dest = read_inode(rw, &sb, dest_ino)?;
+            drop_link(rw, &sb, dest_ino, &dest, now)?
         }
-    }
+        None => None,
+    };
 
     // A directory carries a link to its parent through `..`, so a move between parents
     // shifts one link and rewrites that entry.
@@ -1814,7 +1924,7 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     if new_dir_ino != old_dir_ino {
         touch_inode(rw, &sb, new_dir_ino, now, Stamp::Modified)?;
     }
-    Ok(())
+    Ok(orphan)
 }
 
 /// Rename `old` to `new` **within** directory inode `dir_ino` (the session's bound
@@ -1969,7 +2079,7 @@ pub fn truncate_file<RW: BlockReader + BlockWriter>(
 /// [`resolve_regular_file`], plus `TooLarge` (file > [`MAX_FILE`] or > `out`).
 pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
     let sb = read_superblock(r)?;
-    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let (_, inode, size) = resolve_regular_file(r, &sb, path)?;
     if size > MAX_FILE || size > out.len() {
         return Err(FsError::TooLarge);
     }

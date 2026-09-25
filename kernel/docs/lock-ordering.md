@@ -38,8 +38,9 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 1    | Scheduler runqueue (`SCHED`, **`IrqSpinLock`**)| live as of Phase 1 slice 9 (scheduler) |
 | 2    | Wait queue                                   | reserved (Phase 1 folds wait/timer state into rank 1 — see § Wait queues) |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
-| 4    | Kernel-object internal locks (`AddressSpace`, `Namespace`)| live as of Phase 1 slice 5 (item 3); `Namespace` binding store added Phase 2 slice 1; also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
+| 4    | Kernel-object internal locks (`AddressSpace`, `Namespace`, the `FileObject` page cache)| live as of Phase 1 slice 5 (item 3); `Namespace` binding store added Phase 2 slice 1; the page cache with slice 8. Never nested in either order; also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
 | 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
+| 5 (`Registry`) | Registries that **allocate while held**: the device registry (`DEVICES`) and its driver outcomes (`OUTCOMES`, never held with it), the GPT partition table (`PARTITIONS`), and each userspace server's **file cache** (`UserspaceServerReg::files`) | `DEVICES` and `PARTITIONS` live as of Phase 2 — ranked here rather than as leaves because they push into a `KVec` while held, so they must sit above the allocators. The file cache as of administration Part C.1: a `FileObject`'s `Drop` takes it *after* releasing its own page-cache lock, never inside it, and no object reference is ever dropped under it, since the last one would re-enter it |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
@@ -50,8 +51,6 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); see § The DPC queue lock |
 | leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); see § The entropy lock |
 | 8    | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Held with interrupts *enabled* (the F1 fix), so interrupt work runs beneath it — which is ordinary now that the tracker scopes interrupts (§ Interrupt context restarts the order) and no longer needs the exemption it carried when it first landed. It additionally has a contract the rank cannot express — **no other lock held when taken** — which is asserted separately in debug builds |
-| leaf | Device registry (`DEVICES`)                  | live as of Phase 2; a registry that takes nothing while held |
-| leaf | GPT partition table (`PARTITIONS`)           | live as of Phase 2; as `DEVICES` |
 | leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |
 | leaf | AHCI pending ring (per-port, **`IrqSpinLock`**)| live as of Phase 2; IRQ-side completion bookkeeping |
 | leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from `irp_complete_dpc` at the interrupt-dispatch tail and drained by `reap_pending` in thread context; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |

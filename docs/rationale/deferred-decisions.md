@@ -174,15 +174,42 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-**Concurrent same-page faults.** When a file page fault misses, the fault path reserves
-the frame (`Loading`), starts the producer fill, and parks the faulting thread on a
-per-*fault* `PendingOperation`. A *second* thread faulting the **same** page has no handle
-on that in-flight fill's PO, so it `yield_now`s and retries until the page is `Ready` — a
-spin, not a block. This was unreachable when written (single CPU, one faulter per
-`FileObject`); **under SMP it is reachable today**, and `std::thread` makes it ordinary.
-The fix — store the fill PO in the cache page so a second faulter blocks on it (one wakeup,
-no spin) — is scheduled as **B3 of the pre-CLI substrate-hardening pass**
-(`docs/planning/phase-4-desktop.md`).
+**Concurrent same-page faults — resolved by administration Part C.1 (2026-09-24).** When a
+file page fault missed, the fault path reserved the frame (`Loading`), started the producer
+fill, and parked the faulting thread on a per-*fault* `PendingOperation`. A *second* thread
+faulting the **same** page had no handle on that in-flight fill's PO, so it `yield_now`ed and
+retried until the page was `Ready` — a spin, not a block. The fix this entry named is what
+landed: the page carries the fill's PO, and a second faulter blocks on it. Whoever wakes first
+settles the page.
+
+It was scheduled as B3 of the pre-CLI substrate-hardening pass and did not land there. C.1 made
+it a prerequisite. With one object per file, every process running one binary shares its image,
+so concurrent faults on a page became ordinary. The spin then stopped a `test-qemu` boot
+outright: the fault handler runs with interrupts off, and `yield_now` returns at once when nothing
+else is ready, so the spinning CPU acknowledged no TLB shootdown. A faulter that finds the PO's
+waiter slots full (`PendingOperation::MAX_WAITERS`) parks for a millisecond and retries. It does
+not spin.
+
+**Retired page-cache frames live as long as their object — `TODO(retired-frames)`.** A truncate
+of a cached Model A file takes the pages past the new end out of the cache's index. No fault
+finds them again and no write-back writes them, but a mapping that faulted one in still points
+at its frame, and the kernel keeps no reverse map to say which page tables do. So the frames are
+freed only when the object drops. A long-lived object truncated and refilled over and over, a log
+rotated in place under a mapping held open, grows by the resident pages each truncate retires.
+The fix is a mapping count, which would let a truncate free the frames when nothing maps the
+object, or a reverse map, which would let it unmap them. Trigger: a workload that truncates a
+file held mapped, repeatedly.
+
+**An IRP in flight across a truncate — `TODO(truncate-inflight-writeback)`.** A truncate frees
+blocks in the server and then answers the resolve, and only the answer reaches the kernel. Since
+administration Part C.1b a write-back decides each page as it issues the page's IRP, under the
+object's lock, so every IRP issued after the kernel resizes the object respects the new size. What
+is left is an IRP already in flight when that happens. If the server hands one of the freed blocks
+to another file before the IRP lands, the IRP overwrites it. `File::Forget` closes the same window
+for a freed file, because the server waits for the kernel's answer before it frees anything. A
+truncate needs the same handshake for the blocks it frees, and the plan did not size it. Trigger: a
+truncate of a file being synced concurrently, which nothing does today: `libfs` truncates before
+it maps.
 
 **Kernel log buffer is keep-early, not keep-recent (slice 9 Part 5).** `klog`
 (`/dev/log`) is a **linear append** buffer: it captures kernel `kprint!` output from
@@ -204,18 +231,20 @@ commands at once across the command list. The software queue's depth is already
 `PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
 workload (an SSD, or many concurrent readers).
 
-**No `FLUSH CACHE` after a write — `TODO(ahci-flush)`.** `kernel/src/drivers/ahci.rs` issues
-`IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing else; there is no `0xEA`. A drive is
-free to hold written sectors in its own volatile cache, and this system has no orderly shutdown
-that would flush them — a person powers the machine off. Every writer before Phase 5 Part H.1
-wrote through a filesystem on a machine that stayed running, so the gap cost nothing; `nxinstall`
-is the first writer that says "done, remove the medium and restart" with its last sectors
-possibly still in the drive. It survived the first real install, which is evidence that this
-drive's cache is either write-through or flushed by the firmware's reset, not that the next one
-will be. **Trigger: the first install that comes back with a corrupt tail**, or any writer that
-needs a durability point (a journal, a database). The command is a non-data ATA command, which
-this driver has no path for — `submit` is built around a PRDT — so it is a small new path rather
-than a new opcode. (PR #309 review, optional.)
+**No `FLUSH CACHE` after a write — resolved by administration Part C.2 (2026-09-24).**
+`kernel/src/drivers/ahci.rs` issued `IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing
+else, so a drive was free to hold written sectors in its volatile cache when a person powered the
+machine off. `nxinstall` was the first writer to say "done, remove the medium and restart" with
+its last sectors possibly still there. The first real install survived, which proved only that
+that drive's cache was write-through or flushed by the firmware's reset.
+
+The trigger that fired was the storage service's unmount, whose last step is this flush. It
+landed as `IoOpcode::Flush`, a new opcode after all rather than a driver-internal path. The
+unmount runs in userspace and reaches the device only through `sys_io_submit`. AHCI issues it as
+a non-data command (`FLUSH CACHE EXT`, or `FLUSH CACHE` if IDENTIFY lacks the 48-bit form), a
+partition passes it to its disk, and a RAM disk completes it at once. `nxinstall` flushes the
+target before it says "done", and `check-install` asserts the milestone
+([`drivers-and-irps.md`](../architecture/drivers-and-irps.md) § *Flush*).
 
 **Stateless `File::ReadRange` fill — Model B only, no shipping consumer.** Every
 filesystem shipping today is Model A (the kernel reads the device directly from a block
@@ -236,7 +265,14 @@ axes. **(1) Per-file, not global.** Each `FileObject` owns a sparse page table; 
 processes that independently resolve the same path get separate caches. Global,
 inode-keyed sharing (one physical page shared across every mapping of a file) needs a
 stable file identity the fs-server exposes and is deferred — trigger: a workload that
-maps the same file hot from many processes. **(2) No eviction/reclaim.** The cache
+maps the same file hot from many processes. **Resolved for Model A by administration Part C.1
+(2026-09-24)**: a block filesystem's resolve reply carries the file's id (its inode, for ext4),
+and each registration keeps one object per id, which every resolve shares
+([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*).
+The trigger that fired was not a hot workload. Unmount and shutdown have to write back
+everything a filesystem handed out, which needs the objects to be enumerable. A Model B file
+still gets an object per resolve, since no Model B server exists to give an id. **(2) No
+eviction/reclaim.** The cache
 grows to the mapped extent and is freed only on unmap / `FileObject` drop; the
 clock-algorithm reclaim daemon + `Notification::MemoryPressure` is Phase 3+ — trigger:
 caches that can grow past comfortable bounds (large files, many mappings). **(3)
@@ -1142,7 +1178,9 @@ Trigger: wanting to actually reduce the figure above, rather than just watch it.
 **Resource-server fan-out beyond the `sys_wait` width — `TODO(server-fanout)`.** A server
 that holds a channel per client waits on its serving endpoint plus one slot per client, so
 `MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not
-one of them. Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
+one of them. (Since administration Part C.3 a filesystem server whose supervisor keeps its
+control channel, for `Meta::Unmount`, spends a slot on that too: 30 directory sessions while
+it is open. `init`'s mounts keep 31, since `init` closes its end at once.) Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
 (`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
 concurrent clients to 31, and made both derive their cap from the constant rather than
 restate it. That is a bigger number, not a different shape, and three things are unchanged:
@@ -1176,6 +1214,22 @@ observable), which is the same machinery a periodic writeback daemon needs. Trig
 writeback daemon, a file large enough that flushing clean pages costs real time, or a
 consumer that actually depends on `mtime` meaning "content changed".
 
+Since administration Part C.1 (2026-09-24) there is **dirty per object**: a `FileObject` mapped
+writable is dirty, and holds a reference to itself, until a write-back that began with no
+writable mapping and saw none made. That is what keeps an unsynced writer's pages until a sync.
+It is coarser than this entry's fix and does not replace it. A write-back still writes every
+resident page of a dirty object.
+
+**Checking and repairing a filesystem left not clean — `TODO(fs-repair)`.** Since
+administration Part C.3 a writable mount clears ext4's clean bit and an unmount sets it again, so
+a filesystem knows it was left mounted: a crash, a power cut, or, until Part E's shutdown, any
+boot of an installed machine. `fs-server-ext4` **reports** that and serves the filesystem
+anyway. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
+fine: this server writes metadata through at once, and a crash leaves at worst what
+`rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
+`lost+found`. Trigger: a filesystem that actually comes back inconsistent, or a journal, which
+needs a replay before a mount can trust anything.
+
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
 it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC
@@ -1192,6 +1246,12 @@ the bits are not what the name suggests. Doing it properly means deciding where 
 authority lives: rights on the binding independent of the endpoint handle's, a read-only
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
+
+**Narrowed by administration Part C.3 (2026-09-24)**, which built the second of those: a
+read-only mount flag in the fs-server's setup message. A mount that is read-only is read-only
+at its server, whoever resolves through it, and `init.toml`'s `"ro"` sets it. What stays open is
+the case the flag cannot express: one writable mount reached read-only by some processes and
+writable by others, which needs authority on the binding rather than the server.
 
 **Per-stage attribution in `PipelineStatus` — `TODO(pipeline-stage-attribution)`.**
 §1 makes `PipelineStatus` a headline: a composite exit status with one `StageStatus` per stage, in
@@ -1481,15 +1541,29 @@ place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
-**Writeback when a `FileObject` is torn down.** `sys_file_sync` is the only writeback trigger:
-unmapping a `MAP_WRITE` VMA writes nothing back, and a `FileObject`'s `Drop` frees its cached frames
-unwritten, so data written through a mapping and never synced is lost when its writer lets go.
-Nothing loses data today, because every file writer (`libfs`, `nxsh`) syncs before letting go — but
-that is a convention held by each writer, not a property of the system, and
-`filesystem-data-path.md` claimed otherwise until 2026-09-22. **Trigger, and it is scheduled**: the
-administration plan's unmount and shutdown (`docs/planning/administration.md`, Part C), which must
-write back every `FileObject` under a registration before tearing its server down, or lose whatever
-a writer left unsynced while still marking the filesystem clean.
+**Writeback when a `FileObject` is torn down — half built by administration C.1.**
+
+**Before C.1 (2026-09-24)**, `sys_file_sync` was the only writeback trigger. Unmapping a
+`MAP_WRITE` VMA wrote nothing back, and a `FileObject`'s `Drop` freed its cached frames unwritten.
+So data written through a mapping and never synced was lost when its writer let go. Nothing lost
+data, because every file writer (`libfs`, `nxsh`) synced before letting go. But that was a
+convention each writer held, not a property of the system, and `filesystem-data-path.md` claimed
+otherwise until 2026-09-22.
+
+**What C.1 built: the data now outlives its writer.** A file its server caches holds a reference to
+itself while dirty, so its pages outlive whoever wrote them. Such a file has a nonzero file id,
+which is every file `fs-server-ext4` serves. `sys_ns_sync` writes every such object under a
+registration (`filesystem-data-path.md` § *One object per file*).
+
+**What is still owed:**
+- **Nothing calls `sys_ns_sync` before a server goes.** **Trigger, and it is scheduled**: C.5's
+  unmount and Part E's shutdown (`docs/planning/administration.md`). Each must sync before tearing
+  its server down. Otherwise it loses whatever a writer left unsynced, while still marking the
+  filesystem clean.
+- **A file its server gives id `0` is uncached.** It has no self-pin and no sync can find it, so
+  its unsynced mapped writes are still lost when its writer lets go. No in-tree server sends a
+  zero id: `fs-server-ext4` sends the inode number. **Trigger**: the first server that serves a
+  writable file without an id.
 
 ### Userspace
 
@@ -1896,10 +1970,11 @@ the others:
 
 **Shared read-only text is *not* in this bundle** — it needs no CoW (the existing
 `FileBacked` kind suffices) and is scheduled as **B4a of the pre-CLI substrate-hardening
-pass** (`docs/planning/phase-4-desktop.md`). One design constraint it exposes and this
-bundle inherits: every resolve mints a **fresh `FileObject` with its own page cache**, so
-sharing across instances requires the spawner to reuse one image handle per program (or,
-later, inode-keyed global caching).
+pass** (`docs/planning/phase-4-desktop.md`). One design constraint it exposed: every resolve
+minted a **fresh `FileObject` with its own page cache**, so sharing across instances required
+the spawner to reuse one image handle per program, or inode-keyed caching. The second arrived with
+administration Part C.1 (2026-09-24), for files on a block filesystem: every resolve of a binary
+now shares one object.
 
 **Trigger for the bundle:** the GUI toolkit / desktop-apps milestone — several apps linking
 one toolkit, with real `.data`/`.bss` and enough concurrent instances that private copies

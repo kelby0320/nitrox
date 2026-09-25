@@ -22,6 +22,20 @@ pub enum Mode {
     Rw,
 }
 
+impl Mode {
+    /// The flags byte of the fs-server's **setup message** for this mode: `1` — read-only — for
+    /// `"ro"` (administration Part C.3). Since then `"ro"` is the server's too: it refuses every
+    /// mutation and marks every file read-only, where before only the binding's rights changed,
+    /// and forwarded resolves ignore those. Stated here rather than taken from `librsproto`,
+    /// which init does not link; a host test holds the two equal.
+    pub fn setup_flags(self) -> u8 {
+        match self {
+            Mode::Ro => 1,
+            Mode::Rw => 0,
+        }
+    }
+}
+
 /// One validated `[[mount]]` entry. `options` (the optional `[mount.options]`
 /// subtable) is kept verbatim to forward to the fs-server at Ready (slice 7);
 /// `required_for` is validated to be `"boot"` but not stored (the only value).
@@ -195,6 +209,16 @@ pub fn device_ns_path(device: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **init's copy of the read-only flag is the server's**: the byte `"ro"` sends parses, on the
+    /// server's side, as read-only, and `"rw"`'s as writable.
+    #[test]
+    fn a_read_only_mount_tells_its_server_so() {
+        use librsproto::meta::{FS_SETUP_READ_ONLY, parse_fs_setup};
+        assert_eq!(Mode::Ro.setup_flags(), FS_SETUP_READ_ONLY);
+        assert_ne!(parse_fs_setup(&[Mode::Ro.setup_flags()]) & FS_SETUP_READ_ONLY, 0);
+        assert_eq!(parse_fs_setup(&[Mode::Rw.setup_flags()]) & FS_SETUP_READ_ONLY, 0);
+    }
 
     const SINGLE_ROOT: &str = "\
 [[mount]]

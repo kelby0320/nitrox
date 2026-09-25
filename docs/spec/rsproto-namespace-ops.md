@@ -115,7 +115,7 @@ Body length = 8.
 | `NONE` | `0` | **none** — the request mutated the filesystem and resolves to no object (`RESOLVE_RENAME`). `content_len` is unused. | ✅ |
 | `MEMOBJ` | `1` | a read-only `MemoryObject` of the file content | ✅ |
 | `DIRECTORY` | `2` | reserved — an open directory is answered as `CHANNEL` | — |
-| `SUBNAMESPACE` | `3` | (a nested namespace) | deferred — administration Part C builds it |
+| `SUBNAMESPACE` | `3` | a `Namespace` the server holds `LOOKUP` on — **continue the resolve there** (§ *The `SUBNAMESPACE` body*) | ✅ (administration Part C.4) |
 | `FILE` | `4` | **none** — `content_len` is the total file size; the kernel builds a page-cache object filled via `File::ReadRange`. Paired with `RESOLVE_FILE_LAZY`. | ✅ (slice 8) |
 | `CHANNEL` | `5` | a live `IpcChannel` — a connection to the resolving server: a directory session, a per-principal log channel, a subscription. `content_len` is unused. | ✅ |
 | `FILE_BLOCKS` | `6` | the **block device** — a Model A file: `content_len` is the file size, and the body carries the block map below. The kernel fills each page zero-copy from the device. | ✅ (Phase 3) |
@@ -136,7 +136,40 @@ The 8-byte `ResolveReply` above, then:
 |---|---|---|
 | 8 | 4 | `block_size` — the filesystem's block size, in bytes |
 | 12 | 4 | `run_count` |
-| 16 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
+| 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`; a server names the file by it in `File::Forget` before freeing it. `0` means none: the kernel gives such a file an object of its own, uncached |
+| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for |
+| 28 | 4 | reserved, zero |
+| 32 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
+
+`file_id` and `flags` arrived with administration Part C.1 (2026-09-24), moving the runs from
+offset 16 to 32. Both sides are in-tree and pre-stabilization, so this was a flag-day change
+(`librsproto::namespace::file_blocks_prefix` writes it, `kernel/src/rsproto.rs` reads it). Every
+resolve of a file with an id, a grow, create and truncate included, updates the one object to the
+size and map its reply carries.
+
+#### The `SUBNAMESPACE` body
+
+*(Administration Part C.4, 2026-09-24.)* The 8-byte `ResolveReply` (`content_len` unused), then:
+
+| Offset | Size | Field |
+|---|---|---|
+| 8 | 2 | `consumed` — how many bytes of the request's suffix the server answered for |
+| 10 | 2 | `base_len` |
+| 12 | `base_len` | `base` — the absolute path in the replied namespace that those bytes stand for |
+
+`librsproto::namespace::subnamespace_reply` writes it, and `kernel/src/rsproto.rs` reads it.
+
+**The kernel continues the resolve in the namespace, at `base` joined with what is left of the
+suffix**, with the same operation, rights, caller and `PendingOperation`. So a server answering
+for `fs/nitrox-root/home/a` with `consumed` 14 and `base` `/` sends the resolve on to `/home/a`.
+- **`consumed` must end a component** of the suffix, and the joined path must be valid, else
+  `InvalidArgument`: a server's protocol error. The handle must be a `Namespace` with `LOOKUP`,
+  else `Unsupported`.
+- **A rename's destination continues too**, and must begin with the same `consumed` bytes, else
+  `Unsupported`, the cross-filesystem answer. `Unsupported` also answers a continuation that
+  resolves to a kernel server: it runs in the replying server's syscall, where `/proc/self` would
+  answer for the server.
+- **At most four continuations**; a fifth `SUBNAMESPACE` reply is `TooLarge`.
 
 ### Reply body (error)
 

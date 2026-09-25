@@ -4,7 +4,8 @@
 (fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
 Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
 to "enforced" 2026-09-23; a server minting a narrower endpoint on request (the device manager's
-info-only one) described 2026-09-24.
+info-only one) described 2026-09-24; a resolve continued in a namespace a server hands back
+(`OBJECT_KIND_SUBNAMESPACE`) built with administration Part C.4, 2026-09-24.
 
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
@@ -594,6 +595,40 @@ right on a handle can express: a process that holds the info-only endpoint with 
 bind it with any base and still reach nothing but the tables. It is not self-registration — the
 server mints, and a supervisor still decides where it is bound
 ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+
+### A server can hand back a namespace
+
+*(Administration Part C.4, 2026-09-24.)* A userspace server can answer a resolve with
+**`OBJECT_KIND_SUBNAMESPACE`**: a `Namespace` it holds `LOOKUP` on, and what the path it was sent
+stands for there. The first `consumed` bytes of the suffix stand for `base`
+([`rsproto-namespace-ops.md`](../spec/rsproto-namespace-ops.md) § *The `SUBNAMESPACE` body*). The
+kernel **continues the resolve** in that namespace, at `base` plus the rest of the suffix. It
+carries the same operation (a plain lookup, a size change, a rename), the same requested rights,
+the same caller and the same `PendingOperation`, which completes when the resolve ends,
+wherever that is.
+
+It is what lets the storage service answer for `/storage/<label>/…` without standing between a
+program and the filesystem it names. The service replies with the mount's namespace, and the file
+the program gets is installed by the mounted server's own reply, into the page cache of that
+server's registration.
+
+- **Both paths of a rename continue.** The destination must begin with the same `consumed` bytes,
+  so that it is under the same answer, else `Unsupported`, the cross-filesystem result a caller
+  falls back to copy + unlink on. In the replied namespace both must then land on one server, as
+  in any rename.
+- **Four deep, then `TooLarge`.** A server answering into itself is bounded.
+- **Never onto a kernel server.** A continuation runs in the replying server's
+  `sys_channel_send`, and `/proc/self` answers for whoever is calling: continued onto it, the
+  caller would receive the *server's* process, thread or namespace. So a continuation that
+  resolves to a kernel server is `Unsupported`. A direct binding is installed, and a userspace
+  server is sent the request.
+- **It widens no server's power.** A server that can hand back a namespace could as well have
+  resolved the path there itself and handed back what it found.
+
+The continuation is the half of `sys_ns_lookup` after the syscall's own checks
+(`resolve_and_start` in `kernel/src/syscall/table.rs`), so a first resolve and a continued one
+dispatch identically. A pending lookup keeps what it asked for, the operation and a rename's
+destination, since the user pointers they arrived by are gone by the reply.
 
 ## Kernel vs userspace split
 

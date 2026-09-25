@@ -147,6 +147,15 @@ impl RamDisk {
     /// `memcpy` either direction across the buffer's physical fragments (reached through the
     /// HHDM), under the disk's lock. No blocking, no allocation.
     fn transfer(&self, irp: &Irp) -> (i32, u64) {
+        // **Every op by name**: inferring a write from "not a read" is how a flush, which
+        // carries no range, would be taken for one.
+        let is_read = match irp.op {
+            op if op == IrpOp::Read as u32 => true,
+            op if op == IrpOp::Write as u32 => false,
+            // A RAM disk's memory is its medium: nothing is cached, so a flush is done.
+            op if op == IrpOp::Flush as u32 => return (IrpStatus::Success as i32, 0),
+            _ => return (KError::InvalidArgument as i32, 0),
+        };
         let dev_off = irp.offset;
         let len = irp.length;
         if dev_off
@@ -157,14 +166,16 @@ impl RamDisk {
         }
         let _busy = self.busy.lock();
         let base = self.base();
-        let is_read = irp.op == IrpOp::Read as u32;
-        // SAFETY: `irp.buffer.frags` points at a `[PhysFrag; count]` owned by the
-        // IRP's box for the IRP's lifetime (see `io::block`).
-        let frags = unsafe {
-            core::slice::from_raw_parts(
-                irp.buffer.frags as *const PhysFrag,
-                irp.buffer.count as usize,
-            )
+        // No buffer is an empty slice, never one built from its null pointer, which
+        // `from_raw_parts` forbids at any length — as in the AHCI driver.
+        let frags: &[PhysFrag] = if irp.buffer.count == 0 {
+            &[]
+        } else {
+            // SAFETY: `irp.buffer.frags` points at a `[PhysFrag; count]` owned by the
+            // IRP's box for the IRP's lifetime (see `io::block`).
+            unsafe {
+                core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize)
+            }
         };
         let hhdm = crate::mm::heap::hhdm_offset();
         let mut dev_pos = dev_off;
@@ -396,6 +407,25 @@ mod tests {
         drop(rd);
         assert!(module[512..1024].iter().all(|&x| x == 0xAB), "the write landed in the module");
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
+    }
+
+    /// **A flush completes at once and writes nothing** — a RAM disk's memory is its medium
+    /// — even handed a buffer, which a write would have copied in. And an op it does not
+    /// know is refused rather than taken for a write, which is what "not a read" used to mean.
+    #[test]
+    fn a_flush_is_done_at_once_and_an_unknown_op_is_not_a_write() {
+        init_global_heap();
+        let mut module = vec![7u8; 1024];
+        // SAFETY: as above.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
+        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[])), (IrpStatus::Success as i32, 0));
+        let mut out = [0xCD_u8; 512];
+        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[frag(&mut out)])), (IrpStatus::Success as i32, 0));
+        let mut unknown = irp(IrpOp::Write, 0, &[frag(&mut out)]);
+        unknown.op = 7;
+        assert_eq!(rd.transfer(&unknown).0, KError::InvalidArgument as i32);
+        drop(rd);
+        assert!(module.iter().all(|&x| x == 7), "nothing written");
     }
 
     #[test]

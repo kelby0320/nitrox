@@ -3380,6 +3380,10 @@ fn run_install_steps(
         return Err(format!("the installer copied {files} files, which is not a root: {line}").into());
     }
     println!("  ok: the install finished —{}", line.trim_end());
+    // **Flushed before it said "done"** (administration Part C.2): a person powers the machine
+    // off next, and a drive may still hold the last sectors in its cache.
+    session.expect("nxinstall: flushed the disk's write cache")?;
+    println!("  ok: the installer flushed the disk before saying done");
     Ok(())
 }
 
@@ -9041,7 +9045,10 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // each back through `/dev/draw/<id>/info`, checks a current desktop of 0 is refused, and
     // restores everything, so this changes no pixel the comparison below walks.
     session.expect("ui-testclient: desktop and minimized requests round-tripped through info")?;
-    session.expect("ui-testclient: reference windows placed via /dev/draw/manage")?;
+    // **Placed and then raised, in the order the comparison below composes them.** The stacking
+    // used to be creation order, which raced `nxterm`'s window against these three; the client
+    // now raises them itself, so `nxterm` only has to *exist* first.
+    session.expect("ui-testclient: reference windows placed and stacked via /dev/draw/manage")?;
     session.expect("ui-testclient: a second /dev/draw/manage was refused")?;
 
     session.expect("ui-testclient: scene presented via /dev/draw")?;
@@ -11578,6 +11585,16 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
+    // The `sys_io_submit` opcodes (administration Part C.2, which added `Flush`). The kernel
+    // states each value once as an `IO_OPCODE_*` const and builds `IoOpcode` from them, so the
+    // names pair with `libkern`'s; the other `u32` consts in `abi.rs` are never looked up.
+    AbiFamily {
+        what: "I/O opcodes",
+        kernel_file: "kernel/src/libkern/io_op.rs",
+        user_file: "userspace/libkern/src/abi.rs",
+        shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
 ];
 
 /// Individually-named constants that mirror across the boundary under *different* names or
@@ -13452,9 +13469,10 @@ const BOOT_PROBE_TOML: &str = "\
 # The graphical self-tests and demo clients. `init` spawned these under `selftest` until\n\
 # retrofit Part C2; they are data now, so `init` is byte-identical in both images.\n\
 #\n\
-# **Order is file order.** `nxterm` must precede `ui-testclient` because windows stack in\n\
-# creation order at the origin and the display gate compares the top-left, so the largest\n\
-# window has to be at the bottom.\n\
+# **Order is file order.** `nxterm` precedes `ui-testclient` so that its window exists before\n\
+# `ui-testclient` raises its reference windows over it: the display gate compares the\n\
+# top-left, where all four sit, so the largest has to be at the bottom. The raise is what\n\
+# stacks them. Creation order did until administration C.1, and it was a race.\n\
 [service.display-selftest]\n\
 executable = \"/bin/display-selftest\"\n\
 description = \"Framebuffer + compositor self-test (one-shot)\"\n\
@@ -13503,6 +13521,9 @@ policy = \"never\"\n\
 executable = \"/bin/boot-probe\"\n\
 description = \"In-guest substrate checks and the boot verdict\"\n\
 after = [\"test-harness\"]\n\
+# To bind a channel of its own into a namespace it made, and answer its own lookups\n\
+# with `SUBNAMESPACE` (administration Part C.4).\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
 \n\
 [service.boot-probe.restart]\n\
 policy = \"never\"\n";

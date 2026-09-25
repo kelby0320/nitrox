@@ -85,6 +85,12 @@ Either `"ro"` (read-only) or `"rw"` (read-write). Determines the rights init gra
 | `"ro"` | `LOOKUP \| READ \| MAP_READ` |
 | `"rw"` | `LOOKUP \| READ \| WRITE \| MAP_READ \| MAP_WRITE` |
 
+**`"ro"` is also the server's** (administration Part C.3): init sends the read-only flag in the
+fs-server's setup message ([`rsproto-wire-format.md`](rsproto-wire-format.md) § *A filesystem
+server's setup message*), and the server refuses every mutation and marks every file read-only.
+The rights above alone never made a mount read-only: forwarded resolves ignore a binding's
+rights (`TODO(mount-write-authority)`).
+
 Both modes grant `LOOKUP`. Neither grants `BIND` to the binding's destination process by default — `BIND` is a supervisor capability and is granted explicitly via service.toml service declarations, not implicitly via mount declarations.
 
 For `/store`, `"ro"` is conventional even when the underlying filesystem is writable. The package manager has a different namespace route to write to the store; ordinary processes see `/store` as read-only.

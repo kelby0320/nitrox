@@ -312,6 +312,20 @@ pub struct Vma {
     link: RbLink,
 }
 
+impl Drop for Vma {
+    /// **A writable file mapping lowers its file's count as it goes** (administration Part
+    /// C.1), whichever path frees it — an unmap or an address space's teardown. Lock-free, since
+    /// a VMA drops wherever those do; the object's dirty pin is not touched here — what was
+    /// written through this mapping is still unwritten, and a later write-back decides.
+    fn drop(&mut self) {
+        if self.mapping == MappingKind::FileBacked && self.prot.contains(Protection::WRITE) {
+            if let Some(obj) = self.object.as_ref() {
+                crate::object::FileObject::writable_unmapped(obj.as_ptr());
+            }
+        }
+    }
+}
+
 impl Vma {
     pub const fn new(range: VAddrRange, prot: Protection, mapping: MappingKind) -> Self {
         Self {

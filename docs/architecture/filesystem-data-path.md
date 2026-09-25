@@ -1,9 +1,11 @@
 # Filesystem data path (kernel ↔ fs-server contract)
 
 **Status:** Implemented — the kernel page-cache/mapping path between fs-server and client,
-with deferrals (writeback on teardown, periodic writeback daemon, per-page dirty tracking) marked
-inline. Verified 2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty
-tracking that the code never had corrected 2026-09-24.
+with deferrals (a periodic writeback daemon, per-page dirty tracking) marked inline. Verified
+2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty tracking that the
+code never had corrected 2026-09-24. **One object per file, dirty objects kept until a sync, and
+`sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*), with
+`File::Forget` for a file its server frees.
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -83,30 +85,81 @@ new **`Block`-category** ops (`0x03xx`) in the RS wire format (`docs/spec/rsprot
 Also fs-agnostic — the kernel never knows which filesystem backs a file.
 
 - **`FileObject` producer** (`kernel/src/object/file_object.rs`): the seam that selects the
-  data path. The **Model A** producer carries a **device reference + the file's `BlockRun`
-  map** (fetched via `MapRange`, cached on the object); a page fault translates the page's
-  `file_block → device_lba` and issues a block **read** IRP into the cache frame. The **Model
-  B** producer carries `{server, file-suffix}` and fills via `ReadRange` — the variant a
+  data path. The **Model A** producer carries a **device reference, the file's identity, and its
+  `BlockRun` map** — the map arrives in the resolve reply (`OBJECT_KIND_FILE_BLOCKS`), and is
+  kept under the object's lock, since a size change replaces it. A page fault translates the
+  page's `file_block → device_lba` and issues a block **read** IRP into the cache frame. The
+  **Model B** producer carries `{server, file-suffix}` and fills via `ReadRange` — the variant a
   non-block fs-server uses. A file has one producer, fixed by its filesystem's class.
-- **Writable mappings, and no dirty tracking**: `sys_memory_map` grants `MAP_WRITE` on a
-  `FileObject` when requested and permitted, and a store faults in a writable PTE. **Nothing marks
-  anything dirty** — `CachePage` has no dirty bit (`TODO(page-dirty-tracking)`). This bullet said a
-  store "marks the `CachePage` dirty" until 2026-09-24, when the administration Part C detail pass
-  found no such state in the code.
+- **Writable mappings, and dirty per object**: `sys_memory_map` grants `MAP_WRITE` on a
+  `FileObject` when requested and permitted, and a store faults in a writable PTE. The object
+  counts its writable mappings, and one mapped writable is **dirty** (§ *One object per file*).
+  There is no per-page dirty bit (`TODO(page-dirty-tracking)`). This bullet said a store "marks
+  the `CachePage` dirty" until 2026-09-24, when the administration Part C detail pass found no such
+  state in the code.
 - **Writeback**: `FileObject::writeback` flushes **every resident page** by a block **write** IRP
   from the cache frame to its `device_lba`, dirty or not, since it cannot tell. A page over a hole
-  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **The one trigger is
-  `sys_file_sync`** (an `msync`-style syscall). Unmapping a `MAP_WRITE` VMA does *not*
-  write back, and when a `FileObject`'s last reference goes its `Drop` frees the cached frames
-  without writing them — so data written through a mapping and never synced is **lost** when its
-  writer lets go. Every file writer today syncs first (`libfs`'s write paths, `nxsh`), which is why
-  nothing loses data. Writeback on teardown, and a periodic writeback daemon, are deferred; the
-  administration plan's unmount and shutdown need the first (`docs/planning/administration.md`).
-  (This bullet said unmap was a trigger until 2026-09-22; it never was — PR #326 review.)
+  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **Two triggers:
+  `sys_file_sync`** on one file, an `msync`-style syscall, and **`sys_ns_sync`** on every dirty
+  file of a mount. Unmapping a `MAP_WRITE` VMA does *not* write back. After it, the kernel sends
+  the server `File::Touch` with the file's id, since an in-place write never reaches the server
+  any other way, and its `mtime` would not move. (This bullet said unmap was a trigger until
+  2026-09-22; it never was — PR #326 review.)
 - **Shared device by capability**: the block device (`/dev/blk/N`, a kernel `DeviceNode`) is
   reachable by two handles — the fs-server keeps a read-write handle for **metadata** I/O, and
   the `FileObject` producer references the same device so the kernel can IRP **file data**
   directly. Both are legitimate capabilities to one disk.
+
+## One object per file
+
+*(Administration Part C.1, 2026-09-24.)* **A registration keeps one `FileObject` per file**, keyed
+by an id the server gives the file in its resolve reply: its inode number, for ext4
+(`rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*). Every resolve of the file shares that
+object, so two processes mapping one file read each other's writes without a sync, and a sync or
+an unmount can enumerate everything a filesystem has handed out. Before, each lookup built its own
+object: a file mapped by two processes had two caches, and neither saw the other's writes until a
+sync and a fresh resolve.
+
+- **The cache is an index, not an owner.** It holds each object weakly
+  (`UserspaceServerReg::files`), and an object leaves it when it drops. So a clean file leaves the
+  cache with its last user, and the cache holds what is in use plus what is dirty, never the whole
+  disk. An id of `0` means uncached: such a file gets an object of its own.
+- **A dirty object holds a reference to itself.** Dirty means mapped writable since the last
+  write-back that *began* with no writable mapping and saw none made during it. A mapping present
+  at the start could write after its page's IRP read the frame, then go before the end. Until such
+  a write-back, the object stays alive and in the cache, however soon its users let go, and the
+  next resolve of the file finds it with its pages. **A writer that exits without syncing loses
+  nothing until the machine stops**: `sys_ns_sync` writes it. Since a sync that begins with a
+  writable mapping in place cannot clean, `libfs` and `nxsh` unmap before they sync. Otherwise
+  every file they write would stay pinned until an unmount.
+- **A grow, create or truncate resizes the one object in place.** It is a resolve, and its reply
+  carries the new size and map. What a page says stays honest across it. Everything past the
+  smaller of the old and new sizes leaves the index, so no fault finds it and no write-back writes
+  it, and the page holding that edge is zeroed past it. A mapping that faulted a retired page in
+  keeps a valid frame, which is freed with the object (`TODO(retired-frames)`). The server's half
+  is that **a grow zeroes on the device what it adds** (`ext4-fs-server-rw.md`), because a page no
+  one holds fills from the device. Together, a truncate and a grow read zero over the regrown
+  range, a whole page and a partial tail.
+- **A second faulter of a page being filled waits on that fill's `PendingOperation`.** The page
+  carries it while loading. Whoever wakes first settles the page, matched by the PO rather than
+  the index, so a fill retired mid-flight settles nothing else. Before, the second faulter
+  `yield_now`ed until the page was ready. That was unreachable while each resolve had its own
+  object. Under one object per file every process running one binary shares its image, and the
+  yield became a spin: the fault handler runs with interrupts off and `yield_now` returns at once
+  when nothing else is ready, so the CPU acknowledged no TLB shootdown and the machine stopped.
+  A failed fill fails every faulter waiting on it and leaves the page out of the cache.
+- **A server frees a file only after the kernel has forgotten it** (`File::Forget`, Part C.1b).
+  The last name's unlink, or a rename that replaces a file, sends the kernel the file's id and
+  waits for the answer before freeing a block. The kernel marks the object's cache entry
+  forgotten, which puts it out of reach of any resolve or sync. It also stops the object from
+  starting device I/O and releases its dirty pin. It answers once the last IRP of the file in
+  flight has ended, reads included, so a fill queued before the `Forget` cannot read a block
+  after it has become another file's. For that each object counts its IRPs in flight, and **a
+  write-back decides each page as it issues its IRP**, under the object's lock, rather than from a
+  snapshot taken at its start. The same per-page decision means a truncate's resize governs every
+  page after it. Only an IRP already in flight when a truncate lands can reach a block it freed
+  (`TODO(truncate-inflight-writeback)`). Until the answer the entry stays, so a second `Forget` of
+  the id waits on the same one (`UserspaceServerReg::forget_file`).
 
 ## Consistency ordering (filesystem-neutral)
 

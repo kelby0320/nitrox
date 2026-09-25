@@ -1109,7 +1109,7 @@ namespace, with no login and no session.
 
 ### The pieces, in dependency order
 
-- [ ] **C.1 — one cached `FileObject` per file.** The file id in the block-file reply's body
+- [x] **C.1 — one cached `FileObject` per file.** The file id in the block-file reply's body
       (`rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*); a cache per
       registration, keyed by id; grow, create and truncate in place; the per-object dirty state;
       dirty objects kept past their last user and found again; `File::Forget`; `sys_ns_sync`.
@@ -1121,21 +1121,37 @@ namespace, with no login and no session.
       alone passes for both; `File::Touch` by id after a rename. **A `boot-probe` check**: a file
       written through one mapping is read through another without a sync, a write whose handle was
       closed unsynced reaches the device on `sys_ns_sync`, and an unlink's pages are not written back.
-- [ ] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
+
+      **Landed 2026-09-24 in two halves.** C.1a is everything but `File::Forget`, and C.1b is
+      `Forget`. Beyond the list, C.1a had to build two things: a second faulter now waits on the
+      fill's PO, since the old spin hung `test-qemu`, and a grow zeroes on the device what it adds,
+      since the regrown range's zeroes depended on it. It also added a probe check for the
+      truncate and the grow, end to end. C.1b answers a `Forget` through the `Block` send's PO,
+      counts reads in flight as well as writes, and frees an ext4 inode in two halves. The decision
+      log has the reasons.
+- [x] **C.2 — the flush.** `IoOpcode::Flush` in both ABI copies and `abi-sync-check`; AHCI's
       non-data path and FLUSH CACHE EXT; the RAM disk; a partition passing it to its disk.
       `boot-probe` flushes the root disk and the probe asserts completion.
-      `TODO(ahci-flush)` resolved.
-- [ ] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
+      `TODO(ahci-flush)` resolved. *(Landed 2026-09-24. Also: `nxinstall` flushes before "done"
+      and `check-install` asserts it; a drive without the 48-bit form gets `FLUSH CACHE`; both
+      drivers now name every op, where each inferred one from "not the other".)*
+- [x] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
       read-only mark in the block-file reply; `s_state` cleared on a writable mount and set on
       `Meta::Unmount`. Host tests on the library: a read-only mount refuses each mutating op, and the
       state round-trips — read back from bytes a writer produced, and from a superblock `mkfs` never
-      wrote, one left mounted.
-- [ ] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
+      wrote, one left mounted. *(Landed 2026-09-24. Read-only is `ReadOnly`, a reader that refuses
+      every write; `init` sends the flag for `"ro"`; not clean is reported with `TODO(fs-repair)`.
+      The read-only server and `Meta::Unmount` first run on a boot in C.5/C.8.)*
+- [x] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
       its flags, size change and a rename's destination — so the kernel can continue a resolve in the
       replied namespace with the replied path, for every operation — a rename continues both paths, and
       one whose destination leaves the replied prefix is `Unsupported`, the cross-filesystem answer
       — to a depth of four, past which it is `TooLarge`. Kernel host tests on the continuation's
       path arithmetic; the storage service is the first server to use it, so its boot test is C.5's.
+      *(Landed 2026-09-24. The reply names a prefix — `consumed` bytes stand for `base` — so a
+      rename's destination can follow; a continuation onto a kernel server is refused, since
+      `/proc/self` would answer for the replying server; and `boot-probe` tests it on a boot now,
+      acting as its own server.)*
 - [ ] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
       `init`'s mounts from `init.toml`; the live-boot test; auto-mount; labels; the per-mount
       namespaces and the `SUBNAMESPACE` answer; the session and admin endpoints; the table; `Storage`

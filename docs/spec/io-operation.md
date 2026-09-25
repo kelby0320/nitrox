@@ -7,8 +7,8 @@ asynchronous I/O operation, and `IoOpcode`, the operation selector. Both are
 layouts").
 
 **Status:** Pre-stabilization. Introduced with the storage slice (Phase 2
-slice 5). The layout below is the Phase 2 form; opcodes beyond `Read`/`Write`
-are reserved (see § Deferred).
+slice 5). The layout below is the Phase 2 form. `Flush` joined `Read`/`Write` with
+administration Part C.2 (2026-09-24); other opcodes are reserved (see § Deferred).
 
 ## The async I/O core
 
@@ -28,7 +28,7 @@ fn sys_io_cancel(pending: RawHandle) -> isize
 
 `resource` is the handle the operation targets. In Phase 2 this is a **block
 [`DeviceNode`](device-node.md)** (a whole disk, or — slice 6 — a partition); the
-opcode set is block read/write. The descriptor and syscall are deliberately
+opcode set is block read, write and flush. The descriptor and syscall are deliberately
 resource-agnostic so future resource kinds (char devices, sockets) reuse them.
 
 - **Returns** a `PendingOperation` handle (a positive value) on a successfully
@@ -74,7 +74,11 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 ## Fields
 
 - **`opcode`** — an [`IoOpcode`](#ioopcode). An unrecognised value returns
-  `InvalidArgument` synchronously.
+  `InvalidArgument` synchronously. **A `Flush` names no buffer and no range**:
+  `buffer`, `buf_offset`, `offset` and `length` must all be `0`, else
+  `InvalidArgument`. It covers the whole device, and a descriptor that seemed to
+  cover less would promise something it does not do. It is not a zero-length
+  transfer, so the pre-signalled no-op below does not apply to it.
 - **`flags`** — reserved for per-operation modifiers (e.g. a future
   force-unit-access / no-cache bit). No flag is defined yet, so any set bit
   returns `InvalidArgument`.
@@ -166,16 +170,26 @@ Char devices come in two flavours, and the difference is visible to a caller:
 pub enum IoOpcode {
     Read  = 0,   // device → buffer
     Write = 1,   // buffer → device
+    Flush = 2,   // the device's volatile write cache → its medium
 }
 ```
 
-Defined in `kernel/src/libkern/io_op.rs` (mirrored in `libkern`). The
-discriminant set is part of the ABI version hash; adding a variant changes the
-hash.
+Defined in `kernel/src/libkern/io_op.rs` (mirrored in `libkern`, and paired by
+`cargo xtask abi-sync-check`: the kernel states each value once as an `IO_OPCODE_*`
+constant, which the variants take). The discriminant set is part of the ABI version
+hash; adding a variant changes the hash.
+
+**`Flush`** completes its PO once the device has written what it holds in a volatile
+cache to its medium: what was written before it is durable when it completes. `result`
+is `0`. A partition passes it to its disk; a RAM disk, whose memory is its medium,
+completes it at once; an AHCI disk issues `FLUSH CACHE EXT`, or `FLUSH CACHE` on a drive
+IDENTIFY does not list the 48-bit form for. *(Administration Part C.2; it resolved
+`TODO(ahci-flush)`.)*
 
 ## Rights
 
-`Read` requires the `READ` right on `resource`; `Write` requires `WRITE`. A
+`Read` requires the `READ` right on `resource`; `Write` and `Flush` require
+`WRITE` — only a writer has anything to make durable. A
 block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
 [`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights
 gate, before any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on
@@ -192,8 +206,9 @@ returned. The `IoOp` is the **userspace-facing** request; the `Irp` is its
 
 ## Deferred
 
-- Opcodes beyond `Read`/`Write` — `Flush` (barrier/FUA), `Trim`/`Discard`,
-  device-specific control. Added with a consumer (RW filesystems, SSD trim).
+- Opcodes beyond `Read`/`Write`/`Flush` — `Trim`/`Discard`, device-specific
+  control. Added with a consumer (SSD trim). A per-write force-unit-access bit is a
+  `flags` modifier, below, not an opcode.
 - The `flags` modifiers (force-unit-access, no-cache).
 - `sys_io_cancel` semantics (returns `Unsupported` until IRP cancellation lands).
 - Scatter/gather over multiple buffers in one `IoOp` (Phase 2 is single-buffer;

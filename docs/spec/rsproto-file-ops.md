@@ -16,6 +16,7 @@ transports differ:
 |---|---|---|
 | `ReadRange` (`0x0600`) | the **kernel** (page-cache fill) | the server's forwarding channel; the kernel hand-codes the request/reply in `kernel/src/rsproto.rs` |
 | `Touch` (`0x0606`) | the **kernel** (post-writeback `mtime`) | the server's forwarding channel; **no reply** |
+| `Forget` (`0x0607`) | the **server**, to the kernel: a file is about to be freed | the server's forwarding channel, sent `Block`; answered by the send's `PendingOperation` |
 | `ReadDir` (`0x0601`), `Mkdir` (`0x0602`), `Unlink` (`0x0603`), `Rmdir` (`0x0604`), `Rename` (`0x0605`) | an ordinary **userspace process** | a **directory session channel** — direct client↔server RPC, no kernel involvement |
 
 `librsproto` (`userspace/librsproto/src/file.rs`) is the userspace mirror for both
@@ -162,8 +163,15 @@ session is scoped to one by construction.
 
 ### Touch (`0x0606`)
 
-Request body: `suffix_len: u16`, two reserved bytes, then the suffix naming the file under
-the mount. **No reply**, and `request_id` is `0` — nothing correlates it.
+Request body, from the kernel: `file_id: u64`, the id the file's `FILE_BLOCKS` reply carried
+([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md) § *The `FILE_BLOCKS` body*). **No
+reply**, and `request_id` is `0` — nothing correlates it. On a directory session, where a client
+sends it, the body is a name, like the session's other ops.
+
+**By id since administration Part C.1** (2026-09-24); it named the file by suffix before. The
+kernel now writes back a cached file at a sync or an unmount, long after the resolve that named
+it, and a rename may have given that name to another file by then. A server stamps only a live
+regular file, since the id comes off the wire and a touch can trail the unlink of what it names.
 
 The odd one out of the `File` ops on three counts, all following from who sends it. It
 comes from the **kernel**, on the **forwarding channel** rather than a directory session,
@@ -188,6 +196,35 @@ Two properties are deliberate:
 
 The stamp is applied on **sync**, not on the individual write, because the kernel keeps no
 per-page dirty bit (`TODO(page-dirty-tracking)`).
+
+### Forget (`0x0607`)
+
+Request body: `file_id: u64`, the id the file's `FILE_BLOCKS` replies carried. Sent by a
+**server** to the kernel, on its forwarding channel, `SENDMODE_BLOCK`, with `request_id` `0` and
+no handles. The only request that travels in that direction. *(Administration Part C.1b,
+2026-09-24.)*
+
+**A server sends it before freeing a file's blocks** — the last name's unlink, or a rename that
+replaces a file — and frees them **only once it is answered**. The kernel may hold the file's
+pages and be writing them to those blocks. Freeing them first would let a write it had already
+issued land in a block the server has since given to something else: another file, or a
+directory block the server writes through.
+
+**The answer is the send's result**: a `PendingOperation` the server `sys_wait`s on, as a
+`Block` send's result always is. On a `Forget`, the kernel:
+1. marks the file's cached object, if it has one, forgotten. No later resolve of the id finds
+   it, since after a free the id may name a new file and gets a new object. No sync writes it
+   either. The entry goes at once if none of the file's I/O is in flight; otherwise it stays
+   until the object goes, so that a second `Forget` of the id can find the object;
+2. marks the object so no device I/O of it starts: a write-back stops before its next page,
+   and a fill reads as a hole;
+3. releases the object's dirty pin, so it goes when its users do, with its pages unwritten;
+4. completes the PO at once if none of the file's I/O is in flight, or when the last IRP in
+   flight ends. A second `Forget` of the file while the first waits gets the same PO.
+
+Sent `NoBlock` or `BlockBounded`, or with handles, it is refused with `InvalidArgument`. A
+server that cannot get an answer leaves the file unfreed, since a leaked block is repaired by
+`e2fsck` and a block claimed twice is not.
 
 ## Versioning
 

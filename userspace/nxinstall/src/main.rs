@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 use fs_server_ext4::mkfs;
 use libgpt::table::{self, BACK_BYTES, BLOCK, FRONT_BYTES};
 use libkern::abi::{
-    BlockDeviceInfo, BlockKind, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
+    BlockDeviceInfo, BlockKind, IO_OPCODE_FLUSH, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
 };
 use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
@@ -598,6 +598,25 @@ fn install(
         human(root_bytes_dst),
         copied.files
     ));
+    // **Durable before "done"** (administration Part C.2). A drive may hold the last sectors in
+    // its volatile cache, and the next thing a person does after "done" is take the power away.
+    flush(target.handle).map_err(String::from)?;
+    log("flushed the disk's write cache");
+    Ok(())
+}
+
+/// Have `device` write its volatile cache to its medium, and wait until it has: an
+/// `IO_OPCODE_FLUSH`, which names no buffer and no range.
+fn flush(device: u64) -> Result<(), &'static str> {
+    let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    // SAFETY: `device` is a block device handle with `WRITE`; `&op` is a valid `IoOp`.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
+    if po < 0 {
+        return Err("the disk refused to flush its cache");
+    }
+    if po_wait(po as u64).0 != 0 {
+        return Err("the disk could not flush its cache");
+    }
     Ok(())
 }
 
@@ -880,9 +899,7 @@ fn run(
     say(&format!("installing to {} ({})", target.path(), identity));
     match install(&io, target, &srcs, &layout, &mut say) {
         Ok(()) => {
-            // TODO(ahci-flush): the driver has no `FLUSH CACHE`, so the last sectors may
-            // still be in the drive's volatile cache when a person acts on this line. See
-            // `docs/rationale/deferred-decisions.md`.
+            // The disk flushed its cache before `install` returned, so this is true when said.
             say("done. Remove the installation medium and restart.");
             Outcome::Installed
         }

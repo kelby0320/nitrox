@@ -78,8 +78,8 @@ Field offsets, types, and sizes of:
   payload word was appended at offset 16 for completions that return a value,
   e.g. a namespace lookup's resolved handle; the earlier `handle`/`status`/
   `reserved` offsets are unchanged). Any change to `IoResult` invalidates the hash.
-- `IoOpcode` enum — `Read = 0`, `Write = 1` (Phase 2); see
-  [`io-operation.md`](io-operation.md).
+- `IoOpcode` enum — `Read = 0`, `Write = 1` (Phase 2), `Flush = 2`
+  (administration Part C.2); see [`io-operation.md`](io-operation.md).
 
 ### KError enum layout
 
