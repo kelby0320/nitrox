@@ -1,14 +1,15 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C detailed
-(2026-09-24); scoped 2026-09-22 and revised after the PR #326 review.** Scheduled after
+**Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C complete
+(2026-09-25), Part D detailed (2026-09-25); scoped 2026-09-22 and revised after the PR #326
+review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
 had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
-(*Part B in detail*, 2026-09-24). **Part C has had its detail pass** (*Part C in detail*) and is next
-to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
+(*Part B in detail*, 2026-09-24), as is **Part C** (*Part C in detail*, 2026-09-25). **Part D has had
+its detail pass** (*Part D in detail*) and is next to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
 installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
@@ -201,14 +202,20 @@ auth = "none"        # the person at the machine may power it off
 - **"Admin" lives only in this file.** `/system/users` stays credentials-only.
 - **An *administrator* is an account a rule lets use `admin` with `run = ["*"]`** — narrow on purpose.
   A rule granting one program does not make an administrator, which is why powering off has a
-  profile of its own rather than a rule on `admin`.
+  profile of its own rather than a rule on `admin`. **Part D's detail pass sharpened it**: the
+  profile must grant `views`, since after D nothing else can change the policy, and the account
+  must exist (*Part D in detail*, PR #337 review).
 - **The last-administrator guard lives with the policy.** The broker is the only component that
   reads this file, so it is the one that can answer "would this leave no administrator". `with
-  --check` and `with --edit` refuse a policy that does, and `auth-service` asks the broker before it
-  removes an account. A policy with no administrator is recoverable only from the live image.
-- **A policy that fails to parse denies everything**, and says why in the log. **`with --edit`**
-  edits a copy, checks it, and replaces the file atomically (`visudo`'s job); **`with --check
-  <file>`** validates without installing.
+  --check` and `with --install` refuse a policy that does, and the broker refuses to remove an
+  account if it would (Part D's detail pass: the broker fronts account removal, rather than
+  `auth-service` asking it). A policy with no administrator is recoverable only from the live
+  image.
+- **A policy that fails to parse denies everything**, and says why in the log. **`with --show`**
+  prints it; **`with --install <file>`** checks a copy the person edited and replaces the file
+  atomically, which is `visudo`'s job without the editor. **`with --check <file>`** validates
+  without installing. (Sketched as `with --edit`; Part D's detail pass changed it, since no editor
+  runs in a terminal.)
 - **For later:** groups, constraints on arguments, `deny` rules, and a timestamp that skips the
   prompt for a second request within minutes.
 
@@ -218,12 +225,12 @@ auth = "none"        # the person at the machine may power it off
 |---|---|---|
 | `disks` | `/dev/blk/<n>` and its `info`, per device (H.1's mechanism) | the kernel |
 | `storage` | the storage service's admin endpoint | the storage service |
-| `accounts` | `auth-service`'s admin endpoint, and the root of `/home` | `auth-service` |
+| `accounts` | the broker's accounts endpoint, which checks the guards and asks `auth-service` (Part D's detail pass; sketched as `auth-service`'s admin endpoint and `/home`'s root) | the broker, in front of `auth-service` |
 | `services` | `service-mgr`'s admin endpoint | `service-mgr` |
 | `power` | the endpoint that runs the shutdown sequence | `service-mgr` → `init` |
 | `clock` | `SysCaps::SYSTEM_CLOCK`, passed on at spawn | the kernel |
 | `logs` | `logging-service`'s read endpoint | `logging-service` |
-| `views` | `/system/views.toml`, writable | the filesystem |
+| `views` | the broker's policy endpoint, which installs a checked policy (Part D's detail pass; sketched as `/system/views.toml` writable) | the broker |
 
 **A device the storage service has mounted is not granted raw.** Granting `disks` for it first asks
 the storage service to unmount it, and fails if it cannot. Otherwise `with admin nxinstall` could
@@ -371,11 +378,13 @@ view such as the installer. What a person browses is a *filesystem*, which appea
 
 - **`auth-service` gains admin ops** — list, add, remove, set a password — with an atomic rewrite of
   `/system/users` and a reload. The credential store stays one service's, and the file has one
-  writer. `auth-service` stays a credential oracle: **the tool makes the home**, through the
-  `accounts` grant's `/home` binding.
-- **Your own password needs no view**: the proof is the current password.
-- **Removing an account** keeps its home unless asked, is refused if the broker says it would leave
-  no administrator, and ends its live sessions — which the broker can see.
+  writer. **The broker fronts them** and **makes the home** (Part D's detail pass; sketched as the
+  tool making it through a `/home` binding, which the broker has no endpoint to bind).
+- **Your own password needs no view**: the proof is the current password, checked by the broker,
+  which knows the session's account.
+- **Removing an account** keeps its home unless asked, is refused if it would leave no
+  administrator, and **is refused while the account is logged in** (the maintainer's call in Part
+  D's detail pass, over ending its sessions).
 - **Recovery is the live image.** Boot it, mount the installed disk, and reset a password in **that
   disk's** `/system/users`, not the running system's. So `account` needs a small **offline mode**
   that operates on a users file named by path. It gets its own gate, because it is the one path
@@ -424,11 +433,11 @@ Network time belongs to networking.
 | Command | Does | Needs |
 |---|---|---|
 | `with <view> <program> [args]` | run a program in a view | a rule's say-so, and its proof |
-| `with --list` · `with --check <file>` · `with --edit` | what I may use · validate a policy · edit it safely | nothing · nothing · `views` |
+| `with --list` · `with --check <file>` · `with --show` · `with --install <file>` | what I may use · validate a policy · print it · install an edited copy | nothing · nothing · `views` · `views` |
 | `disk --list` | devices, partitions, filesystems, where each is mounted, and whether each was left clean | nothing |
 | `disk --mount <device> [<label>]` · `disk --unmount <label>` | mount at `/storage/<label>` · write back, sync, flush, unmount | `storage` |
 | `account --list` | accounts, and which have a live session | nothing |
-| `account --add <name>` · `account --remove <name>` | with a home · refusing the last administrator | `accounts` |
+| `account --add <name>` · `account --remove <name> [--home]` | with a home · refusing the last administrator, and anyone logged in | `accounts` |
 | `account --password [<name>]` | your own (proof: the current one) · someone else's | nothing · `accounts` |
 | `account --password <name> --users <file>` | the offline mode, for recovery | the file |
 | `service --list` | each service's state and restart count | nothing |
@@ -476,10 +485,11 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `OBJECT_KIND_SUBNAMESPACE`; the storage service — mount, unmount, auto-mount (read-only on a
       live boot), `/storage` bound into sessions and application namespaces, refusing a raw grant of
       a mounted device; `disk`.
-- [ ] **D — accounts.** `auth-service`'s admin ops and atomic rewrite; `account`, including the
-      offline mode; removal refused when the broker says it would leave no administrator; ending a
-      removed account's sessions; **`with --edit` and the `views` grant** (moved here from A by its
-      detail pass — who administers the system is what this part lets a person change).
+- [ ] **D — accounts** — *detailed below, D.1–D.5.* `auth-service`'s admin ops and atomic rewrite;
+      `account`, including the offline mode; removal refused when it would leave no administrator,
+      or while the account is logged in; **`with --show`, `with --install` and the `views` grant**
+      (moved here from A by its detail pass — who administers the system is what this part lets a
+      person change).
 - [ ] **E — services, power, the clock and the log.** `services.toml` moved onto the root
       filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
@@ -1306,6 +1316,298 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 - **Per-session visibility under `/storage`**: every account sees every mounted filesystem.
 - **`init`'s filesystems' clean state at shutdown** — Part E's `shutdown` runs the same chain on them.
 
+## Part D in detail *(2026-09-25)*
+
+### The spike: what already exists, and what is missing
+
+- **`auth-service` answers one op, `Authenticate`**, on a session opened by any resolve of
+  `/svc/auth` from the root namespace. It is `no_std` with no `alloc`: it reads `/system/users` once,
+  at startup, into a fixed 4 KiB buffer, and nothing writes the file. That is about 25 accounts at
+  roughly 150 bytes a record. `rsproto-auth-ops.md` defers management ops "with their consumers";
+  this part is the consumer.
+- **The file's format lives in two places.** `auth-service`'s `Record::parse` reads it, and
+  `xtask` writes the demo account's line by hand. A third reader and writer is coming: `account`'s
+  offline mode. After that, Part G's installer.
+- **Salts need entropy, and entropy needs no capability.** `sys_entropy_create` hands any process a
+  handle to the kernel CSPRNG, so the service that makes a salt can have one. The build's salt is a
+  fixed constant, which is right for a build input and wrong for a person's password.
+- **The broker already knows every session and its account.** Each supervisor's `OpenSession`
+  names the principal, and `CloseSession` ends it. **It already paces wrong passwords per session**
+  (`view_broker::pacing::Held`: 2 s from the last failure, three per request), and it reads
+  `/system/views.toml` fresh for every request.
+- **The last-administrator guard does not know which accounts exist.** `Policy::has_administrator`
+  asks whether a rule lets someone use `admin` for every program, and `who = ["kelby"]` counts
+  whether or not `kelby` has an account. That was harmless while accounts could not change.
+- **Ending a session from outside has no path.** Both supervisors block in `spawn_leader` until the
+  session's leader exits, waiting on their notification channel alone, and a forcible kill is
+  deferred (Part A).
+- **A session knows its own account** from `/session/user`, a snapshot its supervisor binds.
+- **A new home has nothing in it, and works.** An absent `theme.toml` is `Theme::default()`, and the
+  theme carries the wallpaper. What it lacks is the three folders `nxfiles`' sidebar offers, which
+  the build stages into the demo home. That is `TODO(home-folders)`, whose trigger is "the second
+  home", and `account --add` is that trigger.
+- **There is no terminal editor.** `nxedit` is graphical, so `with --edit` as sketched, which is
+  `visudo`'s shape, would have nothing to open.
+- **The greeter's username is a typed field**, not a list, so nothing on the login side has to
+  learn about a new account.
+
+### The shape
+
+**The maintainer's calls, 2026-09-25:**
+
+- **Removing an account is refused while it is logged in**, and says so. The broker knows every
+  session's account. This is over ending the sessions, which would change how both supervisors
+  wait, and over leaving them running.
+- **A new home gets the three folders from `libfs::HOME_FOLDERS`**, the list `nxfiles`' sidebar
+  reads, and no theme or wallpaper. This resolves `TODO(home-folders)` for every home `account --add`
+  makes. Part G's installer must make the first account's home the same way, which is written down
+  as a consequence for it. The call is over a session making missing folders at each login, and
+  over a skeleton directory.
+- **The policy is changed with `with --show` and `with --install <file>`**, not `with --edit`.
+  The person edits a copy with any editor. `--install` has the broker check it and replace the file
+  atomically, and the `views` grant binds the broker's policy endpoint, so `/system` is never bound
+  writable into a view. `--show` needs the grant too (*What every session can read*, below).
+- **Your own password is changed through the broker**, over the session's `/dev/views`. The broker
+  knows the account and paces a wrong current password as it paces `with`'s.
+- **The broker fronts every account operation.** The `accounts` grant binds the broker's accounts
+  endpoint. The broker checks the policy and the sessions, then asks `auth-service` over an admin
+  session that only the broker opens, a convention of the trusted set rather than a property (*The
+  boundary*, below). This is over `auth-service` asking the broker: the guards need
+  the policy and the sessions, which only the broker has, and one front gives them one place to
+  live.
+
+**Derived from the spike and the calls:**
+
+- **`auth-service` stays the credential store, and its only writer.** It gains an admin session,
+  opened by resolving `/svc/auth/admin` from the root namespace, with four ops:
+  - `List`: names and homes;
+  - `Add`: a name, a password and a home;
+  - `Remove`: a name;
+  - `SetPassword`: a name and a new password.
+
+  Each write replaces the file atomically: `/system/users.new` is written, synced, then renamed
+  over `/system/users`. The in-memory copy changes only once the rename has held. A new password
+  gets a fresh 16-byte salt from the entropy source and `DEFAULT_ITERATIONS`. **It stays `no_std`
+  with no `alloc`**: every op fits the 4 KiB buffer. A write whose file would not fit it is refused:
+  an `Add`, or a `SetPassword` whose new salt is longer than the old one. The build's 8-byte salt
+  becomes 16 bytes, 16 more hex characters. The bound is `libusers::MAX_FILE`, not the service's
+  own, so the offline mode and the installer are held to it too. A file over it is one the service
+  will not load at boot, and then nobody logs in (PR #337 review).
+- **`libusers`, a new crate below `auth-service`, `account` and `xtask`**: the file's format —
+  parse, write a record, the name rules and the size bound — with no `alloc`, like `libinittoml`. A helper with
+  three consumers belongs below them all. The seeded line and the offline mode then write exactly
+  what the service reads.
+- **A name** is 1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_` or
+  `-`. It is never `*`, since that is the policy's wildcard. The home is always `/home/<name>`.
+  **A password** is 1 to 128 bytes, typed twice. Nothing else is imposed (*Left alone*).
+- **The broker makes and removes the home**, in its own root namespace, with `libfs`. That is a
+  change from the plan's "the tool makes the home, through the `accounts` grant's `/home` binding".
+  The broker holds no filesystem endpoint that could bind `/home`'s root into a view, and making the
+  home where the record is made keeps an add one operation.
+  - An add makes the home and its folders first, then the record, so a failure leaves at most an
+    empty directory.
+  - A home already there, one a removal kept, is adopted, and the answer says so.
+  - A removal keeps the home unless asked (`--home`).
+- **The guards, both in the broker:**
+  - **A removal is refused while the account has a session.**
+  - **A removal is refused if no remaining account could administer.** `Policy::administrators`
+    takes the account list from `auth-service`: `who = ["*"]` counts only while an account remains,
+    and a named account counts only if it exists.
+
+  **To administer is to be able to change the policy again**: a rule lets the account use, for
+  every program, a profile that grants `views` (PR #337 review, blocking). Today's
+  `has_administrator` asks only for a view *named* `admin`, and never reads what that profile
+  grants. After D, nothing but `views` changes the policy. So a policy whose `admin` profile had
+  lost `views` would pass the check, and once installed, could be replaced only from the live
+  image, which is the outcome the guard exists to prevent. `administrators` reads the profile's
+  grants as well as `who`.
+
+  **The same check reaches the policy**: `Check` and `Install` refuse a policy under which no
+  existing account could administer.
+- **New broker ops.**
+  - On a session's own channel, for anyone:
+    - `Accounts`: name, home, live sessions, and whether the account can administer;
+    - `ChangePassword`: the current password and a new one, checked under the session's delay.
+  - On the accounts endpoint the `accounts` grant binds at `/dev/accounts`: `AddAccount`,
+    `RemoveAccount` and `SetPassword`.
+  - On the policy endpoint the `views` grant binds at `/dev/policy`: `Show`, the policy's text, and
+    `Install`.
+
+  Both endpoints are the broker's forwarding endpoint, bound into the view with a base of its own,
+  `/accounts/<session>` or `/policy/<session>`. So a request carries the session it came from, for
+  the audit, and a closed session's base answers `NotFound`, as `/dev/views` does.
+- **What every session can read**, decided rather than left to fall out (PR #337 review):
+  - **the account list** — names, homes, live sessions, and who can administer — as a Unix
+    `passwd` and `group` file are;
+  - **of the policy, only its own rows** (`List`, as today).
+
+  The policy's text needs the `views` grant, as `sudoers` needs root: it names who may do what,
+  and the person who edits it is the one who needs to read it.
+- **The boundary is the root namespace**, as it is already for `/svc/auth` and `/svc/views`
+  (`TODO(svc-auth-ungated)`).
+  - `/svc/auth/admin` resolves from the root namespace, which every declared service inherits.
+  - The broker's forwarding endpoint is bound there unbased, at `/svc/views`. So any root holder
+    can resolve `/svc/views/accounts/<id>` or `/svc/views/policy/<id>` for any open session, and
+    hold that grant's authority without a password.
+
+  "Only the broker opens an admin session" is therefore a convention of the trusted set. It adds no
+  authority, because a root holder can already map `/system/users` writable: `boot-probe` maps
+  `/system/rwtest` from the same root. D's share is recorded in `deferred-decisions.md`, as A's
+  and C's were.
+- **`account`, a coreutil**:
+  - `--list` writes a table;
+  - `--add <name>` asks for the new password twice;
+  - `--remove <name> [--home]`;
+  - `--password` changes your own and asks for the current one;
+  - `--password <name>` sets someone else's under the grant;
+  - `--password <name> --users <file>` is the offline mode.
+
+  The prompt is `with`'s, echo off, moved into `coreutils`' library now that it has two users.
+- **The offline mode is `libusers` on a file**, with no service involved. It reads the file, asks
+  for the new password twice, derives it with a fresh salt, and writes `<file>.new` before renaming
+  it over. It reaches only files a session can: on the live image, an installed disk's
+  `/storage/nitrox-root/system/users` once `with admin disk` has mounted it writable. **It cannot
+  reach the running system's file**, which is not mounted under `/storage` on any boot (C.5).
+- **The seeded `admin` profile gains `accounts` and `views`.**
+- **Every write is recorded twice.** The broker records each request, its answer and the guard
+  that refused it. `auth-service` logs each write by account name. Neither ever logs a password.
+
+### An account, end to end
+
+1. `alice`, an administrator, types `with admin account --add bob` and her password. The broker
+   builds the view with the `accounts` grant, binding its accounts endpoint at `/dev/accounts`.
+2. `account` asks for bob's password twice, on its terminal, echo off, and sends `AddAccount`.
+3. The broker checks the name, makes `/home/bob` with its three folders, and sends `Add` to
+   `auth-service`. That writes `/system/users.new`, syncs it, renames it over the file, and answers.
+   The broker records "alice added bob", and `account` writes one row.
+4. bob logs in at the serial prompt or the greeter. `auth-service` knows him already, because it is
+   the writer and its copy changed with the file.
+5. bob types `account --password`. `account` asks for his current password and a new one twice, and
+   sends `ChangePassword` on his session's `/dev/views`. The broker authenticates `bob` with the
+   current password under the session's delay, then sends `SetPassword`.
+6. Later, `alice` types `with admin account --remove bob`. Every session is checked: while bob has
+   one, it is refused. Once he has logged out, the broker checks that an account remaining can
+   still administer, then sends `Remove`. `/home/bob` stays, unless `--home` was given.
+
+### The pieces, in dependency order
+
+- [ ] **D.1 — `libusers`, and `auth-service`'s admin session.** The format moves into `libusers`,
+      with `auth-service`, `xtask`'s seeding and host tests on it. The admin session at
+      `/svc/auth/admin` gets `List`, `Add`, `Remove` and `SetPassword`, the atomic rewrite and
+      salts from entropy. `rsproto-auth-ops.md` gains the ops.
+      - Gates: host tests for the format, the name rules and each op against a file.
+      - `boot-probe` drives the admin session directly. It adds an account and authenticates as
+        it, sets its password and finds the old one refused and the new one accepted, and removes
+        it. After each write, it finds the file as the service said, read raw from the device
+        through the ext4 library, as C.1's checks read it.
+- [ ] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
+      administrator is.** *Before the accounts front*, since the guard that front applies needs this
+      definition, and the definition needs the grant.
+      - The policy endpoint, with `Show` and `Install`: the text must parse, and an existing account
+        must be able to administer. Then the file is replaced atomically: `views.toml.new`, synced,
+        renamed.
+      - `Policy::administrators` over the account list, reading each profile's grants: to
+        administer is to be able to use `views` for every program. The same list and definition
+        judge `Check`.
+      - The seeded `admin` profile gains `views`, and `with --edit` is dropped from the plan.
+      - Gates: host tests for `administrators`:
+        - an `admin` profile without `views`, which is not an administrator;
+        - a profile under another name that has it, which is;
+        - each shape of `who`.
+
+        `boot-probe`: `Show` refused without the grant. Through a view with it, a policy installed
+        and read back with `Show`, one whose administrator profile lacks `views` refused, one naming
+        only accounts that do not exist refused, then the original restored. `test-interactive`:
+        1. `with admin with --show`;
+        2. `with admin with --install` of an edited copy, after which `with --list` shows the
+           change;
+        3. a copy leaving no administrator refused;
+        4. the original restored.
+- [ ] **D.3 — the broker fronts accounts.**
+      - The `accounts` grant and the accounts endpoint: `AddAccount`, `RemoveAccount` and
+        `SetPassword`, with the home made or removed there.
+      - `Accounts` and `ChangePassword` on a session's channel.
+      - The guards: logged in, and the last administrator, by D.2's definition.
+      - The seeded profile gains `accounts`.
+      - Gates: `boot-probe`, through a view as the grant builds it:
+        - an add, then a removal refused while a session is open for the account, which the probe
+          opens as a supervisor would;
+        - the removal of the only administrator refused;
+        - `ChangePassword` refused for a wrong current password and paced, then accepted;
+        - `Accounts` naming each account's sessions.
+- [ ] **D.4 — `account`.**
+      - The five forms above, the prompt shared with `with`, and a new home's folders.
+      - `test-interactive` steps at the real prompt, as `alice`:
+        1. `account --list`;
+        2. `with admin account --add bob`, with bob's password typed twice;
+        3. log out, and log in as `bob`;
+        4. `account --password`, then log out;
+        5. log in with the new password, while the old one is refused;
+        6. back as `alice`, `with admin account --remove bob`, after which `account --list` has
+           no `bob` and his login is refused.
+- [ ] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
+      First boot: the live image beside a copy of the release disk. Log in on serial, run
+      `with admin disk --unmount nitrox-root` and `--mount` it writable, then
+      `account --password alice --users /storage/nitrox-root/system/users` with a new password,
+      then unmount. Second boot: that disk alone. `alice` logs in with the new password, and the
+      old one is refused.
+- [ ] **Docs.**
+      - `session-and-auth.md`:
+        - the user database is written, by `auth-service` alone;
+        - the deferred item for user creation and password change is resolved;
+        - *who can reach what* names the root-namespace boundary above.
+      - `rsproto-auth-ops.md`, `rsproto-views-ops.md`, and `views-toml-schema.md`, including what
+        an administrator is.
+      - `shell-language.md` §10d (`account`).
+      - `auth-service/CLAUDE.md`: the admin session; no `alloc` still holds.
+      - `deferred-decisions.md`:
+        - `TODO(home-folders)` resolved for `account --add`, with the installer's first account
+          left to Part G;
+        - D's share of `TODO(svc-auth-ungated)`.
+
+### What to compare on the day
+
+- **`test-interactive`**: an account's life at the real prompt, and the policy changed and put back.
+- **`test-qemu`**: `auth-service`'s ops and the file on the device; the broker's guards; `Install`.
+- **`check-recovery`**, on demand: a password reset offline reaching the installed machine's login.
+- **Unchanged**: every other gate. The build still seeds `alice` and her home, and D changes neither.
+
+### Consequences for earlier parts
+
+- **`with --check` now asks for the account list, and reads the profiles' grants.** A policy
+  that names only accounts which do not exist fails it, and so does one whose administrator profile
+  lacks `views`. `boot-probe`'s orphaned-policy check fails it for the old reason too, and no other
+  gate checks a policy. The seeded `admin` profile gains `views` in the same piece, D.2, so the
+  build's own policy never fails the new definition.
+- **The plan's *Grants* table changes two rows.** `accounts` is the broker's accounts endpoint and
+  no `/home` binding, owned by the broker in front of `auth-service`. `views` is the broker's policy
+  endpoint, not `/system/views.toml` writable. *Accounts* and *Policy* above are amended to match.
+- **Part G's installer writes the first account through `libusers`**, onto the installed disk's
+  file, as the offline mode does, and its `views.toml` beside it. **It also makes `/home/<name>` with
+  `libfs::HOME_FOLDERS`' three folders**, as the broker does for `account --add`. Until it does,
+  `TODO(home-folders)` stays open for that one home (PR #337 review).
+
+### Left alone
+
+- **Ending a removed account's sessions**: removal is refused instead. A forcible kill stays
+  deferred.
+- **A login the broker never heard of.** A supervisor whose `OpenSession` failed builds the session
+  without `/dev/views` (`libsession::views_open_session`), so the "refused while logged in" guard
+  cannot see it, and the account could be removed with the person still at the prompt. That is the
+  outcome the maintainer's call ruled out, and it is accepted here, named rather than closed.
+  - It needs the broker to fail at that login: `init` starts the broker before `service-mgr`
+    starts either supervisor, and nothing restarts the broker.
+  - Such a session has no `/dev/views`, so it can use neither `with` nor `account --password`.
+  - Closing it would make the broker critical to every login, and a login is the recovery path.
+
+  (PR #337 review)
+- **`with --edit`**, until a terminal editor exists.
+- **Password rules beyond "not empty"**, lockout, expiry, and renaming an account.
+- **Offline add and remove.** Recovery needs a password reset, and the installer uses `libusers`
+  directly.
+- **Groups, and per-account policy fragments** — the policy's *For later* list.
+- **The graphical prompt**, Part F's.
+
 ## Gates
 
 | Part | What proves it |
@@ -1313,7 +1615,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 | A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees the disks nothing has mounted — the ESP, on a release boot — and never `/dev/blk/0`, the disk holding `init`'s root (reworded by C.6, when `disks` began asking `InUse`); the same command without `with` sees none. `check-login`: one `with` request from the terminal the Applications menu opens, and one naming `/dev/blk/0`, refused because it is not in the view |
 | B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
-| D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
+| D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, `check-recovery`, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **a shutdown gate**: write through a mapping without syncing, run `shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot |
 | G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |
 

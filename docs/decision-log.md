@@ -29795,3 +29795,89 @@ server refuse after the service's probe has accepted its device.
 - 2 `check-storage --kvm` boots, each failing at its check: the table not refreshed (after the
   single-writer change above), and the unmount's line saying "left clean" whatever the device
   says (run before that change, which left the line's logic as it was).
+
+## 2026-09-25 — Administration Part D's detail pass: the broker fronts accounts, and removal waits for logout
+
+Part D, accounts, has its detail pass (`planning/administration.md` § *Part D in detail*). The spike
+found:
+- **`auth-service` is a no-alloc oracle over a 4 KiB file it reads once**, and the file's format is
+  parsed in the service and written by hand in `xtask`. `account`'s offline mode and Part G's
+  installer would make that four places, so the format moves into a crate, `libusers`.
+- **The last-administrator guard does not know which accounts exist.** `has_administrator` counts a
+  rule naming an account that is gone. That was harmless while accounts could not change.
+- **Nothing can end a session from outside.** Both supervisors block on the session's leader, and a
+  forcible kill is deferred.
+- **There is no terminal editor**, so the sketched `with --edit` would have nothing to open.
+- **`TODO(home-folders)`'s trigger is "the second home"**, which `account --add` is.
+
+**The maintainer's calls, 2026-09-25:**
+- **A logged-in account's removal is refused**, over ending its sessions (which would change both
+  supervisors' wait loops) and over leaving them running.
+- **A new home gets `libfs::HOME_FOLDERS`**, and no theme or wallpaper. That is over a session
+  making missing folders at each login, and over a skeleton directory.
+- **`with --show` and `with --install <file>`**, over `with --edit`.
+- **Your own password goes through the broker**, which knows the session's account and already
+  paces wrong passwords per session. That is over an `auth-service` endpoint in every session.
+- **The broker fronts every account operation.** The `accounts` grant binds the broker's
+  endpoint, and only the broker opens an admin session on `auth-service`. That is over
+  `auth-service` asking the broker before a removal: the guards need the policy and the sessions,
+  which only the broker has.
+
+**Derived:**
+- **`auth-service`'s admin session** has `List`, `Add`, `Remove` and `SetPassword`, an atomic
+  rewrite (`users.new`, synced, renamed), and salts from the kernel's entropy source. It stays
+  no-`alloc`.
+- **The guards** now judge the policy against the accounts that exist. That goes for removal,
+  `Check` and `Install` alike.
+- **`account`**, with an offline mode on a named file, for recovery from the live image.
+- **Name and password bounds**: a name is 1 to 32 bytes, a password 1 to 128.
+- **The broker makes the home**, where the record is made. **This departs from the plan's sketch,
+  and from the option text the maintainer chose**, which said the grant would bind `/home`'s root.
+  The broker holds no filesystem endpoint to bind it with, and making the home beside the record
+  keeps an add one operation. It is flagged for the pass's review.
+
+**Consequences written down:**
+- The *Grants* table's `accounts` and `views` rows change.
+- `with --check` now needs an existing administrator.
+- Part G's installer writes the first account through `libusers`.
+- A recovery gate, `check-recovery`, runs on demand.
+
+## 2026-09-25 — Part D's detail pass, reviewed: an administrator who can change the policy, and the boundaries named
+
+The review of #337 checked the spike's claims against the source and found each one true. The
+flagged departure's premise holds too: the broker holds no filesystem endpoint. It found one
+blocking problem and two worth fixing, and made three optional points. All six are taken.
+
+**Blocking: the guard's definition of an administrator did not read what the profile grants.**
+- The failure: `has_administrator` asks for a rule on a view *named* `admin`. The reviewer built
+  a scratch host binary and called `policy::check` on a policy whose `admin` profile grants only
+  `disks`. It passed.
+- Why that matters after D: nothing but the `views` grant changes the policy. So an `Install` that
+  had lost `views` from the administrator profile would leave a policy only the live image could
+  replace, which is the outcome the guard exists to prevent.
+- The fix: **to administer is to be able to use a profile that grants `views`, for every program,
+  from an account that exists.**
+- The pieces are reordered to suit. The policy work, with the grant, the definition, `Show` and
+  `Install`, becomes D.2, before the accounts front, now D.3, whose guard uses it. `account`
+  becomes D.4.
+
+**Worth fixing:**
+- **`TODO(home-folders)` was called resolved "the installer's first account included"**, but
+  nothing made that home. Part G's consequence now says the installer makes it with
+  `libfs::HOME_FOLDERS`, and the TODO stays open for that one home until it does.
+- **"Only the broker holds `auth-service`'s admin session" was a convention stated as a
+  property.** `/svc/auth/admin`, and the broker's `/svc/views/accounts/<id>` and
+  `/svc/views/policy/<id>`, resolve from the root namespace, as `/svc/auth` and `/svc/views` do.
+  That is no new authority, since a root holder can already map `/system/users` writable. The
+  boundary is now named, with D's share of `TODO(svc-auth-ungated)` as a Docs item. The detail
+  pass's entry above said "the broker alone holds"; it is unmerged, so it was corrected in place.
+
+**Optional, each taken:**
+- **The 4 KiB bound is `libusers::MAX_FILE`**, so the offline mode and the installer honour it. A
+  `SetPassword` grows a record by 16 bytes when the build's 8-byte salt is replaced.
+- **A login whose `OpenSession` failed is invisible to "refused while logged in".** It is named in
+  *Left alone* with the reasons it is accepted, rather than closed by making the broker critical to
+  every login.
+- **What every session can read is decided**: the account list and its own policy rows. The
+  policy's text moved behind the `views` grant, as `sudoers` is readable by root alone.
+
