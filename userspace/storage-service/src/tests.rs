@@ -9,7 +9,9 @@ use libstream::wire::{Table, Value};
 
 use crate::probe::{Found, fat_label, probe};
 use crate::sources::{DiskTable, InitMount, TableEntry, init_mounts, live_boot, partuuid, source_device};
-use crate::suffix::{self, Asked};
+use crate::labels;
+use crate::mounts::{Plan, at, automount};
+use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
 /// Boot sectors real formatters wrote: `mformat -F -v NITROX_ESP`, which is how the image builder
@@ -360,5 +362,106 @@ fn suffixes_name_the_directory_and_its_tables() {
     assert_eq!(suffix::parse(b"info/blk-3.tsm"), Asked::File("blk-3"));
     for other in [&b""[..], b"info/", b"info/.tsm", b"info/a/b.tsm", b"info/all", b"block", b"infox"] {
         assert_eq!(suffix::parse(other), Asked::Unknown, "{:?}", core::str::from_utf8(other));
+    }
+}
+
+// --- labels ------------------------------------------------------------------------------------
+
+/// **A label is a name a person can type and see**: printable ASCII with no `/`, not hidden, with
+/// no invisible space at either end, and not longer than any label a disk carries.
+#[test]
+fn a_label_is_printable_ascii_a_person_can_type() {
+    for ok in ["nitrox-root", "NITROX_ESP", "My Disk", "a", &"x".repeat(labels::MAX)] {
+        assert!(labels::valid(ok), "{ok:?}");
+    }
+    for bad in ["", ".hidden", "..", " lead", "trail ", "a/b", "tab\there", "\u{7f}", "ümlaut", &"x".repeat(labels::MAX + 1)] {
+        assert!(!labels::valid(bad), "{bad:?}");
+    }
+}
+
+/// **The filesystem's label, else the partition's name, else `blk-<n>`** — each only if valid. A
+/// RAM disk's record name is the module's path, which is not a partition's name and is never used.
+#[test]
+fn a_label_comes_from_the_filesystem_then_the_partition_then_the_index() {
+    let ds = devices();
+    let mut own = ds[3].clone();
+    own.found = Found::Ext4 { label: String::from("data"), clean: None };
+    assert_eq!(labels::preferred(&own), "data", "the filesystem's own, over its partition's name");
+    assert_eq!(labels::preferred(&ds[4]), "nitrox-live", "the filesystem's own");
+    assert_eq!(labels::preferred(&ds[3]), "nitrox-root", "no filesystem label: the partition's name");
+    let mut hidden = ds[3].clone();
+    hidden.found = Found::Ext4 { label: String::from(".hidden"), clean: None };
+    assert_eq!(labels::preferred(&hidden), "nitrox-root", "an invalid label falls back");
+    assert_eq!(labels::preferred(&ds[1]), "blk-1", "a RAM disk's name is its module's path");
+    let mut nameless = ds[3].clone();
+    nameless.record = rec(7, DeviceKind::Partition, 3, 3, "a/b", 1);
+    assert_eq!(labels::preferred(&nameless), "blk-3");
+}
+
+#[test]
+fn a_clash_takes_the_next_free_suffix() {
+    let taken = |v: &[&str]| v.iter().map(|s| String::from(*s)).collect::<Vec<_>>();
+    assert_eq!(labels::unique("a", &taken(&[])), "a");
+    assert_eq!(labels::unique("a", &taken(&["a"])), "a-2");
+    assert_eq!(labels::unique("a", &taken(&["a", "a-2"])), "a-3");
+    assert_eq!(labels::unique("a", &taken(&["a", "a-3"])), "a-2", "the first free one");
+}
+
+// --- mounts ------------------------------------------------------------------------------------
+
+/// **Every ext4 not already mounted, writable, in registry order** — never `init`'s, never FAT.
+#[test]
+fn a_boot_mounts_every_ext4_that_is_not_inits() {
+    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
+    assert_eq!(
+        automount(&devices(), &init, false),
+        [Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw }]
+    );
+    assert_eq!(automount(&devices(), &[], false).len(), 2, "with no init mount, both ext4s");
+}
+
+/// **A live boot mounts read-only.**
+#[test]
+fn a_live_boot_mounts_read_only() {
+    let plan = automount(&devices(), &[], true);
+    assert!(plan.iter().all(|p| p.mode == Mode::Ro));
+}
+
+/// **A clash is settled in registry order**: the first device keeps the name.
+#[test]
+fn two_filesystems_with_one_label_are_told_apart() {
+    let mut ds = devices();
+    ds[3].found = Found::Ext4 { label: String::from("data"), clean: Some(true) };
+    ds[4].found = Found::Ext4 { label: String::from("data"), clean: Some(true) };
+    let labels: Vec<String> = automount(&ds, &[], false).into_iter().map(|p| p.label).collect();
+    assert_eq!(labels, ["data", "data-2"]);
+}
+
+#[test]
+fn a_mount_is_under_storage() {
+    assert_eq!(at("nitrox-root"), "/storage/nitrox-root");
+}
+
+// --- suffixes of the mounts --------------------------------------------------------------------
+
+/// **`fs/<label>` answers for exactly `fs/<label>`**, alone or with a path after it, which is the
+/// `consumed` the `SUBNAMESPACE` reply carries and the kernel requires to end a component.
+#[test]
+fn a_mounts_suffix_answers_for_its_label() {
+    assert_eq!(suffix::parse(b"fs"), Asked::Mounts);
+    assert_eq!(suffix::parse(b"fs/nitrox-root"), Asked::Mount { label: "nitrox-root", consumed: 14 });
+    assert_eq!(suffix::parse(b"fs/nitrox-root/home/a"), Asked::Mount { label: "nitrox-root", consumed: 14 });
+    for bad in [&b"fs/"[..], b"fs//x", b"fsx", b"fs/\xff"] {
+        assert_eq!(suffix::parse(bad), Asked::Unknown, "{bad:?}");
+    }
+}
+
+/// **A session endpoint cannot mint another**, and answers everything else as asked.
+#[test]
+fn a_session_endpoint_answers_all_but_another_endpoint() {
+    assert_eq!(suffix::parse(b"session-endpoint"), Asked::SessionEndpoint);
+    assert_eq!(session_only(Asked::SessionEndpoint), Asked::Unknown);
+    for kept in [Asked::Directory, Asked::File("all"), Asked::Mounts, Asked::Mount { label: "x", consumed: 4 }] {
+        assert_eq!(session_only(kept), kept);
     }
 }

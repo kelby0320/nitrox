@@ -10654,8 +10654,11 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // them and memory published as a disk — so a partition that called itself a disk would be a
     // partition table written over a filesystem. The capacity and the name are asserted with it:
     // they are what a person confirms a destructive operation by.
+    // **By what it is, not where it lands**: a test image's scratch RAM disk (administration Part
+    // C.5b) is published before any partition, so the ESP is `/dev/blk/2` there and would be
+    // `/dev/blk/1` without it. The disk is first in any image.
     &["test-harness: /dev/blk/0 is a disk, 128 MiB, named QEMU HARDDISK"],
-    &["test-harness: /dev/blk/1 is a partition, 48 MiB, named NITROX_ESP"],
+    &["test-harness: /dev/blk/", " is a partition, 48 MiB, named NITROX_ESP"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. Both ask for write-combining since Part G; before it,
@@ -13986,7 +13989,24 @@ fn assemble_image(
     //    FAT is bounded to the partition), then splice it in. mformat on a plain
     //    file formats the whole file; no `@@offset` games.
     let esp = work.join("esp.img");
-    build_esp(&esp, esp_sectors, bootx64, conf, kernel, initramfs, &[])?;
+    // **A test image's second filesystem** (administration Part C.5b): a small ext4, labelled
+    // `nitrox-scratch`, as one more Limine module, which the kernel publishes as a RAM disk. It is
+    // what the storage service finds to auto-mount on a test boot, and so what lets `boot-probe`
+    // mount, read and write through `/svc/storage` on every CI run. The disk it sits beside holds
+    // only `init`'s root and the FAT ESP, neither of which the service mounts. A **machine**
+    // difference, not a software one: the programs are the release programs, as `check-images`
+    // holds, and a release boot simply has one disk fewer.
+    let scratch = work.join("scratch.img");
+    let test_conf = work.join("limine.conf");
+    let scratch_module = [(scratch.as_path(), SCRATCH_ESP_PATH)];
+    let (conf, extra): (&Path, &[(&Path, &str)]) = if mode.stages_test_data() {
+        build_scratch_fs(&scratch)?;
+        fs::write(&test_conf, test_limine_conf(&fs::read_to_string(conf)?)?)?;
+        (test_conf.as_path(), &scratch_module[..])
+    } else {
+        (conf, &[])
+    };
+    build_esp(&esp, esp_sectors, bootx64, conf, kernel, initramfs, extra)?;
     splice_into(out, esp_lba * 512, &esp)?;
 
     // 4. Build the ext4 `nitrox-root` filesystem as a separate, partition-sized
@@ -14051,6 +14071,50 @@ fn build_esp(
         run(Command::new("mcopy").arg("-i").arg(&espf).arg(from).arg(format!("::{to}")))?;
     }
     Ok(())
+}
+
+/// The scratch filesystem's label: the name the storage service mounts it under.
+const SCRATCH_LABEL: &str = "nitrox-scratch";
+/// Where the scratch filesystem rides on a test image's ESP.
+const SCRATCH_ESP_PATH: &str = "/boot/scratch.img";
+/// What the scratch filesystem's `README` says, which `boot-probe` reads through the storage
+/// service and holds to its own copy of this text.
+const SCRATCH_README: &str = "nitrox-scratch: a test image's second filesystem, mounted by the storage service\n";
+/// Its size: room for the probe's writes, and little to load.
+const SCRATCH_MIB: u64 = 8;
+
+/// Build the test image's scratch filesystem at `out`: an ext4 labelled [`SCRATCH_LABEL`] holding a
+/// `README`, with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
+/// table, so its label is its own.
+fn build_scratch_fs(out: &Path) -> R<()> {
+    let staging = out.with_extension("staging");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    fs::write(staging.join("README"), SCRATCH_README)?;
+    let _ = fs::remove_file(out);
+    fs::File::create(out)?.set_len(SCRATCH_MIB * 1024 * 1024)?;
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-L").arg(SCRATCH_LABEL)
+        .arg("-d").arg(&staging)
+        .arg(out)
+        .arg((SCRATCH_MIB * 1024 * 1024 / 4096).to_string()))?;
+    Ok(())
+}
+
+/// A test image's `limine.conf`, from the release one (`base`): the scratch filesystem as a module
+/// after the initramfs. `base` must hold one entry and its initramfs line once, as
+/// [`live_limine_conf`] requires, so the module cannot land in an entry nobody boots.
+fn test_limine_conf(base: &str) -> R<String> {
+    let initramfs_line = "    module_path: boot():/boot/initramfs\n";
+    if base.matches(initramfs_line).count() != 1 || base.matches("\n/").count() + base.starts_with('/') as usize != 1 {
+        return Err("boot/limine.conf no longer has one entry with its initramfs line once".into());
+    }
+    Ok(base.replacen(initramfs_line, &format!("{initramfs_line}    module_path: boot():{SCRATCH_ESP_PATH}\n"), 1))
 }
 
 /// `cargo xtask image --live` — the live image (Phase 5 Part C): the release kernel and initramfs,
@@ -15477,6 +15541,23 @@ mod diag_tests {
         assert!(live_limine_conf(&one.replace("timeout: 0", "timeout: 3")).is_err());
         assert!(live_limine_conf(&format!("{one}\n/Other\n    protocol: limine\n")).is_err());
         assert!(live_limine_conf(&one.replace("    module_path: boot():/boot/initramfs\n", "")).is_err());
+    }
+
+    /// **The scratch module lands in the one entry, after the initramfs**, and the shipped conf is
+    /// the shape that allows it. The kernel publishes every module after the first as a RAM disk,
+    /// so the order is what keeps the initramfs the initramfs.
+    #[test]
+    fn a_test_conf_loads_the_scratch_disk_after_the_initramfs() {
+        let base = fs::read_to_string(limine_conf()).expect("boot/limine.conf reads");
+        let conf = test_limine_conf(&base).expect("the shipped limine.conf is one entry");
+        let initramfs = conf.find("boot():/boot/initramfs").expect("the initramfs is loaded");
+        let scratch = conf.find("boot():/boot/scratch.img").expect("the scratch disk is loaded");
+        assert!(initramfs < scratch, "the initramfs is module 0: {conf}");
+        assert_eq!(conf.matches("module_path:").count(), 2);
+        let one = "timeout: 0\n\n/Nitrox\n    protocol: limine\n    path: boot():/boot/kernel\n    module_path: boot():/boot/initramfs\n";
+        assert!(test_limine_conf(one).is_ok(), "control: the one-entry shape is accepted");
+        assert!(test_limine_conf(&format!("{one}\n/Other\n    protocol: limine\n")).is_err());
+        assert!(test_limine_conf(&one.replace("    module_path: boot():/boot/initramfs\n", "")).is_err());
     }
 
     #[test]

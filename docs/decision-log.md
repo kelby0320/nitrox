@@ -29356,3 +29356,77 @@ resolve, would not map, is not UTF-8, or did not parse.
   - FAT never recognised;
   - the rows out of registry order.
 - 1 `check-live`, with the rule answering "not live", which times out on the new line.
+
+## 2026-09-25 — Administration C.5b: the storage service mounts, and a test image has a disk to mount
+
+**What landed:**
+- **Auto-mount.** Every ext4 `init` did not mount is mounted at boot, read-only on a live boot.
+  - Each gets an `fs-server-ext4` from `/bin`, handed a duplicate of the node narrowed to the
+    mode, so a read-only mount's server holds no `WRITE`.
+  - Each gets a namespace of its own with that server at `/`.
+  - The service keeps each server's control channel for C.5c's unmount, and drops a mount whose
+    server exits.
+- **Labels**: the filesystem's own, else its partition's name, else `blk-<n>`, each only if valid,
+  and a clash takes `-2`, `-3`, … in registry order. A valid label is printable ASCII with no `/`,
+  not hidden, with no space at either end, and 64 bytes at most.
+- **`fs`**: a directory of labels. `fs/<label>/…` is answered with `SUBNAMESPACE`, the mount's
+  namespace with `consumed` covering `fs/<label>` and the base `/`. It is C.4's first real user.
+- **The session endpoint**, minted at `session-endpoint`, which answers `info` and `fs` and nothing
+  else, `device-mgr`'s info-only shape. C.6's supervisors will bind it at `/storage` (base `/fs`)
+  and `/dev/storage` (base `/info`).
+- **`BIND_NAMESPACE` for the service**, now that it builds namespaces. `syscaps.md` and
+  `userspace/CLAUDE.md` name it beside the view broker as a server that constructs namespaces and
+  is registered by `init`.
+
+**The maintainer's call: a test image carries a scratch filesystem.** `test-qemu`'s disk holds
+only `init`'s root and the FAT ESP, so nothing on a test boot was mountable, and the plan's
+`check-storage` topology is C.8's. Three ways were weighed:
+- a test-only RAM disk;
+- building C.8's live `--selftest` image first;
+- host tests only until C.8.
+
+The first was chosen. A test image's ESP carries `scratch.img`, 8 MiB of ext4 labelled
+`nitrox-scratch` with a `README`, as a second Limine module, which the kernel publishes as a RAM
+disk. `boot-probe` mounts, reads and writes through `/svc/storage` on every run, and C.5c will
+unmount there. It is a machine difference, not a software one: the programs are the release
+programs, and a release boot has one disk fewer.
+
+**Its cost arrived at once.** A RAM disk is published before any partition, so a test image's ESP
+became `/dev/blk/2`, and two things had written its index down:
+- `test-qemu`'s hardware facts expected `/dev/blk/1 is a partition … named NITROX_ESP`. The line is
+  now matched by what it says, not where it lands.
+- The harness's block demo read `/dev/blk/1` as "the first GPT partition", read the RAM disk,
+  and printed `/dev/blk/1 (partition) read OK (no 0x55AA sig)`. That passed, called a RAM disk a
+  partition, and had silently stopped proving that the partition layer rebases. It takes its
+  devices from the registry now, as B.5 made everything else do, and reads the ESP's boot signature
+  through the partition again.
+
+**The first mount hung the probe, for two reasons.** The `SUBNAMESPACE` reply's namespace was
+duplicated with `LOOKUP` alone, and every handle a send moves needs `TRANSFER`
+(`syscall-abi.md`), so the send failed. The reply path then closed the handle and answered nothing,
+so the probe's resolve, which the kernel waits on with no deadline, never completed. Progress lines
+between the probe's steps showed where it stopped. The namespace now carries `TRANSFER`. **And every
+reply that moves a handle refuses the resolve if the send fails** (`reply_with_handle`), which
+covers four replies: the table object, a directory, a session endpoint, and `SUBNAMESPACE`. The
+control that removes `TRANSFER` again now fails in a second with the service saying so, where it
+used to hang for the whole timeout.
+
+**Controls:**
+- 12 on the library's host tests, each failing its test:
+  - each of the label rules;
+  - the label sources' order and kind;
+  - a clash;
+  - `init`'s device mounted again;
+  - a live boot mounted writable;
+  - `consumed` one short;
+  - an empty label;
+  - a session endpoint that mints.
+- The label order was first caught only by the clash test, because in the test meant to catch it
+  every partition's name equalled its filesystem's label. A case where the two differ now catches
+  it there too.
+- 5 boots, each failing the verdict at its check:
+  - the namespace without `TRANSFER`, refused rather than hung;
+  - a session endpoint that serves everything;
+  - `consumed` not ending a component;
+  - every mount read-only;
+  - nothing auto-mounted.

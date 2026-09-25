@@ -198,7 +198,8 @@ static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
     syscaps: 0, // a resource server holds no ambient capabilities
 };
 /// Spawn args for the `view-broker` (administration Part A): the control endpoint, moved, as
-/// `auth-service`'s — and **`BIND_NAMESPACE`**, which no other resource server `init` spawns holds.
+/// `auth-service`'s — and **`BIND_NAMESPACE`**, which only it and the storage service, of the
+/// resource servers `init` spawns, hold.
 /// The broker binds a profile's grants into the views it builds; it binds only into namespaces it
 /// created, and never registers itself (`docs/architecture/graphical-session.md` §3 is the same
 /// reconciliation, for `desktop-shell`).
@@ -225,10 +226,12 @@ static mut SPAWN_DEVICES: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0,
 };
-/// Spawn args for the `storage-service` (administration Part C.5): the control endpoint, moved.
-/// **No syscaps yet**: it reads what the disks hold and serves a table of it, and binds nothing —
-/// `init` binds it at `/svc/storage`. It takes its disks from `/svc/devices/block`, which the
-/// root namespace it inherits reaches, as `input-server` takes its devices from `input`.
+/// Spawn args for the `storage-service` (administration Part C.5): the control endpoint, moved,
+/// and **`BIND_NAMESPACE`** since C.5b. It builds a namespace for each filesystem it mounts, with
+/// that filesystem's server bound at `/`, and binds into no namespace it did not create — the view
+/// broker's reconciliation (`userspace/CLAUDE.md` § Capability discipline). `init` binds the
+/// service itself at `/svc/storage`. It takes its disks from `/svc/devices/block`, which the root
+/// namespace it inherits reaches, as `input-server` takes its devices from `input`.
 static mut SPAWN_STORAGE: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/storage-service
     handle_count: 1,
@@ -237,7 +240,7 @@ static mut SPAWN_STORAGE: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
     namespace: 0,
-    syscaps: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE,
 };
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves

@@ -168,7 +168,17 @@ takes.
 which is distinct from `selftest` because it changes *terminal* behavior. No userspace program
 takes either: `init` was the last, until Phase 5 Part C.1 turned its one test-only branch into
 manifest data. What a test image's userspace does differently comes from its data — declarations,
-the mount manifest, and the `test` store package. The two modes differ in:
+the mount manifest, and the `test` store package.
+
+**And its machine has one more disk.** Since administration Part C.5b a test image's ESP carries
+`scratch.img`, an 8 MiB ext4 labelled `nitrox-scratch` holding a `README`, as a second Limine
+module, which the kernel publishes as a RAM disk. It is what the storage service finds to
+auto-mount, since the boot disk holds only `init`'s root and the FAT ESP, and so what lets
+`boot-probe` mount, read and write through `/svc/storage` on every run. The programs are the release
+programs, and a release boot simply has one disk fewer. **The cost is the block devices' order**: a
+RAM disk is published before any partition, so a test image's ESP is `/dev/blk/2` where a release
+image's is `/dev/blk/1`. Nothing may find a device by its index for that reason; the registry says
+what each one is. The two modes differ in:
 
 |  | `selftest` (`xtask qemu --selftest`) | `test-harness` (`xtask test-qemu`) |
 |---|---|---|

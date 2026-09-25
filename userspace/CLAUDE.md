@@ -107,9 +107,9 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
 - Don't pass handles around with more rights than necessary. Use `sys_handle_restrict` / `Handle::without_*` to attenuate before transferring.
 - A handle granted to a child process should have the minimum rights the child needs.
 - Resource servers don't hold `BIND_NAMESPACE`. Coordination supervisors (init, service-mgr,
-  session-mgr) do. **Two processes do both**, and the reconciliation is the same for each: they
-  hold the capability to *construct namespaces*, which is their job, rather than to register
-  themselves — and neither registers itself.
+  session-mgr) do. **Three processes do both**, and the reconciliation is the same for each:
+  they hold the capability to *construct namespaces*, which is their job, rather than to register
+  themselves — and none registers itself.
   - **`desktop-shell`** builds application namespaces continuously, and serves `/dev/desktop` by
     binding its endpoint into the namespaces it builds, never into one a supervisor owns. See
     [`graphical-session.md`](../docs/architecture/graphical-session.md) §3.
@@ -117,6 +117,10 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
     each a copy it made itself of the namespace its caller sent — and is registered at
     `/svc/views` by `init`, like any server. See
     [`rsproto-views-ops.md`](../docs/spec/rsproto-views-ops.md).
+  - **`storage-service`** (administration Part C.5b) builds a namespace for each filesystem it
+    mounts, binding that filesystem's server at its `/`, and hands the namespace on in a
+    `SUBNAMESPACE` reply. It binds into nothing it did not create, and is registered at
+    `/svc/storage` by `init`. See [`storage.md`](../docs/architecture/storage.md).
 
   Read §3 before copying the pattern: the trusted set widens when a process does both, and that
   cost is named there.

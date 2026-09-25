@@ -1176,7 +1176,14 @@ namespace, with no login and no session.
       - The `boot-probe` check and B.2's change are as listed above. `init` spawns the service with
         no syscaps, and `BIND_NAMESPACE` comes with C.5b's namespaces.
 
-      *C.5b*: mounts, labels, the per-mount namespaces, `SUBNAMESPACE`, and the session endpoint.
+      *C.5b (2026-09-25): the service mounts.*
+      - It auto-mounts every ext4 `init` did not mount, read-only on a live boot. Each mount has
+        its own `fs-server-ext4` and namespace, and is named by its label.
+      - `fs/<label>/…` is answered with `SUBNAMESPACE`, and the session endpoint is minted.
+      - The service holds `BIND_NAMESPACE`.
+      - **By the maintainer's call, a test image carries a scratch ext4 as a second Limine module**,
+        a RAM disk, so `boot-probe` mounts, reads and writes through `/svc/storage` on every run.
+
       *C.5c*: `Storage`, the admin endpoint, and the unmount chain.
 - [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`

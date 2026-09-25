@@ -4469,20 +4469,64 @@ fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
     sig
 }
 
-/// Block-storage demo: read sector 0 of the whole disk (`/dev/blk/0`), of its
-/// first GPT partition (`/dev/blk/1`, proving the partition layer rebases the
-/// offset), and of the same partition under its stable `/dev/disk/by-partlabel`
-/// name. Each verifies the `0x55AA` boot signature.
+/// Block-storage demo: read sector 0 of the first whole disk, of the first GPT partition (proving
+/// the partition layer rebases the offset), and of the ESP under its stable
+/// `/dev/disk/by-partlabel` name. Each verifies the `0x55AA` boot signature.
+///
+/// **Which `/dev/blk/<n>` each is comes from the registry**, not from the order a boot happened to
+/// have. The demo read `/dev/blk/1` as "the first partition" until a test image gained a scratch RAM
+/// disk (administration Part C.5b), which the kernel publishes before any partition, and the line
+/// then read the RAM disk and called it a partition.
 fn block_demo(root_ns: u64) {
+    use libkern::device::DeviceKind;
     kprint(b"test-harness: /dev/blk demo start\n");
-    // **What each device is** (Phase 5 Part H.1), before reading either: an index says nothing,
+    let (st, snap) = ns_lookup_wait(root_ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
+    let blocks: alloc::vec::Vec<(u32, DeviceKind)> = if st == 0 && snap != 0 {
+        let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+        // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+        let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
+        // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+        let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+        let found = if addr > 0 {
+            // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
+            let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
+            let out = libkern::device::records(bytes)
+                .map(|rs| rs.filter_map(|r| r.block_index().map(|n| (n, r.kind()))).collect())
+                .unwrap_or_default();
+            // SAFETY: unmapping what was mapped above; `out` holds copies.
+            unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+            out
+        } else {
+            alloc::vec::Vec::new()
+        };
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, snap) };
+        found
+    } else {
+        alloc::vec::Vec::new()
+    };
+    if blocks.is_empty() {
+        kprint(b"test-harness: /dev/blk demo FAIL (the registry lists no block device)\n");
+        return;
+    }
+    // **What each device is** (Phase 5 Part H.1), before reading any: an index says nothing,
     // and this registry holds a disk, the partitions found on it and any module RAM disk. The
     // installer refuses to write anything that is not a `disk`, so the facts it will decide on are
     // asserted here, where a boot can check them.
-    report_block_info(root_ns, b"/dev/blk/0/info", b"test-harness: /dev/blk/0");
-    report_block_info(root_ns, b"/dev/blk/1/info", b"test-harness: /dev/blk/1");
-    report_block_read(root_ns, b"/dev/blk/0", b"test-harness: /dev/blk/0 (disk) read");
-    report_block_read(root_ns, b"/dev/blk/1", b"test-harness: /dev/blk/1 (partition) read");
+    let path = |n: u32, leaf: &str| alloc::format!("/dev/blk/{n}{leaf}");
+    for &(n, _) in &blocks {
+        report_block_info(root_ns, path(n, "/info").as_bytes(), path(n, "").replacen("/dev", "test-harness: /dev", 1).as_bytes());
+    }
+    for (kind, word) in [(DeviceKind::Disk, "disk"), (DeviceKind::Partition, "partition")] {
+        match blocks.iter().find(|&&(_, k)| k == kind) {
+            Some(&(n, _)) => report_block_read(
+                root_ns,
+                path(n, "").as_bytes(),
+                alloc::format!("test-harness: /dev/blk/{n} ({word}) read").as_bytes(),
+            ),
+            None => Line::new().s(b"test-harness: /dev/blk demo: no ").s(word.as_bytes()).s(b" to read FAIL").end(),
+        }
+    }
     report_block_read(
         root_ns,
         b"/dev/disk/by-partlabel/NITROX_ESP",

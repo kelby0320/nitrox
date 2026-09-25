@@ -123,7 +123,12 @@ This is the whole enforcement model for *distribution*: supervisors hand out sub
 `BIND_NAMESPACE` illustrates the intent — init holds it, delegates it to the service
 manager and session manager (coordination processes that construct namespaces), and
 **never** grants it to an ordinary resource server (which registers via the
-supervisor, per the [RS Startup Protocol](namespace-and-resource-servers.md)).
+supervisor, per the [RS Startup Protocol](namespace-and-resource-servers.md)). Two servers
+are not ordinary in that sense, and init grants them it: the **view broker** (administration
+Part A) and the **storage service** (Part C.5b). Each builds namespaces as its job — a view, a
+namespace per mounted filesystem — binds only into namespaces it created, and is itself
+registered by init like any server ([`userspace/CLAUDE.md`](../../userspace/CLAUDE.md)
+§ Capability discipline).
 
 ## The boot grant: init holds the full set
 

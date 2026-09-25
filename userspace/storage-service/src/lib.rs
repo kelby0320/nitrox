@@ -5,7 +5,9 @@
 //!   nothing;
 //! - [`sources`] — which devices `init` mounted, from `init.toml`, and whether this is a live boot;
 //! - [`table`] — the TSM1 tables `/svc/storage/info` serves;
-//! - [`suffix`] — what a resolve that reached the service asked for.
+//! - [`labels`] — what a mount is called under `/storage`;
+//! - [`mounts`] — what is mounted at boot, and how;
+//! - [`suffix`] — what a resolve that reached the service asked for, and where it may ask it.
 //!
 //! The binary is the event loop: taking `block` from the device manager, reading each device, and
 //! serving.
@@ -377,8 +379,127 @@ pub mod table {
     }
 }
 
+pub mod labels {
+    //! **What a mount is called: `/storage/<label>`.** A name anything persistent can use, since
+    //! `/dev/blk/<n>` is discovery order and changes as disks come and go.
+    //!
+    //! The label is the filesystem's own, else its partition's name, else `blk-<n>`, taking the
+    //! first that is valid. A clash takes `-2`, `-3`, … in registry order, so the first device
+    //! found keeps the plain name.
+
+    use alloc::format;
+    use alloc::string::String;
+    use libkern::device::DeviceKind;
+
+    use crate::table::{Device, name};
+
+    /// Longest label accepted, in bytes. Every label this service reads is shorter: GPT's 36,
+    /// ext4's 16, FAT's 11.
+    pub const MAX: usize = 64;
+
+    /// Whether `s` may be a label: 1 to [`MAX`] bytes of printable ASCII, with no `/`, not
+    /// beginning with `.` or a space and not ending with one. **A name beginning with `.` is
+    /// refused** because `.` and `..` are not path components and a hidden name is not one a
+    /// person looking at `/storage` would find. A space at either end is refused because it
+    /// cannot be seen. Anything else — a non-ASCII label included — falls back to the next source.
+    pub fn valid(s: &str) -> bool {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && b.len() <= MAX
+            && b.iter().all(|&c| (0x20..0x7F).contains(&c) && c != b'/')
+            && b[0] != b'.'
+            && b[0] != b' '
+            && b[b.len() - 1] != b' '
+    }
+
+    /// The label `d` would be mounted under, before clashes: its filesystem's own label, else its
+    /// partition's name, else `blk-<n>`.
+    pub fn preferred(d: &Device) -> String {
+        if let Some(l) = d.found.label().filter(|l| valid(l)) {
+            return String::from(l);
+        }
+        if d.record.kind() == DeviceKind::Partition
+            && let Ok(n) = core::str::from_utf8(d.record.name())
+            && valid(n)
+        {
+            return String::from(n);
+        }
+        name(&d.record)
+    }
+
+    /// `want`, or the first of `want-2`, `want-3`, … that `taken` does not hold.
+    pub fn unique(want: &str, taken: &[String]) -> String {
+        if !taken.iter().any(|t| t == want) {
+            return String::from(want);
+        }
+        (2..).map(|k| format!("{want}-{k}")).find(|c| !taken.contains(c)).unwrap_or_default()
+    }
+}
+
+pub mod mounts {
+    //! **What this service mounts at boot.** Every device holding a filesystem it can serve that
+    //! is not already mounted: today that is every ext4 `init` did not mount. FAT is recognised
+    //! and not served until Phase 6.
+    //!
+    //! **A live boot mounts read-only**: the root is on a RAM disk, which makes the machine's own
+    //! disks the install target, and nothing written to one of them by accident could be taken
+    //! back. An administrator's explicit mount (C.5c) is writable either way; it is the automatic
+    //! one that has to be careful.
+
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use libinittoml::manifest::Mode;
+
+    use crate::labels;
+    use crate::probe::Found;
+    use crate::table::{Device, Mounted};
+
+    /// One mount to make: the device, its label and its mode.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        /// The registry id of the device.
+        pub device: u32,
+        /// Its label, unique among the plan's.
+        pub label: String,
+        /// `ro` on a live boot, `rw` otherwise.
+        pub mode: Mode,
+    }
+
+    /// Where a label is mounted.
+    pub fn at(label: &str) -> String {
+        let mut s = String::from("/storage/");
+        s.push_str(label);
+        s
+    }
+
+    /// The boot's auto-mounts, in registry order. `already` is what is mounted, `init`'s mounts
+    /// among it, and none of those devices is mounted again.
+    pub fn automount(devices: &[Device], already: &[Mounted], live: bool) -> Vec<Plan> {
+        let mode = if live { Mode::Ro } else { Mode::Rw };
+        let mut taken: Vec<String> = Vec::new();
+        let mut plan = Vec::new();
+        for d in devices {
+            if !matches!(d.found, Found::Ext4 { .. }) || already.iter().any(|m| m.device == d.record.id) {
+                continue;
+            }
+            let label = labels::unique(&labels::preferred(d), &taken);
+            taken.push(label.clone());
+            plan.push(Plan { device: d.record.id, label, mode });
+        }
+        plan
+    }
+}
+
 pub mod suffix {
-    //! What a resolve that reached the service asked for.
+    //! What a resolve that reached the service asked for, and what it may ask for where it came
+    //! from.
+    //!
+    //! **A session reaches the service through an endpoint of its own** (C.5b), which the login
+    //! supervisors bind at `/storage` with the base `/fs` and at `/dev/storage` with the base
+    //! `/info` (C.6). A resolve arriving there is [`session_only`]: the filesystems and the tables,
+    //! and nothing that would mint another endpoint. The base alone would not be enough, since a
+    //! holder with `BIND_NAMESPACE` could bind the endpoint with no base; an endpoint that cannot
+    //! mint is a capability it can be handed, as `/dev/devices`' is.
 
     /// A forwarded suffix, classified.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -387,6 +508,20 @@ pub mod suffix {
         Directory,
         /// `info/<name>.tsm`: one table, `all` or a device's.
         File(&'a str),
+        /// `fs`: the directory of mounted filesystems, a subdirectory per label.
+        Mounts,
+        /// `fs/<label>`, alone or with more after it: a resolve to continue in that mount's
+        /// namespace. `consumed` is how many bytes of the suffix `fs/<label>` is — what the
+        /// `SUBNAMESPACE` reply answers for.
+        Mount {
+            /// The label.
+            label: &'a str,
+            /// The bytes the reply answers for.
+            consumed: usize,
+        },
+        /// `session-endpoint`: a forwarding endpoint of the service's own, every resolve on which
+        /// is [`session_only`].
+        SessionEndpoint,
         /// Anything else.
         Unknown,
     }
@@ -396,13 +531,36 @@ pub mod suffix {
         if suffix == b"info" {
             return Asked::Directory;
         }
+        if suffix == b"fs" {
+            return Asked::Mounts;
+        }
+        if suffix == b"session-endpoint" {
+            return Asked::SessionEndpoint;
+        }
         if let Some(file) = suffix.strip_prefix(b"info/") {
             return match file.strip_suffix(b".tsm").map(core::str::from_utf8) {
                 Some(Ok(name)) if !name.is_empty() && !name.contains('/') => Asked::File(name),
                 _ => Asked::Unknown,
             };
         }
+        if let Some(rest) = suffix.strip_prefix(b"fs/") {
+            let end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
+            return match core::str::from_utf8(&rest[..end]) {
+                Ok(label) if !label.is_empty() => Asked::Mount { label, consumed: 3 + end },
+                _ => Asked::Unknown,
+            };
+        }
         Asked::Unknown
+    }
+
+    /// What a resolve arriving on a session endpoint gets: the tables and the filesystems as
+    /// asked, and **another endpoint answered as if it did not exist**, since its holder could
+    /// then mint more.
+    pub fn session_only(asked: Asked<'_>) -> Asked<'_> {
+        match asked {
+            Asked::SessionEndpoint => Asked::Unknown,
+            other => other,
+        }
     }
 }
 
