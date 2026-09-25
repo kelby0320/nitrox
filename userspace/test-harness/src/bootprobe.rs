@@ -1796,6 +1796,89 @@ fn view_broker_test(root_ns: u64) -> bool {
     // SAFETY: closing our own handle; the request is done.
     unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
 
+    // 3b. **What `disks` leaves out** (administration Part C.6). The broker asks the storage
+    // service `InUse` first. `nxinstall` with no operand writes the devices it can reach to stdout
+    // as a table, so a pipe goes with the request and the listing is read back and held to the
+    // registry: **the ESP is in it, and the disk holding `init`'s root, the root itself and the
+    // mounted scratch disk are not**.
+    //
+    // **The listing, not an exit code.** The first version ran `nxinstall /dev/blk/0` and wanted 1.
+    // A control that handed over every disk passed it, because `nxinstall` refuses each in-use
+    // device by its own rules whether or not the grant withheld it: the running root's disk, a
+    // partition, a RAM disk.
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    use libkern::device::DeviceKind;
+    let path = |r: &libkern::device::DeviceRecord| r.block_index().map(|n| alloc::format!("/dev/blk/{n}"));
+    let root_part = registry.iter().find(|r| r.kind() == DeviceKind::Partition && r.name() == b"nitrox-root");
+    let esp = registry.iter().find(|r| r.kind() == DeviceKind::Partition && r.name() == b"NITROX_ESP").and_then(path);
+    let root = root_part.and_then(path);
+    let disk = root_part.and_then(|p| registry.iter().find(|r| r.id == p.parent)).and_then(path);
+    let scratch = registry.iter().find(|r| r.kind() == DeviceKind::RamDisk).and_then(path);
+    let (Some(esp), Some(root), Some(disk), Some(scratch)) = (esp, root, disk, scratch) else {
+        return fail(b"the registry has no ESP, root, root disk and scratch disk to hold the grant to");
+    };
+    let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let (mut out_w, mut out_r) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let piped = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) } == 0;
+    if st != 0 || cli == 0 || copy <= 0 || !piped {
+        return fail(b"a client, a copy and a pipe to ask what disks leaves out");
+    }
+    let copy = copy as u64;
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    unsafe { syscall4(SYS_NS_UNBIND, copy, blk.as_ptr() as u64, blk.len() as u64, 0) };
+    let Some(n) = build_request(&mut req, REQ_STDOUT, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli, OP_VIEWS_REQUEST, 5, &req[..n], &[copy, out_w], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+        _ => return fail(b"a request with a stdout did not ask for a password"),
+    }
+    match views_call(cli, OP_VIEWS_PASSWORD, 6, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"nxinstall with a stdout did not start"),
+    }
+    let listing = libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive();
+    close(out_r);
+    let code = match exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) {
+        Some(body) => parse_exited(&body),
+        None => None,
+    };
+    // SAFETY: closing our own handle; the request is done.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
+    let mut granted: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let decoded = listing.ok().is_some_and(|bytes| {
+        let Ok(mut tr) = libstream::table::TableReader::new(&bytes) else {
+            return false;
+        };
+        loop {
+            match tr.next() {
+                Some(Ok(libstream::table::Item::Row(vals))) => match vals.first() {
+                    Some(libstream::wire::Value::Str(p)) => granted.push(p.clone()),
+                    _ => return false,
+                },
+                Some(Ok(libstream::table::Item::End(_))) | None => return true,
+                _ => return false,
+            }
+        }
+    });
+    if !decoded || code != Some((0, false)) {
+        return fail(b"nxinstall's listing in the admin view did not read");
+    }
+    for (what, p) in [(&b"the disk holding init's root"[..], &disk), (b"init's root", &root), (b"the mounted scratch disk", &scratch)] {
+        if granted.contains(p) {
+            Line::new().s(b"boot-probe: view broker: disks granted ").s(what).s(b", ").s(p.as_bytes()).s(b", which is in use").end();
+            return fail(b"the disks grant handed over a device in use");
+        }
+    }
+    if !granted.contains(&esp) {
+        return fail(b"the disks grant withheld the ESP, which nothing has mounted");
+    }
+
     // 4. **A client let in can always start its program.** Open clients until the broker refuses
     // one, then start a program on the last it let in: that program's exit must still be heard.
     // Admitting by what was open let the last channel into the last slot, and its program's life

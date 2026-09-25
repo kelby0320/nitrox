@@ -1439,6 +1439,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     if !built.contains("/dev/devices") {
         return Err(format!("the serial session was built without /dev/devices: ({built}").into());
     }
+    // **And the storage service's filesystems and table** (administration Part C.6).
+    if !built.contains("/storage") {
+        return Err(format!("the serial session was built without /storage: ({built}").into());
+    }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1510,6 +1514,32 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("open /dev/registry")?;
     s.expect("nxsh: cannot open /dev/registry")?;
     s.expect("/home>")?;
+    steps += 1;
+
+    // 5e. **The machine's filesystems** (administration Part C.6). The session's `/dev/storage` is
+    //     the storage service at the base `/info`: `list` names a table per device, and the row
+    //     mounted at `/` is `init`'s root, matched on `blk-2` and `init`, which the command does not
+    //     contain. `/storage` is the service at the base `/fs`: a release boot has nothing for the
+    //     service to mount, so it lists empty — and without an error, which is what says the
+    //     binding reached a directory rather than nothing.
+    s.send("list /dev/storage")?;
+    s.expect_all(&["all.tsm", "blk-0.tsm", "blk-2.tsm"])?;
+    s.expect("/home>")?;
+    s.send("open /dev/storage/all.tsm | filter mounted == \"/\"")?;
+    s.expect_all(&["blk-2", "init"])?;
+    s.expect("/home>")?;
+    let before = s.transcript().len();
+    s.send("list /storage")?;
+    s.expect("/home>")?;
+    let listed = s.transcript()[before..].to_string();
+    if listed.contains("cannot") || listed.contains("nxsh:") {
+        return Err(format!("`list /storage` failed where it should list nothing: {listed:?}").into());
+    }
+    // **And it is the filesystems, not the tables.** Both bindings are one endpoint at two bases;
+    // `/storage` at the tables' base would list without an error too.
+    if listed.contains(".tsm") {
+        return Err(format!("`list /storage` listed tables — it is bound at the wrong base: {listed:?}").into());
+    }
     steps += 1;
 
     // 6. A *failing* stage reports and returns to the prompt rather than hanging. This is
@@ -1879,7 +1909,12 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //      (d) **A wrong password, then the right one — held for the session's delay — and the
     //          grant arrived.** The right password is typed the moment the second prompt appears;
     //          the broker holds its check until two seconds after the failure, so the listing
-    //          cannot come sooner. And the listing names `/dev/blk/0`, which (a) could not.
+    //          cannot come sooner. And the listing names the ESP, `/dev/blk/1`, which (a) could not.
+    //
+    //          **And what the grant leaves out** (administration Part C.6): the broker asks the
+    //          storage service what is in use first, and `/dev/blk/0` holds `init`'s root, so the
+    //          listing never names it. Until C.6 this step expected `/dev/blk/0` — the disk under
+    //          a live server, handed over raw.
     const WRONG: &str = "not-the-password-4271";
     s.send("with admin nxinstall")?;
     s.expect("[with admin] password (1 of 3): ")?;
@@ -1887,8 +1922,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("with: wrong password")?;
     let refused = s.matched_at();
     s.expect("[with admin] password (2 of 3): ")?;
+    let listing_from = s.transcript().len();
     s.send(DEMO_PASSWORD)?;
-    s.expect("/dev/blk/0")?;
+    s.expect("/dev/blk/1")?;
     let held = s.matched_at().saturating_duration_since(refused);
     if held < std::time::Duration::from_millis(1500) {
         return Err(format!(
@@ -1898,6 +1934,16 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         .into());
     }
     s.expect("/home>")?;
+    let listing = s.transcript()[listing_from..].to_string();
+    for withheld in ["/dev/blk/0", "/dev/blk/2"] {
+        if listing.contains(withheld) {
+            return Err(format!(
+                "`with admin nxinstall` listed {withheld}, which is in use (init's root, or the disk \
+                 holding it): {listing:?}"
+            )
+            .into());
+        }
+    }
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
     s.send("with admin whoami")?;
@@ -4297,6 +4343,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // right after, from what was bound. The application namespaces the shell builds carry them too,
     // which the shell checks by resolving the binding and says on its `grants` line below.
     session.expect("desktop-session-mgr: session has /dev/devices")?;
+    // **And `/storage`** (administration Part C.6): the storage service's session endpoint, which
+    // the supervisor resolved itself and bound at `/storage` and `/dev/storage`.
+    session.expect("desktop-session-mgr: session has /storage")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and
@@ -4389,7 +4438,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -4511,7 +4560,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the menu, so an `expect` between the two is a race between processes —
@@ -6442,6 +6491,29 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("view: alice admin nxinstall — started")?;
     session.expect("view: alice admin nxinstall — exited, code 0")?;
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
+    //      **And not the one in use** (administration Part C.6). Code 0 above says the grant bound
+    //      something, which on a release boot is the ESP alone. The disk holding `init`'s root is
+    //      `/dev/blk/0`, and naming it with an identity makes `nxinstall` log its refusal on the
+    //      console, where a release image's gate can read it: the disk is not in the session at
+    //      all. Until C.6 this step passed on that disk too, which was the weaker claim.
+    type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0 x")?;
+    session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
+    for c in DEMO_PASSWORD.chars() {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(&mut qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(&mut qmp, "ret")?;
+    session.expect("nxinstall: refused /dev/blk/0: not a block device in this session")?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
+    println!("  ok: and it did not see /dev/blk/0, the disk holding init's root");
 
     // Close the terminal from inside, so steps 11 and 12 drive the windows step 9 left.
     for qcode in ["e", "x", "i", "t"] {
@@ -13736,7 +13808,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\"]\n\
+         grants = [\"disks\", \"storage\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

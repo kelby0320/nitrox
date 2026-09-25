@@ -1,6 +1,6 @@
 # Storage
 
-**Status: built as administration Part C.5 drew it — C.5a, C.5b and C.5c, 2026-09-25; last checked
+**Status: built as administration Part C.5 and C.6 drew it — 2026-09-25; last checked
 2026-09-25.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
@@ -15,10 +15,13 @@ What exists:
   ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)). An unmount writes back every dirty
   file, is refused while a file is still held, and flushes the drive.
 
+- **Sessions and views** (C.6): every session and application has `/storage` and `/dev/storage`,
+  the view broker's `storage` grant binds the admin endpoint at `/dev/storage/admin`, and its
+  `disks` grant leaves out what `InUse` names.
+
 What does not exist yet, in the order Part C builds it
-([`administration.md`](../planning/administration.md) § *Part C in detail*):
-- **`/storage` and `/dev/storage` in sessions**, and the view broker's `storage` and `disks`
-  grants (C.6); **`disk`** (C.7); and **`check-storage`** (C.8).
+([`administration.md`](../planning/administration.md) § *Part C in detail*): **`disk`** (C.7),
+and **`check-storage`** (C.8).
 
 ## 1. What it is for
 
@@ -227,8 +230,10 @@ same rule.
 |---|---|
 | The root namespace: `init`, `service-mgr`, both login supervisors, the view broker, declared services | `/svc/storage` whole: the tables, every mounted filesystem, and a session or admin endpoint to mint |
 | A holder of a session endpoint | the tables and every mounted filesystem, never another endpoint |
-| A holder of an admin endpoint | admin sessions: `Mount`, `Unmount`, `InUse` — the `storage` grant's, from C.6 |
-| A session or an application | nothing yet: C.6 binds the session endpoint into them at `/storage` and `/dev/storage` |
+| A holder of an admin endpoint | admin sessions: `Mount`, `Unmount`, `InUse` |
+| A session, and every application `desktop-shell` launches | `/storage` (base `/fs`) and `/dev/storage` (base `/info`): every mounted filesystem and the table, through a session endpoint, so nothing to mount with |
+| A view with the `storage` grant | also `/dev/storage/admin`: the admin endpoint the view broker resolved |
+| A view with the `disks` grant | every block device **not** in use: the broker asks `InUse` first, and refuses the request if the service cannot answer |
 
 **The root namespace reaches mounting**, since anything holding it can mint an admin endpoint. That
 is the same ungated boundary `/svc/devices` and `/svc/views` have, the same trusted set of system
@@ -252,6 +257,9 @@ service itself at `/svc/storage`.
 | `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real |
 | `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
+| `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
+| `test-interactive` | The serial session is built with `/storage`. `list /dev/storage` names a table per device, and `open /dev/storage/all.tsm \| filter mounted == "/"` prints the root's row, `init`'s. `list /storage` lists filesystems, not tables, and on a release boot none. **`with admin nxinstall` lists the ESP and never `/dev/blk/0` or the root**, where before C.6 it listed the disk under a live server |
+| `check-login` | The graphical session has `/storage`, and so does every application namespace the shell builds. In a desktop terminal, `with admin nxinstall /dev/blk/0 x` is refused because that disk is not in the view at all |
 | `test-qemu` (`boot-probe`), mounts | Through `/svc/storage`: `fs` lists `nitrox-scratch` as a directory. Its `README` reads. **A file created, written through a mapping and synced there is on the device**, read back from the RAM disk raw, since a re-resolve would only read the page cache. A session endpoint bound at `/storage` with the base `/fs` and at `/dev/storage` with `/info` reaches the same file and the same table, and bound with no base it mints nothing. An unknown label is `NotFound` |
 
 Host tests hold the rest: FAT against sectors `mformat` wrote and a real protective MBR, ext4
@@ -260,6 +268,10 @@ scheme, the live-boot rule, every column's rule, every label rule and clash, wha
 how, and what each suffix asks for where it arrives.
 
 ## 12. Not built, and what that costs
+
+- **No boot exercises the `storage` grant yet.** The broker binds `/dev/storage/admin` into a view
+  that has it, but nothing a person runs uses that path until `disk` (C.7), which is where its gate
+  is.
 
 - **A resolve already on its way to a mount's server can outlive the busy check.** One the kernel
   forwarded before the unmount began may complete after `sys_ns_held` said zero, and hand out a

@@ -12,7 +12,7 @@ syntax. A view is a profile's grants added to the caller's own namespace; see
 
 ```toml
 [profile.admin]
-grants = ["disks"]
+grants = ["disks", "storage"]
 
 [profile.install]
 grants = ["disks"]
@@ -53,7 +53,8 @@ names its line.
 
 | Grant | What it binds | Since |
 |---|---|---|
-| `disks` | every block device, raw: `/dev/blk/<n>` and its `info`, one binding each | Part A |
+| `disks` | every block device **not in use**, raw: `/dev/blk/<n>` and its `info`, one binding each. The broker asks the storage service's `InUse` first, and leaves out a mounted filesystem's device, `init`'s root included, and the disk under it; if the service cannot answer, the request is refused rather than granted blind | Part A; `InUse` since Part C.6 |
+| `storage` | the storage service's admin endpoint at `/dev/storage/admin`: mounting and unmounting ([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) | Part C.6 |
 
 Each later part of the administration phase adds its grant to this table.
 

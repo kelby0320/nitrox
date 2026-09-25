@@ -140,6 +140,7 @@ fn run_session(
     views: u64,
     views_sup: u64,
     devices: u64,
+    storage: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -181,6 +182,7 @@ fn run_session(
         views_endpoint: if opened.is_some() { views } else { 0 },
         views_base: &views_base[..base_len],
         devices_endpoint: devices,
+        storage_endpoint: storage,
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
@@ -235,6 +237,12 @@ fn run_session(
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/devices\n");
     }
+    // And the storage service's filesystems and table (administration Part C.6).
+    if libsession::session_has_storage() {
+        kprint(b"desktop-session-mgr: session has /storage\n");
+    } else {
+        kprint(b"desktop-session-mgr: session has NO /storage\n");
+    }
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
@@ -268,11 +276,12 @@ fn run_session(
         "desktop-shell",
         &[home_str, base_str],
         SYSCAP_BIND_NAMESPACE,
-        // **Seven now.** The fifth is the clipboard (M12 Part E), the sixth the view broker
-        // (administration Part A.4) and the seventh the device manager (Part B.4); the shell
-        // binds each into every application namespace it constructs, for the same reason as the
-        // rest — a binding resolves to a kernel registration and never back to an endpoint.
-        &[draw, fs, tty, profile, clipboard, views_for_shell, devices],
+        // **Eight now.** The fifth is the clipboard (M12 Part E), the sixth the view broker
+        // (administration Part A.4), the seventh the device manager (Part B.4) and the eighth the
+        // storage service's session endpoint (Part C.6); the shell binds each into every
+        // application namespace it constructs, for the same reason as the rest — a binding
+        // resolves to a kernel registration and never back to an endpoint.
+        &[draw, fs, tty, profile, clipboard, views_for_shell, devices, storage],
     );
     // **Tell the broker the session ended**, as the serial column does.
     if let Some((id, _)) = opened {
@@ -311,6 +320,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // the fourth both take: bound at `/dev/devices` with the base `/info`, in the session and in
     // every application. Info-only because the shell holds it with `BIND_NAMESPACE`.
     let devices_endpoint = recv_handoff(control);
+    // **The storage service's session endpoint** (administration Part C.6), resolved rather than
+    // couriered, as `/svc/views/session` is: nothing new travels the handoff channels. Once, since
+    // its lifetime is the machine's. Bound at `/storage` and `/dev/storage` in every session and,
+    // through the shell, every application. `0` on a boot without the service.
+    let (_, storage_endpoint) =
+        ns_lookup(root_ns, b"/svc/storage/session-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
     // A supervisor channel to it, resolved once, as the serial column does: this process opens a
     // session for each login and closes it when the shell exits.
     let views_sup = if views_endpoint != 0 {
@@ -477,7 +492,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
                 draw_endpoint, clipboard_endpoint, views_endpoint, views_sup, devices_endpoint,
-                &user[..ul], &pass[..pl],
+                storage_endpoint, &user[..ul], &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.

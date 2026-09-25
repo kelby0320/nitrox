@@ -29505,3 +29505,63 @@ statement order, which is an argument and not a test.
   - a session reaching the admin endpoint;
   - a mounted device mounted again. That one spawned a second server over `init`'s root, which the
     rebuilt test disk survives.
+
+## 2026-09-25 — Administration C.6: sessions reach `/storage`, and `disks` leaves out what is in use
+
+**What landed:**
+- **`/storage` and `/dev/storage` in every session and application.** Each login supervisor
+  resolves `/svc/storage/session-endpoint` itself, once, as it resolves `/svc/views/session`, so
+  nothing new travels `init`'s and `service-mgr`'s handoff channels. `libsession::build_namespace`
+  binds it at `/storage` with the base `/fs` and at `/dev/storage` with the base `/info`.
+  `desktop-session-mgr` hands it to `desktop-shell` as its eighth extra, and the shell binds it the
+  same two ways into each application. A session endpoint answers `admin-endpoint` with
+  `NotFound`, so the shell, holding it with `BIND_NAMESPACE`, cannot mint the endpoint that mounts.
+- **The `storage` grant** binds the storage service's admin endpoint at `/dev/storage/admin` in a
+  view, and a session's end unbinds it. The seeded `admin` profile has it.
+- **The `disks` grant asks `InUse` first** and hands over the rest
+  (`libsession::rebind_block_devices_except`). If the service cannot answer, the request is refused
+  rather than granted blind.
+
+**The broker resolves the storage service when first needed, not at startup.** `init` spawns it
+before the device manager and the storage service, so at startup `/svc/storage` does not exist
+yet. The admin endpoint, and an admin session of the broker's own for `InUse`, are resolved on the
+first grant that needs them. A failure is not remembered, so a service that came up later is found.
+
+**Consequences, as the detail pass said:**
+- `test-interactive` step 20b(d) expected `with admin nxinstall` to list `/dev/blk/0`, the disk
+  holding `init`'s root. It now lists the ESP, and the step asserts neither the disk nor the root
+  appears between the command and the prompt.
+- `check-login`'s 9a2 keeps its exit-code check, since the ESP is still granted. It adds
+  `with admin nxinstall /dev/blk/0 x`, whose refusal `nxinstall` logs where a release image's gate
+  can read it: `not a block device in this session`.
+- The *Gates* table's row A is reworded to match.
+
+**A probe check that proved nothing, caught by its control.** `boot-probe`'s new step first ran
+`nxinstall /dev/blk/0` in the admin view and expected exit 1. The control that handed over every
+disk passed it. `nxinstall` refuses each in-use device on this image by its own rules — the running
+root's disk, a partition, a RAM disk — so its exit code is 1 whether or not the grant withheld it.
+The step now sends a stdout pipe with the request and reads `nxinstall`'s listing back. The ESP must
+be in it, and the root's disk, the root and the mounted scratch disk must not. The same control
+then fails, naming `/dev/blk/0`.
+
+**`test-interactive`'s `/storage` check had the same weakness, found by reading the control list
+before running it.** "`list /storage` prints no error" would pass with `/storage` bound at the
+tables' base. It now also asserts that no `.tsm` appears.
+
+**Not tested on a boot:**
+- **The `storage` grant's binding**, since nothing a person runs uses `/dev/storage/admin` until
+  `disk` (C.7), whose gate the plan already gives it.
+- **The broker refusing `disks` when `InUse` is unanswered**, which needs a boot without the storage
+  service.
+
+**Controls:**
+- 2 on the broker's host tests, each failing its test: `storage` unnamed, and `storage` missing from
+  the known grants.
+- 5 boots, each failing at its check:
+  - `disks` handing over everything (`test-qemu`, against the listing);
+  - a serial session without `/storage` (`test-interactive`);
+  - one with `/storage` at the tables' base (`test-interactive`);
+  - a graphical session without it (`check-login`);
+  - a shell binding none into its applications (`check-login`).
+- The first run of the `disks` control was against the exit-code version, and it passed. That is
+  what replaced the step.

@@ -114,6 +114,8 @@ the tty endpoint where the profile endpoint belongs.
 - `/dev/clipboard` — the clipboard server;
 - `/dev/views` — the view broker, at the session's base `/s/<id>`, which is its identity there;
 - `/dev/devices` — the device manager's tables, through an info-only endpoint at the base `/info`;
+- `/storage` and `/dev/storage` — the storage service's session endpoint, at the bases `/fs` (every
+  mounted filesystem) and `/info` (the table), resolved by this supervisor itself;
 - `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
 - **on an installer boot only**, the machine's block devices, each bound individually with its

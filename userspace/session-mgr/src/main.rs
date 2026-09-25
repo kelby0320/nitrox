@@ -222,6 +222,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     if views_endpoint != 0 && views_sup == 0 {
         kprint(b"session-mgr: /svc/views/session resolve FAIL; sessions will have no `with`\n");
     }
+    // **The storage service's session endpoint** (administration Part C.6), resolved rather than
+    // couriered, for `/svc/views/session`'s reason: nothing new travels the handoff channels.
+    // Bound at `/storage` and `/dev/storage` in every session. `0` on a boot without the service,
+    // whose sessions have no `/storage`.
+    let (_, storage_endpoint) =
+        ns_lookup(root_ns, b"/svc/storage/session-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
     // the shell into it, and reap it — the same way in every build.
@@ -266,6 +272,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 views_endpoint: if views.is_some() { views_endpoint } else { 0 },
                 views_base: &views_base[..views.map_or(0, |v| v.1)],
                 devices_endpoint,
+                storage_endpoint,
             });
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");
@@ -291,6 +298,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             if libsession::session_has_devices() {
                 kprint(b" + /dev/devices");
+            }
+            if libsession::session_has_storage() {
+                kprint(b" + /storage");
             }
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.

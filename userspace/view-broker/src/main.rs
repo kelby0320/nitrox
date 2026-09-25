@@ -29,6 +29,7 @@ use alloc::vec::Vec;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
+use librsproto::storage::{OP_STORAGE_IN_USE, parse_in_use};
 use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_full};
@@ -129,7 +130,27 @@ struct Client {
     state: State,
 }
 
+/// Where the storage service mints an admin endpoint (administration Part C.6).
+const STORAGE_ADMIN: &[u8] = b"/svc/storage/admin-endpoint";
+/// How long the storage service may take to answer `InUse`: it answers from what it holds, so this
+/// bounds a service that is wedged, not an ordinary wait.
+const IN_USE_WAIT_NS: u64 = 5_000_000_000;
+
+/// **The storage service, as this broker reaches it** (administration Part C.6): an admin endpoint,
+/// which the `storage` grant binds into a view, and an admin session of the broker's own, on which
+/// it asks `InUse` before the `disks` grant.
+///
+/// **Resolved when first needed, not at startup**: `init` spawns the broker before the device
+/// manager and the storage service, so at startup there is nothing to resolve. A failure is not
+/// remembered, so a service that came up later is found the next time.
+#[derive(Default)]
+struct Storage {
+    endpoint: u64,
+    session: u64,
+}
+
 struct Broker {
+    storage: Storage,
     root_ns: u64,
     notif: u64,
     serve_end: u64,
@@ -246,7 +267,83 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     if st == 0 { h } else { 0 }
 }
 
+/// Where the `storage` grant is bound in a view.
+const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
+
+/// Wait on `h` until `deadline`. `true` if it became ready.
+fn wait_until(h: u64, deadline: u64) -> bool {
+    let handles = [h];
+    let mut results = [0u8; 24];
+    // SAFETY: valid one-entry wait arrays on this frame.
+    unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline) == 1 }
+}
+
 impl Broker {
+    /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
+    /// there.
+    fn storage_endpoint(&mut self) -> u64 {
+        if self.storage.endpoint == 0 {
+            self.storage.endpoint = ns_lookup(
+                self.root_ns,
+                STORAGE_ADMIN,
+                RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_TRANSFER,
+            );
+        }
+        self.storage.endpoint
+    }
+
+    /// An admin session of the broker's own, opened on first need: the admin endpoint bound in a
+    /// namespace made for the purpose, and resolved there. `0` if there is none to open.
+    fn storage_session(&mut self) -> u64 {
+        if self.storage.session != 0 {
+            return self.storage.session;
+        }
+        let endpoint = self.storage_endpoint();
+        if endpoint == 0 {
+            return 0;
+        }
+        // SAFETY: register-only syscall; returns a fresh namespace handle.
+        let ns = unsafe { syscall0(SYS_NS_CREATE) };
+        if ns <= 0 {
+            return 0;
+        }
+        let at = b"/admin";
+        // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
+        let bound = unsafe { syscall4(SYS_NS_BIND, ns as u64, at.as_ptr() as u64, at.len() as u64, endpoint) } == 0;
+        let session = if bound { ns_lookup(ns as u64, at, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT) } else { 0 };
+        close(ns as u64);
+        self.storage.session = session;
+        session
+    }
+
+    /// **What is in use**: the registry ids the storage service's `InUse` names. `None` if it did
+    /// not answer — and then the session is dropped, so the next ask opens a new one.
+    fn in_use(&mut self) -> Option<Vec<u32>> {
+        let session = self.storage_session();
+        if session == 0 {
+            return None;
+        }
+        let asked = send(session, OP_STORAGE_IN_USE, 1, 0, &[], &[]);
+        let deadline = now_ns().saturating_add(IN_USE_WAIT_NS);
+        let mut ids = Vec::new();
+        let answered = asked
+            && loop {
+                match recv(session) {
+                    Ok(Some((op, 1, body))) if op == OP_STORAGE_IN_USE => break parse_in_use(&body, |id| ids.push(id)),
+                    // A stray is dropped; nothing else is asked on this session.
+                    Ok(Some(_)) => received().into_iter().for_each(close),
+                    Ok(None) if wait_until(session, deadline) => {}
+                    _ => break false,
+                }
+            };
+        if !answered {
+            close(session);
+            self.storage.session = 0;
+            return None;
+        }
+        Some(ids)
+    }
+
     /// A record in the log — every request, failure and exit, and never a password.
     fn audit(&self, what: &str) {
         self.log.info(what);
@@ -355,6 +452,9 @@ impl Broker {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
                     unsafe { syscall1(SYS_PROCESS_TERMINATE, *process) };
                     libsession::unbind_block_devices(*view_ns);
+                    // The `storage` grant too; `NotFound` for a view that was not given it.
+                    // SAFETY: valid namespace handle and path.
+                    unsafe { syscall3(SYS_NS_UNBIND, *view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64) };
                 }
                 State::Password(p) => {
                     p.handles.close();
@@ -604,8 +704,31 @@ impl Broker {
         let view_ns = view_ns as u64;
         for g in &p.grants {
             match g {
+                // **Every disk not in use** (administration Part C.6): a mounted filesystem's
+                // device, `init`'s root included, and the disk under it are left out, since a raw
+                // write there lands underneath a live server. **Refused, not granted blind**, when
+                // the storage service cannot say what is in use.
                 Grant::Disks => {
-                    libsession::rebind_block_devices(self.root_ns, view_ns);
+                    let Some(in_use) = self.in_use() else {
+                        close(view_ns);
+                        return fail(self, &mut p, "the storage service could not say which disks are in use");
+                    };
+                    libsession::rebind_block_devices_except(self.root_ns, view_ns, &in_use);
+                }
+                // **Mounting and unmounting**: the storage service's admin endpoint, at
+                // `/dev/storage/admin`. The service answers every request on a session opened
+                // there, so holding this binding is the authority.
+                Grant::Storage => {
+                    let endpoint = self.storage_endpoint();
+                    // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
+                    let bound = endpoint != 0
+                        && unsafe {
+                            syscall4(SYS_NS_BIND, view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64, endpoint)
+                        } == 0;
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "the storage service is not there to grant");
+                    }
                 }
             }
         }
@@ -844,6 +967,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         exit(1);
     }
     let mut b = Broker {
+        storage: Storage::default(),
         root_ns,
         notif,
         serve_end,

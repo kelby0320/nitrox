@@ -35,13 +35,18 @@ pub mod policy {
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
 
-    /// Something a profile grants. **Part A knows one**; each later part adds its own, and a
+    /// Something a profile grants. **Part A knew one**; each later part adds its own, and a
     /// policy naming a grant this broker does not know is refused rather than ignored — a grant
     /// silently dropped is an administrator who believes they can do something they cannot.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Grant {
-        /// Every block device, raw: `/dev/blk/<n>` and its `info`, bound one by one.
+        /// Every block device **not in use**, raw: `/dev/blk/<n>` and its `info`, bound one by
+        /// one. Since administration Part C.6 the storage service's `InUse` is asked first, and a
+        /// mounted filesystem's device and the disk under it are left out.
         Disks,
+        /// Mounting and unmounting: the storage service's admin endpoint, bound at
+        /// `/dev/storage/admin` (administration Part C.6).
+        Storage,
     }
 
     impl Grant {
@@ -49,6 +54,7 @@ pub mod policy {
         pub fn from_name(name: &str) -> Option<Grant> {
             match name {
                 "disks" => Some(Grant::Disks),
+                "storage" => Some(Grant::Storage),
                 _ => None,
             }
         }
@@ -57,12 +63,13 @@ pub mod policy {
         pub fn name(self) -> &'static str {
             match self {
                 Grant::Disks => "disks",
+                Grant::Storage => "storage",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
-    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks];
+    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks, Grant::Storage];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -792,6 +799,18 @@ auth = "password"
         let deny = |s: &str| Decision::Deny(s.into());
         assert_eq!(p.decide("bob", "admin", "nxsh"), deny("no rule lets bob use `admin`"));
         assert_eq!(p.decide("alice", "nope", "x"), deny("there is no view called `nope`"));
+    }
+
+    /// **`storage` is a grant** (administration Part C.6), named beside `disks` and kept in the
+    /// order the policy gives, and the refusal of an unknown grant names it among the ones there are.
+    #[test]
+    fn storage_is_a_grant_a_policy_can_name() {
+        let p = parse("[profile.admin]\ngrants = [\"disks\", \"storage\"]\n").unwrap();
+        assert_eq!(p.profiles[0].grants, [Grant::Disks, Grant::Storage]);
+        assert_eq!(Grant::from_name("storage"), Some(Grant::Storage));
+        assert_eq!(Grant::Storage.name(), "storage");
+        let e = parse("[profile.admin]\ngrants = [\"power\"]\n").unwrap_err();
+        assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
     }
 
     #[test]

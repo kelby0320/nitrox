@@ -1194,12 +1194,21 @@ namespace, with no login and no session.
       - `boot-probe` unmounts the scratch disk on every run. The unmount is refused while a file
         is held; a file written through a mapping and never synced is on the device after it,
         which also leaves the filesystem clean; and a `Mount` by name brings the disk back.
-- [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
+- [x] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
       grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and
       `/dev/storage/all.tsm` from a serial login, and `disk --mount` refused without the grant; step
       20b(d) and `check-login`'s 9a2 re-aimed, and the *Gates* table's row A reworded
-      (*Consequences for earlier parts*).
+      (*Consequences for earlier parts*). *(Landed 2026-09-25.*
+      - *Each supervisor resolves `/svc/storage/session-endpoint` itself, and `desktop-shell` gets
+        it as its eighth extra.*
+      - *The broker resolves the admin endpoint on first need, since `init` spawns it before the
+        storage service. It asks `InUse` on an admin session of its own, and refuses a `disks`
+        request if the service cannot answer.*
+      - *`boot-probe` reads `nxinstall`'s listing in an admin view back through a stdout pipe:
+        the ESP is there, and every device in use is not.*
+      - *`disk --mount` refused without the grant is C.7's, since `disk` is: until then no boot
+        exercises the `storage` grant.)*
 - [ ] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
 - [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
       packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
@@ -1276,7 +1285,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 
 | Part | What proves it |
 |---|---|
-| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-login`: one `with` request from the terminal the Applications menu opens |
+| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees the disks nothing has mounted — the ESP, on a release boot — and never `/dev/blk/0`, the disk holding `init`'s root (reworded by C.6, when `disks` began asking `InUse`); the same command without `with` sees none. `check-login`: one `with` request from the terminal the Applications menu opens, and one naming `/dev/blk/0`, refused because it is not in the view |
 | B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |

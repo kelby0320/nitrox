@@ -2,9 +2,11 @@
 
 ## Status
 
-**Built, and checked 2026-09-24** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2. On 2026-09-24 administration Part B.4 gave sessions and applications
-`/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+**Built, and checked 2026-09-25** — Milestone 7 (Parts A–F). Graduated from `design/` on
+2026-08-25, revision 2. On 2026-09-25 administration Part C.6 gave sessions and applications
+`/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
+supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
+them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
 supervisor is now handed. Two things changed under it before that: the session namespace also binds
 `/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
 records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
@@ -246,6 +248,14 @@ which the whole-tree filesystem endpoint does not give. So `init` asks the manag
 **info-only endpoint**, on which only the tables are answered whatever suffix arrives, and that is
 what travels down this chain. The shell can bind it however it likes and reach nothing but the
 tables ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+
+**The storage service's endpoint is shaped the same way** (administration Part C.6). The shell binds
+it into each application twice — `/storage` at the base `/fs`, `/dev/storage` at `/info` — and
+could bind it at any base. On the endpoint bound at `/svc/storage`, `admin-endpoint` mints the
+endpoint that mounts and unmounts. So `desktop-session-mgr` resolves a **session endpoint**, on
+which the service answers the filesystems and the table and nothing else, and hands that to the
+shell as its eighth extra ([`storage.md`](storage.md) §7). Mounting reaches a program only through
+the view broker's `storage` grant.
 
 ## 4. The session recipe, and what the two supervisors share
 
