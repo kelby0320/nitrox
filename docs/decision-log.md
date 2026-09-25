@@ -29795,3 +29795,49 @@ server refuse after the service's probe has accepted its device.
 - 2 `check-storage --kvm` boots, each failing at its check: the table not refreshed (after the
   single-writer change above), and the unmount's line saying "left clean" whatever the device
   says (run before that change, which left the line's logic as it was).
+
+## 2026-09-25 — Administration Part D's detail pass: the broker fronts accounts, and removal waits for logout
+
+Part D, accounts, has its detail pass (`planning/administration.md` § *Part D in detail*). The spike
+found:
+- **`auth-service` is a no-alloc oracle over a 4 KiB file it reads once**, and the file's format is
+  parsed in the service and written by hand in `xtask`. `account`'s offline mode and Part G's
+  installer would make that four places, so the format moves into a crate, `libusers`.
+- **The last-administrator guard does not know which accounts exist.** `has_administrator` counts a
+  rule naming an account that is gone. That was harmless while accounts could not change.
+- **Nothing can end a session from outside.** Both supervisors block on the session's leader, and a
+  forcible kill is deferred.
+- **There is no terminal editor**, so the sketched `with --edit` would have nothing to open.
+- **`TODO(home-folders)`'s trigger is "the second home"**, which `account --add` is.
+
+**The maintainer's calls, 2026-09-25:**
+- **A logged-in account's removal is refused**, over ending its sessions (which would change both
+  supervisors' wait loops) and over leaving them running.
+- **A new home gets `libfs::HOME_FOLDERS`**, and no theme or wallpaper. That is over a session
+  making missing folders at each login, and over a skeleton directory.
+- **`with --show` and `with --install <file>`**, over `with --edit`.
+- **Your own password goes through the broker**, which knows the session's account and already
+  paces wrong passwords per session. That is over an `auth-service` endpoint in every session.
+- **The broker fronts every account operation.** The `accounts` grant binds the broker's
+  endpoint, and the broker alone holds an admin session on `auth-service`. That is over
+  `auth-service` asking the broker before a removal: the guards need the policy and the sessions,
+  which only the broker has.
+
+**Derived:**
+- **`auth-service`'s admin session** has `List`, `Add`, `Remove` and `SetPassword`, an atomic
+  rewrite (`users.new`, synced, renamed), and salts from the kernel's entropy source. It stays
+  no-`alloc`.
+- **The guards** now judge the policy against the accounts that exist. That goes for removal,
+  `Check` and `Install` alike.
+- **`account`**, with an offline mode on a named file, for recovery from the live image.
+- **Name and password bounds**: a name is 1 to 32 bytes, a password 1 to 128.
+- **The broker makes the home**, where the record is made. **This departs from the plan's sketch,
+  and from the option text the maintainer chose**, which said the grant would bind `/home`'s root.
+  The broker holds no filesystem endpoint to bind it with, and making the home beside the record
+  keeps an add one operation. It is flagged for the pass's review.
+
+**Consequences written down:**
+- The *Grants* table's `accounts` and `views` rows change.
+- `with --check` now needs an existing administrator.
+- Part G's installer writes the first account through `libusers`.
+- A recovery gate, `check-recovery`, runs on demand.
