@@ -33,7 +33,7 @@ info-only endpoint is `WouldBlock` too.
 | Class | Kinds | Owner |
 |---|---|---|
 | `input` | keyboard, mouse | `input-server`, from boot on |
-| `block` | disk, partition, RAM disk | the storage service (Part C) |
+| `block` | disk, partition, RAM disk | `storage-service`, from boot on (administration Part C.5a) |
 
 A console or a PCI function is in no class, and is only ever information.
 

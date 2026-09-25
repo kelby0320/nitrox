@@ -1165,6 +1165,19 @@ namespace, with no login and no session.
       test the replay, the one-owner rule and a retake, and `block` is owned from boot now, so the
       probe asserts `block` is refused, as it does `input`, and the retake stays the host tests' and
       B.2's recorded controls'.
+
+      **Lands in three parts.** *C.5a (2026-09-25): the service sees what is there.*
+      - `storage-service` owns `block` from boot on and probes each device: ext4 through
+        `fs-server-ext4`'s own `check_device`, with a new `volume_label`; FAT from its boot sector;
+        or nothing.
+      - It matches `init.toml`'s mounts to their devices, applies the live-boot rule, and serves
+        `/svc/storage/info`.
+      - `init.toml`'s parser moved out of `init` into `libinittoml`, since it has two readers now.
+      - The `boot-probe` check and B.2's change are as listed above. `init` spawns the service with
+        no syscaps, and `BIND_NAMESPACE` comes with C.5b's namespaces.
+
+      *C.5b*: mounts, labels, the per-mount namespaces, `SUBNAMESPACE`, and the session endpoint.
+      *C.5c*: `Storage`, the admin endpoint, and the unmount chain.
 - [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
       grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and

@@ -29285,3 +29285,74 @@ Two host tests go through the registration. Five controls each fail one:
 entry now records what C.1 built: the self-pin, and `sys_ns_sync`. It also says what is owed. C.5's
 unmount and Part E's shutdown must call it, and a file served with id `0` is still uncached. No
 in-tree server sends a zero id, so that part carries its own trigger.
+
+## 2026-09-25 — Administration C.5a: the storage service sees what is there
+
+**C.5 lands in three parts**, as C.1 did in two. A service that mounts, unmounts and answers
+`Storage` is too much to verify in one step, and each part here has a boot that shows it:
+- **C.5a** reads and reports;
+- **C.5b** mounts (auto-mount, labels, a namespace per mount, `SUBNAMESPACE`, the session endpoint);
+- **C.5c** unmounts and speaks `Storage`.
+
+**What landed:**
+- **`storage-service` owns `block`.** `init` spawns it straight after the device manager, so
+  first-come ownership is met by coming first. The subscription stays open for the service's life.
+- **It probes each device** and closes the node after, since nothing here writes:
+  - ext4 through `fs-server-ext4`'s own `check_device`, so it never offers a filesystem the server
+    would refuse, plus a new `volume_label` and the C.3 state;
+  - FAT from its boot sector;
+  - otherwise nothing.
+- **It matches `init.toml`'s mounts to their devices**, decides whether this is a live boot, and
+  serves `/svc/storage/info`: `all.tsm` and a table per device, named as `/dev/devices` names them.
+  It logs a line per device.
+- **`init.toml`'s parser moved into `libinittoml`**, since it has two readers now and they must not
+  read it differently. `init` re-exports it at its old paths.
+- **`boot-probe`**: `block` is refused now, and a new check reads the table on a boot (below).
+- **`check-live` asserts the service calls its boot a live one.** It is the only gate whose root is
+  on a RAM disk, so the only place the live-boot rule's input is real rather than a host test's.
+
+**Decisions:**
+1. **A UUID source is matched through the parent disk's table.** The registry carries a partition's
+   name, parent and size, and not its GUID. The kernel publishes a disk's partitions in table order
+   and skips unused entries. So the k-th entry `libgpt` reads is the k-th partition record under
+   that disk, confirmed by name and size. `libgpt` holds eight entries and checks both checksums,
+   where the kernel does neither, so a UUID on a disk with more than eight partitions, or a damaged
+   table, is reported unmatched rather than guessed.
+2. **FAT needs four marks**: the signature, a sector size, the extended boot signature, and the type
+   string. The host tests read real bytes, not ones written for them: sectors `mformat` wrote, and
+   the image builder's own protective MBR, which has the signature and none of the rest.
+3. **`clean` is `Null` for a filesystem mounted writable**, in the table and in the log. A writable
+   mount clears the bit before Ready, so the state says "in use" and nothing about how it was left.
+   The first log line said a mounted root was "not left clean", which was true of the bits and
+   false of the filesystem.
+4. **No syscaps until they are used.** The plan spawns the service with `BIND_NAMESPACE`. C.5a builds
+   no namespace, so the grant comes with C.5b's.
+5. **B.2's subscription check changed as the plan said.** The probe asserts `block` refused, as it
+   does `input`. The replay reaching its owner is now the storage check's row per block record. The
+   replay settling before its resolve completes, one owner at a time, and a retake are the manager's
+   host tests and B.2's recorded controls, since taking the class on a boot would take the disks
+   from their owner.
+
+**The first boot failed the new check**, and the check was right. The service logged `no init.toml
+it could read`, so no row was `init`'s and the root check failed. It had resolved the manifest with
+`MAP_READ` only, and `sys_handle_stat`, which it used to size the mapping, needs `INSPECT`
+(`syscall-abi.md`). It asks for both now, and the read names each way it can fail: it did not
+resolve, would not map, is not UTF-8, or did not parse.
+
+**Controls:**
+- 11 on the library's host tests, each failing its test:
+  - FAT without each of its four marks, and with `NO NAME` kept as a label;
+  - ext4 by its magic instead of `check_device`;
+  - a label matching any kind;
+  - a UUID position unconfirmed;
+  - a GUID not byte-swapped;
+  - a live boot through the RAM disk only;
+  - `clean` shown while mounted writable;
+  - an empty table name.
+- 2 on `volume_label`: reading past the NUL, and the wrong field.
+- 4 boots, each failing the verdict at its check:
+  - `block` never taken;
+  - `init`'s mounts recorded as the service's;
+  - FAT never recognised;
+  - the rows out of registry order.
+- 1 `check-live`, with the rule answering "not live", which times out on the new line.

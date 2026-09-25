@@ -1363,7 +1363,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
         & registry_test(root_ns)
-        & devices_test(root_ns);
+        & devices_test(root_ns)
+        & storage_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -1647,20 +1648,6 @@ fn read_all(h: u64) -> Option<alloc::vec::Vec<u8>> {
     Some(bytes)
 }
 
-/// Sleep `ms` milliseconds on a one-shot timer — `sys_wait` refuses an empty handle list, so a
-/// deadline alone is not a sleep. Returns at once if no timer can be made.
-fn sleep_ms(ms: u64) {
-    // SAFETY: register-only syscall; returns a handle or a negative KError.
-    let th = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
-    if th < 0 {
-        return;
-    }
-    let fire_at = clock_ns() + ms * 1_000_000;
-    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
-    unsafe { syscall4(libkern::SYS_TIMER_SET, th as u64, fire_at, 0, 0) };
-    wait_one(th as u64);
-    close(th as u64);
-}
 
 /// Close `h` if it is a handle at all.
 fn close(h: u64) {
@@ -2092,8 +2079,6 @@ fn registry_test(root_ns: u64) -> bool {
 ///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
 ///   and `info` opens the directory.
 fn devices_test(root_ns: u64) -> bool {
-    use libkern::device::DeviceKind;
-    use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived, parse_settled};
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: devices: ").s(what).s(b" FAIL").end();
         false
@@ -2104,85 +2089,19 @@ fn devices_test(root_ns: u64) -> bool {
     let Some(registry) = registry_records(root_ns) else {
         return fail(b"the registry does not read");
     };
-    let block_ids: alloc::vec::Vec<u32> = registry
-        .iter()
-        .filter(|r| matches!(r.kind(), DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk))
-        .map(|r| r.id)
-        .collect();
 
-    // A subscription's replay: the ids that arrived, each with a device node, and what `Settled`
-    // counted. **Read without waiting**, because the manager queues all of it before the resolve
-    // completes. This states the property rather than guarding it: a manager that replied first
-    // and sent after passes whenever its sends beat this process's wake, as they did in the boot
-    // that tried it. `subscribe`'s order is what holds it.
-    let read_replay = |owner: u64| -> Result<(alloc::vec::Vec<u32>, Option<u32>), &'static [u8]> {
-        let mut arrived = alloc::vec::Vec::new();
-        loop {
-            let Some(m) = receive(owner, 0) else {
-                return Err(b"the replay was not queued when the subscription completed");
-            };
-            let node_ok = m.handles.len() == 1
-                && stat(m.handles[0]).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
-            m.handles.iter().for_each(|&h| close(h));
-            if m.op == OP_DEVICES_SETTLED {
-                return Ok((arrived, parse_settled(&m.body)));
-            }
-            if m.op != OP_DEVICES_ARRIVED || !node_ok {
-                return Err(b"a replay message was not an arrival carrying a device node");
-            }
-            let Some(rec) = parse_arrived(&m.body) else {
-                return Err(b"an arrival's body is not a record");
-            };
-            arrived.push(u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]));
-        }
-    };
-    let replayed_the_registry = |owner: u64| match read_replay(owner) {
-        Ok((arrived, settled)) if arrived == block_ids && settled == Some(block_ids.len() as u32) => Ok(()),
-        Ok((arrived, _)) => {
-            Line::new().s(b"boot-probe: devices: ").u(arrived.len() as u64).s(b" arrived, ").u(block_ids.len() as u64).s(b" block records").end();
-            Err(&b"the replay is not the registry's block devices"[..])
-        }
-        Err(what) => Err(what),
-    };
-
-    // Subscribe, and read the replay.
-    let (st, owner) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-    if st != 0 || owner == 0 {
-        return fail(b"/svc/devices/block would not subscribe");
-    }
-    if let Err(what) = replayed_the_registry(owner) {
-        close(owner);
-        return fail(what);
-    }
-
-    // One owner at a time.
-    let (st, second) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-    close(second);
+    // **`block` has its owner from boot on** (administration Part C.5): `init` spawns the storage
+    // service straight after the manager and waits for its `Ready`, which comes only after it has
+    // subscribed and settled. So `block` is refused here, as `input` is below. Until C.5 the probe
+    // took the class itself, to see the replay settle before its resolve completed, a second owner
+    // refused, and the class taken again once closed. Those stay the manager's host tests and B.2's
+    // recorded controls, since taking the class now would take the disks from their owner. That
+    // the replay reaches its owner is `storage_test`'s: a row per block record.
+    let (st, block) = ns_lookup(root_ns, b"/svc/devices/block", chan);
+    close(block);
     if st != libkern::KError::AlreadyExists.as_i32() {
-        close(owner);
-        Line::new().s(b"boot-probe: devices: a second subscription answered ").i(st as i64).end();
-        return fail(b"a second owner was not refused");
-    }
-    close(owner);
-    // The manager notices the close in its own time; a subscription sent before it has is refused
-    // like any other, so ask a few times.
-    let mut retaken = 0;
-    for _ in 0..50 {
-        let (st, again) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-        if st == 0 {
-            retaken = again;
-            break;
-        }
-        sleep_ms(20);
-    }
-    if retaken == 0 {
-        return fail(b"the class was not taken again once its owner closed");
-    }
-    // A new owner is sent the whole class again, not what the last one left.
-    let again = replayed_the_registry(retaken);
-    close(retaken);
-    if let Err(what) = again {
-        return fail(what);
+        Line::new().s(b"boot-probe: devices: a subscription to block answered ").i(st as i64).end();
+        return fail(b"block is not held, so the storage service did not take the disks");
     }
 
     // `input` has its owner from boot on: `init` waits for `input-server`'s `Ready`, which comes
@@ -2283,11 +2202,111 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"all.tsm has not a row per device");
     }
     Line::new()
-        .s(b"boot-probe: devices: block replayed ")
-        .u(block_ids.len() as u64)
-        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
+        .s(b"boot-probe: devices: block held by the storage service, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
         .u(rows as u64)
         .s(b" rows ok")
+        .end();
+    true
+}
+
+/// **The storage service owns the disks and says what is on them** (administration Part C.5a),
+/// read through the root endpoint, since the probe runs in the root namespace.
+/// - `all.tsm` has a row per block record, in registry order: the device manager's replay reached
+///   its owner whole.
+/// - `nitrox-root` is `init`'s, at `/`, and the only row mounted there, so nothing mounts the root
+///   twice. The service mounts nothing on a boot with nothing to mount: the ESP is FAT, which it
+///   recognises and does not serve, and the disk holds only its table.
+/// - What each device holds is what the image builder put there, read off the disks on a boot:
+///   the FAT recogniser's host tests use a sector `mformat` wrote, and this is the ESP itself.
+fn storage_test(root_ns: u64) -> bool {
+    use alloc::string::String;
+    use libkern::device::{DeviceKind, DeviceRecord};
+    use libstream::wire::Value;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let block: alloc::vec::Vec<&DeviceRecord> = registry.iter().filter(|r| r.kind().is_block()).collect();
+    let (st, table) = ns_lookup(root_ns, b"/svc/storage/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+    let bytes = if st == 0 { read_all(table) } else { None };
+    close(table);
+    let Some(bytes) = bytes else {
+        return fail(b"/svc/storage/info/all.tsm would not map");
+    };
+    let Ok(t) = libstream::wire::Table::decode(&bytes) else {
+        return fail(b"all.tsm is not a TSM1 table");
+    };
+    let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let (Some(name_c), Some(fs_c), Some(at_c), Some(by_c), Some(mode_c), Some(clean_c)) =
+        (col("name"), col("filesystem"), col("mounted"), col("by"), col("mode"), col("clean"))
+    else {
+        return fail(b"all.tsm lacks a column");
+    };
+    let text = |row: usize, c: usize| match &t.rows[row][c] {
+        Value::Str(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let name = |r: &DeviceRecord| alloc::format!("blk-{}", r.served);
+    let want: alloc::vec::Vec<String> = block.iter().map(|r| name(r)).collect();
+    let got: alloc::vec::Vec<&str> = (0..t.rows.len()).map(|i| text(i, name_c).unwrap_or("")).collect();
+    if got != want {
+        Line::new().s(b"boot-probe: storage: ").u(got.len() as u64).s(b" rows for ").u(want.len() as u64).s(b" block records").end();
+        return fail(b"all.tsm is not a row per block record, in registry order");
+    }
+    let row = |r: &DeviceRecord| want.iter().position(|n| *n == name(r));
+    let find = |kind: DeviceKind, label: &[u8]| block.iter().find(|r| r.kind() == kind && (label.is_empty() || r.name() == label)).and_then(|r| row(r));
+
+    let Some(root) = find(DeviceKind::Partition, b"nitrox-root") else {
+        return fail(b"no nitrox-root partition to check the root against");
+    };
+    let at_root: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, at_c) == Some("/")).collect();
+    if at_root != [root] {
+        return fail(b"the root is not one row, nitrox-root's");
+    }
+    if text(root, by_c) != Some("init") || text(root, mode_c) != Some("rw") || text(root, fs_c) != Some("ext4") {
+        return fail(b"the root is not init's writable ext4");
+    }
+    if t.rows[root][clean_c] != Value::Null {
+        return fail(b"a root mounted writable reported how it was left");
+    }
+    if (0..t.rows.len()).any(|i| text(i, by_c) == Some("storage")) {
+        return fail(b"the service mounted something on a boot with nothing for it to mount");
+    }
+    let (Some(esp), Some(disk)) = (find(DeviceKind::Partition, b"NITROX_ESP"), find(DeviceKind::Disk, b"")) else {
+        return fail(b"no ESP or disk to check what they hold");
+    };
+    if text(esp, fs_c) != Some("fat") {
+        return fail(b"the ESP is not FAT");
+    }
+    if t.rows[disk][fs_c] != Value::Null {
+        return fail(b"the disk, which holds only its table, reported a filesystem");
+    }
+
+    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/info", &mut dirbuf) else {
+        return fail(b"/svc/storage/info is not a directory");
+    };
+    let mut names = 0usize;
+    let listed = dir.read_dir(|e| {
+        names += (e.name != b"." && e.name != b"..") as usize;
+        true
+    });
+    dir.close();
+    if listed.is_err() || names != block.len() + 1 {
+        return fail(b"the directory is not all.tsm and a file per device");
+    }
+    let (st, other) = ns_lookup(root_ns, b"/svc/storage/block", RIGHT_MAP_READ);
+    close(other);
+    if st != libkern::KError::NotFound.as_i32() {
+        return fail(b"a suffix the service does not serve was not NotFound");
+    }
+    Line::new()
+        .s(b"boot-probe: storage: a row per block record (")
+        .u(block.len() as u64)
+        .s(b"), nitrox-root init's at / and nothing else mounted, the ESP fat and the disk holding its table ok")
         .end();
     true
 }

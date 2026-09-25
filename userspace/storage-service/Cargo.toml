@@ -1,0 +1,27 @@
+[package]
+name = "storage-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream" }
+libgpt = { path = "../libgpt" }
+libinittoml = { path = "../libinittoml" }
+# The ext4 library, for what a device holds: `check_device`, the label and the clean state. The
+# service reads; the servers it spawns (C.5b) are the ones that serve.
+fs-server-ext4 = { path = "../fs-server-ext4" }
+
+# The library/binary split every resource server here uses: the library is what can be wrong
+# about a disk — what it holds, whether `init` mounted it, what a live boot is, its row in the
+# table — and is host-tested; the binary is the bare-target event loop, which cannot build on
+# host (`#![no_main]`).
+[lib]
+name = "storage_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "storage-service"
+path = "src/main.rs"

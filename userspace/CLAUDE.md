@@ -84,6 +84,8 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libcrypto` (hand-rolled SHA-256 / HMAC / PBKDF2) is an off-to-the-side foundation like `libheap`: `core`-only, no `alloc`, depends on nothing (not even `libkern` — it touches no syscalls), so it slots in beside `libkern` at the bottom. Consumers link it directly (auth-service; later the audit subsystem). See `userspace/libcrypto/CLAUDE.md`.
 
+`libinittoml` (the `init.toml` schema and the minimal TOML reader under it) is another: `alloc` only, depending on nothing. `init` and the storage service both read `init.toml`, so the parser moved out of `init` into a crate below both when the second arrived (administration Part C.5), which is the rule above applied.
+
 Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 
 ## Async-first

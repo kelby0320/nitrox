@@ -547,13 +547,13 @@ on this boundary: their namespaces are built, and bind only `/dev/views` at thei
 **`/svc/devices` sits on it too, with a cost of its own: class ownership is first-come**
 (administration Part B, 2026-09-24; PR #333 review, optional 6). `init` binds the device manager at
 `/svc/devices` in the root namespace, and resolving `/svc/devices/<class>` makes the resolver that
-class's one owner, handed every device of it with write. `input` is taken at boot by
-`input-server`, before any declared service runs, so what is exposed is `block`, which has no owner
-until Part C's storage service subscribes: **any process holding the root namespace can take every
-disk first and hold it**, and the storage service would then be refused. It is the same trusted set
-and the same fix — a constructed namespace for supervisors and services, with `/svc/devices/block`
-bound only into the storage service's — and until then the storage service should be spawned by
-`init` before anything declared, as `input-server` is. Sessions are not on this boundary: their
+class's one owner, handed every device of it with write. Both classes are taken at boot, before
+any declared service runs: `input` by `input-server`, and since administration Part C.5a
+(2026-09-25) `block` by the storage service, which `init` spawns straight after the manager. So
+first-come is met by coming first, and what stays exposed is **the class after its owner exits**:
+nothing restarts either owner, and a process holding the root namespace could then take every disk.
+It is the same trusted set and the same fix, a constructed namespace for supervisors and services
+with `/svc/devices/block` bound only into the storage service's. Sessions are not on this boundary: their
 `/dev/devices` is an info-only endpoint the manager answers nothing but tables on
 ([`device-manager.md`](../architecture/device-manager.md) §6).
 

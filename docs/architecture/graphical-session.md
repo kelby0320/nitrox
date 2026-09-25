@@ -137,6 +137,7 @@ kernel ─spawns→ init (full SysCaps)
   init ─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
   init ─spawns with BIND_NAMESPACE, binds /svc/views→ view-broker (builds views; see below)
   init ─spawns, binds /svc/devices→ device-mgr (no caps; hands devices to their class's owner)
+  init ─spawns, binds /svc/storage→ storage-service (no caps; owns block, reports the disks)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
     │      + fs, profile, tty, clipboard and view-broker endpoints, and an info-only

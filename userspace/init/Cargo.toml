@@ -7,6 +7,8 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 libos = { path = "../libos" }
+# The `init.toml` parser, shared with the storage service (administration Part C.5).
+libinittoml = { path = "../libinittoml" }
 
 # The host tests of `ready` build messages with the encoder every server uses. A dev-dependency
 # only: init's own build still hand-parses (`userspace/init/CLAUDE.md`).

@@ -609,6 +609,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The device manager (administration Part B). `init` spawns it before `input-server`, which
     // takes its devices from it, and binds it at `/svc/devices`.
     "device-mgr",
+    // The storage service (administration Part C.5). `init` spawns it straight after the device
+    // manager, so it owns `block` from boot on, and binds it at `/svc/storage`.
+    "storage-service",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -674,6 +677,10 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The device manager (administration Part B). A lib + bin split: names, classes, owners and
     // the tables are host-tested, this builds the bare-target server.
     build_userspace_bin("device-mgr", None)?;
+    // The storage service (administration Part C.5). A lib + bin split: what a device holds,
+    // which of them `init` mounted, the live-boot rule and the tables are host-tested, this builds
+    // the bare-target server.
+    build_userspace_bin("storage-service", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -3498,6 +3505,11 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // a device that fails, so a zeroed partition stops at the line above — but the check reads
     // three blocks, and `init`'s first lookup is still the first read of a file.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
+    // **The storage service knows this is a live boot** (administration Part C.5a): `init`'s root
+    // is on the RAM disk. The rule is host-tested; this is the one boot whose root is on a RAM
+    // disk, so it is the only place the rule's input is real, and the fact is what makes a
+    // machine's own disks auto-mount read-only (C.5b).
+    s.expect("storage-service: a live boot")?;
     // **And this boot is not an installer boot.** The live image's third menu entry starts a
     // session that can write every disk in the machine; the ordinary entry must not, and absence
     // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
@@ -11055,7 +11067,8 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // init's library tests (the `manifest` + `toml_lite` parsers). `--lib` skips the
+    // init's library tests (the first message a resource server sends; the `manifest` and
+    // `toml_lite` parsers moved to `libinittoml`, tested below). `--lib` skips the
     // `#![no_main]` bin, which can't build for the host.
     run(Command::new("cargo")
         .arg("test")
@@ -11251,6 +11264,27 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("device-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // storage-service's library tests (what a device holds, against real `mformat` and GPT
+    // sectors and an ext4 `mkfs` made; `init.toml`'s mounts matched to devices; the live-boot rule;
+    // the tables). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("storage-service")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libinittoml` — the `init.toml` parser, shared by `init` and the storage service since
+    // administration Part C.5, and its tests with it.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libinittoml")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

@@ -518,6 +518,28 @@ mod tests {
         assert!(ext4::was_left_clean(&rw).is_err());
     }
 
+    /// **The label is `s_volume_name` up to its first NUL**: what `mkfs` wrote, nothing for an
+    /// image `mke2fs` made without `-L`, all sixteen bytes when there is no terminator, and an
+    /// error on a device holding no ext4 filesystem.
+    #[test]
+    fn the_volume_label_reads_up_to_its_first_nul() {
+        use std::cell::RefCell;
+        let mut out = [0u8; 16];
+        let made = RwImage(RefCell::new(format_image(16384, 4096).0));
+        let n = ext4::volume_label(&made, &mut out).unwrap();
+        assert_eq!(&out[..n], b"nitrox-root");
+
+        let bare = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        assert_eq!(ext4::volume_label(&bare, &mut out), Ok(0), "mke2fs without -L gives no label");
+
+        bare.0.borrow_mut()[1024 + 120..1024 + 136].copy_from_slice(b"sixteen-bytes-ok");
+        let n = ext4::volume_label(&bare, &mut out).unwrap();
+        assert_eq!(&out[..n], b"sixteen-bytes-ok", "a full label has no terminator");
+
+        bare.0.borrow_mut()[1024 + 56] = 0; // the magic: not ext4 at all
+        assert!(ext4::volume_label(&bare, &mut out).is_err());
+    }
+
     /// **A touch follows the file, not its old name** — the reason it is by id. The kernel
     /// flushes a cached file long after the resolve that named it; by then a rename has moved
     /// it, and a new file has taken the name.

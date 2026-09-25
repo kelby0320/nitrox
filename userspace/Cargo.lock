@@ -156,6 +156,7 @@ name = "init"
 version = "0.1.0"
 dependencies = [
  "libheap",
+ "libinittoml",
  "libkern",
  "libos",
  "librsproto",
@@ -202,6 +203,13 @@ name = "libheap"
 version = "0.1.0"
 dependencies = [
  "libkern",
+]
+
+[[package]]
+name = "libinittoml"
+version = "0.1.0"
+dependencies = [
+ "librsproto",
 ]
 
 [[package]]
@@ -421,6 +429,19 @@ dependencies = [
  "libkern",
  "librsproto",
  "libsession",
+ "libstream",
+]
+
+[[package]]
+name = "storage-service"
+version = "0.1.0"
+dependencies = [
+ "fs-server-ext4",
+ "libgpt",
+ "libheap",
+ "libinittoml",
+ "libkern",
+ "librsproto",
  "libstream",
 ]
 

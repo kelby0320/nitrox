@@ -225,6 +225,20 @@ static mut SPAWN_DEVICES: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0,
 };
+/// Spawn args for the `storage-service` (administration Part C.5): the control endpoint, moved.
+/// **No syscaps yet**: it reads what the disks hold and serves a table of it, and binds nothing —
+/// `init` binds it at `/svc/storage`. It takes its disks from `/svc/devices/block`, which the
+/// root namespace it inherits reaches, as `input-server` takes its devices from `input`.
+static mut SPAWN_STORAGE: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/storage-service
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0,
+};
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
 /// `/svc/devices/input`, where the device manager hands it its devices (administration Part
@@ -1109,6 +1123,60 @@ fn bind_device_mgr(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the storage service and bind its forwarding endpoint at `/svc/storage` (administration
+/// Part C.5). **Straight after the device manager**, so it takes `block` before anything else can:
+/// the class has one owner, and the first to subscribe is it (`TODO(svc-auth-ungated)` records
+/// why that is the rule for now). Non-critical: without it the disks are unowned and the table is
+/// missing, and nothing `init` mounted is affected.
+fn bind_storage_service(root_ns: u64) -> bool {
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+    // SAFETY: SPAWN_STORAGE is a valid writable arg block; spawn_program resolves the ELF,
+    // stamps it, spawns, and closes the image handle.
+    let ss_h = unsafe {
+        SPAWN_STORAGE.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/storage-service", &raw mut SPAWN_STORAGE)
+    };
+    if ss_h < 0 {
+        kprint(b"init: storage-service spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+    let endpoint = match wait_ready(ctrl_init, &[b"storage-service".as_slice()]) {
+        Some(e) => e,
+        None => {
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+    let path = b"/svc/storage";
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
+    };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: storage-service bind FAIL at /svc/storage\n");
+        return false;
+    }
+    kprint(b"init: storage-service bound at /svc/storage\n");
+    // init keeps `ss_h` (the long-lived server's process handle).
+    let _ = ss_h;
+    true
+}
+
 /// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
 ///
 /// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
@@ -1870,6 +1938,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // critical-path: without it no device is handed to its owner, which the owner reports.
     if !bind_device_mgr(root_ns) {
         kprint(b"init: no device manager; no device will be handed to its owner\n");
+    }
+
+    // The storage service (administration Part C.5), **straight after the device manager**: it
+    // owns `block`, and a class's owner is whoever subscribes first. Not critical-path: `init`'s
+    // own mounts are already up, and a machine without it only goes without the table.
+    if !bind_storage_service(root_ns) {
+        kprint(b"init: no storage service; the disks have no owner and /svc/storage is missing\n");
     }
 
     // ---- the display arm ----
