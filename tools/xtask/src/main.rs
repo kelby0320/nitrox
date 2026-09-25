@@ -573,6 +573,9 @@ const COREUTILS: &[&str] = &[
     // Running a program in a view (administration Part A.5): the view broker's client, typed at a
     // shell like the rest of these.
     "with",
+    // The machine's disks (administration Part C.7): `--list` from any session, and `--mount` and
+    // `--unmount` from a view with the `storage` grant.
+    "disk",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -1987,6 +1990,30 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
             return Err(format!("a password reached the console: `{secret}`").into());
         }
     }
+    steps += 1;
+
+    // 20c. **`disk`, with and without the grant** (administration Part C.7).
+    //      (a) `--list` is the storage service's table, from any session: the row mounted at `/`
+    //          is `init`'s root, matched on words the command does not contain.
+    s.send("disk --list | filter mounted == \"/\"")?;
+    s.expect_all(&["blk-2", "init"])?;
+    s.expect("/home>")?;
+    //      (b) **`--mount` without the grant is refused before the service is asked**: the
+    //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
+    //          nothing answers, and `disk` names `with`.
+    s.send("disk --mount /dev/blk/1")?;
+    s.expect("need the storage grant")?;
+    s.expect("/home>")?;
+    //      (c) **With it, the request reaches the service**, whose own reason comes back: the
+    //          ESP holds FAT, which it recognises and cannot serve. On a release boot there is
+    //          nothing it could mount, so the refusal is the evidence the grant arrived; the
+    //          successful mount and unmount through a view are `boot-probe`'s, on a test image's
+    //          scratch disk.
+    s.send("with admin disk --mount /dev/blk/1")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("it holds no filesystem this service can serve")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
@@ -11324,7 +11351,8 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
     // view-broker's library tests (the policy reader, rule evaluation, the last-administrator
-    // guard, per-session pacing and session ids). `--lib` skips the `#![no_main]` server bin.
+    // guard, per-session pacing, session ids, and pairing exits with their codes). `--lib` skips
+    // the `#![no_main]` server bin.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")

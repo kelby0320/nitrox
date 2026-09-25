@@ -29565,3 +29565,100 @@ tables' base. It now also asserts that no `.tsm` appears.
   - a shell binding none into its applications (`check-login`).
 - The first run of the `disks` control was against the exit-code version, and it passed. That is
   what replaced the step.
+
+## 2026-09-25 — Administration C.7: `disk`, a busy service is not a missing grant, and two supervisors lost an exit
+
+**What landed:** `disk`, a coreutil, in the store beside `with`
+([`shell-language.md`](spec/shell-language.md) §10d).
+- **`disk --list`** reads `/dev/storage/all.tsm` through the session endpoint every session has
+  (C.6), and writes the service's table as it gave it: a table on a pipe, text otherwise. It needs
+  no grant, and it is the same table a pipeline can `open` and `filter`.
+- **`disk --mount DEVICE [LABEL]`** and **`disk --unmount LABEL`** speak `Storage` on
+  `/dev/storage/admin`, which only the `storage` grant binds. Each writes a one-row table:
+  `{device, label, mounted}` and `{label, unmounted}`. A device is `/dev/blk/<n>` or `blk-<n>`,
+  and is sent as `blk-<n>`, the tables' name for it.
+- Each verb also says what happened on the console, escaped, since a terminal on a release image
+  renders nothing a gate can read.
+
+**Refusals, and whose they are.** Without the grant, `/dev/storage/admin` resolves through the
+session endpoint at the base `/info`, where nothing is called `admin`: `NotFound`. `disk` reads that
+one status as "no grant", says the storage grant is needed and names `with admin`, before the
+service is asked. Any other failure to open the session is the service's, and says so with its
+status. A refusal on the session is printed with the service's own reason.
+
+**A first version read every failed open as a missing grant**, while its doc comment said it told
+the two apart. It was found by re-reading the file before the entry, not by a gate. It mattered:
+with every admin session in use, the service answers `WouldBlock`, and `disk` told a person who
+held the grant to go and get it. `boot-probe` now takes every admin session, runs `disk --unmount`
+in the admin view with a `stderr` pipe, and asserts that the text names `WouldBlock`, does not
+mention the grant, and that the mount stayed. The same re-read found `disk` printing its console
+line twice when it had no `stderr`, since `diag` falls back to the console, and printing a typed
+label there unescaped.
+
+**The view broker lost an exit, and then ran out of memory** — a Part A bug that C.7's probe was
+the first to reach. It is the first boot to run two programs in one view back to back.
+- **The symptom.** In the full gate set, `test-qemu --kvm` failed: `view-broker: PANIC` after
+  `disk --mount` exited, then `init` restarted `service-mgr` and a second `boot-probe` failed
+  against changed state. The broker's panic handler printed nothing more.
+- **Found, not guessed.** A temporary panic handler that printed the location gave `alloc.rs`:
+  "memory allocation of 16777216 bytes failed". Temporary lines in `life_closed` and `pair_exits`,
+  on a boot that panicked (the 9th of a loop), showed the chain:
+  - the first program's life was queued twice before its code came;
+  - at the next exit, the stale copy took the new code, matched no program, and dropped it;
+  - the new program's life was then queued on every wake.
+- **Why the close came first.** `sys_process_exit` closes the handle table before `exit_process`
+  queues `ChildExited` (2026-07-31), so a peer's `PeerClosed` is prompt. On another CPU the
+  broker saw the life closed with no code yet. A closed channel stays ready, so every wake until
+  the code came reported the same close again.
+- **The fix** is `view_broker::exits`, a host-tested type:
+  - a closed life is queued once;
+  - the wait set leaves out a life that is closed and waiting for its code;
+  - a closed life whose program is gone is dropped without taking a code.
+
+  Three host tests pin the orderings. **On 15 `test-qemu --kvm` boots with temporary probes,
+  all passed.** The close came before its code on 5 of them, nothing was reported twice, and
+  nothing panicked. Before the fix, 3 boots in 19 panicked.
+- **`service-mgr` had the same ordering wrong, and the next gate set showed it.** Its doc comment
+  said the notification and the endpoint's close happen under one `SCHED` hold, so both reach one
+  wake. It reaped a death found before its code as `code=unknown`, treating a normal exit as a
+  failure. `check-terminal` asserts `'boot-probe' exited code=0`, and failed that way under TCG
+  and KVM in the second full gate set, then once in 6 KVM reruns: 3 in 9. A kept transcript
+  showed `code=unknown`, and the code logged just after it.
+- **The service-mgr fix:** a wake that finds more deaths than codes waits for the rest, on the
+  notification channel alone, up to `CODE_GRACE_NS` (1 s). Only past that is an exit
+  `code=unknown`. On 12 `check-terminal --kvm` runs with a temporary probe, all passed. The wait
+  was taken in 10 of them, each time for `boot-probe`, and every exit was attributed `code=0`. The
+  probe's timing figure is not reported here, because it included its own serial print. **Why the
+  late code was 10 in 12 with the fix but about 1 in 3 before is not explained**: the check that
+  finds it runs identically in both builds.
+
+**The gates:**
+- `boot-probe` runs `disk --unmount nitrox-scratch` and then `disk --mount /dev/blk/<n>` in the
+  admin view, as `with` runs them. It checks each exit code, the row each writes, and the service's
+  table after each. Then comes the busy service, as above. This is the first boot to reach
+  `/dev/storage/admin` through a view, which C.6's entry listed as untested.
+- `test-interactive` step 20c (31 steps):
+  - `disk --list | filter mounted == "/"` prints the root's row in a session with no grant;
+  - `disk --mount /dev/blk/1` there is refused, naming the grant;
+  - `with admin disk --mount /dev/blk/1`, with a typed password, is refused by the service for the
+    ESP's FAT. A release boot has nothing the service could mount, so the service's own refusal is
+    the evidence the grant arrived. The mount that succeeds is `boot-probe`'s, on the scratch disk.
+
+**Not tested on a boot:** the console copy's escaping, and `--list` writing text when it has no
+pipe.
+
+**Controls**, 6 boots, each failing at its check:
+- the `storage` grant binding nothing (`test-qemu`, and `test-interactive` at 20c's service
+  refusal);
+- `disk` refusing the `/dev/blk/<n>` form (`test-qemu`, at the mount);
+- `--unmount` sending no label (`test-qemu`: the service answered "nothing is mounted with that
+  label");
+- `--mount` writing no table (`test-qemu`);
+- every failed open read as a missing grant, the first version's logic (`test-qemu`, at the busy
+  check).
+
+And 2 on the broker's host tests, each failing its own test:
+- a closed life queued on every report;
+- a stale life taking a code.
+
+The service-mgr fix's control is the code before it: 3 `check-terminal` failures in 9 runs.

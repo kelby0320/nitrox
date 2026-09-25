@@ -2,7 +2,7 @@
 //! `/system/views.toml` says the person asking may (`docs/planning/administration.md` § Part A).
 //!
 //! ```text
-//! with admin disk --mount /dev/blk/1     # later parts' tools; today, e.g. `with admin nxinstall`
+//! with admin disk --mount /dev/blk/1     # mount a disk, through the view's storage grant
 //! with --list                            # the views you may use
 //! with --check policy.toml               # whether a file is a valid policy
 //! ```

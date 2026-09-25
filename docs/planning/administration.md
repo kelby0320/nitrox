@@ -1209,7 +1209,20 @@ namespace, with no login and no session.
         the ESP is there, and every device in use is not.*
       - *`disk --mount` refused without the grant is C.7's, since `disk` is: until then no boot
         exercises the `storage` grant.)*
-- [ ] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
+- [x] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
+      *(Landed 2026-09-25.*
+      - *`--list` is the service's `all.tsm`, read from `/dev/storage` in any session. `--mount`
+        and `--unmount` each write a one-row table. `--mount` takes `/dev/blk/<n>` or `blk-<n>`
+        and an optional label.*
+      - *Without the grant, `/dev/storage/admin` is the session endpoint at the tables' base, where
+        nothing answers. `disk` says the storage grant is needed and names `with admin`, before
+        the service is asked. With the grant, a refusal is the service's own reason.*
+      - *`boot-probe` runs `disk --unmount` and then `--mount` on the scratch disk in the admin
+        view, as `with` runs them. Each checks the table `disk` writes and the service's table
+        after it. Then, with every admin session taken, `disk` must name the service's
+        `WouldBlock`, not the grant. `test-interactive`'s 20c runs `--list` in a session with no grant, `--mount`
+        refused there, and `with admin disk --mount` on the ESP refused by the service for
+        holding FAT.)*
 - [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
       packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
       its SATA disk; assert `nitrox-root` auto-mounted read-only and a write to it refused; log in on

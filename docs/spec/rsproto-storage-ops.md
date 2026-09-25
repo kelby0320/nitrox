@@ -2,9 +2,9 @@
 
 **Status: normative for what is built (2026-09-25).** `Mount`, `Unmount` and `InUse` are
 implemented in `userspace/storage-service/` and encoded by `userspace/librsproto/src/storage.rs`
-(administration Part C.5c). Nothing binds the admin endpoint into a view yet: the view broker's
-`storage` grant is C.6's, and `disk` is C.7's. See [`storage.md`](../architecture/storage.md)
-for the service, and [`administration.md`](../planning/administration.md) § *Part C in detail*
+(administration Part C.5c). The view broker's `storage` grant binds the admin endpoint into a view
+(C.6), and `disk --mount` and `disk --unmount` speak these requests there (C.7). See
+[`storage.md`](../architecture/storage.md) for the service, and [`administration.md`](../planning/administration.md) § *Part C in detail*
 for the design and its reasons.
 
 ## The shape
@@ -20,8 +20,9 @@ unmounting are asked for on an **admin session**, and nothing else speaks this c
 | admin session | any resolve on an admin endpoint — the view broker's `/dev/storage/admin` | any | a channel carrying the requests below |
 
 **Who holds an admin endpoint decides who mounts.** The service answers every request on an admin
-session, and gates nothing itself. The view broker resolves one admin endpoint at boot and binds
-it at `/dev/storage/admin` in a view whose profile has the `storage` grant (C.6). A **session
+session, and gates nothing itself. The view broker resolves one admin endpoint the first time a
+view needs it, and binds it at `/dev/storage/admin` in a view whose profile has the `storage` grant
+(C.6). `disk` is what a person runs there ([`shell-language.md`](shell-language.md) §10d). A **session
 endpoint**, the one sessions get for `/storage` and `/dev/storage`, answers `admin-endpoint` with
 `NotFound`, however it is bound. Two admin endpoints can exist at once, and four admin sessions.
 Past either, the resolve is `WouldBlock`.

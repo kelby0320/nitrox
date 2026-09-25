@@ -2,7 +2,8 @@
 
 **Status:** Implemented (Phase 3) — `userspace/service-mgr`, spawned by `init`, supervising
 the service set and performing supervisor-side namespace binding. Verified 2026-08-05; last
-checked 2026-08-21, when it learned to hold **more than one** service and a stale
+checked 2026-09-25, when a death found before its exit code learned to wait for it (below);
+before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
 
 Design doc for `service-mgr`, the userspace process supervisor.
@@ -96,7 +97,10 @@ handle cannot be recycled under its holder the way a pid can, so this is exact.
 
 The exit **code** is still taken from the notification queue in arrival order, since it
 arrives beside a pid that cannot be matched. One exit per wake — every case the system
-produces — pairs correctly; the residual is in the deferral entry.
+produces — pairs correctly; the residual is in the deferral entry. **The close can come
+first**: `sys_process_exit` closes the child's handles before it queues `ChildExited`, so a
+wake that finds more deaths than codes waits on the notification channel for the rest, up to
+`CODE_GRACE_NS` (1 s). Only past that is an exit reported `code=unknown`.
 
 **Litmus test:** *could this be written as a `service.toml` and supervised?* → it is
 service-mgr's. *Does it require being the kernel's first process / the reparent target

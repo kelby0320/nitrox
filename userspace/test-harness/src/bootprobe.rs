@@ -1372,7 +1372,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & devices_test(root_ns)
         & storage_test(root_ns)
         & storage_mount_test(root_ns)
-        & storage_admin_test(root_ns);
+        & storage_admin_test(root_ns)
+        & storage_grant_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -2677,6 +2678,178 @@ fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"a session endpoint answered admin-endpoint"));
     }
     kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session ok\n");
+    finish(true)
+}
+
+/// **`disk`, through the `storage` grant** (administration Part C.7): the success path a person
+/// takes with `with admin disk`, from a view the broker built. `disk --unmount nitrox-scratch`
+/// and then `disk --mount /dev/blk/<n>` each run in the admin view with a stdout pipe. The table
+/// each writes is read back, its exit code checked, and the service's own table checked after it.
+/// This is the one boot that reaches `/dev/storage/admin` through a view — the grant's binding,
+/// which C.6 bound and nothing used until `disk`.
+///
+/// **Then a busy service, which is not a missing grant.** With every admin session taken,
+/// `disk --unmount` in the same view is refused, and what it writes on `stderr` names the service's
+/// `WouldBlock` rather than telling a person who holds the grant to go and get it.
+fn storage_grant_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::views::*;
+    use libstream::wire::Value;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage grant: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+    let Some(scratch) = registry_records(root_ns)
+        .and_then(|r| r.iter().find(|r| r.kind() == libkern::device::DeviceKind::RamDisk).and_then(|r| r.block_index()))
+    else {
+        return fail(b"no scratch disk in the registry");
+    };
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => parse_session_id(&body),
+        _ => None,
+    };
+    let Some(session) = session else {
+        close(sup);
+        return fail(b"OpenSession");
+    };
+    let client_path = alloc::format!("/svc/views/s/{session}");
+
+    // One program in the admin view: its exit code, the first row of the table it wrote, and
+    // what it wrote on `stderr`.
+    let mut run = |args: &[&[u8]]| -> Option<(i64, alloc::vec::Vec<Value>, alloc::vec::Vec<u8>)> {
+        let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        let (mut out_w, mut out_r, mut err_w, mut err_r) = (0u64, 0u64, 0u64, 0u64);
+        // SAFETY: valid writable out-params, for each of the two pipes.
+        let piped = unsafe {
+            syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) == 0
+                && syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut err_w) as u64, (&raw mut err_r) as u64, 16, 0) == 0
+        };
+        if st != 0 || cli == 0 || copy <= 0 || !piped {
+            return None;
+        }
+        let mut req = [0u8; 256];
+        let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", b"disk", args, b"")?;
+        let asked = matches!(
+            views_call(cli, OP_VIEWS_REQUEST, 1, &req[..n], &[copy as u64, out_w, err_w], &mut exited),
+            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::NeedPassword, _)))
+        ) && matches!(
+            views_call(cli, OP_VIEWS_PASSWORD, 2, DEMO_PASSWORD, &[], &mut exited),
+            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+        );
+        let listing = if asked {
+            libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive().ok()
+        } else {
+            None
+        };
+        close(out_r);
+        // Every diagnostic is one message, and the program has closed its end by now: read to
+        // the close.
+        let mut said = alloc::vec::Vec::new();
+        if asked {
+            use libstream::channel::MsgPort;
+            let mut port = libstream::channel::IpcPort::new(err_r);
+            while port.recv(&mut said).is_ok() {}
+        }
+        close(err_r);
+        let code = if asked { exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) } else { None };
+        close(cli);
+        let code = code.as_deref().and_then(parse_exited)?.0 as i64;
+        let row = listing.and_then(|bytes| {
+            let mut tr = libstream::table::TableReader::new(&bytes).ok()?;
+            match tr.next() {
+                Some(Ok(libstream::table::Item::Row(vals))) => Some(vals),
+                _ => None,
+            }
+        });
+        Some((code, row.unwrap_or_default(), said))
+    };
+    let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
+    let s = |v: &str| Value::Str(alloc::string::String::from(v));
+    let mounted_rw = || {
+        let (st, h) = ns_lookup(root_ns, b"/svc/storage/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        let t = bytes.and_then(|b| libstream::wire::Table::decode(&b).ok())?;
+        let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+        let (l, m) = (col("label")?, col("mode")?);
+        t.rows.iter().find(|r| r[l] == s("nitrox-scratch")).map(|r| r[m] == s("rw"))
+    };
+
+    let unmounted = run(&[b"--unmount", b"nitrox-scratch"]);
+    let finish = |ok: bool| {
+        let mut id = [0u8; 8];
+        let n = build_session_id(&mut id, session).unwrap_or(0);
+        let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 3, &id[..n], &[], &mut alloc::vec::Vec::new());
+        close(sup);
+        ok
+    };
+    if unmounted.map(|(code, row, _)| (code, row)) != Some((0, alloc::vec![s("nitrox-scratch"), Value::Bool(true)])) {
+        return finish(fail(b"disk --unmount nitrox-scratch in the admin view did not answer its table"));
+    }
+    if mounted_rw() != Some(false) {
+        return finish(fail(b"the table still shows nitrox-scratch mounted after disk --unmount"));
+    }
+    let path = alloc::format!("/dev/blk/{scratch}");
+    let mounted = run(&[b"--mount", path.as_bytes()]);
+    let name = alloc::format!("blk-{scratch}");
+    if mounted.map(|(code, row, _)| (code, row))
+        != Some((0, alloc::vec![s(&name), s("nitrox-scratch"), s("/storage/nitrox-scratch")]))
+    {
+        return finish(fail(b"disk --mount in the admin view did not answer its table"));
+    }
+    if mounted_rw() != Some(true) {
+        return finish(fail(b"disk --mount did not leave nitrox-scratch mounted writable"));
+    }
+
+    // Every admin session taken — the broker holds one, for `InUse` — through the admin
+    // endpoint bound in a namespace of the probe's own, as `storage_admin_test` opens one.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/admin-endpoint", chan);
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    let at = b"/admin";
+    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+    let bound = st == 0
+        && ns > 0
+        && unsafe { syscall6(SYS_NS_BIND, ns as u64, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) } == 0;
+    close(endpoint);
+    let mut held = alloc::vec::Vec::new();
+    let mut refused = 0;
+    while bound && held.len() < 8 {
+        let (st, h) = ns_lookup(ns as u64, at, chan);
+        if st != 0 {
+            refused = st;
+            break;
+        }
+        held.push(h);
+    }
+    if ns > 0 {
+        close(ns as u64);
+    }
+    let busy = if refused == KError::WouldBlock.as_i32() { run(&[b"--unmount", b"nitrox-scratch"]) } else { None };
+    for h in held {
+        close(h);
+    }
+    if refused != KError::WouldBlock.as_i32() {
+        return finish(fail(b"the admin sessions never ran out, so there is no busy service to ask"));
+    }
+    let Some((1, row, said)) = busy else {
+        return finish(fail(b"disk --unmount with every admin session taken did not exit 1"));
+    };
+    if !row.is_empty() || !says(&said, b"opened no admin session (WouldBlock)") || says(&said, b"storage grant") {
+        return finish(fail(b"disk with every admin session taken did not name the service's WouldBlock"));
+    }
+    if mounted_rw() != Some(true) {
+        return finish(fail(b"a refused disk --unmount unmounted nitrox-scratch"));
+    }
+    kprint(b"boot-probe: storage grant: disk --unmount and disk --mount ran in the admin view, each answered its table, the service agreed, and a busy service was named as busy ok\n");
     finish(true)
 }
 

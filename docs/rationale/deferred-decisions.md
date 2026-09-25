@@ -630,6 +630,22 @@ at spawn that it never learns of, whose close says exactly *which* program exite
 in arrival order. The maintainer took that over closing this entry now (2026-09-23), since two of
 the broker's programs exiting in one wake is rare and closing it needs the ABI.
 
+**A close can come before its code, and not only after a crash** (found 2026-09-25,
+administration C.7). Since 2026-07-31, `sys_process_exit` closes the exiting process's handle
+table in syscall context, before `exit_process` queues `ChildExited`, so that a peer sees
+`PeerClosed` promptly. On another CPU, a supervisor can therefore see the channel closed while the
+code is still to come.
+- **The view broker assumed the opposite.** It queued a closed life again on every wake until the
+  code came. A copy left behind took the next program's code and matched nothing, and that
+  program's life then never paired. The broker ran out of memory: 3 `test-qemu --kvm` boots in
+  19. It now queues a closed life once and stops waiting on it until its code arrives
+  (`view_broker::exits`).
+- **`service-mgr` reaped such a death with no code**: a normal exit treated as a failure, and
+  its code reported a wake later as an unsupervised child's. `check-terminal`, which asserts
+  `'boot-probe' exited code=0`, failed that way in 3 runs of 9, under TCG and KVM. A wake that
+  finds more deaths than codes now waits for the rest on the notification channel, up to
+  `CODE_GRACE_NS`.
+
 **`init` is untouched and still has the original bug**: `reap_loop` attributes the first
 `ChildExited` to its primary child without comparing the pid. Its children do not all have control
 channels, so `service-mgr`'s fix does not carry over.

@@ -23,7 +23,6 @@
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::debug::Line;
@@ -34,6 +33,7 @@ use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
+use view_broker::exits::Exits;
 use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
 use view_broker::sessions::Sessions;
@@ -161,10 +161,9 @@ struct Broker {
     /// Passwords waiting to be checked, by client channel — see [`Held`] for why none of them
     /// carries a deadline of its own.
     held: Held,
-    /// Exit codes from `ChildExited`, in arrival order, and programs whose life channel closed
-    /// before their code came. Paired first-to-first — see [`Broker::pair_exits`].
-    codes: VecDeque<(i32, bool)>,
-    exited: VecDeque<u64>,
+    /// Programs whose life channel closed, and exit codes from `ChildExited`, each waiting for
+    /// the other — see [`Exits`] for why either can come first.
+    exits: Exits,
     log: liblog::Logger,
 }
 
@@ -854,15 +853,15 @@ impl Broker {
             if kind == KIND_CHILD_EXITED {
                 let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-                self.codes.push_back((code, exit_kind != 0));
+                self.exits.code(code, exit_kind != 0);
             }
         }
         self.pair_exits();
     }
 
-    /// A program's life channel closed: it exited.
+    /// A program's life channel closed: it exited. Its code may not be queued yet.
     fn life_closed(&mut self, life: u64) {
-        self.exited.push_back(life);
+        self.exits.closed(life);
         self.drain_notifications();
     }
 
@@ -870,9 +869,12 @@ impl Broker {
     /// correctly; two in the same wake can swap codes** — the residual of
     /// `TODO(child-exit-attribution)`, which `service-mgr` lives with too.
     fn pair_exits(&mut self) {
-        while !self.exited.is_empty() && !self.codes.is_empty() {
-            let life = self.exited.pop_front().unwrap_or(0);
-            let (code, crashed) = self.codes.pop_front().unwrap_or((0, true));
+        loop {
+            let clients = &self.clients;
+            let running = |l: u64| clients.iter().any(|c| matches!(c.state, State::Running { life, .. } if life == l));
+            let Some((life, code, crashed)) = self.exits.next(running) else {
+                break;
+            };
             let Some(i) = self.clients.iter().position(|c| matches!(c.state, State::Running { life: l, .. } if l == life)) else {
                 continue;
             };
@@ -976,8 +978,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         clients: Vec::new(),
         sessions: Sessions::new(),
         held: Held::default(),
-        codes: VecDeque::new(),
-        exited: VecDeque::new(),
+        exits: Exits::default(),
         log: liblog::open_source(root_ns, b"/log/system/view-broker"),
     };
     loop {
@@ -1001,7 +1002,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 if c.ch != 0 {
                     push(c.ch);
                 }
-                if let State::Running { life, .. } = c.state {
+                // A closed life channel stays ready: waiting on it again until its code arrived
+                // would spin, reporting the same exit on every wake.
+                if let State::Running { life, .. } = c.state
+                    && !b.exits.is_closed(life)
+                {
                     push(life);
                 }
             }
