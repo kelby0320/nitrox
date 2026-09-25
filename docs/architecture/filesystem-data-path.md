@@ -129,9 +129,15 @@ sync and a fresh resolve.
   at the start could write after its page's IRP read the frame, then go before the end. Until such
   a write-back, the object stays alive and in the cache, however soon its users let go, and the
   next resolve of the file finds it with its pages. **A writer that exits without syncing loses
-  nothing until the machine stops**: `sys_ns_sync` writes it. Since a sync that begins with a
-  writable mapping in place cannot clean, `libfs` and `nxsh` unmap before they sync. Otherwise
-  every file they write would stay pinned until an unmount.
+  nothing until the machine stops**: `sys_ns_sync` writes it, and **the storage service's unmount
+  calls it** before the filesystem is marked clean (administration Part C.5c,
+  [`storage.md`](storage.md) §8). What is still owed is `init`'s own mounts, which only Part E's
+  shutdown will unmount. Since a sync that begins with a writable mapping in place cannot clean,
+  `libfs` and `nxsh` unmap before they sync. Otherwise every file they write would stay pinned
+  until an unmount.
+- **What still holds a file is countable**: `sys_ns_held` counts a registration's live cached
+  objects, after the finished IRPs have let go of theirs. Asked after a sync, a non-zero answer is
+  someone's handle or mapping, which is what an unmount is refused on.
 - **A grow, create or truncate resizes the one object in place.** It is a resolve, and its reply
   carries the new size and map. What a page says stays honest across it. Everything past the
   smaller of the old and new sizes leaves the index, so no fault finds it and no write-back writes

@@ -1,8 +1,10 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-24, when each session gained `/dev/devices`, the device manager's tables at the base
-`/info` — administration Part B.4; before that 2026-09-23, when each session gained a
+2026-09-25, when each session gained `/storage` and `/dev/storage`, the storage service's session
+endpoint at the bases `/fs` and `/info` — administration Part C.6; before that 2026-09-24, when
+each session gained `/dev/devices`, the device manager's tables at the base `/info` — Part B.4;
+before that 2026-09-23, when each session gained a
 view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document described
 before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
 under "Credential validation" is the current shape; the history is kept because a doc that
@@ -173,6 +175,8 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/store` | the store | read-only (shared artifacts) |
 | `/dev/views` | the view broker's forwarding endpoint, **scoped to `/s/<session>`** | the session's identity to the broker — see below |
 | `/dev/devices` | an **info-only** endpoint of the device manager's, scoped to `/info` | the machine's devices as typed tables, and nothing to take one with — see below |
+| `/storage` | the storage service's **session** endpoint, scoped to `/fs` | every mounted filesystem, `/storage/<label>/…`, and nothing to mount with — see below |
+| `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
@@ -253,6 +257,25 @@ is not bound in a session at all. `test-interactive` asserts from a serial login
 list and filter, and that `/dev/devices/block` and `/dev/registry` open nothing; `boot-probe`
 sends `block` down an info-only endpoint directly. A boot without the manager builds sessions
 without `/dev/devices`, and says so.
+
+### The storage service's filesystems
+
+**Every session reaches every mounted filesystem; none can mount one** (administration Part C.6).
+Each supervisor resolves a **session endpoint** at `/svc/storage/session-endpoint` itself, once,
+as it resolves `/svc/views/session`, so nothing new travels the handoff channels. It binds it
+twice: at `/storage` with the base `/fs`, so `/storage/<label>/…` continues into that filesystem's
+own namespace, and at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table
+of what each disk holds and where it is mounted. `desktop-session-mgr` hands the endpoint to
+`desktop-shell` as its eighth extra, and the shell binds it the same two ways into every
+application ([`storage.md`](storage.md)).
+
+**The endpoint is the boundary, again.** On a session endpoint the service answers the filesystems
+and the table, and `admin-endpoint` is `NotFound` however it is bound, so the shell, holding it
+with `BIND_NAMESPACE`, cannot mint the endpoint that mounts. Mounting is the view broker's
+`storage` grant. `test-interactive` lists `/dev/storage` and filters its table from a serial login,
+and asserts that `/storage` lists filesystems, not tables. `check-login` asserts both bindings in
+the graphical session and in every application namespace. A boot without the service builds
+sessions without `/storage`, and says so.
 
 ### Where the building-block endpoints come from
 

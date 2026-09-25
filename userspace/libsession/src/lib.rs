@@ -173,6 +173,18 @@ pub struct NamespaceSpec<'a> {
     /// in the root namespace. The base names what a session reaches: `/dev/devices` is the
     /// directory, `/dev/devices/all.tsm` a table.
     pub devices_endpoint: u64,
+    /// A **session endpoint** of the storage service's, bound twice (administration Part C.6):
+    /// at `/storage` with the base `/fs`, so `/storage/<label>/…` is a mounted filesystem, and
+    /// at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table of what
+    /// each disk holds. `0` binds nothing — a boot without the service, whose sessions have no
+    /// `/storage`.
+    ///
+    /// **The endpoint, not the bases, is what keeps a session from mounting.** Each supervisor
+    /// resolves it at `/svc/storage/session-endpoint`, and the service answers the filesystems and
+    /// the tables on it and nothing else: `admin-endpoint` is `NotFound` there however it is
+    /// bound, so `desktop-shell`, which holds it with `BIND_NAMESPACE`, cannot mint an admin
+    /// endpoint from it either.
+    pub storage_endpoint: u64,
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -355,6 +367,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         views_endpoint,
         views_base,
         devices_endpoint,
+        storage_endpoint,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
@@ -581,6 +594,22 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         has_devices = dvr == 0;
     }
 
+    // `/storage` and `/dev/storage` → the storage service's session endpoint, twice
+    // (administration Part C.6): the mounted filesystems at the base `/fs`, and the table of what
+    // each disk holds at `/info`. Non-fatal, like `/dev/devices`: a session without them has no
+    // `/storage`, and nothing else in it notices.
+    let has_storage = storage_endpoint != 0
+        && [(&b"/storage"[..], &b"/fs"[..]), (b"/dev/storage", b"/info")].iter().all(|&(at, base)| {
+            // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+            let r = unsafe {
+                syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, storage_endpoint, base.as_ptr() as u64, base.len() as u64)
+            };
+            r == 0
+        });
+    if storage_endpoint != 0 && !has_storage {
+        kprint(b"libsession: /storage bind FAIL (no filesystems in this session)\n");
+    }
+
     // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
     // uses. Read-only by construction: a subtree bind forwards to the same registration, and
     // nothing in the session has a writable handle to it.
@@ -659,6 +688,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         SESSION_HAS_CLIPBOARD = has_clipboard;
         SESSION_HAS_VIEWS = has_views;
         SESSION_HAS_DEVICES = has_devices;
+        SESSION_HAS_STORAGE = has_storage;
     }
     ns
 }
@@ -684,8 +714,21 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
 /// Each device's `info` is a snapshot object, resolved once and bound beside its device: device
 /// facts do not change while a machine runs.
 pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
+    rebind_block_devices_except(from_ns, to_ns, &[])
+}
+
+/// [`rebind_block_devices`], **leaving out the devices whose registry ids are in `withheld`**
+/// (administration Part C.6): the view broker's `disks` grant, which asks the storage service what
+/// is in use — a mounted filesystem's device, `init`'s included, and the disk that holds it — and
+/// hands on the rest. A raw write to a mounted filesystem's device, or to the disk under it, would
+/// land underneath a live server.
+///
+/// **Only a source with a registry can withhold**, since the ids are the registry's: a namespace
+/// holding its devices as bindings has no way to say which is which. The broker's source is the
+/// root namespace, which has one. `withheld` empty is `rebind_block_devices`.
+pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -> usize {
     let mut bound = 0;
-    for n in block_indices(from_ns) {
+    for n in block_indices(from_ns, withheld) {
         let path = blk_path(n, false);
         let (st, dev) = ns_lookup(
             from_ns,
@@ -760,19 +803,30 @@ pub fn unbind_block_devices(ns: u64) -> usize {
     unbound
 }
 
-/// The `/dev/blk/<n>` indices `ns` can reach, ascending (administration Part B.5).
+/// The `/dev/blk/<n>` indices `ns` can reach, ascending (administration Part B.5), less the
+/// devices whose registry ids are in `withheld` (Part C.6).
 ///
 /// **From the registry where `ns` has one** — the root namespace, where `/dev/blk` is one
 /// kernel-server binding whose children no enumeration can see — **and otherwise from `ns`'s own
 /// bindings**: a session, a view and an application namespace are each handed their devices one
-/// binding at a time, and deliberately have no registry.
-fn block_indices(ns: u64) -> alloc::vec::Vec<u32> {
-    registry_block_indices(ns).unwrap_or_else(|| bound_block_indices(ns))
+/// binding at a time, and deliberately have no registry. Only the first can withhold, since the
+/// ids are the registry's.
+fn block_indices(ns: u64, withheld: &[u32]) -> alloc::vec::Vec<u32> {
+    match registry_blocks(ns) {
+        Some(blocks) => {
+            let mut out: alloc::vec::Vec<u32> =
+                blocks.iter().filter(|(id, _)| !withheld.contains(id)).map(|&(_, n)| n).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        None => bound_block_indices(ns),
+    }
 }
 
-/// The block devices `/dev/registry` lists, by their `/dev/blk` index. `None` if `ns` has no
-/// registry, or it does not read.
-fn registry_block_indices(ns: u64) -> Option<alloc::vec::Vec<u32>> {
+/// The block devices `/dev/registry` lists, as `(registry id, /dev/blk index)`. `None` if `ns` has
+/// no registry, or it does not read.
+fn registry_blocks(ns: u64) -> Option<alloc::vec::Vec<(u32, u32)>> {
     let (st, snap) = ns_lookup(ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
     if st != 0 || snap == 0 {
         return None;
@@ -789,14 +843,12 @@ fn registry_block_indices(ns: u64) -> Option<alloc::vec::Vec<u32>> {
     }
     // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
-    let mut out: alloc::vec::Vec<u32> = match libkern::device::records(bytes) {
-        Ok(records) => records.filter_map(|r| r.block_index()).collect(),
+    let out: alloc::vec::Vec<(u32, u32)> = match libkern::device::records(bytes) {
+        Ok(records) => records.filter_map(|r| r.block_index().map(|n| (r.id, n))).collect(),
         Err(_) => alloc::vec::Vec::new(),
     };
     // SAFETY: unmapping what was mapped above; `out` holds copies.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
-    out.sort_unstable();
-    out.dedup();
     Some(out)
 }
 
@@ -963,6 +1015,16 @@ pub fn session_has_devices() -> bool {
 
 /// Set by [`build_namespace`]; see [`session_has_devices`].
 static mut SESSION_HAS_DEVICES: bool = false;
+
+/// Whether the last [`build_namespace`] bound `/storage` and `/dev/storage` — reported, for the
+/// log line that has to be able to say "no".
+pub fn session_has_storage() -> bool {
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe { SESSION_HAS_STORAGE }
+}
+
+/// Set by [`build_namespace`]; see [`session_has_storage`].
+static mut SESSION_HAS_STORAGE: bool = false;
 
 /// See [`session_has_console`].
 static mut SESSION_HAS_CONSOLE: bool = false;

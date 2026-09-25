@@ -947,19 +947,21 @@ struct Supervised {
 ///
 /// **The exit *code* is still unattributed**, and that is the deliberate residual. It
 /// arrives on `KIND_CHILD_EXITED` beside a pid this process cannot match, so codes are
-/// collected **per wake** and paired with whichever service that wake found dead. A wake
-/// is the right scope because a child's exit enqueues its notification and destroys its
-/// endpoint under the same `SCHED` hold, so both reach one `sys_wait`. Codes left over at
-/// the end of a wake are **discarded, and counted**: they belong to a child that is not
-/// supervised here — `bring_up_login_chain` spawns `auth-service` and `session-mgr`, and
-/// every child's exit reaches its parent's notification channel whether the parent
-/// supervises it or not. Carrying them forward would mispair them with the next supervised
-/// death (PR #226 review, finding 4).
+/// collected **per wake** and paired with whichever service that wake found dead. **A wake
+/// can find the death before the code.** `sys_process_exit` closes a child's handles, its end
+/// of the control channel included, before it queues the notification. So a wake that finds
+/// more deaths than codes waits for the rest on the notification channel, up to
+/// [`CODE_GRACE_NS`]. Found 2026-09-25: `check-terminal` saw `code=unknown`, and the view broker
+/// spun on the same ordering. Codes left over at the end of a wake are **discarded, and
+/// counted**: they belong to a child that is not supervised here. `bring_up_login_chain` spawns
+/// `auth-service` and `session-mgr`, and every child's exit reaches its parent's notification
+/// channel whether the parent supervises it or not. Carrying them forward would mispair them with
+/// the next supervised death (PR #226 review, finding 4).
 ///
 /// Within one wake, two deaths can still swap their codes, which matters only to
-/// `on-failure`; `never` and `always` do not read the code. A service found dead with no
-/// code is treated as a **failure**, because a crash that outruns its notification is the
-/// case worth restarting.
+/// `on-failure`; `never` and `always` do not read the code. A service still without a code
+/// after [`CODE_GRACE_NS`] is treated as a **failure**, because a crash that outruns its
+/// notification is the case worth restarting.
 ///
 /// **The demo shutdown applies to the first declared service only.** It exercises the
 /// control path end to end after `DEMO_RUN_NS`; a real shutdown trigger is still deferred.
@@ -1079,29 +1081,7 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
         //    **per wake**: a code with no death to pair with by the end of this iteration
         //    belongs to a child service-mgr does not supervise.
         let mut codes: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-        loop {
-            // SAFETY: NOTIF is a valid 64-byte writable out-param.
-            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-            if r != 0 {
-                break; // WouldBlock: drained
-            }
-            // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-            let (kind, body) =
-                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-            if kind != KIND_CHILD_EXITED {
-                continue;
-            }
-            let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            Line::new()
-                .s(b"service-mgr: reaped pid=")
-                .u(cpid as u64)
-                // `.i`, not `.u`: an exit code is signed.
-                .s(b" code=")
-                .i(code as i64)
-                .end();
-            codes.push(code);
-        }
+        drain_codes(notif, &mut codes);
 
         // 2. Ask each running service's control channel whether its peer is gone. This
         //    is the attribution: the handle that answers `PeerClosed` names the service.
@@ -1112,6 +1092,15 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
             }
             if channel_peer_closed(s.ctrl) {
                 dead.push(i);
+            }
+        }
+
+        // 2b. **A death can be seen before its code** (`CODE_GRACE_NS`). Wait for the codes
+        //     owed on the notification channel alone, before pairing any.
+        if dead.len() > codes.len() {
+            let until = now_ns().saturating_add(CODE_GRACE_NS);
+            while dead.len() > codes.len() && notif_wait(notif, until) {
+                drain_codes(notif, &mut codes);
             }
         }
 
@@ -1134,8 +1123,9 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
             l.s(b"service-mgr: '").s(svcs[i].decl.name.as_bytes()).s(b"' exited");
             match code {
                 Some(c) => l.s(b" code=").i(c as i64),
-                // Its notification has not arrived (or was consumed by a sibling that
-                // exited in the same wake). Named rather than printed as a fake `0`.
+                // Its notification did not arrive within `CODE_GRACE_NS` (or was consumed by
+                // a sibling that exited in the same wake). Named rather than printed as a
+                // fake `0`.
                 None => l.s(b" code=unknown"),
             };
             l.end();
@@ -1315,6 +1305,50 @@ fn await_dependencies(decl: &ServiceDecl, svcs: &[Supervised]) {
         // level-triggered, so `supervise`'s first pass sees the same closed channel, drains
         // the matching notification, and handles it exactly like any other exit.
         Line::new().s(b"service-mgr: '").s(dep.as_bytes()).s(b"' finished").end();
+    }
+}
+
+/// How long a service found dead waits for its exit code. **The close can come first.**
+/// `sys_process_exit` closes the child's handles, its control endpoint among them, before it
+/// queues `ChildExited`. So on another CPU, a wake can find a service dead with its code still to
+/// come. `check-terminal` saw `'boot-probe' exited code=unknown` that way (administration C.7).
+/// The gap is the rest of one exit syscall; this bound only matters for a code that never comes.
+const CODE_GRACE_NS: u64 = 1_000_000_000;
+
+/// Take every `ChildExited` queued on `notif`, logging each, and append its code to `codes`.
+fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
+    loop {
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            break; // WouldBlock: drained
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let (kind, body) =
+            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        if kind != KIND_CHILD_EXITED {
+            continue;
+        }
+        let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+        Line::new()
+            .s(b"service-mgr: reaped pid=")
+            .u(cpid as u64)
+            // `.i`, not `.u`: an exit code is signed.
+            .s(b" code=")
+            .i(code as i64)
+            .end();
+        codes.push(code);
+    }
+}
+
+/// Wait on the notification channel alone until `deadline`. `true` if something arrived.
+fn notif_wait(notif: u64, deadline: u64) -> bool {
+    let handles = [notif];
+    let mut results = [0u8; 24];
+    // SAFETY: valid one-entry wait arrays on this frame.
+    unsafe {
+        syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline) >= 1
     }
 }
 

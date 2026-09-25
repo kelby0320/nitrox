@@ -274,6 +274,16 @@ jobs:
       - name: cargo xtask check-report --kvm
         run: cargo xtask check-report --kvm
 
+      # **The storage chain, with the host holding the result** (administration Part C.8): the
+      # test live image as a USB stick beside a copy of the release disk on the AHCI controller.
+      # The disk's root auto-mounts read-only and refuses a write; `with admin disk` remounts it
+      # writable; a test program writes a pattern through a mapping and exits without a sync, and
+      # the host sees the file there without the pattern; the unmount runs the chain. Then, with
+      # the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock
+      # marked clean, and the file holding the pattern. The only gate whose verdict is the disk.
+      - name: cargo xtask check-storage --kvm
+        run: cargo xtask check-storage --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

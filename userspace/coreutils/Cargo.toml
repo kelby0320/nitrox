@@ -65,3 +65,9 @@ path = "src/bin/sleep.rs"
 [[bin]]
 name = "whoami"
 path = "src/bin/whoami.rs"
+
+# The machine's disks (administration Part C.7): the storage service's table, and mounting and
+# unmounting on its admin endpoint, which the view broker's `storage` grant binds.
+[[bin]]
+name = "disk"
+path = "src/bin/disk.rs"

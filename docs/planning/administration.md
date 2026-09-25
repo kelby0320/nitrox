@@ -471,7 +471,7 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `device-mgr`, with subscriptions by class that replay every present device (coldplug);
       `input-server` taking a changing set of devices from it; `/dev/devices`, typed tables anyone
       can read, in place of listing `/dev/blk`.
-- [ ] **C — storage** — *detailed below, C.1–C.8.* Write-back of a registration's `FileObject`s;
+- [x] **C — storage** — *detailed below, C.1–C.8; complete 2026-09-25.* Write-back of a registration's `FileObject`s;
       a whole-filesystem sync and clean/dirty state in `fs-server-ext4`; `TODO(ahci-flush)`;
       `OBJECT_KIND_SUBNAMESPACE`; the storage service — mount, unmount, auto-mount (read-only on a
       live boot), `/storage` bound into sessions and application namespaces, refusing a raw grant of
@@ -1152,7 +1152,7 @@ namespace, with no login and no session.
       rename's destination can follow; a continuation onto a kernel server is refused, since
       `/proc/self` would answer for the replying server; and `boot-probe` tests it on a boot now,
       acting as its own server.)*
-- [ ] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
+- [x] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
       `init`'s mounts from `init.toml`; the live-boot test; auto-mount; labels; the per-mount
       namespaces and the `SUBNAMESPACE` answer; the session and admin endpoints; the table; `Storage`
       (`rsproto-storage-ops.md`, `0x10xx`, its row in the wire-format table); the unmount chain. <!-- check-docs: allow-missing -->
@@ -1165,28 +1165,91 @@ namespace, with no login and no session.
       test the replay, the one-owner rule and a retake, and `block` is owned from boot now, so the
       probe asserts `block` is refused, as it does `input`, and the retake stays the host tests' and
       B.2's recorded controls'.
-- [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
+
+      **Lands in three parts.** *C.5a (2026-09-25): the service sees what is there.*
+      - `storage-service` owns `block` from boot on and probes each device: ext4 through
+        `fs-server-ext4`'s own `check_device`, with a new `volume_label`; FAT from its boot sector;
+        or nothing.
+      - It matches `init.toml`'s mounts to their devices, applies the live-boot rule, and serves
+        `/svc/storage/info`.
+      - `init.toml`'s parser moved out of `init` into `libinittoml`, since it has two readers now.
+      - The `boot-probe` check and B.2's change are as listed above. `init` spawns the service with
+        no syscaps, and `BIND_NAMESPACE` comes with C.5b's namespaces.
+
+      *C.5b (2026-09-25): the service mounts.*
+      - It auto-mounts every ext4 `init` did not mount, read-only on a live boot. Each mount has
+        its own `fs-server-ext4` and namespace, and is named by its label.
+      - `fs/<label>/…` is answered with `SUBNAMESPACE`, and the session endpoint is minted.
+      - The service holds `BIND_NAMESPACE`.
+      - **By the maintainer's call, a test image carries a scratch ext4 as a second Limine module**,
+        a RAM disk, so `boot-probe` mounts, reads and writes through `/svc/storage` on every run.
+
+      *C.5c (2026-09-25): the service unmounts, and speaks `Storage`.*
+      - The admin endpoint, admin sessions, and `Mount`, `Unmount` and `InUse`
+        (`rsproto-storage-ops.md`, `0x10xx`).
+      - The unmount chain as drawn, with one kernel addition the pass had not named:
+        **`sys_ns_held`** (syscall 39), which counts a mount's files still held once a sync has
+        run. The service asks it three times, 5 ms apart, before believing a non-zero answer,
+        because a finished IRP holds its file until thread context frees it.
+      - `boot-probe` unmounts the scratch disk on every run. The unmount is refused while a file
+        is held; a file written through a mapping and never synced is on the device after it,
+        which also leaves the filesystem clean; and a `Mount` by name brings the disk back.
+- [x] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
       grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and
       `/dev/storage/all.tsm` from a serial login, and `disk --mount` refused without the grant; step
       20b(d) and `check-login`'s 9a2 re-aimed, and the *Gates* table's row A reworded
-      (*Consequences for earlier parts*).
-- [ ] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
-- [ ] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
+      (*Consequences for earlier parts*). *(Landed 2026-09-25.*
+      - *Each supervisor resolves `/svc/storage/session-endpoint` itself, and `desktop-shell` gets
+        it as its eighth extra.*
+      - *The broker resolves the admin endpoint on first need, since `init` spawns it before the
+        storage service. It asks `InUse` on an admin session of its own, and refuses a `disks`
+        request if the service cannot answer.*
+      - *`boot-probe` reads `nxinstall`'s listing in an admin view back through a stdout pipe:
+        the ESP is there, and every device in use is not.*
+      - *`disk --mount` refused without the grant is C.7's, since `disk` is: until then no boot
+        exercises the `storage` grant.)*
+- [x] **C.7 — `disk`.** `--list`, `--mount` and `--unmount`, each a typed result like every `--list`.
+      *(Landed 2026-09-25.*
+      - *`--list` is the service's `all.tsm`, read from `/dev/storage` in any session. `--mount`
+        and `--unmount` each write a one-row table. `--mount` takes `/dev/blk/<n>` or `blk-<n>`
+        and an optional label.*
+      - *Without the grant, `/dev/storage/admin` is the session endpoint at the tables' base, where
+        nothing answers. `disk` says the storage grant is needed and names `with admin`, before
+        the service is asked. With the grant, a refusal is the service's own reason.*
+      - *`boot-probe` runs `disk --unmount` and then `--mount` on the scratch disk in the admin
+        view, as `with` runs them. Each checks the table `disk` writes and the service's table
+        after it. Then, with every admin session taken, `disk` must name the service's
+        `WouldBlock`, not the grant. `test-interactive`'s 20c runs `--list` in a session with no grant, `--mount`
+        refused there, and `with admin disk --mount` on the ESP refused by the service for
+        holding FAT.)*
+- [x] **C.8 — the gate.** `cargo xtask image --live --selftest`, the live image with the test
       packages, and **`cargo xtask check-storage`**, in CI: boot it with a copy of the release disk as
       its SATA disk; assert `nitrox-root` auto-mounted read-only and a write to it refused; log in on
       serial and `with admin disk --unmount`, then `--mount` it writable; run a test program that
       writes a pattern through a mapping, **exits without a sync**, and a second that reads it back
       through `/storage` in the guest; unmount; stop the machine. On the host, carve `nitrox-root` from
       the disk: `e2fsck -fn` clean, `s_state` clean, and the file's **contents** the pattern — read
-      with the same `fs-server-ext4` library `check-install` uses.
-- [ ] **Docs**: a storage architecture doc; `filesystem-data-path.md` (the cache, the triggers, the
+      with the same `fs-server-ext4` library `check-install` uses. *(Landed 2026-09-25.*
+      - *The writer and the reader are one test program, `test-pattern`, with `--write` and
+        `--check`, so the pattern is written down once in the guest. `xtask` has its own copy.*
+      - *A write refused on the read-only mount is `test-pattern --write`, and the gate matches
+        the kernel's `NoAccess` rather than `touch`'s "cannot create file".*
+      - ***Added**: the host reads the disk mid-run, after the write and before the unmount. The
+        file is there at its size without the pattern, and the superblock says mounted. So what
+        the host finds at the end, the unmount put there.*
+      - ***Changed**: the contents are read with `debugfs`, not the `fs-server-ext4` library,
+        which is the code that wrote them. `s_state` is read from the superblock's bytes, not with
+        `was_left_clean`.*
+      - *`check-images` holds the test stick to the ordinary `--selftest` image as it holds the
+        release stick to the release image.)*
+- [x] **Docs**: a storage architecture doc; `filesystem-data-path.md` (the cache, the triggers, the
       dirty claim corrected); `ext4-fs-server-rw.md` (read-only mode, the state); the namespace-ops
       spec (`SUBNAMESPACE` built, the file id and read-only mark in the block reply);
       `rsproto-storage-ops.md`; `session-and-auth.md`'s <!-- check-docs: allow-missing -->
       table; `boot-flow.md`; `deferred-decisions.md` — teardown write-back and `TODO(ahci-flush)`
       resolved, the page cache's first axis resolved and its other two kept, the new `File::Forget`
-      boundary noted.
+      boundary noted. *(Each landed with the piece that built it, C.1–C.8.)*
 
 **Part C may land as two PRs** — C.1–C.4, the kernel and `fs-server-ext4`, then C.5–C.8 — if one
 proves too large to review. The first half is useful on its own, but less than it sounds: it makes
@@ -1247,7 +1310,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 
 | Part | What proves it |
 |---|---|
-| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees `/dev/blk/0`, and the same command without it does not. `check-login`: one `with` request from the terminal the Applications menu opens |
+| A | `test-interactive`: a request allowed, one denied by policy, wrong passwords delayed and capped, an audit record for each, and Ctrl-C stopping a program started with `with`. **And that the grant arrived**: under `with admin` a program sees the disks nothing has mounted — the ESP, on a release boot — and never `/dev/blk/0`, the disk holding `init`'s root (reworded by C.6, when `disks` began asking `InUse`); the same command without `with` sees none. `check-login`: one `with` request from the terminal the Applications menu opens, and one naming `/dev/blk/0`, refused because it is not in the view |
 | B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |

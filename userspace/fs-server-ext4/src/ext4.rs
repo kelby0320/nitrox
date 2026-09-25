@@ -22,6 +22,8 @@ const SUPER_MAGIC: u16 = 0xEF53;
 /// Byte offset of `s_state` from the device's start: the superblock at 1024, `s_state` at 58
 /// within it.
 const S_STATE_AT: u64 = 1024 + 58;
+/// Where the superblock keeps `s_volume_name`: 16 bytes, NUL-padded.
+const S_VOLUME_NAME_AT: u64 = 1024 + 120;
 /// `s_state`'s "cleanly unmounted" bit (`EXT4_VALID_FS`).
 const STATE_CLEAN: u16 = 0x0001;
 const ROOT_INO: u32 = 2;
@@ -822,6 +824,16 @@ pub fn was_left_clean<R: BlockReader>(r: &R) -> Result<bool, FsError> {
     let mut s = [0u8; 2];
     r.read_at(S_STATE_AT, &mut s)?;
     Ok(u16::from_le_bytes(s) & STATE_CLEAN != 0)
+}
+
+/// **The filesystem's own label**, `s_volume_name`, written into `out`: returns how many bytes of
+/// it are meaningful. Sixteen bytes, NUL-padded, with no terminator when all sixteen are used, and
+/// empty when none was given, which is what `mke2fs` leaves without `-L`. The storage service
+/// names a mount by it (administration Part C.5). `Err` if the device holds no ext4 filesystem.
+pub fn volume_label<R: BlockReader>(r: &R, out: &mut [u8; 16]) -> Result<usize, FsError> {
+    read_superblock(r)?;
+    r.read_at(S_VOLUME_NAME_AT, out)?;
+    Ok(out.iter().position(|&b| b == 0).unwrap_or(out.len()))
 }
 
 /// Record that the filesystem is **mounted writable**: clear the "cleanly unmounted" bit,

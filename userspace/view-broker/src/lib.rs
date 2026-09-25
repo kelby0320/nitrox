@@ -35,13 +35,18 @@ pub mod policy {
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
 
-    /// Something a profile grants. **Part A knows one**; each later part adds its own, and a
+    /// Something a profile grants. **Part A knew one**; each later part adds its own, and a
     /// policy naming a grant this broker does not know is refused rather than ignored — a grant
     /// silently dropped is an administrator who believes they can do something they cannot.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Grant {
-        /// Every block device, raw: `/dev/blk/<n>` and its `info`, bound one by one.
+        /// Every block device **not in use**, raw: `/dev/blk/<n>` and its `info`, bound one by
+        /// one. Since administration Part C.6 the storage service's `InUse` is asked first, and a
+        /// mounted filesystem's device and the disk under it are left out.
         Disks,
+        /// Mounting and unmounting: the storage service's admin endpoint, bound at
+        /// `/dev/storage/admin` (administration Part C.6).
+        Storage,
     }
 
     impl Grant {
@@ -49,6 +54,7 @@ pub mod policy {
         pub fn from_name(name: &str) -> Option<Grant> {
             match name {
                 "disks" => Some(Grant::Disks),
+                "storage" => Some(Grant::Storage),
                 _ => None,
             }
         }
@@ -57,12 +63,13 @@ pub mod policy {
         pub fn name(self) -> &'static str {
             match self {
                 Grant::Disks => "disks",
+                Grant::Storage => "storage",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
-    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks];
+    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks, Grant::Storage];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -672,6 +679,69 @@ pub mod slots {
     }
 }
 
+pub mod exits {
+    //! Which program exited, and with what code: a life channel closing, paired with a
+    //! `ChildExited`.
+    //!
+    //! **Either can come first.** `sys_process_exit` closes the program's handle table, its life
+    //! channel's end included, before it queues `ChildExited`, so that a peer's `PeerClosed` is
+    //! prompt. On another CPU the broker can see the close while the code is still to come. A
+    //! closed channel stays ready, so the broker must also stop waiting on it
+    //! ([`Exits::is_closed`]); otherwise every wake until the code arrives reports it again.
+    //!
+    //! **A first version pushed the life on every report** (administration C.7, found by
+    //! `boot-probe` under KVM). A life reported twice left a copy behind. That copy then took the
+    //! next program's code and matched no program, and the code was lost. That program's life
+    //! then never paired: it was queued again on every wake until the broker ran out of memory.
+    //!
+    //! Codes are still paired first with first. **Two exits in one wake can swap codes**, which is
+    //! the residual of `TODO(child-exit-attribution)`.
+
+    use alloc::collections::VecDeque;
+
+    /// Closed life channels waiting for a code, and codes waiting for a closed life channel.
+    #[derive(Debug, Default)]
+    pub struct Exits {
+        closed: VecDeque<u64>,
+        codes: VecDeque<(i32, bool)>,
+    }
+
+    impl Exits {
+        /// Life channel `life` closed. **Queued once**, however many times it is reported.
+        pub fn closed(&mut self, life: u64) {
+            if !self.closed.contains(&life) {
+                self.closed.push_back(life);
+            }
+        }
+
+        /// Whether `life` has closed and waits for its code. The broker does not wait on it again.
+        pub fn is_closed(&self, life: u64) -> bool {
+            self.closed.contains(&life)
+        }
+
+        /// A `ChildExited`: its code, and whether the program crashed.
+        pub fn code(&mut self, code: i32, crashed: bool) {
+            self.codes.push_back((code, crashed));
+        }
+
+        /// The next closed life that is still `running`, with its code, taken out. **A closed life
+        /// that is no longer running is dropped without taking a code**, which then goes to the
+        /// next life. `None` if no pair is ready yet.
+        pub fn next(&mut self, running: impl Fn(u64) -> bool) -> Option<(u64, i32, bool)> {
+            while let Some(&life) = self.closed.front() {
+                if !running(life) {
+                    self.closed.pop_front();
+                    continue;
+                }
+                let (code, crashed) = self.codes.pop_front()?;
+                self.closed.pop_front();
+                return Some((life, code, crashed));
+            }
+            None
+        }
+    }
+}
+
 pub mod suffix {
     //! What a resolve that reached the broker asked for.
     //!
@@ -717,6 +787,7 @@ pub mod suffix {
 
 #[cfg(test)]
 mod tests {
+    use super::exits::Exits;
     use super::pacing::{FAIL_DELAY_NS, Held, Pacing};
     use super::policy::*;
     use super::sessions::Sessions;
@@ -792,6 +863,18 @@ auth = "password"
         let deny = |s: &str| Decision::Deny(s.into());
         assert_eq!(p.decide("bob", "admin", "nxsh"), deny("no rule lets bob use `admin`"));
         assert_eq!(p.decide("alice", "nope", "x"), deny("there is no view called `nope`"));
+    }
+
+    /// **`storage` is a grant** (administration Part C.6), named beside `disks` and kept in the
+    /// order the policy gives, and the refusal of an unknown grant names it among the ones there are.
+    #[test]
+    fn storage_is_a_grant_a_policy_can_name() {
+        let p = parse("[profile.admin]\ngrants = [\"disks\", \"storage\"]\n").unwrap();
+        assert_eq!(p.profiles[0].grants, [Grant::Disks, Grant::Storage]);
+        assert_eq!(Grant::from_name("storage"), Some(Grant::Storage));
+        assert_eq!(Grant::Storage.name(), "storage");
+        let e = parse("[profile.admin]\ngrants = [\"power\"]\n").unwrap_err();
+        assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
     }
 
     #[test]
@@ -969,6 +1052,48 @@ auth = "password"
         let none = Load { supervisors: 1, ..one };
         assert!(!none.admits_supervisor(MAX));
         assert!(!none.admits_client(MAX));
+    }
+
+    /// **A life reported closed twice before its code is queued once**: the case `boot-probe` hit
+    /// under KVM. The copy the first version left took the next program's code, matched nothing,
+    /// and lost it.
+    #[test]
+    fn a_life_reported_closed_twice_takes_one_code_and_leaves_the_next_one_alone() {
+        let mut e = Exits::default();
+        let mut running = alloc::vec![7u64, 9];
+        e.closed(7);
+        assert!(e.is_closed(7));
+        assert_eq!(e.next(|l| running.contains(&l)), None, "no code yet");
+        e.closed(7);
+        e.code(0, false);
+        assert_eq!(e.next(|l| running.contains(&l)), Some((7, 0, false)));
+        assert!(!e.is_closed(7));
+        running.retain(|&l| l != 7);
+        e.closed(9);
+        e.code(3, true);
+        assert_eq!(e.next(|l| running.contains(&l)), Some((9, 3, true)), "the next program's code is its own");
+        assert_eq!(e.next(|_| true), None);
+    }
+
+    /// **A closed life whose program is gone takes no code**: the code goes to the next one.
+    #[test]
+    fn a_life_no_longer_running_takes_no_code() {
+        let mut e = Exits::default();
+        e.closed(5);
+        e.closed(6);
+        e.code(1, false);
+        assert_eq!(e.next(|l| l == 6), Some((6, 1, false)));
+        assert!(!e.is_closed(5), "dropped on the way");
+    }
+
+    /// **A code can come first**, and waits for its close.
+    #[test]
+    fn a_code_before_its_close_waits_for_it() {
+        let mut e = Exits::default();
+        e.code(2, false);
+        assert_eq!(e.next(|_| true), None);
+        e.closed(4);
+        assert_eq!(e.next(|l| l == 4), Some((4, 2, false)));
     }
 
     #[test]

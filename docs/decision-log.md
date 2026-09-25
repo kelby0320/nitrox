@@ -29285,3 +29285,513 @@ Two host tests go through the registration. Five controls each fail one:
 entry now records what C.1 built: the self-pin, and `sys_ns_sync`. It also says what is owed. C.5's
 unmount and Part E's shutdown must call it, and a file served with id `0` is still uncached. No
 in-tree server sends a zero id, so that part carries its own trigger.
+
+## 2026-09-25 — Administration C.5a: the storage service sees what is there
+
+**C.5 lands in three parts**, as C.1 did in two. A service that mounts, unmounts and answers
+`Storage` is too much to verify in one step, and each part here has a boot that shows it:
+- **C.5a** reads and reports;
+- **C.5b** mounts (auto-mount, labels, a namespace per mount, `SUBNAMESPACE`, the session endpoint);
+- **C.5c** unmounts and speaks `Storage`.
+
+**What landed:**
+- **`storage-service` owns `block`.** `init` spawns it straight after the device manager, so
+  first-come ownership is met by coming first. The subscription stays open for the service's life.
+- **It probes each device** and closes the node after, since nothing here writes:
+  - ext4 through `fs-server-ext4`'s own `check_device`, so it never offers a filesystem the server
+    would refuse, plus a new `volume_label` and the C.3 state;
+  - FAT from its boot sector;
+  - otherwise nothing.
+- **It matches `init.toml`'s mounts to their devices**, decides whether this is a live boot, and
+  serves `/svc/storage/info`: `all.tsm` and a table per device, named as `/dev/devices` names them.
+  It logs a line per device.
+- **`init.toml`'s parser moved into `libinittoml`**, since it has two readers now and they must not
+  read it differently. `init` re-exports it at its old paths.
+- **`boot-probe`**: `block` is refused now, and a new check reads the table on a boot (below).
+- **`check-live` asserts the service calls its boot a live one.** It is the only gate whose root is
+  on a RAM disk, so the only place the live-boot rule's input is real rather than a host test's.
+
+**Decisions:**
+1. **A UUID source is matched through the parent disk's table.** The registry carries a partition's
+   name, parent and size, and not its GUID. The kernel publishes a disk's partitions in table order
+   and skips unused entries. So the k-th entry `libgpt` reads is the k-th partition record under
+   that disk, confirmed by name and size. `libgpt` holds eight entries and checks both checksums,
+   where the kernel does neither, so a UUID on a disk with more than eight partitions, or a damaged
+   table, is reported unmatched rather than guessed.
+2. **FAT needs four marks**: the signature, a sector size, the extended boot signature, and the type
+   string. The host tests read real bytes, not ones written for them: sectors `mformat` wrote, and
+   the image builder's own protective MBR, which has the signature and none of the rest.
+3. **`clean` is `Null` for a filesystem mounted writable**, in the table and in the log. A writable
+   mount clears the bit before Ready, so the state says "in use" and nothing about how it was left.
+   The first log line said a mounted root was "not left clean", which was true of the bits and
+   false of the filesystem.
+4. **No syscaps until they are used.** The plan spawns the service with `BIND_NAMESPACE`. C.5a builds
+   no namespace, so the grant comes with C.5b's.
+5. **B.2's subscription check changed as the plan said.** The probe asserts `block` refused, as it
+   does `input`. The replay reaching its owner is now the storage check's row per block record. The
+   replay settling before its resolve completes, one owner at a time, and a retake are the manager's
+   host tests and B.2's recorded controls, since taking the class on a boot would take the disks
+   from their owner.
+
+**The first boot failed the new check**, and the check was right. The service logged `no init.toml
+it could read`, so no row was `init`'s and the root check failed. It had resolved the manifest with
+`MAP_READ` only, and `sys_handle_stat`, which it used to size the mapping, needs `INSPECT`
+(`syscall-abi.md`). It asks for both now, and the read names each way it can fail: it did not
+resolve, would not map, is not UTF-8, or did not parse.
+
+**Controls:**
+- 11 on the library's host tests, each failing its test:
+  - FAT without each of its four marks, and with `NO NAME` kept as a label;
+  - ext4 by its magic instead of `check_device`;
+  - a label matching any kind;
+  - a UUID position unconfirmed;
+  - a GUID not byte-swapped;
+  - a live boot through the RAM disk only;
+  - `clean` shown while mounted writable;
+  - an empty table name.
+- 2 on `volume_label`: reading past the NUL, and the wrong field.
+- 4 boots, each failing the verdict at its check:
+  - `block` never taken;
+  - `init`'s mounts recorded as the service's;
+  - FAT never recognised;
+  - the rows out of registry order.
+- 1 `check-live`, with the rule answering "not live", which times out on the new line.
+
+## 2026-09-25 — Administration C.5b: the storage service mounts, and a test image has a disk to mount
+
+**What landed:**
+- **Auto-mount.** Every ext4 `init` did not mount is mounted at boot, read-only on a live boot.
+  - Each gets an `fs-server-ext4` from `/bin`, handed a duplicate of the node narrowed to the
+    mode, so a read-only mount's server holds no `WRITE`.
+  - Each gets a namespace of its own with that server at `/`.
+  - The service keeps each server's control channel for C.5c's unmount, and drops a mount whose
+    server exits.
+- **Labels**: the filesystem's own, else its partition's name, else `blk-<n>`, each only if valid,
+  and a clash takes `-2`, `-3`, … in registry order. A valid label is printable ASCII with no `/`,
+  not hidden, with no space at either end, and 64 bytes at most.
+- **`fs`**: a directory of labels. `fs/<label>/…` is answered with `SUBNAMESPACE`, the mount's
+  namespace with `consumed` covering `fs/<label>` and the base `/`. It is C.4's first real user.
+- **The session endpoint**, minted at `session-endpoint`, which answers `info` and `fs` and nothing
+  else, `device-mgr`'s info-only shape. C.6's supervisors will bind it at `/storage` (base `/fs`)
+  and `/dev/storage` (base `/info`).
+- **`BIND_NAMESPACE` for the service**, now that it builds namespaces. `syscaps.md` and
+  `userspace/CLAUDE.md` name it beside the view broker as a server that constructs namespaces and
+  is registered by `init`.
+
+**The maintainer's call: a test image carries a scratch filesystem.** `test-qemu`'s disk holds
+only `init`'s root and the FAT ESP, so nothing on a test boot was mountable, and the plan's
+`check-storage` topology is C.8's. Three ways were weighed:
+- a test-only RAM disk;
+- building C.8's live `--selftest` image first;
+- host tests only until C.8.
+
+The first was chosen. A test image's ESP carries `scratch.img`, 8 MiB of ext4 labelled
+`nitrox-scratch` with a `README`, as a second Limine module, which the kernel publishes as a RAM
+disk. `boot-probe` mounts, reads and writes through `/svc/storage` on every run, and C.5c will
+unmount there. It is a machine difference, not a software one: the programs are the release
+programs, and a release boot has one disk fewer.
+
+**Its cost arrived at once.** A RAM disk is published before any partition, so a test image's ESP
+became `/dev/blk/2`, and two things had written its index down:
+- `test-qemu`'s hardware facts expected `/dev/blk/1 is a partition … named NITROX_ESP`. The line is
+  now matched by what it says, not where it lands.
+- The harness's block demo read `/dev/blk/1` as "the first GPT partition", read the RAM disk,
+  and printed `/dev/blk/1 (partition) read OK (no 0x55AA sig)`. That passed, called a RAM disk a
+  partition, and had silently stopped proving that the partition layer rebases. It takes its
+  devices from the registry now, as B.5 made everything else do, and reads the ESP's boot signature
+  through the partition again.
+
+**The first mount hung the probe, for two reasons.** The `SUBNAMESPACE` reply's namespace was
+duplicated with `LOOKUP` alone, and every handle a send moves needs `TRANSFER`
+(`syscall-abi.md`), so the send failed. The reply path then closed the handle and answered nothing,
+so the probe's resolve, which the kernel waits on with no deadline, never completed. Progress lines
+between the probe's steps showed where it stopped. The namespace now carries `TRANSFER`. **And every
+reply that moves a handle refuses the resolve if the send fails** (`reply_with_handle`), which
+covers four replies: the table object, a directory, a session endpoint, and `SUBNAMESPACE`. The
+control that removes `TRANSFER` again now fails in a second with the service saying so, where it
+used to hang for the whole timeout.
+
+**Controls:**
+- 12 on the library's host tests, each failing its test:
+  - each of the label rules;
+  - the label sources' order and kind;
+  - a clash;
+  - `init`'s device mounted again;
+  - a live boot mounted writable;
+  - `consumed` one short;
+  - an empty label;
+  - a session endpoint that mints.
+- The label order was first caught only by the clash test, because in the test meant to catch it
+  every partition's name equalled its filesystem's label. A case where the two differ now catches
+  it there too.
+- 5 boots, each failing the verdict at its check:
+  - the namespace without `TRANSFER`, refused rather than hung;
+  - a session endpoint that serves everything;
+  - `consumed` not ending a component;
+  - every mount read-only;
+  - nothing auto-mounted.
+
+## 2026-09-25 — Administration C.5c: the storage service unmounts, and a finished IRP was still holding its file
+
+**What landed:**
+- **`Storage` (`0x10xx`, `rsproto-storage-ops.md`)** on an admin session, opened by any resolve on
+  the admin endpoint `/svc/storage/admin-endpoint`. A session endpoint refuses that suffix.
+  - `Mount`: a device by its table name, writable, with a label given or chosen.
+  - `Unmount`: a label, through the whole chain.
+  - `InUse`: every mounted device and the disk holding it.
+  - Who holds an admin endpoint is the view broker's `storage` grant (C.6). Until then the root
+    namespace can mint one, the `svc-auth-ungated` boundary again, and the deferral now names it.
+- **The unmount chain as the detail pass drew it.** The label leaves `fs`; `sys_ns_sync`; a
+  refusal if a file is held; `Meta::Unmount`, the server's first sender; `IoOpcode::Flush` for a
+  writable mount; then the namespace goes. A refusal before `Meta::Unmount` puts the label back
+  and changes nothing.
+- **The service keeps every device's node**, where C.5a closed an unmounted one's: an
+  administrator may mount any of them, and an unmount flushes through one.
+- **`boot-probe` unmounts the scratch disk on every run**, through an admin session bound as the
+  view broker will bind it:
+  - it is refused while the `README` is held;
+  - a file written through a mapping and never synced is on the device after the unmount, which
+    also left the filesystem clean;
+  - then a `Mount` by name brings it back, writable and holding that file.
+
+**Kernel work the detail pass had not named: `sys_ns_held` (syscall 39).** The plan's step "refused
+if any cached object is still held" needs the kernel to say so. The syscall counts a registration's
+live cached files, forgotten ones aside. The cache holds them weakly, so a live one is held by
+something: a handle, a mapping, an IRP, or a dirty file's pin on itself. Asked after
+`sys_ns_sync`, which drops the pins a write-back can clean, what is left is someone's. Syscall
+numbers are not in the ABI hash.
+
+**The first unmount after a write was refused, and nothing held the file.** A temporary print in
+`sys_ns_held` named the one held file. It was the unsynced file, and it was not dirty: the sync had
+written and cleaned it. The holder was the write-back's own IRPs. A page-cache IRP's box pins the
+file whose frames it moves, and a finished box is freed only in thread context
+(`io::block::reclaim_completed`, at the next yield, exit or idle), so for a moment after the sync
+the file was still referenced. Two measures now cover it:
+- **The kernel frees finished IRPs before it counts.** This makes the answer exact whenever each
+  finished IRP's box is already parked.
+- **The service asks up to three times, 5 ms apart, before it believes a count.** This covers an
+  IRP whose DPC is still finishing on another CPU. The DPC wakes the waiter before it parks the
+  box, so for that moment the file counts; under KVM a vCPU can be descheduled between the two.
+
+A DPC that parked the box first would close the window properly, but only if something else kept
+the `PendingOperation` alive meanwhile. `deferred_drops` is sized for entropy waiters, not one per
+IRP. So a race-free kernel answer would mean redesigning how IRP pins are released, which is out of
+proportion here.
+
+**Measured and recorded, not proven.** With neither measure the gate failed. With the drain alone,
+or the re-ask alone, it passes, so no gate distinguishes them. Keeping both rests on the DPC's
+statement order, which is an argument and not a test.
+
+**Two controls passed, and both were the test's fault:**
+- **`in_use` filtered its parent by kind**, and removing the filter changed nothing. The devices it
+  searches are all block devices, so a parent found among them is always a disk or a RAM disk. The
+  filter is gone. A case where the parent is not a block device now pins the search itself: a whole
+  disk mounted bare, whose parent is its controller.
+- **The held-count test forgot its file with nothing in flight.** `forget_file` then removes the
+  entry outright, so "a forgotten file is not counted" passed whether or not the count filtered
+  forgotten entries. The test now forgets with a read in flight.
+
+**Controls:**
+- 8 on the host:
+  - the `Mount` codec's exact length, and the `InUse` codec's count;
+  - `explicit`'s bad label, taken label, FAT, and a full table;
+  - `in_use` pushing any parent;
+  - a forgotten file counted.
+- 6 boots, each failing the verdict at its check:
+  - the unmount with no sync;
+  - held files ignored;
+  - the server never told;
+  - `InUse` without the disks;
+  - a session reaching the admin endpoint;
+  - a mounted device mounted again. That one spawned a second server over `init`'s root, which the
+    rebuilt test disk survives.
+
+## 2026-09-25 — Administration C.6: sessions reach `/storage`, and `disks` leaves out what is in use
+
+**What landed:**
+- **`/storage` and `/dev/storage` in every session and application.** Each login supervisor
+  resolves `/svc/storage/session-endpoint` itself, once, as it resolves `/svc/views/session`, so
+  nothing new travels `init`'s and `service-mgr`'s handoff channels. `libsession::build_namespace`
+  binds it at `/storage` with the base `/fs` and at `/dev/storage` with the base `/info`.
+  `desktop-session-mgr` hands it to `desktop-shell` as its eighth extra, and the shell binds it the
+  same two ways into each application. A session endpoint answers `admin-endpoint` with
+  `NotFound`, so the shell, holding it with `BIND_NAMESPACE`, cannot mint the endpoint that mounts.
+- **The `storage` grant** binds the storage service's admin endpoint at `/dev/storage/admin` in a
+  view, and a session's end unbinds it. The seeded `admin` profile has it.
+- **The `disks` grant asks `InUse` first** and hands over the rest
+  (`libsession::rebind_block_devices_except`). If the service cannot answer, the request is refused
+  rather than granted blind.
+
+**The broker resolves the storage service when first needed, not at startup.** `init` spawns it
+before the device manager and the storage service, so at startup `/svc/storage` does not exist
+yet. The admin endpoint, and an admin session of the broker's own for `InUse`, are resolved on the
+first grant that needs them. A failure is not remembered, so a service that came up later is found.
+
+**Consequences, as the detail pass said:**
+- `test-interactive` step 20b(d) expected `with admin nxinstall` to list `/dev/blk/0`, the disk
+  holding `init`'s root. It now lists the ESP, and the step asserts neither the disk nor the root
+  appears between the command and the prompt.
+- `check-login`'s 9a2 keeps its exit-code check, since the ESP is still granted. It adds
+  `with admin nxinstall /dev/blk/0 x`, whose refusal `nxinstall` logs where a release image's gate
+  can read it: `not a block device in this session`.
+- The *Gates* table's row A is reworded to match.
+
+**A probe check that proved nothing, caught by its control.** `boot-probe`'s new step first ran
+`nxinstall /dev/blk/0` in the admin view and expected exit 1. The control that handed over every
+disk passed it. `nxinstall` refuses each in-use device on this image by its own rules — the running
+root's disk, a partition, a RAM disk — so its exit code is 1 whether or not the grant withheld it.
+The step now sends a stdout pipe with the request and reads `nxinstall`'s listing back. The ESP must
+be in it, and the root's disk, the root and the mounted scratch disk must not. The same control
+then fails, naming `/dev/blk/0`.
+
+**`test-interactive`'s `/storage` check had the same weakness, found by reading the control list
+before running it.** "`list /storage` prints no error" would pass with `/storage` bound at the
+tables' base. It now also asserts that no `.tsm` appears.
+
+**Not tested on a boot:**
+- **The `storage` grant's binding**, since nothing a person runs uses `/dev/storage/admin` until
+  `disk` (C.7), whose gate the plan already gives it.
+- **The broker refusing `disks` when `InUse` is unanswered**, which needs a boot without the storage
+  service.
+
+**Controls:**
+- 2 on the broker's host tests, each failing its test: `storage` unnamed, and `storage` missing from
+  the known grants.
+- 5 boots, each failing at its check:
+  - `disks` handing over everything (`test-qemu`, against the listing);
+  - a serial session without `/storage` (`test-interactive`);
+  - one with `/storage` at the tables' base (`test-interactive`);
+  - a graphical session without it (`check-login`);
+  - a shell binding none into its applications (`check-login`).
+- The first run of the `disks` control was against the exit-code version, and it passed. That is
+  what replaced the step.
+
+## 2026-09-25 — Administration C.7: `disk`, a busy service is not a missing grant, and two supervisors lost an exit
+
+**What landed:** `disk`, a coreutil, in the store beside `with`
+([`shell-language.md`](spec/shell-language.md) §10d).
+- **`disk --list`** reads `/dev/storage/all.tsm` through the session endpoint every session has
+  (C.6), and writes the service's table as it gave it: a table on a pipe, text otherwise. It needs
+  no grant, and it is the same table a pipeline can `open` and `filter`.
+- **`disk --mount DEVICE [LABEL]`** and **`disk --unmount LABEL`** speak `Storage` on
+  `/dev/storage/admin`, which only the `storage` grant binds. Each writes a one-row table:
+  `{device, label, mounted}` and `{label, unmounted}`. A device is `/dev/blk/<n>` or `blk-<n>`,
+  and is sent as `blk-<n>`, the tables' name for it.
+- Each verb also says what happened on the console, escaped, since a terminal on a release image
+  renders nothing a gate can read.
+
+**Refusals, and whose they are.** Without the grant, `/dev/storage/admin` resolves through the
+session endpoint at the base `/info`, where nothing is called `admin`: `NotFound`. `disk` reads that
+one status as "no grant", says the storage grant is needed and names `with admin`, before the
+service is asked. Any other failure to open the session is the service's, and says so with its
+status. A refusal on the session is printed with the service's own reason.
+
+**A first version read every failed open as a missing grant**, while its doc comment said it told
+the two apart. It was found by re-reading the file before the entry, not by a gate. It mattered:
+with every admin session in use, the service answers `WouldBlock`, and `disk` told a person who
+held the grant to go and get it. `boot-probe` now takes every admin session, runs `disk --unmount`
+in the admin view with a `stderr` pipe, and asserts that the text names `WouldBlock`, does not
+mention the grant, and that the mount stayed. The same re-read found `disk` printing its console
+line twice when it had no `stderr`, since `diag` falls back to the console, and printing a typed
+label there unescaped.
+
+**The view broker lost an exit, and then ran out of memory** — a Part A bug that C.7's probe was
+the first to reach. It is the first boot to run two programs in one view back to back.
+- **The symptom.** In the full gate set, `test-qemu --kvm` failed: `view-broker: PANIC` after
+  `disk --mount` exited, then `init` restarted `service-mgr` and a second `boot-probe` failed
+  against changed state. The broker's panic handler printed nothing more.
+- **Found, not guessed.** A temporary panic handler that printed the location gave `alloc.rs`:
+  "memory allocation of 16777216 bytes failed". Temporary lines in `life_closed` and `pair_exits`,
+  on a boot that panicked (the 9th of a loop), showed the chain:
+  - the first program's life was queued twice before its code came;
+  - at the next exit, the stale copy took the new code, matched no program, and dropped it;
+  - the new program's life was then queued on every wake.
+- **Why the close came first.** `sys_process_exit` closes the handle table before `exit_process`
+  queues `ChildExited` (2026-07-31), so a peer's `PeerClosed` is prompt. On another CPU the
+  broker saw the life closed with no code yet. A closed channel stays ready, so every wake until
+  the code came reported the same close again.
+- **The fix** is `view_broker::exits`, a host-tested type:
+  - a closed life is queued once;
+  - the wait set leaves out a life that is closed and waiting for its code;
+  - a closed life whose program is gone is dropped without taking a code.
+
+  Three host tests pin the orderings. **On 15 `test-qemu --kvm` boots with temporary probes,
+  all passed.** The close came before its code on 5 of them, nothing was reported twice, and
+  nothing panicked. Before the fix, 3 boots in 19 panicked.
+- **`service-mgr` had the same ordering wrong, and the next gate set showed it.** Its doc comment
+  said the notification and the endpoint's close happen under one `SCHED` hold, so both reach one
+  wake. It reaped a death found before its code as `code=unknown`, treating a normal exit as a
+  failure. `check-terminal` asserts `'boot-probe' exited code=0`, and failed that way under TCG
+  and KVM in the second full gate set, then once in 6 KVM reruns: 3 in 9. A kept transcript
+  showed `code=unknown`, and the code logged just after it.
+- **The service-mgr fix:** a wake that finds more deaths than codes waits for the rest, on the
+  notification channel alone, up to `CODE_GRACE_NS` (1 s). Only past that is an exit
+  `code=unknown`. On 12 `check-terminal --kvm` runs with a temporary probe, all passed. The wait
+  was taken in 10 of them, each time for `boot-probe`, and every exit was attributed `code=0`. The
+  probe's timing figure is not reported here, because it included its own serial print. **Why the
+  late code was 10 in 12 with the fix but about 1 in 3 before is not explained**: the check that
+  finds it runs identically in both builds.
+
+**The gates:**
+- `boot-probe` runs `disk --unmount nitrox-scratch` and then `disk --mount /dev/blk/<n>` in the
+  admin view, as `with` runs them. It checks each exit code, the row each writes, and the service's
+  table after each. Then comes the busy service, as above. This is the first boot to reach
+  `/dev/storage/admin` through a view, which C.6's entry listed as untested.
+- `test-interactive` step 20c (31 steps):
+  - `disk --list | filter mounted == "/"` prints the root's row in a session with no grant;
+  - `disk --mount /dev/blk/1` there is refused, naming the grant;
+  - `with admin disk --mount /dev/blk/1`, with a typed password, is refused by the service for the
+    ESP's FAT. A release boot has nothing the service could mount, so the service's own refusal is
+    the evidence the grant arrived. The mount that succeeds is `boot-probe`'s, on the scratch disk.
+
+**Not tested on a boot:** the console copy's escaping, and `--list` writing text when it has no
+pipe.
+
+**Controls**, 6 boots, each failing at its check:
+- the `storage` grant binding nothing (`test-qemu`, and `test-interactive` at 20c's service
+  refusal);
+- `disk` refusing the `/dev/blk/<n>` form (`test-qemu`, at the mount);
+- `--unmount` sending no label (`test-qemu`: the service answered "nothing is mounted with that
+  label");
+- `--mount` writing no table (`test-qemu`);
+- every failed open read as a missing grant, the first version's logic (`test-qemu`, at the busy
+  check).
+
+And 2 on the broker's host tests, each failing its own test:
+- a closed life queued on every report;
+- a stale life taking a code.
+
+The service-mgr fix's control is the code before it: 3 `check-terminal` failures in 9 runs.
+
+## 2026-09-25 — Administration C.8: `check-storage`, and Part C is complete
+
+**What landed:**
+- **`cargo xtask image --live --selftest`**, the test live image. It is the live stick built in
+  `--selftest` mode: that kernel, that initramfs with the live root's label, and a `root.img` with
+  the test packages, 29 MiB against the 64 MiB ceiling. It gets its own file, so it never stands in
+  for the release stick.
+- **`cargo xtask check-storage`**, in CI's QEMU job. It boots the test stick as a USB stick beside a
+  copy of the release disk on the AHCI controller. On serial:
+  - the disk's `nitrox-root` is auto-mounted read-only on a live boot, and a write there is refused
+    `NoAccess`;
+  - `with admin disk` unmounts it and mounts it writable;
+  - `test-pattern --write` writes 13,522 bytes through a mapping and exits without a sync;
+  - `test-pattern --check` reads them back through `/storage`;
+  - `with admin disk --unmount` runs the chain.
+
+  With the machine stopped, the host carves the partition out and checks it: `e2fsck -fn` clean,
+  `s_state` clean, and the file holding the pattern.
+- **`test-pattern`**, a test program: one binary with `--write` and `--check`. No release program
+  writes through a mapping and lets go without a sync.
+- **`check-images` holds the test stick to a `--selftest` image**, as it holds the release stick to
+  the release image: the initramfs differs only in `etc/init.toml`, and `root.img` matches the
+  ordinary root partition file for file. The installable-ESP claim stays the release stick's
+  alone; nobody installs from a test stick.
+
+**Where the gate departs from the plan's wording, and why:**
+- **The host reads the disk mid-run as well**, after the write and before the unmount. The file is
+  there at its size without the pattern, and the superblock says mounted. Without this, a writer
+  that synced, or a background write-back, would pass the final check just as well. With it, what
+  the host finds at the end is the unmount's doing. The mid-run read is safe because QEMU writes
+  the image file as the guest writes the disk, and nothing on the filesystem moves between steps.
+- **The contents are read with `debugfs`, and `s_state` from the superblock's bytes.** The plan
+  said to read with the `fs-server-ext4` library `check-install` uses. That library is the code
+  that wrote the file, and a gate should not take its aim from the code under test. The pattern is
+  written down a second time in `xtask` for the same reason.
+- **One test program, run twice**, where the plan said "a test program … and a second". The
+  pattern is defined once in the guest.
+- **The refused write is `test-pattern --write`**, which names the kernel's status. `touch` says
+  only "cannot create file", which a refusal for any other reason would also print.
+
+**The test services run on this boot too**, since it is a `--selftest` one. `boot-probe` would fail
+its storage checks without touching `nitrox-root`, because it finds no `nitrox-scratch` and stops.
+It never started on the runs measured: it waits for `test-harness`, which was still running its
+demos when the gate ended, under both TCG and KVM.
+
+**Measured:** KVM passed 3 of 3 runs and TCG 2 of 2, the full gate set's included.
+
+**Controls**, each a `check-storage --kvm` boot, each failing at its own check:
+- the writer syncs: the mid-run host read finds the pattern already on the disk;
+- the machine stops before the final unmount: `s_state` is `0x0000`;
+- the unmount writes nothing back: the unmount is refused, because the dirty file still counts as
+  held, and the gate times out waiting for it. That is defence in depth, but it means this control
+  never reaches the contents check, hence the next control but one;
+- the server records nothing clean but says it did: only the host's `s_state` read sees it;
+- a live boot mounts the disk writable: the report line says `(rw)`;
+- the unmount writes nothing back **and** does not ask what is held. The filesystem is recorded
+  clean and its dirty pages are dropped. `e2fsck` and `s_state` pass, and only the contents check
+  fails, differing at byte 0.
+
+And 2 on `check-images`, each failing its own claim while the release stick's still passed: one
+more file on the test stick's root, and one more in its initramfs.
+
+**Part C is complete**: C.1–C.8, and its Docs box, whose items landed with the pieces that built
+them.
+
+## 2026-09-25 — PR #336 review: the table reads the disk, and an unplaced `init` mount stops all mounting
+
+The review found one blocking bug and two worth fixing, and made three optional points. All six
+are addressed.
+
+**1 (blocking): the table's `clean` was the boot's, forever.** `Device.found` was probed once at
+boot, so `disk --list` was wrong both ways:
+- a root unmounted clean went on reading "not clean", which is the laptop's flow, since its
+  installed root is never cleanly unmounted before Part E;
+- a disk whose writable server exited read "clean", as it had at boot.
+
+**The fix reads the disks where their state is read.** When a table is resolved, and before an
+administrator's mount, every device nothing has mounted is probed afresh. That covers raw writers
+through `disks` too, which the review did not name. `refresh` is the only thing that changes
+`found` after the boot.
+
+**That last point came from a control that passed.** The first fix also stored a re-read at the
+unmount, for the service's log line. With it, the control that removed the table's refresh passed,
+because the unmount's write kept the table right. The unmount now reads with `read_found`, which
+stores nothing, and the same control fails at `clean-now=true`.
+
+**The same false claim was in three log lines.** A read-only mount's `Meta::Unmount` answers Ok
+without writing, yet:
+- `fs-server-ext4` printed "the filesystem recorded clean";
+- the service logged "left clean";
+- `disk`'s text said "and left clean".
+
+The server now says a read-only mount wrote nothing. The service's line says what the device
+says, read again, plus "(read-only, so as it was found)". `disk` says only "unmounted".
+
+**The gate:** `check-storage` now clears the clean bit on its disk copy before booting, modelling
+an installed root. It asserts the report line says "not left clean", and reads `clean` from the
+table three times: no at boot, no after the read-only unmount, and yes after the writable one.
+The host's final `s_state` check now starts from a not-clean disk, so it says more than before.
+Filtering on `label` matched nothing, because the release root has no filesystem label, so the
+gate filters on the device's name.
+
+**2: when `init`'s mounts cannot all be placed, the service mounts nothing.** That covers a
+manifest that did not read, one that names no mount, and a mount that matches no device. The new
+library function `init_known` decides it, and `automount` and `explicit` take its answer:
+- the service plans nothing, and refuses an administrator's `Mount` with `NoAccess`;
+- the service refuses `InUse` too, which the review did not name. An answer would leave out a
+  root it could not place, and the broker would then have granted that disk raw. The broker
+  already refuses `disks` when `InUse` is unanswered.
+
+This is host-tested only. No gate can build a boot whose `init` mounts a root the service cannot
+match.
+
+**3: a failed `mount()` terminates and closes its server.** Every failure arm after the spawn
+goes through one `abandon`, so the process handle no longer leaks, and a server that timed out
+before `Ready` no longer runs on unmanaged. This is not tested on a boot, since no gate can make a
+server refuse after the service's probe has accepted its device.
+
+**Optional points:**
+- 4: `views-toml-schema.md`'s `disks` row says "not in use **when the view is built**".
+- 5: `storage.md` §12 names the service's own writable auto-mounts beside `init`'s as never synced
+  before power-off.
+- 6: `syscall-abi.md` states that `sys_ns_sync` and `sys_ns_held` act on the whole server, so a
+  session's count covers its whole root filesystem, and it describes the finished-IRP window that
+  `rsproto-storage-ops.md` cites.
+
+**Controls:**
+- 3 on host tests, each failing its own test: `init_known` accepting an unmatched mount,
+  `automount` ignoring it, and `explicit` ignoring it.
+- 2 `check-storage --kvm` boots, each failing at its check: the table not refreshed (after the
+  single-writer change above), and the unmount's line saying "left clean" whatever the device
+  says (run before that change, which left the line's logic as it was).

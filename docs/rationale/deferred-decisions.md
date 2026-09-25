@@ -547,15 +547,21 @@ on this boundary: their namespaces are built, and bind only `/dev/views` at thei
 **`/svc/devices` sits on it too, with a cost of its own: class ownership is first-come**
 (administration Part B, 2026-09-24; PR #333 review, optional 6). `init` binds the device manager at
 `/svc/devices` in the root namespace, and resolving `/svc/devices/<class>` makes the resolver that
-class's one owner, handed every device of it with write. `input` is taken at boot by
-`input-server`, before any declared service runs, so what is exposed is `block`, which has no owner
-until Part C's storage service subscribes: **any process holding the root namespace can take every
-disk first and hold it**, and the storage service would then be refused. It is the same trusted set
-and the same fix — a constructed namespace for supervisors and services, with `/svc/devices/block`
-bound only into the storage service's — and until then the storage service should be spawned by
-`init` before anything declared, as `input-server` is. Sessions are not on this boundary: their
+class's one owner, handed every device of it with write. Both classes are taken at boot, before
+any declared service runs: `input` by `input-server`, and since administration Part C.5a
+(2026-09-25) `block` by the storage service, which `init` spawns straight after the manager. So
+first-come is met by coming first, and what stays exposed is **the class after its owner exits**:
+nothing restarts either owner, and a process holding the root namespace could then take every disk.
+It is the same trusted set and the same fix, a constructed namespace for supervisors and services
+with `/svc/devices/block` bound only into the storage service's. Sessions are not on this boundary: their
 `/dev/devices` is an info-only endpoint the manager answers nothing but tables on
 ([`device-manager.md`](../architecture/device-manager.md) §6).
+
+**`/svc/storage` sits on it too** (administration Part C.5c, 2026-09-25). Anything holding the root
+namespace can resolve `/svc/storage/admin-endpoint`, and so mount and unmount any filesystem the
+service can serve. The view broker's `storage` grant (C.6) decides who reaches one from a view, but
+the root namespace reaches it without asking. The same fix closes it: supervisors and services
+given constructed namespaces, with `/svc/storage` bound whole only into the view broker's.
 
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
@@ -623,6 +629,22 @@ did. It does what `service-mgr` does — a *life channel* per program, a handle 
 at spawn that it never learns of, whose close says exactly *which* program exited — and pairs codes
 in arrival order. The maintainer took that over closing this entry now (2026-09-23), since two of
 the broker's programs exiting in one wake is rare and closing it needs the ABI.
+
+**A close can come before its code, and not only after a crash** (found 2026-09-25,
+administration C.7). Since 2026-07-31, `sys_process_exit` closes the exiting process's handle
+table in syscall context, before `exit_process` queues `ChildExited`, so that a peer sees
+`PeerClosed` promptly. On another CPU, a supervisor can therefore see the channel closed while the
+code is still to come.
+- **The view broker assumed the opposite.** It queued a closed life again on every wake until the
+  code came. A copy left behind took the next program's code and matched nothing, and that
+  program's life then never paired. The broker ran out of memory: 3 `test-qemu --kvm` boots in
+  19. It now queues a closed life once and stops waiting on it until its code arrives
+  (`view_broker::exits`).
+- **`service-mgr` reaped such a death with no code**: a normal exit treated as a failure, and
+  its code reported a wake later as an unsupervised child's. `check-terminal`, which asserts
+  `'boot-probe' exited code=0`, failed that way in 3 runs of 9, under TCG and KVM. A wake that
+  finds more deaths than codes now waits for the rest on the notification channel, up to
+  `CODE_GRACE_NS`.
 
 **`init` is untouched and still has the original bug**: `reap_loop` attributes the first
 `ChildExited` to its primary child without comparing the pid. Its children do not all have control
@@ -1541,7 +1563,8 @@ place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
-**Writeback when a `FileObject` is torn down — half built by administration C.1.**
+**Writeback when a `FileObject` is torn down — built for unmount by administration C.1 and C.5c;
+shutdown's half still owed.**
 
 **Before C.1 (2026-09-24)**, `sys_file_sync` was the only writeback trigger. Unmapping a
 `MAP_WRITE` VMA wrote nothing back, and a `FileObject`'s `Drop` freed its cached frames unwritten.
@@ -1555,11 +1578,19 @@ itself while dirty, so its pages outlive whoever wrote them. Such a file has a n
 which is every file `fs-server-ext4` serves. `sys_ns_sync` writes every such object under a
 registration (`filesystem-data-path.md` § *One object per file*).
 
+**What C.5c built: an unmount syncs first.** The storage service's unmount calls `sys_ns_sync`,
+refuses while a file is still held (`sys_ns_held`), and only then has the server record the
+filesystem clean ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md) § `Unmount`).
+`boot-probe` proves it on every run: a file written through a mapping and never synced is on the
+device after the unmount. **C.8's `check-storage` proves it where the host can read the result**: a
+real SATA disk, unmounted in the guest and then checked on the host. The file holds its pattern,
+`e2fsck -fn` finds the filesystem clean, and the superblock says so.
+
 **What is still owed:**
-- **Nothing calls `sys_ns_sync` before a server goes.** **Trigger, and it is scheduled**: C.5's
-  unmount and Part E's shutdown (`docs/planning/administration.md`). Each must sync before tearing
-  its server down. Otherwise it loses whatever a writer left unsynced, while still marking the
-  filesystem clean.
+- **`init`'s mounts are never unmounted, so nothing syncs them before the machine stops.**
+  **Trigger, and it is scheduled**: Part E's `shutdown` (`docs/planning/administration.md`),
+  which runs the same chain on them. Until then a file on `/` or `/home` that its writer left
+  unsynced is written only by a later sync of it.
 - **A file its server gives id `0` is uncached.** It has no self-pin and no sync can find it, so
   its unsynced mapped writes are still lost when its writer lets go. No in-tree server sends a
   zero id: `fs-server-ext4` sends the inode number. **Trigger**: the first server that serves a

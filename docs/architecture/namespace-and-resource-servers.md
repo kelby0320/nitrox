@@ -608,9 +608,13 @@ the same caller and the same `PendingOperation`, which completes when the resolv
 wherever that is.
 
 It is what lets the storage service answer for `/storage/<label>/…` without standing between a
-program and the filesystem it names. The service replies with the mount's namespace, and the file
-the program gets is installed by the mounted server's own reply, into the page cache of that
-server's registration.
+program and the filesystem it names, and since administration Part C.5b it does
+([`storage.md`](storage.md) §6). The service replies with the mount's namespace, and the file the
+program gets is installed by the mounted server's own reply, into the page cache of that server's
+registration. **The namespace handle must carry `TRANSFER`** as well as `LOOKUP`, as every handle a
+reply moves must. The storage service's first reply lacked it, the send failed, and the resolve,
+which the kernel waits on with no deadline, hung until the service learned to answer a failed send
+with an error.
 
 - **Both paths of a rename continue.** The destination must begin with the same `consumed` bytes,
   so that it is under the same answer, else `Unsupported`, the cross-filesystem result a caller

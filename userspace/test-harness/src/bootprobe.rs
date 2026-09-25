@@ -411,10 +411,16 @@ impl RootDevice {
     fn open(ns: u64) -> Option<RootDevice> {
         let labels: [&[u8]; 2] =
             [b"/dev/disk/by-partlabel/nitrox-root", b"/dev/disk/by-partlabel/nitrox-live"];
-        let device = labels.iter().find_map(|p| match ns_lookup(ns, p, RIGHT_READ) {
-            (0, h) if h != 0 => Some(h),
-            _ => None,
-        })?;
+        labels.iter().find_map(|p| RootDevice::on(ns, p))
+    }
+
+    /// Any device, by its path in `ns`: a disk the storage service mounted, read as the device
+    /// holds it (administration Part C.5b).
+    fn on(ns: u64, path: &[u8]) -> Option<RootDevice> {
+        let device = match ns_lookup(ns, path, RIGHT_READ) {
+            (0, h) if h != 0 => h,
+            _ => return None,
+        };
         // SAFETY: register-only syscall.
         let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
         if mem < 0 {
@@ -1363,7 +1369,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
         & registry_test(root_ns)
-        & devices_test(root_ns);
+        & devices_test(root_ns)
+        & storage_test(root_ns)
+        & storage_mount_test(root_ns)
+        & storage_admin_test(root_ns)
+        & storage_grant_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -1647,20 +1657,6 @@ fn read_all(h: u64) -> Option<alloc::vec::Vec<u8>> {
     Some(bytes)
 }
 
-/// Sleep `ms` milliseconds on a one-shot timer — `sys_wait` refuses an empty handle list, so a
-/// deadline alone is not a sleep. Returns at once if no timer can be made.
-fn sleep_ms(ms: u64) {
-    // SAFETY: register-only syscall; returns a handle or a negative KError.
-    let th = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
-    if th < 0 {
-        return;
-    }
-    let fire_at = clock_ns() + ms * 1_000_000;
-    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
-    unsafe { syscall4(libkern::SYS_TIMER_SET, th as u64, fire_at, 0, 0) };
-    wait_one(th as u64);
-    close(th as u64);
-}
 
 /// Close `h` if it is a handle at all.
 fn close(h: u64) {
@@ -1800,6 +1796,89 @@ fn view_broker_test(root_ns: u64) -> bool {
     }
     // SAFETY: closing our own handle; the request is done.
     unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
+
+    // 3b. **What `disks` leaves out** (administration Part C.6). The broker asks the storage
+    // service `InUse` first. `nxinstall` with no operand writes the devices it can reach to stdout
+    // as a table, so a pipe goes with the request and the listing is read back and held to the
+    // registry: **the ESP is in it, and the disk holding `init`'s root, the root itself and the
+    // mounted scratch disk are not**.
+    //
+    // **The listing, not an exit code.** The first version ran `nxinstall /dev/blk/0` and wanted 1.
+    // A control that handed over every disk passed it, because `nxinstall` refuses each in-use
+    // device by its own rules whether or not the grant withheld it: the running root's disk, a
+    // partition, a RAM disk.
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    use libkern::device::DeviceKind;
+    let path = |r: &libkern::device::DeviceRecord| r.block_index().map(|n| alloc::format!("/dev/blk/{n}"));
+    let root_part = registry.iter().find(|r| r.kind() == DeviceKind::Partition && r.name() == b"nitrox-root");
+    let esp = registry.iter().find(|r| r.kind() == DeviceKind::Partition && r.name() == b"NITROX_ESP").and_then(path);
+    let root = root_part.and_then(path);
+    let disk = root_part.and_then(|p| registry.iter().find(|r| r.id == p.parent)).and_then(path);
+    let scratch = registry.iter().find(|r| r.kind() == DeviceKind::RamDisk).and_then(path);
+    let (Some(esp), Some(root), Some(disk), Some(scratch)) = (esp, root, disk, scratch) else {
+        return fail(b"the registry has no ESP, root, root disk and scratch disk to hold the grant to");
+    };
+    let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let (mut out_w, mut out_r) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let piped = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) } == 0;
+    if st != 0 || cli == 0 || copy <= 0 || !piped {
+        return fail(b"a client, a copy and a pipe to ask what disks leaves out");
+    }
+    let copy = copy as u64;
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    unsafe { syscall4(SYS_NS_UNBIND, copy, blk.as_ptr() as u64, blk.len() as u64, 0) };
+    let Some(n) = build_request(&mut req, REQ_STDOUT, b"admin", b"nxinstall", &[], b"") else {
+        return fail(b"build a request");
+    };
+    match views_call(cli, OP_VIEWS_REQUEST, 5, &req[..n], &[copy, out_w], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _))) => {}
+        _ => return fail(b"a request with a stdout did not ask for a password"),
+    }
+    match views_call(cli, OP_VIEWS_PASSWORD, 6, DEMO_PASSWORD, &[], &mut exited) {
+        Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
+        _ => return fail(b"nxinstall with a stdout did not start"),
+    }
+    let listing = libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive();
+    close(out_r);
+    let code = match exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) {
+        Some(body) => parse_exited(&body),
+        None => None,
+    };
+    // SAFETY: closing our own handle; the request is done.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
+    let mut granted: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let decoded = listing.ok().is_some_and(|bytes| {
+        let Ok(mut tr) = libstream::table::TableReader::new(&bytes) else {
+            return false;
+        };
+        loop {
+            match tr.next() {
+                Some(Ok(libstream::table::Item::Row(vals))) => match vals.first() {
+                    Some(libstream::wire::Value::Str(p)) => granted.push(p.clone()),
+                    _ => return false,
+                },
+                Some(Ok(libstream::table::Item::End(_))) | None => return true,
+                _ => return false,
+            }
+        }
+    });
+    if !decoded || code != Some((0, false)) {
+        return fail(b"nxinstall's listing in the admin view did not read");
+    }
+    for (what, p) in [(&b"the disk holding init's root"[..], &disk), (b"init's root", &root), (b"the mounted scratch disk", &scratch)] {
+        if granted.contains(p) {
+            Line::new().s(b"boot-probe: view broker: disks granted ").s(what).s(b", ").s(p.as_bytes()).s(b", which is in use").end();
+            return fail(b"the disks grant handed over a device in use");
+        }
+    }
+    if !granted.contains(&esp) {
+        return fail(b"the disks grant withheld the ESP, which nothing has mounted");
+    }
 
     // 4. **A client let in can always start its program.** Open clients until the broker refuses
     // one, then start a program on the last it let in: that program's exit must still be heard.
@@ -2092,8 +2171,6 @@ fn registry_test(root_ns: u64) -> bool {
 ///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
 ///   and `info` opens the directory.
 fn devices_test(root_ns: u64) -> bool {
-    use libkern::device::DeviceKind;
-    use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived, parse_settled};
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: devices: ").s(what).s(b" FAIL").end();
         false
@@ -2104,85 +2181,19 @@ fn devices_test(root_ns: u64) -> bool {
     let Some(registry) = registry_records(root_ns) else {
         return fail(b"the registry does not read");
     };
-    let block_ids: alloc::vec::Vec<u32> = registry
-        .iter()
-        .filter(|r| matches!(r.kind(), DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk))
-        .map(|r| r.id)
-        .collect();
 
-    // A subscription's replay: the ids that arrived, each with a device node, and what `Settled`
-    // counted. **Read without waiting**, because the manager queues all of it before the resolve
-    // completes. This states the property rather than guarding it: a manager that replied first
-    // and sent after passes whenever its sends beat this process's wake, as they did in the boot
-    // that tried it. `subscribe`'s order is what holds it.
-    let read_replay = |owner: u64| -> Result<(alloc::vec::Vec<u32>, Option<u32>), &'static [u8]> {
-        let mut arrived = alloc::vec::Vec::new();
-        loop {
-            let Some(m) = receive(owner, 0) else {
-                return Err(b"the replay was not queued when the subscription completed");
-            };
-            let node_ok = m.handles.len() == 1
-                && stat(m.handles[0]).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
-            m.handles.iter().for_each(|&h| close(h));
-            if m.op == OP_DEVICES_SETTLED {
-                return Ok((arrived, parse_settled(&m.body)));
-            }
-            if m.op != OP_DEVICES_ARRIVED || !node_ok {
-                return Err(b"a replay message was not an arrival carrying a device node");
-            }
-            let Some(rec) = parse_arrived(&m.body) else {
-                return Err(b"an arrival's body is not a record");
-            };
-            arrived.push(u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]));
-        }
-    };
-    let replayed_the_registry = |owner: u64| match read_replay(owner) {
-        Ok((arrived, settled)) if arrived == block_ids && settled == Some(block_ids.len() as u32) => Ok(()),
-        Ok((arrived, _)) => {
-            Line::new().s(b"boot-probe: devices: ").u(arrived.len() as u64).s(b" arrived, ").u(block_ids.len() as u64).s(b" block records").end();
-            Err(&b"the replay is not the registry's block devices"[..])
-        }
-        Err(what) => Err(what),
-    };
-
-    // Subscribe, and read the replay.
-    let (st, owner) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-    if st != 0 || owner == 0 {
-        return fail(b"/svc/devices/block would not subscribe");
-    }
-    if let Err(what) = replayed_the_registry(owner) {
-        close(owner);
-        return fail(what);
-    }
-
-    // One owner at a time.
-    let (st, second) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-    close(second);
+    // **`block` has its owner from boot on** (administration Part C.5): `init` spawns the storage
+    // service straight after the manager and waits for its `Ready`, which comes only after it has
+    // subscribed and settled. So `block` is refused here, as `input` is below. Until C.5 the probe
+    // took the class itself, to see the replay settle before its resolve completed, a second owner
+    // refused, and the class taken again once closed. Those stay the manager's host tests and B.2's
+    // recorded controls, since taking the class now would take the disks from their owner. That
+    // the replay reaches its owner is `storage_test`'s: a row per block record.
+    let (st, block) = ns_lookup(root_ns, b"/svc/devices/block", chan);
+    close(block);
     if st != libkern::KError::AlreadyExists.as_i32() {
-        close(owner);
-        Line::new().s(b"boot-probe: devices: a second subscription answered ").i(st as i64).end();
-        return fail(b"a second owner was not refused");
-    }
-    close(owner);
-    // The manager notices the close in its own time; a subscription sent before it has is refused
-    // like any other, so ask a few times.
-    let mut retaken = 0;
-    for _ in 0..50 {
-        let (st, again) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-        if st == 0 {
-            retaken = again;
-            break;
-        }
-        sleep_ms(20);
-    }
-    if retaken == 0 {
-        return fail(b"the class was not taken again once its owner closed");
-    }
-    // A new owner is sent the whole class again, not what the last one left.
-    let again = replayed_the_registry(retaken);
-    close(retaken);
-    if let Err(what) = again {
-        return fail(what);
+        Line::new().s(b"boot-probe: devices: a subscription to block answered ").i(st as i64).end();
+        return fail(b"block is not held, so the storage service did not take the disks");
     }
 
     // `input` has its owner from boot on: `init` waits for `input-server`'s `Ready`, which comes
@@ -2283,11 +2294,680 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"all.tsm has not a row per device");
     }
     Line::new()
-        .s(b"boot-probe: devices: block replayed ")
-        .u(block_ids.len() as u64)
-        .s(b" and settled before the resolve completed, a second owner refused, taken and replayed again once closed, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
+        .s(b"boot-probe: devices: block held by the storage service, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
         .u(rows as u64)
         .s(b" rows ok")
+        .end();
+    true
+}
+
+/// The test image's scratch filesystem: its label, and what its `README` says. The image builder
+/// writes both (`SCRATCH_LABEL` and `SCRATCH_README` in `tools/xtask`); a copy that drifted from
+/// its text fails the read below, which is the point of keeping two.
+const SCRATCH_README: &[u8] = b"nitrox-scratch: a test image's second filesystem, mounted by the storage service\n";
+
+/// **A filesystem the storage service mounted, reached through it** (administration Part C.5b).
+///
+/// The scratch disk is a RAM disk, and the service auto-mounted it at boot. Every step below goes
+/// through `/svc/storage`, so the service answers `fs/nitrox-scratch/…` with `SUBNAMESPACE`, and
+/// the kernel continues the resolve in the mount's own namespace, to the server the service spawned.
+/// 1. `fs` lists the label, as a directory.
+/// 2. The `README` the image builder wrote reads through the service.
+/// 3. **A file created and written through the service reaches the device**, read back from the
+///    RAM disk itself, since a re-resolve would only read the page cache. A create is a resolve
+///    with a size, so this also carries C.4's continued operation through a real server.
+/// 4. **A session endpoint, bound as a login supervisor will bind it** (C.6): at `/storage` with
+///    the base `/fs`, and at `/dev/storage` with the base `/info`, in a namespace the probe builds.
+///    The same file and the same table come back. Bound with no base, it will not mint another
+///    endpoint.
+/// 5. A label nothing is mounted under is `NotFound`.
+fn storage_mount_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage mount: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let read = |ns: u64, path: &[u8]| {
+        let (st, h) = ns_lookup(ns, path, RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        bytes
+    };
+
+    // 1. The directory of mounts.
+    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs", &mut dirbuf) else {
+        return fail(b"/svc/storage/fs is not a directory");
+    };
+    let mut listed_dir = false;
+    let mut others = 0usize;
+    let listed = dir.read_dir(|e| {
+        if e.name == b"nitrox-scratch" {
+            listed_dir = e.kind == librsproto::file::DIRENT_KIND_DIR;
+        } else if e.name != b"." && e.name != b".." {
+            others += 1;
+        }
+        true
+    });
+    dir.close();
+    if listed.is_err() || !listed_dir || others != 0 {
+        return fail(b"/svc/storage/fs is not the one directory nitrox-scratch");
+    }
+
+    // 2. A file the image builder wrote, through the service.
+    if read(root_ns, b"/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
+        return fail(b"the scratch disk's README did not read through /svc/storage");
+    }
+
+    // 3. A file made through the service reaches the device.
+    const LEN: u64 = 3 * PAGE + 100;
+    let path = b"/svc/storage/fs/nitrox-scratch/probe-write";
+    let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, path, LEN) else {
+        return fail(b"a file would not create through /svc/storage");
+    };
+    let Some(addr) = map_file(fh, LEN, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
+        close(fh);
+        return fail(b"the created file would not map writable");
+    };
+    let pattern = |i: u64| (i * 7 + 3) as u8;
+    for i in 0..LEN {
+        // SAFETY: `LEN` bytes are mapped writable at `addr`.
+        unsafe { ((addr + i) as *mut u8).write_volatile(pattern(i)) };
+    }
+    // Unmapped before the sync, as `libfs` does, so the write-back can leave the file clean.
+    // SAFETY: unmapping this call's own mapping.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    // SAFETY: register-only syscall on a file handle this process holds.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
+    close(fh);
+    if synced != 0 {
+        return fail(b"the file made through /svc/storage would not sync");
+    }
+    let Some(t) = read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()) else {
+        return fail(b"all.tsm would not read");
+    };
+    let name_c = t.schema.fields.iter().position(|f| f.name == "name");
+    let label_c = t.schema.fields.iter().position(|f| f.name == "label");
+    let device = name_c.zip(label_c).and_then(|(n, l)| {
+        t.rows.iter().find_map(|row| match (&row[n], &row[l]) {
+            (libstream::wire::Value::Str(name), libstream::wire::Value::Str(label)) if label == "nitrox-scratch" => {
+                name.strip_prefix("blk-").map(|i| alloc::format!("/dev/blk/{i}"))
+            }
+            _ => None,
+        })
+    });
+    let Some(raw) = device.and_then(|p| RootDevice::on(root_ns, p.as_bytes())) else {
+        return fail(b"the scratch disk's device would not open raw");
+    };
+    let want: alloc::vec::Vec<u8> = (0..LEN).map(pattern).collect();
+    if raw.read_file(b"/probe-write", 0, LEN as usize).as_deref() != Some(&want[..]) {
+        return fail(b"what was written through /svc/storage is not on the device");
+    }
+    drop(raw);
+
+    // 4. A session endpoint, bound as a supervisor will bind it.
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no session endpoint at /svc/storage/session-endpoint");
+    }
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if ns <= 0 {
+        close(endpoint);
+        return fail(b"no namespace to bind the session endpoint into");
+    }
+    let ns = ns as u64;
+    let bind = |at: &[u8], base: &[u8]| {
+        // SAFETY: a namespace this process created, valid path and base, an endpoint it holds.
+        let r = unsafe {
+            syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, base.as_ptr() as u64, base.len() as u64)
+        };
+        r == 0
+    };
+    let bound = bind(b"/storage", b"/fs") && bind(b"/dev/storage", b"/info") && bind(b"/raw", b"");
+    close(endpoint);
+    if !bound {
+        close(ns);
+        return fail(b"the session endpoint would not bind as a supervisor binds it");
+    }
+    let readme = read(ns, b"/storage/nitrox-scratch/README");
+    let rows = read(ns, b"/dev/storage/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
+    let (minted, other) = ns_lookup(ns, b"/raw/session-endpoint", chan);
+    close(other);
+    close(ns);
+    if readme.as_deref() != Some(SCRATCH_README) {
+        return fail(b"/storage/nitrox-scratch/README did not read through a session endpoint");
+    }
+    if rows != Some(t.rows.len()) {
+        return fail(b"/dev/storage/all.tsm is not the table /svc/storage serves");
+    }
+    if minted != KError::NotFound.as_i32() {
+        return fail(b"a session endpoint minted another");
+    }
+
+    // 5. A label nothing is mounted under.
+    let (st, h) = ns_lookup(root_ns, b"/svc/storage/fs/no-such-label/README", RIGHT_MAP_READ);
+    close(h);
+    if st != KError::NotFound.as_i32() {
+        return fail(b"a label nothing is mounted under was not NotFound");
+    }
+    kprint(b"boot-probe: storage mount: nitrox-scratch listed, its README read and a new file written to the device through /svc/storage, the same through a session endpoint bound at /storage and /dev/storage, which minted nothing, and an unknown label NotFound ok\n");
+    true
+}
+
+/// **Unmounting and mounting, through an admin session** (administration Part C.5c), opened as the
+/// view broker will open one: the endpoint `/svc/storage/admin-endpoint` mints, bound at
+/// `/dev/storage/admin` in a namespace the probe builds, and resolved there.
+/// 1. `InUse` names the scratch disk, `init`'s root and the disk holding it, and not the ESP.
+/// 2. **An unmount is refused while a file is held**, and the mount is left as it was.
+/// 3. **A file written through a mapping and never synced survives an unmount**: the unmount's
+///    write-back is what puts it on the device, which then also says it was left clean.
+/// 4. The label is gone once unmounted, and a `Mount` by name brings the filesystem back, with the
+///    file, writable.
+/// 5. Each refusal is its own: a hidden label, `init`'s root, a device already mounted, a FAT device,
+///    an unknown label.
+/// 6. A session endpoint reaches no admin endpoint.
+fn storage_admin_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount, parse_in_use};
+    use libstream::wire::{Table, Value};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage admin: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let read = |ns: u64, path: &[u8]| {
+        let (st, h) = ns_lookup(ns, path, RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        bytes
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
+
+    // The devices, by what the table says of them.
+    let table = || read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| Table::decode(&b).ok());
+    let Some(t) = table() else {
+        return fail(b"all.tsm would not read");
+    };
+    let col = |t: &Table, name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let text = |t: &Table, row: usize, c: Option<usize>| match c.map(|c| &t.rows[row][c]) {
+        Some(Value::Str(s)) => Some(alloc::string::String::from(s.as_str())),
+        _ => None,
+    };
+    let row_where = |t: &Table, c: &str, v: &str| (0..t.rows.len()).find(|&i| text(t, i, col(t, c)).as_deref() == Some(v));
+    let (Some(scratch), Some(root), Some(esp)) = (row_where(&t, "label", "nitrox-scratch"), row_where(&t, "mounted", "/"), row_where(&t, "filesystem", "fat")) else {
+        return fail(b"the table has no scratch disk, root or ESP to work with");
+    };
+    let names: alloc::vec::Vec<alloc::string::String> = [scratch, root, esp].iter().map(|&r| text(&t, r, col(&t, "name")).unwrap_or_default()).collect();
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let id_of = |name: &str| registry.iter().find(|r| r.block_index().is_some_and(|n| alloc::format!("blk-{n}") == name));
+    let (Some(scratch_rec), Some(root_rec), Some(esp_rec)) = (id_of(&names[0]), id_of(&names[1]), id_of(&names[2])) else {
+        return fail(b"a table name matches no registry record");
+    };
+
+    // The admin session, as the view broker will reach it.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/admin-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no admin endpoint at /svc/storage/admin-endpoint");
+    }
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if ns <= 0 {
+        close(endpoint);
+        return fail(b"no namespace to bind the admin endpoint into");
+    }
+    let ns = ns as u64;
+    let at = b"/dev/storage/admin";
+    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+    let bound = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) };
+    close(endpoint);
+    let (st, admin) = if bound == 0 { ns_lookup(ns, at, chan) } else { (-1, 0) };
+    close(ns);
+    if st != 0 || admin == 0 {
+        return fail(b"/dev/storage/admin opened no admin session");
+    }
+    let mut next = 0u64;
+    let mut ask = |op: u16, body: &[u8]| -> Option<Received> {
+        next += 1;
+        if !rs_send(admin, op, next, body, &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 30_000_000_000;
+        loop {
+            let m = receive(admin, deadline)?;
+            m.handles.iter().for_each(|&h| close(h));
+            if m.request_id == next {
+                return Some(m);
+            }
+        }
+    };
+    let refused = |m: &Option<Received>, err: KError| {
+        m.as_ref().is_some_and(|m| m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32()))
+    };
+    let answered = |m: &Option<Received>| m.as_ref().is_some_and(|m| !m.error);
+    let finish = |ok: bool| {
+        close(admin);
+        ok
+    };
+
+    // 1. What is in use.
+    let mut ids = alloc::vec::Vec::new();
+    let in_use = ask(OP_STORAGE_IN_USE, &[]);
+    if !in_use.as_ref().is_some_and(|m| !m.error && parse_in_use(&m.body, |id| ids.push(id))) {
+        return finish(fail(b"InUse was not answered"));
+    }
+    let disk_of_root = root_rec.parent;
+    if !(ids.contains(&scratch_rec.id) && ids.contains(&root_rec.id) && ids.contains(&disk_of_root)) || ids.contains(&esp_rec.id) {
+        return finish(fail(b"InUse is not the scratch disk, the root and its disk, without the ESP"));
+    }
+
+    // 2. Refused while a file is held.
+    let (st, held) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/README", RIGHT_MAP_READ);
+    if st != 0 || held == 0 {
+        return finish(fail(b"the README would not open to hold"));
+    }
+    let busy = ask(OP_STORAGE_UNMOUNT, b"nitrox-scratch");
+    close(held);
+    if !refused(&busy, KError::WouldBlock) {
+        return finish(fail(b"an unmount with a file held was not refused WouldBlock"));
+    }
+    if read(root_ns, b"/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
+        return finish(fail(b"a refused unmount did not leave the mount as it was"));
+    }
+
+    // 3. A write through a mapping, never synced.
+    const LEN: u64 = 2 * PAGE + 17;
+    let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, b"/svc/storage/fs/nitrox-scratch/unsynced", LEN) else {
+        return finish(fail(b"a file would not create to write unsynced"));
+    };
+    let Some(addr) = map_file(fh, LEN, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
+        close(fh);
+        return finish(fail(b"that file would not map writable"));
+    };
+    let pattern = |i: u64| (i * 13 + 5) as u8;
+    for i in 0..LEN {
+        // SAFETY: `LEN` bytes are mapped writable at `addr`.
+        unsafe { ((addr + i) as *mut u8).write_volatile(pattern(i)) };
+    }
+    // SAFETY: unmapping this call's own mapping; the handle goes too, with no sync.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    close(fh);
+
+    // 4. Unmount, then the label is gone.
+    if !answered(&ask(OP_STORAGE_UNMOUNT, b"nitrox-scratch")) {
+        return finish(fail(b"the unmount was not answered"));
+    }
+    let (st, gone) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/README", RIGHT_MAP_READ);
+    close(gone);
+    if st != KError::NotFound.as_i32() {
+        return finish(fail(b"the label still resolved once unmounted"));
+    }
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mounted")))) != Some(None) {
+        return finish(fail(b"the table still shows the scratch disk mounted"));
+    }
+
+    // 5. On the device: the unsynced file, and a filesystem left clean.
+    let Some(raw) = RootDevice::on(root_ns, alloc::format!("/dev/blk/{}", scratch_rec.served).as_bytes()) else {
+        return finish(fail(b"the scratch disk's device would not open raw"));
+    };
+    let want: alloc::vec::Vec<u8> = (0..LEN).map(pattern).collect();
+    let on_disk = raw.read_file(b"/unsynced", 0, LEN as usize);
+    let clean = fs_server_ext4::ext4::was_left_clean(&raw);
+    drop(raw);
+    if on_disk.as_deref() != Some(&want[..]) {
+        return finish(fail(b"what was written and never synced is not on the device after the unmount"));
+    }
+    if clean != Ok(true) {
+        return finish(fail(b"the unmounted filesystem was not left clean"));
+    }
+
+    // 6. Mounted again by name — once refused a hidden label, the one moment a mountable device
+    //    exists to refuse it on.
+    let mut body = [0u8; 64];
+    let n = build_mount(&mut body, names[0].as_bytes(), b".hidden").unwrap_or(0);
+    if !refused(&ask(OP_STORAGE_MOUNT, &body[..n]), KError::InvalidArgument) {
+        return finish(fail(b"a hidden label was not refused InvalidArgument"));
+    }
+    let n = build_mount(&mut body, names[0].as_bytes(), b"").unwrap_or(0);
+    let again = ask(OP_STORAGE_MOUNT, &body[..n]);
+    if !again.as_ref().is_some_and(|m| !m.error && m.body == b"nitrox-scratch") {
+        return finish(fail(b"a Mount by name did not bring nitrox-scratch back"));
+    }
+    if read(root_ns, b"/svc/storage/fs/nitrox-scratch/unsynced").as_deref() != Some(&want[..]) {
+        return finish(fail(b"the remounted filesystem does not hold the unsynced file"));
+    }
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode")))) != Some(Some(alloc::string::String::from("rw"))) {
+        return finish(fail(b"the remount is not writable"));
+    }
+
+    // 7. Each refusal.
+    let mount = |ask: &mut dyn FnMut(u16, &[u8]) -> Option<Received>, device: &str, label: &[u8]| {
+        let mut body = [0u8; 96];
+        let n = build_mount(&mut body, device.as_bytes(), label).unwrap_or(0);
+        ask(OP_STORAGE_MOUNT, &body[..n])
+    };
+    let cases: [(&[u8], bool); 4] = [
+        (b"init's root", refused(&mount(&mut ask, &names[1], b""), KError::AlreadyExists)),
+        (b"the mounted scratch disk", refused(&mount(&mut ask, &names[0], b""), KError::AlreadyExists)),
+        (b"the ESP", refused(&mount(&mut ask, &names[2], b""), KError::Unsupported)),
+        (b"an unknown label", refused(&ask(OP_STORAGE_UNMOUNT, b"no-such-label"), KError::NotFound)),
+    ];
+    for (what, ok) in cases {
+        if !ok {
+            Line::new().s(b"boot-probe: storage admin: refusing ").s(what).s(b" was not the right error").end();
+            return finish(fail(b"a refusal"));
+        }
+    }
+
+    // 8. A session endpoint reaches no admin endpoint.
+    let (st, session) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
+    if st != 0 || session == 0 {
+        return finish(fail(b"no session endpoint"));
+    }
+    let mut req = [0u8; 64];
+    let n = librsproto::namespace::resolve_request(&mut req, chan, 0, b"admin-endpoint").unwrap_or(0);
+    let asked = rs_send(session, librsproto::OP_NS_RESOLVE, 1, &req[..n], &[]);
+    let reply = if asked { receive(session, clock_ns() + 5_000_000_000) } else { None };
+    close(session);
+    if let Some(m) = &reply {
+        m.handles.iter().for_each(|&h| close(h));
+    }
+    if !refused(&reply, KError::NotFound) {
+        return finish(fail(b"a session endpoint answered admin-endpoint"));
+    }
+    kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session ok\n");
+    finish(true)
+}
+
+/// **`disk`, through the `storage` grant** (administration Part C.7): the success path a person
+/// takes with `with admin disk`, from a view the broker built. `disk --unmount nitrox-scratch`
+/// and then `disk --mount /dev/blk/<n>` each run in the admin view with a stdout pipe. The table
+/// each writes is read back, its exit code checked, and the service's own table checked after it.
+/// This is the one boot that reaches `/dev/storage/admin` through a view — the grant's binding,
+/// which C.6 bound and nothing used until `disk`.
+///
+/// **Then a busy service, which is not a missing grant.** With every admin session taken,
+/// `disk --unmount` in the same view is refused, and what it writes on `stderr` names the service's
+/// `WouldBlock` rather than telling a person who holds the grant to go and get it.
+fn storage_grant_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::views::*;
+    use libstream::wire::Value;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage grant: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+    let Some(scratch) = registry_records(root_ns)
+        .and_then(|r| r.iter().find(|r| r.kind() == libkern::device::DeviceKind::RamDisk).and_then(|r| r.block_index()))
+    else {
+        return fail(b"no scratch disk in the registry");
+    };
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => parse_session_id(&body),
+        _ => None,
+    };
+    let Some(session) = session else {
+        close(sup);
+        return fail(b"OpenSession");
+    };
+    let client_path = alloc::format!("/svc/views/s/{session}");
+
+    // One program in the admin view: its exit code, the first row of the table it wrote, and
+    // what it wrote on `stderr`.
+    let mut run = |args: &[&[u8]]| -> Option<(i64, alloc::vec::Vec<Value>, alloc::vec::Vec<u8>)> {
+        let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        let (mut out_w, mut out_r, mut err_w, mut err_r) = (0u64, 0u64, 0u64, 0u64);
+        // SAFETY: valid writable out-params, for each of the two pipes.
+        let piped = unsafe {
+            syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) == 0
+                && syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut err_w) as u64, (&raw mut err_r) as u64, 16, 0) == 0
+        };
+        if st != 0 || cli == 0 || copy <= 0 || !piped {
+            return None;
+        }
+        let mut req = [0u8; 256];
+        let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", b"disk", args, b"")?;
+        let asked = matches!(
+            views_call(cli, OP_VIEWS_REQUEST, 1, &req[..n], &[copy as u64, out_w, err_w], &mut exited),
+            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::NeedPassword, _)))
+        ) && matches!(
+            views_call(cli, OP_VIEWS_PASSWORD, 2, DEMO_PASSWORD, &[], &mut exited),
+            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+        );
+        let listing = if asked {
+            libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive().ok()
+        } else {
+            None
+        };
+        close(out_r);
+        // Every diagnostic is one message, and the program has closed its end by now: read to
+        // the close.
+        let mut said = alloc::vec::Vec::new();
+        if asked {
+            use libstream::channel::MsgPort;
+            let mut port = libstream::channel::IpcPort::new(err_r);
+            while port.recv(&mut said).is_ok() {}
+        }
+        close(err_r);
+        let code = if asked { exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) } else { None };
+        close(cli);
+        let code = code.as_deref().and_then(parse_exited)?.0 as i64;
+        let row = listing.and_then(|bytes| {
+            let mut tr = libstream::table::TableReader::new(&bytes).ok()?;
+            match tr.next() {
+                Some(Ok(libstream::table::Item::Row(vals))) => Some(vals),
+                _ => None,
+            }
+        });
+        Some((code, row.unwrap_or_default(), said))
+    };
+    let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
+    let s = |v: &str| Value::Str(alloc::string::String::from(v));
+    let mounted_rw = || {
+        let (st, h) = ns_lookup(root_ns, b"/svc/storage/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        let t = bytes.and_then(|b| libstream::wire::Table::decode(&b).ok())?;
+        let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+        let (l, m) = (col("label")?, col("mode")?);
+        t.rows.iter().find(|r| r[l] == s("nitrox-scratch")).map(|r| r[m] == s("rw"))
+    };
+
+    let unmounted = run(&[b"--unmount", b"nitrox-scratch"]);
+    let finish = |ok: bool| {
+        let mut id = [0u8; 8];
+        let n = build_session_id(&mut id, session).unwrap_or(0);
+        let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 3, &id[..n], &[], &mut alloc::vec::Vec::new());
+        close(sup);
+        ok
+    };
+    if unmounted.map(|(code, row, _)| (code, row)) != Some((0, alloc::vec![s("nitrox-scratch"), Value::Bool(true)])) {
+        return finish(fail(b"disk --unmount nitrox-scratch in the admin view did not answer its table"));
+    }
+    if mounted_rw() != Some(false) {
+        return finish(fail(b"the table still shows nitrox-scratch mounted after disk --unmount"));
+    }
+    let path = alloc::format!("/dev/blk/{scratch}");
+    let mounted = run(&[b"--mount", path.as_bytes()]);
+    let name = alloc::format!("blk-{scratch}");
+    if mounted.map(|(code, row, _)| (code, row))
+        != Some((0, alloc::vec![s(&name), s("nitrox-scratch"), s("/storage/nitrox-scratch")]))
+    {
+        return finish(fail(b"disk --mount in the admin view did not answer its table"));
+    }
+    if mounted_rw() != Some(true) {
+        return finish(fail(b"disk --mount did not leave nitrox-scratch mounted writable"));
+    }
+
+    // Every admin session taken — the broker holds one, for `InUse` — through the admin
+    // endpoint bound in a namespace of the probe's own, as `storage_admin_test` opens one.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/admin-endpoint", chan);
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    let at = b"/admin";
+    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+    let bound = st == 0
+        && ns > 0
+        && unsafe { syscall6(SYS_NS_BIND, ns as u64, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) } == 0;
+    close(endpoint);
+    let mut held = alloc::vec::Vec::new();
+    let mut refused = 0;
+    while bound && held.len() < 8 {
+        let (st, h) = ns_lookup(ns as u64, at, chan);
+        if st != 0 {
+            refused = st;
+            break;
+        }
+        held.push(h);
+    }
+    if ns > 0 {
+        close(ns as u64);
+    }
+    let busy = if refused == KError::WouldBlock.as_i32() { run(&[b"--unmount", b"nitrox-scratch"]) } else { None };
+    for h in held {
+        close(h);
+    }
+    if refused != KError::WouldBlock.as_i32() {
+        return finish(fail(b"the admin sessions never ran out, so there is no busy service to ask"));
+    }
+    let Some((1, row, said)) = busy else {
+        return finish(fail(b"disk --unmount with every admin session taken did not exit 1"));
+    };
+    if !row.is_empty() || !says(&said, b"opened no admin session (WouldBlock)") || says(&said, b"storage grant") {
+        return finish(fail(b"disk with every admin session taken did not name the service's WouldBlock"));
+    }
+    if mounted_rw() != Some(true) {
+        return finish(fail(b"a refused disk --unmount unmounted nitrox-scratch"));
+    }
+    kprint(b"boot-probe: storage grant: disk --unmount and disk --mount ran in the admin view, each answered its table, the service agreed, and a busy service was named as busy ok\n");
+    finish(true)
+}
+
+/// **The storage service owns the disks and says what is on them** (administration Part C.5a),
+/// read through the root endpoint, since the probe runs in the root namespace.
+/// - `all.tsm` has a row per block record, in registry order: the device manager's replay reached
+///   its owner whole.
+/// - `nitrox-root` is `init`'s, at `/`, and the only row mounted there, so nothing mounts the root
+///   twice. The service mounts nothing on a boot with nothing to mount: the ESP is FAT, which it
+///   recognises and does not serve, and the disk holds only its table.
+/// - What each device holds is what the image builder put there, read off the disks on a boot:
+///   the FAT recogniser's host tests use a sector `mformat` wrote, and this is the ESP itself.
+fn storage_test(root_ns: u64) -> bool {
+    use alloc::string::String;
+    use libkern::device::{DeviceKind, DeviceRecord};
+    use libstream::wire::Value;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: storage: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let Some(registry) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let block: alloc::vec::Vec<&DeviceRecord> = registry.iter().filter(|r| r.kind().is_block()).collect();
+    let (st, table) = ns_lookup(root_ns, b"/svc/storage/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+    let bytes = if st == 0 { read_all(table) } else { None };
+    close(table);
+    let Some(bytes) = bytes else {
+        return fail(b"/svc/storage/info/all.tsm would not map");
+    };
+    let Ok(t) = libstream::wire::Table::decode(&bytes) else {
+        return fail(b"all.tsm is not a TSM1 table");
+    };
+    let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let (Some(name_c), Some(fs_c), Some(at_c), Some(by_c), Some(mode_c), Some(clean_c)) =
+        (col("name"), col("filesystem"), col("mounted"), col("by"), col("mode"), col("clean"))
+    else {
+        return fail(b"all.tsm lacks a column");
+    };
+    let text = |row: usize, c: usize| match &t.rows[row][c] {
+        Value::Str(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let name = |r: &DeviceRecord| alloc::format!("blk-{}", r.served);
+    let want: alloc::vec::Vec<String> = block.iter().map(|r| name(r)).collect();
+    let got: alloc::vec::Vec<&str> = (0..t.rows.len()).map(|i| text(i, name_c).unwrap_or("")).collect();
+    if got != want {
+        Line::new().s(b"boot-probe: storage: ").u(got.len() as u64).s(b" rows for ").u(want.len() as u64).s(b" block records").end();
+        return fail(b"all.tsm is not a row per block record, in registry order");
+    }
+    let row = |r: &DeviceRecord| want.iter().position(|n| *n == name(r));
+    let find = |kind: DeviceKind, label: &[u8]| block.iter().find(|r| r.kind() == kind && (label.is_empty() || r.name() == label)).and_then(|r| row(r));
+
+    let Some(root) = find(DeviceKind::Partition, b"nitrox-root") else {
+        return fail(b"no nitrox-root partition to check the root against");
+    };
+    let at_root: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, at_c) == Some("/")).collect();
+    if at_root != [root] {
+        return fail(b"the root is not one row, nitrox-root's");
+    }
+    if text(root, by_c) != Some("init") || text(root, mode_c) != Some("rw") || text(root, fs_c) != Some("ext4") {
+        return fail(b"the root is not init's writable ext4");
+    }
+    if t.rows[root][clean_c] != Value::Null {
+        return fail(b"a root mounted writable reported how it was left");
+    }
+    // **What the service mounted is the test image's scratch disk, and only it** (C.5b): the
+    // one filesystem on this boot that is neither `init`'s nor FAT.
+    let by_storage: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, by_c) == Some("storage")).collect();
+    let Some(scratch) = find(DeviceKind::RamDisk, b"") else {
+        return fail(b"no RAM disk: the test image's scratch module did not arrive");
+    };
+    if by_storage != [scratch] {
+        return fail(b"the service did not mount exactly the scratch disk");
+    }
+    let (Some(label_c), Some(kind_c)) = (col("label"), col("kind")) else {
+        return fail(b"all.tsm lacks a column");
+    };
+    if text(scratch, at_c) != Some("/storage/nitrox-scratch")
+        || text(scratch, mode_c) != Some("rw")
+        || text(scratch, fs_c) != Some("ext4")
+        || text(scratch, label_c) != Some("nitrox-scratch")
+        || text(scratch, kind_c) != Some("ramdisk")
+    {
+        return fail(b"the scratch disk is not mounted writable at /storage/nitrox-scratch");
+    }
+    let (Some(esp), Some(disk)) = (find(DeviceKind::Partition, b"NITROX_ESP"), find(DeviceKind::Disk, b"")) else {
+        return fail(b"no ESP or disk to check what they hold");
+    };
+    if text(esp, fs_c) != Some("fat") {
+        return fail(b"the ESP is not FAT");
+    }
+    if t.rows[disk][fs_c] != Value::Null {
+        return fail(b"the disk, which holds only its table, reported a filesystem");
+    }
+
+    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/info", &mut dirbuf) else {
+        return fail(b"/svc/storage/info is not a directory");
+    };
+    let mut names = 0usize;
+    let listed = dir.read_dir(|e| {
+        names += (e.name != b"." && e.name != b"..") as usize;
+        true
+    });
+    dir.close();
+    if listed.is_err() || names != block.len() + 1 {
+        return fail(b"the directory is not all.tsm and a file per device");
+    }
+    let (st, other) = ns_lookup(root_ns, b"/svc/storage/block", RIGHT_MAP_READ);
+    close(other);
+    if st != libkern::KError::NotFound.as_i32() {
+        return fail(b"a suffix the service does not serve was not NotFound");
+    }
+    Line::new()
+        .s(b"boot-probe: storage: a row per block record (")
+        .u(block.len() as u64)
+        .s(b"), nitrox-root init's at /, the scratch disk the service's at /storage/nitrox-scratch, the ESP fat and the disk holding its table ok")
         .end();
     true
 }

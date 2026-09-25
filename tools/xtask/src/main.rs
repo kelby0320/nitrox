@@ -357,6 +357,7 @@ fn main() -> ExitCode {
         "check-login",
         "check-fbcon",
         "check-live",
+        "check-storage",
         "check-report",
         "check-install",
         "shot",
@@ -408,7 +409,7 @@ fn main() -> ExitCode {
 
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
-        Some("image") if live => cmd_image_live(),
+        Some("image") if live => cmd_image_live_for(mode),
         Some("image") => cmd_image(mode),
         Some("qemu") => cmd_qemu(false, mode, accel, grab, size, &qargs),
         Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, size, &qargs),
@@ -440,6 +441,7 @@ fn main() -> ExitCode {
         Some("check-login") => cmd_check_login(accel, gate_size),
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
+        Some("check-storage") => cmd_check_storage(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
@@ -573,6 +575,9 @@ const COREUTILS: &[&str] = &[
     // Running a program in a view (administration Part A.5): the view broker's client, typed at a
     // shell like the rest of these.
     "with",
+    // The machine's disks (administration Part C.7): `--list` from any session, and `--mount` and
+    // `--unmount` from a view with the `storage` grant.
+    "disk",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -609,6 +614,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The device manager (administration Part B). `init` spawns it before `input-server`, which
     // takes its devices from it, and binds it at `/svc/devices`.
     "device-mgr",
+    // The storage service (administration Part C.5). `init` spawns it straight after the device
+    // manager, so it owns `block` from boot on, and binds it at `/svc/storage`.
+    "storage-service",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -628,6 +636,9 @@ const TEST_PROGRAMS: &[&str] = &[
     // The M13 Part A measurement. In the same package as the rest: it is a test program, and a
     // package per binary would claim an independence it does not have.
     "compose-bench",
+    // `check-storage`'s writer and reader (administration Part C.8): no release program writes
+    // through a mapping and lets go without a sync.
+    "test-pattern",
 ];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
@@ -674,6 +685,10 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The device manager (administration Part B). A lib + bin split: names, classes, owners and
     // the tables are host-tested, this builds the bare-target server.
     build_userspace_bin("device-mgr", None)?;
+    // The storage service (administration Part C.5). A lib + bin split: what a device holds,
+    // which of them `init` mounted, the live-boot rule and the tables are host-tested, this builds
+    // the bare-target server.
+    build_userspace_bin("storage-service", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -1432,6 +1447,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     if !built.contains("/dev/devices") {
         return Err(format!("the serial session was built without /dev/devices: ({built}").into());
     }
+    // **And the storage service's filesystems and table** (administration Part C.6).
+    if !built.contains("/storage") {
+        return Err(format!("the serial session was built without /storage: ({built}").into());
+    }
     s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
     steps += 1;
@@ -1503,6 +1522,32 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("open /dev/registry")?;
     s.expect("nxsh: cannot open /dev/registry")?;
     s.expect("/home>")?;
+    steps += 1;
+
+    // 5e. **The machine's filesystems** (administration Part C.6). The session's `/dev/storage` is
+    //     the storage service at the base `/info`: `list` names a table per device, and the row
+    //     mounted at `/` is `init`'s root, matched on `blk-2` and `init`, which the command does not
+    //     contain. `/storage` is the service at the base `/fs`: a release boot has nothing for the
+    //     service to mount, so it lists empty — and without an error, which is what says the
+    //     binding reached a directory rather than nothing.
+    s.send("list /dev/storage")?;
+    s.expect_all(&["all.tsm", "blk-0.tsm", "blk-2.tsm"])?;
+    s.expect("/home>")?;
+    s.send("open /dev/storage/all.tsm | filter mounted == \"/\"")?;
+    s.expect_all(&["blk-2", "init"])?;
+    s.expect("/home>")?;
+    let before = s.transcript().len();
+    s.send("list /storage")?;
+    s.expect("/home>")?;
+    let listed = s.transcript()[before..].to_string();
+    if listed.contains("cannot") || listed.contains("nxsh:") {
+        return Err(format!("`list /storage` failed where it should list nothing: {listed:?}").into());
+    }
+    // **And it is the filesystems, not the tables.** Both bindings are one endpoint at two bases;
+    // `/storage` at the tables' base would list without an error too.
+    if listed.contains(".tsm") {
+        return Err(format!("`list /storage` listed tables — it is bound at the wrong base: {listed:?}").into());
+    }
     steps += 1;
 
     // 6. A *failing* stage reports and returns to the prompt rather than hanging. This is
@@ -1872,7 +1917,12 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //      (d) **A wrong password, then the right one — held for the session's delay — and the
     //          grant arrived.** The right password is typed the moment the second prompt appears;
     //          the broker holds its check until two seconds after the failure, so the listing
-    //          cannot come sooner. And the listing names `/dev/blk/0`, which (a) could not.
+    //          cannot come sooner. And the listing names the ESP, `/dev/blk/1`, which (a) could not.
+    //
+    //          **And what the grant leaves out** (administration Part C.6): the broker asks the
+    //          storage service what is in use first, and `/dev/blk/0` holds `init`'s root, so the
+    //          listing never names it. Until C.6 this step expected `/dev/blk/0` — the disk under
+    //          a live server, handed over raw.
     const WRONG: &str = "not-the-password-4271";
     s.send("with admin nxinstall")?;
     s.expect("[with admin] password (1 of 3): ")?;
@@ -1880,8 +1930,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("with: wrong password")?;
     let refused = s.matched_at();
     s.expect("[with admin] password (2 of 3): ")?;
+    let listing_from = s.transcript().len();
     s.send(DEMO_PASSWORD)?;
-    s.expect("/dev/blk/0")?;
+    s.expect("/dev/blk/1")?;
     let held = s.matched_at().saturating_duration_since(refused);
     if held < std::time::Duration::from_millis(1500) {
         return Err(format!(
@@ -1891,6 +1942,16 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         .into());
     }
     s.expect("/home>")?;
+    let listing = s.transcript()[listing_from..].to_string();
+    for withheld in ["/dev/blk/0", "/dev/blk/2"] {
+        if listing.contains(withheld) {
+            return Err(format!(
+                "`with admin nxinstall` listed {withheld}, which is in use (init's root, or the disk \
+                 holding it): {listing:?}"
+            )
+            .into());
+        }
+    }
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
     s.send("with admin whoami")?;
@@ -1934,6 +1995,30 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
             return Err(format!("a password reached the console: `{secret}`").into());
         }
     }
+    steps += 1;
+
+    // 20c. **`disk`, with and without the grant** (administration Part C.7).
+    //      (a) `--list` is the storage service's table, from any session: the row mounted at `/`
+    //          is `init`'s root, matched on words the command does not contain.
+    s.send("disk --list | filter mounted == \"/\"")?;
+    s.expect_all(&["blk-2", "init"])?;
+    s.expect("/home>")?;
+    //      (b) **`--mount` without the grant is refused before the service is asked**: the
+    //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
+    //          nothing answers, and `disk` names `with`.
+    s.send("disk --mount /dev/blk/1")?;
+    s.expect("need the storage grant")?;
+    s.expect("/home>")?;
+    //      (c) **With it, the request reaches the service**, whose own reason comes back: the
+    //          ESP holds FAT, which it recognises and cannot serve. On a release boot there is
+    //          nothing it could mount, so the refusal is the evidence the grant arrived; the
+    //          successful mount and unmount through a view are `boot-probe`'s, on a test image's
+    //          scratch disk.
+    s.send("with admin disk --mount /dev/blk/1")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("it holds no filesystem this service can serve")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
@@ -3498,6 +3583,11 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // a device that fails, so a zeroed partition stops at the line above — but the check reads
     // three blocks, and `init`'s first lookup is still the first read of a file.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
+    // **The storage service knows this is a live boot** (administration Part C.5a): `init`'s root
+    // is on the RAM disk. The rule is host-tested; this is the one boot whose root is on a RAM
+    // disk, so it is the only place the rule's input is real, and the fact is what makes a
+    // machine's own disks auto-mount read-only (C.5b).
+    s.expect("storage-service: a live boot")?;
     // **And this boot is not an installer boot.** The live image's third menu entry starts a
     // session that can write every disk in the machine; the ordinary entry must not, and absence
     // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
@@ -3563,6 +3653,369 @@ fn run_live_steps(s: &mut Session) -> R<()> {
         .into());
     }
     println!("  ok: and no session on this boot could reach a disk");
+    Ok(())
+}
+
+/// The file `check-storage` writes, at the root of the SATA disk's `nitrox-root`.
+const STORAGE_PATTERN_FILE: &str = "check-storage.bin";
+/// The pattern `test-pattern` writes, **written down a second time here** so the gate does not
+/// take its aim from the program under test: `userspace/test-harness/src/pattern.rs`'s `LEN` and
+/// `byte` must match these.
+const STORAGE_PATTERN_LEN: usize = 3 * 4096 + 1234;
+
+/// Byte `i` of [`STORAGE_PATTERN_LEN`]'s pattern.
+fn storage_pattern_byte(i: usize) -> u8 {
+    ((i >> 12) as u8).wrapping_mul(0x5B) ^ (i as u8) ^ 0xA5
+}
+
+/// `cargo xtask check-storage` — **the storage chain, with the host holding the result**
+/// (administration Part C.8).
+///
+/// The test live image boots as a USB stick beside **a copy of the release disk** on the AHCI
+/// controller: the laptop with Nitrox installed and a stick in it. That is the one topology with a
+/// second disk the host can read afterwards, since the only other second disk a boot can have is a
+/// RAM disk, whose writes never reach a host file.
+///
+/// The copy's root is first marked **not cleanly unmounted**, as an installed machine's is until
+/// Part E's `shutdown`. On the serial console:
+/// - the storage service reports it so and auto-mounts it read-only, it being a live boot, and a
+///   write there is refused;
+/// - the table's `clean` column says no, and still says no after the read-only unmount, which
+///   wrote nothing;
+/// - `with admin disk` mounts it writable, and `test-pattern` writes a pattern through a mapping
+///   and **exits without a sync**. The host sees the file on the disk without the pattern;
+/// - `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount`
+///   runs the chain, after which the table says clean.
+///
+/// Then the machine is stopped, and the host carves `nitrox-root` out of the disk: `e2fsck -fn`
+/// clean, the superblock marked clean, and the file holding the pattern — read with `debugfs`,
+/// not with the library that wrote it.
+fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    require_tool("e2fsck")?;
+    require_tool("debugfs")?;
+    // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
+    // wrote. The release image is built first: building the test stick rebuilds the programs
+    // for its own mode.
+    cmd_image(BuildMode::Normal)?;
+    let work = build_cache().join("check-storage");
+    fs::create_dir_all(&work)?;
+    let disk = work.join("disk.img");
+    let _ = fs::remove_file(&disk);
+    fs::copy(image_path(), &disk)?;
+    mark_root_not_clean(&disk)?;
+    cmd_image_live_for(BuildMode::Selftest)?;
+
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_test_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-drive")
+        .arg(format!("if=none,id=disk,format=raw,file={}", disk.display()))
+        .arg("-device")
+        .arg("ide-hd,drive=disk,bus=ide.0")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!(
+        "xtask: storage gate — booting the test live image beside a copy of the release disk…\n"
+    );
+    let mut session = Session::spawn(cmd, "check-storage")?;
+    let result = run_storage_steps(&mut session, &disk, &work);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    println!("\nxtask: the machine is stopped; the disk, on the host:");
+    check_storage_disk(&disk, &work)?;
+    println!(
+        "\nxtask: a file written through a mapping and never synced reached the disk through an \
+         unmount, and the filesystem was left clean ✓"
+    );
+    Ok(())
+}
+
+/// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
+/// nothing unmounts `init`'s root until Part E's `shutdown`, so a live boot on the laptop finds its
+/// disk this way. It is also what makes the table's `clean` column mean something here: after the
+/// read-only unmount it must still say no, and only the writable one may make it say yes
+/// (PR #336 review, finding 1).
+fn mark_root_not_clean(disk: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (lba, _) = partition_extent(disk, 2)?;
+    let at = lba * 512 + 1024 + 58;
+    let mut f = fs::OpenOptions::new().read(true).write(true).open(disk)?;
+    let mut b = [0u8; 2];
+    f.seek(SeekFrom::Start(at))?;
+    f.read_exact(&mut b)?;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(&(u16::from_le_bytes(b) & !EXT4_VALID_FS).to_le_bytes())?;
+    Ok(())
+}
+
+/// The SATA disk's `nitrox-root`, as it stands in the disk image `disk`, carved into `work`.
+fn storage_root_fs(disk: &Path, work: &Path) -> R<PathBuf> {
+    let fs_img = work.join("nitrox-root.ext4");
+    carve_partition(disk, 2, &fs_img)?;
+    Ok(fs_img)
+}
+
+/// `path`'s bytes in the ext4 image `fs_img`, read with `debugfs`; `None` if it is not there.
+fn debugfs_cat(fs_img: &Path, path: &str) -> R<Option<Vec<u8>>> {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("cat {path}"))
+        .arg(fs_img)
+        .output()
+        .map_err(|e| format!("run debugfs: {e}"))?;
+    if String::from_utf8_lossy(&out.stderr).contains("not found") {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        return Err(format!("debugfs could not read {path} in {}", fs_img.display()).into());
+    }
+    Ok(Some(out.stdout))
+}
+
+/// The superblock's `s_state` in the ext4 image `fs_img`: bytes 58–59 of the superblock at 1024.
+/// Read here rather than through `fs_server_ext4::ext4::was_left_clean`, which is the code under
+/// test.
+fn ext4_s_state(fs_img: &Path) -> R<u16> {
+    let bytes = fs::read(fs_img)?;
+    let at = 1024 + 58;
+    bytes
+        .get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or_else(|| format!("{} has no superblock", fs_img.display()).into())
+}
+
+/// `s_state`'s "cleanly unmounted" bit (`EXT4_VALID_FS`) and its error bit (`EXT4_ERROR_FS`).
+const EXT4_VALID_FS: u16 = 0x0001;
+const EXT4_ERROR_FS: u16 = 0x0002;
+
+fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
+    let at = format!("/storage/{ROOT_PARTLABEL}/{STORAGE_PATTERN_FILE}");
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+
+    // 0. The menu's countdown boots its first entry, the ordinary one.
+    s.expect(", cmdline \"\"")?;
+
+    // 1. **The disk's root is auto-mounted read-only**, the boot being a live one. Its name is
+    //    what the storage service calls it, read off the line that reports it.
+    let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
+    s.expect(&reported)?;
+    let line = s
+        .transcript()
+        .lines()
+        .find(|l| l.contains(&reported))
+        .map(str::to_string)
+        .ok_or("the report line went missing from the transcript")?;
+    let name = line
+        .split_whitespace()
+        .find(|w| w.starts_with("blk-"))
+        .ok_or_else(|| format!("no `blk-<n>` in {line:?}"))?
+        .to_string();
+    let index = name.trim_start_matches("blk-").to_string();
+    if !line.contains(&format!("ext4, not left clean; mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
+        return Err(format!(
+            "the disk's {ROOT_PARTLABEL} is not reported not clean and auto-mounted read-only: \
+             {line:?}. The gate cleared its clean bit, and a live boot mounts the machine's own \
+             disks read-only"
+        )
+        .into());
+    }
+    s.expect("storage-service: a live boot")?;
+    println!(
+        "  ok: {name}, the disk's {ROOT_PARTLABEL}, not left clean and auto-mounted read-only on a \
+         live boot"
+    );
+
+    // 2. A serial login. The prompt is searched for in the whole transcript, as `check-live`
+    //    does: it and the greeter come up together.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !s.transcript().contains("nitrox login:") {
+        if std::time::Instant::now() > deadline {
+            return Err("no `nitrox login:` prompt on the serial column".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    // **The table's `clean` column, as a session reads it** — a token the typed command does not
+    // contain, so the match is the answer and not the echo. The row is found by the device's name:
+    // `label` is the filesystem's own, and this one has none.
+    let clean_now = |s: &mut Session, expected: bool| -> R<()> {
+        s.send(&format!(
+            "disk --list | filter name == \"{name}\" | map {{ |r| format(\"clean-now={{}}\", r.clean) }}"
+        ))?;
+        s.expect(&format!("clean-now={expected}"))?;
+        s.expect("/home>")?;
+        Ok(())
+    };
+    clean_now(s, false)?;
+
+    // 3. **A write there is refused**, by the read-only mount: named, rather than any failure.
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: {at} refused: NoAccess (-2)"))?;
+    s.expect("/home>")?;
+    println!("  ok: a write to it is refused NoAccess");
+
+    // 4. Unmounted, and mounted writable, through the `storage` grant.
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect("fs-server: unmounted; a read-only mount wrote nothing")?;
+    s.expect(&format!(
+        "storage-service: unmounted {ROOT_PARTLABEL}, not left clean (read-only, so as it was found)"
+    ))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    // **Still not clean**, and the table says so: it reads the device, not the unmount's word.
+    clean_now(s, false)?;
+    admin(s, &format!("disk --mount /dev/blk/{index}"))?;
+    s.expect(&format!("storage-service: mounted {ROOT_PARTLABEL} (rw), as asked"))?;
+    s.expect(&format!("disk: mounted {name} at /storage/{ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: `with admin disk` unmounted it and mounted it writable");
+
+    // 5. **Written through a mapping, and not synced.**
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!(
+        "test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not \
+         sync"
+    ))?;
+    s.expect("/home>")?;
+
+    // 6. **On the host, the file is on the disk and the pattern is not** — so what the last step
+    //    finds, the unmount put there. Read while the guest runs: QEMU writes the image file as
+    //    the guest writes the disk, and nothing on this filesystem is moving between steps. The
+    //    file's being there, at its size, is what makes the pattern's absence mean something:
+    //    this is the live filesystem the host is reading, and its data has not been written yet.
+    //    And the superblock says it is mounted writable, so a clean one at the end is the
+    //    unmount's doing.
+    let fs_img = storage_root_fs(disk, work)?;
+    let path = format!("/{STORAGE_PATTERN_FILE}");
+    match debugfs_cat(&fs_img, &path)? {
+        None => {
+            return Err(format!(
+                "{path} is not on the disk at all after `test-pattern --write`: the server's \
+                 create did not reach it, so the absence of the pattern would prove nothing"
+            )
+            .into())
+        }
+        Some(b) if b.len() != STORAGE_PATTERN_LEN => {
+            return Err(format!(
+                "{path} is on the disk at {} bytes, not the {STORAGE_PATTERN_LEN} it was created \
+                 with",
+                b.len()
+            )
+            .into())
+        }
+        Some(b) if b == pattern => {
+            return Err(format!(
+                "{path} already holds the pattern before any sync or unmount — something wrote it \
+                 back, so this gate cannot show that the unmount does"
+            )
+            .into())
+        }
+        Some(_) => {}
+    }
+    let state = ext4_s_state(&fs_img)?;
+    if state & EXT4_VALID_FS != 0 {
+        return Err(format!(
+            "the superblock says clean (s_state {state:#06x}) while the filesystem is mounted \
+             writable, so a clean one at the end would not be the unmount's doing"
+        )
+        .into());
+    }
+    println!(
+        "  ok: on the host meanwhile: the file is there at {STORAGE_PATTERN_LEN} bytes without the \
+         pattern, and the superblock says mounted"
+    );
+
+    // 7. Read back through `/storage` in the guest: from the kernel's cache, the one object.
+    s.send(&format!("test-pattern --check {at}"))?;
+    s.expect(&format!("test-pattern: {at} holds the pattern, {STORAGE_PATTERN_LEN} bytes ok"))?;
+    s.expect("/home>")?;
+    println!("  ok: test-pattern reads it back through /storage");
+
+    // 8. **The unmount**: written back, marked clean, the drive flushed.
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    // And the table, which said no after the read-only unmount, now says yes.
+    clean_now(s, true)?;
+    println!("  ok: `with admin disk --unmount` ran the chain, and the table says clean");
+    Ok(())
+}
+
+/// The disk, once the machine has stopped: `e2fsck -fn` clean, the superblock marked clean, and
+/// the file holding the pattern.
+fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
+    let fs_img = storage_root_fs(disk, work)?;
+    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
+    // `check_installed_root` reads it.
+    let out = Command::new("e2fsck")
+        .args(["-fn", &fs_img.display().to_string()])
+        .output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
+    }
+    println!("  ok: e2fsck -fn finds it clean");
+    let state = ext4_s_state(&fs_img)?;
+    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
+        return Err(format!(
+            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
+             set. The unmount's `Meta::Unmount` is what records it clean"
+        )
+        .into());
+    }
+    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    let path = format!("/{STORAGE_PATTERN_FILE}");
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+    match debugfs_cat(&fs_img, &path)? {
+        Some(b) if b == pattern => {}
+        Some(b) => {
+            let first = (0..STORAGE_PATTERN_LEN).find(|&i| b.get(i) != Some(&pattern[i]));
+            return Err(format!(
+                "{path} on the disk is {} bytes and is not the pattern (first difference at \
+                 byte {first:?}): the unmount did not write the mapped pages back",
+                b.len()
+            )
+            .into());
+        }
+        None => return Err(format!("{path} is not on the disk").into()),
+    }
+    println!("  ok: {path} holds the pattern, {STORAGE_PATTERN_LEN} bytes, read by debugfs");
     Ok(())
 }
 
@@ -4285,6 +4738,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // right after, from what was bound. The application namespaces the shell builds carry them too,
     // which the shell checks by resolving the binding and says on its `grants` line below.
     session.expect("desktop-session-mgr: session has /dev/devices")?;
+    // **And `/storage`** (administration Part C.6): the storage service's session endpoint, which
+    // the supervisor resolved itself and bound at `/storage` and `/dev/storage`.
+    session.expect("desktop-session-mgr: session has /storage")?;
     // **The leader's own line, and only it.** `libsession` logs "spawned … with its
     // environment" from the *parent* after the setup message goes out, while the child logs
     // this from its first instruction — so their order is a race between two processes, and
@@ -4377,7 +4833,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -4499,7 +4955,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the menu, so an `expect` between the two is a race between processes —
@@ -6430,6 +6886,29 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("view: alice admin nxinstall — started")?;
     session.expect("view: alice admin nxinstall — exited, code 0")?;
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
+    //      **And not the one in use** (administration Part C.6). Code 0 above says the grant bound
+    //      something, which on a release boot is the ESP alone. The disk holding `init`'s root is
+    //      `/dev/blk/0`, and naming it with an identity makes `nxinstall` log its refusal on the
+    //      console, where a release image's gate can read it: the disk is not in the session at
+    //      all. Until C.6 this step passed on that disk too, which was the weaker claim.
+    type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0 x")?;
+    session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
+    for c in DEMO_PASSWORD.chars() {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(&mut qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(&mut qmp, "ret")?;
+    session.expect("nxinstall: refused /dev/blk/0: not a block device in this session")?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
+    println!("  ok: and it did not see /dev/blk/0, the disk holding init's root");
 
     // Close the terminal from inside, so steps 11 and 12 drive the windows step 9 left.
     for qcode in ["e", "x", "i", "t"] {
@@ -10642,8 +11121,11 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // them and memory published as a disk — so a partition that called itself a disk would be a
     // partition table written over a filesystem. The capacity and the name are asserted with it:
     // they are what a person confirms a destructive operation by.
+    // **By what it is, not where it lands**: a test image's scratch RAM disk (administration Part
+    // C.5b) is published before any partition, so the ESP is `/dev/blk/2` there and would be
+    // `/dev/blk/1` without it. The disk is first in any image.
     &["test-harness: /dev/blk/0 is a disk, 128 MiB, named QEMU HARDDISK"],
-    &["test-harness: /dev/blk/1 is a partition, 48 MiB, named NITROX_ESP"],
+    &["test-harness: /dev/blk/", " is a partition, 48 MiB, named NITROX_ESP"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. Both ask for write-combining since Part G; before it,
@@ -11055,7 +11537,8 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // init's library tests (the `manifest` + `toml_lite` parsers). `--lib` skips the
+    // init's library tests (the first message a resource server sends; the `manifest` and
+    // `toml_lite` parsers moved to `libinittoml`, tested below). `--lib` skips the
     // `#![no_main]` bin, which can't build for the host.
     run(Command::new("cargo")
         .arg("test")
@@ -11236,7 +11719,8 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
     // view-broker's library tests (the policy reader, rule evaluation, the last-administrator
-    // guard, per-session pacing and session ids). `--lib` skips the `#![no_main]` server bin.
+    // guard, per-session pacing, session ids, and pairing exits with their codes). `--lib` skips
+    // the `#![no_main]` server bin.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
@@ -11251,6 +11735,27 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("device-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // storage-service's library tests (what a device holds, against real `mformat` and GPT
+    // sectors and an ext4 `mkfs` made; `init.toml`'s mounts matched to devices; the live-boot rule;
+    // the tables). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("storage-service")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libinittoml` — the `init.toml` parser, shared by `init` and the storage service since
+    // administration Part C.5, and its tests with it.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libinittoml")
         .arg("--lib")
         .arg("--target")
         .arg(&host)
@@ -12042,23 +12547,29 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// `check-images`' live half: the live image differs from the release image **only in data**.
+/// `check-images`' live half: the live image differs from the image of its mode **only in data** —
+/// the release stick from the release image, and the test stick (`image --live --selftest`) from a
+/// `--selftest` image.
 ///
 /// Three claims, each checked against what the builds produced rather than against the functions
 /// that produced them — a live build that called `stage_rootfs` and then wrote one file more would
 /// pass a check on the function (PR #297 review):
 ///
-/// 1. the live initramfs carries the release initramfs's files, byte-identical except
+/// 1. the live initramfs carries the ordinary initramfs's files, byte-identical except
 ///    `etc/init.toml`, which must differ — it names `nitrox-live`;
 /// 2. the ext4 filesystem inside the built stick's `root.img` holds the same entries as the
-///    release image's root partition — names, kinds, sizes and contents — read back out of both
+///    ordinary image's root partition — names, kinds, sizes and contents — read back out of both
 ///    with `debugfs`;
-/// 3. the FAT filesystem inside the stick's `install-esp.img` module — the ESP the installer
-///    writes to a disk — holds the same entries as the release image's own ESP. The first two
-///    are about the stick booting; this one is about the machine booting once the stick is gone.
-fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
-    let live_cpio = dir.join("live.cpio");
-    build_initramfs_for(&live_cpio, BuildMode::Normal, RootDevice::Live)?;
+/// 3. for the release stick, the FAT filesystem inside its `install-esp.img` module — the ESP the
+///    installer writes to a disk — holds the same entries as the release image's own ESP. The
+///    first two are about the stick booting; this one is about the machine booting once the stick
+///    is gone. Nobody installs from a test stick, so it is not asked of that one.
+fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
+    let tag = if mode.stages_test_data() { "live-test" } else { "live" };
+    let what = if mode.stages_test_data() { "the test live" } else { "the live" };
+    let base = if mode.stages_test_data() { "a --selftest" } else { "the release" };
+    let live_cpio = dir.join(format!("{tag}.cpio"));
+    build_initramfs_for(&live_cpio, mode, RootDevice::Live)?;
     let r = cpio_entries(&fs::read(release_cpio)?);
     let l = cpio_entries(&fs::read(&live_cpio)?);
     let mut names: Vec<&String> = r.keys().chain(l.keys()).collect();
@@ -12073,60 +12584,65 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     const MARKER: &str = "etc/install-allowed";
     if !l.contains_key(MARKER) {
         return Err(format!(
-            "the live initramfs must carry `{MARKER}`: it is what permits an installer session, \
+            "{what} initramfs must carry `{MARKER}`: it is what permits an installer session, \
              and without it the live image's own install entry does nothing"
         )
         .into());
     }
     if r.contains_key(MARKER) {
         return Err(format!(
-            "a release initramfs must not carry `{MARKER}` — it is what keeps an installer \
-             session a live-image thing rather than something any boot can ask for"
+            "{base} initramfs must not carry `{MARKER}` — it is what keeps an installer session \
+             a live-image thing rather than something any boot can ask for"
         )
         .into());
     }
     let differ: Vec<&String> = differ.into_iter().filter(|k| k.as_str() != MARKER).collect();
     if differ != ["etc/init.toml"] {
         return Err(format!(
-            "the live initramfs must differ from the release one in `etc/init.toml` alone — the \
-             root's partition label — and it differs in {differ:?}. A live image is the release \
-             image with its root in RAM; a program or a declaration that differs is a live-only \
+            "{what} initramfs must differ from {base} one in `etc/init.toml` alone — the root's \
+             partition label — and it differs in {differ:?}. A live image is the image of its \
+             mode with its root in RAM; a program or a declaration that differs is a live-only \
              build, which Part C's discipline rules out."
         )
         .into());
     }
     println!(
-        "check-images: the live initramfs is the release one but for etc/init.toml ({} files) ✓",
+        "check-images: {what} initramfs is {base} one but for etc/init.toml ({} files) ✓",
         r.len()
     );
 
     require_tool("debugfs")?;
-    cmd_image(BuildMode::Normal)?;
-    cmd_image_live()?;
-    let release_fs = dir.join("release-root.ext4");
+    cmd_image(mode)?;
+    cmd_image_live_for(mode)?;
+    let stick = if mode.stages_test_data() { live_test_image_path() } else { live_image_path() };
+    let release_fs = dir.join(format!("{tag}-base-root.ext4"));
     carve_partition(&image_path(), 2, &release_fs)?;
-    let esp = dir.join("live-esp.img");
-    carve_partition(&live_image_path(), 1, &esp)?;
-    let root_img = dir.join("live-root.img");
+    let esp = dir.join(format!("{tag}-esp.img"));
+    carve_partition(&stick, 1, &esp)?;
+    let root_img = dir.join(format!("{tag}-root.img"));
     let _ = fs::remove_file(&root_img);
     run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/root.img").arg(&root_img))?;
-    let live_fs = dir.join("live-root.ext4");
+    let live_fs = dir.join(format!("{tag}-root.ext4"));
     carve_partition(&root_img, 1, &live_fs)?;
 
-    let release_tree = ext4_tree(&release_fs, &dir.join("release-root"))?;
-    let live_tree = ext4_tree(&live_fs, &dir.join("live-root"))?;
-    let problems = tree_problems(&release_tree, &live_tree, "the live root");
+    let release_tree = ext4_tree(&release_fs, &dir.join(format!("{tag}-base-root")))?;
+    let live_tree = ext4_tree(&live_fs, &dir.join(format!("{tag}-root")))?;
+    let problems = tree_problems(&release_tree, &live_tree, &format!("{what} root"));
     if !problems.is_empty() {
         return Err(format!(
-            "the filesystem inside the live image's root.img is not the release root: {problems:?}. \
-             The live root is built from `stage_rootfs` for a release image and nothing else."
+            "the filesystem inside {what} image's root.img is not {base} image's root: \
+             {problems:?}. The live root is built from `stage_rootfs` for the image's mode and \
+             nothing else."
         )
         .into());
     }
     println!(
-        "check-images: the live root.img holds the release root's {} entries, byte for byte ✓",
+        "check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓",
         release_tree.len()
     );
+    if mode.stages_test_data() {
+        return Ok(());
+    }
 
     // **The installable ESP is the release ESP** (Phase 5 Part H.1, PR #307 review finding 6).
     // The two claims above compare the parts of the live image that boot the *stick*; this module
@@ -12322,7 +12838,15 @@ fn cmd_check_images() -> R<()> {
     // **The third mode, the live image** (Phase 5 Part C), while the release programs are the
     // ones built: its initramfs may differ from the release one in the root's label and nothing
     // else, and the filesystem inside its `root.img` must be the release root's.
-    check_live_image(&dir, &release)?;
+    check_live_image(&dir, &release, BuildMode::Normal)?;
+
+    // **And the test live image** (administration Part C.8), held to a `--selftest` image as the
+    // release stick is held to the release image: `check-storage` boots it, and what it proves
+    // about the storage chain holds for the release stick only while the two differ in data.
+    let selftest = dir.join("selftest.cpio");
+    cmd_build(BuildMode::Selftest)?;
+    build_initramfs(&selftest, BuildMode::Selftest)?;
+    check_live_image(&dir, &selftest, BuildMode::Selftest)?;
 
     cmd_build(BuildMode::TestHarness)?;
     build_initramfs(&test, BuildMode::TestHarness)?;
@@ -13565,6 +14089,18 @@ fn live_initramfs_path() -> PathBuf {
     build_cache().join("initramfs-live.cpio")
 }
 
+/// The **test** live image (administration Part C.8): the live image built with `--selftest`, for
+/// `check-storage`. A file of its own, so a test stick never stands in for the release one that
+/// `check-live`, `check-report` and `check-install` boot.
+fn live_test_image_path() -> PathBuf {
+    build_cache().join("nitrox-live-test.img")
+}
+
+/// The test live image's initramfs.
+fn live_test_initramfs_path() -> PathBuf {
+    build_cache().join("initramfs-live-test.cpio")
+}
+
 /// The root partition's label on a disk.
 const ROOT_PARTLABEL: &str = "nitrox-root";
 
@@ -13699,7 +14235,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\"]\n\
+         grants = [\"disks\", \"storage\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\
@@ -13952,7 +14488,24 @@ fn assemble_image(
     //    FAT is bounded to the partition), then splice it in. mformat on a plain
     //    file formats the whole file; no `@@offset` games.
     let esp = work.join("esp.img");
-    build_esp(&esp, esp_sectors, bootx64, conf, kernel, initramfs, &[])?;
+    // **A test image's second filesystem** (administration Part C.5b): a small ext4, labelled
+    // `nitrox-scratch`, as one more Limine module, which the kernel publishes as a RAM disk. It is
+    // what the storage service finds to auto-mount on a test boot, and so what lets `boot-probe`
+    // mount, read and write through `/svc/storage` on every CI run. The disk it sits beside holds
+    // only `init`'s root and the FAT ESP, neither of which the service mounts. A **machine**
+    // difference, not a software one: the programs are the release programs, as `check-images`
+    // holds, and a release boot simply has one disk fewer.
+    let scratch = work.join("scratch.img");
+    let test_conf = work.join("limine.conf");
+    let scratch_module = [(scratch.as_path(), SCRATCH_ESP_PATH)];
+    let (conf, extra): (&Path, &[(&Path, &str)]) = if mode.stages_test_data() {
+        build_scratch_fs(&scratch)?;
+        fs::write(&test_conf, test_limine_conf(&fs::read_to_string(conf)?)?)?;
+        (test_conf.as_path(), &scratch_module[..])
+    } else {
+        (conf, &[])
+    };
+    build_esp(&esp, esp_sectors, bootx64, conf, kernel, initramfs, extra)?;
     splice_into(out, esp_lba * 512, &esp)?;
 
     // 4. Build the ext4 `nitrox-root` filesystem as a separate, partition-sized
@@ -14019,25 +14572,85 @@ fn build_esp(
     Ok(())
 }
 
+/// The scratch filesystem's label: the name the storage service mounts it under.
+const SCRATCH_LABEL: &str = "nitrox-scratch";
+/// Where the scratch filesystem rides on a test image's ESP.
+const SCRATCH_ESP_PATH: &str = "/boot/scratch.img";
+/// What the scratch filesystem's `README` says, which `boot-probe` reads through the storage
+/// service and holds to its own copy of this text.
+const SCRATCH_README: &str = "nitrox-scratch: a test image's second filesystem, mounted by the storage service\n";
+/// Its size: room for the probe's writes, and little to load.
+const SCRATCH_MIB: u64 = 8;
+
+/// Build the test image's scratch filesystem at `out`: an ext4 labelled [`SCRATCH_LABEL`] holding a
+/// `README`, with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
+/// table, so its label is its own.
+fn build_scratch_fs(out: &Path) -> R<()> {
+    let staging = out.with_extension("staging");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    fs::write(staging.join("README"), SCRATCH_README)?;
+    let _ = fs::remove_file(out);
+    fs::File::create(out)?.set_len(SCRATCH_MIB * 1024 * 1024)?;
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-L").arg(SCRATCH_LABEL)
+        .arg("-d").arg(&staging)
+        .arg(out)
+        .arg((SCRATCH_MIB * 1024 * 1024 / 4096).to_string()))?;
+    Ok(())
+}
+
+/// A test image's `limine.conf`, from the release one (`base`): the scratch filesystem as a module
+/// after the initramfs. `base` must hold one entry and its initramfs line once, as
+/// [`live_limine_conf`] requires, so the module cannot land in an entry nobody boots.
+fn test_limine_conf(base: &str) -> R<String> {
+    let initramfs_line = "    module_path: boot():/boot/initramfs\n";
+    if base.matches(initramfs_line).count() != 1 || base.matches("\n/").count() + base.starts_with('/') as usize != 1 {
+        return Err("boot/limine.conf no longer has one entry with its initramfs line once".into());
+    }
+    Ok(base.replacen(initramfs_line, &format!("{initramfs_line}    module_path: boot():{SCRATCH_ESP_PATH}\n"), 1))
+}
+
 /// `cargo xtask image --live` — the live image (Phase 5 Part C): the release kernel and initramfs,
 /// with the release root filesystem riding along as a second Limine module, so a machine boots to
 /// a desktop without a storage driver.
 fn cmd_image_live() -> R<()> {
-    let mode = BuildMode::Normal;
+    cmd_image_live_for(BuildMode::Normal)
+}
+
+/// The live image built in `mode`: the release one, or with `--selftest` the **test live image**
+/// (administration Part C.8) — the same stick with the test data a `--selftest` image carries,
+/// its test packages on the root in RAM. `check-images` holds each to its own ordinary image.
+fn cmd_image_live_for(mode: BuildMode) -> R<()> {
     cmd_build(mode)?;
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
-    let initramfs = live_initramfs_path();
+    let (initramfs, out) = if mode.stages_test_data() {
+        (live_test_initramfs_path(), live_test_image_path())
+    } else {
+        (live_initramfs_path(), live_image_path())
+    };
     build_initramfs_for(&initramfs, mode, RootDevice::Live)?;
-    assemble_live_image(&bootx64, &kernel_elf(), &initramfs, &live_image_path())?;
-    println!("xtask: live image at {}", live_image_path().display());
+    assemble_live_image(&bootx64, &kernel_elf(), &initramfs, &out, mode)?;
+    println!("xtask: live image at {}", out.display());
     Ok(())
 }
 
 /// Assemble the live image at `out`: a GPT disk with one ESP holding everything, `root.img`
 /// included. `root.img` is itself a GPT image with one `nitrox-live` partition, whose ext4
-/// filesystem is built from [`stage_rootfs`] for a release image — the release root, in RAM.
-fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Path) -> R<()> {
+/// filesystem is built from [`stage_rootfs`] for `mode` — the release root, in RAM, or a test one.
+fn assemble_live_image(
+    bootx64: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    out: &Path,
+    mode: BuildMode,
+) -> R<()> {
     const MIB: u64 = 1024 * 1024;
     require_tool("sgdisk")?;
     require_tool("mformat")?;
@@ -14053,7 +14666,7 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
 
     // 1. `root.img`: a partition sized to the staged tree plus room to write, under its ceiling.
     let staging = work.join("rootfs");
-    stage_rootfs(&staging, BuildMode::Normal)?;
+    stage_rootfs(&staging, mode)?;
     let staged = tree_bytes(&staging)?;
     let part_mib = staged.div_ceil(MIB) + LIVE_ROOT_SLACK_MIB;
     let root_img_mib = part_mib + 2; // a MiB before the partition, room for the backup GPT after
@@ -14102,9 +14715,13 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
     //    `check_live_image` reads this filesystem back out of the built stick and holds every
     //    file in it against the release ESP, because the mistake is invisible until a real
     //    machine reboots without the stick.
+    //
+    //    **In a test live image it is built in the same mode as the rest**, so the kernel beside it
+    //    and its initramfs agree. Nobody installs from a test stick; `check-images` compares only
+    //    the release stick's installable ESP with a release image's.
     let install_esp = work.join("install-esp.img");
     let install_initramfs = work.join("initramfs");
-    build_initramfs_for(&install_initramfs, BuildMode::Normal, RootDevice::Disk)?;
+    build_initramfs_for(&install_initramfs, mode, RootDevice::Disk)?;
     let esp_payload = [bootx64, kernel, install_initramfs.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))
@@ -15443,6 +16060,23 @@ mod diag_tests {
         assert!(live_limine_conf(&one.replace("timeout: 0", "timeout: 3")).is_err());
         assert!(live_limine_conf(&format!("{one}\n/Other\n    protocol: limine\n")).is_err());
         assert!(live_limine_conf(&one.replace("    module_path: boot():/boot/initramfs\n", "")).is_err());
+    }
+
+    /// **The scratch module lands in the one entry, after the initramfs**, and the shipped conf is
+    /// the shape that allows it. The kernel publishes every module after the first as a RAM disk,
+    /// so the order is what keeps the initramfs the initramfs.
+    #[test]
+    fn a_test_conf_loads_the_scratch_disk_after_the_initramfs() {
+        let base = fs::read_to_string(limine_conf()).expect("boot/limine.conf reads");
+        let conf = test_limine_conf(&base).expect("the shipped limine.conf is one entry");
+        let initramfs = conf.find("boot():/boot/initramfs").expect("the initramfs is loaded");
+        let scratch = conf.find("boot():/boot/scratch.img").expect("the scratch disk is loaded");
+        assert!(initramfs < scratch, "the initramfs is module 0: {conf}");
+        assert_eq!(conf.matches("module_path:").count(), 2);
+        let one = "timeout: 0\n\n/Nitrox\n    protocol: limine\n    path: boot():/boot/kernel\n    module_path: boot():/boot/initramfs\n";
+        assert!(test_limine_conf(one).is_ok(), "control: the one-entry shape is accepted");
+        assert!(test_limine_conf(&format!("{one}\n/Other\n    protocol: limine\n")).is_err());
+        assert!(test_limine_conf(&one.replace("    module_path: boot():/boot/initramfs\n", "")).is_err());
     }
 
     #[test]

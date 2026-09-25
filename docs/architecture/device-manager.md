@@ -1,18 +1,17 @@
 # The Device Manager
 
-**Status: built — administration Part B, B.1–B.5, 2026-09-24; last checked 2026-09-24.** What
-exists:
+**Status: built — administration Part B, B.1–B.5, 2026-09-24; `block` owned by the storage service
+since Part C.5a, 2026-09-25; last checked 2026-09-25.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
 - `input-server` as the owner of `input` (B.3);
 - `/dev/devices` in every session and application, through an info-only endpoint (B.4);
-- every enumeration of block devices reading the registry or its namespace's own bindings (B.5).
+- every enumeration of block devices reading the registry or its namespace's own bindings (B.5);
+- `storage-service` as the owner of `block` ([`storage.md`](storage.md), administration Part C.5a).
 
-What does not exist yet:
-- **Anything that sends a later `Arrived` or a `Departed`.** Phase 6's USB driver is the first
-  event source.
-- **An owner for `block`.** That is Part C's storage service.
+What does not exist yet: **anything that sends a later `Arrived` or a `Departed`.** Phase 6's USB
+driver is the first event source.
 
 The design, and why each piece is shaped as it is, is
 [`administration.md`](../planning/administration.md) § *Part B in detail*. The contracts are
@@ -22,8 +21,8 @@ The design, and why each piece is shaped as it is, is
 ## 1. What it is for
 
 **The manager learns what devices the machine has and hands each to the service that owns its
-class.** It does not drive them. It gives the keyboard and the mouse to `input-server`, and it will
-give disks to the storage service. Everyone else can read what exists.
+class.** It does not drive them. It gives the keyboard and the mouse to `input-server`, and the
+disks to the storage service. Everyone else can read what exists.
 
 Before it, every consumer found its own devices:
 - `input-server` opened `/dev/input/raw/0` and `/1` by path, and exited if either was missing;
@@ -63,7 +62,8 @@ component extended: it hands a driver process a `Handle<DeviceNode>` the same wa
    queued the whole replay on the channel it answers with: an `Arrived` per keyboard and mouse,
    each carrying the owner's duplicate of its node, then `Settled`. So `input-server` holds every
    device the moment its resolve completes. It arms a read on each, answers `Meta::Ready`, and
-   `init` binds `/dev/input/new`, as before the manager existed.
+   `init` binds `/dev/input/new`, as before the manager existed. **The storage service** is spawned
+   before it, straight after the manager, and takes `block` the same way ([`storage.md`](storage.md)).
 5. **A person types `list /dev/devices`**, or opens `/dev/devices/all.tsm` and filters it. The
    resolve reaches the manager as `info` or `info/all.tsm`, and the shell decodes the table with no
    device code of its own.
@@ -76,7 +76,7 @@ calls the console, the keyboard and the mouse all `Char`:
 | Class | Kinds | Owner |
 |---|---|---|
 | `input` | keyboard, mouse | `input-server`, from boot on |
-| `block` | disk, partition, RAM disk | nobody until Part C's storage service |
+| `block` | disk, partition, RAM disk | `storage-service`, from boot on (Part C.5a) |
 
 A console or a PCI function is in no class, and is only ever information.
 
@@ -139,6 +139,7 @@ records the shape: attenuation by construction, for authority no right on a hand
 |---|---|
 | The root namespace: `init`, `service-mgr`, both login supervisors, the view broker, declared services | `/svc/devices` whole, which is every class to subscribe to, and `/dev/registry` |
 | `input-server` | the `input` class, which it owns |
+| `storage-service` | the `block` class, which it owns |
 | A session, an application, and `desktop-shell` | the tables, through the info-only endpoint; never a class, never the registry |
 
 The first row is the same ungated boundary `/svc/auth` and `/svc/views` have
@@ -163,7 +164,7 @@ counter. `libfs::ns_children` still reports a kernel server's subtree as one bin
 
 | Gate | What it asserts |
 |---|---|
-| `test-qemu` (`boot-probe`) | The registry decodes, and its ids, sizes, names and served indices match the paths that serve them. `block` replays and settles before its resolve completes. A second owner is refused and the class is taken again once closed. `input` is held. An info-only endpoint refuses `block`. `all.tsm` has a row per record. A view's `nxinstall` finds its granted disks |
+| `test-qemu` (`boot-probe`) | The registry decodes, and its ids, sizes, names and served indices match the paths that serve them. `block` and `input` are held, by the storage service and `input-server`. The storage service's `all.tsm` has a row per block record, which is the replay reaching its owner whole. An info-only endpoint refuses `block`. `all.tsm` has a row per record. A view's `nxinstall` finds its granted disks. Until Part C.5a the probe took `block` itself, to see it settle before its resolve completed, a second owner refused, and the class taken again once closed; those are the host tests' now, since taking the class would take the disks from their owner |
 | `test-interactive` | The manager mints the info-only endpoint before the first login. In a serial session, `list /dev/devices` names the disk and both input devices, a `filter kind == "disk"` prints the disk's model, and `/dev/devices/block` and `/dev/registry` open nothing |
 | `check-login` | The graphical session has `/dev/devices`, and each application namespace the shell builds reaches it |
 | `check-live` | `/dev/devices` lists the live image's module as a `ramdisk`, the one RAM disk any gate has |
@@ -178,8 +179,6 @@ one-off boot of a release disk whose root would not mount.
 - **An event source.** The kernel registers every node before userspace, and nothing registers one
   later. `Arrived` after `Settled` and `Departed` are specified and handled, `input-server`'s side
   in host tests, and sent by nothing until Phase 6.
-- **An owner for `block`.** Until Part C, anything in the root namespace can take the class. The
-  probe takes it briefly to test the replay.
 - **Supervision.** `init` keeps the manager's process handle, and nothing restarts it. If it
   exited, an owner would keep the devices it holds (`input-server` logs that the manager has gone
   and keeps reading), and every `/dev/devices` resolve would fail.

@@ -1295,6 +1295,7 @@ it applies rather than either camp uninspected:**
 | `date` | — (optional format spec) | Emits current date/time as a structured value. |
 | `sleep` | duration | Suspends the calling pipeline stage for the given duration; not schema-producing. |
 | `whoami` | — | Emits current user identity as a value. |
+| `disk` | block devices and mounted filesystems | `--list` emits the storage service's `Table<{name, kind, size, filesystem, label, mounted, by, mode, clean}>`, from any session. `--mount DEVICE [LABEL]` and `--unmount LABEL` each emit a one-row table, and need the view broker's `storage` grant: without it they fail naming `with` (administration Part C.7, [`storage.md`](../architecture/storage.md)). |
 
 ### 10e. Aliasing — namespace binding, not a new shell feature
 

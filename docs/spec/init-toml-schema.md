@@ -8,6 +8,8 @@ This document specifies the schema of `init.toml`, the bootstrap mount manifest 
 
 The file is at `/etc/init.toml` within the initramfs. Path is hard-coded; init looks it up via the in-kernel initramfs resource server bound at `/initramfs/`.
 
+**It has a second reader: the storage service** (administration Part C.5). `init` records its mounts as bindings, which do not name the device behind them, so the service reads this file to learn which devices are `init`'s. It reports those and never mounts or unmounts them. Both parse it with one crate, `libinittoml`, so they cannot disagree about what the file says.
+
 ## File format
 
 Standard TOML. UTF-8 encoded. No external imports or includes.

@@ -84,6 +84,8 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libcrypto` (hand-rolled SHA-256 / HMAC / PBKDF2) is an off-to-the-side foundation like `libheap`: `core`-only, no `alloc`, depends on nothing (not even `libkern` — it touches no syscalls), so it slots in beside `libkern` at the bottom. Consumers link it directly (auth-service; later the audit subsystem). See `userspace/libcrypto/CLAUDE.md`.
 
+`libinittoml` (the `init.toml` schema and the minimal TOML reader under it) is another: `alloc` only, depending on nothing. `init` and the storage service both read `init.toml`, so the parser moved out of `init` into a crate below both when the second arrived (administration Part C.5), which is the rule above applied.
+
 Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 
 ## Async-first
@@ -105,9 +107,9 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
 - Don't pass handles around with more rights than necessary. Use `sys_handle_restrict` / `Handle::without_*` to attenuate before transferring.
 - A handle granted to a child process should have the minimum rights the child needs.
 - Resource servers don't hold `BIND_NAMESPACE`. Coordination supervisors (init, service-mgr,
-  session-mgr) do. **Two processes do both**, and the reconciliation is the same for each: they
-  hold the capability to *construct namespaces*, which is their job, rather than to register
-  themselves — and neither registers itself.
+  session-mgr) do. **Three processes do both**, and the reconciliation is the same for each:
+  they hold the capability to *construct namespaces*, which is their job, rather than to register
+  themselves — and none registers itself.
   - **`desktop-shell`** builds application namespaces continuously, and serves `/dev/desktop` by
     binding its endpoint into the namespaces it builds, never into one a supervisor owns. See
     [`graphical-session.md`](../docs/architecture/graphical-session.md) §3.
@@ -115,6 +117,10 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
     each a copy it made itself of the namespace its caller sent — and is registered at
     `/svc/views` by `init`, like any server. See
     [`rsproto-views-ops.md`](../docs/spec/rsproto-views-ops.md).
+  - **`storage-service`** (administration Part C.5b) builds a namespace for each filesystem it
+    mounts, binding that filesystem's server at its `/`, and hands the namespace on in a
+    `SUBNAMESPACE` reply. It binds into nothing it did not create, and is registered at
+    `/svc/storage` by `init`. See [`storage.md`](../docs/architecture/storage.md).
 
   Read §3 before copying the pattern: the trusted set widens when a process does both, and that
   cost is named there.

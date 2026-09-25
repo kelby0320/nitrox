@@ -27,7 +27,7 @@ The line init draws is about **runtime state and started services**, not about s
 This means:
 - `libos` `Handle<T,M>` + `block_on` for typed, async-shaped I/O is fine (init uses it — e.g. `read_current_generation`). Raw `sys_io_submit`/`sys_wait` + `RawHandle` are still available where mixing is simpler.
 - Use `IpcMsg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope, and a refusal's reason, in `src/ready.rs`), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet. It is a **dev-dependency** only, so the parser's host tests can build messages with the encoder every server uses.
-- Parse TOML manually (init has its own minimal TOML parser, since a full parser pulls in more than init needs).
+- Parse TOML manually (a minimal TOML parser, `libinittoml`, since a full parser pulls in more than init needs).
 
 ## Critical-path discipline
 
@@ -65,7 +65,7 @@ When spawning fs-servers, init grants only the device handles, log channel, and 
 
 ## TOML parsing
 
-Init has its own minimal TOML parser. It supports only what `init.toml` needs:
+Init uses a minimal TOML parser, `libinittoml`. It supports only what `init.toml` needs:
 
 - Top-level tables and table arrays (`[[mount]]`)
 - String, integer, boolean values
@@ -73,7 +73,12 @@ Init has its own minimal TOML parser. It supports only what `init.toml` needs:
 
 It does NOT support: TOML's full datetime types, nested arrays of tables beyond one level, complex value expressions. If `init.toml` ever needs those, the parser is upgraded — but the schema deliberately avoids them.
 
-Don't add a full TOML library. The minimal parser is in `userspace/init/src/toml_lite.rs` (or similar).
+Don't add a full TOML library. The minimal parser, and the manifest schema on top of it, are
+`userspace/libinittoml/`. **It was init's own module until administration Part C.5**, when the
+storage service needed to read `init.toml` too: it reports `init`'s mounts and never mounts them
+again, so it must read the file exactly as `init` does. `init`'s library re-exports both modules
+at their old paths (`init::manifest`, `init::toml_lite`). A change to the schema is a change to
+both consumers.
 
 ## Initramfs interaction
 

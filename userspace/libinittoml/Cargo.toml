@@ -1,0 +1,12 @@
+[package]
+name = "libinittoml"
+version = "0.1.0"
+edition = "2024"
+
+# `alloc` only: the parser allocates the manifest it returns, and depends on nothing else.
+[dependencies]
+
+# The read-only flag's test builds and parses the setup message with the codec every server
+# uses. A dev-dependency only, as it was in `init`.
+[dev-dependencies]
+librsproto = { path = "../librsproto" }
