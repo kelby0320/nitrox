@@ -12,6 +12,10 @@ path = "src/main.rs"
 # Pure `core`, host-compilable: seed the user DB's PBKDF2 verifiers with the *same*
 # KDF the on-target auth-service verifies with (no drift). See `assemble_image`.
 libcrypto = { path = "../../userspace/libcrypto" }
+# The user database's format (administration Part D.1): the seeded account's line is written by
+# the same `write_record` `auth-service` and `account` write through, so the build cannot write a
+# line the service reads differently.
+libusers = { path = "../../userspace/libusers" }
 # The display gate renders the expected image itself rather than comparing against a
 # golden file checked into the repo. `libdraw`'s core is `core + alloc` with no
 # dependencies, so the host build is free; the `io` feature (syscalls) stays off.

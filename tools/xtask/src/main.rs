@@ -11750,6 +11750,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libusers` — the user database's format and its edits, shared by `auth-service`, `account`
+    // and this build since administration Part D.1.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libusers")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libinittoml` — the `init.toml` parser, shared by `init` and the storage service since
     // administration Part C.5, and its tests with it.
     run(Command::new("cargo")
@@ -14911,27 +14921,28 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // `/system/users` — the auth-service credential DB (passwd-style:
     // `name:salt_hex:iterations:verifier_hex:home`). Seeded here so NO plaintext or
     // verifier is committed to the source tree: the stored value is the one-way
-    // PBKDF2 of the fixture password, computed with the *same* libcrypto the
-    // on-target auth-service verifies with (no drift). The fixture credential is a
-    // build input for the emulator demo user, not a secret; init's login selftest
-    // (auth Part E) uses the same literals. See docs/architecture/session-and-auth.md.
+    // PBKDF2 of the fixture password. The fixture credential is a build input for the
+    // emulator demo user, not a secret. See docs/architecture/session-and-auth.md.
+    //
+    // **Written by `libusers::write_record`** (administration Part D.1), the function
+    // `auth-service` rewrites the file with and `account`'s offline mode edits it with — so the
+    // seeded line is one the service reads by construction, where it was formatted by hand here
+    // until then.
     {
-        use std::fmt::Write as _;
-        let iters = libcrypto::password::DEFAULT_ITERATIONS;
-        let verifier = libcrypto::password::derive(DEMO_PASSWORD.as_bytes(), &DEMO_SALT, iters);
-        let mut users = String::new();
-        users.push_str("# Nitrox user database (auth-service).\n");
-        users.push_str("# name:salt_hex:iterations:verifier_hex:home\n");
-        write!(users, "{DEMO_USER}:").unwrap();
-        for b in &DEMO_SALT {
-            write!(users, "{b:02x}").unwrap();
-        }
-        write!(users, ":{iters}:").unwrap();
-        for b in &verifier {
-            write!(users, "{b:02x}").unwrap();
-        }
-        writeln!(users, ":{DEMO_HOME}").unwrap();
-        fs::write(staging.join("system").join("users"), users.as_bytes())?;
+        let mut users = Vec::from(
+            &b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n"[..],
+        );
+        let mut line = [0u8; libusers::MAX_FILE];
+        let n = libusers::write_record(
+            &mut line,
+            DEMO_USER.as_bytes(),
+            DEMO_HOME.as_bytes(),
+            DEMO_PASSWORD.as_bytes(),
+            &DEMO_SALT,
+        )
+        .map_err(|r| format!("seed the demo account: {}", String::from_utf8_lossy(r.why())))?;
+        users.extend_from_slice(&line[..n]);
+        fs::write(staging.join("system").join("users"), &users)?;
     }
     // `/system/views.toml` — the view broker's policy (administration Part A.6). The demo account
     // administers the machine, as it is the only account the build makes; `install` is a narrower

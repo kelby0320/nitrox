@@ -1373,7 +1373,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_test(root_ns)
         & storage_mount_test(root_ns)
         & storage_admin_test(root_ns)
-        & storage_grant_test(root_ns);
+        & storage_grant_test(root_ns)
+        & auth_admin_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -2850,6 +2851,179 @@ fn storage_grant_test(root_ns: u64) -> bool {
         return finish(fail(b"a refused disk --unmount unmounted nitrox-scratch"));
     }
     kprint(b"boot-probe: storage grant: disk --unmount and disk --mount ran in the admin view, each answered its table, the service agreed, and a busy service was named as busy ok\n");
+    finish(true)
+}
+
+/// **`auth-service`'s admin session, and the file it writes** (administration Part D.1).
+///
+/// Asked directly, as the view broker will ask it, on a session resolved at `/svc/auth/admin`:
+/// - an account added, then authenticated against on an ordinary oracle session;
+/// - its password set, after which the old one is refused and the new one accepted;
+/// - the account removed, after which it is refused altogether.
+///
+/// **After each write, the file is read from the device**, raw, through the ext4 library: a
+/// re-resolve would read the page cache, and what is at stake is that the rename landed. `alice`'s
+/// line is the same bytes throughout. Each refusal is its own, and a suffix the service does not
+/// serve is `NotFound` — the whole error body, where a short one once arrived as `KernelError`.
+fn auth_admin_test(root_ns: u64) -> bool {
+    use librsproto::auth::{
+        OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_account_request,
+        build_authenticate_request, parse_account_list, parse_authenticate_reply,
+    };
+    use libkern::KError;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: auth admin: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    match ns_lookup(root_ns, b"/svc/auth/nope", chan) {
+        (st, _) if st == KError::NotFound.as_i32() => {}
+        _ => return fail(b"a suffix auth-service does not serve was not NotFound"),
+    }
+    let (st, admin) = ns_lookup(root_ns, b"/svc/auth/admin", chan);
+    let (so, oracle) = ns_lookup(root_ns, b"/svc/auth", chan);
+    if st != 0 || admin == 0 || so != 0 || oracle == 0 {
+        return fail(b"no admin session and oracle session at /svc/auth");
+    }
+    let Some(dev) = RootDevice::open(root_ns) else {
+        return fail(b"the root device would not open");
+    };
+    let finish = |ok: bool| {
+        close(admin);
+        close(oracle);
+        ok
+    };
+
+    let next = core::cell::Cell::new(0u64);
+    let ask = |ch: u64, op: u16, body: &[u8]| -> Option<Received> {
+        next.set(next.get() + 1);
+        let id = next.get();
+        if !rs_send(ch, op, id, body, &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 10_000_000_000;
+        loop {
+            let m = receive(ch, deadline)?;
+            if m.request_id == id {
+                return Some(m);
+            }
+        }
+    };
+    let account = |name: &[u8], pw: &[u8]| {
+        let mut b = [0u8; 256];
+        let n = build_account_request(&mut b, name, pw).unwrap_or(0);
+        b[..n].to_vec()
+    };
+    let refused_with = |m: Option<Received>| {
+        m.filter(|m| m.error)
+            .and_then(|m| librsproto::error::parse_error(&m.body).map(|e| e.kerror))
+    };
+    // `Some(home)` if the oracle authenticates `name` with `pw`, `None` if it refuses.
+    let authenticates = |name: &[u8], pw: &[u8]| -> Option<alloc::vec::Vec<u8>> {
+        let mut b = [0u8; 256];
+        let n = build_authenticate_request(&mut b, name, pw)?;
+        let m = ask(oracle, librsproto::OP_AUTHENTICATE, &b[..n])?;
+        let r = parse_authenticate_reply(&m.body)?;
+        r.is_authenticated().then(|| r.home.to_vec())
+    };
+    // The file as the device holds it, and the line in it naming `name`.
+    let on_device = || -> Option<alloc::vec::Vec<u8>> {
+        let size = fs_server_ext4::ext4::stat_file(&dev, b"/system/users").ok()?;
+        dev.read_file(b"/system/users", 0, size)
+    };
+    let line_of = |file: &[u8], name: &[u8]| -> Option<alloc::vec::Vec<u8>> {
+        file.split(|&b| b == b'\n')
+            .find(|l| l.len() > name.len() && l.starts_with(name) && l[name.len()] == b':')
+            .map(|l| l.to_vec())
+    };
+    let Some(before) = on_device() else {
+        return finish(fail(b"/system/users would not read from the device"));
+    };
+    let Some(alice) = line_of(&before, b"alice") else {
+        return finish(fail(b"alice is not in /system/users on the device"));
+    };
+    let alice_unchanged = |file: &[u8]| line_of(file, b"alice").as_deref() == Some(&alice[..]);
+
+    // `List`: alice, and her home.
+    let listed = |m: Option<Received>, name: &[u8]| {
+        m.filter(|m| !m.error).is_some_and(|m| {
+            parse_account_list(&m.body).is_some_and(|l| l.iter().any(|(n, _)| n == name))
+        })
+    };
+    if !listed(ask(admin, OP_AUTH_LIST, &[]), b"alice") {
+        return finish(fail(b"List does not name alice"));
+    }
+
+    // An account added: the oracle knows it, and so does the device.
+    const NAME: &[u8] = b"d1probe";
+    let added = ask(admin, OP_AUTH_ADD, &account(NAME, b"first secret"));
+    if !added.as_ref().is_some_and(|m| !m.error) {
+        return finish(fail(b"Add was not answered"));
+    }
+    if authenticates(NAME, b"first secret").as_deref() != Some(&b"/home/d1probe"[..]) {
+        return finish(fail(b"the added account does not authenticate, with its home"));
+    }
+    let Some(file) = on_device() else {
+        return finish(fail(b"/system/users would not read after the add"));
+    };
+    let Some(first) = line_of(&file, NAME).filter(|l| l.ends_with(b":/home/d1probe")) else {
+        return finish(fail(b"the added account is not on the device"));
+    };
+    if !alice_unchanged(&file) {
+        return finish(fail(b"alice's line changed when another account was added"));
+    }
+
+    // Each refusal, its own.
+    if refused_with(ask(admin, OP_AUTH_ADD, &account(NAME, b"x"))) != Some(KError::AlreadyExists.as_i32()) {
+        return finish(fail(b"a second Add of one name was not AlreadyExists"));
+    }
+    if refused_with(ask(admin, OP_AUTH_ADD, &account(b"Bad Name", b"x"))) != Some(KError::InvalidArgument.as_i32()) {
+        return finish(fail(b"a bad name was not InvalidArgument"));
+    }
+    if refused_with(ask(admin, librsproto::OP_AUTHENTICATE, &[])) != Some(KError::Unsupported.as_i32()) {
+        return finish(fail(b"an admin session authenticated"));
+    }
+    if !ask(oracle, OP_AUTH_LIST, &[]).is_some_and(|m| m.error) {
+        return finish(fail(b"an oracle session answered List"));
+    }
+
+    // A new password: the old refused, the new accepted, and the device's line another.
+    if !ask(admin, OP_AUTH_SET_PASSWORD, &account(NAME, b"second secret")).is_some_and(|m| !m.error) {
+        return finish(fail(b"SetPassword was not answered"));
+    }
+    if authenticates(NAME, b"first secret").is_some() || authenticates(NAME, b"second secret").is_none() {
+        return finish(fail(b"after SetPassword the old password still works, or the new one does not"));
+    }
+    let Some(file) = on_device() else {
+        return finish(fail(b"/system/users would not read after SetPassword"));
+    };
+    if line_of(&file, NAME).is_none_or(|l| l == first) || !alice_unchanged(&file) {
+        return finish(fail(b"the new password is not on the device, or alice's line moved"));
+    }
+
+    // Removed: refused, gone from the device and the list, and a second removal NotFound.
+    if !ask(admin, OP_AUTH_REMOVE, NAME).is_some_and(|m| !m.error) {
+        return finish(fail(b"Remove was not answered"));
+    }
+    if authenticates(NAME, b"second secret").is_some() {
+        return finish(fail(b"a removed account still authenticates"));
+    }
+    let Some(file) = on_device() else {
+        return finish(fail(b"/system/users would not read after Remove"));
+    };
+    if line_of(&file, NAME).is_some() || !alice_unchanged(&file) {
+        return finish(fail(b"the removed account is still on the device, or alice's line moved"));
+    }
+    if listed(ask(admin, OP_AUTH_LIST, &[]), NAME) {
+        return finish(fail(b"List still names the removed account"));
+    }
+    if refused_with(ask(admin, OP_AUTH_REMOVE, NAME)) != Some(KError::NotFound.as_i32()) {
+        return finish(fail(b"a second Remove was not NotFound"));
+    }
+    if authenticates(b"alice", DEMO_PASSWORD).is_none() {
+        return finish(fail(b"alice no longer authenticates"));
+    }
+    kprint(b"boot-probe: auth admin: an account added, authenticated, its password changed and removed, each on the device with alice's line untouched, each refusal its own ok\n");
     finish(true)
 }
 

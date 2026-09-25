@@ -35,6 +35,7 @@ dependencies = [
  "libcrypto",
  "libkern",
  "librsproto",
+ "libusers",
 ]
 
 [[package]]
@@ -304,6 +305,13 @@ dependencies = [
  "libm",
  "librsproto",
  "libsurface",
+]
+
+[[package]]
+name = "libusers"
+version = "0.1.0"
+dependencies = [
+ "libcrypto",
 ]
 
 [[package]]

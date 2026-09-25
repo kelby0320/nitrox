@@ -1491,7 +1491,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 
 ### The pieces, in dependency order
 
-- [ ] **D.1 — `libusers`, and `auth-service`'s admin session.** The format moves into `libusers`,
+- [x] **D.1 — `libusers`, and `auth-service`'s admin session.** The format moves into `libusers`,
       with `auth-service`, `xtask`'s seeding and host tests on it. The admin session at
       `/svc/auth/admin` gets `List`, `Add`, `Remove` and `SetPassword`, the atomic rewrite and
       salts from entropy. `rsproto-auth-ops.md` gains the ops.
@@ -1500,6 +1500,16 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         it, sets its password and finds the old one refused and the new one accepted, and removes
         it. After each write, it finds the file as the service said, read raw from the device
         through the ext4 library, as C.1's checks read it.
+
+      *(Landed 2026-09-25.*
+      - *`Add` takes no home: it is always `/home/<name>`, so the pass's "a name, a password and a
+        home" became a name and a password.*
+      - *Admin refusals are error replies with reasons; an `Authenticate` there is `Unsupported`.*
+      - *Also fixed: `auth-service`'s resolve refusals sent a 4-byte error body, which the kernel
+        hands the caller as `KernelError`. They send the whole `ErrorBody` now, and the probe
+        checks that an unknown suffix is `NotFound`.*
+      - *D's share of `TODO(svc-auth-ungated)` is recorded now, since the admin session exists
+        from D.1.)*
 - [ ] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
       administrator is.** *Before the accounts front*, since the guard that front applies needs this
       definition, and the definition needs the grant.

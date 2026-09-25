@@ -1,7 +1,8 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-25, when each session gained `/storage` and `/dev/storage`, the storage service's session
+2026-09-25, when `auth-service` became the user database's writer — administration Part D.1; earlier
+that day, when each session gained `/storage` and `/dev/storage`, the storage service's session
 endpoint at the bases `/fs` and `/info` — administration Part C.6; before that 2026-09-24, when
 each session gained `/dev/devices`, the device manager's tables at the base `/info` — Part B.4;
 before that 2026-09-23, when each session gained a
@@ -154,12 +155,21 @@ hash-chained tamper-evident records ("build the hash once").
 
 ### The user database
 
-A read-only credential store — one record per principal: a salt, an iteration count,
-the one-way verifier, and the principal's home path. It is not user-facing
-configuration (so it is not TOML), and it contains **no plaintext secret**: the
-stored verifier is one-way, and it is populated by the build tooling from a build
-input, never committed to the source tree (the "no embedded secrets" rule,
-`userspace/CLAUDE.md`).
+A credential store — one record per principal: a salt, an iteration count, the one-way
+verifier, and the principal's home path. It is not user-facing configuration (so it is not
+TOML), and it contains **no plaintext secret**: the stored verifier is one-way. The build seeds
+the demo account from a build input, never committed to the source tree (the "no embedded
+secrets" rule, `userspace/CLAUDE.md`).
+
+**`auth-service` writes it, and is its only writer on a running system** (administration Part
+D.1). An admin session, opened by resolving `/svc/auth/admin`, answers `List`, `Add`, `Remove` and
+`SetPassword` ([`rsproto-auth-ops.md`](../spec/rsproto-auth-ops.md) § *Administration*). Each write
+replaces the file atomically: `/system/users.new`, synced, renamed over. A new password is salted
+from the kernel's entropy source. **The format is `libusers`'**
+(`userspace/libusers/`): the service, the build's seeder and, from Part D.4, `account`'s offline
+mode all read and write the file through it, and it bounds the file at the 4 KiB the service loads
+at boot. The view broker is meant to be the one client of the admin session, fronting it for
+people with its guards; that front is Part D.3's.
 
 ## Session construction — subtree-scoped namespaces
 
@@ -316,8 +326,9 @@ supervisor drops to on a critical-path failure — no longer the normal console.
   on both in one boot and requires that neither session ended while the other started. The
   accepted cost is that the same user may be logged in twice with two namespaces
   ([graphical-session.md](graphical-session.md) §6.2).
-- User *creation* and password *change* (the DB is read-only); persisted per-user
-  state beyond the seeded home directory.
+- User *creation* and password *change* for **people**: `auth-service` writes the database since
+  administration Part D.1, and the broker's front and `account` are Parts D.3 and D.4. Persisted
+  per-user state beyond the home directory stays deferred.
 - The real user shell (Phase 4).
 
 ## References

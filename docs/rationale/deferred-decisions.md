@@ -563,6 +563,16 @@ service can serve. The view broker's `storage` grant (C.6) decides who reaches o
 the root namespace reaches it without asking. The same fix closes it: supervisors and services
 given constructed namespaces, with `/svc/storage` bound whole only into the view broker's.
 
+**`/svc/auth/admin` sits on it too** (administration Part D.1, 2026-09-25). Resolving it opens an
+admin session on `auth-service`, which adds, removes and sets the password of any account. The view
+broker is the one client meant to hold one, and it fronts every account operation with its guards
+(Part D.3). But the root namespace reaches the session without the broker. So do the broker's own
+`/svc/views/accounts/<id>` and `/svc/views/policy/<id>`, once they exist: they act as any open
+session's `accounts` or `views` grant without a password (Parts D.2 and D.3). **It adds no
+authority**: a root holder can already map `/system/users` writable, since `boot-probe` maps
+`/system/rwtest` from the same root. The fix is the same: constructed namespaces, with `/svc/auth`
+bound whole only into the broker's and the two login supervisors'.
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly

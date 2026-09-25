@@ -29881,3 +29881,80 @@ blocking problem and two worth fixing, and made three optional points. All six a
 - **What every session can read is decided**: the account list and its own policy rows. The
   policy's text moved behind the `views` grant, as `sudoers` is readable by root alone.
 
+
+## 2026-09-25 — Administration D.1: `libusers`, and `auth-service` writes the user database
+
+**What landed:**
+- **`libusers`**, a new `core`-only crate over `libcrypto`, holds the file's format:
+  - parse a record, and write one;
+  - the name rules (1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_`
+    or `-`) and the password bounds (1 to 128 bytes);
+  - `MAX_FILE`, 4 KiB;
+  - three no-`alloc` edits, `add`, `remove` and `set_password`. Each writes the whole new file
+    into its caller's buffer and keeps every other line byte for byte.
+
+  `auth-service`'s parser moved out into it, and the build's seeder now writes the demo account
+  through `write_record`, where it formatted the line by hand.
+- **`auth-service`'s admin session**, opened by resolving `/svc/auth/admin`, answers four ops:
+  `List`, `Add`, `Remove` and `SetPassword` (`rsproto-auth-ops.md` § *Administration*,
+  `0x0801`–`0x0804`). How it is served:
+  - `serve_admin`, in the host-tested library, decides each request: a reply, a new file, or a
+    refusal with its `KError` and reason.
+  - The server draws a 16-byte salt from the kernel's entropy source for each new password.
+  - It installs a new file atomically: a leftover `users.new` is cut to nothing, then the new one
+    is created, written through a mapping, unmapped, synced and renamed over `/system/users`.
+  - **It changes its copy in memory only once the rename has held.** It zeroes the request buffer
+    after every session request, since three ops carry passwords.
+  - It stays `no_std` with no `alloc`.
+- **`Add` takes no home**: it is always `/home/<name>`, where the pass said "a name, a password and
+  a home".
+
+**A pre-existing bug, fixed on the way.** `auth-service` refused a resolve with a 4-byte error body,
+and the kernel reads anything shorter than the 12-byte `ErrorBody` on a forwarded resolve as
+malformed, handing the caller `KernelError`. So `WouldBlock` for a full table, and now `NotFound`
+for an unknown suffix, arrived as `KernelError`. The view broker had the same bug, fixed in PR #329's
+review. The probe now asserts that `/svc/auth/nope` is `NotFound`.
+
+**D's share of `TODO(svc-auth-ungated)` is recorded now**, not with D's docs, because the admin
+session exists from this piece on.
+
+**A control passed at first, and it was the test's fault.** With `libusers`' bound moved off by
+one, every test still passed. The tests' output buffer was exactly `MAX_FILE` long, so the buffer's
+own length check refused the extra byte before the bound could. The tests now edit into a buffer
+twice that, and the same control fails both boundary tests.
+
+**Gates:**
+- Host tests:
+  - `libusers` (16): the format both ways, including a record written by hand as the build's
+    was; each rule at its edges; each edit keeping the rest byte for byte; the bound at exactly
+    `MAX_FILE` and one byte more, for an add and for a password change that grows the salt from 8
+    bytes to 16.
+  - `auth-service` (10), which now authenticates through `libusers`: a record added, changed and
+    removed through `serve_admin`, authenticating as each file says; `List`; each refusal with its
+    error.
+  - `librsproto` (4 new): the account list and account requests both ways, and the list reader
+    fed bytes no correct writer makes.
+- **`boot-probe`** drives the admin session:
+  - an unknown suffix is `NotFound`;
+  - `List` names `alice`;
+  - an account is added and authenticates on an oracle session, with its home;
+  - its password is set, after which the old one is refused and the new one accepted;
+  - it is removed and refused, and a second removal is `NotFound`;
+  - a duplicate add, a bad name, `Authenticate` on the admin session and `List` on an oracle one
+    are each refused.
+
+  **After each write, `/system/users` is read raw from the device** through the ext4 library, and
+  `alice`'s line is the same bytes throughout.
+
+**Controls:**
+- 3 on host tests, each failing its own test:
+  - `add` not refusing a taken name;
+  - the bound off by one (after the buffer fix above);
+  - a new password appended instead of put in place.
+- 3 `test-qemu --kvm` boots, each failing at its check:
+  - **the install skipping the rename**: the oracle still authenticated the new account from
+    memory, and only the device read failed, which is what that read is for;
+  - the 4-byte resolve error again;
+  - memory not updated after an install.
+
+No kernel change and no ABI hash impact.
