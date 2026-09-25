@@ -111,6 +111,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `36` | `sys_process_terminate` |
 | `37` | `sys_ns_derive` |
 | `38` | `sys_ns_sync` |
+| `39` | `sys_ns_held` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -343,6 +344,24 @@ whose write failed stays dirty.
 **It blocks** until the writes complete, as `sys_file_sync` does. That is the one documented
 exemption from async-first, for the same reason: a durability point is something the caller
 wants to know it has reached. (Syscall number `38`.)
+
+```rust
+fn sys_ns_held(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
+```
+Returns **how many of the files the userspace server that `path` resolves to in `ns` has handed
+out are still held by something**: a handle, a mapping, an IRP in flight, or a dirty file's pin
+on itself. A forgotten file is not counted. The page cache holds its files weakly, so a file
+nothing holds is not there to count.
+
+**Ask it after `sys_ns_sync`.** The sync writes back every dirty file a write-back can clean, and
+lets go of its pin, so what is left is held by someone. That is the storage service's check
+before an unmount, which it refuses while the answer is not zero
+([`storage.md`](../architecture/storage.md)). A filesystem is marked clean as the last step of an
+unmount, and a file still mapped writable could otherwise be written after it.
+
+Requires `LOOKUP` on `ns`. `Unsupported` if `path` resolves to anything but a userspace server,
+and `NotFound` if it resolves to nothing. It does not block. (Syscall number `39`,
+administration Part C.5c.)
 
 ### Entropy
 

@@ -1708,6 +1708,46 @@ mod tests {
         assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
     }
 
+    /// **What `sys_ns_held` counts: the cache's live files, a forgotten one aside** (administration
+    /// Part C.5c). A file nothing holds leaves the cache at once. A dirty one holds itself, and goes
+    /// once a write-back cleans it, which is why the storage service asks after a sync. A file
+    /// something holds stays, and that is the answer an unmount is refused on.
+    #[test]
+    fn the_held_count_is_what_a_sync_leaves_alive() {
+        init_global_heap();
+        let reg = registration();
+        let count = || reg_of(&reg).cache_objects().unwrap().len();
+        let held = two_block_file(&reg, 7);
+        let dirty = two_block_file(&reg, 8);
+        let gone = two_block_file(&reg, 9);
+        assert_eq!(count(), 3);
+        drop(gone);
+        assert_eq!(count(), 2, "a file nothing holds leaves the cache");
+
+        FileObject::writable_mapped(&dirty);
+        FileObject::writable_unmapped(dirty.as_ptr());
+        let mark = file_of(&dirty).clean_mark().expect("no writable mapping remains");
+        let dirty_at = dirty.as_ptr();
+        drop(dirty);
+        assert_eq!(count(), 2, "a dirty file holds itself");
+        // What a write-back that cleans ends with, without its IRPs.
+        let live = reg_of(&reg).cache_objects().unwrap();
+        let pinned = live.iter().find(|f| f.as_ptr() == dirty_at).unwrap().clone();
+        drop(live);
+        FileObject::unpin_if_clean(&pinned, mark);
+        drop(pinned);
+        assert_eq!(count(), 1, "cleaned, it goes");
+
+        // Forgotten with a read in flight, so the entry stays — marked, and not counted.
+        assert_eq!(file_of(&held).begin_read(1), 101);
+        let answer = po();
+        assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
+        assert_eq!(reg_of(&reg).cached_files(), 1, "the entry stays while the read is in flight");
+        assert_eq!(count(), 0, "a forgotten file is not counted, though something holds it");
+        assert!(file_of(&held).end_io().is_some());
+        drop(held);
+    }
+
     /// No sync writes a forgotten object, so a writable mapping must not pin it: nothing would
     /// ever clean it.
     #[test]

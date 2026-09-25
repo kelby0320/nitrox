@@ -465,6 +465,106 @@ pub mod mounts {
         pub mode: Mode,
     }
 
+    /// Why an administrator's mount was refused: a [`KError`](libkern::KError) and the words the
+    /// refusal carries.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Refusal {
+        /// No block device has that name.
+        NoSuchDevice,
+        /// It is mounted already, by `init` or by this service.
+        AlreadyMounted,
+        /// It holds no filesystem this service can serve.
+        NothingToServe,
+        /// The label asked for is not a valid one.
+        BadLabel,
+        /// The label asked for names another mount.
+        LabelTaken,
+        /// Every mount slot is in use.
+        Full,
+    }
+
+    impl Refusal {
+        /// The error a client is answered with.
+        pub fn kerror(self) -> libkern::KError {
+            use libkern::KError;
+            match self {
+                Refusal::NoSuchDevice => KError::NotFound,
+                Refusal::AlreadyMounted | Refusal::LabelTaken => KError::AlreadyExists,
+                Refusal::NothingToServe => KError::Unsupported,
+                Refusal::BadLabel => KError::InvalidArgument,
+                Refusal::Full => KError::WouldBlock,
+            }
+        }
+
+        /// The reason, as the refusal says it.
+        pub fn why(self) -> &'static [u8] {
+            match self {
+                Refusal::NoSuchDevice => b"no block device has that name",
+                Refusal::AlreadyMounted => b"it is already mounted",
+                Refusal::NothingToServe => b"it holds no filesystem this service can serve",
+                Refusal::BadLabel => b"that is not a valid label",
+                Refusal::LabelTaken => b"another mount has that label",
+                Refusal::Full => b"no more filesystems can be mounted at once",
+            }
+        }
+    }
+
+    /// **An administrator's mount** of the device called `name` (`blk-<n>`), under `label`, or
+    /// under the label the service would choose if `label` is empty. `mounted` is everything
+    /// mounted, `init`'s included; `taken` is the labels in use; `room` is whether a slot is free.
+    /// **Always writable**, on a live boot too: the auto-mount is the careful one.
+    pub fn explicit(
+        devices: &[Device],
+        mounted: &[Mounted],
+        taken: &[String],
+        room: bool,
+        name: &str,
+        label: &str,
+    ) -> Result<Plan, Refusal> {
+        let d = devices.iter().find(|d| crate::table::name(&d.record) == name).ok_or(Refusal::NoSuchDevice)?;
+        if mounted.iter().any(|m| m.device == d.record.id) {
+            return Err(Refusal::AlreadyMounted);
+        }
+        if !matches!(d.found, Found::Ext4 { .. }) {
+            return Err(Refusal::NothingToServe);
+        }
+        let label = if label.is_empty() {
+            labels::unique(&labels::preferred(d), taken)
+        } else if !labels::valid(label) {
+            return Err(Refusal::BadLabel);
+        } else if taken.iter().any(|t| t == label) {
+            return Err(Refusal::LabelTaken);
+        } else {
+            String::from(label)
+        };
+        if !room {
+            return Err(Refusal::Full);
+        }
+        Ok(Plan { device: d.record.id, label, mode: Mode::Rw })
+    }
+
+    /// **The devices in use, which must not be granted raw**: every mounted filesystem's device,
+    /// `init`'s included, and the disk that holds it, since a raw write to a disk reaches its
+    /// partitions. Registry ids, ascending. **The holder is the parent only if it is a block
+    /// device**: a partition's is its disk or RAM disk, while a whole disk's is the PCI function
+    /// of its controller, which is not one and not grantable.
+    pub fn in_use(devices: &[Device], mounted: &[Mounted]) -> Vec<u32> {
+        use libkern::device::NO_PARENT;
+        let mut ids = Vec::new();
+        for m in mounted {
+            ids.push(m.device);
+            let parent = devices.iter().find(|d| d.record.id == m.device).map(|d| d.record.parent);
+            if let Some(p) = parent.filter(|&p| p != NO_PARENT)
+                && devices.iter().any(|d| d.record.id == p)
+            {
+                ids.push(p);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Where a label is mounted.
     pub fn at(label: &str) -> String {
         let mut s = String::from("/storage/");
@@ -522,6 +622,9 @@ pub mod suffix {
         /// `session-endpoint`: a forwarding endpoint of the service's own, every resolve on which
         /// is [`session_only`].
         SessionEndpoint,
+        /// `admin-endpoint`: a forwarding endpoint of the service's own, on which any resolve is
+        /// answered with an admin session — a channel for `Storage` requests (C.5c).
+        AdminEndpoint,
         /// Anything else.
         Unknown,
     }
@@ -536,6 +639,9 @@ pub mod suffix {
         }
         if suffix == b"session-endpoint" {
             return Asked::SessionEndpoint;
+        }
+        if suffix == b"admin-endpoint" {
+            return Asked::AdminEndpoint;
         }
         if let Some(file) = suffix.strip_prefix(b"info/") {
             return match file.strip_suffix(b".tsm").map(core::str::from_utf8) {
@@ -554,11 +660,12 @@ pub mod suffix {
     }
 
     /// What a resolve arriving on a session endpoint gets: the tables and the filesystems as
-    /// asked, and **another endpoint answered as if it did not exist**, since its holder could
-    /// then mint more.
+    /// asked, and **any endpoint answered as if it did not exist**: another session endpoint,
+    /// whose holder could then mint more, and above all the admin endpoint, which mounts and
+    /// unmounts.
     pub fn session_only(asked: Asked<'_>) -> Asked<'_> {
         match asked {
-            Asked::SessionEndpoint => Asked::Unknown,
+            Asked::SessionEndpoint | Asked::AdminEndpoint => Asked::Unknown,
             other => other,
         }
     }

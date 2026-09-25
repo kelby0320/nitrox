@@ -1152,7 +1152,7 @@ namespace, with no login and no session.
       rename's destination can follow; a continuation onto a kernel server is refused, since
       `/proc/self` would answer for the replying server; and `boot-probe` tests it on a boot now,
       acting as its own server.)*
-- [ ] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
+- [x] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
       `init`'s mounts from `init.toml`; the live-boot test; auto-mount; labels; the per-mount
       namespaces and the `SUBNAMESPACE` answer; the session and admin endpoints; the table; `Storage`
       (`rsproto-storage-ops.md`, `0x10xx`, its row in the wire-format table); the unmount chain. <!-- check-docs: allow-missing -->
@@ -1184,7 +1184,16 @@ namespace, with no login and no session.
       - **By the maintainer's call, a test image carries a scratch ext4 as a second Limine module**,
         a RAM disk, so `boot-probe` mounts, reads and writes through `/svc/storage` on every run.
 
-      *C.5c*: `Storage`, the admin endpoint, and the unmount chain.
+      *C.5c (2026-09-25): the service unmounts, and speaks `Storage`.*
+      - The admin endpoint, admin sessions, and `Mount`, `Unmount` and `InUse`
+        (`rsproto-storage-ops.md`, `0x10xx`).
+      - The unmount chain as drawn, with one kernel addition the pass had not named:
+        **`sys_ns_held`** (syscall 39), which counts a mount's files still held once a sync has
+        run. The service asks it three times, 5 ms apart, before believing a non-zero answer,
+        because a finished IRP holds its file until thread context frees it.
+      - `boot-probe` unmounts the scratch disk on every run. The unmount is refused while a file
+        is held; a file written through a mapping and never synced is on the device after it,
+        which also leaves the filesystem clean; and a `Mount` by name brings the disk back.
 - [ ] **C.6 — sessions and views.** Both supervisors resolve the session endpoint and bind
       `/storage` and `/dev/storage`; `desktop-shell` binds both into each application; the `storage`
       grant; the `disks` grant asking `InUse` first. `test-interactive`: `list /storage` and

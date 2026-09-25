@@ -1,6 +1,7 @@
 # Storage
 
-**Status: partly built — administration Parts C.5a and C.5b, 2026-09-25; last checked 2026-09-25.**
+**Status: built as administration Part C.5 drew it — C.5a, C.5b and C.5c, 2026-09-25; last checked
+2026-09-25.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -10,11 +11,14 @@ What exists:
   namespace.
 - **The session endpoint** (C.5b): minted at `/svc/storage/session-endpoint`, answering the
   filesystems and the tables and nothing else.
+- **The admin endpoint and `Storage`** (C.5c): `Mount`, `Unmount` and `InUse` on an admin session
+  ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)). An unmount writes back every dirty
+  file, is refused while a file is still held, and flushes the drive.
 
 What does not exist yet, in the order Part C builds it
 ([`administration.md`](../planning/administration.md) § *Part C in detail*):
-- **The admin endpoint**, the `Storage` protocol, and the unmount chain (C.5c).
-- **`/storage` and `/dev/storage` in sessions** (C.6), **`disk`** (C.7), and **`check-storage`** (C.8).
+- **`/storage` and `/dev/storage` in sessions**, and the view broker's `storage` and `disks`
+  grants (C.6); **`disk`** (C.7); and **`check-storage`** (C.8).
 
 ## 1. What it is for
 
@@ -42,6 +46,8 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 | The manifest reader | `userspace/libinittoml/` | `init.toml`'s schema and parser, shared with `init` so the two cannot read it differently |
 | The ext4 checks | `userspace/fs-server-ext4/src/ext4.rs` | `check_device`, `volume_label` and `was_left_clean`: what the server itself runs, so the service never offers a filesystem the server would refuse |
 | The partition-table reader | `userspace/libgpt/` | Each disk's entries, for `init.toml`'s UUID sources |
+| The `Storage` codec | `userspace/librsproto/src/storage.rs` | `Mount`, `Unmount` and `InUse` bodies ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)) |
+| The busy check | `kernel/src/syscall/table.rs` (`sys_ns_held`) | How many of a mount's files something still holds, after the finished IRPs have let go |
 
 ## 3. A boot, end to end
 
@@ -55,8 +61,7 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
    subscription stays open for the life of the service; closing it would free the class.
 3. **It reads each device** (§4), and each disk's partition table.
 4. **It reads `/initramfs/etc/init.toml`** and matches each of `init`'s mounts to its device (§5).
-5. **It mounts what it can serve** (§6). A device it does not mount has its node closed: the class
-   stays the service's through the subscription alone.
+5. **It mounts what it can serve** (§6), and keeps every device's node, mounted or not.
 6. **It says what it found**, a line per device, then answers `Meta::Ready`, and `init` binds it
    at `/svc/storage`.
 
@@ -83,7 +88,7 @@ storage-service: not a live boot
   mounted: there is no `fs-server-fat` until Phase 6. A GPT disk's protective MBR carries the
   signature and none of the rest, so a whole disk is not mistaken for a filesystem.
 - **Nothing**, otherwise: a disk holding a partition table, a blank one, or a filesystem neither
-  reader can read. An ext4 its server would refuse, a 64-bit one say, is also "nothing" today (§11).
+  reader can read. An ext4 its server would refuse, a 64-bit one say, is also "nothing" today (§12).
 
 ## 5. `init`'s mounts, and a live boot
 
@@ -126,10 +131,13 @@ order, so the first device found keeps the plain name.
    ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md)).
 3. Wait, bounded as `init` waits, for its `Meta::Ready`, and take the endpoint it carries.
 4. Create a namespace and bind that endpoint at its `/`. This is why the service holds
-   `BIND_NAMESPACE`: it binds only into namespaces it created (§9).
-5. **Keep the server's control channel.** It will carry C.5c's `Meta::Unmount`. The service waits
-   on it meanwhile, since its closing means the server has gone, and the mount goes with it rather
+   `BIND_NAMESPACE`: it binds only into namespaces it created (§10).
+5. **Keep the server's control channel.** It carries `Meta::Unmount` (§8). The service waits on
+   it meanwhile, since its closing means the server has gone, and the mount goes with it rather
    than leaving a label every resolve under would fail.
+
+**The service keeps every device's node**, not only a mounted one's: an administrator may mount
+any of them (§8), and an unmount flushes the drive through it.
 
 **The `fs` side.** `fs` is a directory session listing a subdirectory per mount. `fs/<label>`,
 alone or with a path after it, is answered with `SUBNAMESPACE`:
@@ -159,7 +167,38 @@ no base, and on the root endpoint that would let it resolve `session-endpoint` a
 session endpoint that suffix is `NotFound`, however it is bound. Four session endpoints can exist
 at once: one for each login supervisor, and headroom.
 
-## 8. The tables
+## 8. Mounting and unmounting by request
+
+**An admin session carries `Storage` requests** ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)).
+The root endpoint mints an admin endpoint at `admin-endpoint`, and any resolve on that endpoint
+opens a session. A session endpoint refuses the suffix, so a session cannot reach mounting at all.
+Who holds an admin endpoint is the view broker's `storage` grant to decide (C.6); the service
+answers every request on a session.
+
+- **`Mount`** names a device as the tables do, `blk-<n>`, and optionally a label. It is always
+  writable, on a live boot too. It is refused for a device already mounted, `init`'s included, for
+  one holding nothing the service serves, and for a label that is invalid or taken.
+- **`InUse`** is every mounted device and the disk that holds it: what the `disks` grant must not
+  hand out raw, since a raw write to a disk reaches its partitions.
+- **`Unmount`** is a chain, each link only once the one before it held:
+  1. The label leaves `fs`.
+  2. Every dirty file is written back: `sys_ns_sync` on the mount's namespace. That includes a
+     file a writer mapped, wrote and let go of without a sync.
+  3. **Refused while a file is still held**: `sys_ns_held`, asked after the sync, when what is
+     left is someone's. A handle or a mapping could write after the filesystem is marked clean.
+     A refusal here puts the label back and changes nothing.
+  4. `Meta::Unmount`: the server records the filesystem clean and exits.
+  5. `IoOpcode::Flush` on the device, for a writable mount.
+  6. The namespace is dropped.
+
+**The count is asked up to three times, 5 ms apart, before it is believed.** A block IRP pins the
+file whose frames it moves, and a finished IRP's box is freed only in thread context. The first
+unmount after a write was refused because the write-back's IRPs still held the file they had just
+written. The kernel now frees finished IRPs before it counts. But an IRP whose completion is
+still running on another CPU wakes the sync before it parks its box, and for that moment its file
+counts. A real holder is still holding milliseconds later; that moment has passed.
+
+## 9. The tables
 
 `/svc/storage/info` is a directory of TSM1 tables, like `/dev/devices`: `all.tsm` with a row per
 block device in registry order, then one `<name>.tsm` per device. **A name is `/dev/devices`' own**,
@@ -182,13 +221,19 @@ it answers Ready ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md)), so that state
 because it is, and nothing about how the filesystem was left. The service's log line follows the
 same rule.
 
-## 9. Who can reach what
+## 10. Who can reach what
 
 | Holder | Reaches |
 |---|---|
-| The root namespace: `init`, `service-mgr`, both login supervisors, the view broker, declared services | `/svc/storage` whole: the tables, every mounted filesystem, and a session endpoint to mint |
+| The root namespace: `init`, `service-mgr`, both login supervisors, the view broker, declared services | `/svc/storage` whole: the tables, every mounted filesystem, and a session or admin endpoint to mint |
 | A holder of a session endpoint | the tables and every mounted filesystem, never another endpoint |
+| A holder of an admin endpoint | admin sessions: `Mount`, `Unmount`, `InUse` — the `storage` grant's, from C.6 |
 | A session or an application | nothing yet: C.6 binds the session endpoint into them at `/storage` and `/dev/storage` |
+
+**The root namespace reaches mounting**, since anything holding it can mint an admin endpoint. That
+is the same ungated boundary `/svc/devices` and `/svc/views` have, the same trusted set of system
+services, and the same fix to come (`TODO(svc-auth-ungated)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md)).
 
 **Every mounted filesystem is writable by whoever reaches it**, read-only mounts aside: a mount's
 namespace binds its server with no narrowing, as `init`'s mounts are bound. That is the plan's
@@ -200,12 +245,13 @@ nothing it did not create, which is the view broker's reconciliation
 ([`userspace/CLAUDE.md`](../../userspace/CLAUDE.md) § Capability discipline). `init` binds the
 service itself at `/svc/storage`.
 
-## 10. What the gates prove
+## 11. What the gates prove
 
 | Gate | What it asserts |
 |---|---|
 | `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real |
 | `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
+| `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), mounts | Through `/svc/storage`: `fs` lists `nitrox-scratch` as a directory. Its `README` reads. **A file created, written through a mapping and synced there is on the device**, read back from the RAM disk raw, since a re-resolve would only read the page cache. A session endpoint bound at `/storage` with the base `/fs` and at `/dev/storage` with `/info` reaches the same file and the same table, and bound with no base it mints nothing. An unknown label is `NotFound` |
 
 Host tests hold the rest: FAT against sectors `mformat` wrote and a real protective MBR, ext4
@@ -213,9 +259,16 @@ against a filesystem `mkfs` made (and one whose root inode `check_device` refuse
 scheme, the live-boot rule, every column's rule, every label rule and clash, what a boot mounts and
 how, and what each suffix asks for where it arrives.
 
-## 11. Not built, and what that costs
+## 12. Not built, and what that costs
 
-- **Nothing unmounts.** A mount lasts until its server exits (C.5c).
+- **A resolve already on its way to a mount's server can outlive the busy check.** One the kernel
+  forwarded before the unmount began may complete after `sys_ns_held` said zero, and hand out a
+  file of a filesystem about to be marked clean. It needs a resolve in flight at the moment the
+  unmount starts. A lazy unmount, which would drain those, is not built.
+- **An open directory session is not a held file.** A client holding one when its filesystem is
+  unmounted finds the channel closed.
+- **Nothing unmounts `init`'s mounts**, so nothing syncs them before the machine stops. That is
+  Part E's `shutdown`.
 - **A live boot's read-only auto-mount has no gate yet.** `check-live` has nothing to mount, and
   `check-storage`, which boots a live image beside a SATA disk, is C.8's.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system

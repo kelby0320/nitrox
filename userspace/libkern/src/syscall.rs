@@ -102,6 +102,10 @@ pub const SYS_NS_DERIVE: u64 = 37;
 /// server `path` resolves to in `ns`, returning how many were written. Requires `LOOKUP` on
 /// `ns`. **Blocks** until the writes complete, like `sys_file_sync` — a durability point.
 pub const SYS_NS_SYNC: u64 = 38;
+/// `sys_ns_held(ns, path, path_len)` — how many of the files the userspace server `path` resolves
+/// to handed out are still held by something: a handle, a mapping, an IRP, or a dirty pin. Asked
+/// after `sys_ns_sync`, a non-zero answer means the mount is in use (administration Part C.5c).
+pub const SYS_NS_HELD: u64 = 39;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to

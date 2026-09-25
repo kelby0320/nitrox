@@ -7,7 +7,10 @@ deferred list was swept against the code. Administration Part C.1 (2026-09-24): 
 reply carries the inode number as the file's id, `File::Touch` names a file by it, and a grow
 zeroes on the device what it adds. C.1b (2026-09-24): an unlink or a replacing rename frees the
 file only after the kernel has answered `File::Forget` for it. C.3 (2026-09-24): a read-only mode,
-and `s_state` kept — § *Read-only mounts, and how a filesystem was left*.
+and `s_state` kept — § *Read-only mounts, and how a filesystem was left*. C.5b–C.5c (2026-09-25):
+**the storage service spawns it for every filesystem it mounts**, keeps its control channel, and
+unmounts it with `Meta::Unmount`, which `boot-probe` drives on every `test-qemu` run
+([`storage.md`](storage.md)).
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**

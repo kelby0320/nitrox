@@ -557,6 +557,12 @@ with `/svc/devices/block` bound only into the storage service's. Sessions are no
 `/dev/devices` is an info-only endpoint the manager answers nothing but tables on
 ([`device-manager.md`](../architecture/device-manager.md) §6).
 
+**`/svc/storage` sits on it too** (administration Part C.5c, 2026-09-25). Anything holding the root
+namespace can resolve `/svc/storage/admin-endpoint`, and so mount and unmount any filesystem the
+service can serve. The view broker's `storage` grant (C.6) decides who reaches one from a view, but
+the root namespace reaches it without asking. The same fix closes it: supervisors and services
+given constructed namespaces, with `/svc/storage` bound whole only into the view broker's.
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly
@@ -1541,7 +1547,8 @@ place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
-**Writeback when a `FileObject` is torn down — half built by administration C.1.**
+**Writeback when a `FileObject` is torn down — built for unmount by administration C.1 and C.5c;
+shutdown's half still owed.**
 
 **Before C.1 (2026-09-24)**, `sys_file_sync` was the only writeback trigger. Unmapping a
 `MAP_WRITE` VMA wrote nothing back, and a `FileObject`'s `Drop` freed its cached frames unwritten.
@@ -1555,11 +1562,17 @@ itself while dirty, so its pages outlive whoever wrote them. Such a file has a n
 which is every file `fs-server-ext4` serves. `sys_ns_sync` writes every such object under a
 registration (`filesystem-data-path.md` § *One object per file*).
 
+**What C.5c built: an unmount syncs first.** The storage service's unmount calls `sys_ns_sync`,
+refuses while a file is still held (`sys_ns_held`), and only then has the server record the
+filesystem clean ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md) § `Unmount`).
+`boot-probe` proves it on every run: a file written through a mapping and never synced is on the
+device after the unmount.
+
 **What is still owed:**
-- **Nothing calls `sys_ns_sync` before a server goes.** **Trigger, and it is scheduled**: C.5's
-  unmount and Part E's shutdown (`docs/planning/administration.md`). Each must sync before tearing
-  its server down. Otherwise it loses whatever a writer left unsynced, while still marking the
-  filesystem clean.
+- **`init`'s mounts are never unmounted, so nothing syncs them before the machine stops.**
+  **Trigger, and it is scheduled**: Part E's `shutdown` (`docs/planning/administration.md`),
+  which runs the same chain on them. Until then a file on `/` or `/home` that its writer left
+  unsynced is written only by a later sync of it.
 - **A file its server gives id `0` is uncached.** It has no self-pin and no sync can find it, so
   its unsynced mapped writes are still lost when its writer lets go. No in-tree server sends a
   zero id: `fs-server-ext4` sends the inode number. **Trigger**: the first server that serves a

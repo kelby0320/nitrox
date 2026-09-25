@@ -22,9 +22,14 @@
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
 //!    reply: the kernel continues the resolve in the mount's namespace, so a file fills through
 //!    the mounted server's own registration and nothing passes through this service.
-//!    `session-endpoint` mints an endpoint on which only `info` and `fs` are answered.
+//!    `session-endpoint` mints an endpoint on which only `info` and `fs` are answered, and
+//!    `admin-endpoint` one on which any resolve opens an **admin session**: a channel for
+//!    `Storage` requests (C.5c) — `Mount`, `Unmount` and `InUse`.
 //!
-//! The `Storage` protocol and unmounting are C.5c's.
+//! **An unmount is a chain** (C.5c): the label leaves `fs`, every dirty file is written back
+//! (`sys_ns_sync`), the unmount is refused if a file is still held (`sys_ns_held`), the server
+//! records the filesystem clean and exits (`Meta::Unmount`), the drive's cache is flushed, and
+//! the namespace is dropped.
 
 #![no_std]
 #![no_main]
@@ -35,7 +40,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fs_server_ext4::{BlockReader, FsError};
 use libinittoml::manifest::{self, Mode};
-use libkern::abi::{IO_OPCODE_READ, IoOp};
+use libkern::abi::{IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
 use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
@@ -46,8 +51,9 @@ use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, SUBNAMESPACE_PREFIX_LEN, parse_resolve_request,
     resolve_reply, subnamespace_reply,
 };
-use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
-use storage_service::mounts::{self, Plan, automount};
+use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use, parse_mount};
+use storage_service::mounts::{self, Plan, automount, explicit, in_use};
 use storage_service::probe::{Found, probe};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
@@ -73,13 +79,23 @@ const REPLAY_WAIT_NS: u64 = 2_000_000_000;
 const MAX_SESSION_ENDPOINTS: usize = 4;
 /// Mounts at once. Each keeps its server's control channel in the wait set, to see it exit.
 const MAX_MOUNTS: usize = 8;
-/// Directory sessions open at once: the wait set, less the endpoint, the subscription, the
-/// session endpoints and the mounts.
-const MAX_DIRS: usize = MAX_WAIT_HANDLES - 2 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS;
+/// Admin endpoints at once. The view broker asks for one at boot (C.6); the second is headroom.
+const MAX_ADMIN_ENDPOINTS: usize = 2;
+/// Admin sessions open at once: a `disk --mount` or `--unmount` is one, briefly.
+const MAX_ADMIN_SESSIONS: usize = 4;
+/// Directory sessions open at once: the wait set, less the endpoint, the subscription, and every
+/// other kind's bound.
+const MAX_DIRS: usize =
+    MAX_WAIT_HANDLES - 2 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS - MAX_ADMIN_ENDPOINTS - MAX_ADMIN_SESSIONS;
 /// Where a filesystem server is spawned from: the store's copy, since the root is mounted by now.
 const FS_SERVER: &[u8] = b"/bin/fs-server-ext4";
 /// How long a filesystem server may take to answer `Meta::Ready`: `init`'s bound for its own.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000;
+/// How many times an unmount asks whether a file is held before it believes the answer, and how
+/// long it parks between: long enough for an IRP's completion on another CPU to finish, short
+/// enough that a refused unmount is still prompt.
+const HELD_ASKS: u32 = 3;
+const HELD_PARK_NS: u64 = 5_000_000;
 /// The scratch every device read passes through: 64 KiB, enough for the front of a disk's
 /// partition table in one read.
 const SCRATCH: usize = 64 * 1024;
@@ -113,6 +129,20 @@ fn wait_until(h: u64, deadline: u64) -> bool {
         WAIT_HANDLES[0] = h;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline) == 1
     }
+}
+
+/// Park this thread for `ns`: a one-shot timer, since `sys_wait` takes no empty handle list, so a
+/// deadline alone is not a sleep. Returns at once if no timer can be made.
+fn park(ns: u64) {
+    // SAFETY: register-only syscall; returns a handle or a negative KError.
+    let timer = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
+    if timer < 0 {
+        return;
+    }
+    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
+    unsafe { syscall4(SYS_TIMER_SET, timer as u64, now_ns().saturating_add(ns), 0, 0) };
+    wait_until(timer as u64, u64::MAX);
+    close(timer as u64);
 }
 
 /// Wait for a pending operation and return its `(status, value)`.
@@ -532,15 +562,26 @@ fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
     }
 }
 
+/// **Flush the drive's volatile write cache** (`IoOpcode::Flush`): `true` once it completes. A
+/// partition passes it to its disk, a RAM disk completes it at once, and AHCI sends `FLUSH CACHE
+/// EXT` ([`drivers-and-irps.md`](../../../docs/architecture/drivers-and-irps.md) § Flush). Needs
+/// `WRITE` on the node, which the device manager's duplicate carries.
+fn flush(node: u64) -> bool {
+    let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
+    po >= 0 && po_wait(po as u64).0 == 0
+}
+
 /// Mount `plan`'s device, whose node is `node`: spawn a server over it, and build its namespace.
-/// The node is consumed either way — a duplicate goes to the server, and this service keeps none.
+/// The server gets a duplicate of the node; this service keeps its own, for the flush that ends an
+/// unmount and for a later mount of the same device.
 fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
     // **The server's handle, narrowed to the mode**: a read-only mount's server cannot write the
     // device even if it tried, whatever `ReadOnly` does above it.
     let write = if plan.mode == Mode::Rw { RIGHT_WRITE } else { 0 };
     // SAFETY: duplicating a node this process holds with DUPLICATE, narrowed.
     let device = unsafe { syscall2(SYS_HANDLE_DUPLICATE, node, RIGHT_READ | write | RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-    close(node);
     if device <= 0 {
         return Err(b"its node would not duplicate");
     }
@@ -597,17 +638,26 @@ enum Listing {
 }
 
 struct Service {
+    root_ns: u64,
     serve_end: u64,
     /// The `block` subscription. **Held for the life of the service**: closing it frees the
     /// class, and the disks would be anyone's.
     subscription: u64,
     devices: Vec<Device>,
+    /// Every device's node, by registry id: this service's own duplicate, from the replay. Kept,
+    /// since an administrator may mount any of them and an unmount flushes the drive.
+    nodes: Vec<(u32, u64)>,
     /// `init`'s mounts, as the table reports them. This service's own are [`mounted`](Self::mounted).
     init: Vec<Mounted>,
     mounted: Vec<Mount>,
     /// This service's ends of the session endpoints it has minted: resolves arriving here are
     /// [`session_only`].
     session_ends: Vec<u64>,
+    /// This service's ends of the admin endpoints it has minted: any resolve on one opens an admin
+    /// session.
+    admin_ends: Vec<u64>,
+    /// Admin sessions: channels carrying `Storage` requests.
+    admin_sessions: Vec<u64>,
     dirs: Vec<(u64, Listing)>,
 }
 
@@ -658,6 +708,7 @@ impl Service {
                 None => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
             },
             Asked::SessionEndpoint => self.mint_session_endpoint(from, m.request_id),
+            Asked::AdminEndpoint => self.mint_admin_endpoint(from, m.request_id),
             Asked::Unknown => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
         }
         true
@@ -679,6 +730,204 @@ impl Service {
         } else {
             close(ours);
         }
+    }
+
+    /// Answer with a forwarding endpoint of this service's own, on which any resolve opens an admin
+    /// session. **Minted only on the root endpoint**: [`session_only`] refuses the suffix on a
+    /// session endpoint, so a session cannot reach mounting at all. Who holds one is the view
+    /// broker's `storage` grant to decide (C.6).
+    fn mint_admin_endpoint(&mut self, reply_to: u64, request_id: u64) {
+        if self.admin_ends.len() >= MAX_ADMIN_ENDPOINTS {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+        }
+        let Some((client_end, ours)) = make_channel(4) else {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        };
+        if reply_channel(reply_to, request_id, client_end) {
+            self.admin_ends.push(ours);
+            kprint(b"storage-service: an admin endpoint minted\n");
+        } else {
+            close(ours);
+        }
+    }
+
+    /// A resolve on an admin endpoint: whatever its suffix, answer with an admin session. `false`
+    /// if the endpoint has gone.
+    fn serve_admin_endpoint(&mut self, from: u64) -> bool {
+        let m = match recv_request(from) {
+            Ok(Some(m)) => m,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        if m.op != OP_NS_RESOLVE {
+            reply_error(from, m.op, m.request_id, KError::Unsupported);
+            return true;
+        }
+        if self.admin_sessions.len() >= MAX_ADMIN_SESSIONS {
+            reply_error(from, OP_NS_RESOLVE, m.request_id, KError::WouldBlock);
+            return true;
+        }
+        let Some((client_end, ours)) = make_channel(4) else {
+            reply_error(from, OP_NS_RESOLVE, m.request_id, KError::KernelError);
+            return true;
+        };
+        if reply_channel(from, m.request_id, client_end) {
+            self.admin_sessions.push(ours);
+        } else {
+            close(ours);
+        }
+        true
+    }
+
+    /// One `Storage` request on admin session `i`.
+    fn serve_admin(&mut self, i: usize) {
+        let ch = self.admin_sessions[i];
+        let m = match recv_request(ch) {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(()) => {
+                close(ch);
+                self.admin_sessions.remove(i);
+                return;
+            }
+        };
+        let refuse = |err: KError, why: &[u8]| {
+            let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 96];
+            let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
+            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
+        };
+        match m.op {
+            OP_STORAGE_MOUNT => {
+                let Some((device, label)) = parse_mount(&m.body) else {
+                    return refuse(KError::InvalidArgument, b"a malformed Mount");
+                };
+                let (Ok(device), Ok(label)) = (core::str::from_utf8(device), core::str::from_utf8(label)) else {
+                    return refuse(KError::InvalidArgument, b"a name or label that is not UTF-8");
+                };
+                match self.mount_explicit(device, label) {
+                    Ok(label) => {
+                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, label.as_bytes(), &[]);
+                    }
+                    Err((err, why)) => refuse(err, why),
+                }
+            }
+            OP_STORAGE_UNMOUNT => {
+                let Ok(label) = core::str::from_utf8(&m.body) else {
+                    return refuse(KError::InvalidArgument, b"a label that is not UTF-8");
+                };
+                match self.unmount(label) {
+                    Ok(()) => {
+                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &[], &[]);
+                    }
+                    Err((err, why)) => refuse(err, why),
+                }
+            }
+            OP_STORAGE_IN_USE => {
+                let ids = in_use(&self.devices, &self.all_mounts());
+                let mut body = alloc::vec![0u8; 4 + 4 * ids.len()];
+                match build_in_use(&mut body, &ids) {
+                    Some(n) => {
+                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &body[..n], &[]);
+                    }
+                    None => refuse(KError::KernelError, b"the list would not encode"),
+                }
+            }
+            _ => refuse(KError::Unsupported, b"not a Storage request"),
+        }
+    }
+
+    /// An administrator's `Mount`: the label it went under, or why not.
+    fn mount_explicit(&mut self, device: &str, label: &str) -> Result<String, (KError, &'static [u8])> {
+        let taken: Vec<String> = self.mounted.iter().map(|x| x.label.clone()).collect();
+        let room = self.mounted.len() < MAX_MOUNTS;
+        let plan = explicit(&self.devices, &self.all_mounts(), &taken, room, device, label)
+            .map_err(|r| (r.kerror(), r.why()))?;
+        let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == plan.device) else {
+            return Err((KError::NotFound, b"this service holds no node for it"));
+        };
+        let m = mount(self.root_ns, &plan, node).map_err(|why| (KError::IoError, why))?;
+        Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(b" (rw), as asked").end();
+        self.mounted.push(m);
+        Ok(plan.label)
+    }
+
+    /// **Unmount `label`: the chain**, each link only once the one before it held. An `Err` names
+    /// the link that refused. A refusal before the server is told leaves the mount as it was.
+    fn unmount(&mut self, label: &str) -> Result<(), (KError, &'static [u8])> {
+        let Some(i) = self.mounted.iter().position(|x| x.label == label) else {
+            return Err((KError::NotFound, b"nothing is mounted with that label"));
+        };
+        // 1. **The label leaves `fs`**: taken out of the list, so a resolve under it is `NotFound`
+        //    from here, and put back if a link before the server's refuses. This service is one
+        //    thread, so nothing is answered in between anyway; taking it out says what the chain
+        //    assumes.
+        let x = self.mounted.remove(i);
+        let root = b"/";
+        // 2. **Every dirty file written back**, whether or not anything still holds it.
+        // SAFETY: a namespace handle this process holds, and a valid path.
+        let synced = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
+        if synced < 0 {
+            self.mounted.insert(i, x);
+            return Err((KError::IoError, b"its files could not all be written back"));
+        }
+        // 3. **Refused while a file is held**: a mapping or a handle could write after the
+        //    filesystem is marked clean. Asked after the sync, which let go of every dirty pin a
+        //    write-back could clean, so what is left is someone's — **once a finished IRP has let
+        //    go of its file too**. The kernel frees finished IRPs before it counts, but one whose
+        //    completion is still running on another CPU holds its file for that moment
+        //    (`sys_ns_held`, `syscall-abi.md`), so a count is asked again after a short park
+        //    before it is believed. A real holder is still holding a few milliseconds later.
+        let mut held = 0;
+        for attempt in 0..HELD_ASKS {
+            if attempt > 0 {
+                park(HELD_PARK_NS);
+            }
+            // SAFETY: as above.
+            held = unsafe { syscall3(SYS_NS_HELD, x.ns, root.as_ptr() as u64, root.len() as u64) };
+            if held == 0 {
+                break;
+            }
+        }
+        if held != 0 {
+            Line::new()
+                .s(b"storage-service: ")
+                .untrusted(x.label.as_bytes())
+                .s(b" is in use: ")
+                .i(held as i64)
+                .s(b" file(s) still open or mapped")
+                .end();
+            self.mounted.insert(i, x);
+            return Err((KError::WouldBlock, b"a file on it is still open or mapped"));
+        }
+        // 4. **The server records the filesystem clean and exits.** From here the mount is gone
+        //    whatever the answer: a server that could not record it exits too.
+        let told = send(x.control, OP_UNMOUNT, 1, 0, &[], &[]);
+        let answer = if told && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
+            recv(x.control).ok().flatten()
+        } else {
+            None
+        };
+        let recorded = answer.as_ref().is_some_and(|a| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
+        if let Some(a) = answer {
+            a.handles.iter().for_each(|&h| close(h));
+        }
+        close(x.ns);
+        close(x.control);
+        close(x.process);
+        if !recorded {
+            return Err((KError::IoError, b"its server did not record it clean, and the filesystem was not left clean"));
+        }
+        // 5. **The drive's cache written to its medium**: a writable mount's writes are only
+        //    durable once it is. A read-only mount wrote nothing.
+        if x.mode == Mode::Rw
+            && let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == x.device)
+            && !flush(node)
+        {
+            return Err((KError::IoError, b"the drive's cache could not be flushed"));
+        }
+        // 6. The namespace went with the handle closed above.
+        Line::new().s(b"storage-service: unmounted ").untrusted(x.label.as_bytes()).s(b", left clean").end();
+        Ok(())
     }
 
     fn open_dir(&mut self, reply_to: u64, request_id: u64, listing: Listing) {
@@ -907,15 +1156,13 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     let live = live_boot(&init_list, &records);
 
-    // Mount what can be served. Every node is consumed here: a mount hands a duplicate to its
-    // server, and nothing else here writes to a device, so the class stays this service's through
-    // the subscription alone.
+    // Mount what can be served. A mount hands its server a duplicate of the node; the service
+    // keeps every node, for an administrator's mount and for an unmount's flush.
     let mut plan = automount(&devices, &init, live);
     plan.truncate(MAX_MOUNTS);
     let mut mounted = Vec::new();
-    for (id, node) in nodes {
+    for &(id, node) in &nodes {
         let Some(p) = plan.iter().find(|p| p.device == id) else {
-            close(node);
             continue;
         };
         match mount(root_ns, p, node) {
@@ -929,7 +1176,19 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         }
     }
 
-    let mut s = Service { serve_end: 0, subscription, devices, init, mounted, session_ends: Vec::new(), dirs: Vec::new() };
+    let mut s = Service {
+        root_ns,
+        serve_end: 0,
+        subscription,
+        devices,
+        nodes,
+        init,
+        mounted,
+        session_ends: Vec::new(),
+        admin_ends: Vec::new(),
+        admin_sessions: Vec::new(),
+        dirs: Vec::new(),
+    };
     let mounts = s.all_mounts();
     Line::new().s(b"storage-service: ").u(s.devices.len() as u64).s(b" block device(s)").end();
     for d in &s.devices {
@@ -951,8 +1210,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     s.serve_end = serve_end;
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, at most
-        // MAX_SESSION_ENDPOINTS, MAX_MOUNTS and MAX_DIRS more — each refuses past its bound.
+        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, and at
+        // most each kind's bound more — each refuses past it.
         let waited = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -968,6 +1227,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             }
             for x in &s.mounted {
                 push(x.control);
+            }
+            for &e in &s.admin_ends {
+                push(e);
+            }
+            for &a in &s.admin_sessions {
+                push(a);
             }
             for &(d, _) in &s.dirs {
                 push(d);
@@ -998,6 +1263,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 }
             } else if let Some(i) = s.mounted.iter().position(|x| x.control == h) {
                 s.serve_control(i);
+            } else if let Some(i) = s.admin_ends.iter().position(|&e| e == h) {
+                // Every holder of this endpoint has let it go, its bindings included.
+                if !s.serve_admin_endpoint(h) {
+                    close(h);
+                    s.admin_ends.remove(i);
+                }
+            } else if let Some(i) = s.admin_sessions.iter().position(|&a| a == h) {
+                s.serve_admin(i);
             } else if let Some(i) = s.dirs.iter().position(|&(d, _)| d == h) {
                 s.serve_dir(i);
             }

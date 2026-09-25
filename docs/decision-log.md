@@ -29430,3 +29430,78 @@ used to hang for the whole timeout.
   - `consumed` not ending a component;
   - every mount read-only;
   - nothing auto-mounted.
+
+## 2026-09-25 — Administration C.5c: the storage service unmounts, and a finished IRP was still holding its file
+
+**What landed:**
+- **`Storage` (`0x10xx`, `rsproto-storage-ops.md`)** on an admin session, opened by any resolve on
+  the admin endpoint `/svc/storage/admin-endpoint`. A session endpoint refuses that suffix.
+  - `Mount`: a device by its table name, writable, with a label given or chosen.
+  - `Unmount`: a label, through the whole chain.
+  - `InUse`: every mounted device and the disk holding it.
+  - Who holds an admin endpoint is the view broker's `storage` grant (C.6). Until then the root
+    namespace can mint one, the `svc-auth-ungated` boundary again, and the deferral now names it.
+- **The unmount chain as the detail pass drew it.** The label leaves `fs`; `sys_ns_sync`; a
+  refusal if a file is held; `Meta::Unmount`, the server's first sender; `IoOpcode::Flush` for a
+  writable mount; then the namespace goes. A refusal before `Meta::Unmount` puts the label back
+  and changes nothing.
+- **The service keeps every device's node**, where C.5a closed an unmounted one's: an
+  administrator may mount any of them, and an unmount flushes through one.
+- **`boot-probe` unmounts the scratch disk on every run**, through an admin session bound as the
+  view broker will bind it:
+  - it is refused while the `README` is held;
+  - a file written through a mapping and never synced is on the device after the unmount, which
+    also left the filesystem clean;
+  - then a `Mount` by name brings it back, writable and holding that file.
+
+**Kernel work the detail pass had not named: `sys_ns_held` (syscall 39).** The plan's step "refused
+if any cached object is still held" needs the kernel to say so. The syscall counts a registration's
+live cached files, forgotten ones aside. The cache holds them weakly, so a live one is held by
+something: a handle, a mapping, an IRP, or a dirty file's pin on itself. Asked after
+`sys_ns_sync`, which drops the pins a write-back can clean, what is left is someone's. Syscall
+numbers are not in the ABI hash.
+
+**The first unmount after a write was refused, and nothing held the file.** A temporary print in
+`sys_ns_held` named the one held file. It was the unsynced file, and it was not dirty: the sync had
+written and cleaned it. The holder was the write-back's own IRPs. A page-cache IRP's box pins the
+file whose frames it moves, and a finished box is freed only in thread context
+(`io::block::reclaim_completed`, at the next yield, exit or idle), so for a moment after the sync
+the file was still referenced. Two measures now cover it:
+- **The kernel frees finished IRPs before it counts.** This makes the answer exact whenever each
+  finished IRP's box is already parked.
+- **The service asks up to three times, 5 ms apart, before it believes a count.** This covers an
+  IRP whose DPC is still finishing on another CPU. The DPC wakes the waiter before it parks the
+  box, so for that moment the file counts; under KVM a vCPU can be descheduled between the two.
+
+A DPC that parked the box first would close the window properly, but only if something else kept
+the `PendingOperation` alive meanwhile. `deferred_drops` is sized for entropy waiters, not one per
+IRP. So a race-free kernel answer would mean redesigning how IRP pins are released, which is out of
+proportion here.
+
+**Measured and recorded, not proven.** With neither measure the gate failed. With the drain alone,
+or the re-ask alone, it passes, so no gate distinguishes them. Keeping both rests on the DPC's
+statement order, which is an argument and not a test.
+
+**Two controls passed, and both were the test's fault:**
+- **`in_use` filtered its parent by kind**, and removing the filter changed nothing. The devices it
+  searches are all block devices, so a parent found among them is always a disk or a RAM disk. The
+  filter is gone. A case where the parent is not a block device now pins the search itself: a whole
+  disk mounted bare, whose parent is its controller.
+- **The held-count test forgot its file with nothing in flight.** `forget_file` then removes the
+  entry outright, so "a forgotten file is not counted" passed whether or not the count filtered
+  forgotten entries. The test now forgets with a read in flight.
+
+**Controls:**
+- 8 on the host:
+  - the `Mount` codec's exact length, and the `InUse` codec's count;
+  - `explicit`'s bad label, taken label, FAT, and a full table;
+  - `in_use` pushing any parent;
+  - a forgotten file counted.
+- 6 boots, each failing the verdict at its check:
+  - the unmount with no sync;
+  - held files ignored;
+  - the server never told;
+  - `InUse` without the disks;
+  - a session reaching the admin endpoint;
+  - a mounted device mounted again. That one spawned a second server over `init`'s root, which the
+    rebuilt test disk survives.

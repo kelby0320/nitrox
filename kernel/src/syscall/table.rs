@@ -235,6 +235,9 @@ pub const SYS_NS_DERIVE: u64 = 37;
 /// `sys_ns_sync(ns, path, path_len)` — write back every dirty file under a mount
 /// (administration Part C.1).
 pub const SYS_NS_SYNC: u64 = 38;
+/// `sys_ns_held(ns, path, path_len)` — how many of a mount's files something still holds
+/// (administration Part C.5c).
+pub const SYS_NS_HELD: u64 = 39;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -286,6 +289,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_CREATE => encode(sys_ns_create()),
         SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
         SYS_NS_SYNC => encode(sys_ns_sync(a0, a1, a2 as usize)),
+        SYS_NS_HELD => encode(sys_ns_held(a0, a1, a2 as usize)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
@@ -2877,6 +2881,54 @@ fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     drop(files);
     drop(reg);
     result.map(|()| written)
+}
+
+/// `sys_ns_held(ns, path, path_len)` — **how many of the files a mount's server handed out
+/// something still holds** (administration Part C.5c): the page-cache objects of the registration
+/// `path` resolves through in `ns` that are alive, a forgotten file's aside.
+///
+/// The cache holds its objects weakly, so an object is alive only while something holds it: a
+/// handle, a mapping, an IRP in flight, or its own dirty pin. **Asked after [`sys_ns_sync`]**, the
+/// pin is gone from every file a write-back could clean, and what is left is held by someone. That
+/// is the storage service's question before an unmount, which it refuses while the answer is not
+/// zero, since a filesystem marked clean must not be written after.
+///
+/// **A finished IRP's reference is released first.** A block IRP pins the file whose frames it
+/// moves, and its box is freed only in thread context ([`crate::io::block::reclaim_completed`]),
+/// at the next yield, exit or idle. So a write-back's file stayed "held" for a moment after the
+/// sync that waited for it, and the first unmount after a write was refused. Freeing the finished
+/// boxes here makes the answer exact, except for an IRP whose completion is still running on
+/// another CPU: its DPC wakes the waiter before it parks the box, so for that moment the file is
+/// counted. A caller that sees a count straight after a sync asks again after a moment
+/// ([`storage.md`](../../docs/architecture/storage.md) §6).
+///
+/// Needs `LOOKUP` on `ns`. `Unsupported` if `path` resolves to anything but a userspace server,
+/// `NotFound` if to nothing. It does not block.
+fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
+    let mut buf = [0u8; NS_PATH_MAX];
+    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+    validate_path(path).map_err(|_| KError::InvalidArgument)?;
+    // SAFETY: `lookup_typed` verified the type; the refcount pins it for this call.
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    let reg = match ns.resolve(path) {
+        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
+        Some(_) => return Err(KError::Unsupported),
+        None => return Err(KError::NotFound),
+    };
+    // SAFETY: `reg` pins a live `UserspaceServerReg`.
+    let r: &crate::object::UserspaceServerReg =
+        unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
+    // Thread context, no lock held: the finished IRPs' boxes may drop here.
+    crate::io::block::reclaim_completed();
+    // The references are taken under the cache's lock and dropped after it is released: each
+    // may be the last, and its `Drop` takes that lock.
+    let files = r.cache_objects().map_err(|_| KError::OutOfMemory)?;
+    let held = files.len() as isize;
+    drop(files);
+    drop(reg);
+    Ok(held)
 }
 
 /// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.

@@ -10,7 +10,7 @@ use libstream::wire::{Table, Value};
 use crate::probe::{Found, fat_label, probe};
 use crate::sources::{DiskTable, InitMount, TableEntry, init_mounts, live_boot, partuuid, source_device};
 use crate::labels;
-use crate::mounts::{Plan, at, automount};
+use crate::mounts::{Plan, Refusal, at, automount, explicit, in_use};
 use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
@@ -456,12 +456,68 @@ fn a_mounts_suffix_answers_for_its_label() {
     }
 }
 
-/// **A session endpoint cannot mint another**, and answers everything else as asked.
+/// **A session endpoint mints no endpoint**, session or admin, and answers everything else as asked.
 #[test]
 fn a_session_endpoint_answers_all_but_another_endpoint() {
     assert_eq!(suffix::parse(b"session-endpoint"), Asked::SessionEndpoint);
+    assert_eq!(suffix::parse(b"admin-endpoint"), Asked::AdminEndpoint);
     assert_eq!(session_only(Asked::SessionEndpoint), Asked::Unknown);
+    assert_eq!(session_only(Asked::AdminEndpoint), Asked::Unknown, "a session cannot mount");
     for kept in [Asked::Directory, Asked::File("all"), Asked::Mounts, Asked::Mount { label: "x", consumed: 4 }] {
         assert_eq!(session_only(kept), kept);
     }
+}
+
+// --- an administrator's mount, and what is in use -----------------------------------------------
+
+fn init_root() -> Vec<Mounted> {
+    std::vec![Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }]
+}
+
+/// **A mount by name, writable, under the label asked for or the one the service would choose.**
+#[test]
+fn an_administrator_mounts_by_name() {
+    let ds = devices();
+    let plan = explicit(&ds, &init_root(), &[], true, "blk-4", "").unwrap();
+    assert_eq!(plan, Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw });
+    let plan = explicit(&ds, &init_root(), &[], true, "blk-4", "stick").unwrap();
+    assert_eq!(plan.label, "stick");
+    let taken = [String::from("nitrox-live")];
+    assert_eq!(explicit(&ds, &init_root(), &taken, true, "blk-4", "").unwrap().label, "nitrox-live-2");
+}
+
+/// **Each refusal, for its own reason**: no such device, one already mounted (`init`'s
+/// included), one holding nothing this service serves, a bad label, a taken one, and no room.
+#[test]
+fn an_administrators_mount_is_refused_for_each_reason() {
+    let ds = devices();
+    let taken = [String::from("taken")];
+    let mounted = [
+        init_root()[0].clone(),
+        Mounted { device: 8, at: String::from("/storage/nitrox-live"), by: By::Storage, mode: Mode::Ro },
+    ];
+    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-9", ""), Err(Refusal::NoSuchDevice));
+    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-3", ""), Err(Refusal::AlreadyMounted), "init's root");
+    assert_eq!(explicit(&ds, &mounted, &[], true, "blk-4", ""), Err(Refusal::AlreadyMounted), "the service's own");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-2", ""), Err(Refusal::NothingToServe), "FAT");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-0", ""), Err(Refusal::NothingToServe), "a disk");
+    assert_eq!(explicit(&ds, &init_root(), &[], true, "blk-4", ".x"), Err(Refusal::BadLabel));
+    assert_eq!(explicit(&ds, &init_root(), &taken, true, "blk-4", "taken"), Err(Refusal::LabelTaken));
+    assert_eq!(explicit(&ds, &init_root(), &[], false, "blk-4", ""), Err(Refusal::Full));
+}
+
+/// **What is in use is every mounted device and the disk that holds it** — never a partition's
+/// sibling, and a RAM disk counts as the disk it is.
+#[test]
+fn in_use_is_each_mount_and_its_disk() {
+    let ds = devices();
+    assert_eq!(in_use(&ds, &init_root()), [3, 7], "the root and the SATA disk, not the ESP");
+    let mut both = init_root();
+    both.push(Mounted { device: 8, at: String::from("/storage/nitrox-live"), by: By::Storage, mode: Mode::Ro });
+    assert_eq!(in_use(&ds, &both), [3, 5, 7, 8], "and the live partition's RAM disk");
+    assert_eq!(in_use(&ds, &[]), [] as [u32; 0]);
+    // A whole disk holding a filesystem: its parent is its controller's PCI function, which is not
+    // a block device, so the disk alone is in use.
+    let bare = [Mounted { device: 3, at: String::from("/storage/bare"), by: By::Storage, mode: Mode::Rw }];
+    assert_eq!(in_use(&ds, &bare), [3], "the disk's controller (id 1) is not a device to withhold");
 }

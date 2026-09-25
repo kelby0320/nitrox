@@ -74,7 +74,8 @@ The 16-bit `op` field decomposes:
 | `Clipboard` | `0x0Dxx` | The kill ring, served by `clipboard-server` at `/dev/clipboard`. See [`clipboard.md`](../architecture/clipboard.md). |
 | `Views` | `0x0Exx` | Running a program in a view, served by `view-broker` at `/svc/views` and a session's `/dev/views`. See [Views operations spec](rsproto-views-ops.md). |
 | `Devices` | `0x0Fxx` | Devices handed to the owner of their class, served by `device-mgr` at `/svc/devices`. See [Devices operations spec](rsproto-devices-ops.md). |
-| (reserved) | `0x10xx` – `0xFExx` | Future categories |
+| `Storage` | `0x10xx` | Mounting and unmounting, on an admin session of the storage service's (`/svc/storage/admin-endpoint`). See [Storage operations spec](rsproto-storage-ops.md). |
+| (reserved) | `0x11xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 **This table is the allocation, and every category in it must be distinct.** That sounds
@@ -183,10 +184,12 @@ replies and exits. The reply is empty on success, or an [`ErrorBody`](#error-rep
 could not be written. A read-only mount writes nothing, since it never marked the filesystem
 mounted, and replies success.
 
-It is the fourth step of the storage service's unmount chain (administration Part C): by then
-the supervisor has taken the mount out of every namespace, found nothing still holding a file
-of it, and had the kernel write back every dirty file (`sys_ns_sync`). After the reply it flushes
-the drive (`IoOpcode::Flush`).
+It is the fourth step of the storage service's unmount chain (administration Part C.5c,
+[`rsproto-storage-ops.md`](rsproto-storage-ops.md) § `Unmount`): by then the supervisor has
+taken the label out of `fs`, had the kernel write back every dirty file (`sys_ns_sync`), and found
+nothing still holding a file of it (`sys_ns_held`). After the reply it flushes the drive
+(`IoOpcode::Flush`). The storage service is the first sender, and `boot-probe` drives it on every
+`test-qemu` run, against the test image's scratch filesystem.
 
 **A filesystem server keeps its control channel after `Ready` for this**, and treats the peer
 closing it as ordinary. `init` closes its end as soon as a mount is bound, and never unmounts.
