@@ -29129,3 +29129,57 @@ goes unchecked, and one allowed on a read-only handle. `abi-sync-check` fails on
 
 **ABI hash:** `IoOpcode` and `IrpOp` each gained a variant, which changes the kernel ABI version
 hash (`abi-version-hash.md`).
+
+## 2026-09-24 — Administration C.3: a read-only mount is the server's, and a filesystem knows how it was left
+
+**Read-only is a type the server serves through, not a check per operation.**
+`fs_server_ext4::ReadOnly` is a reader whose every write is refused with `FsError::ReadOnly`.
+- **Whatever mutation is reached, by a session or a resolve, fails at its first write having
+  written nothing**, since a mutation only reads before it writes. A per-operation check would
+  have to be remembered by every future operation. This one can't be forgotten short of
+  bypassing the reader, which the crate's rules file now forbids.
+- **The same type answers `read_only()`**, from which the block-file reply takes its
+  `FILE_BLOCKS_READ_ONLY` mark. The mark and the refusal are one fact.
+- **The host test runs each of the 13 mutations the server can reach twice.** Through
+  `ReadOnly` it must fail with `ReadOnly`, and on a writable copy of the same image it must
+  succeed, so the mount is the only thing that stopped it. The image is byte-identical after.
+- **One path needed more than the type.** A grow or create that arrives as a resolve ignored its
+  errors, so the reply fell through to the file's current size. That answers a create with a
+  file that never changed. `maybe_grow` now reports a `ReadOnly` refusal, and only that, and the
+  resolve is answered `NoAccess` with the reason `read-only mount`. Other grow failures fall
+  through as before.
+
+**The flag travels in the setup message**, as one flags byte; an empty payload is writable, as
+before. `init` sets it for `init.toml`'s `"ro"`, which until now only narrowed the binding's
+rights, and forwarded resolves ignore those. `init` does not link `librsproto`, so it states the
+byte itself (`Mode::setup_flags`), and a host test holds the two equal.
+`TODO(mount-write-authority)` is narrowed accordingly: a read-only mount now exists, and what
+stays open is one mount writable to some and read-only to others.
+
+**`s_state`.**
+- **A writable mount clears the clean bit before `Ready`**, and a mount that cannot write it is
+  refused (`Unservable::StateUnwritable`), since a filesystem that changed while looking clean
+  would be worse than one not mounted.
+- **`Meta::Unmount` (`0x0005`) on the control channel sets it again as the last write**, then
+  the server replies and exits.
+- **Not clean at mount is reported, not refused**, with the repair tool that would do better
+  recorded as `TODO(fs-repair)`. Until Part E's shutdown, every boot of an installed machine will
+  report it, because `init`'s mounts are never unmounted.
+- **On a boot:** after a `test-qemu` boot, the root partition's `s_state` in the image read
+  `0x0`.
+- **Host-tested from bytes this writer never produced as well as its own**: `s_state` values
+  set by hand read as they should, and a set error bit survives a mount and an unmount.
+
+**The control channel costs a wait slot while it is open**, so a session may take the last slot
+only once it has closed. `init` closes its end at the first chance, so its mounts keep all 31;
+a supervisor that keeps the channel for `Meta::Unmount` gets 30.
+
+**Not exercised on a boot yet:** no image mounts anything read-only, and nothing sends
+`Meta::Unmount`. The storage service's live-boot auto-mount (C.5) and `check-storage` (C.8) are
+where both first run. What does run on every boot is the control channel's new life: `init`
+closing it after `Ready`, and the server dropping it and serving on.
+
+**Controls:** seven negative controls fail their tests: `ReadOnly` letting writes through or
+not marking replies; a mount that keeps the clean bit or clobbers the other bits; a reader that
+calls any nonzero state clean; `init`'s flag for `"ro"` zeroed; and an empty setup payload read
+as read-only.

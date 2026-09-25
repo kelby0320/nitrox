@@ -56,7 +56,11 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   unlink's last name, or a rename's replaced file, sends `File::Forget` on the forwarding
   endpoint `SENDMODE_BLOCK`, waits for the answer on buffers of its own — never
   `WAIT_HANDLES`/`WAIT_RESULTS`, which `serve_loop` is still walking — and only then calls
-  `release_inode`. **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+  `release_inode`. **A read-only mount serves through `ReadOnly`** (administration Part C.3):
+  every write refused, so no mutation needs its own check, and the block-file reply's read-only
+  mark comes from the same type. A writable mount `mark_mounted`s before `Ready`; the control
+  channel is kept, while open, for `Meta::Unmount`, which `mark_clean`s, replies and exits.
+  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
 
 ## Scope
 
@@ -115,6 +119,8 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
   and a new range must read as zero rather than as whatever those blocks last held. It writes no
   byte a file ever held.
 - Freeing a file's blocks before the kernel has answered `File::Forget` for it.
+- A mutating path that bypasses the reader it was handed — writing the device another way would
+  step around a read-only mount's `ReadOnly`, which is the whole of its enforcement.
 - Binding itself into a namespace, or holding `BIND_NAMESPACE`.
 - Trusting on-disk structures without bounds-checking (a malformed image must
   yield `FsError`, never a panic or OOB read).

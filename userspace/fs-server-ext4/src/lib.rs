@@ -33,6 +33,13 @@ pub trait BlockReader {
     /// Fill `buf` with the bytes at device byte `offset`. `Err` on any short or
     /// failed read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError>;
+
+    /// Whether this is a **read-only mount** — `true` only for [`ReadOnly`]. What the block-file
+    /// reply marks a file with comes from here, so the mark and the refusal of every write are
+    /// one fact, the type the server serves through.
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// A read failure.
@@ -54,6 +61,9 @@ pub enum FsError {
     Exists,
     /// An `rmdir` target directory is not empty (POSIX `ENOTEMPTY`).
     NotEmpty,
+    /// A write to a **read-only mount** ([`ReadOnly`], administration Part C.3). What the
+    /// server answers is `NoAccess`.
+    ReadOnly,
 }
 
 /// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
@@ -63,6 +73,31 @@ pub enum FsError {
 /// `sys_io_submit` writes.
 pub trait BlockWriter {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
+}
+
+/// **A read-only mount** (administration Part C.3): reads pass through to the device, and every
+/// write is refused with [`FsError::ReadOnly`] before it reaches it.
+///
+/// The server serves a read-only mount through this type, so read-only is not a check each
+/// mutating operation has to remember. Any mutation, reached any way, fails at its first write
+/// having changed nothing: a mutation only reads before it writes, and none of its writes
+/// happen. The host tests hold every mutating operation to that against this same type.
+pub struct ReadOnly<'a, R: BlockReader>(pub &'a R);
+
+impl<R: BlockReader> BlockReader for ReadOnly<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+}
+
+impl<R: BlockReader> BlockWriter for ReadOnly<'_, R> {
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
 }
 
 /// One contiguous mapping from a file's blocks to the device, for the **Model A** data
@@ -336,6 +371,151 @@ mod tests {
         ext4::release_inode(&rw, orphan, LATER).unwrap();
         assert_eq!(ext4::touch_file(&rw, ino, LATER + 2), Err(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-unlink");
+    }
+
+    /// **A read-only mount refuses every mutation the server can reach, and writes nothing**
+    /// (administration Part C.3). Each operation is run twice: through [`ReadOnly`], where it
+    /// must fail with `ReadOnly`, and on a writable copy of the same image, where it must
+    /// succeed — so read-only is the only thing that stopped it, not a missing name or a full
+    /// directory. The image is byte-for-byte what it was afterwards.
+    #[test]
+    fn a_read_only_mount_refuses_every_mutation_and_writes_nothing() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        let victim = ext4::create_file(&rw, b"/system", b"victim", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/victim", 5000, TEST_NOW).unwrap();
+        ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();
+        let orphan_ino = ext4::create_file(&rw, b"/system", b"orphan", TEST_NOW).unwrap();
+        let orphan = ext4::unlink_at(&rw, sys, b"orphan", TEST_NOW).unwrap().unwrap();
+        assert_eq!(orphan, orphan_ino);
+        let before = rw.0.borrow().clone();
+
+        const NOW: i64 = TEST_NOW + 50;
+        type Op<'a> = &'a dyn Fn(&dyn Mutate) -> Result<(), FsError>;
+        let ops: [(&str, Op); 13] = [
+            ("mark_mounted", &|m| m.mark_mounted()),
+            ("mark_clean", &|m| m.mark_clean()),
+            ("touch_at", &|m| m.touch_at(sys, b"victim", NOW)),
+            ("touch_file", &|m| m.touch_file(victim, NOW)),
+            ("grow_file", &|m| m.grow_file(b"/system/victim", 9000, NOW)),
+            ("truncate_file", &|m| m.truncate_file(b"/system/victim", 10, NOW)),
+            ("create_file", &|m| m.create_file(b"/system", b"newfile", NOW)),
+            ("mkdir_at", &|m| m.mkdir_at(sys, b"newdir", NOW)),
+            ("unlink_at", &|m| m.unlink_at(sys, b"victim", NOW)),
+            ("release_inode", &|m| m.release_inode(orphan, NOW)),
+            ("rmdir_at", &|m| m.rmdir_at(sys, b"adir", NOW)),
+            ("rename_path", &|m| m.rename_path(b"/system/victim", b"/system/moved", NOW)),
+            ("rename_at", &|m| m.rename_at(sys, b"victim", b"renamed", NOW)),
+        ];
+        for (name, op) in ops {
+            let ro = crate::ReadOnly(&rw);
+            assert_eq!(op(&ro), Err(FsError::ReadOnly), "{name} through a read-only mount");
+            let copy = RwImage(RefCell::new(before.clone()));
+            assert_eq!(op(&copy), Ok(()), "{name} on a writable copy — else read-only is not what stopped it");
+        }
+        assert!(*rw.0.borrow() == before, "a read-only mount wrote nothing");
+        // Reading through it still works.
+        let ro = crate::ReadOnly(&rw);
+        let mut out = [0u8; 4];
+        assert_eq!(ext4::read_file_range(&ro, b"/system/current-generation", 0, 4, &mut out), Ok(4));
+        assert!(ro.read_only() && !rw.read_only());
+    }
+
+    /// Every mutating operation, callable through one object-safe face so the test above can
+    /// list them. Each discards what its operation returns on success.
+    trait Mutate {
+        fn mark_mounted(&self) -> Result<(), FsError>;
+        fn mark_clean(&self) -> Result<(), FsError>;
+        fn touch_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn touch_file(&self, ino: u32, now: i64) -> Result<(), FsError>;
+        fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError>;
+        fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError>;
+        fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError>;
+        fn mkdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn unlink_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn release_inode(&self, ino: u32, now: i64) -> Result<(), FsError>;
+        fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError>;
+        fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError>;
+        fn rename_at(&self, dir: u32, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError>;
+    }
+
+    impl<T: BlockReader + BlockWriter> Mutate for T {
+        fn mark_mounted(&self) -> Result<(), FsError> {
+            ext4::mark_mounted(self)
+        }
+        fn mark_clean(&self) -> Result<(), FsError> {
+            ext4::mark_clean(self)
+        }
+        fn touch_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::touch_at(self, dir, name, now)
+        }
+        fn touch_file(&self, ino: u32, now: i64) -> Result<(), FsError> {
+            ext4::touch_file(self, ino, now)
+        }
+        fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+            ext4::grow_file(self, path, size, now).map(drop)
+        }
+        fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+            ext4::truncate_file(self, path, size, now).map(drop)
+        }
+        fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::create_file(self, parent, name, now).map(drop)
+        }
+        fn mkdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::mkdir_at(self, dir, name, now)
+        }
+        fn unlink_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::unlink_at(self, dir, name, now).map(drop)
+        }
+        fn release_inode(&self, ino: u32, now: i64) -> Result<(), FsError> {
+            ext4::release_inode(self, ino, now)
+        }
+        fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rmdir_at(self, dir, name, now)
+        }
+        fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rename_path(self, from, to, false, now).map(drop)
+        }
+        fn rename_at(&self, dir: u32, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
+            ext4::rename_at(self, dir, from, to, now)
+        }
+    }
+
+    /// **How the filesystem was left round-trips** through the writer, and preserves the rest of
+    /// `s_state` — a filesystem with its error bit set keeps it across a mount and an unmount.
+    #[test]
+    fn the_state_round_trips_through_a_mount_and_an_unmount() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        assert_eq!(ext4::was_left_clean(&rw), Ok(true), "mke2fs leaves it clean");
+        ext4::mark_mounted(&rw).unwrap();
+        assert_eq!(ext4::was_left_clean(&rw), Ok(false));
+        ext4::mark_clean(&rw).unwrap();
+        assert_eq!(ext4::was_left_clean(&rw), Ok(true));
+        assert_e2fsck_clean(&rw.0.borrow(), "state-round-trip");
+        // The error bit (`EXT4_ERROR_FS`, 0x2) survives both, set by hand.
+        rw.0.borrow_mut()[1024 + 58] |= 0x2;
+        ext4::mark_mounted(&rw).unwrap();
+        assert_eq!(rw.0.borrow()[1024 + 58], 0x2, "the clean bit cleared, the error bit kept");
+        ext4::mark_clean(&rw).unwrap();
+        assert_eq!(rw.0.borrow()[1024 + 58], 0x3);
+    }
+
+    /// **The state is read from bytes this writer never produced**: a superblock left mounted
+    /// by someone else — `s_state` written by hand — reads as not clean, and one with only the
+    /// clean bit reads as clean. A reader tested only on its own writer's output could share
+    /// that writer's mistake.
+    #[test]
+    fn a_superblock_left_mounted_reads_as_not_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"gen\n")));
+        for (state, clean) in [(0x0000u16, false), (0x0002, false), (0x0004, false), (0x0001, true), (0x0005, true)] {
+            rw.0.borrow_mut()[1024 + 58..1024 + 60].copy_from_slice(&state.to_le_bytes());
+            assert_eq!(ext4::was_left_clean(&rw), Ok(clean), "s_state {state:#06x}");
+        }
+        rw.0.borrow_mut()[1024 + 56] = 0; // the magic: not ext4 at all
+        assert!(ext4::was_left_clean(&rw).is_err());
     }
 
     /// **A touch follows the file, not its old name** — the reason it is by id. The kernel

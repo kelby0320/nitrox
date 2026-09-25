@@ -47,7 +47,7 @@ use librsproto::namespace::{
 };
 use librsproto::{
     OP_FILE_FORGET, OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
-    OP_FILE_UNLINK, OP_NS_RESOLVE,
+    OP_FILE_UNLINK, OP_NS_RESOLVE, OP_UNMOUNT,
     RS_FLAG_REPLY,
 };
 use libkern::*;
@@ -104,6 +104,20 @@ const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
 /// the session is bound to. A session addresses entries by name, never path, so it can
 /// only ever touch this inode's directory (structural confinement).
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
+/// The control channel, kept after `Ready` for `Meta::Unmount` (administration Part C.3); `0`
+/// once its peer has closed it, as `init` does as soon as a mount is bound.
+///
+/// **While it is open it takes a wait slot**, so a session may use the last slot only once it
+/// has closed ([`session_capacity`]). `init`'s mounts lose nothing: their control channel closes
+/// before the first session can open.
+static mut CONTROL: u64 = 0;
+
+/// How many directory sessions may be open now: one fewer while the control channel holds a
+/// wait slot of its own.
+fn session_capacity() -> usize {
+    // SAFETY: a single-threaded read.
+    if unsafe { CONTROL } != 0 { MAX_SESSIONS - 1 } else { MAX_SESSIONS }
+}
 static mut SESSION_INO: [u32; MAX_SESSIONS] = [0; MAX_SESSIONS];
 /// Body scratch for a `File::ReadDir` reply (packed entries), before the rsproto header is
 /// prepended into `REPLY_MSG`. Bounded to one IPC payload minus the two headers.
@@ -273,7 +287,7 @@ impl BlockWriter for DiskReader {
 
 /// Receive the setup message on the control channel and return the transferred
 /// block-device handle (its `handles[0]`). `None` on any failure.
-fn recv_device(control: u64) -> Option<u64> {
+fn recv_device(control: u64) -> Option<(u64, bool)> {
     // SAFETY: one waiter on the control endpoint.
     let waited = unsafe {
         WAIT_HANDLES[0] = control;
@@ -303,7 +317,17 @@ fn recv_device(control: u64) -> Option<u64> {
     if rr != 0 || count < 1 {
         return None;
     }
-    Some(unsafe { (&raw const RECV_HANDLES[0]).read() })
+    // The payload is the setup flags (administration Part C.3); an empty one is writable.
+    // SAFETY: `RECV_MSG` holds the setup message; the slice is bounded by its payload length.
+    let flags = unsafe {
+        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        librsproto::meta::parse_fs_setup(core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            len.min(MSG_LEN - PAYLOAD_OFF),
+        ))
+    };
+    let read_only = flags & librsproto::meta::FS_SETUP_READ_ONLY != 0;
+    Some((unsafe { (&raw const RECV_HANDLES[0]).read() }, read_only))
 }
 
 /// Create a connected channel pair (depth 4), returning `(kernel_end, serve_end)`.
@@ -472,22 +496,27 @@ fn send_reply(serve_end: u64, count: usize) {
 /// file first (allocate an inode + insert a directory entry in the parent). Best-effort —
 /// any parse / create / grow error is ignored and the subsequent `serve` maps the file at
 /// its current size (the reply reflects that, so a failed create surfaces as `NotFound`).
-fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
+fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) -> Result<(), FsError> {
     let Ok(m) = librsproto::decode(req) else {
-        return;
+        return Ok(());
     };
     if m.op != OP_NS_RESOLVE {
-        return;
+        return Ok(());
     }
     let Some(r) = parse_resolve_request(m.body) else {
-        return;
+        return Ok(());
     };
     if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
-        return;
+        return Ok(());
     }
     let Some(new_size) = parse_resolve_grow_size(m.body) else {
-        return;
+        return Ok(());
     };
+    // **A read-only mount's refusal is the one failure reported** (administration Part C.3).
+    // Every other one falls through, as it always has, and the reply shows the size the file
+    // has; this one would otherwise answer a create or a grow with a file that never changed.
+    let mut refused = false;
+    let mut note = |r: Result<(), FsError>| refused |= r == Err(FsError::ReadOnly);
     let mut path = [0u8; MAX_SUFFIX + 1];
     path[0] = b'/';
     path[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
@@ -500,17 +529,23 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
         if let Some(slash) = path.iter().rposition(|&b| b == b'/') {
             let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
             let name = &path[slash + 1..];
-            let _ = ext4::create_file(reader, parent, name, now_secs());
+            note(ext4::create_file(reader, parent, name, now_secs()).map(drop));
         }
     }
 
     if r.flags & RESOLVE_TRUNCATE != 0 {
         // Shrink: free the blocks past the new end. Never combined with GROW — the two
         // move the allocator in opposite directions, so the flags are exclusive.
-        let _ = ext4::truncate_file(reader, path, new_size as usize, now_secs());
+        note(ext4::truncate_file(reader, path, new_size as usize, now_secs()).map(drop));
     } else {
-        let _ = ext4::grow_file(reader, path, new_size as usize, now_secs());
+        note(ext4::grow_file(reader, path, new_size as usize, now_secs()).map(drop));
     }
+    if refused { Err(FsError::ReadOnly) } else { Ok(()) }
+}
+
+/// What a person is told beside a refusal's `KError` — the reason, when it is not in the code.
+fn reason(e: FsError) -> &'static [u8] {
+    if e == FsError::ReadOnly { b"read-only mount" } else { b"" }
 }
 
 /// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:
@@ -758,7 +793,7 @@ fn try_resolve_rename<RW: BlockReader + BlockWriter>(reader: &RW, serve_end: u64
             }
             reply_resolve_none(serve_end, request_id)
         }
-        Err(e) => reply_resolve_error(serve_end, request_id, fs_kerror(e)),
+        Err(e) => reply_resolve_error_why(serve_end, request_id, fs_kerror(e), reason(e)),
     }
     true
 }
@@ -802,13 +837,18 @@ fn free_session_at(slot: usize) {
 
 /// Send an error reply for a forwarded resolve (no transferred handle) on `serve_end`.
 fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
+    reply_resolve_error_why(serve_end, request_id, kerror, b"");
+}
+
+/// [`reply_resolve_error`] with a reason for a person reading it.
+fn reply_resolve_error_why(serve_end: u64, request_id: u64, kerror: i32, why: &[u8]) {
     // SAFETY: disjoint reply region.
     let elen = unsafe {
         let reply = core::slice::from_raw_parts_mut(
             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
             MSG_LEN - PAYLOAD_OFF,
         );
-        encode_error(reply, request_id, kerror, OP_NS_RESOLVE)
+        encode_error(reply, request_id, kerror, OP_NS_RESOLVE, why)
     };
     let count = stage_reply(elen, None);
     send_reply(serve_end, count);
@@ -857,7 +897,7 @@ fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
 /// failure an error reply is sent instead.
 fn open_dir_session(serve_end: u64, request_id: u64, dir_ino: u32) {
     // SAFETY: single-threaded scan of the session table.
-    let slot = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) };
+    let slot = unsafe { (0..session_capacity()).find(|&i| SESSION_CH[i] == 0) };
     let Some(slot) = slot else {
         // Every session slot in use — ask the client to retry (WouldBlock).
         reply_resolve_error(serve_end, request_id, KError::WouldBlock.as_i32());
@@ -1015,6 +1055,7 @@ fn fs_kerror(e: FsError) -> i32 {
         FsError::Exists => KError::AlreadyExists.as_i32(),
         FsError::NotEmpty => KError::NotEmpty.as_i32(),
         FsError::Corrupt | FsError::Io => KError::IoError.as_i32(),
+        FsError::ReadOnly => KError::NoAccess.as_i32(),
     }
 }
 
@@ -1048,7 +1089,7 @@ fn reply_session_status(session_ch: u64, request_id: u64, op: u16, r: Result<(),
                 );
             }
         }
-        Err(e) => reply_session_error(session_ch, request_id, op, fs_kerror(e)),
+        Err(e) => reply_session_error_why(session_ch, request_id, op, fs_kerror(e), reason(e)),
     }
 }
 
@@ -1101,13 +1142,18 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
 
 /// Send an error reply for a `File::ReadDir` on a session channel.
 fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
+    reply_session_error_why(session_ch, request_id, op, kerror, b"");
+}
+
+/// [`reply_session_error`] with a reason for a person reading it.
+fn reply_session_error_why(session_ch: u64, request_id: u64, op: u16, kerror: i32, why: &[u8]) {
     // SAFETY: disjoint reply region.
     let elen = unsafe {
         let reply = core::slice::from_raw_parts_mut(
             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
             MSG_LEN - PAYLOAD_OFF,
         );
-        encode_error(reply, request_id, kerror, op)
+        encode_error(reply, request_id, kerror, op, why)
     };
     let count = stage_reply(elen, None);
     send_reply(session_ch, count);
@@ -1115,12 +1161,18 @@ fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
 
 fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: u64) -> ! {
     loop {
-        // Wait set: the forwarding endpoint plus every open directory session (mirrors the
-        // logging service). `count ≤ 1 + MAX_SESSIONS = MAX_WAIT_HANDLES` by construction.
+        // Wait set: the forwarding endpoint, the control channel while it is open, and every
+        // open directory session (mirrors the logging service). `count ≤ MAX_WAIT_HANDLES` by
+        // construction: while the control channel is open, a session never takes the last slot
+        // ([`session_capacity`]).
         // SAFETY: single-threaded build of the wait array.
         let count = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1;
+            if CONTROL != 0 {
+                WAIT_HANDLES[n] = CONTROL;
+                n += 1;
+            }
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -1163,7 +1215,10 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
                     ])
                 };
                 match (pass, h == serve_end) {
-                    // Pass 0: session traffic, including the `PeerClosed` that frees a slot.
+                    // Pass 0: the supervisor, and session traffic, including the `PeerClosed`
+                    // that frees a slot.
+                    // SAFETY: a single-threaded read.
+                    (0, false) if h == unsafe { CONTROL } => serve_control(reader),
                     (0, false) => serve_session(reader, h, serve_end),
                     // Pass 1: drain every queued forwarded request on the kernel endpoint.
                     (1, true) => {
@@ -1175,6 +1230,74 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
                 }
             }
         }
+    }
+}
+
+/// Serve the control channel after `Ready` (administration Part C.3). `init` closes its end as
+/// soon as the mount is bound, so a closed peer is ordinary: the channel leaves the wait set
+/// and serving goes on. **The one request is `Meta::Unmount`**: record the filesystem cleanly
+/// unmounted, answer, and exit. By then the supervisor has written back everything the kernel
+/// held of it, and nothing more can reach it. A read-only mount writes nothing, since it never
+/// marked the filesystem mounted.
+fn serve_control<R: BlockReader + BlockWriter>(reader: &R) {
+    // SAFETY: a single-threaded read.
+    let control = unsafe { CONTROL };
+    loop {
+        let rr = recv_on(control);
+        if rr == KError::PeerClosed.as_i32() as i64 {
+            // SAFETY: closing our own end, and forgetting it.
+            unsafe {
+                syscall1(SYS_HANDLE_CLOSE, control);
+                CONTROL = 0;
+            }
+            return;
+        }
+        if rr != 0 {
+            return; // drained
+        }
+        // SAFETY: `RECV_MSG` holds the message; the slice is bounded by its payload length.
+        let (op, flags, request_id) = unsafe {
+            let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let req = core::slice::from_raw_parts(
+                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+                len.min(MSG_LEN - PAYLOAD_OFF),
+            );
+            match librsproto::decode(req) {
+                Ok(m) => (m.op, m.flags, m.request_id),
+                Err(_) => continue,
+            }
+        };
+        if op != OP_UNMOUNT || flags & RS_FLAG_REPLY != 0 {
+            continue;
+        }
+        let marked = if reader.read_only() { Ok(()) } else { ext4::mark_clean(reader) };
+        let count = match marked {
+            Ok(()) => {
+                // SAFETY: REPLY_MSG is a valid buffer; an empty-body reply.
+                let rs_len = unsafe {
+                    librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_UNMOUNT, request_id, RS_FLAG_REPLY, &[], 0)
+                };
+                rs_len.map_or(0, |n| stage_reply(n, None))
+            }
+            Err(e) => {
+                // SAFETY: disjoint reply region.
+                let elen = unsafe {
+                    let reply = core::slice::from_raw_parts_mut(
+                        ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                        MSG_LEN - PAYLOAD_OFF,
+                    );
+                    encode_error(reply, request_id, fs_kerror(e), OP_UNMOUNT, b"the state could not be written")
+                };
+                stage_reply(elen, None)
+            }
+        };
+        send_reply(control, count);
+        if marked.is_ok() {
+            kprint(b"fs-server: unmounted, and the filesystem recorded clean\n");
+            exit(0);
+        }
+        kprint(b"fs-server: unmounted, but the filesystem could not be recorded clean\n");
+        exit(1);
     }
 }
 
@@ -1233,8 +1356,12 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
             // (allocate blocks + extend the extent tree), so the map `serve` then builds
             // covers the new size. A grow failure falls through — `serve` maps the current
             // size and the reply reflects it.
-            maybe_grow(reader, req);
-            serve(reader, req, content, reply)
+            match maybe_grow(reader, req) {
+                Err(e) => Served::Error {
+                    reply_len: encode_error(reply, request_id, fs_kerror(e), OP_NS_RESOLVE, reason(e)),
+                },
+                Ok(()) => serve(reader, req, content, reply),
+            }
         };
 
         let count = match served {
@@ -1250,7 +1377,7 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
                             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
                             MSG_LEN - PAYLOAD_OFF,
                         );
-                        encode_error(reply, request_id, KError::OutOfMemory.as_i32(), served_op)
+                        encode_error(reply, request_id, KError::OutOfMemory.as_i32(), served_op, b"")
                     };
                     stage_reply(elen, None)
                 }
@@ -1270,7 +1397,7 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
                             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
                             MSG_LEN - PAYLOAD_OFF,
                         );
-                        encode_error(reply, request_id, KError::KernelError.as_i32(), served_op)
+                        encode_error(reply, request_id, KError::KernelError.as_i32(), served_op, b"")
                     };
                     stage_reply(elen, None)
                 } else {
@@ -1288,8 +1415,9 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
 /// installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
-    // 1. Receive the block-device handle via the setup message.
-    let device = match recv_device(control) {
+    // 1. Receive the block-device handle, and whether to serve it read-only, via the setup
+    //    message.
+    let (device, read_only) = match recv_device(control) {
         Some(d) => d,
         None => fail(b"fs-server: setup recv failed\n"),
     };
@@ -1318,6 +1446,22 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
         exit(1);
     }
 
+    // 3b. **How it was left** (administration Part C.3): reported, never refused — a repair tool
+    //     is deferred (`TODO(fs-repair)`), and refusing would strand a disk that is most likely
+    //     fine. Then a writable
+    //     mount records itself mounted **before** anything can change the filesystem, so it never
+    //     looks clean while it can change; one that cannot record it is refused. A read-only
+    //     mount writes nothing, the superblock included.
+    if fs_server_ext4::ext4::was_left_clean(&reader) == Ok(false) {
+        kprint(b"fs-server: the filesystem was not cleanly unmounted last time; serving it anyway\n");
+    }
+    if !read_only && fs_server_ext4::ext4::mark_mounted(&reader).is_err() {
+        if !send_refusal(control, fs_server_ext4::ext4::Unservable::StateUnwritable) {
+            fail(b"fs-server: the state could not be written, and the refusal could not be sent\n");
+        }
+        exit(1);
+    }
+
     // 4. The forwarding channel: keep the serving end, hand the kernel end to init.
     let (kernel_end, serve_end) = match make_channel() {
         Some(p) => p,
@@ -1328,10 +1472,19 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     if !send_ready(control, kernel_end) {
         fail(b"fs-server: ready send failed\n");
     }
-    kprint(b"fs-server: ready (ext4, read-write)\n");
+    // Kept for `Meta::Unmount`, until its peer closes it.
+    // SAFETY: single-threaded; set before the serve loop reads it.
+    unsafe { CONTROL = control };
 
-    // 6. Serve forwarded Resolve requests forever.
-    serve_loop(&reader, serve_end, device);
+    // 6. Serve forwarded requests until an unmount — a read-only mount through the type that
+    //    refuses every write, which also marks each file it resolves read-only.
+    if read_only {
+        kprint(b"fs-server: ready (ext4, read-only)\n");
+        serve_loop(&fs_server_ext4::ReadOnly(&reader), serve_end, device)
+    } else {
+        kprint(b"fs-server: ready (ext4, read-write)\n");
+        serve_loop(&reader, serve_end, device)
+    }
 }
 
 #[panic_handler]

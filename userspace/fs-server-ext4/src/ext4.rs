@@ -18,6 +18,12 @@ const MAX_BLOCK: usize = 4096;
 static ZERO_BLOCK: [u8; MAX_BLOCK] = [0; MAX_BLOCK];
 
 const SUPER_MAGIC: u16 = 0xEF53;
+
+/// Byte offset of `s_state` from the device's start: the superblock at 1024, `s_state` at 58
+/// within it.
+const S_STATE_AT: u64 = 1024 + 58;
+/// `s_state`'s "cleanly unmounted" bit (`EXT4_VALID_FS`).
+const STATE_CLEAN: u16 = 0x0001;
 const ROOT_INO: u32 = 2;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const INCOMPAT_64BIT: u32 = 0x80;
@@ -209,13 +215,17 @@ pub enum Unservable {
         /// The inode's `i_mode`.
         mode: u16,
     },
+    /// A writable mount could not record that it is mounted (administration Part C.3): the
+    /// superblock's state would not write, so neither would anything else, and a filesystem
+    /// that changed while looking clean would be worse than one not mounted.
+    StateUnwritable,
 }
 
 impl Unservable {
     /// The [`FsError`] a request fails with for the same reason.
     pub fn fs_error(self) -> FsError {
         match self {
-            Unservable::Unreadable | Unservable::RootUnreadable => FsError::Io,
+            Unservable::Unreadable | Unservable::RootUnreadable | Unservable::StateUnwritable => FsError::Io,
             Unservable::NoMagic { .. }
             | Unservable::ZeroField(_)
             | Unservable::RootNotDirectory { .. } => FsError::Corrupt,
@@ -250,6 +260,9 @@ impl core::fmt::Display for Unservable {
                 "inode 2 is not a directory (mode {mode:#06o}): the group descriptors or the inode \
                  table are not what the superblock describes"
             ),
+            Unservable::StateUnwritable => {
+                write!(f, "the superblock could not be written to record the filesystem mounted")
+            }
         }
     }
 }
@@ -795,6 +808,40 @@ fn resolve_path_ino<R: BlockReader>(
         inode = read_inode(r, sb, ino)?;
     }
     Ok((ino, inode))
+}
+
+// --- how the filesystem was left (administration Part C.3) --------------------
+
+/// **Whether the filesystem was left clean**: `s_state`'s "cleanly unmounted" bit. A writable
+/// mount clears it ([`mark_mounted`]) and an unmount sets it again as its last write
+/// ([`mark_clean`]), so a filesystem found without it was mounted writable and never
+/// unmounted — a crash, a power cut, or a shutdown this system does not have yet. `Err` if
+/// the device holds no ext4 filesystem.
+pub fn was_left_clean<R: BlockReader>(r: &R) -> Result<bool, FsError> {
+    read_superblock(r)?;
+    let mut s = [0u8; 2];
+    r.read_at(S_STATE_AT, &mut s)?;
+    Ok(u16::from_le_bytes(s) & STATE_CLEAN != 0)
+}
+
+/// Record that the filesystem is **mounted writable**: clear the "cleanly unmounted" bit,
+/// leaving the rest of `s_state` (the error and orphan bits) as it was. A writable mount does
+/// this before it answers `Meta::Ready`, so a filesystem never looks clean while it can change.
+pub fn mark_mounted<RW: BlockReader + BlockWriter>(rw: &RW) -> Result<(), FsError> {
+    set_state(rw, |s| s & !STATE_CLEAN)
+}
+
+/// Record that the filesystem was **cleanly unmounted**: set the bit — the last write of an
+/// unmount, after everything else it wrote.
+pub fn mark_clean<RW: BlockReader + BlockWriter>(rw: &RW) -> Result<(), FsError> {
+    set_state(rw, |s| s | STATE_CLEAN)
+}
+
+fn set_state<RW: BlockReader + BlockWriter>(rw: &RW, f: impl Fn(u16) -> u16) -> Result<(), FsError> {
+    read_superblock(rw)?;
+    let mut s = [0u8; 2];
+    rw.read_at(S_STATE_AT, &mut s)?;
+    rw.write_at(S_STATE_AT, &f(u16::from_le_bytes(s)).to_le_bytes())
 }
 
 /// Stamp the modification time of `name` inside `dir_ino`, the **session-scoped**

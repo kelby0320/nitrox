@@ -1135,11 +1135,13 @@ namespace, with no login and no session.
       `TODO(ahci-flush)` resolved. *(Landed 2026-09-24. Also: `nxinstall` flushes before "done"
       and `check-install` asserts it; a drive without the 48-bit form gets `FLUSH CACHE`; both
       drivers now name every op, where each inferred one from "not the other".)*
-- [ ] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
+- [x] **C.3 — `fs-server-ext4`'s state.** The read-only flag, every mutation refused under it, and the
       read-only mark in the block-file reply; `s_state` cleared on a writable mount and set on
       `Meta::Unmount`. Host tests on the library: a read-only mount refuses each mutating op, and the
       state round-trips — read back from bytes a writer produced, and from a superblock `mkfs` never
-      wrote, one left mounted.
+      wrote, one left mounted. *(Landed 2026-09-24. Read-only is `ReadOnly`, a reader that refuses
+      every write; `init` sends the flag for `"ro"`; not clean is reported with `TODO(fs-repair)`.
+      The read-only server and `Meta::Unmount` first run on a boot in C.5/C.8.)*
 - [ ] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
       its flags, size change and a rename's destination — so the kernel can continue a resolve in the
       replied namespace with the replied path, for every operation — a rename continues both paths, and

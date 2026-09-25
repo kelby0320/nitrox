@@ -245,8 +245,10 @@ than an implementation detail.
 1. **Read the manifest** — `/initramfs/etc/init.toml`, parsed into an ordered list of
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
 2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
-   over the device handle, wait for its `Ready` message carrying the server's endpoint,
-   and bind that endpoint at the mount point. Any failure → the emergency path. The
+   over the device handle (and, for a `"ro"` mount, the read-only flag), wait for its `Ready`
+   message carrying the server's endpoint, and bind that endpoint at the mount point. A
+   writable server records the filesystem mounted before it answers, and reports one it finds
+   was not cleanly unmounted (administration Part C.3). Any failure → the emergency path. The
    server reads the superblock and the root directory **before** it answers, and a device
    it cannot serve gets a refusal instead, which init prints:
    `init: fs-server-ext4 for / on gpt-partlabel:nitrox-live refused: no ext4 filesystem: …`.

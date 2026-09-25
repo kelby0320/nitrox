@@ -583,10 +583,12 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         return None;
     }
 
-    // 4. Setup message: transfer the device handle to the server (an empty payload;
-    //    the server just takes handles[0]). NoBlock — the control ring is empty.
+    // 4. Setup message: transfer the device handle to the server, with one flags byte — read-only
+    //    for a `"ro"` mount (administration Part C.3). NoBlock — the control ring is empty.
     // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring one handle.
     let sr = unsafe {
+        IPC_MSG[4..8].copy_from_slice(&1u32.to_le_bytes());
+        IPC_MSG[24] = m.mode.setup_flags();
         IPC_HANDLES[0] = device;
         syscall5(
             SYS_CHANNEL_SEND,

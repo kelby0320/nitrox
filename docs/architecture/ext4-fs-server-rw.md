@@ -6,7 +6,8 @@ deferrals are marked inline. Verified 2026-09-17, when cross-group allocation la
 deferred list was swept against the code. Administration Part C.1 (2026-09-24): the block-file
 reply carries the inode number as the file's id, `File::Touch` names a file by it, and a grow
 zeroes on the device what it adds. C.1b (2026-09-24): an unlink or a replacing rename frees the
-file only after the kernel has answered `File::Forget` for it.
+file only after the kernel has answered `File::Forget` for it. C.3 (2026-09-24): a read-only mode,
+and `s_state` kept — § *Read-only mounts, and how a filesystem was left*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -72,6 +73,35 @@ be asked, the inode is not freed: a leaked block can be repaired, a block claime
 **No checksums.** The fixtures are `^metadata_csum`, so there is nothing to maintain. Enabling
 `metadata_csum` (group-desc / inode / extent / dir / bitmap checksums across every write above)
 is a feature-gated later addition.
+
+## Read-only mounts, and how a filesystem was left
+
+*(Administration Part C.3, 2026-09-24.)*
+
+**A read-only mount is the server's.** Its supervisor sets `FS_SETUP_READ_ONLY` in the setup
+message (`init` does for `init.toml`'s `"ro"`), and the server serves through
+`fs_server_ext4::ReadOnly`, a `BlockReader`/`BlockWriter` whose every write is refused with
+`FsError::ReadOnly`. So read-only isn't a check each mutation has to remember: whichever
+mutation is reached, by a session or a resolve, it fails at its first write having changed
+nothing, and the server answers `NoAccess` with the reason `read-only mount`. A grow or create
+that arrives as a resolve is refused, rather than falling through to the file's current size as
+other grow failures do. The same type answers `read_only()`, from which the block-file reply
+takes its `FILE_BLOCKS_READ_ONLY` mark, so the kernel installs the files without `MAP_WRITE`;
+the mark and the refusal are one fact. It never writes the superblock.
+
+**A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
+(`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
+change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An
+unmount sets the bit again as its last write (`mark_clean`), on `Meta::Unmount` from its
+supervisor on the control channel. The server then replies and exits
+([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
+not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
+a repair tool is `TODO(fs-repair)`. `init`'s mounts are never unmounted, so until Part E's
+shutdown every boot of an installed machine reports it.
+
+**The control channel stays open after `Ready`**, and takes a wait slot while it is. A directory
+session may use the last slot only once it has closed. `init` closes its end as soon as a mount
+is bound, so its mounts keep every session slot, and a closed control channel is ordinary.
 
 ## Journaling (jbd2) — deferred
 

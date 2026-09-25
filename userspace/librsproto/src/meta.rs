@@ -94,6 +94,28 @@ pub fn parse_ping(body: &[u8]) -> Option<u64> {
     Some(get_u64(body, 0))
 }
 
+// --- A filesystem server's setup message ---------------------------------------
+
+/// [`fs_setup`] flag: serve the filesystem **read-only** — refuse every mutation with
+/// `NoAccess`, mark every file resolved read-only, and never write the superblock
+/// (administration Part C.3).
+pub const FS_SETUP_READ_ONLY: u8 = 1 << 0;
+
+/// The payload of the **setup message** a supervisor sends a filesystem server on its control
+/// channel, transferring the block device in `handles[0]`: one flags byte ([`FS_SETUP_READ_ONLY`]).
+/// Not rsproto-framed — it precedes everything else on the channel, and carries only this.
+/// Returns its length.
+pub fn fs_setup(out: &mut [u8], flags: u8) -> Option<usize> {
+    *out.first_mut()? = flags;
+    Some(1)
+}
+
+/// The flags of a setup message's payload. **An empty payload is `0` — writable**, which is
+/// what every setup message said before the flags existed.
+pub fn parse_fs_setup(payload: &[u8]) -> u8 {
+    payload.first().copied().unwrap_or(0)
+}
+
 // --- Ready (startup signal on the control channel) --------------------------
 
 /// Fixed prefix of a `ReadyMessage` (before the server name).
@@ -131,6 +153,17 @@ pub fn parse_ready(body: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The setup payload is one flags byte; an empty one is writable, as before the flags.
+    #[test]
+    fn a_setup_payload_is_a_flags_byte() {
+        let mut out = [0xAAu8; 2];
+        assert_eq!(fs_setup(&mut out, FS_SETUP_READ_ONLY), Some(1));
+        assert_eq!(out, [1, 0xAA]);
+        assert_eq!(parse_fs_setup(&[1]), FS_SETUP_READ_ONLY);
+        assert_eq!(parse_fs_setup(&[]), 0, "an empty payload is writable");
+        assert_eq!(fs_setup(&mut [], 1), None);
+    }
 
     #[test]
     fn hello_round_trips() {

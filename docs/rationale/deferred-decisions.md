@@ -1178,7 +1178,9 @@ Trigger: wanting to actually reduce the figure above, rather than just watch it.
 **Resource-server fan-out beyond the `sys_wait` width — `TODO(server-fanout)`.** A server
 that holds a channel per client waits on its serving endpoint plus one slot per client, so
 `MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not
-one of them. Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
+one of them. (Since administration Part C.3 a filesystem server whose supervisor keeps its
+control channel, for `Meta::Unmount`, spends a slot on that too: 30 directory sessions while
+it is open. `init`'s mounts keep 31, since `init` closes its end at once.) Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
 (`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
 concurrent clients to 31, and made both derive their cap from the constant rather than
 restate it. That is a bigger number, not a different shape, and three things are unchanged:
@@ -1218,6 +1220,16 @@ writable mapping and saw none made. That is what keeps an unsynced writer's page
 It is coarser than this entry's fix and does not replace it. A write-back still writes every
 resident page of a dirty object.
 
+**Checking and repairing a filesystem left not clean — `TODO(fs-repair)`.** Since
+administration Part C.3 a writable mount clears ext4's clean bit and an unmount sets it again, so
+a filesystem knows it was left mounted: a crash, a power cut, or, until Part E's shutdown, any
+boot of an installed machine. `fs-server-ext4` **reports** that and serves the filesystem
+anyway. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
+fine: this server writes metadata through at once, and a crash leaves at worst what
+`rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
+`lost+found`. Trigger: a filesystem that actually comes back inconsistent, or a journal, which
+needs a replay before a mount can trust anything.
+
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
 it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC
@@ -1234,6 +1246,12 @@ the bits are not what the name suggests. Doing it properly means deciding where 
 authority lives: rights on the binding independent of the endpoint handle's, a read-only
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
+
+**Narrowed by administration Part C.3 (2026-09-24)**, which built the second of those: a
+read-only mount flag in the fs-server's setup message. A mount that is read-only is read-only
+at its server, whoever resolves through it, and `init.toml`'s `"ro"` sets it. What stays open is
+the case the flag cannot express: one writable mount reached read-only by some processes and
+writable by others, which needs authority on the binding rather than the server.
 
 **Per-stage attribution in `PipelineStatus` — `TODO(pipeline-stage-attribution)`.**
 §1 makes `PipelineStatus` a headline: a composite exit status with one `StageStatus` per stage, in

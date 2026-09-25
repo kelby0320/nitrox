@@ -74,6 +74,11 @@ pub const OP_QUERY_CAPS: u16 = 0x0002;
 pub const OP_PING: u16 = 0x0003;
 /// `Meta::Ready` — startup signal on the control channel.
 pub const OP_READY: u16 = 0x0004;
+/// `Meta::Unmount` — a supervisor telling a filesystem server, on its control channel, to
+/// record the filesystem cleanly unmounted and exit (administration Part C.3). Empty body; the
+/// server answers with a reply — empty on success, an error body if the state could not be
+/// written — then exits.
+pub const OP_UNMOUNT: u16 = 0x0005;
 /// `Namespace::Resolve` — resolve a path suffix to a resource handle.
 pub const OP_NS_RESOLVE: u16 = 0x0100;
 /// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
