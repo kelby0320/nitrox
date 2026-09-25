@@ -1934,12 +1934,13 @@ pub fn us_forward_originate(
     owner_pid: u32,
     requested: Rights,
     suffix: &[u8],
+    fwd: crate::object::userspace_server::Forward<'_>,
 ) -> ForwardOutcome {
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
     let request_id =
-        match unsafe { UserspaceServerReg::begin(reg, po, owner_pid, requested, suffix) } {
+        match unsafe { UserspaceServerReg::begin_forward(reg, po, owner_pid, requested, suffix, fwd) } {
             Some(id) => id,
         None => return ForwardOutcome::Busy,
     };

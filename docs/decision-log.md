@@ -29183,3 +29183,52 @@ closing it after `Ready`, and the server dropping it and serving on.
 not marking replies; a mount that keeps the clean bit or clobbers the other bits; a reader that
 calls any nonzero state clean; `init`'s flag for `"ro"` zeroed; and an empty setup payload read
 as read-only.
+
+## 2026-09-24 — Administration C.4: a resolve continues in a namespace a server hands back
+
+**What the reply says was left open, and it names a prefix, not a path.** The detail pass's
+example has the storage service reply with a namespace and the rest of the path. That is enough
+for one path. A rename carries two, and from a returned path alone the kernel could map the
+destination only by inferring the server's prefix, which breaks as soon as a server maps into a
+subdirectory. So the `SUBNAMESPACE` body says `consumed`, how many bytes of the suffix the server
+answered for, and `base`, what they stand for in the namespace it returns. Every path of the
+operation continues as `base` plus its own remainder, and a destination whose first `consumed`
+bytes differ has left the answer and is `Unsupported`.
+
+**The continuation is `sys_ns_lookup`'s second half, run again.** `resolve_and_start` is the
+resolve and dispatch the syscall does after its own checks, now called by the syscall at depth
+`0` and by a `SUBNAMESPACE` reply one deeper. So a continued resolve dispatches exactly as a first
+one does. A pending lookup now keeps a `ForwardOp` (plain, size change, or rename with its flags)
+and a rename's destination, since the user pointers the syscall had are gone by the reply.
+
+**A continuation that lands on a kernel server is refused.** It runs in the replying server's
+`sys_channel_send`, and `/proc/self` answers for whoever is calling. A server could otherwise
+have handed its caller the server's own process, thread or namespace. This was found while
+designing, before any code: the plan had said "continue for every operation". A direct binding is
+still installed, and a userspace server still forwarded.
+
+**Four deep.** A fifth `SUBNAMESPACE` reply is `TooLarge`, so a server answering into itself ends.
+
+**Tested on a boot now, not only in C.5.** The plan left the boot test to the storage service.
+But the two properties a host test cannot reach are safety properties, the kernel-server refusal
+and the depth cap, so `boot-probe` gained `BIND_NAMESPACE` in the test image and acts as its own
+server: a channel bound at `/cont` in a namespace it made, answering each lookup with a copy of
+the root namespace. It checks six things:
+- a lookup comes back with the root filesystem's file;
+- a create carries its size on;
+- a rename continues both paths;
+- a rename leaving the prefix is refused with nothing moved;
+- a server answering into itself is refused after exactly five replies;
+- `/proc/self` is refused.
+
+Three boots, each failing only that check: no depth cap, the kernel-server refusal removed, and
+the operation not carried past the first server.
+
+**One guard per invariant, again.** The first draft validated `base` and then the joined path.
+A control that removed the first check passed, because every bad base also made a bad path. The
+join's validation is the guard now, and the only base it could let through, the empty one, is
+refused up front, each with a control.
+
+Two doc comments had drifted onto the wrong items and are back where they belong:
+`forward_userspace_lookup`'s had been sitting on `join_subtree`, and `OBJECT_KIND_MEMOBJ`'s on
+`OBJECT_KIND_NONE`.

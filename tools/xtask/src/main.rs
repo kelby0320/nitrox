@@ -13517,6 +13517,9 @@ policy = \"never\"\n\
 executable = \"/bin/boot-probe\"\n\
 description = \"In-guest substrate checks and the boot verdict\"\n\
 after = [\"test-harness\"]\n\
+# To bind a channel of its own into a namespace it made, and answer its own lookups\n\
+# with `SUBNAMESPACE` (administration Part C.4).\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
 \n\
 [service.boot-probe.restart]\n\
 policy = \"never\"\n";

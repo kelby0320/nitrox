@@ -60,6 +60,37 @@ use crate::object::header::KObjectHeader;
 /// 256 bytes covers every milestone path; a heap-backed suffix is a later concern.
 pub const LOOKUP_SUFFIX_MAX: usize = 256;
 
+/// **What a forwarded resolve asks its server to do**, kept with the pending lookup so a
+/// `SUBNAMESPACE` reply can send the same request on into another namespace (administration Part
+/// C.4). By then the syscall that started it is gone, and with it the user pointers its
+/// `ResolveOp` carried; these are values.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ForwardOp {
+    /// A plain lookup.
+    Plain,
+    /// A size change first (`sys_file_create` / `_grow` / `_truncate`).
+    Size(u32, crate::rsproto::SizeChange),
+    /// A rename to the lookup's `dest`, with its `RENAME_*` flags.
+    Rename {
+        /// The rename's flags.
+        flags: u16,
+    },
+}
+
+/// A forwarded resolve's request, beyond its suffix: the operation, a rename's destination —
+/// mount-relative, as sent — and how many `SUBNAMESPACE` replies it has already followed.
+#[derive(Copy, Clone)]
+pub struct Forward<'a> {
+    pub op: ForwardOp,
+    pub dest: &'a [u8],
+    pub depth: u8,
+}
+
+impl Forward<'_> {
+    /// A plain lookup's: no destination, never continued.
+    pub const PLAIN: Forward<'static> = Forward { op: ForwardOp::Plain, dest: b"", depth: 0 };
+}
+
 /// One outstanding forwarded lookup: everything needed to complete its
 /// `PendingOperation` when the server's reply arrives. Moved out of the table by
 /// [`take_pending_matching`](UserspaceServerReg::take_pending_matching) /
@@ -84,9 +115,22 @@ pub struct PendingLookup {
     /// reply fails `TooLarge`).
     pub(crate) suffix: [u8; LOOKUP_SUFFIX_MAX],
     pub(crate) suffix_len: u16,
+    /// What the request asked for, so a `SUBNAMESPACE` reply can ask it again elsewhere.
+    pub(crate) op: ForwardOp,
+    /// A rename's destination as sent, inline like `suffix`, with its true length.
+    pub(crate) dest: [u8; LOOKUP_SUFFIX_MAX],
+    pub(crate) dest_len: u16,
+    /// How many `SUBNAMESPACE` replies this lookup has already followed.
+    pub(crate) depth: u8,
 }
 
 impl PendingLookup {
+    /// A rename's stored destination, or `None` if it overran [`LOOKUP_SUFFIX_MAX`].
+    pub(crate) fn dest(&self) -> Option<&[u8]> {
+        let n = self.dest_len as usize;
+        if n > LOOKUP_SUFFIX_MAX { None } else { Some(&self.dest[..n]) }
+    }
+
     /// The stored suffix bytes, or `None` if the true length overran
     /// [`LOOKUP_SUFFIX_MAX`] (the inline buffer is then incomplete — a `FILE` reply
     /// for it cannot recover the path).
@@ -331,19 +375,38 @@ impl UserspaceServerReg {
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
-    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
-    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
-    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
-    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
+    /// A plain lookup's [`begin_forward`](Self::begin_forward) — the tests' shorthand.
     ///
     /// # Safety
-    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    /// As [`begin_forward`](Self::begin_forward).
+    #[cfg(test)]
     pub(crate) unsafe fn begin(
         reg: *mut (),
         po: &ObjectRef,
         owner_pid: u32,
         requested: Rights,
         suffix: &[u8],
+    ) -> Option<u64> {
+        // SAFETY: the caller's contract, passed through.
+        unsafe { Self::begin_forward(reg, po, owner_pid, requested, suffix, Forward::PLAIN) }
+    }
+
+    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
+    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
+    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
+    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
+    ///
+    /// `fwd` is what the request asked for, kept so a `SUBNAMESPACE` reply can send it on.
+    ///
+    /// # Safety
+    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    pub(crate) unsafe fn begin_forward(
+        reg: *mut (),
+        po: &ObjectRef,
+        owner_pid: u32,
+        requested: Rights,
+        suffix: &[u8],
+        fwd: Forward<'_>,
     ) -> Option<u64> {
         let inner = unsafe { Self::inner(reg) };
         // First free slot, or `None` when the table is full (all in flight).
@@ -355,6 +418,9 @@ impl UserspaceServerReg {
         let mut sbuf = [0u8; LOOKUP_SUFFIX_MAX];
         let n = suffix.len().min(LOOKUP_SUFFIX_MAX);
         sbuf[..n].copy_from_slice(&suffix[..n]);
+        let mut dbuf = [0u8; LOOKUP_SUFFIX_MAX];
+        let d = fwd.dest.len().min(LOOKUP_SUFFIX_MAX);
+        dbuf[..d].copy_from_slice(&fwd.dest[..d]);
         inner.pending[slot] = Some(PendingLookup {
             request_id,
             po: po.clone(),
@@ -362,6 +428,10 @@ impl UserspaceServerReg {
             requested,
             suffix: sbuf,
             suffix_len: suffix.len() as u16,
+            op: fwd.op,
+            dest: dbuf,
+            dest_len: fwd.dest.len() as u16,
+            depth: fwd.depth,
         });
         Some(request_id)
     }
@@ -632,6 +702,32 @@ mod tests {
         assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
         // Drain the rest before dropping.
         while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
+        drop(po);
+        drop(r);
+    }
+
+    /// **A pending lookup keeps what it asked for** (administration Part C.4): the operation, a
+    /// rename's destination and the depth come back with it, so a `SUBNAMESPACE` reply can send
+    /// the same request on. A destination longer than the inline buffer reads as absent rather
+    /// than as a truncated path, which would continue somewhere else.
+    #[test]
+    fn a_pending_lookup_keeps_its_operation_for_a_continuation() {
+        init_global_heap();
+        let r = reg();
+        let po = make_po();
+        let fwd = Forward { op: ForwardOp::Rename { flags: 1 }, dest: b"fs/l1/b", depth: 2 };
+        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"fs/l1/a", fwd) }
+            .unwrap();
+        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        assert_eq!((pl.op, pl.dest(), pl.depth), (ForwardOp::Rename { flags: 1 }, Some(&b"fs/l1/b"[..]), 2));
+        assert_eq!(pl.suffix(), Some(&b"fs/l1/a"[..]));
+        drop(pl);
+        let long = [b'a'; LOOKUP_SUFFIX_MAX + 1];
+        let fwd = Forward { op: ForwardOp::Rename { flags: 0 }, dest: &long, depth: 0 };
+        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"a", fwd) }.unwrap();
+        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        assert_eq!(pl.dest(), None, "an overlong destination is absent, not truncated");
+        drop(pl);
         drop(po);
         drop(r);
     }

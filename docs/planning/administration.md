@@ -1142,12 +1142,16 @@ namespace, with no login and no session.
       wrote, one left mounted. *(Landed 2026-09-24. Read-only is `ReadOnly`, a reader that refuses
       every write; `init` sends the flag for `"ro"`; not clean is reported with `TODO(fs-repair)`.
       The read-only server and `Meta::Unmount` first run on a boot in C.5/C.8.)*
-- [ ] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
+- [x] **C.4 — `OBJECT_KIND_SUBNAMESPACE`.** The pending lookup keeps the resolve's operation —
       its flags, size change and a rename's destination — so the kernel can continue a resolve in the
       replied namespace with the replied path, for every operation — a rename continues both paths, and
       one whose destination leaves the replied prefix is `Unsupported`, the cross-filesystem answer
       — to a depth of four, past which it is `TooLarge`. Kernel host tests on the continuation's
       path arithmetic; the storage service is the first server to use it, so its boot test is C.5's.
+      *(Landed 2026-09-24. The reply names a prefix — `consumed` bytes stand for `base` — so a
+      rename's destination can follow; a continuation onto a kernel server is refused, since
+      `/proc/self` would answer for the replying server; and `boot-probe` tests it on a boot now,
+      acting as its own server.)*
 - [ ] **C.5 — the storage service.** The `block` subscription and what it reads from each device;
       `init`'s mounts from `init.toml`; the live-boot test; auto-mount; labels; the per-mount
       namespaces and the `SUBNAMESPACE` answer; the session and admin endpoints; the table; `Storage`

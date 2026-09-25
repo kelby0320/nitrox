@@ -44,11 +44,17 @@ const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
 /// the kernel builds the page-cache object (slice 8). See `build_resolve_request`.
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 
-/// Reply `object_kind`: `handles[0]` is a read-only `MemoryObject` of file content.
 /// Status-only success: the request mutated the filesystem and produced no object (the
 /// mutating resolves, e.g. `RESOLVE_RENAME`). No handle rides the reply.
 pub const OBJECT_KIND_NONE: u16 = 0;
+/// Reply `object_kind`: `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
+/// Reply `object_kind`: **continue the resolve in another namespace** (administration Part
+/// C.4). `handles[0]` is a `Namespace` the server holds `LOOKUP` on, and the body says what the
+/// server answered for — [`subnamespace_reply`]: the first `consumed` bytes of the request's
+/// suffix stand for `base` in that namespace. The kernel resolves `base` plus the rest of the
+/// suffix there and carries the same operation on. `content_len` is unused.
+pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
 /// Reply `object_kind`: a lazily-filled file — `content_len` is the total file
 /// size and `handles[0]` is empty; the kernel builds the page-cache object,
 /// pointed back at the server, and fills it on demand via `build_read_range_request`.
@@ -117,6 +123,23 @@ pub fn file_blocks_reply_header(body: &[u8]) -> Option<FileBlocksHeader> {
         file_id: get_u64(body, 16),
         flags: get_u32(body, 24),
     })
+}
+
+/// Bytes of a `SUBNAMESPACE` reply body before `base`: `ResolveReply` (8), `consumed` (2),
+/// `base_len` (2).
+const SUBNAMESPACE_PREFIX_LEN: usize = 12;
+
+/// A `SUBNAMESPACE` reply body's `(consumed, base)`: how many bytes of the request's suffix the
+/// server answered for, and the absolute path in the replied namespace they stand for. `None`
+/// if the body is short. Nothing here is validated beyond its length; the caller does that.
+pub fn subnamespace_reply(body: &[u8]) -> Option<(u16, &[u8])> {
+    if body.len() < SUBNAMESPACE_PREFIX_LEN {
+        return None;
+    }
+    let consumed = get_u16(body, 8);
+    let base_len = get_u16(body, 10) as usize;
+    let base = body.get(SUBNAMESPACE_PREFIX_LEN..SUBNAMESPACE_PREFIX_LEN.checked_add(base_len)?)?;
+    Some((consumed, base))
 }
 
 /// Read the `i`-th `BlockRun` from a Model A resolve reply body as
@@ -753,6 +776,21 @@ mod tests {
         put_u32(&mut short, 20, 7);
         assert_eq!(forget_request(&short), None, "a body a byte short");
         assert_eq!(forget_request(&buf[..RS_HEADER_LEN + 7]), None);
+    }
+
+    /// **A `SUBNAMESPACE` body is read at its documented offsets** — `consumed` at 8, the base's
+    /// length at 10, the base from 12 — from bytes laid out by hand, since the writer is
+    /// `librsproto`'s.
+    #[test]
+    fn a_subnamespace_reply_carries_what_was_consumed_and_the_base() {
+        let mut body = [0u8; 12 + 5];
+        put_u16(&mut body, 0, OBJECT_KIND_SUBNAMESPACE);
+        put_u16(&mut body, 8, 14);
+        put_u16(&mut body, 10, 5);
+        body[12..].copy_from_slice(b"/home");
+        assert_eq!(subnamespace_reply(&body), Some((14, &b"/home"[..])));
+        assert_eq!(subnamespace_reply(&body[..16]), None, "a base a byte short");
+        assert_eq!(subnamespace_reply(&body[..11]), None, "a prefix a byte short");
     }
 
     /// **The kernel's touch names the file by id**, eight bytes at the start of the body.

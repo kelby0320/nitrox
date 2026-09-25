@@ -57,6 +57,7 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, SubtreeBase, validate_path};
 use crate::object::device_node::DeviceClass;
+use crate::object::userspace_server::{Forward, ForwardOp};
 use crate::object::{
     BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES,
     MemoryObject, Namespace, NotificationChannel, NsError, ObjectRef, PendingOperation, Process,
@@ -1753,64 +1754,18 @@ pub fn sys_ns_lookup(
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
     validate_path(path).map_err(|_| KError::InvalidArgument)?;
 
-    // A rename resolves *two* paths. Reduce them here — before any PO exists, so a
-    // malformed destination fails synchronously — to one mount-relative suffix plus a
-    // verdict. Both must land on the same server and the same subtree base, or the rename
-    // would cross a filesystem: that is reported as `Unsupported`, which is the signal a
-    // caller needs to fall back to copy + unlink (POSIX spells it `EXDEV`).
-    //
-    // No *write*-authority check happens here, deliberately. A binding's rights on a
-    // userspace-server mount are the rights of the endpoint **handle** it was bound with
-    // (`sys_ns_bind` takes them from the target), so they describe the channel, not the
-    // files behind it — which is exactly why the forwarding arm below ignores them. The
-    // mutating resolves that already exist (`RESOLVE_CREATE`/`GROW`/`TRUNCATE`) gate on
-    // nothing but `LOOKUP` on the namespace for the same reason, and rename matches them
-    // rather than inventing a stricter rule that a caller could not satisfy. Giving a
-    // namespace binding real per-mount write authority is a system-wide change, filed as
-    // TODO(mount-write-authority) in docs/rationale/deferred-decisions.md.
+    // A rename's destination is copied and validated here, before any PO exists, so a
+    // malformed one fails synchronously. Whether it shares the source's mount is decided with
+    // the resolve (`resolve_and_start`), and delivered through the PO.
     let mut dest_buf = [0u8; NS_PATH_MAX];
-    let mut dest_len = 0usize;
-    let mut rename_verdict: Option<KError> = None;
-    if let ResolveOp::Rename { dest_ptr, dest_len: dlen, .. } = op {
-        let d = copy_ns_path(dest_ptr, dlen, &mut dest_buf)?;
-        validate_path(d).map_err(|_| KError::InvalidArgument)?;
-        let dcopy_len = d.len();
-        let mut dcopy = [0u8; NS_PATH_MAX];
-        dcopy[..dcopy_len].copy_from_slice(d);
-        // SAFETY: live `Namespace` (type verified by `lookup_typed` above).
-        let nsr = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-        rename_verdict = match (nsr.resolve(path), nsr.resolve(&dcopy[..dcopy_len])) {
-            (
-                Some((ResolvedTarget::UserspaceServer(sreg, sbase), _, _)),
-                Some((ResolvedTarget::UserspaceServer(dreg, dbase), _, dsuffix)),
-            ) => {
-                let same = sreg.as_ptr() == dreg.as_ptr() && sbase.as_path() == dbase.as_path();
-                let joined = if dbase.as_path().is_empty() {
-                    dest_buf[..dsuffix.len()].copy_from_slice(dsuffix);
-                    Some(dsuffix.len())
-                } else {
-                    let mut jb = [0u8; NS_PATH_MAX];
-                    join_subtree(dbase.as_path(), dsuffix, &mut jb).map(|j| {
-                        let n = j.len();
-                        dest_buf[..n].copy_from_slice(j);
-                        n
-                    })
-                };
-                drop(sreg);
-                drop(dreg);
-                match (same, joined) {
-                    (false, _) => Some(KError::Unsupported),
-                    (_, None) => Some(KError::TooLarge),
-                    (true, Some(n)) => {
-                        dest_len = n;
-                        None
-                    }
-                }
-            }
-            // Anything not served by a userspace filesystem cannot be renamed.
-            _ => Some(KError::Unsupported),
-        };
-    }
+    let dest: Option<&[u8]> = match op {
+        ResolveOp::Rename { dest_ptr, dest_len, .. } => {
+            let d = copy_ns_path(dest_ptr, dest_len, &mut dest_buf)?;
+            validate_path(d).map_err(|_| KError::InvalidArgument)?;
+            Some(d)
+        }
+        _ => None,
+    };
 
     // Create the PO and its handle FIRST, so every *resolution* outcome (success
     // or not-found) is delivered through the PO; only the pre-PO failures above
@@ -1840,56 +1795,141 @@ pub fn sys_ns_lookup(
     // --- resolve + install (failures delivered via the PO) ---
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-
-    // Install an `obj` into the caller's table with `requested ∩ binding_rights`,
-    // returning the `(status, result)` pair the PO is signalled with. Shared by the
-    // direct-handle and kernel-server-`Completed` paths.
-    let install = |obj: ObjectRef, binding_rights: Rights| -> (i32, u64) {
-        let attenuated = requested & binding_rights;
-        // Hand `allocate` the reference via `into_raw`.
-        let (tptr, tty) = obj.into_raw();
-        match global::get().allocate(pid, tptr, tty, attenuated) {
-            Ok(h) => (0, h.bits()),
-            Err(e) => {
-                // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-                (map_handle_err(e) as i32, 0)
-            }
-        }
-    };
-
-    // The resolution outcome: `Some((status, result))` completes the PO now (the
-    // synchronous direct-handle / kernel-server paths); `None` leaves it **pending**
-    // (a forwarded userspace lookup — the server's reply completes it later).
-    //
-    // A refused rename short-circuits the resolve entirely. This has to happen *before*
-    // it, not inside the forwarding arm: when the source is not on a userspace filesystem
-    // (`/initramfs/x`, or a direct-handle binding) the resolve below would succeed and
-    // hand back a handle to the source — reporting a rename that never happened.
-    if let Some(e) = rename_verdict {
-        // Same shape as the `Some(outcome)` arm at the end: pre-signal the PO (no waiters
-        // yet) and hand back its handle. `ns_ok` / `po_ref` are still held, so nothing
-        // drops an `ObjectRef` under `SCHED`.
-        crate::sched::complete_pending_op(po_ptr, e as i32, 0);
-        return Ok(po_h.bits() as isize);
+    match resolve_and_start(ns, path, dest, op.forward_op(), requested, pid, &po_ref, 0) {
+        // Pre-signal the PO with the outcome (no waiters yet → just records it).
+        // `ns_ok` / `po_ref` are still held here (refcounts, no lock), so this —
+        // which takes `SCHED` — performs no `ObjectRef` drop under the lock.
+        Some((status, result)) => crate::sched::complete_pending_op(po_ptr, status, result),
+        // Left pending: the forwarded request was delivered; the server's reply
+        // completes the PO. `po_ref` drops at return (the forwarding path cloned
+        // its own reference into the registration's pending-lookup table).
+        None => {}
     }
-    let outcome: Option<(i32, u64)> = match ns.resolve(path) {
+    Ok(po_h.bits() as isize)
+}
+
+impl ResolveOp {
+    /// What a forwarded request carries of this operation: the values, without the user
+    /// pointers a rename's destination arrived by.
+    fn forward_op(self) -> ForwardOp {
+        match self {
+            ResolveOp::Plain => ForwardOp::Plain,
+            ResolveOp::Size(size, change) => ForwardOp::Size(size, change),
+            ResolveOp::Rename { flags, .. } => ForwardOp::Rename { flags },
+        }
+    }
+}
+
+/// Install `obj` into `pid`'s table with `requested ∩ binding_rights` — the `(status, result)` a
+/// lookup's PO completes with.
+fn install_for(pid: u32, requested: Rights, obj: ObjectRef, binding_rights: Rights) -> (i32, u64) {
+    let (tptr, tty) = obj.into_raw();
+    match global::get().allocate(pid, tptr, tty, requested & binding_rights) {
+        Ok(h) => (0, h.bits()),
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            (map_handle_err(e) as i32, 0)
+        }
+    }
+}
+
+/// **Resolve `path` in `ns` and start the operation there**: the half of a namespace lookup
+/// that a `SUBNAMESPACE` reply repeats in another namespace (administration Part C.4). A direct
+/// binding installs its object, a kernel server answers, and a userspace server is sent the
+/// request. `Some((status, result))` completes the lookup's PO now; `None` leaves it pending on
+/// that server's reply.
+///
+/// `depth` is how many `SUBNAMESPACE` replies the lookup has followed. At `0` this is the
+/// caller's own syscall; past it, it runs in the syscall of the server that replied, which is
+/// why **a kernel server is refused there**: `/proc/self` answers for whoever is calling, and
+/// that would be the server, handing the caller the server's process, thread or namespace.
+///
+/// A rename (`dest` is its destination, a path in `ns`) must land on the same userspace server
+/// and subtree base as its source, else `Unsupported`, which is the signal a caller needs to fall
+/// back to copy + unlink (POSIX spells it `EXDEV`). No *write*-authority check happens here,
+/// deliberately: a binding's rights on a userspace-server mount are the rights of the endpoint
+/// handle it was bound with, so they describe the channel, not the files behind it, which is
+/// exactly why the forwarding arm ignores them (`TODO(mount-write-authority)`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_start(
+    ns: &Namespace,
+    path: &[u8],
+    dest: Option<&[u8]>,
+    op: ForwardOp,
+    requested: Rights,
+    pid: u32,
+    po_ref: &ObjectRef,
+    depth: u8,
+) -> Option<(i32, u64)> {
+    // A rename's destination, reduced to the mount-relative suffix the server is sent.
+    let mut dest_buf = [0u8; NS_PATH_MAX];
+    let mut dest_len = 0usize;
+    if let ForwardOp::Rename { .. } = op {
+        let Some(d) = dest else {
+            return Some((KError::InvalidArgument as i32, 0));
+        };
+        let verdict = match (ns.resolve(path), ns.resolve(d)) {
+            (
+                Some((ResolvedTarget::UserspaceServer(sreg, sbase), _, _)),
+                Some((ResolvedTarget::UserspaceServer(dreg, dbase), _, dsuffix)),
+            ) => {
+                let same = sreg.as_ptr() == dreg.as_ptr() && sbase.as_path() == dbase.as_path();
+                let joined = if dbase.as_path().is_empty() {
+                    dest_buf.get_mut(..dsuffix.len()).map(|b| {
+                        b.copy_from_slice(dsuffix);
+                        dsuffix.len()
+                    })
+                } else {
+                    let mut jb = [0u8; NS_PATH_MAX];
+                    join_subtree(dbase.as_path(), dsuffix, &mut jb).map(|j| {
+                        let n = j.len();
+                        dest_buf[..n].copy_from_slice(j);
+                        n
+                    })
+                };
+                drop(sreg);
+                drop(dreg);
+                match (same, joined) {
+                    (false, _) => Some(KError::Unsupported),
+                    (_, None) => Some(KError::TooLarge),
+                    (true, Some(n)) => {
+                        dest_len = n;
+                        None
+                    }
+                }
+            }
+            // Anything not served by a userspace filesystem cannot be renamed.
+            _ => Some(KError::Unsupported),
+        };
+        // A refused rename short-circuits the resolve entirely. When the source is not on a
+        // userspace filesystem (`/initramfs/x`, or a direct-handle binding) the resolve below
+        // would succeed and hand back a handle to the source — reporting a rename that never
+        // happened.
+        if let Some(e) = verdict {
+            return Some((e as i32, 0));
+        }
+    }
+
+    match ns.resolve(path) {
         None => Some((KError::NotFound as i32, 0)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
             if suffix.is_empty() {
-                Some(install(target, binding_rights))
+                Some(install_for(pid, requested, target, binding_rights))
             } else {
                 // Direct-handle leaf: a non-empty suffix has no sub-resource.
                 drop(target);
                 Some((KError::NotFound as i32, 0))
             }
         }
+        // Not from a server's syscall, where `/proc/self` would answer for the server.
+        Some((ResolvedTarget::KernelServer(_), _, _)) if depth > 0 => Some((KError::Unsupported as i32, 0)),
         Some((ResolvedTarget::KernelServer(id), binding_rights, suffix)) => {
             // Call the in-kernel server in this syscall context; it produces a
             // handle (or rejects). Suffix interpretation (leaf vs. subtree) is the
             // server's policy. The result still flows through the pre-signalled PO.
             match kernel_server::dispatch(id, suffix, requested) {
-                OpStatus::Completed(obj) => Some(install(obj, binding_rights)),
+                OpStatus::Completed(obj) => Some(install_for(pid, requested, obj, binding_rights)),
                 OpStatus::Rejected(err) => Some((err as i32, 0)),
                 OpStatus::Pending => {
                     // A Kernel Server never forwards; treat the impossible as an
@@ -1907,18 +1947,14 @@ pub fn sys_ns_lookup(
             // A subtree binding prepends its `base` to the suffix so the server sees
             // only its scoped sub-tree (e.g. `/home` bound with base `/home/alice`).
             // Both `base` (validated at bind) and `suffix` (the lookup path was
-            // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
-            // the subtree.
+            // `validate_path`d) are free of `.`/`..`, so the join cannot escape the subtree.
+            let fwd = Forward { op, dest: &dest_buf[..dest_len], depth };
             if base.is_empty() {
-                forward_userspace_lookup(
-                    reg, &po_ref, pid, requested, suffix, op, &dest_buf[..dest_len],
-                )
+                forward_userspace_lookup(reg, po_ref, pid, requested, suffix, fwd)
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
-                    Some(joined) => forward_userspace_lookup(
-                        reg, &po_ref, pid, requested, joined, op, &dest_buf[..dest_len],
-                    ),
+                    Some(joined) => forward_userspace_lookup(reg, po_ref, pid, requested, joined, fwd),
                     None => {
                         // The joined path overflows the buffer — drop the forwarding
                         // reference (outside the namespace lock) and fail the lookup.
@@ -1928,29 +1964,9 @@ pub fn sys_ns_lookup(
                 }
             }
         }
-    };
-    match outcome {
-        // Pre-signal the PO with the outcome (no waiters yet → just records it).
-        // `ns_ok` / `po_ref` are still held here (refcounts, no lock), so this —
-        // which takes `SCHED` — performs no `ObjectRef` drop under the lock.
-        Some((status, result)) => crate::sched::complete_pending_op(po_ptr, status, result),
-        // Left pending: the forwarded request was delivered; the server's reply
-        // completes the PO. `po_ref` drops at return (the forwarding path cloned
-        // its own reference into the registration's pending-lookup table).
-        None => {}
     }
-    Ok(po_h.bits() as isize)
 }
 
-/// Forward a namespace lookup that resolved to a [`UserspaceServer`] binding to
-/// its server process over IPC: build the `Namespace::Resolve` request, originate
-/// it (recording the lookup in the registration's pending table), and report
-/// whether the lookup PO was left **pending** (`None`) or must be completed now
-/// with an error (`Some((status, 0))`). `reg` is the resolved registration
-/// reference (dropped here, outside the namespace lock); `po_ref` pins the lookup
-/// PO; `suffix` is the path past the mount prefix.
-///
-/// [`UserspaceServer`]: crate::object::namespace::ResolvedTarget::UserspaceServer
 /// Join a subtree binding's `base` (an absolute namespace path, e.g. `/home/alice`)
 /// with a resolved server-relative `suffix` (e.g. `notes.txt`), producing the
 /// server-root-relative path to forward (`home/alice/notes.txt`). The base's leading
@@ -1978,14 +1994,22 @@ fn join_subtree<'o>(base: &[u8], suffix: &[u8], out: &'o mut [u8]) -> Option<&'o
     Some(&out[..joined_len])
 }
 
+/// Forward a namespace lookup that resolved to a [`UserspaceServer`] binding to
+/// its server process over IPC: build the `Namespace::Resolve` request, originate
+/// it (recording the lookup in the registration's pending table, with what it asked for —
+/// `fwd` — so a `SUBNAMESPACE` reply can carry it on), and report whether the lookup PO was
+/// left **pending** (`None`) or must be completed now with an error (`Some((status, 0))`).
+/// `reg` is the resolved registration reference (dropped here, outside the namespace lock);
+/// `po_ref` pins the lookup PO; `suffix` is the path past the mount prefix.
+///
+/// [`UserspaceServer`]: crate::object::namespace::ResolvedTarget::UserspaceServer
 fn forward_userspace_lookup(
     reg: ObjectRef,
     po_ref: &ObjectRef,
     pid: u32,
     requested: Rights,
     suffix: &[u8],
-    op: ResolveOp,
-    dest: &[u8],
+    fwd: Forward<'_>,
 ) -> Option<(i32, u64)> {
     // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
     // request (`sys_file_grow`/`sys_file_create`) additionally carries the target size +
@@ -1996,22 +2020,22 @@ fn forward_userspace_lookup(
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let built = match op {
-        ResolveOp::Size(new_size, change) => crate::rsproto::build_resolve_request_sized(
+    let built = match fwd.op {
+        ForwardOp::Size(new_size, change) => crate::rsproto::build_resolve_request_sized(
             &mut msg.payload,
             requested.bits(),
             suffix,
             new_size,
             change,
         ),
-        ResolveOp::Rename { flags, .. } => crate::rsproto::build_resolve_request_rename(
+        ForwardOp::Rename { flags } => crate::rsproto::build_resolve_request_rename(
             &mut msg.payload,
             requested.bits(),
             suffix,
-            dest,
+            fwd.dest,
             flags,
         ),
-        ResolveOp::Plain => {
+        ForwardOp::Plain => {
             crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix)
         }
     };
@@ -2023,11 +2047,10 @@ fn forward_userspace_lookup(
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
 
-    // Originate (assigns the request id, records the pending lookup + its suffix,
-    // sends). The suffix is stored so a lazy `FILE` reply can name the file in the
-    // page-cache producer.
-    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix)
-    {
+    // Originate (assigns the request id, records the pending lookup + its suffix and
+    // request, sends). The suffix is stored so a lazy `FILE` reply can name the file in the
+    // page-cache producer, and so a `SUBNAMESPACE` reply can continue it.
+    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) {
         crate::sched::ForwardOutcome::Pending => None,
         crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
             Some((KError::WouldBlock as i32, 0))
@@ -2678,7 +2701,7 @@ fn complete_resolve_reply(
 ) -> SysResult {
     use crate::rsproto::{
         OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
-        OBJECT_KIND_NONE,
+        OBJECT_KIND_NONE, OBJECT_KIND_SUBNAMESPACE,
         ReplyKind, parse_reply,
     };
 
@@ -2696,69 +2719,81 @@ fn complete_resolve_reply(
     };
     let reply = reply.expect("pending taken ⇒ reply parsed");
 
-    let (status, result): (i32, u64) = match reply.kind {
-        ReplyKind::Error { kerror } => (kerror, 0),
-        ReplyKind::Malformed => (KError::KernelError as i32, 0),
-        // A lazy file: build the page-cache object (no transferred handle) and
-        // install it. `content_len` is the total file size.
-        ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
-            build_and_install_file(reg, &pl, content_len)
-        }
-        // A Model A (block-fs) lazy file: `handles[0]` is the device, and the body carries
-        // the block size + the initial `BlockRun` map. Build a page-cache object the kernel
-        // fills zero-copy from the device.
-        ReplyKind::Success { object_kind, content_len }
-            if object_kind == OBJECT_KIND_FILE_BLOCKS =>
-        {
-            build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
-        }
-        // A mutating resolve (rename): the work is done and there is nothing to install.
-        ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
-        ReplyKind::Success { object_kind, .. }
-            if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
-        {
-            (KError::Unsupported as i32, 0)
-        }
-        ReplyKind::Success { .. } => match transfers[0].take() {
-            None => (KError::InvalidArgument as i32, 0), // success but no handle
-            // The resolved object is a capability the server hands back. A `MemoryObject`
-            // is the fs-server's eager reply; a `FileObject` is a **re-exported** handle
-            // (an indirection server like the profile server resolves onward and passes
-            // the store `FileObject` through); an `IpcChannel` is a live **connection** to
-            // the server (the "resolve a service path → get a channel to it" case, e.g. the
-            // logging service handing back a per-principal log channel). All install
-            // identically below; other object types are not valid resolve results.
-            Some(tr)
-                if !matches!(
-                    tr.obj.object_type(),
-                    KObjectType::MemoryObject | KObjectType::FileObject | KObjectType::IpcChannel
-                ) =>
+    // `None` only when a `SUBNAMESPACE` reply carried the lookup on to another server, whose
+    // reply completes it instead.
+    let subnamespace =
+        matches!(reply.kind, ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_SUBNAMESPACE);
+    let outcome: Option<(i32, u64)> = if subnamespace {
+        // Continue the resolve in the namespace the server handed back (administration C.4).
+        continue_resolve(&pl, &bounce.payload[..payload_len], transfers)
+    } else {
+        Some(match reply.kind {
+            ReplyKind::Error { kerror } => (kerror, 0),
+            ReplyKind::Malformed => (KError::KernelError as i32, 0),
+            // A lazy file: build the page-cache object (no transferred handle) and
+            // install it. `content_len` is the total file size.
+            ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
+                build_and_install_file(reg, &pl, content_len)
+            }
+            // A Model A (block-fs) lazy file: `handles[0]` is the device, and the body carries
+            // the block size + the initial `BlockRun` map. Build a page-cache object the kernel
+            // fills zero-copy from the device.
+            ReplyKind::Success { object_kind, content_len }
+                if object_kind == OBJECT_KIND_FILE_BLOCKS =>
             {
-                drop(tr.obj);
+                build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
+            }
+            // A mutating resolve (rename): the work is done and there is nothing to install.
+            ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
+            ReplyKind::Success { object_kind, .. }
+                if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
+            {
                 (KError::Unsupported as i32, 0)
             }
-            Some(tr) => {
-                // Install the resolved object into the original caller's table with
-                // `requested ∩ (the rights the server granted on the transfer)`.
-                let attenuated = pl.requested & tr.rights;
-                // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
-                let (op, ot) = tr.obj.into_raw();
-                match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
-                    Ok(h) => (0, h.bits()),
-                    Err(e) => {
-                        // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                        // (A dead caller pid takes this path — fails cleanly.)
-                        drop(unsafe { ObjectRef::from_raw(op, ot) });
-                        (map_handle_err(e) as i32, 0)
+            ReplyKind::Success { .. } => match transfers[0].take() {
+                None => (KError::InvalidArgument as i32, 0), // success but no handle
+                // The resolved object is a capability the server hands back. A `MemoryObject`
+                // is the fs-server's eager reply; a `FileObject` is a **re-exported** handle
+                // (an indirection server like the profile server resolves onward and passes
+                // the store `FileObject` through); an `IpcChannel` is a live **connection** to
+                // the server (the "resolve a service path → get a channel to it" case, e.g. the
+                // logging service handing back a per-principal log channel). All install
+                // identically below; other object types are not valid resolve results.
+                Some(tr)
+                    if !matches!(
+                        tr.obj.object_type(),
+                        KObjectType::MemoryObject | KObjectType::FileObject | KObjectType::IpcChannel
+                    ) =>
+                {
+                    drop(tr.obj);
+                    (KError::Unsupported as i32, 0)
+                }
+                Some(tr) => {
+                    // Install the resolved object into the original caller's table with
+                    // `requested ∩ (the rights the server granted on the transfer)`.
+                    let attenuated = pl.requested & tr.rights;
+                    // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
+                    let (op, ot) = tr.obj.into_raw();
+                    match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
+                        Ok(h) => (0, h.bits()),
+                        Err(e) => {
+                            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+                            // (A dead caller pid takes this path — fails cleanly.)
+                            drop(unsafe { ObjectRef::from_raw(op, ot) });
+                            (map_handle_err(e) as i32, 0)
+                        }
                     }
                 }
-            }
-        },
+            },
+        })
     };
 
-    // Complete the lookup PO (one-shot); release the kernel's PO clone outside
-    // `SCHED`; commit the transfer move by closing the sender's handles.
-    crate::sched::complete_pending_op(pl.po.as_ptr(), status, result);
+    // Complete the lookup PO (one-shot), unless it went on to another server; release the
+    // kernel's PO clone outside `SCHED`; commit the transfer move by closing the sender's
+    // handles.
+    if let Some((status, result)) = outcome {
+        crate::sched::complete_pending_op(pl.po.as_ptr(), status, result);
+    }
     drop(pl);
     for i in 0..count {
         close_and_release(RawHandle(h_raw[i]), pid);
@@ -3025,6 +3060,140 @@ fn build_and_install_file_blocks(
             (map_handle_err(e) as i32, 0)
         }
     }
+}
+
+/// The deepest a lookup follows `SUBNAMESPACE` replies; the next one is `TooLarge`.
+const SUBNAMESPACE_DEPTH_MAX: u8 = 4;
+
+/// **Carry a lookup on into the namespace a server replied with** (`OBJECT_KIND_SUBNAMESPACE`,
+/// administration Part C.4). `handles[0]` is the namespace, which the server must hold `LOOKUP`
+/// on. The body says the first `consumed` bytes of the suffix it was sent stand for `base` there.
+/// The lookup's path — and a rename's destination, which must share those bytes — continue from
+/// `base`, with the same operation, rights, caller and PO, one level deeper
+/// ([`resolve_and_start`]). `None` if it went on to another server, which then completes it;
+/// otherwise the status it completes with here.
+///
+/// **This widens no server's power**: a server that can reply with a namespace could have
+/// resolved the path in it and handed back what it found. It is how a server answers for a
+/// path without standing between its caller and the server that holds the file.
+fn continue_resolve(
+    pl: &crate::object::userspace_server::PendingLookup,
+    reply_msg: &[u8],
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+) -> Option<(i32, u64)> {
+    let ns_ref = match transfers[0].take() {
+        Some(tr) if tr.obj.object_type() == KObjectType::Namespace && tr.rights.contains(Rights::LOOKUP) => tr.obj,
+        Some(tr) => {
+            drop(tr.obj);
+            return Some((KError::Unsupported as i32, 0));
+        }
+        None => return Some((KError::InvalidArgument as i32, 0)),
+    };
+    if pl.depth >= SUBNAMESPACE_DEPTH_MAX {
+        return Some((KError::TooLarge as i32, 0));
+    }
+    let Some((consumed, base)) = crate::rsproto::reply_body(reply_msg).and_then(crate::rsproto::subnamespace_reply)
+    else {
+        return Some((KError::KernelError as i32, 0));
+    };
+    let Some(suffix) = pl.suffix() else {
+        return Some((KError::TooLarge as i32, 0));
+    };
+    // Both continued paths, on the heap: this runs in the replying server's
+    // `sys_channel_send`, a deeper stack than the lookup's own.
+    let Ok(mut bufs) = KBox::try_new([[0u8; NS_PATH_MAX]; 2]) else {
+        return Some((KError::OutOfMemory as i32, 0));
+    };
+    let [pbuf, dbuf] = &mut *bufs;
+    let path = match continued_path(suffix, consumed as usize, base, pbuf) {
+        Ok(p) => p,
+        Err(e) => return Some((e as i32, 0)),
+    };
+    let dest = match pl.op {
+        ForwardOp::Rename { .. } => {
+            let Some(d) = pl.dest() else {
+                return Some((KError::TooLarge as i32, 0));
+            };
+            match continued_dest(suffix, d, consumed as usize, base, dbuf) {
+                Ok(p) => Some(&*p),
+                Err(e) => return Some((e as i32, 0)),
+            }
+        }
+        _ => None,
+    };
+    // SAFETY: `ns_ref` pins a live `Namespace` (type checked above) across this call.
+    let ns: &Namespace = unsafe { &*(ns_ref.as_ptr() as *const Namespace) };
+    let outcome = resolve_and_start(ns, path, dest, pl.op, pl.requested, pl.owner_pid, &pl.po, pl.depth + 1);
+    drop(ns_ref);
+    outcome
+}
+
+/// **Where a `SUBNAMESPACE` reply sends a path.** The server answered for the first `consumed`
+/// bytes of `suffix`, the mount-relative suffix it was sent, and they stand for `base`, an
+/// absolute path in the namespace it replied with; the rest of the suffix is joined onto `base`.
+/// `consumed` must end at a component boundary and `base` must be a valid absolute path, else
+/// `InvalidArgument` — a server's protocol error, not the caller's. A join longer than `out`
+/// is `TooLarge`.
+///
+/// **`base` is judged by the path it makes**: the joined path is validated, and it is valid only
+/// if `base` is, so a relative base, a trailing slash or a `..` fails there. The one base that
+/// would join into a valid path anyway is the empty one, refused up front.
+fn continued_path<'o>(suffix: &[u8], consumed: usize, base: &[u8], out: &'o mut [u8]) -> Result<&'o [u8], KError> {
+    if consumed > suffix.len() || base.is_empty() {
+        return Err(KError::InvalidArgument);
+    }
+    // What is left of the suffix, as a relative path. A suffix has no leading `/`, so all of it
+    // continues when nothing was consumed; otherwise the consumed part must end a component.
+    let rest = match (consumed, &suffix[consumed..]) {
+        (0, rest) => rest,
+        (_, []) => &[][..],
+        (_, [b'/', rest @ ..]) => rest,
+        _ => return Err(KError::InvalidArgument),
+    };
+    let root = base == b"/";
+    let len = match (rest.is_empty(), root) {
+        (true, _) => base.len(),
+        (false, true) => 1 + rest.len(),
+        (false, false) => base.len() + 1 + rest.len(),
+    };
+    if len > out.len() {
+        return Err(KError::TooLarge);
+    }
+    let mut at = 0;
+    if !(root && !rest.is_empty()) {
+        out[..base.len()].copy_from_slice(base);
+        at = base.len();
+    }
+    if !rest.is_empty() {
+        out[at] = b'/';
+        out[at + 1..len].copy_from_slice(rest);
+    }
+    let path = &out[..len];
+    validate_path(path).map_err(|_| KError::InvalidArgument)?;
+    Ok(path)
+}
+
+/// **Where a rename's destination goes**: it must begin with the same `consumed` bytes the server
+/// answered for in the source, and end a component there — the same prefix, so the same mount —
+/// else `Unsupported`, the cross-filesystem answer a caller falls back to copy + unlink on. Then
+/// as [`continued_path`].
+fn continued_dest<'o>(
+    suffix: &[u8],
+    dest: &[u8],
+    consumed: usize,
+    base: &[u8],
+    out: &'o mut [u8],
+) -> Result<&'o [u8], KError> {
+    if consumed > suffix.len() {
+        return Err(KError::InvalidArgument);
+    }
+    let same_prefix = dest.len() >= consumed
+        && dest[..consumed] == suffix[..consumed]
+        && (consumed == 0 || dest.len() == consumed || dest[consumed] == b'/');
+    if !same_prefix {
+        return Err(KError::Unsupported);
+    }
+    continued_path(dest, consumed, base, out)
 }
 
 /// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: the file's size, its
@@ -3613,6 +3782,65 @@ mod tests {
     /// band + the two principal rights `Process` allows).
     fn full() -> Rights {
         Rights::DUPLICATE | Rights::INSPECT | Rights::SIGNAL | Rights::TERMINATE
+    }
+
+    /// A continuation's path for `suffix` with `consumed` bytes answered, onto `base`.
+    fn cont(suffix: &[u8], consumed: usize, base: &[u8]) -> Result<std::vec::Vec<u8>, KError> {
+        let mut out = [0u8; NS_PATH_MAX];
+        continued_path(suffix, consumed, base, &mut out).map(|p| p.to_vec())
+    }
+
+    /// **Where a `SUBNAMESPACE` reply sends a path** (administration Part C.4): the storage
+    /// service's case — the label consumed, standing for the mount's root — and a base below
+    /// the root, all of the suffix consumed or none of it.
+    #[test]
+    fn a_continued_path_joins_the_rest_of_the_suffix_onto_the_base() {
+        let s = b"fs/nitrox-root/home/alice/notes.txt";
+        assert_eq!(cont(s, 14, b"/").unwrap(), b"/home/alice/notes.txt");
+        assert_eq!(cont(s, 14, b"/mnt/x").unwrap(), b"/mnt/x/home/alice/notes.txt");
+        assert_eq!(cont(b"fs/nitrox-root", 14, b"/").unwrap(), b"/", "the label itself is the root");
+        assert_eq!(cont(b"fs/nitrox-root", 14, b"/mnt").unwrap(), b"/mnt");
+        assert_eq!(cont(b"a/b", 0, b"/").unwrap(), b"/a/b", "nothing consumed: all of it continues");
+        assert_eq!(cont(b"a/b", 0, b"/m").unwrap(), b"/m/a/b");
+        assert_eq!(cont(b"", 0, b"/m").unwrap(), b"/m", "a mount's own root");
+    }
+
+    /// **A server's protocol errors are its own**: a boundary that is not one, a count past the
+    /// suffix, a base that is not a valid absolute path — and a join that does not fit.
+    #[test]
+    fn a_continued_path_refuses_what_a_server_got_wrong() {
+        let s = b"fs/nitrox-rootx/y";
+        assert_eq!(cont(s, 14, b"/"), Err(KError::InvalidArgument), "mid-component");
+        assert_eq!(cont(b"fs/a", 5, b"/"), Err(KError::InvalidArgument), "past the suffix");
+        assert_eq!(cont(b"fs/a/b", 4, b"home"), Err(KError::InvalidArgument), "a relative base");
+        assert_eq!(cont(b"fs/a/b", 4, b"/m/"), Err(KError::InvalidArgument), "a trailing slash");
+        assert_eq!(cont(b"fs/a/b", 4, b"/m/../n"), Err(KError::InvalidArgument), "a dot-dot base");
+        assert_eq!(cont(b"fs/a/b", 4, b""), Err(KError::InvalidArgument), "an empty base is not the root");
+        let mut small = [0u8; 8];
+        assert_eq!(continued_path(b"fs/a/bcdefgh", 4, b"/m", &mut small), Err(KError::TooLarge));
+        // At exactly the size it fits.
+        let mut exact = [0u8; 12];
+        assert_eq!(continued_path(b"fs/a/bcdefgh", 4, b"/m", &mut exact), Ok(&b"/m/bcdefgh"[..]));
+        let mut one_short = [0u8; 9];
+        assert_eq!(continued_path(b"fs/a/bcdefgh", 4, b"/m", &mut one_short), Err(KError::TooLarge));
+    }
+
+    /// **A rename continues both paths**, and one whose destination leaves the prefix the server
+    /// answered for — another label, so another mount — is `Unsupported`, the cross-filesystem
+    /// answer. A label that only *starts* the same is another label.
+    #[test]
+    fn a_rename_continues_its_destination_only_within_the_prefix() {
+        let dest = |d: &[u8]| {
+            let mut out = [0u8; NS_PATH_MAX];
+            continued_dest(b"fs/nitrox-root/a", d, 14, b"/", &mut out).map(|p| p.to_vec())
+        };
+        assert_eq!(dest(b"fs/nitrox-root/dir/b").unwrap(), b"/dir/b");
+        assert_eq!(dest(b"fs/nitrox-root").unwrap(), b"/", "onto the mount's root");
+        assert_eq!(dest(b"fs/usb-stick/b"), Err(KError::Unsupported), "another mount");
+        assert_eq!(dest(b"fs/nitrox-rootx/b"), Err(KError::Unsupported), "a label that starts the same");
+        assert_eq!(dest(b"fs/nitrox"), Err(KError::Unsupported), "shorter than the prefix");
+        let mut out = [0u8; NS_PATH_MAX];
+        assert_eq!(continued_dest(b"a", b"b/c", 0, b"/m", &mut out), Ok(&b"/m/b/c"[..]), "nothing consumed");
     }
 
     #[test]

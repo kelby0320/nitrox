@@ -201,6 +201,28 @@ pub fn file_blocks_prefix(
     Some(FILE_BLOCKS_PREFIX_LEN)
 }
 
+/// Bytes of a `SUBNAMESPACE` reply body before its base: the `ResolveReply`, `consumed` and
+/// `base_len`.
+pub const SUBNAMESPACE_PREFIX_LEN: usize = 12;
+
+/// Build an **`OBJECT_KIND_SUBNAMESPACE`** reply body into `out` (administration Part C.4): the
+/// resolve continues in the namespace the server transfers in `handles[0]`, which it must hold
+/// `LOOKUP` on. The first `consumed` bytes of the suffix the server was sent stand for `base`,
+/// an absolute path in that namespace, and the kernel resolves `base` plus the rest there with
+/// the same operation — a rename's destination too, which must share those bytes. `consumed`
+/// ends a component of the suffix. `None` if `out` is short.
+pub fn subnamespace_reply(out: &mut [u8], consumed: u16, base: &[u8]) -> Option<usize> {
+    let total = SUBNAMESPACE_PREFIX_LEN.checked_add(base.len())?;
+    if out.len() < total || base.len() > u16::MAX as usize {
+        return None;
+    }
+    resolve_reply(out, OBJECT_KIND_SUBNAMESPACE, 0)?;
+    put_u16(out, 8, consumed);
+    put_u16(out, 10, base.len() as u16);
+    out[SUBNAMESPACE_PREFIX_LEN..total].copy_from_slice(base);
+    Some(total)
+}
+
 /// Parse a success `ResolveReply` body.
 pub fn parse_resolve_reply(body: &[u8]) -> Option<ResolveReply> {
     if body.len() < RESOLVE_REPLY_LEN {
@@ -226,6 +248,21 @@ mod tests {
         assert_eq!(r.requested_rights, 0x4);
         assert_eq!(r.flags, RESOLVE_FILE_AS_MEMOBJ);
         assert_eq!(r.suffix, b"system/current-generation");
+    }
+
+    /// **A `SUBNAMESPACE` body is laid out as the kernel reads it** — `consumed` at 8, the base's
+    /// length at 10, the base from 12 — checked byte by byte.
+    #[test]
+    fn a_subnamespace_reply_is_laid_out_as_the_spec_draws_it() {
+        let mut out = [0xAAu8; 20];
+        assert_eq!(subnamespace_reply(&mut out, 14, b"/home"), Some(17));
+        assert_eq!(&out[0..2], &OBJECT_KIND_SUBNAMESPACE.to_le_bytes());
+        assert_eq!(&out[2..8], &[0; 6], "reserved, and an unused content_len");
+        assert_eq!(&out[8..10], &14u16.to_le_bytes());
+        assert_eq!(&out[10..12], &5u16.to_le_bytes());
+        assert_eq!(&out[12..17], b"/home");
+        assert_eq!(&out[17..], &[0xAA; 3]);
+        assert_eq!(subnamespace_reply(&mut out[..16], 0, b"/home"), None);
     }
 
     /// **The prefix lands where the kernel reads it** — checked byte by byte against the

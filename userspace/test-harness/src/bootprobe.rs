@@ -43,7 +43,7 @@ use libkern::{
 };
 use libkern::{
     IO_OPCODE_READ, IoOp, RIGHT_READ, SYS_FILE_TRUNCATE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
-    SYS_NS_SYNC,
+    SYS_NS_SYNC, syscall6,
 };
 use libkern::{
     RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
@@ -785,6 +785,222 @@ fn flush_test(root_ns: u64) -> bool {
     true
 }
 
+// === a resolve continued in another namespace (administration Part C.4) ===========================
+
+/// Reply `SUBNAMESPACE` to `request_id` on `ch`: the first `consumed` bytes of the suffix stand for
+/// `base` in `ns`, a duplicate of which is transferred (with `LOOKUP`, which the kernel requires).
+fn reply_subnamespace(ch: u64, request_id: u64, consumed: u16, base: &[u8], ns: u64) -> bool {
+    // SAFETY: register-only syscall on a handle this process holds.
+    let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, ns, RIGHT_LOOKUP | RIGHT_TRANSFER) };
+    if dup < 0 {
+        return false;
+    }
+    let mut body = [0u8; librsproto::namespace::SUBNAMESPACE_PREFIX_LEN + 64];
+    let mut msg = [0u8; 4096];
+    let encoded = librsproto::namespace::subnamespace_reply(&mut body, consumed, base).and_then(|n| {
+        librsproto::encode(&mut msg[24..], librsproto::OP_NS_RESOLVE, request_id, librsproto::RS_FLAG_REPLY, &body[..n], 1)
+    });
+    let Some(len) = encoded else {
+        close(dup as u64);
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    msg[8] = 1;
+    let handles = [dup as u64];
+    // SAFETY: valid message buffer and one transferred handle.
+    let sr = unsafe {
+        syscall5(libkern::SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, handles.as_ptr() as u64, 1, libkern::SENDMODE_NOBLOCK)
+    };
+    sr == 0
+}
+
+/// A `PendingOperation`'s `(status, result)` if it has completed, without waiting; `None` if not
+/// yet. Leaves the handle open.
+fn po_poll(po: u64) -> Option<(i32, u64)> {
+    let handles = [po];
+    let mut r = [0u8; 24];
+    // SAFETY: valid single-waiter buffers; a zero deadline only looks.
+    let w = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, 0) };
+    (w == 1).then(|| {
+        (i32::from_le_bytes([r[8], r[9], r[10], r[11]]), u64::from_le_bytes(r[16..24].try_into().unwrap_or([0; 8])))
+    })
+}
+
+/// **Administration Part C.4, end to end: a resolve continues in a namespace a server hands back.**
+///
+/// This probe is the server. It binds a channel of its own at `/cont` in a namespace it made, and
+/// answers each lookup that reaches it with `OBJECT_KIND_SUBNAMESPACE`, pointing into a copy of the
+/// root namespace, where the root filesystem is. Six things, each with its own operation:
+/// 1. **a lookup** continues, and the file comes back from the root filesystem;
+/// 2. **a create** carries its size change on, and the file exists at that size;
+/// 3. **a rename** continues both of its paths, and the file moves;
+/// 4. a rename whose destination **leaves the prefix** is `Unsupported`, and nothing moves;
+/// 5. a server that keeps answering into itself is stopped at **depth four**, `TooLarge`, after
+///    exactly five replies;
+/// 6. a continuation onto **`/proc/self`** is `Unsupported`. It runs in the replying server's
+///    syscall, and `/proc/self` answers for whoever is calling, so without the refusal it would
+///    have handed the caller the server's own `Process`.
+fn continuation_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_FILE_RENAME, SYS_NS_BIND, SYS_NS_CREATE};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: c4 FAIL: ").s(why).end();
+        false
+    };
+    // The probe's own server, at /cont in a namespace of its own.
+    // SAFETY: register-only syscall.
+    let a = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    let (mut ours, mut theirs) = (0u64, 0u64);
+    // SAFETY: valid out-params.
+    let cr = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 8, 0) };
+    if a < 0 || cr != 0 {
+        return fail(b"no namespace or channel");
+    }
+    let a = a as u64;
+    let at = b"/cont";
+    // SAFETY: valid path; `theirs` is the channel's kernel-facing end.
+    if unsafe { syscall6(SYS_NS_BIND, a, at.as_ptr() as u64, at.len() as u64, theirs, 0, 0) } != 0 {
+        return fail(b"binding /cont (the probe needs BIND_NAMESPACE)");
+    }
+    close(theirs);
+    // Where it answers into: a copy of the root namespace.
+    // SAFETY: register-only syscall.
+    let b = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if b < 0 {
+        return fail(b"no copy of the root namespace");
+    }
+    let b = b as u64;
+
+    // Serve requests on `ours` until `po` completes, answering each with (`consumed`, `base`,
+    // `ns`); the completion, and how many requests were answered.
+    let serve_until = |po: i64, consumed: u16, base: &[u8], ns: u64| -> Option<((i32, u64), u32)> {
+        if po < 0 {
+            return None;
+        }
+        let po = po as u64;
+        let deadline = clock_ns() + 10_000_000_000;
+        let mut answered = 0u32;
+        loop {
+            if let Some(done) = po_poll(po) {
+                close(po);
+                return Some((done, answered));
+            }
+            let req = receive(ours, clock_ns() + 200_000_000);
+            if let Some(req) = req {
+                if req.op != librsproto::OP_NS_RESOLVE || !reply_subnamespace(ours, req.request_id, consumed, base, ns) {
+                    close(po);
+                    return None;
+                }
+                answered += 1;
+            }
+            if clock_ns() > deadline {
+                close(po);
+                return None;
+            }
+        }
+    };
+    let rw = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
+
+    // 1. A lookup, continued into the root filesystem.
+    let p = b"/cont/fs/l1/system/current-generation";
+    // SAFETY: valid path + namespace handle.
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, a, p.as_ptr() as u64, p.len() as u64, RIGHT_MAP_READ) };
+    let direct = {
+        let (st, h) = ns_lookup(root_ns, b"/system/current-generation", RIGHT_MAP_READ);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        bytes
+    };
+    let looked_up = match serve_until(po, 5, b"/", b) {
+        Some(((0, h), 1)) => {
+            let bytes = read_all(h);
+            close(h);
+            bytes.is_some() && bytes == direct
+        }
+        _ => false,
+    };
+    if !looked_up {
+        return fail(b"a lookup did not continue to the root filesystem's file");
+    }
+
+    // 2. A create, its size change carried on.
+    let c = b"/cont/fs/l1/system/c4-created";
+    // SAFETY: valid path + namespace handle.
+    let po = unsafe { syscall5(SYS_FILE_CREATE, a, c.as_ptr() as u64, c.len() as u64, rw, 100) };
+    let created = matches!(serve_until(po, 5, b"/", b), Some(((0, h), 1)) if { close(h); true })
+        && {
+            let (st, h) = ns_lookup(root_ns, b"/system/c4-created", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+            let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
+            close(h);
+            size == Some(100)
+        };
+    if !created {
+        return fail(b"a create did not carry its size on");
+    }
+
+    // 3. A rename, both paths continued.
+    let d = b"/cont/fs/l1/system/c4-renamed";
+    // SAFETY: valid paths + namespace handle.
+    let po = unsafe {
+        syscall6(SYS_FILE_RENAME, a, c.as_ptr() as u64, c.len() as u64, d.as_ptr() as u64, d.len() as u64, 0)
+    };
+    let renamed = matches!(serve_until(po, 5, b"/", b), Some(((0, _), 1)))
+        && ns_lookup(root_ns, b"/system/c4-created", RIGHT_MAP_READ).0 != 0
+        && {
+            let (st, h) = ns_lookup(root_ns, b"/system/c4-renamed", RIGHT_MAP_READ);
+            close(h);
+            st == 0
+        };
+    if !renamed {
+        return fail(b"a rename did not continue both paths");
+    }
+
+    // 4. A rename whose destination leaves the prefix answered for: another mount.
+    let x = b"/cont/fs/l2/system/c4-elsewhere";
+    // SAFETY: valid paths + namespace handle.
+    let po = unsafe {
+        syscall6(SYS_FILE_RENAME, a, d.as_ptr() as u64, d.len() as u64, x.as_ptr() as u64, x.len() as u64, 0)
+    };
+    let left = matches!(serve_until(po, 5, b"/", b), Some(((st, _), 1)) if st == KError::Unsupported.as_i32())
+        && {
+            let (st, h) = ns_lookup(root_ns, b"/system/c4-renamed", RIGHT_MAP_READ);
+            close(h);
+            st == 0
+        };
+    if !left {
+        return fail(b"a rename leaving the prefix was not refused, or moved the file");
+    }
+
+    // 5. A server answering into itself: four continuations, and the fifth reply refused.
+    let l = b"/cont/loop/x";
+    // SAFETY: valid path + namespace handle.
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, a, l.as_ptr() as u64, l.len() as u64, RIGHT_MAP_READ) };
+    let bounded = matches!(serve_until(po, 4, b"/cont/loop", a), Some(((st, _), 5)) if st == KError::TooLarge.as_i32());
+    if !bounded {
+        return fail(b"a resolve answering into itself was not stopped at depth four");
+    }
+
+    // 6. Not onto /proc/self, which would answer for this server.
+    let s = b"/cont/proc/self/process";
+    // SAFETY: valid path + namespace handle.
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, a, s.as_ptr() as u64, s.len() as u64, libkern::RIGHT_INSPECT) };
+    let refused = match serve_until(po, 4, b"/proc", b) {
+        Some(((st, h), 1)) => {
+            close(h);
+            st == KError::Unsupported.as_i32()
+        }
+        _ => false,
+    };
+    if !refused {
+        return fail(b"a continuation onto /proc/self was not refused");
+    }
+
+    close(ours);
+    close(a);
+    close(b);
+    kprint(b"boot-probe: c4 a lookup, a create and a rename continue in a replied namespace; a rename leaving it, a loop past depth four and /proc/self refused ok\n");
+    true
+}
+
 /// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
 /// a `MAP_WRITE` mapping, `sys_file_sync`, then read the block **off the device** and verify
 /// the change persisted — proving the Model A write data path (dirty pages → write IRPs →
@@ -1141,6 +1357,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)
+        & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)
