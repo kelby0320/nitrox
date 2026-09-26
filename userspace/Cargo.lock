@@ -499,4 +499,5 @@ dependencies = [
  "librsproto",
  "libsession",
  "libstream",
+ "libusers",
 ]

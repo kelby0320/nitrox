@@ -749,10 +749,11 @@ pub fn join(dir: &[u8], name: &[u8]) -> String {
 /// The folders a session's home holds for a person's own files — between Home and Root in every
 /// list of [`places`].
 ///
-/// **Named here and made by the image build**, which is the arrangement M14 Part D chose while
-/// there is one staged home: first-login creation is the right answer once there are real users,
-/// and is `TODO(home-folders)` rather than built. A place whose directory is absent is still
-/// offered — opening it says so, which is the same answer a typed path gets.
+/// **Named here, and made by whoever makes a home**: the image build for the demo home, and since
+/// administration Part D.3 the view broker for every account an administrator adds. The first
+/// account's home, which Part G's installer makes, is the one still owed (`TODO(home-folders)`).
+/// A place whose directory is absent is still offered — opening it says so, which is the same
+/// answer a typed path gets.
 ///
 /// It was `nxfiles::DEFAULT_FOLDERS` until the shell's Places menu needed the same list (desktop
 /// refresh, Part C): a helper with two consumers belongs below both, and a second copy is how the

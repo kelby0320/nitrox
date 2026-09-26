@@ -567,8 +567,8 @@ given constructed namespaces, with `/svc/storage` bound whole only into the view
 admin session on `auth-service`, which adds, removes and sets the password of any account. The view
 broker is the one client meant to hold one, and it fronts every account operation with its guards
 (Part D.3). But the root namespace reaches the session without the broker. So do the broker's own
-`/svc/views/accounts/<id>` and `/svc/views/policy/<id>`, once they exist: they act as any open
-session's `accounts` or `views` grant without a password (Parts D.2 and D.3). **It adds no
+`/svc/views/policy/<id>` and, since Part D.3, `/svc/views/accounts/<id>`: they act as any open
+session's `views` or `accounts` grant without a password (Parts D.2 and D.3). **It adds no
 authority**: a root holder can already map `/system/users` writable, since `boot-probe` maps
 `/system/rwtest` from the same root. The fix is the same: constructed namespaces, with `/svc/auth`
 bound whole only into the broker's and the two login supervisors'.
@@ -1664,6 +1664,14 @@ The right answer is for the session to create them when it first builds a user's
 needs a decision about *where the list lives* — a profile default, a skeleton directory, or the
 shell's own — rather than the three lines of `mkdir`. **Trigger: the second home**, whether that
 is a second demo user or the first real one.
+
+**Resolved for every home an administrator adds (administration Part D.3, 2026-09-25), and not by
+the session.** The maintainer's call in Part D's detail pass: **whoever makes a home makes its
+folders**, from `libfs::HOME_FOLDERS`, the list the sidebar already reads — over a session making
+missing folders at each login, and over a skeleton directory. The view broker makes the home for
+`AddAccount`, so every account added on a running system gets them. **Still open for one home**:
+the first account's, which Part G's installer writes onto the installed disk and must make the
+same way. The tag stays until it does.
 
 **Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
 `nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a

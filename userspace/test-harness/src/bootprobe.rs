@@ -1375,7 +1375,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_admin_test(root_ns)
         & storage_grant_test(root_ns)
         & auth_admin_test(root_ns)
-        & policy_test(root_ns);
+        & policy_test(root_ns)
+        & accounts_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -2683,6 +2684,67 @@ fn storage_admin_test(root_ns: u64) -> bool {
     finish(true)
 }
 
+/// **One program in the admin view**, as `with admin` runs it: a request on the client channel at
+/// `client_path`, the demo password, and `stdout` and `stderr` piped back. Its exit code, every row
+/// of the table it wrote, and what it wrote on `stderr`. `None` if the broker did not start it.
+fn in_admin_view(
+    root_ns: u64,
+    client_path: &str,
+    program: &[u8],
+    args: &[&[u8]],
+    exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> Option<(i64, alloc::vec::Vec<alloc::vec::Vec<libstream::wire::Value>>, alloc::vec::Vec<u8>)> {
+    use libkern::SYS_NS_DERIVE;
+    use librsproto::views::*;
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
+    // SAFETY: a namespace handle this process holds.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    let (mut out_w, mut out_r, mut err_w, mut err_r) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: valid writable out-params, for each of the two pipes.
+    let piped = unsafe {
+        syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) == 0
+            && syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut err_w) as u64, (&raw mut err_r) as u64, 16, 0) == 0
+    };
+    if st != 0 || cli == 0 || copy <= 0 || !piped {
+        return None;
+    }
+    let mut req = [0u8; 256];
+    let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", program, args, b"")?;
+    let asked = matches!(
+        views_call(cli, OP_VIEWS_REQUEST, 1, &req[..n], &[copy as u64, out_w, err_w], exited),
+        Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::NeedPassword, _)))
+    ) && matches!(
+        views_call(cli, OP_VIEWS_PASSWORD, 2, DEMO_PASSWORD, &[], exited),
+        Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+    );
+    let listing = if asked {
+        libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive().ok()
+    } else {
+        None
+    };
+    close(out_r);
+    // Every diagnostic is one message, and the program has closed its end by now: read to
+    // the close.
+    let mut said = alloc::vec::Vec::new();
+    if asked {
+        use libstream::channel::MsgPort;
+        let mut port = libstream::channel::IpcPort::new(err_r);
+        while port.recv(&mut said).is_ok() {}
+    }
+    close(err_r);
+    let code = if asked { exited.pop().or_else(|| views_receive(cli, 0, exited).map(|r| r.1)) } else { None };
+    close(cli);
+    let code = code.as_deref().and_then(parse_exited)?.0 as i64;
+    let mut rows = alloc::vec::Vec::new();
+    if let Some(mut tr) = listing.as_deref().and_then(|b| libstream::table::TableReader::new(b).ok()) {
+        while let Some(Ok(libstream::table::Item::Row(vals))) = tr.next() {
+            rows.push(vals);
+        }
+    }
+    Some((code, rows, said))
+}
+
 /// **`disk`, through the `storage` grant** (administration Part C.7): the success path a person
 /// takes with `with admin disk`, from a view the broker built. `disk --unmount nitrox-scratch`
 /// and then `disk --mount /dev/blk/<n>` each run in the admin view with a stdout pipe. The table
@@ -2724,54 +2786,9 @@ fn storage_grant_test(root_ns: u64) -> bool {
 
     // One program in the admin view: its exit code, the first row of the table it wrote, and
     // what it wrote on `stderr`.
-    let mut run = |args: &[&[u8]]| -> Option<(i64, alloc::vec::Vec<Value>, alloc::vec::Vec<u8>)> {
-        let (st, cli) = ns_lookup(root_ns, client_path.as_bytes(), chan);
-        // SAFETY: a namespace handle this process holds.
-        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
-        let (mut out_w, mut out_r, mut err_w, mut err_r) = (0u64, 0u64, 0u64, 0u64);
-        // SAFETY: valid writable out-params, for each of the two pipes.
-        let piped = unsafe {
-            syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) == 0
-                && syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut err_w) as u64, (&raw mut err_r) as u64, 16, 0) == 0
-        };
-        if st != 0 || cli == 0 || copy <= 0 || !piped {
-            return None;
-        }
-        let mut req = [0u8; 256];
-        let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", b"disk", args, b"")?;
-        let asked = matches!(
-            views_call(cli, OP_VIEWS_REQUEST, 1, &req[..n], &[copy as u64, out_w, err_w], &mut exited),
-            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::NeedPassword, _)))
-        ) && matches!(
-            views_call(cli, OP_VIEWS_PASSWORD, 2, DEMO_PASSWORD, &[], &mut exited),
-            Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
-        );
-        let listing = if asked {
-            libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive().ok()
-        } else {
-            None
-        };
-        close(out_r);
-        // Every diagnostic is one message, and the program has closed its end by now: read to
-        // the close.
-        let mut said = alloc::vec::Vec::new();
-        if asked {
-            use libstream::channel::MsgPort;
-            let mut port = libstream::channel::IpcPort::new(err_r);
-            while port.recv(&mut said).is_ok() {}
-        }
-        close(err_r);
-        let code = if asked { exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) } else { None };
-        close(cli);
-        let code = code.as_deref().and_then(parse_exited)?.0 as i64;
-        let row = listing.and_then(|bytes| {
-            let mut tr = libstream::table::TableReader::new(&bytes).ok()?;
-            match tr.next() {
-                Some(Ok(libstream::table::Item::Row(vals))) => Some(vals),
-                _ => None,
-            }
-        });
-        Some((code, row.unwrap_or_default(), said))
+    let mut run = |args: &[&[u8]]| {
+        in_admin_view(root_ns, &client_path, b"disk", args, &mut exited)
+            .map(|(code, rows, said)| (code, rows.into_iter().next().unwrap_or_default(), said))
     };
     let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
     let s = |v: &str| Value::Str(alloc::string::String::from(v));
@@ -3010,6 +3027,272 @@ fn policy_test(root_ns: u64) -> bool {
         return fail(b"a closed session's policy channel still answered");
     }
     kprint(b"boot-probe: policy: Show is the device's file; a policy with no views administrator and one naming no account refused by Check and Install; one more view installed, listed, and put back; a closed session's channel closed ok\n");
+    true
+}
+
+/// **Accounts, fronted by the broker** (administration Part D.3).
+///
+/// **First the grant, as a view builds it**: `list /dev`, run in the admin view, names `accounts`
+/// there, and `policy` beside it. Then the ops, asked at the protocol on `/svc/views/accounts/<id>`
+/// — the suffix the grant's binding forwards to — for a session the probe opens as a supervisor
+/// does, under a principal no account has, so no guard sees the probe itself as logged in:
+/// - a client channel refuses `AddAccount`, and a name that is not one is refused without a home;
+/// - `d3probe` added, its home made with the three folders, and it authenticates;
+/// - `Accounts` names it with no session, then with the one the probe opens for it;
+/// - its removal refused while that session is open;
+/// - `ChangePassword` on its session: a wrong current password refused, and the right one answered
+///   only once the session's delay has passed; the new one authenticates and the old does not;
+/// - `SetPassword` from the accounts channel;
+/// - removing `alice`, the only administrator, refused for that reason, with her logged out;
+/// - `d3probe` removed keeping its home, added again adopting it, and removed with it;
+/// - a closed session's accounts channel answers nothing.
+fn accounts_test(root_ns: u64) -> bool {
+    use libkern::KError;
+    use librsproto::auth::{build_account_request, build_authenticate_request, parse_authenticate_reply};
+    use librsproto::views::*;
+    use libstream::wire::Value;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: accounts: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let open = |who: &[u8]| match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, who, &[], &mut alloc::vec::Vec::new()) {
+        Some((false, body)) => parse_session_id(&body),
+        _ => None,
+    };
+    let close_session = |id: u64| {
+        let mut b = [0u8; 8];
+        let n = build_session_id(&mut b, id).unwrap_or(0);
+        let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &b[..n], &[], &mut alloc::vec::Vec::new());
+    };
+
+    // The grant, as a view builds it.
+    let Some(as_alice) = open(DEMO_USER) else {
+        close(sup);
+        return fail(b"OpenSession for alice");
+    };
+    let path = alloc::format!("/svc/views/s/{as_alice}");
+    let listed = in_admin_view(root_ns, &path, b"list", &[b"/dev"], &mut alloc::vec::Vec::new());
+    close_session(as_alice);
+    let names = |rows: &[alloc::vec::Vec<Value>], what: &str| {
+        rows.iter().any(|r| r.first() == Some(&Value::Str(alloc::string::String::from(what))))
+    };
+    if !listed.is_some_and(|(code, rows, _)| code == 0 && names(&rows, "accounts") && names(&rows, "policy")) {
+        close(sup);
+        return fail(b"list /dev in the admin view does not name accounts and policy");
+    }
+
+    // A session of the probe's own, and its channels.
+    let Some(probe) = open(b"boot-probe") else {
+        close(sup);
+        return fail(b"OpenSession for the probe");
+    };
+    let (sa, acc) = ns_lookup(root_ns, alloc::format!("/svc/views/accounts/{probe}").as_bytes(), chan);
+    let (sc, cli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{probe}").as_bytes(), chan);
+    let (so, oracle) = ns_lookup(root_ns, b"/svc/auth", chan);
+    let finish = |ok: bool| {
+        close(acc);
+        close(cli);
+        close(oracle);
+        close_session(probe);
+        close(sup);
+        ok
+    };
+    if sa != 0 || acc == 0 || sc != 0 || cli == 0 || so != 0 || oracle == 0 {
+        return finish(fail(b"no accounts channel, client channel and oracle session"));
+    }
+    match ns_lookup(root_ns, b"/svc/views/accounts/999999", chan) {
+        (st, _) if st == KError::NotFound.as_i32() => {}
+        _ => return finish(fail(b"a session that is not open has an accounts endpoint")),
+    }
+
+    let next = core::cell::Cell::new(100u64);
+    let ask = |ch: u64, op: u16, body: &[u8]| {
+        next.set(next.get() + 1);
+        views_call(ch, op, next.get(), body, &[], &mut alloc::vec::Vec::new())
+    };
+    // `Some((started, reason))` for an outcome, `None` for anything else.
+    let outcome = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
+        r.filter(|(err, _)| !err)
+            .and_then(|(_, b)| parse_outcome(&b).map(|(o, why)| (o == Outcome::Started, alloc::vec::Vec::from(why))))
+    };
+    let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
+    let refused_for = |r: Option<(bool, alloc::vec::Vec<u8>)>, what: &[u8]| {
+        outcome(r).is_some_and(|(started, why)| !started && says(&why, what))
+    };
+    let pair = |a: &[u8], b: &[u8]| {
+        let mut x = [0u8; 256];
+        let n = build_account_request(&mut x, a, b).unwrap_or(0);
+        x[..n].to_vec()
+    };
+    let removal = |name: &[u8], home: bool| {
+        let mut x = [0u8; 64];
+        let n = build_remove_account(&mut x, name, home).unwrap_or(0);
+        x[..n].to_vec()
+    };
+    let change = |current: &[u8], new: &[u8]| {
+        let mut x = [0u8; 256];
+        let n = build_password_change(&mut x, current, new).unwrap_or(0);
+        x[..n].to_vec()
+    };
+    let authenticates = |name: &[u8], pw: &[u8]| {
+        let mut b = [0u8; 256];
+        let n = build_authenticate_request(&mut b, name, pw).unwrap_or(0);
+        ask(oracle, librsproto::OP_AUTHENTICATE, &b[..n])
+            .is_some_and(|(err, body)| !err && parse_authenticate_reply(&body).is_some_and(|r| r.is_authenticated()))
+    };
+    // Each account `Accounts` names: `(sessions, administers)`.
+    let shown = |name: &[u8]| -> Option<(u16, bool)> {
+        let (err, body) = ask(cli, OP_VIEWS_ACCOUNTS, &[])?;
+        let mut found = None;
+        parse_accounts(&body, |r| {
+            if r.name == name {
+                found = Some((r.sessions, r.administers));
+            }
+        })
+        .filter(|_| !err)?;
+        found
+    };
+    const NAME: &[u8] = b"d3probe";
+    const HOME: &[u8] = b"/home/d3probe";
+    let homed = || {
+        libfs::is_dir(root_ns, HOME)
+            && libfs::HOME_FOLDERS.iter().all(|f| libfs::is_dir(root_ns, libfs::join(HOME, f.as_bytes()).as_bytes()))
+    };
+
+    // Only an accounts channel adds, and a name has to be one.
+    if !ask(cli, OP_VIEWS_ADD_ACCOUNT, &pair(NAME, b"first secret")).is_some_and(|(err, _)| err) {
+        return finish(fail(b"a client channel answered AddAccount"));
+    }
+    if !refused_for(ask(acc, OP_VIEWS_ADD_ACCOUNT, &pair(b"../d3", b"first secret")), b"a name is 1 to 32 bytes")
+        || libfs::is_dir(root_ns, b"/d3")
+    {
+        return finish(fail(b"a name that is not one was not refused, or made a directory"));
+    }
+
+    // Added, with a home and its folders.
+    match outcome(ask(acc, OP_VIEWS_ADD_ACCOUNT, &pair(NAME, b"first secret"))) {
+        Some((true, why)) if says(&why, b"with a new home at /home/d3probe") => {}
+        _ => return finish(fail(b"AddAccount did not add d3probe with a new home")),
+    }
+    if !homed() || !authenticates(NAME, b"first secret") {
+        return finish(fail(b"d3probe has no home with its folders, or does not authenticate"));
+    }
+    if !refused_for(ask(acc, OP_VIEWS_ADD_ACCOUNT, &pair(NAME, b"other")), b"already exists") {
+        return finish(fail(b"a second add of d3probe was not refused"));
+    }
+    if shown(NAME) != Some((0, false)) || shown(DEMO_USER) != Some((0, true)) {
+        return finish(fail(b"Accounts does not show d3probe with no session, and alice administering"));
+    }
+
+    // Logged in: shown with its session, and not removed.
+    let Some(as_d3) = open(NAME) else {
+        return finish(fail(b"OpenSession for d3probe"));
+    };
+    let (sd, d3) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{as_d3}").as_bytes(), chan);
+    let finish = |ok: bool| {
+        close(d3);
+        close_session(as_d3);
+        finish(ok)
+    };
+    if sd != 0 || d3 == 0 {
+        return finish(fail(b"no client channel for d3probe's session"));
+    }
+    if shown(NAME) != Some((1, false)) {
+        return finish(fail(b"Accounts does not show d3probe's session"));
+    }
+    if !refused_for(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(NAME, true)), b"d3probe is logged in")
+        || !authenticates(NAME, b"first secret")
+        || !homed()
+    {
+        return finish(fail(b"d3probe was removed while logged in"));
+    }
+
+    // Its own password: a wrong current one refused, and the next check held for the delay.
+    if !refused_for(ask(d3, OP_VIEWS_CHANGE_PASSWORD, &change(b"wrong", b"second secret")), b"wrong password") {
+        return finish(fail(b"ChangePassword took a wrong current password"));
+    }
+    let asked_at = clock_ns();
+    let changed = outcome(ask(d3, OP_VIEWS_CHANGE_PASSWORD, &change(b"first secret", b"second secret")));
+    let waited = clock_ns().saturating_sub(asked_at);
+    if !changed.is_some_and(|(started, _)| started) {
+        return finish(fail(b"ChangePassword with the right current password was not answered Started"));
+    }
+    // The broker's delay is two seconds (`view_broker::pacing::FAIL_DELAY_NS`); unpaced, the
+    // answer takes milliseconds.
+    if waited < 1_500_000_000 {
+        return finish(fail(b"ChangePassword after a wrong one was answered without the session's delay"));
+    }
+    if !authenticates(NAME, b"second secret") || authenticates(NAME, b"first secret") {
+        return finish(fail(b"after ChangePassword, the new password is refused or the old one taken"));
+    }
+    close(d3);
+    close_session(as_d3);
+    let finish = |ok: bool| {
+        close(acc);
+        close(cli);
+        close(oracle);
+        close_session(probe);
+        close(sup);
+        ok
+    };
+    if shown(NAME) != Some((0, false)) {
+        return finish(fail(b"Accounts still shows d3probe's closed session"));
+    }
+
+    // An administrator's `SetPassword`, with no current password to prove.
+    if !outcome(ask(acc, OP_VIEWS_SET_PASSWORD, &pair(NAME, b"third secret"))).is_some_and(|(s, _)| s)
+        || !authenticates(NAME, b"third secret")
+    {
+        return finish(fail(b"SetPassword did not set d3probe's password"));
+    }
+
+    // The only administrator, logged out, is not removed.
+    let why: &[u8] = b"removing alice would leave no account that could use `views` for every program";
+    if !refused_for(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(DEMO_USER, false)), why)
+        || !authenticates(DEMO_USER, DEMO_PASSWORD)
+    {
+        return finish(fail(b"removing alice, the only administrator, was not refused for that reason"));
+    }
+
+    // Removed keeping the home, added again adopting it, and removed with it.
+    match outcome(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(NAME, false))) {
+        Some((true, why)) if says(&why, b"keeping /home/d3probe") => {}
+        _ => return finish(fail(b"RemoveAccount without the home did not remove d3probe")),
+    }
+    if authenticates(NAME, b"third secret") || !homed() {
+        return finish(fail(b"a removed d3probe still authenticates, or its kept home went"));
+    }
+    match outcome(ask(acc, OP_VIEWS_ADD_ACCOUNT, &pair(NAME, b"fourth secret"))) {
+        Some((true, why)) if says(&why, b"adopting /home/d3probe") => {}
+        _ => return finish(fail(b"adding d3probe again did not adopt its home")),
+    }
+    match outcome(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(NAME, true))) {
+        Some((true, why)) if says(&why, b"and /home/d3probe with it") => {}
+        _ => return finish(fail(b"RemoveAccount with the home did not remove both")),
+    }
+    if libfs::is_dir(root_ns, HOME) || authenticates(NAME, b"fourth secret") {
+        return finish(fail(b"d3probe's home or record outlived its removal"));
+    }
+    if !refused_for(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(NAME, true)), b"no account is named d3probe") {
+        return finish(fail(b"a second removal of d3probe was not refused"));
+    }
+
+    // A closed session's accounts channel closes with it.
+    close_session(probe);
+    let answered = ask(acc, OP_VIEWS_SET_PASSWORD, &pair(NAME, b"fifth secret")).is_some();
+    close(acc);
+    close(cli);
+    close(oracle);
+    close(sup);
+    if answered {
+        return fail(b"a closed session's accounts channel still answered");
+    }
+    kprint(b"boot-probe: accounts: the grant binds /dev/accounts; an account added with its home, shown with its session, kept while logged in, its password changed after the delay and set; the only administrator kept; a home kept, adopted and removed; a closed session's channel closed ok\n");
     true
 }
 

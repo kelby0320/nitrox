@@ -30044,3 +30044,98 @@ to send a longer line.
     still answered".
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.3: the broker fronts accounts
+
+**What landed.** The `accounts` grant binds the broker's forwarding endpoint at `/dev/accounts`,
+with the base `/accounts/<session>`, as D.2's `views` grant binds `/dev/policy`. A resolve there
+is that session's **accounts channel**, one wait-set slot, which answers three ops:
+- `AddAccount` (`0x0E0C`);
+- `RemoveAccount` (`0x0E0D`), with a flag to remove the home;
+- `SetPassword` (`0x0E0E`), someone's password without their current one.
+
+Every session's client channel gains two more, needing no grant:
+- `Accounts` (`0x0E0A`): each account's name, home, open sessions, and whether it could
+  administer;
+- `ChangePassword` (`0x0E0B`): the person's own, proved with the current one.
+
+The seeded `admin` profile gains `accounts`. The broker asks `auth-service`'s admin session
+(D.1) for every write, once its own checks have passed.
+
+**How an add goes, and why in that order.** The name and password are checked against `libusers`'
+rules first, so **a name reaches a path (`/home/<name>`) and a log line only once it is one**; a
+refused name is not echoed back. A taken name is refused before `/home` is touched. Then the home
+is made with `libfs::HOME_FOLDERS`' three folders, or adopted if a removal kept it, and only then
+is the record added. If `auth-service` refuses the record, a home made for it is removed again, so
+a failure leaves nothing. The plan allowed an empty directory.
+
+**The guards, in the library where the host tests reach them** (`view_broker::accounts`):
+- no account of that name;
+- **logged in**: a session the broker opened for it is still open;
+- **the policy does not read**: a removal is refused, since whether an administrator would remain
+  cannot be said;
+- **no account left could administer**, by D.2's definition, over the accounts that would remain.
+
+**`ChangePassword` is held in the same queue as `with`'s passwords.** The new password is checked
+against the rules at once, then the request waits for the session's delay, and a wrong current
+password is a failure like any other. So a program cannot guess faster by switching between
+`Password` and `ChangePassword`, or by opening channels.
+
+**Replies are outcomes with reasons** — what was done ("added d3probe, with a new home at
+/home/d3probe"), or the guard that refused — as `Check` and `Install` answer, so D.4's `account`
+prints what the broker says. **Every write is recorded twice**: the broker's audit names who asked
+and what happened, and `auth-service` logs each write by account name. No password appears in
+either; the gate's log was searched for the probe's.
+
+**`TODO(home-folders)` is resolved for every home an administrator adds**, by the maintainer's
+Part D call that whoever makes a home makes its folders. It stays open for the first account's
+home, which Part G's installer makes.
+
+**A narrower case of a named gap.** The broker learns of a session only from the supervisor's
+`OpenSession`. So a removal between a login's `Authenticate` and that `OpenSession` passes the
+logged-in guard. It is the class Part D's *Left alone* already names for a failed `OpenSession`,
+and it stays open for the same reason: closing it would put the broker on every login's path.
+
+**The probe's shape.** "Through a view as the grant builds it" is met for the binding: `list /dev`
+in the admin view names `accounts` there. The ops are asked at the protocol, on
+`/svc/views/accounts/<id>`, as D.2's were, until D.4's `account` drives them through the binding.
+The helper that runs a program in the admin view, `in_admin_view`, was lifted out of C.7's
+`storage_grant_test`, which now uses it too.
+
+`view-broker` depends on `libusers` now, for the rules; `userspace/Cargo.lock` changes with it.
+
+**Gates:**
+- **Host tests**:
+  - `view-broker` (23, 2 new): the removal guards, each at its neighbour, in the order they are
+    said; `Accounts` counting each account's own sessions, and showing nobody administering when
+    the policy does not read.
+  - `librsproto` (3 new): the account rows both ways, and a reader fed bytes no writer makes; the
+    removal body and its flag; the password change accounted for exactly.
+- **`boot-probe`** (`accounts_test`):
+  - `list /dev` in the admin view names `accounts` and `policy`;
+  - an add refused on a client channel, and a name that is not one refused without a directory;
+  - `d3probe` added with its home and three folders, authenticating;
+  - `Accounts` showing it with no session, then one;
+  - its removal refused while logged in;
+  - `ChangePassword` refused for a wrong current password, then answered only after the delay
+    (2.06 s on the first run), the new password taken and the old refused;
+  - `SetPassword` from the accounts channel;
+  - `alice`'s removal refused as the only administrator;
+  - `d3probe` removed keeping its home, added again adopting it, removed with it, and a second
+    removal refused;
+  - a closed session's accounts channel answering nothing.
+
+**Controls:**
+- 6 host, each failing its test: the logged-in guard gone; the removed account still counted as
+  remaining; an unread policy letting a removal through; an unread policy showing administrators;
+  sessions counted for everyone; an `administers` byte of 2 read.
+- 7 `test-qemu --kvm` boots, each failing at its own check:
+  - the logged-in guard shown no sessions;
+  - `ChangePassword` checked at once instead of held;
+  - a wrong current password starting no delay;
+  - the `accounts` grant binding nothing;
+  - a closed session keeping its accounts channel;
+  - a new home without its folders;
+  - a removal asked to take the home keeping it.
+
+No kernel change and no ABI hash impact.

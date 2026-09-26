@@ -1,7 +1,8 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-25, when the view broker opened an admin session of its own to judge a policy — Part D.2;
+2026-09-25, when the view broker began fronting account operations — administration Part D.3;
+earlier that day, when it opened an admin session of its own to judge a policy — Part D.2;
 earlier that day, when `auth-service` became the user database's writer — administration Part
 D.1; earlier that day, when each session gained `/storage` and `/dev/storage`, the storage
 service's session endpoint at the bases `/fs` and `/info` — administration Part C.6; before that
@@ -170,8 +171,17 @@ from the kernel's entropy source. **The format is `libusers`'**
 (`userspace/libusers/`): the service, the build's seeder and, from Part D.4, `account`'s offline
 mode all read and write the file through it, and it bounds the file at the 4 KiB the service loads
 at boot. **The view broker holds one from Part D.2**, and asks it `List` when it judges a policy,
-since an administrator must be an account that exists. It is meant to be the admin session's one
-client, and its front for people, with its guards, is Part D.3's.
+since an administrator must be an account that exists.
+
+**Since Part D.3 the broker fronts every account operation for people**
+([`rsproto-views-ops.md`](../spec/rsproto-views-ops.md)): `AddAccount`, `RemoveAccount` and
+`SetPassword` on the `accounts` grant's `/dev/accounts`, and on any session's `/dev/views`,
+`Accounts` — every account, its sessions, and who administers — and `ChangePassword`, the
+person's own, proved with the current password under the session's delay. It checks what only it
+knows before it asks `auth-service`: **a removal waits until the account has logged out, and must
+leave an account that could administer**. It makes the home an add names, `/home/<name>`, with
+the three folders of `libfs::HOME_FOLDERS`, and removes it only when asked. `account`, the tool
+a person types, is Part D.4's.
 
 ## Session construction — subtree-scoped namespaces
 
@@ -329,8 +339,8 @@ supervisor drops to on a critical-path failure — no longer the normal console.
   accepted cost is that the same user may be logged in twice with two namespaces
   ([graphical-session.md](graphical-session.md) §6.2).
 - User *creation* and password *change* for **people**: `auth-service` writes the database since
-  administration Part D.1, and the broker's front and `account` are Parts D.3 and D.4. Persisted
-  per-user state beyond the home directory stays deferred.
+  administration Part D.1, and the broker fronts it since Part D.3; `account`, the tool a person
+  types, is Part D.4. Persisted per-user state beyond the home directory stays deferred.
 - The real user shell (Phase 4).
 
 ## References

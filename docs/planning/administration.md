@@ -1551,7 +1551,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         console's input ring, which drops what does not fit. A longer line loses its end and its
         newline, and the shell never sees the command.*
       - *`Install` is audited, as its session's principal, whether it installs or is refused.)*
-- [ ] **D.3 — the broker fronts accounts.**
+- [x] **D.3 — the broker fronts accounts.**
       - The `accounts` grant and the accounts endpoint: `AddAccount`, `RemoveAccount` and
         `SetPassword`, with the home made or removed there.
       - `Accounts` and `ChangePassword` on a session's channel.
@@ -1563,6 +1563,28 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         - the removal of the only administrator refused;
         - `ChangePassword` refused for a wrong current password and paced, then accepted;
         - `Accounts` naming each account's sessions.
+
+      *(Landed 2026-09-25.*
+      - *"Through a view as the grant builds it" is met for the binding, and the ops are asked at
+        the protocol as D.2's were. `list /dev`, run in the admin view, names `accounts` there,
+        with `in_admin_view` lifted out of C.7's `storage_grant_test` to do it. The ops go to
+        `/svc/views/accounts/<id>`, the suffix that binding forwards to, until D.4's `account`
+        drives them through the binding itself.*
+      - *The probe's accounts channel belongs to a session whose principal has no account, so
+        that `alice` is logged out when her removal is tried, and the administrator guard is
+        what refuses it rather than the logged-in one.*
+      - *Every answer is an outcome with a reason: what was done, or the guard that refused.*
+      - *`AddAccount` refuses a taken name before it touches `/home`, and removes a home it made
+        if `auth-service` refuses the record. So a failure leaves nothing, where the plan allowed
+        an empty directory.*
+      - *A refused name is never echoed. It has not been checked, so it reaches no path and no
+        log line.*
+      - *A policy that does not read refuses a removal, since whether an administrator would
+        remain cannot be said.*
+      - *A narrower case of the gap under* Left alone: *a removal between a login's
+        `Authenticate` and its supervisor's `OpenSession` is not seen by the logged-in guard,
+        since the broker learns of a session only from `OpenSession`. The window is the time
+        between the two, and it is named rather than closed for the same reason.)*
 - [ ] **D.4 — `account`.**
       - The five forms above, the prompt shared with `with`, and a new home's folders.
       - `test-interactive` steps at the real prompt, as `alice`:

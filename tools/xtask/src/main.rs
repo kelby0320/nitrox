@@ -2062,7 +2062,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     };
     part(s, "e1.txt", &[
         "[profile.admin]",
-        "grants = [\"disks\", \"storage\", \"views\"]",
+        "grants = [\"disks\", \"storage\", \"views\", \"accounts\"]",
         "[profile.install]",
         "grants = [\"disks\"]",
         "[profile.d2test]",
@@ -14327,7 +14327,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\
@@ -15059,9 +15059,10 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
             "xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)"
         );
     }
-    // **The folders the browser's sidebar offers** (M14 Part D). Staged here while there is one
-    // demo home; the right answer once there are real users is for the session to make them on
-    // first login, which is `TODO(home-folders)` rather than built.
+    // **The folders the browser's sidebar offers** (M14 Part D). Staged here for the demo home.
+    // Whoever makes a home makes them: the view broker for every account an administrator adds
+    // (administration Part D.3), and Part G's installer for the first, which is what
+    // `TODO(home-folders)` still waits on.
     //
     // **Spelled twice, and checked by a boot rather than by the compiler.** `libfs` names the
     // same three in `HOME_FOLDERS` and this crate does not link it — that is the same reason the

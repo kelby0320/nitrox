@@ -86,7 +86,7 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libinittoml` (the `init.toml` schema and the minimal TOML reader under it) is another: `alloc` only, depending on nothing. `init` and the storage service both read `init.toml`, so the parser moved out of `init` into a crate below both when the second arrived (administration Part C.5), which is the rule above applied.
 
-`libusers` (the user database's format, its rules and its edits) is a third: `core` only, over `libcrypto`. `auth-service`, which must stay free of `alloc`, writes the file with it; so do `xtask`'s seeder and, from Part D.4, `account`'s offline mode (administration Part D.1).
+`libusers` (the user database's format, its rules and its edits) is a third: `core` only, over `libcrypto`. `auth-service`, which must stay free of `alloc`, writes the file with it; so do `xtask`'s seeder and, from Part D.4, `account`'s offline mode (administration Part D.1). The view broker checks a name and a password with its rules before either reaches `auth-service`, a path or a log line (Part D.3).
 
 Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 

@@ -3,16 +3,22 @@
 //!
 //! **What it holds, and so what a bug here reaches.** It is spawned by `init` with
 //! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and it inherits the
-//! root namespace, which is where the grants come from: every block device, for `disks`. It never
-//! holds a session's ingredients — the caller hands it a copy of its own namespace
-//! (`sys_ns_derive`), and it copies that again before binding anything, so the caller cannot keep a
-//! handle to what it builds. It never touches a terminal: `with` reads the password.
+//! root namespace, which is where the grants come from: every block device, for `disks`. **And the
+//! root filesystem**, through which it reads `/system/views.toml`, replaces it since Part D.2, and
+//! makes and removes `/home/<name>` for the accounts it fronts since Part D.3. It never holds a
+//! session's ingredients — the caller hands it a copy of its own namespace (`sys_ns_derive`), and
+//! it copies that again before binding anything, so the caller cannot keep a handle to what it
+//! builds. It never touches a terminal: `with` reads the password.
 //!
 //! **Two kinds of channel off one forwarding endpoint**, which `init` binds at `/svc/views`: a
 //! login supervisor resolves `/svc/views/session` for a channel to open and close sessions on,
 //! and binds the same endpoint into each session at `/dev/views` with the base `/s/<session>`, so a
 //! process there resolves a channel the broker already knows the session of. See
 //! `librsproto::views` for the ops.
+//!
+//! **And a channel per grant that needs one**: the `views` grant binds the same endpoint at
+//! `/dev/policy` and `accounts` at `/dev/accounts`, each with a base naming the session, so a
+//! resolve there is a channel for that grant's ops alone (administration Parts D.2 and D.3).
 //!
 //! **A resource server holding `BIND_NAMESPACE`** — the second after `desktop-shell`, and for the
 //! same reason: it binds only into namespaces it creates, and never registers itself
@@ -28,12 +34,16 @@ use alloc::vec::Vec;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
-use librsproto::auth::{OP_AUTH_LIST, parse_account_list};
+use librsproto::auth::{
+    OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_account_request, parse_account_list,
+    parse_account_request,
+};
 use librsproto::storage::{OP_STORAGE_IN_USE, parse_in_use};
 use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
+use view_broker::accounts;
 use view_broker::exits::Exits;
 use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
@@ -121,6 +131,9 @@ struct Pending {
 enum State {
     Idle,
     Password(Pending),
+    /// A `ChangePassword` held until the session's delay from its last failure has passed: the
+    /// request to answer, the current password and the new one (administration Part D.3).
+    Changing { request_id: u64, current: Vec<u8>, new: Vec<u8> },
     Running { process: u64, life: u64, view_ns: u64, view: String, program: String },
     Done,
 }
@@ -150,6 +163,16 @@ struct Storage {
     session: u64,
 }
 
+/// Which grant's endpoint a channel was resolved through.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Endpoint {
+    /// `/dev/policy`, the `views` grant's: `Show` and `Install` (administration Part D.2).
+    Policy,
+    /// `/dev/accounts`, the `accounts` grant's: `AddAccount`, `RemoveAccount` and `SetPassword`
+    /// (administration Part D.3).
+    Accounts,
+}
+
 struct Broker {
     storage: Storage,
     root_ns: u64,
@@ -161,11 +184,13 @@ struct Broker {
     /// that grant is refused rather than given without its binding.
     forwarding: u64,
     auth_ch: u64,
-    /// An admin session on `auth-service` (`/svc/auth/admin`), opened on first need, for the
-    /// account list the policy is judged against. `0` until then, or after it failed.
+    /// An admin session on `auth-service` (`/svc/auth/admin`), opened on first need: the account
+    /// list the policy and a removal are judged against, and every account write the accounts
+    /// endpoint asks for. `0` until then, or after it failed.
     auth_admin: u64,
-    /// Policy channels, each resolved through a view's `/dev/policy`: the channel and its session.
-    policies: Vec<(u64, u64)>,
+    /// Channels resolved through a grant's endpoint in a view — `/dev/policy` or `/dev/accounts` —
+    /// each with its session.
+    endpoints: Vec<(u64, u64, Endpoint)>,
     supervisors: Vec<u64>,
     clients: Vec<Client>,
     sessions: Sessions,
@@ -230,6 +255,11 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
 /// Receive one message on `ch` into the static buffers. `Ok(None)` if nothing was queued,
 /// `Err(())` if the peer has gone.
 fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
+    recv_full(ch).map(|m| m.map(|(op, request_id, _, body)| (op, request_id, body)))
+}
+
+/// [`recv`], with the message's flags: an answer from a server may be an error reply.
+fn recv_full(ch: u64) -> Result<Option<(u16, u64, u32, Vec<u8>)>, ()> {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
         syscall4(
@@ -255,7 +285,7 @@ fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
         )
     };
     match decode(msg) {
-        Ok(m) => Ok(Some((m.op, m.request_id, m.body.to_vec()))),
+        Ok(m) => Ok(Some((m.op, m.request_id, m.flags, m.body.to_vec()))),
         Err(_) => {
             // A message that does not decode may still have carried handles; they are ours now.
             for h in received() {
@@ -281,6 +311,9 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
 /// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
+/// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
+/// D.3).
+const ACCOUNTS_GRANT: &[u8] = b"/dev/accounts";
 /// Where a new policy is written before it is renamed over the old one.
 const POLICY_NEW: &[u8] = b"/system/views.toml.new";
 /// How long the broker waits for `auth-service`'s account list.
@@ -293,6 +326,25 @@ fn wait_until(h: u64, deadline: u64) -> bool {
     // SAFETY: valid one-entry wait arrays on this frame.
     unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline) == 1 }
 }
+
+/// Whether `op`'s body carries a password, and so must not outlive its use in any buffer.
+fn carries_password(op: u16) -> bool {
+    matches!(op, OP_VIEWS_PASSWORD | OP_VIEWS_CHANGE_PASSWORD | OP_VIEWS_ADD_ACCOUNT | OP_VIEWS_SET_PASSWORD)
+}
+
+/// The reason an error reply gives in its `ErrorBody`, or its `KError` when it gives none.
+fn refusal(body: &[u8]) -> String {
+    match librsproto::error::parse_error(body) {
+        Some(e) if !e.msg.is_empty() => String::from_utf8_lossy(e.msg).into_owned(),
+        Some(e) => alloc::format!("{:?}", KError::from_i32(e.kerror)),
+        None => String::from("an answer that does not read"),
+    }
+}
+
+/// What a refused name is told: the rule, never the name back — it has not been checked, so it
+/// goes into no log line and no path.
+const NAME_RULE: &str =
+    "a name is 1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_` or `-`";
 
 impl Broker {
     /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
@@ -381,22 +433,24 @@ impl Broker {
             Some(r) if op == OP_NS_RESOLVE => suffix::parse(r.suffix),
             _ => Suffix::Unknown,
         };
-        let (session, policy) = match asked {
-            Suffix::Supervisor => (None, false),
-            Suffix::Client(id) if self.sessions.get(id).is_some() => (Some(id), false),
+        let (session, endpoint) = match asked {
+            Suffix::Supervisor => (None, None),
+            Suffix::Client(id) if self.sessions.get(id).is_some() => (Some(id), None),
             // **The policy endpoint, as the `views` grant binds it** (administration Part D.2): a
             // channel of its own, on which only `Show` and `Install` are answered.
-            Suffix::Policy(id) if self.sessions.get(id).is_some() => (Some(id), true),
+            Suffix::Policy(id) if self.sessions.get(id).is_some() => (Some(id), Some(Endpoint::Policy)),
+            // **The accounts endpoint, as the `accounts` grant binds it** (Part D.3).
+            Suffix::Accounts(id) if self.sessions.get(id).is_some() => (Some(id), Some(Endpoint::Accounts)),
             _ => {
                 reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::NotFound);
                 return;
             }
         };
         // Every channel is a slot in the one wait set this process has, and a client's program
-        // will need a second. A policy channel starts no program, so it is one slot, as a
+        // will need a second. A grant's endpoint starts no program, so it is one slot, as a
         // supervisor's is.
         let load = self.load();
-        let fits = if session.is_none() || policy {
+        let fits = if session.is_none() || endpoint.is_some() {
             load.admits_supervisor(MAX_WAIT_HANDLES)
         } else {
             load.admits_client(MAX_WAIT_HANDLES)
@@ -416,10 +470,10 @@ impl Broker {
             close(ours);
             return;
         }
-        match session {
-            None => self.supervisors.push(ours),
-            Some(id) if policy => self.policies.push((ours, id)),
-            Some(id) => self.clients.push(Client { ch: ours, session: id, state: State::Idle }),
+        match (session, endpoint) {
+            (None, _) => self.supervisors.push(ours),
+            (Some(id), Some(e)) => self.endpoints.push((ours, id, e)),
+            (Some(id), None) => self.clients.push(Client { ch: ours, session: id, state: State::Idle }),
         }
     }
 
@@ -477,12 +531,12 @@ impl Broker {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
                     unsafe { syscall1(SYS_PROCESS_TERMINATE, *process) };
                     libsession::unbind_block_devices(*view_ns);
-                    // The `storage` and `views` grants too; `NotFound` for a view not given one.
-                    // SAFETY: valid namespace handle and paths.
-                    unsafe {
-                        syscall3(SYS_NS_UNBIND, *view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64);
-                        syscall3(SYS_NS_UNBIND, *view_ns, POLICY_GRANT.as_ptr() as u64, POLICY_GRANT.len() as u64);
-                    };
+                    // The `storage`, `views` and `accounts` grants too; `NotFound` for a view not
+                    // given one.
+                    for at in [STORAGE_GRANT, POLICY_GRANT, ACCOUNTS_GRANT] {
+                        // SAFETY: valid namespace handle and path.
+                        unsafe { syscall3(SYS_NS_UNBIND, *view_ns, at.as_ptr() as u64, at.len() as u64) };
+                    }
                 }
                 State::Password(p) => {
                     p.handles.close();
@@ -494,13 +548,21 @@ impl Broker {
                     }
                     c.state = State::Done;
                 }
+                State::Changing { request_id, current, new } => {
+                    scrub(current);
+                    scrub(new);
+                    self.held.forget(c.ch);
+                    let why = "this session has ended";
+                    reply_outcome(c.ch, OP_VIEWS_CHANGE_PASSWORD, *request_id, Outcome::Denied { retry: false }, why);
+                    c.state = State::Done;
+                }
                 _ => {}
             }
         }
-        // Its policy channels close with it: nothing more is heard under its base.
-        let (gone, kept): (Vec<(u64, u64)>, Vec<(u64, u64)>) = self.policies.drain(..).partition(|p| p.1 == id);
-        self.policies = kept;
-        gone.iter().for_each(|&(ch, _)| close(ch));
+        // Its grants' channels close with it: nothing more is heard under its bases.
+        let (gone, kept): (Vec<_>, Vec<_>) = self.endpoints.drain(..).partition(|e| e.1 == id);
+        self.endpoints = kept;
+        gone.iter().for_each(|&(ch, _, _)| close(ch));
         Line::new().s(b"view-broker: session ").u(id).s(b" ended").end();
     }
 
@@ -508,35 +570,50 @@ impl Broker {
     /// broker's own, opened on first need. `None` if it cannot be asked or does not answer — and
     /// then the session is dropped, so the next ask opens a new one. Judging a policy fails closed
     /// without it: a policy cannot be said to leave an administrator when nobody knows who exists.
-    fn accounts(&mut self) -> Option<Vec<String>> {
+    fn accounts(&mut self) -> Option<Vec<(String, String)>> {
+        let body = self.ask_auth(OP_AUTH_LIST, &[]).ok()?;
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        Some(parse_account_list(&body)?.iter().map(|(n, h)| (text(n), text(h))).collect())
+    }
+
+    /// **Ask `auth-service`'s admin session**, opened on first need: send `op` with `body`, and
+    /// wait at most `ACCOUNTS_WAIT_NS` for the answer — its body, or the reason it refused. A
+    /// session that does not answer is dropped, so the next ask opens a new one.
+    ///
+    /// **The body may carry a password**, so the send buffer is zeroed as soon as the kernel has
+    /// the message; the caller zeroes its own copy.
+    fn ask_auth(&mut self, op: u16, body: &[u8]) -> Result<Vec<u8>, String> {
         if self.auth_admin == 0 {
             self.auth_admin = ns_lookup(self.root_ns, b"/svc/auth/admin", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
         }
         let admin = self.auth_admin;
         if admin == 0 {
-            return None;
+            return Err(String::from("auth-service could not be reached"));
         }
-        let asked = send(admin, OP_AUTH_LIST, 1, 0, &[], &[]);
+        let asked = send(admin, op, 1, 0, body, &[]);
+        // SAFETY: our send buffer; single-threaded, and the kernel copied the message during the
+        // send.
+        unsafe { scrub(&mut *(&raw mut REPLY_MSG)) };
         let deadline = now_ns().saturating_add(ACCOUNTS_WAIT_NS);
-        let listed = asked
+        let answer = asked
             .then(|| loop {
-                match recv(admin) {
-                    Ok(Some((op, 1, body))) if op == OP_AUTH_LIST => break Some(body),
+                match recv_full(admin) {
+                    Ok(Some((o, 1, flags, body))) if o == op => break Some((flags & RS_FLAG_ERROR != 0, body)),
                     Ok(Some(_)) => received().into_iter().for_each(close),
                     Ok(None) if wait_until(admin, deadline) => {}
                     _ => break None,
                 }
             })
             .flatten();
-        let names = listed.as_deref().and_then(|b| {
-            let l = parse_account_list(b)?;
-            Some(l.iter().map(|(n, _)| String::from_utf8_lossy(n).into_owned()).collect())
-        });
-        if names.is_none() {
-            close(admin);
-            self.auth_admin = 0;
+        match answer {
+            Some((false, body)) => Ok(body),
+            Some((true, body)) => Err(refusal(&body)),
+            None => {
+                close(admin);
+                self.auth_admin = 0;
+                Err(String::from("auth-service did not answer"))
+            }
         }
-        names
     }
 
     /// **Judge a policy's text** as `Check` and `Install` do: it must be text, it must read, and an
@@ -547,26 +624,40 @@ impl Broker {
         let accounts = self
             .accounts()
             .ok_or_else(|| String::from("the accounts could not be listed, so the policy cannot be judged"))?;
-        let names: Vec<&str> = accounts.iter().map(String::as_str).collect();
+        let names: Vec<&str> = accounts.iter().map(|(n, _)| n.as_str()).collect();
         policy::check(text, &names).map_err(|e| alloc::format!("{e}"))
     }
 
-    /// **A policy channel**: `Show` and `Install`, and nothing else (administration Part D.2).
-    /// From a session it is reached only through the `views` grant's `/dev/policy`, so holding it
-    /// is the authority.
-    fn serve_policy(&mut self, i: usize) {
-        let (ch, session) = self.policies[i];
-        let (op, request_id, body) = match recv(ch) {
+    /// A channel resolved through a grant's endpoint in a view: the policy's or the accounts'.
+    /// From a session each is reached only through its grant's binding, so holding it is the
+    /// authority.
+    fn serve_endpoint(&mut self, i: usize) {
+        let (ch, session, endpoint) = self.endpoints[i];
+        let (op, request_id, mut body) = match recv(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
                 close(ch);
-                self.policies.remove(i);
+                self.endpoints.remove(i);
                 return;
             }
         };
+        if carries_password(op) {
+            // The password now lives only in `body`, until it has been used.
+            // SAFETY: our receive buffer; single-threaded, and the message was copied out.
+            unsafe { scrub(&mut *(&raw mut RECV_MSG)) };
+        }
         received().into_iter().for_each(close);
         let who = self.principal(session).unwrap_or_default();
+        match endpoint {
+            Endpoint::Policy => self.serve_policy(ch, op, request_id, &body, &who),
+            Endpoint::Accounts => self.serve_accounts(ch, op, request_id, &body, &who),
+        }
+        scrub(&mut body);
+    }
+
+    /// **A policy channel**: `Show` and `Install`, and nothing else (administration Part D.2).
+    fn serve_policy(&mut self, ch: u64, op: u16, request_id: u64, body: &[u8], who: &str) {
         match op {
             OP_VIEWS_SHOW => match libfs::read_file(self.root_ns, POLICY_PATH) {
                 Ok(text) if text.len() <= POLICY_MAX => {
@@ -579,8 +670,8 @@ impl Broker {
                 let installed = if body.len() > POLICY_MAX {
                     Err(alloc::format!("a policy is at most {POLICY_MAX} bytes"))
                 } else {
-                    self.judge(&body).and_then(|_| {
-                        libfs::write_file(self.root_ns, POLICY_NEW, &body)
+                    self.judge(body).and_then(|_| {
+                        libfs::write_file(self.root_ns, POLICY_NEW, body)
                             .and_then(|()| libfs::rename(self.root_ns, POLICY_NEW, POLICY_PATH, true))
                             .map_err(|_| String::from("the policy could not be written"))
                     })
@@ -608,7 +699,7 @@ impl Broker {
             Ok(None) => return,
             Err(()) => return self.client_gone(i),
         };
-        if op == OP_VIEWS_PASSWORD {
+        if carries_password(op) {
             // The password now lives only in `body`, until it has been checked.
             // SAFETY: our receive buffer; single-threaded, and the message was copied out.
             unsafe { scrub(&mut *(&raw mut RECV_MSG)) };
@@ -632,7 +723,9 @@ impl Broker {
         };
         match op {
             OP_VIEWS_REQUEST => self.request(i, request_id, &body, handles, &principal),
-            OP_VIEWS_PASSWORD => self.password(i, request_id, body),
+            OP_VIEWS_PASSWORD => self.password(i, request_id, core::mem::take(&mut body)),
+            OP_VIEWS_CHANGE_PASSWORD => self.change_password(i, request_id, &body),
+            OP_VIEWS_ACCOUNTS => self.list_accounts(ch, request_id),
             OP_VIEWS_STOP => {
                 if let State::Running { process, .. } = &self.clients[i].state {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
@@ -650,6 +743,7 @@ impl Broker {
             }
             _ => reply_error(ch, op, request_id, KError::Unsupported),
         }
+        scrub(&mut body);
     }
 
     fn read_policy(&self) -> Result<policy::Policy, String> {
@@ -759,8 +853,20 @@ impl Broker {
         self.held.hold(ch, session);
     }
 
+    /// Whether `password` is `principal`'s, asked of `auth-service`'s oracle, opened on first need.
+    fn authenticate(&mut self, principal: &str, password: &[u8]) -> bool {
+        if self.auth_ch == 0 {
+            self.auth_ch = ns_lookup(self.root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+        }
+        let mut home = [0u8; 256];
+        self.auth_ch != 0 && libsession::authenticate(self.auth_ch, principal.as_bytes(), password, &mut home).is_some()
+    }
+
     /// Check client `i`'s held password: its session's delay has passed.
     fn check(&mut self, i: usize) {
+        if matches!(self.clients[i].state, State::Changing { .. }) {
+            return self.check_change(i);
+        }
         let ch = self.clients[i].ch;
         let session = self.clients[i].session;
         let Some(principal) = self.principal(session) else {
@@ -772,11 +878,7 @@ impl Broker {
         let Some((request_id, mut pw)) = p.queued.take() else {
             return;
         };
-        if self.auth_ch == 0 {
-            self.auth_ch = ns_lookup(self.root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-        }
-        let mut home = [0u8; 256];
-        let ok = self.auth_ch != 0 && libsession::authenticate(self.auth_ch, principal.as_bytes(), &pw, &mut home).is_some();
+        let ok = self.authenticate(&principal, &pw);
         scrub(&mut pw);
         let State::Password(p) = &mut self.clients[i].state else {
             return;
@@ -806,6 +908,242 @@ impl Broker {
         } else {
             reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: true }, "wrong password");
         }
+    }
+
+    /// **`ChangePassword`** (administration Part D.3): the new password checked against the rules
+    /// here, and the request **held**, as a `Password` is, until the session's delay from its last
+    /// failure has passed — so a wrong current password here and a wrong one for `with` share one
+    /// pace. [`Broker::check_change`] answers it.
+    fn change_password(&mut self, i: usize, request_id: u64, body: &[u8]) {
+        let ch = self.clients[i].ch;
+        let session = self.clients[i].session;
+        let refuse = |why: &str| {
+            reply_outcome(ch, OP_VIEWS_CHANGE_PASSWORD, request_id, Outcome::Denied { retry: false }, why);
+        };
+        if !matches!(self.clients[i].state, State::Idle) {
+            return refuse("this channel is already busy with a request");
+        }
+        let Some((current, new)) = parse_password_change(body) else {
+            return refuse("the request does not read");
+        };
+        if !libusers::valid_password(new) {
+            return refuse("a password is 1 to 128 bytes");
+        }
+        self.clients[i].state = State::Changing { request_id, current: current.to_vec(), new: new.to_vec() };
+        self.held.hold(ch, session);
+    }
+
+    /// A held `ChangePassword`, its session's delay passed: the current password checked as the
+    /// session's principal's, and on success the new one set. **A wrong current password is a
+    /// failure like any other**: it holds the session's next check, on whichever request.
+    fn check_change(&mut self, i: usize) {
+        let ch = self.clients[i].ch;
+        let session = self.clients[i].session;
+        let taken = core::mem::replace(&mut self.clients[i].state, State::Idle);
+        let State::Changing { request_id, mut current, mut new } = taken else {
+            return;
+        };
+        let Some(principal) = self.principal(session) else {
+            scrub(&mut current);
+            scrub(&mut new);
+            return;
+        };
+        let right = self.authenticate(&principal, &current);
+        scrub(&mut current);
+        let answer = if right {
+            let mut req = [0u8; 256];
+            let asked = match build_account_request(&mut req, principal.as_bytes(), &new) {
+                Some(n) => self.ask_auth(OP_AUTH_SET_PASSWORD, &req[..n]).map(|_| ()),
+                None => Err(String::from("the new password does not fit a request")),
+            };
+            scrub(&mut req);
+            asked
+        } else {
+            // From when the check ended, as for `with`'s.
+            if let Some(s) = self.sessions.get_mut(session) {
+                s.pacing.failed(now_ns());
+            }
+            Err(String::from("wrong password"))
+        };
+        scrub(&mut new);
+        match answer {
+            Ok(()) => {
+                self.audit(&alloc::format!("accounts: {principal} changed their own password"));
+                reply_outcome(ch, OP_VIEWS_CHANGE_PASSWORD, request_id, Outcome::Started, "your password is changed");
+            }
+            Err(why) => {
+                self.audit(&alloc::format!("accounts: {principal}'s password change was refused: {why}"));
+                reply_outcome(ch, OP_VIEWS_CHANGE_PASSWORD, request_id, Outcome::Denied { retry: false }, &why);
+            }
+        }
+    }
+
+    /// **`Accounts`** (administration Part D.3): every account, its home, its open sessions and
+    /// whether it could administer — anyone's to read, as a Unix `passwd` file is.
+    fn list_accounts(&mut self, ch: u64, request_id: u64) {
+        let Some(listed) = self.accounts() else {
+            return reply_error(ch, OP_VIEWS_ACCOUNTS, request_id, KError::IoError);
+        };
+        let policy = self.read_policy().ok();
+        let mut out = [0u8; POLICY_MAX];
+        let mut at = 2;
+        for a in accounts::shown(&listed, &self.sessions, policy.as_ref()) {
+            let row = AccountRow {
+                name: a.name.as_bytes(),
+                home: a.home.as_bytes(),
+                sessions: a.sessions.min(u16::MAX as usize) as u16,
+                administers: a.administers,
+            };
+            if push_account(&mut out, &mut at, &row).is_none() {
+                return reply_error(ch, OP_VIEWS_ACCOUNTS, request_id, KError::TooLarge);
+            }
+        }
+        let _ = send(ch, OP_VIEWS_ACCOUNTS, request_id, RS_FLAG_REPLY, &out[..at], &[]);
+    }
+
+    /// **An accounts channel** (administration Part D.3): `AddAccount`, `RemoveAccount` and
+    /// `SetPassword`, and nothing else. Every answer is audited as the session's principal, and a
+    /// refusal with the guard that refused it.
+    fn serve_accounts(&mut self, ch: u64, op: u16, request_id: u64, body: &[u8], who: &str) {
+        let (asked, answer) = match op {
+            OP_VIEWS_ADD_ACCOUNT => ("add", self.add_account(body)),
+            OP_VIEWS_REMOVE_ACCOUNT => ("removal", self.remove_account(body)),
+            OP_VIEWS_SET_PASSWORD => ("password setting", self.set_password(body)),
+            _ => return reply_error(ch, op, request_id, KError::Unsupported),
+        };
+        match answer {
+            Ok(done) => {
+                self.audit(&alloc::format!("accounts: {who} {done}"));
+                reply_outcome(ch, op, request_id, Outcome::Started, &done);
+            }
+            Err(why) => {
+                self.audit(&alloc::format!("accounts: {who}'s {asked} was refused: {why}"));
+                reply_outcome(ch, op, request_id, Outcome::Denied { retry: false }, &why);
+            }
+        }
+    }
+
+    /// **`AddAccount`**: the name and password checked, the home and its folders made — or an
+    /// existing home adopted — and then the record, by `auth-service`. A home this made is taken
+    /// away again if the record is refused, so a failure leaves nothing behind.
+    fn add_account(&mut self, body: &[u8]) -> Result<String, String> {
+        let r = parse_account_request(body).ok_or_else(|| String::from("the request does not read"))?;
+        if !libusers::valid_name(r.username) {
+            return Err(String::from(NAME_RULE));
+        }
+        if !libusers::valid_password(r.password) {
+            return Err(String::from("a password is 1 to 128 bytes"));
+        }
+        // Checked, so ASCII: fit for a path and a log line.
+        let name = String::from_utf8_lossy(r.username).into_owned();
+        let listed = self.accounts().ok_or_else(|| String::from("the accounts could not be listed"))?;
+        if listed.iter().any(|(n, _)| *n == name) {
+            return Err(alloc::format!("an account named {name} already exists"));
+        }
+        let home = alloc::format!("/home/{name}");
+        let made = match libfs::mkdir(self.root_ns, home.as_bytes()) {
+            Ok(()) => true,
+            Err(_) if libfs::is_dir(self.root_ns, home.as_bytes()) => false,
+            Err(_) => return Err(alloc::format!("{home} could not be made")),
+        };
+        let root_ns = self.root_ns;
+        let undo = || {
+            if made {
+                let _ = libfs::remove_tree(root_ns, home.as_bytes(), &mut |_, _| {});
+            }
+        };
+        // **The folders a person's files go in** (`TODO(home-folders)`, resolved here for every
+        // home an administrator adds): the same three `nxfiles`' sidebar offers.
+        for folder in libfs::HOME_FOLDERS {
+            let dir = libfs::join(home.as_bytes(), folder.as_bytes());
+            if libfs::mkdir(root_ns, dir.as_bytes()).is_err() && !libfs::is_dir(root_ns, dir.as_bytes()) {
+                undo();
+                return Err(alloc::format!("{dir} could not be made"));
+            }
+        }
+        let mut req = [0u8; 256];
+        let asked = match build_account_request(&mut req, r.username, r.password) {
+            Some(n) => self.ask_auth(OP_AUTH_ADD, &req[..n]).map(|_| ()),
+            None => Err(String::from("the request does not fit")),
+        };
+        scrub(&mut req);
+        match asked {
+            Ok(()) if made => Ok(alloc::format!("added {name}, with a new home at {home}")),
+            Ok(()) => Ok(alloc::format!("added {name}, adopting {home}, which was already there")),
+            Err(why) => {
+                undo();
+                Err(why)
+            }
+        }
+    }
+
+    /// **`RemoveAccount`**: refused while the account is logged in, and when no account left
+    /// could administer (`view_broker::accounts::refuse_removal`); then the record, by
+    /// `auth-service`, and the home only if asked.
+    fn remove_account(&mut self, body: &[u8]) -> Result<String, String> {
+        let (name, home_too) = parse_remove_account(body).ok_or_else(|| String::from("the request does not read"))?;
+        if !libusers::valid_name(name) {
+            return Err(String::from(NAME_RULE));
+        }
+        let name = String::from_utf8_lossy(name).into_owned();
+        let listed = self.accounts().ok_or_else(|| String::from("the accounts could not be listed"))?;
+        let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        let policy = self.read_policy();
+        let policy = policy.as_ref().map_err(String::as_str);
+        if let Some(why) = accounts::refuse_removal(&name, &names, &self.sessions, policy) {
+            return Err(why);
+        }
+        self.ask_auth(OP_AUTH_REMOVE, name.as_bytes())?;
+        let home = alloc::format!("/home/{name}");
+        if !home_too {
+            return Ok(alloc::format!("removed {name}, keeping {home}"));
+        }
+        Ok(match libfs::remove_tree(self.root_ns, home.as_bytes(), &mut |_, _| {}) {
+            Ok(()) => alloc::format!("removed {name}, and {home} with it"),
+            Err(_) if !libfs::is_dir(self.root_ns, home.as_bytes()) => {
+                alloc::format!("removed {name}; there was no {home}")
+            }
+            Err(_) => alloc::format!("removed {name}, but {home} could not be removed"),
+        })
+    }
+
+    /// **`SetPassword`**: an administrator setting someone's password, with no current one to
+    /// prove — the grant is the proof.
+    fn set_password(&mut self, body: &[u8]) -> Result<String, String> {
+        let r = parse_account_request(body).ok_or_else(|| String::from("the request does not read"))?;
+        if !libusers::valid_name(r.username) {
+            return Err(String::from(NAME_RULE));
+        }
+        if !libusers::valid_password(r.password) {
+            return Err(String::from("a password is 1 to 128 bytes"));
+        }
+        let name = String::from_utf8_lossy(r.username).into_owned();
+        let mut req = [0u8; 256];
+        let asked = match build_account_request(&mut req, r.username, r.password) {
+            Some(n) => self.ask_auth(OP_AUTH_SET_PASSWORD, &req[..n]).map(|_| ()),
+            None => Err(String::from("the request does not fit")),
+        };
+        scrub(&mut req);
+        asked.map(|()| alloc::format!("set a new password for {name}"))
+    }
+
+    /// Bind this broker's own forwarding endpoint at `at` in `view_ns`, with `base` — how a grant
+    /// gives a view an endpoint that knows which session it serves. `false` if it would not bind,
+    /// or there is no endpoint to bind.
+    fn bind_endpoint(&self, view_ns: u64, at: &[u8], base: &str) -> bool {
+        // SAFETY: a namespace this broker made, a valid path and base, and an endpoint it holds.
+        self.forwarding != 0
+            && unsafe {
+                syscall6(
+                    SYS_NS_BIND,
+                    view_ns,
+                    at.as_ptr() as u64,
+                    at.len() as u64,
+                    self.forwarding,
+                    base.as_ptr() as u64,
+                    base.len() as u64,
+                )
+            } == 0
     }
 
     /// Build the view and spawn the program in it.
@@ -860,23 +1198,18 @@ impl Broker {
                 // reaches the broker as this session's policy channel.
                 Grant::Views => {
                     let base = alloc::format!("/policy/{}", self.clients[i].session);
-                    // SAFETY: a namespace this broker made, a valid path and base, and an endpoint
-                    // it holds.
-                    let bound = self.forwarding != 0
-                        && unsafe {
-                            syscall6(
-                                SYS_NS_BIND,
-                                view_ns,
-                                POLICY_GRANT.as_ptr() as u64,
-                                POLICY_GRANT.len() as u64,
-                                self.forwarding,
-                                base.as_ptr() as u64,
-                                base.len() as u64,
-                            )
-                        } == 0;
-                    if !bound {
+                    if !self.bind_endpoint(view_ns, POLICY_GRANT, &base) {
                         close(view_ns);
                         return fail(self, &mut p, "the policy endpoint could not be granted");
+                    }
+                }
+                // **Administering accounts** (administration Part D.3): the same endpoint at
+                // `/dev/accounts`, with the base `/accounts/<session>`.
+                Grant::Accounts => {
+                    let base = alloc::format!("/accounts/{}", self.clients[i].session);
+                    if !self.bind_endpoint(view_ns, ACCOUNTS_GRANT, &base) {
+                        close(view_ns);
+                        return fail(self, &mut p, "the accounts endpoint could not be granted");
                     }
                 }
             }
@@ -984,6 +1317,10 @@ impl Broker {
                     scrub(&mut pw);
                 }
             }
+            State::Changing { mut current, mut new, .. } => {
+                scrub(&mut current);
+                scrub(&mut new);
+            }
             _ => {}
         }
         self.held.forget(c.ch);
@@ -1062,7 +1399,7 @@ impl Broker {
                 clients += 1;
             }
         }
-        Load { supervisors: self.supervisors.len(), clients, singles: singles + self.policies.len() }
+        Load { supervisors: self.supervisors.len(), clients, singles: singles + self.endpoints.len() }
     }
 
     /// The soonest a held password may be checked.
@@ -1130,7 +1467,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         forwarding,
         auth_ch: 0,
         auth_admin: 0,
-        policies: Vec::new(),
+        endpoints: Vec::new(),
         supervisors: Vec::new(),
         clients: Vec::new(),
         sessions: Sessions::new(),
@@ -1155,7 +1492,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             for &s in &b.supervisors {
                 push(s);
             }
-            for &(ch, _) in &b.policies {
+            for &(ch, _, _) in &b.endpoints {
                 push(ch);
             }
             for c in &b.clients {
@@ -1194,8 +1531,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     b.drain_notifications();
                 } else if let Some(i) = b.supervisors.iter().position(|&s| s == h) {
                     b.serve_supervisor(i);
-                } else if let Some(i) = b.policies.iter().position(|&(ch, _)| ch == h) {
-                    b.serve_policy(i);
+                } else if let Some(i) = b.endpoints.iter().position(|&(ch, _, _)| ch == h) {
+                    b.serve_endpoint(i);
                 } else if let Some(i) = b.clients.iter().position(|c| c.ch == h && h != 0) {
                     b.serve_client(i);
                 } else if b.clients.iter().any(|c| matches!(c.state, State::Running { life, .. } if life == h)) {

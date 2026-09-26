@@ -10,6 +10,7 @@
 //! - [`pacing`] — the delay after a wrong password, held per *session*, so a program that opens
 //!   several requests at once still guesses at one per delay;
 //! - [`sessions`] — which sessions are open, for whom, under ids that are never reused;
+//! - [`accounts`] — the guards on removing an account, and what `Accounts` shows of each;
 //! - [`slots`] — room in the one wait set, counted so a client let in can always start;
 //! - [`suffix`] — what a forwarded resolve asked for, which is where a client's identity comes
 //!   from.
@@ -53,6 +54,11 @@ pub mod policy {
         /// administrator is an account that may use this for every program**
         /// ([`Policy::administrators`]).
         Views,
+        /// **Administering accounts**: the broker's own accounts endpoint, bound at `/dev/accounts`
+        /// with the base `/accounts/<session>`, which answers `AddAccount`, `RemoveAccount` and
+        /// `SetPassword` (administration Part D.3). The broker checks the guards and asks
+        /// `auth-service`, the accounts' only writer.
+        Accounts,
     }
 
     impl Grant {
@@ -62,6 +68,7 @@ pub mod policy {
                 "disks" => Some(Grant::Disks),
                 "storage" => Some(Grant::Storage),
                 "views" => Some(Grant::Views),
+                "accounts" => Some(Grant::Accounts),
                 _ => None,
             }
         }
@@ -72,12 +79,13 @@ pub mod policy {
                 Grant::Disks => "disks",
                 Grant::Storage => "storage",
                 Grant::Views => "views",
+                Grant::Accounts => "accounts",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
-    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks, Grant::Storage, Grant::Views];
+    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -656,6 +664,90 @@ pub mod sessions {
         pub fn get_mut(&mut self, id: u64) -> Option<&mut Session> {
             self.open.iter_mut().find(|s| s.id == id)
         }
+
+        /// How many sessions are open for `principal`.
+        pub fn count_for(&self, principal: &str) -> usize {
+            self.open.iter().filter(|s| s.principal == principal).count()
+        }
+    }
+}
+
+pub mod accounts {
+    //! **Accounts, as the broker fronts them** (administration Part D.3). `auth-service` holds
+    //! them and is their only writer; the broker checks what only it knows — the policy, and who
+    //! is logged in — before it asks.
+
+    use crate::policy::Policy;
+    use crate::sessions::Sessions;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// One account as `Accounts` shows it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Shown<'a> {
+        pub name: &'a str,
+        pub home: &'a str,
+        /// Sessions open for it.
+        pub sessions: usize,
+        /// Whether it could administer under the policy as it stands.
+        pub administers: bool,
+    }
+
+    /// Every account of `accounts` — `(name, home)`, in the service's order — with its open
+    /// sessions and whether it could administer under `policy`. **Nobody administers when the
+    /// policy does not read** (`None`): nothing can be said of it, and saying "no" is the answer
+    /// that does not mislead.
+    pub fn shown<'a>(accounts: &'a [(String, String)], sessions: &Sessions, policy: Option<&Policy>) -> Vec<Shown<'a>> {
+        let names: Vec<&str> = accounts.iter().map(|(n, _)| n.as_str()).collect();
+        let administrators = policy.map(|p| p.administrators(&names)).unwrap_or_default();
+        accounts
+            .iter()
+            .map(|(name, home)| Shown {
+                name,
+                home,
+                sessions: sessions.count_for(name),
+                administers: administrators.contains(&name.as_str()),
+            })
+            .collect()
+    }
+
+    /// **Why removing `name` is refused**, if it is. The guards, in the order a person should
+    /// hear them:
+    /// - no account of `accounts` has that name;
+    /// - **it is logged in**: removal waits until every session of the account has ended (the
+    ///   maintainer's call in Part D's detail pass, over ending the sessions);
+    /// - the policy does not read (`Err`, with its reason), so whether an administrator would
+    ///   remain cannot be said — refused rather than guessed;
+    /// - **no account left could administer** ([`Policy::administrators`]).
+    pub fn refuse_removal(
+        name: &str,
+        accounts: &[&str],
+        sessions: &Sessions,
+        policy: Result<&Policy, &str>,
+    ) -> Option<String> {
+        if !accounts.contains(&name) {
+            return Some(format!("no account is named {name}"));
+        }
+        let open = sessions.count_for(name);
+        if open > 0 {
+            let plural = if open == 1 { "" } else { "s" };
+            return Some(format!(
+                "{name} is logged in, in {open} session{plural}; an account can be removed once it has logged out"
+            ));
+        }
+        let policy = match policy {
+            Ok(p) => p,
+            Err(why) => return Some(format!("{why}, so whether anyone could still administer cannot be said")),
+        };
+        let remaining: Vec<&str> = accounts.iter().copied().filter(|a| *a != name).collect();
+        if policy.administrators(&remaining).is_empty() {
+            return Some(format!(
+                "removing {name} would leave no account that could use `views` for every program, so nothing \
+                 could change the policy again — only the live image could"
+            ));
+        }
+        None
     }
 }
 
@@ -783,6 +875,9 @@ pub mod suffix {
         /// `policy/<id>`: the policy endpoint, as the `views` grant binds it into a view of session
         /// `id` (administration Part D.2).
         Policy(u64),
+        /// `accounts/<id>`: the accounts endpoint, as the `accounts` grant binds it into a view of
+        /// session `id` (administration Part D.3).
+        Accounts(u64),
         /// Anything else — answered `NotFound`.
         Unknown,
     }
@@ -798,6 +893,9 @@ pub mod suffix {
         }
         if let Some(digits) = suffix.strip_prefix(b"policy/") {
             return session_id(digits).map_or(Suffix::Unknown, Suffix::Policy);
+        }
+        if let Some(digits) = suffix.strip_prefix(b"accounts/") {
+            return session_id(digits).map_or(Suffix::Unknown, Suffix::Accounts);
         }
         Suffix::Unknown
     }
@@ -818,6 +916,7 @@ pub mod suffix {
 
 #[cfg(test)]
 mod tests {
+    use super::accounts;
     use super::exits::Exits;
     use super::pacing::{FAIL_DELAY_NS, Held, Pacing};
     use super::policy::*;
@@ -910,6 +1009,10 @@ auth = "password"
         assert_eq!(Grant::from_name("views"), Some(Grant::Views));
         assert_eq!(Grant::Views.name(), "views");
         assert!(e.message.contains("views"), "{e}");
+        // And `accounts` (administration Part D.3).
+        assert_eq!(Grant::from_name("accounts"), Some(Grant::Accounts));
+        assert_eq!(Grant::Accounts.name(), "accounts");
+        assert!(e.message.contains("accounts"), "{e}");
     }
 
     #[test]
@@ -1202,6 +1305,79 @@ auth = "password"
         for bad in [&b"policy/"[..], b"policy/0", b"policy/03", b"policy/x", b"policy", b"policies/3"] {
             assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
         }
+        // And the accounts endpoint's (administration Part D.3).
+        assert_eq!(suffix::parse(b"accounts/12"), Suffix::Accounts(12));
+        for bad in [&b"accounts/"[..], b"accounts/0", b"accounts/012", b"accounts/1/x", b"accounts", b"account/1"] {
+            assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
+        }
+    }
+
+    /// **The guards on a removal, each at its neighbour** (administration Part D.3): an account
+    /// that exists, logged out, whose going leaves someone able to administer, is removed; one step
+    /// away on each axis is refused, for its own reason.
+    #[test]
+    fn a_removal_waits_for_logout_and_leaves_an_administrator() {
+        let policy = |who: &str| {
+            parse(&alloc::format!(
+                "[profile.admin]\ngrants = [\"views\"]\n\
+                 [[rule]]\nwho = {who}\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n"
+            ))
+            .unwrap()
+        };
+        let alice_only = policy("[\"alice\"]");
+        let accounts = ["alice", "bob"];
+        let mut sessions = Sessions::new();
+        let refuse =
+            |name: &str, s: &Sessions, p: Result<&Policy, &str>| accounts::refuse_removal(name, &accounts, s, p);
+
+        assert_eq!(refuse("bob", &sessions, Ok(&alice_only)), None, "logged out, and alice remains");
+        let id = sessions.open("bob");
+        let why = refuse("bob", &sessions, Ok(&alice_only)).unwrap();
+        assert!(why.contains("bob is logged in, in 1 session;"), "{why}");
+        sessions.open("bob");
+        assert!(refuse("bob", &sessions, Ok(&alice_only)).unwrap().contains("in 2 sessions"));
+        let why = refuse("bob", &sessions, Err("the policy does not read")).unwrap();
+        assert!(why.contains("logged in"), "logged in is said first: {why}");
+        sessions.close(id);
+        sessions.close(id + 1);
+        assert_eq!(refuse("bob", &sessions, Ok(&alice_only)), None, "and once logged out, removed");
+
+        let why = refuse("alice", &sessions, Ok(&alice_only)).unwrap();
+        assert!(why.starts_with("removing alice would leave no account that could use `views`"), "{why}");
+        assert_eq!(refuse("alice", &sessions, Ok(&policy("[\"*\"]"))), None, "bob could administer");
+        let why = refuse("carol", &sessions, Ok(&alice_only)).unwrap();
+        assert_eq!(why, "no account is named carol");
+        let why = refuse("bob", &sessions, Err("the policy does not read")).unwrap();
+        assert!(why.ends_with("so whether anyone could still administer cannot be said"), "{why}");
+
+        let last = accounts::refuse_removal("alice", &["alice"], &sessions, Ok(&policy("[\"*\"]")));
+        assert!(last.is_some(), "`*` of nobody is nobody: the last account is never removed");
+    }
+
+    /// **`Accounts` shows each account's sessions and whether it administers** — and, when the
+    /// policy does not read, that nobody does.
+    #[test]
+    fn accounts_are_shown_with_their_sessions_and_who_administers() {
+        let policy = parse(
+            "[profile.admin]\ngrants = [\"views\"]\n\
+             [[rule]]\nwho = [\"alice\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n",
+        )
+        .unwrap();
+        let accounts = alloc::vec![
+            (String::from("alice"), String::from("/home/alice")),
+            (String::from("bob"), String::from("/home/bob")),
+        ];
+        let mut sessions = Sessions::new();
+        sessions.open("bob");
+        sessions.open("bob");
+        sessions.open("carol");
+        let shown = accounts::shown(&accounts, &sessions, Some(&policy));
+        let alice = accounts::Shown { name: "alice", home: "/home/alice", sessions: 0, administers: true };
+        let bob = accounts::Shown { name: "bob", home: "/home/bob", sessions: 2, administers: false };
+        assert_eq!(shown, [alice.clone(), bob.clone()], "carol has a session and no account");
+        let unread = accounts::shown(&accounts, &sessions, None);
+        assert!(unread.iter().all(|a| !a.administers), "nobody, when the policy does not read");
+        assert_eq!(unread[1].sessions, 2);
     }
 
     #[test]
