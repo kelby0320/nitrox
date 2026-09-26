@@ -30139,3 +30139,71 @@ The helper that runs a program in the admin view, `in_admin_view`, was lifted ou
   - a removal asked to take the home keeping it.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.4: `account`
+
+**What landed.** `account`, a coreutil with five forms, each reaching the authority it needs and
+no more:
+- `--list`: `Table<{name, home, sessions, administers}>`, from the broker's `Accounts` on the
+  session's `/dev/views`. Anyone may read it.
+- `--password`: the person's own. The current password, then a new one twice, sent as
+  `ChangePassword`, which the broker checks under the session's delay.
+- `--add NAME`, `--remove NAME [--home]` and `--password NAME`: on `/dev/accounts`, which only the
+  `accounts` grant binds. So they run as `with admin account …`, and without the grant they fail
+  naming it.
+- `--password NAME --users FILE`: recovery with no service. It edits a users file with `libusers`
+  under a fresh salt from the entropy source, then writes `FILE.new` and renames it over.
+
+**The prompt moved into `coreutils`**, as Part D's detail pass said it would once it had two users:
+- `coreutils::prompt`: `ask_password`, and `ask_new_password`, which asks twice and `confirm`s;
+- `coreutils::ipc`: the send, receive and call plumbing `with` had, which zeroes every buffer a
+  password passes through.
+
+`with` lost 177 lines to them, and gained only the imports and a line of its doc. **`confirm` is
+a pure function, and host-tested**: a mismatch, or a password outside `libusers`' 1 to 128 bytes,
+is refused before anything is sent. So a typing mistake changes nothing, and says so.
+
+**A change is reported as a sentence, not a row.** Part D's detail pass said "`account` writes one
+row". What the broker answers is the result: "added bob, adopting /home/bob, which was already
+there", or the guard that refused. So `account` writes it on `stderr` and, escaped, on the console,
+and `--list` stays the one table. A row would only repeat the name back.
+
+**A new check for all of `test-interactive`: no password it types may appear in the serial
+transcript.** Every prompt the gate answers turns echo off: the login's, `with`'s and `account`'s.
+Until now nothing held them to it, and a prompt that echoed would put the password in every log
+that keeps a transcript. The four passwords the gate types are listed in `TYPED_PASSWORDS`, and a
+pass requires none of them in what the guest printed.
+
+**The root `CLAUDE.md`'s step count was stale**: it said 31 when D.2 had made it 32. It says 33 now.
+
+**Gates:**
+- **Host tests**: `coreutils` (1 new): `confirm` takes the password typed twice within the rules,
+  and refuses a mismatch — a trailing space included — an empty one, and one byte over the
+  longest.
+- **`test-interactive`**, step 20e (33 steps), at the real prompt:
+  - `account --list` shows alice administering, in one session, and no bob;
+  - `with admin account --add bob`: alice's password for the view, then bob's twice, and the
+    broker's "added bob, with a new home at /home/bob";
+  - bob logs in, `whoami` names him, and `list .` finds `Documents`, `Downloads` and `Pictures`;
+  - `account --password`: a mismatched pair refused before anything is sent, then the change;
+  - the old password is refused at the login and the new one taken;
+  - back as alice, `with admin account --remove bob --home`, after which the list has no bob and
+    his login is refused.
+
+  The removal takes the home, where the plan's step kept it, so that the gate leaves nothing
+  behind. **And no password the gate types reaches the transcript**, checked at the end of the
+  run.
+
+**Controls:**
+- 2 host, each failing its test: the second copy not compared; the rules not applied.
+- 6 `test-interactive --kvm` boots, each failing at its own check:
+  - `confirm` not comparing: the mismatch step;
+  - `ChangePassword` sent with the two swapped: "your password is changed" never comes;
+  - the sessions column always 0: `alice-row=1`;
+  - `--home` not sent: the removal keeps the home;
+  - **echo left on at every prompt**: caught first by step 20b's own check, on `with`'s prompt.
+    That proved nothing about the new check, so a second control left echo on at `account`'s
+    prompts alone, and the new check caught bob's password.
+
+No kernel change and no ABI hash impact. `coreutils` gains `libusers`, so `userspace/Cargo.lock`
+changes.

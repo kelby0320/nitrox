@@ -144,6 +144,28 @@ mod browser {
 const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
+/// A second account `test-interactive` adds, logs in as, and removes (administration Part D.4):
+/// a fixture like `DEMO_PASSWORD`, for an account that exists only for the length of one step.
+const BOB_PASSWORD: &str = "bob's first password";
+/// What bob changes his password to.
+const BOB_NEW_PASSWORD: &str = "bob's second password";
+/// A second copy that does not match the first, typed once to be refused.
+const BOB_MISTYPED_PASSWORD: &str = "bob's second pasword";
+/// The wrong password `test-interactive` types at the login prompt, before the right one.
+const LOGIN_WRONG_PASSWORD: &str = "wrong-password";
+/// The wrong password it types at `with`'s prompt, in step 20b.
+const WITH_WRONG_PASSWORD: &str = "not-the-password-4271";
+/// **Every password `test-interactive` types**, none of which may appear in what the guest prints:
+/// each is typed at a prompt with echo off, and a copy on the console is a copy in every log.
+/// Step 20b checks its two early, so a failure there names the step; this is the whole run's.
+const TYPED_PASSWORDS: &[&str] = &[
+    DEMO_PASSWORD,
+    LOGIN_WRONG_PASSWORD,
+    WITH_WRONG_PASSWORD,
+    BOB_PASSWORD,
+    BOB_NEW_PASSWORD,
+    BOB_MISTYPED_PASSWORD,
+];
 
 /// The greeter's window, `GREETER_W`×`GREETER_H` — **this file's own copy** of
 /// `desktop-session-mgr`'s pair, as every chrome metric here is a copy (M11 decision 2).
@@ -578,6 +600,9 @@ const COREUTILS: &[&str] = &[
     // The machine's disks (administration Part C.7): `--list` from any session, and `--mount` and
     // `--unmount` from a view with the `storage` grant.
     "disk",
+    // The accounts (administration Part D.4): `--list` and your own `--password` from any session,
+    // the rest from a view with the `accounts` grant, or on a users file for recovery.
+    "account",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -1376,6 +1401,16 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
     match result {
         Ok(n) => {
             check_diagnostic_colour(&transcript)?;
+            // **No password typed at a prompt reached the console** (administration Part D.4).
+            // Every prompt here turns echo off — the login, `with`'s, `account`'s — so a password
+            // in the transcript is a prompt that did not, and it would be in every log that keeps
+            // this one.
+            if let Some(p) = TYPED_PASSWORDS.iter().position(|p| transcript.contains(p)) {
+                return Err(format!(
+                    "password {p} of TYPED_PASSWORDS appears in the serial transcript: a prompt echoed it"
+                )
+                .into());
+            }
             println!("\nxtask: interactive tests PASSED ({n} steps)");
             Ok(())
         }
@@ -1408,7 +1443,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    one so a broken denial cannot hide behind a successful login.
     s.send("alice")?;
     s.expect("password:")?;
-    s.send("wrong-password")?;
+    s.send(LOGIN_WRONG_PASSWORD)?;
     s.expect("login incorrect")?;
     s.expect("nitrox login:")?;
     steps += 1;
@@ -1923,7 +1958,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          storage service what is in use first, and `/dev/blk/0` holds `init`'s root, so the
     //          listing never names it. Until C.6 this step expected `/dev/blk/0` — the disk under
     //          a live server, handed over raw.
-    const WRONG: &str = "not-the-password-4271";
+    const WRONG: &str = WITH_WRONG_PASSWORD;
     s.send("with admin nxinstall")?;
     s.expect("[with admin] password (1 of 3): ")?;
     s.send(WRONG)?;
@@ -2100,6 +2135,107 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     s.send(rows)?;
     s.expect("d2test-rows=0")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20e. **An account's life at the real prompt** (administration Part D.4): `account`, a
+    //      person's way to the accounts the view broker fronts. Bob is a fixture this step makes
+    //      and removes, like `alice`'s build-input password; nothing persists past it.
+    //
+    //      (a) `account --list` from any session: alice, administering, in one session — this one.
+    let rows = |what: &str| format!("format(\"{what}={{}}\", (account --list | filter name == \"{what}\" | count))");
+    s.send("format(\"alice-row={}\", (account --list | filter name == \"alice\" | filter administers == true | filter sessions == 1 | count))")?;
+    s.expect("alice-row=1")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=0")?;
+    s.expect("/home>")?;
+    //      (b) **Added through the `accounts` grant**: alice's password for the view, then bob's
+    //          twice, echo off, on the terminal `with` handed on.
+    s.send("with admin account --add bob")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("new password for bob: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("account: added bob, with a new home at /home/bob")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=1")?;
+    s.expect("/home>")?;
+    //      (c) **Bob logs in**, at the same prompt alice did, into the home the broker made — with
+    //          the three folders a file browser offers already in it.
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("whoami")?;
+    s.expect("bob")?;
+    s.expect("/home>")?;
+    s.send("list .")?;
+    s.expect_all(&["Documents", "Downloads", "Pictures"])?;
+    s.expect("/home>")?;
+    //      (d) **His own password**, with no view: the current one, then a new one twice. A
+    //          mismatch first, which changes nothing and is said before anything is sent.
+    s.send("account --password")?;
+    s.expect("current password: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("new password: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_MISTYPED_PASSWORD)?;
+    s.expect("account: the two passwords did not match; nothing was changed")?;
+    s.expect("/home>")?;
+    s.send("account --password")?;
+    s.expect("current password: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("new password: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("account: your password is changed")?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    //      (e) The old password refused, and the new one taken.
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    //      (f) **Back as alice, bob removed** with his home — he is logged out, so the broker lets
+    //          it happen — after which the list has no bob and his login is refused.
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("with admin account --remove bob --home")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("account: removed bob, and /home/bob with it")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=0")?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
     steps += 1;
 

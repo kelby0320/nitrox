@@ -1585,7 +1585,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         `Authenticate` and its supervisor's `OpenSession` is not seen by the logged-in guard,
         since the broker learns of a session only from `OpenSession`. The window is the time
         between the two, and it is named rather than closed for the same reason.)*
-- [ ] **D.4 — `account`.**
+- [x] **D.4 — `account`.**
       - The five forms above, the prompt shared with `with`, and a new home's folders.
       - `test-interactive` steps at the real prompt, as `alice`:
         1. `account --list`;
@@ -1595,6 +1595,22 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         5. log in with the new password, while the old one is refused;
         6. back as `alice`, `with admin account --remove bob`, after which `account --list` has
            no `bob` and his login is refused.
+
+      *(Landed 2026-09-25, as `test-interactive` step 20e.*
+      - *A change is reported as a sentence, not a row: what the broker says, such as "added bob,
+        adopting /home/bob, which was already there", on `stderr` and the console. `--list` is
+        the table. The pass's "`account` writes one row" is dropped, since the sentence is the
+        result and a row would only repeat the name.*
+      - *The prompt moved into `coreutils::prompt`, and the request plumbing `with` had into
+        `coreutils::ipc`, both shared now. A new password is asked twice and checked by
+        `confirm`, host-tested, so a mismatch or a rule broken is said before anything is sent.*
+      - *Also in the gate: bob's home holds its three folders at his first login; a mismatched
+        pair at `account --password` is refused; and the removal is `--remove bob --home`, so
+        the step leaves nothing behind.*
+      - *And a check for the whole gate: **no password it types may appear in the serial
+        transcript.** Every prompt turns echo off, and this is what holds them to it.*
+      - *The offline mode, `--users FILE`, is built here and gated by D.5's `check-recovery`,
+        as planned.)*
 - [ ] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
       First boot: the live image beside a copy of the release disk. Log in on serial, run
       `with admin disk --unmount nitrox-root` and `--mount` it writable, then

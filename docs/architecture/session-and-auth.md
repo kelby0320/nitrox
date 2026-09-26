@@ -1,22 +1,21 @@
 # Sessions and authentication
 
-**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-25, when the view broker began fronting account operations — administration Part D.3;
-earlier that day, when it opened an admin session of its own to judge a policy — Part D.2;
-earlier that day, when `auth-service` became the user database's writer — administration Part
-D.1; earlier that day, when each session gained `/storage` and `/dev/storage`, the storage
-service's session endpoint at the bases `/fs` and `/info` — administration Part C.6; before that
-2026-09-24, when each session gained `/dev/devices`, the device manager's tables at the base
-`/info` — Part B.4; before that 2026-09-23, when each session gained a view-broker session and
-`/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document
-described before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
-under "Credential validation" is the current shape; the history is kept because a doc that
-quietly starts being right again teaches nobody why it was wrong. The full
-path — login → authenticate → per-user namespace → sandboxed user shell → home write —
-runs end to end. Living document; describes the architecture, with the build sequence
-in the [implementation plan](../planning/implementation-plan.md). What remains is
-deferred polish (roles, profile overlays, session tokens, the real Phase-4 shell) — see
-Deferred.
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-25,
+when `account` arrived — administration Part D.4; earlier that day, when the view broker began
+fronting account operations — Part D.3; earlier that day, when it opened an admin session of its own
+to judge a policy — Part D.2; earlier that day, when `auth-service` became the user database's
+writer — administration Part D.1; earlier that day, when each session gained `/storage` and
+`/dev/storage`, the storage service's session endpoint at the bases `/fs` and `/info` —
+administration Part C.6; before that 2026-09-24, when each session gained `/dev/devices`, the device
+manager's tables at the base `/info` — Part B.4; before that 2026-09-23, when each session gained a
+view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the
+binding this document described before 2026-08-21, found then to have never existed and removed, now
+exists. The paragraph under "Credential validation" is the current shape; the history is kept
+because a doc that quietly starts being right again teaches nobody why it was wrong. The full path —
+login → authenticate → per-user namespace → sandboxed user shell → home write — runs end to end.
+Living document; describes the architecture, with the build sequence in the [implementation
+plan](../planning/implementation-plan.md). What remains is deferred polish (roles, profile overlays,
+session tokens, the real Phase-4 shell) — see Deferred.
 
 This is how a human logs in and gets a running, *sandboxed* shell — the first time
 Nitrox exercises its defining property end to end: **authority is constructed, not
@@ -168,7 +167,7 @@ D.1). An admin session, opened by resolving `/svc/auth/admin`, answers `List`, `
 `SetPassword` ([`rsproto-auth-ops.md`](../spec/rsproto-auth-ops.md) § *Administration*). Each write
 replaces the file atomically: `/system/users.new`, synced, renamed over. A new password is salted
 from the kernel's entropy source. **The format is `libusers`'**
-(`userspace/libusers/`): the service, the build's seeder and, from Part D.4, `account`'s offline
+(`userspace/libusers/`): the service, the build's seeder and, since Part D.4, `account`'s offline
 mode all read and write the file through it, and it bounds the file at the 4 KiB the service loads
 at boot. **The view broker holds one from Part D.2**, and asks it `List` when it judges a policy,
 since an administrator must be an account that exists.
@@ -180,8 +179,10 @@ since an administrator must be an account that exists.
 person's own, proved with the current password under the session's delay. It checks what only it
 knows before it asks `auth-service`: **a removal waits until the account has logged out, and must
 leave an account that could administer**. It makes the home an add names, `/home/<name>`, with
-the three folders of `libfs::HOME_FOLDERS`, and removes it only when asked. `account`, the tool
-a person types, is Part D.4's.
+the three folders of `libfs::HOME_FOLDERS`, and removes it only when asked. **`account`** is the
+tool a person types for all of it (Part D.4, [`shell-language.md`](../spec/shell-language.md)
+§10d): `account --list` and `account --password` from any session, the rest as
+`with admin account …`.
 
 ## Session construction — subtree-scoped namespaces
 
@@ -339,8 +340,8 @@ supervisor drops to on a critical-path failure — no longer the normal console.
   accepted cost is that the same user may be logged in twice with two namespaces
   ([graphical-session.md](graphical-session.md) §6.2).
 - User *creation* and password *change* for **people**: `auth-service` writes the database since
-  administration Part D.1, and the broker fronts it since Part D.3; `account`, the tool a person
-  types, is Part D.4. Persisted per-user state beyond the home directory stays deferred.
+  administration Part D.1, the broker fronts it since Part D.3, and `account` is what a person
+  types since Part D.4. Persisted per-user state beyond the home directory stays deferred.
 - The real user shell (Phase 4).
 
 ## References
