@@ -1,6 +1,6 @@
 # `views.toml` — the view broker's policy
 
-**Status: normative for what is built (2026-09-23).** Read by `userspace/view-broker/`
+**Status: normative for what is built (2026-09-25, Part D.3).** Read by `userspace/view-broker/`
 (`view_broker::policy`) from `/system/views.toml`, **for every request**. The build seeds one;
 an installed system's comes from the installer (administration Part G).
 
@@ -12,7 +12,7 @@ syntax. A view is a profile's grants added to the caller's own namespace; see
 
 ```toml
 [profile.admin]
-grants = ["disks", "storage"]
+grants = ["disks", "storage", "views", "accounts"]
 
 [profile.install]
 grants = ["disks"]
@@ -55,6 +55,8 @@ names its line.
 |---|---|---|
 | `disks` | every block device **not in use when the view is built**, raw: `/dev/blk/<n>` and its `info`, one binding each. The broker asks the storage service's `InUse` first, and leaves out a mounted filesystem's device, `init`'s root included, and the disk under it; if the service cannot answer, the request is refused rather than granted blind. **Asked once, at the start**: a device mounted later in the view's life stays bound raw. That is the administrator's own doing in a view with `storage` too, such as `disk --mount` from `with admin nxsh` | Part A; `InUse` since Part C.6 |
 | `storage` | the storage service's admin endpoint at `/dev/storage/admin`: mounting and unmounting ([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) | Part C.6 |
+| `views` | the broker's policy endpoint at `/dev/policy`: reading this file and installing a new one, which `with --show` and `with --install` use ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `Show`, `Install`). **Not** `/system/views.toml` writable: an install is judged first, so a policy that leaves no administrator never reaches the disk | Part D.2 |
+| `accounts` | the broker's accounts endpoint at `/dev/accounts`: adding and removing accounts and setting their passwords ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `AddAccount`, `RemoveAccount`, `SetPassword`). **Not** `/system/users` or `/home` writable: the broker checks the guards — a removal waits for logout and must leave an administrator — makes and removes homes, and asks `auth-service`, the file's only writer. Listing accounts and changing one's own password need no grant | Part D.3 |
 
 Each later part of the administration phase adds its grant to this table.
 
@@ -82,10 +84,26 @@ returned to whoever asked.
 
 ## Administrators, and the guard
 
-**An administrator is an account a rule lets use `admin` with `run = ["*"]`** — narrow on
-purpose, so that a broad rule letting everyone run one program does not count. A policy with no
-administrator reads, but `with --check` refuses it, because nothing could change the file again
-short of the live image. Part D's `with --edit` refuses to install one.
+**An administrator is an account that exists, which a rule lets use a profile granting `views`,
+with `run = ["*"]`** (`view_broker::policy::Policy::administrators`). To administer is to be able
+to change this file, from any program:
+
+- **The grant decides, not the profile's name.** A profile called `admin` without `views` makes
+  no administrator; one under another name with it does.
+- **`run = ["*"]` and nothing narrower**, so that a rule letting someone run one program with
+  `views` does not count.
+- **An account that exists**, as `auth-service` lists them. `who = ["*"]` counts every one of
+  them; a rule naming only accounts that do not exist counts none.
+- `auth` does not enter into it: `"none"` makes an administrator as `"password"` does.
+
+A policy with no administrator reads, and the broker would decide requests by it, but
+**`with --check` and `Install` both refuse it**, with the same list and the same definition,
+because nothing could change the file again short of the live image. The file on the disk is left
+as it was.
+
+**The same definition guards the accounts** (Part D.3): `RemoveAccount` refuses to remove an
+account when no account left could administer, so the last administrator cannot be removed any
+more than the policy can be changed to leave none.
 
 ## References
 

@@ -215,9 +215,9 @@ distribution/affinity self-tests are meaningful), `-display none`,
 
 **`test-qemu` and `test-interactive` boot QEMU's default screen, 1280×800; every gate that looks
 at or clicks on a screen boots 1360×768** — `check-display`, `check-input`, `check-terminal`,
-`check-login`, `check-fbcon`, `check-live`, `check-report`, `check-install`, `check-storage`, and
-the `shot` and `bench-compose` tools (Phase 5 Part E). So every CI run boots two sizes, and a size written back into a client
-fails somewhere. `--size WxH` boots one of those at another size; `qemu_base_args` takes the
+`check-login`, `check-fbcon`, `check-live`, `check-report`, `check-install`, `check-storage`,
+`check-recovery`, and the `shot` and `bench-compose` tools (Phase 5 Part E). So every CI run
+boots two sizes, and a size written back into a client fails somewhere. `--size WxH` boots one of those at another size; `qemu_base_args` takes the
 screen from every caller, so a new boot cannot forget to say.
 
 - **The size is QEMU's, not the image's**: `-vga none -device VGA,xres=…,yres=…` makes QEMU's

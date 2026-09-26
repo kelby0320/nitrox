@@ -1491,7 +1491,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 
 ### The pieces, in dependency order
 
-- [ ] **D.1 — `libusers`, and `auth-service`'s admin session.** The format moves into `libusers`,
+- [x] **D.1 — `libusers`, and `auth-service`'s admin session.** The format moves into `libusers`,
       with `auth-service`, `xtask`'s seeding and host tests on it. The admin session at
       `/svc/auth/admin` gets `List`, `Add`, `Remove` and `SetPassword`, the atomic rewrite and
       salts from entropy. `rsproto-auth-ops.md` gains the ops.
@@ -1500,7 +1500,17 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         it, sets its password and finds the old one refused and the new one accepted, and removes
         it. After each write, it finds the file as the service said, read raw from the device
         through the ext4 library, as C.1's checks read it.
-- [ ] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
+
+      *(Landed 2026-09-25.*
+      - *`Add` takes no home: it is always `/home/<name>`, so the pass's "a name, a password and a
+        home" became a name and a password.*
+      - *Admin refusals are error replies with reasons; an `Authenticate` there is `Unsupported`.*
+      - *Also fixed: `auth-service`'s resolve refusals sent a 4-byte error body, which the kernel
+        hands the caller as `KernelError`. They send the whole `ErrorBody` now, and the probe
+        checks that an unknown suffix is `NotFound`.*
+      - *D's share of `TODO(svc-auth-ungated)` is recorded now, since the admin session exists
+        from D.1.)*
+- [x] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
       administrator is.** *Before the accounts front*, since the guard that front applies needs this
       definition, and the definition needs the grant.
       - The policy endpoint, with `Show` and `Install`: the text must parse, and an existing account
@@ -1523,7 +1533,25 @@ from "lost at exit" to "lost at power-off unless something syncs it".
            change;
         3. a copy leaving no administrator refused;
         4. the original restored.
-- [ ] **D.3 — the broker fronts accounts.**
+
+      *(Landed 2026-09-25.*
+      - *`boot-probe` asks at the protocol, as a supervisor can: it opens a session and resolves
+        `/svc/views/policy/<id>`, the suffix the grant's binding forwards to. "`Show` refused
+        without the grant" became `Show` refused on the session's client channel, which is what a
+        session without the grant holds. The binding itself is proved by `test-interactive`, where
+        `with --show` outside a view is refused naming the grant, and `with admin with --show`
+        works.*
+      - *Also in the probe: a policy installed with a profile the original lacks, found in `List`,
+        and gone again once the original is restored; and a closed session's policy channel
+        answering nothing.*
+      - *`with --show FILE` writes the text to a file, and bare `with --show` prints it. Piped to
+        `save`, each line would be written as a record, `{ line: … }`, which does not read back as
+        a policy.*
+      - *`test-interactive` builds each policy in typed parts of under 256 bytes, the kernel
+        console's input ring, which drops what does not fit. A longer line loses its end and its
+        newline, and the shell never sees the command.*
+      - *`Install` is audited, as its session's principal, whether it installs or is refused.)*
+- [x] **D.3 — the broker fronts accounts.**
       - The `accounts` grant and the accounts endpoint: `AddAccount`, `RemoveAccount` and
         `SetPassword`, with the home made or removed there.
       - `Accounts` and `ChangePassword` on a session's channel.
@@ -1535,7 +1563,29 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         - the removal of the only administrator refused;
         - `ChangePassword` refused for a wrong current password and paced, then accepted;
         - `Accounts` naming each account's sessions.
-- [ ] **D.4 — `account`.**
+
+      *(Landed 2026-09-25.*
+      - *"Through a view as the grant builds it" is met for the binding, and the ops are asked at
+        the protocol as D.2's were. `list /dev`, run in the admin view, names `accounts` there,
+        with `in_admin_view` lifted out of C.7's `storage_grant_test` to do it. The ops go to
+        `/svc/views/accounts/<id>`, the suffix that binding forwards to, until D.4's `account`
+        drives them through the binding itself.*
+      - *The probe's accounts channel belongs to a session whose principal has no account, so
+        that `alice` is logged out when her removal is tried, and the administrator guard is
+        what refuses it rather than the logged-in one.*
+      - *Every answer is an outcome with a reason: what was done, or the guard that refused.*
+      - *`AddAccount` refuses a taken name before it touches `/home`, and removes a home it made
+        if `auth-service` refuses the record. So a failure leaves nothing, where the plan allowed
+        an empty directory.*
+      - *A refused name is never echoed. It has not been checked, so it reaches no path and no
+        log line.*
+      - *A policy that does not read refuses a removal, since whether an administrator would
+        remain cannot be said.*
+      - *A narrower case of the gap under* Left alone: *a removal between a login's
+        `Authenticate` and its supervisor's `OpenSession` is not seen by the logged-in guard,
+        since the broker learns of a session only from `OpenSession`. The window is the time
+        between the two, and it is named rather than closed for the same reason.)*
+- [x] **D.4 — `account`.**
       - The five forms above, the prompt shared with `with`, and a new home's folders.
       - `test-interactive` steps at the real prompt, as `alice`:
         1. `account --list`;
@@ -1545,13 +1595,45 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         5. log in with the new password, while the old one is refused;
         6. back as `alice`, `with admin account --remove bob`, after which `account --list` has
            no `bob` and his login is refused.
-- [ ] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
+
+      *(Landed 2026-09-25, as `test-interactive` step 20e.*
+      - *A change is reported as a sentence, not a row: what the broker says, such as "added bob,
+        adopting /home/bob, which was already there", on `stderr` and the console. `--list` is
+        the table. The pass's "`account` writes one row" is dropped, since the sentence is the
+        result and a row would only repeat the name.*
+      - *The prompt moved into `coreutils::prompt`, and the request plumbing `with` had into
+        `coreutils::ipc`, both shared now. A new password is asked twice and checked by
+        `confirm`, host-tested, so a mismatch or a rule broken is said before anything is sent.*
+      - *Also in the gate: bob's home holds its three folders at his first login; a mismatched
+        pair at `account --password` is refused; and the removal is `--remove bob --home`, so
+        the step leaves nothing behind.*
+      - *And a check for the whole gate: **no password it types may appear in the serial
+        transcript.** Every prompt turns echo off, and this is what holds them to it.*
+      - *The offline mode, `--users FILE`, is built here and gated by D.5's `check-recovery`,
+        as planned.)*
+- [x] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
       First boot: the live image beside a copy of the release disk. Log in on serial, run
       `with admin disk --unmount nitrox-root` and `--mount` it writable, then
       `account --password alice --users /storage/nitrox-root/system/users` with a new password,
       then unmount. Second boot: that disk alone. `alice` logs in with the new password, and the
       old one is refused.
-- [ ] **Docs.**
+
+      *(Landed 2026-09-25.*
+      - *The disk's root is marked not cleanly unmounted first, as an installed machine's is,
+        as `check-storage` does.*
+      - *Between the boots the host carves the partition out and checks it. `e2fsck -fn` finds it
+        clean, the superblock records a clean unmount, and `/system/users` differs from the
+        release disk's in `alice`'s line alone. That line takes the new password, under a fresh
+        16-byte salt that is neither zeros nor the build's.*
+      - *After the unmount, the live system's own `alice` logs in with the old password: the file
+        edited was the disk's.*
+      - *Neither boot may print either password.*
+      - *The host's clean checks moved out of `check-storage` into `check_left_clean`, which both
+        gates call.)*
+- [x] **Docs.** *(Each landed with its piece: D.1 the user database and D's share of
+      `TODO(svc-auth-ungated)`; D.2 and D.3 the three specs and what an administrator is; D.3
+      `TODO(home-folders)`; D.4 `shell-language.md` §10d and the deferred item; D.5 the boundary,
+      in `session-and-auth.md` § Credential validation.)*
       - `session-and-auth.md`:
         - the user database is written, by `auth-service` alone;
         - the deferred item for user creation and password change is resolved;

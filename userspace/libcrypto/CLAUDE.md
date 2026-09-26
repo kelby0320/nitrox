@@ -33,9 +33,10 @@ See `docs/architecture/session-and-auth.md`.
 - **Constant-time comparison for secrets.** Compare verifiers/MACs with `ct_eq`,
   never `==` on the raw bytes, so verification leaks no timing.
 - **Don't add protocol or policy here.** This crate is primitives only. The user-DB
-  format, the auth wire protocol, and the KDF *cost policy's* home live in the
-  auth-service, not here (the `DEFAULT_ITERATIONS` constant is a convenience default,
-  not the source of truth — the cost is stored per record).
+  format and the KDF *cost policy* live in `libusers` (administration Part D.1: its
+  `ITERATIONS`, and the cost stored per record), and the auth wire protocol in
+  `librsproto::auth` — not here. The `DEFAULT_ITERATIONS` constant is a convenience
+  default, not the source of truth.
 
 ## Testing
 

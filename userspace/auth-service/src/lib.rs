@@ -1,32 +1,28 @@
-//! `auth-service` — the credential-oracle logic (host-testable).
+//! `auth-service` — the credential logic (host-testable).
 //!
-//! Pure, `#![no_std]`, no-`alloc` credential validation: parse the user database
-//! and verify a `(username, password)` against a stored PBKDF2 verifier, answering
-//! the `Auth` rsproto category (`docs/spec/rsproto-auth-ops.md`). No syscalls —
-//! the bare-target server (`src/main.rs`) supplies the DB bytes + the request/reply
-//! buffers; this crate is the policy. Under `cargo test` it builds as host `std`.
+//! Pure, `#![no_std]`, no-`alloc`: verify a `(username, password)` against the user database, and
+//! decide what an administrator's request does to it, answering the `Auth` rsproto category
+//! (`docs/spec/rsproto-auth-ops.md`). No syscalls — the bare-target server (`src/main.rs`) supplies
+//! the database's bytes, the buffers, and a salt from the kernel's entropy source, and does the
+//! writing. Under `cargo test` it builds as host `std`.
 //!
-//! **User DB format** — a `passwd`-style line file (`docs/architecture/session-and-auth.md`):
-//!
-//! ```text
-//! # comment / blank lines ignored
-//! name:salt_hex:iterations:verifier_hex:home
-//! ```
-//!
-//! The stored `verifier` is `PBKDF2-HMAC-SHA256(password, salt, iterations)` — a
-//! one-way value; the password is never stored. See `userspace/auth-service/CLAUDE.md`.
+//! **The database's format is `libusers`'** (administration Part D.1): a `passwd`-style line file,
+//! `name:salt_hex:iterations:verifier_hex:home`, whose `verifier` is
+//! `PBKDF2-HMAC-SHA256(password, salt, iterations)` — one-way; the password is never stored. It was
+//! parsed here until the build's seeder and `account`'s offline mode needed to write it too. See
+//! `userspace/auth-service/CLAUDE.md`.
 
 #![cfg_attr(not(test), no_std)]
 
+use libkern::KError;
 use librsproto::auth::{
-    AUTH_RESULT_AUTHENTICATED, build_authenticate_reply, build_denied_reply,
+    AUTH_RESULT_AUTHENTICATED, AccountListWriter, OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE,
+    OP_AUTH_SET_PASSWORD, build_authenticate_reply, build_denied_reply, parse_account_request,
     parse_authenticate_request,
 };
 
-/// Max salt length in bytes we decode from a record (generous — salts are ~8–16 B).
-pub const SALT_MAX: usize = 32;
 /// The PBKDF2 verifier length (one SHA-256 block), matching `libcrypto`.
-pub const VERIFIER_LEN: usize = libcrypto::password::VERIFIER_LEN;
+pub const VERIFIER_LEN: usize = libusers::VERIFIER_LEN;
 
 /// The outcome of an authentication attempt. On success the `principal` / `home`
 /// borrow from the matched DB record.
@@ -45,42 +41,22 @@ const DUMMY_VERIFIER: [u8; VERIFIER_LEN] = [0u8; VERIFIER_LEN];
 /// Validate `(username, password)` against the user DB `db`. A missing user still
 /// runs a dummy verify (constant work) and returns [`AuthOutcome::Denied`].
 pub fn authenticate<'a>(db: &'a [u8], username: &[u8], password: &[u8]) -> AuthOutcome<'a> {
-    for line in db.split(|&b| b == b'\n') {
-        let line = trim(line);
-        if line.is_empty() || line[0] == b'#' {
-            continue;
+    match libusers::find(db, username) {
+        Some(rec) if rec.verifies(password) => {
+            AuthOutcome::Authenticated { principal: rec.name, home: rec.home }
         }
-        let Some(rec) = Record::parse(line) else {
-            continue; // a malformed record is skipped, not fatal
-        };
-        if rec.name != username {
-            continue;
+        Some(_) => AuthOutcome::Denied,
+        None => {
+            // Unknown user: run an equivalent derivation so timing does not distinguish it.
+            let _ = libcrypto::password::verify(
+                password,
+                &DUMMY_SALT,
+                libcrypto::password::DEFAULT_ITERATIONS,
+                &DUMMY_VERIFIER,
+            );
+            AuthOutcome::Denied
         }
-        // Decode the record's salt + verifier, then verify.
-        let mut salt = [0u8; SALT_MAX];
-        let Some(salt_len) = hex_decode(rec.salt_hex, &mut salt) else {
-            return AuthOutcome::Denied;
-        };
-        let mut verifier = [0u8; VERIFIER_LEN];
-        let Some(vlen) = hex_decode(rec.verifier_hex, &mut verifier) else {
-            return AuthOutcome::Denied;
-        };
-        if vlen != VERIFIER_LEN {
-            return AuthOutcome::Denied;
-        }
-        if libcrypto::password::verify(password, &salt[..salt_len], rec.iterations, &verifier) {
-            return AuthOutcome::Authenticated { principal: rec.name, home: rec.home };
-        }
-        return AuthOutcome::Denied;
     }
-    // Unknown user: run an equivalent derivation so timing does not distinguish it.
-    let _ = libcrypto::password::verify(
-        password,
-        &DUMMY_SALT,
-        libcrypto::password::DEFAULT_ITERATIONS,
-        &DUMMY_VERIFIER,
-    );
-    AuthOutcome::Denied
 }
 
 /// Serve one `Authenticate` request: parse the request body, authenticate against
@@ -97,102 +73,129 @@ pub fn serve_authenticate(request_body: &[u8], db: &[u8], reply_out: &mut [u8]) 
     }
 }
 
-/// One parsed DB record (fields borrow from the line).
-struct Record<'a> {
-    name: &'a [u8],
-    salt_hex: &'a [u8],
-    iterations: u32,
-    verifier_hex: &'a [u8],
-    home: &'a [u8],
+// --- administration (Part D.1) ------------------------------------------------------------------
+
+/// What an administrator's request comes to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Admin {
+    /// Answer with the first `n` bytes of the reply buffer; nothing is written.
+    Reply(usize),
+    /// Install the first `n` bytes of the new-database buffer as the file, then answer with an
+    /// empty body. **Nothing has changed until the install holds**: the caller keeps the old
+    /// database if it does not.
+    Write(usize),
+    /// Refuse, with this error and reason.
+    Refused(Refused),
 }
 
-impl<'a> Record<'a> {
-    /// Parse `name:salt_hex:iterations:verifier_hex:home`. `None` if a field is
-    /// missing or `iterations` is not a decimal number.
-    fn parse(line: &'a [u8]) -> Option<Record<'a>> {
-        let mut it = line.splitn(5, |&b| b == b':');
-        let name = it.next()?;
-        let salt_hex = it.next()?;
-        let iterations = parse_u32(it.next()?)?;
-        let verifier_hex = it.next()?;
-        let home = it.next()?;
-        if name.is_empty() || home.is_empty() {
-            return None;
+/// Why an administrator's request was refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The edit itself: a bad name or password, a name taken or missing, a file too large.
+    Edit(libusers::Refusal),
+    /// The body does not parse, or does not account for itself exactly.
+    Malformed,
+    /// Not one of the four administrative ops.
+    NotAdmin,
+    /// The account list would not fit in one message.
+    ListTooLong,
+}
+
+impl Refused {
+    /// The error a client is answered with.
+    pub fn kerror(self) -> KError {
+        use libusers::Refusal;
+        match self {
+            Refused::Edit(Refusal::BadName | Refusal::BadPassword) | Refused::Malformed => {
+                KError::InvalidArgument
+            }
+            Refused::Edit(Refusal::Exists) => KError::AlreadyExists,
+            Refused::Edit(Refusal::NoSuchAccount) => KError::NotFound,
+            Refused::Edit(Refusal::TooLarge) | Refused::ListTooLong => KError::TooLarge,
+            Refused::NotAdmin => KError::Unsupported,
         }
-        Some(Record { name, salt_hex, iterations, verifier_hex, home })
+    }
+
+    /// The reason, as the refusal says it.
+    pub fn why(self) -> &'static [u8] {
+        match self {
+            Refused::Edit(r) => r.why(),
+            Refused::Malformed => b"a malformed request",
+            Refused::NotAdmin => b"not an administrative request",
+            Refused::ListTooLong => b"the account list does not fit in one message",
+        }
     }
 }
 
-/// Trim leading/trailing ASCII whitespace (spaces, tabs, CR) from a line.
-fn trim(s: &[u8]) -> &[u8] {
-    let is_ws = |c: u8| c == b' ' || c == b'\t' || c == b'\r';
-    let mut a = 0;
-    let mut b = s.len();
-    while a < b && is_ws(s[a]) {
-        a += 1;
-    }
-    while b > a && is_ws(s[b - 1]) {
-        b -= 1;
-    }
-    &s[a..b]
+/// **Serve one administrator's request** on `db`: `List`, `Add`, `Remove` or `SetPassword`. A new
+/// password is derived under `salt`, which the caller draws fresh for each request, at
+/// `libusers::ITERATIONS`. A write goes into `new_db`, and a reply into `reply`.
+pub fn serve_admin(
+    op: u16,
+    body: &[u8],
+    db: &[u8],
+    salt: &[u8; libusers::SALT_LEN],
+    new_db: &mut [u8],
+    reply: &mut [u8],
+) -> Admin {
+    serve_admin_with(op, body, db, salt, libusers::ITERATIONS, new_db, reply)
 }
 
-/// Parse an ASCII decimal `u32`; `None` if empty or non-digit / overflow.
-fn parse_u32(s: &[u8]) -> Option<u32> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut n: u32 = 0;
-    for &c in s {
-        let d = c.checked_sub(b'0').filter(|&d| d < 10)?;
-        n = n.checked_mul(10)?.checked_add(d as u32)?;
-    }
-    Some(n)
-}
-
-/// Decode lowercase/uppercase hex `hex` into `out`, returning the byte count.
-/// `None` on an odd length, a non-hex digit, or `out` too small.
-fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
-    if hex.len() % 2 != 0 || hex.len() / 2 > out.len() {
-        return None;
-    }
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
-        out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
-    }
-    Some(hex.len() / 2)
-}
-
-/// One hex digit → its 0–15 value; `None` if not a hex digit.
-fn nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
+/// [`serve_admin`], deriving at `iterations` — for a test that cannot afford the real count, as
+/// `libusers`' `*_with` edits are (PR #338 review: one admin test took 21 s at the real count).
+pub fn serve_admin_with(
+    op: u16,
+    body: &[u8],
+    db: &[u8],
+    salt: &[u8; libusers::SALT_LEN],
+    iterations: u32,
+    new_db: &mut [u8],
+    reply: &mut [u8],
+) -> Admin {
+    let edit = |r: Result<usize, libusers::Refusal>| match r {
+        Ok(n) => Admin::Write(n),
+        Err(e) => Admin::Refused(Refused::Edit(e)),
+    };
+    match op {
+        OP_AUTH_LIST => {
+            if !body.is_empty() {
+                return Admin::Refused(Refused::Malformed);
+            }
+            let Some(mut w) = AccountListWriter::new(reply) else {
+                return Admin::Refused(Refused::ListTooLong);
+            };
+            for r in libusers::records(db) {
+                if w.push(r.name, r.home).is_none() {
+                    return Admin::Refused(Refused::ListTooLong);
+                }
+            }
+            Admin::Reply(w.finish())
+        }
+        OP_AUTH_ADD => match parse_account_request(body) {
+            Some(r) => edit(libusers::add_with(db, new_db, r.username, r.password, salt, iterations)),
+            None => Admin::Refused(Refused::Malformed),
+        },
+        OP_AUTH_REMOVE => edit(libusers::remove(db, new_db, body)),
+        OP_AUTH_SET_PASSWORD => match parse_account_request(body) {
+            Some(r) => edit(libusers::set_password_with(db, new_db, r.username, r.password, salt, iterations)),
+            None => Admin::Refused(Refused::Malformed),
+        },
+        _ => Admin::Refused(Refused::NotAdmin),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use librsproto::auth::{build_account_request, parse_account_list};
 
     /// Build a one-line DB for `user`/`password` with the given `home`, using the
     /// real KDF (so the test exercises the same path the seeder + verifier do).
     fn db_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
-        use std::fmt::Write;
-        let iters = libcrypto::password::DEFAULT_ITERATIONS;
-        let v = libcrypto::password::derive(password.as_bytes(), salt, iters);
-        let mut s = std::string::String::new();
-        write!(s, "{user}:").unwrap();
-        for b in salt {
-            write!(s, "{b:02x}").unwrap();
-        }
-        write!(s, ":{iters}:").unwrap();
-        for b in &v {
-            write!(s, "{b:02x}").unwrap();
-        }
-        write!(s, ":{home}").unwrap();
-        s
+        let mut out = [0u8; libusers::MAX_FILE];
+        let n = libusers::write_record(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt)
+            .unwrap();
+        std::string::String::from_utf8(out[..n].to_vec()).unwrap()
     }
 
     #[test]
@@ -221,9 +224,8 @@ mod tests {
         let mut db = std::string::String::new();
         db.push_str("# the user database\n\n");
         db.push_str(&db_line("alice", "apw", b"aaaa1111", "/home/alice"));
-        db.push('\n');
         db.push_str(&db_line("bob", "bpw", b"bbbb2222", "/home/bob"));
-        db.push_str("\n# trailing comment\n");
+        db.push_str("# trailing comment\n");
         assert!(matches!(
             authenticate(db.as_bytes(), b"bob", b"bpw"),
             AuthOutcome::Authenticated { home, .. } if home == b"/home/bob"
@@ -261,15 +263,136 @@ mod tests {
         assert!(serve_authenticate(&[0u8; 2], db.as_bytes(), &mut reply).is_none());
     }
 
+    // --- administration ------------------------------------------------------------------------
+
+    const SALT: [u8; libusers::SALT_LEN] = *b"0123456789abcdef";
+    /// The iteration count a test derives at: the real one costs seconds per derivation, and each
+    /// record keeps its own count, so `authenticate` reads these back at this one.
+    const IT: u32 = 2;
+
+    /// [`db_line`] at [`IT`]: an administrator's request never derives the existing records, and a
+    /// login checked against one here should not cost the real count either.
+    fn cheap_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
+        let mut out = [0u8; libusers::MAX_FILE];
+        let n = libusers::write_record_with(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt, IT)
+            .unwrap();
+        std::string::String::from_utf8(out[..n].to_vec()).unwrap()
+    }
+
+    /// One admin request against `db`: what it came to, and the new file if it wrote one.
+    fn admin(op: u16, body: &[u8], db: &str) -> (Admin, std::string::String) {
+        let mut new_db = [0u8; libusers::MAX_FILE];
+        let mut reply = [0u8; 4096];
+        let a = serve_admin_with(op, body, db.as_bytes(), &SALT, IT, &mut new_db, &mut reply);
+        let file = match a {
+            Admin::Write(n) => std::string::String::from_utf8(new_db[..n].to_vec()).unwrap(),
+            _ => std::string::String::new(),
+        };
+        (a, file)
+    }
+
+    fn account(name: &str, password: &str) -> std::vec::Vec<u8> {
+        let mut b = [0u8; 256];
+        let n = build_account_request(&mut b, name.as_bytes(), password.as_bytes()).unwrap();
+        b[..n].to_vec()
+    }
+
+    /// **An account added, its password set, then removed — each step authenticating as the file
+    /// it wrote says.** The service installs what `Write` holds, so this is the whole of what an
+    /// administrator's request does to the database.
     #[test]
-    fn hex_and_int_parsers() {
-        let mut out = [0u8; 4];
-        assert_eq!(hex_decode(b"deadBEEF", &mut out), Some(4));
-        assert_eq!(out, [0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(hex_decode(b"abc", &mut out), None); // odd length
-        assert_eq!(hex_decode(b"xy", &mut out), None); // non-hex
-        assert_eq!(parse_u32(b"4096"), Some(4096));
-        assert_eq!(parse_u32(b""), None);
-        assert_eq!(parse_u32(b"12a"), None);
+    fn an_account_is_added_changed_and_removed() {
+        let db = format!("# header\n{}", cheap_line("alice", "apw", b"s1", "/home/alice"));
+
+        let (a, db) = admin(OP_AUTH_ADD, &account("bob", "first"), &db);
+        assert!(matches!(a, Admin::Write(_)));
+        assert_eq!(
+            authenticate(db.as_bytes(), b"bob", b"first"),
+            AuthOutcome::Authenticated { principal: b"bob", home: b"/home/bob" }
+        );
+
+        let (a, db) = admin(OP_AUTH_SET_PASSWORD, &account("bob", "second"), &db);
+        assert!(matches!(a, Admin::Write(_)));
+        assert_eq!(authenticate(db.as_bytes(), b"bob", b"first"), AuthOutcome::Denied);
+        assert!(matches!(authenticate(db.as_bytes(), b"bob", b"second"), AuthOutcome::Authenticated { .. }));
+
+        let (a, db) = admin(OP_AUTH_REMOVE, b"bob", &db);
+        assert!(matches!(a, Admin::Write(_)));
+        assert_eq!(authenticate(db.as_bytes(), b"bob", b"second"), AuthOutcome::Denied);
+        assert!(
+            matches!(authenticate(db.as_bytes(), b"alice", b"apw"), AuthOutcome::Authenticated { .. }),
+            "and alice, untouched throughout"
+        );
+        assert!(db.starts_with("# header\n"));
+    }
+
+    /// **`List` names every account and its home**, and writes nothing.
+    #[test]
+    fn a_list_names_every_account() {
+        let db = format!(
+            "# header\n{}{}",
+            cheap_line("alice", "a", b"s1", "/home/alice"),
+            cheap_line("bob", "b", b"s2", "/home/bob")
+        );
+        let mut new_db = [0u8; libusers::MAX_FILE];
+        let mut reply = [0u8; 4096];
+        let Admin::Reply(n) = serve_admin(OP_AUTH_LIST, &[], db.as_bytes(), &SALT, &mut new_db, &mut reply) else {
+            panic!("a list replies");
+        };
+        let l = parse_account_list(&reply[..n]).unwrap();
+        let got: std::vec::Vec<_> = l.iter().collect();
+        assert_eq!(got, [(&b"alice"[..], &b"/home/alice"[..]), (&b"bob"[..], &b"/home/bob"[..])]);
+    }
+
+    /// **Each refusal, with the error a client is answered with.**
+    #[test]
+    fn an_admin_request_is_refused_for_each_reason() {
+        use libusers::Refusal;
+        let db = cheap_line("alice", "a", b"s1", "/home/alice");
+        let refused = |op, body: &[u8]| match admin(op, body, &db).0 {
+            Admin::Refused(r) => Some((r, r.kerror())),
+            _ => None,
+        };
+        let edit = |r, k| Some((Refused::Edit(r), k));
+        assert_eq!(refused(OP_AUTH_ADD, &account("alice", "x")), edit(Refusal::Exists, KError::AlreadyExists));
+        assert_eq!(refused(OP_AUTH_ADD, &account("Bob", "x")), edit(Refusal::BadName, KError::InvalidArgument));
+        assert_eq!(refused(OP_AUTH_ADD, &account("bob", "")), edit(Refusal::BadPassword, KError::InvalidArgument));
+        assert_eq!(refused(OP_AUTH_REMOVE, b"bob"), edit(Refusal::NoSuchAccount, KError::NotFound));
+        // **A bad name is refused as one by every op**, not reported missing (PR #338 review).
+        assert_eq!(refused(OP_AUTH_REMOVE, b"Bad Name"), edit(Refusal::BadName, KError::InvalidArgument));
+        assert_eq!(
+            refused(OP_AUTH_SET_PASSWORD, &account("Bad Name", "x")),
+            edit(Refusal::BadName, KError::InvalidArgument)
+        );
+        assert_eq!(
+            refused(OP_AUTH_SET_PASSWORD, &account("bob", "")),
+            edit(Refusal::BadPassword, KError::InvalidArgument)
+        );
+        assert_eq!(
+            refused(OP_AUTH_SET_PASSWORD, &account("bob", "x")),
+            Some((Refused::Edit(Refusal::NoSuchAccount), KError::NotFound))
+        );
+        let mut trailing = account("bob", "x");
+        trailing.push(0);
+        assert_eq!(refused(OP_AUTH_ADD, &trailing), Some((Refused::Malformed, KError::InvalidArgument)));
+        assert_eq!(refused(OP_AUTH_LIST, b"x"), Some((Refused::Malformed, KError::InvalidArgument)));
+        assert_eq!(
+            refused(librsproto::OP_AUTHENTICATE, b""),
+            Some((Refused::NotAdmin, KError::Unsupported)),
+            "an admin session does not authenticate"
+        );
+    }
+
+    /// **A list too long for the reply buffer is refused**, not cut short: a partial list would
+    /// read as the whole of it.
+    #[test]
+    fn a_list_that_does_not_fit_is_refused() {
+        let db = cheap_line("alice", "a", b"s1", "/home/alice");
+        let mut new_db = [0u8; libusers::MAX_FILE];
+        let mut reply = [0u8; 8];
+        assert_eq!(
+            serve_admin(OP_AUTH_LIST, &[], db.as_bytes(), &SALT, &mut new_db, &mut reply),
+            Admin::Refused(Refused::ListTooLong)
+        );
     }
 }

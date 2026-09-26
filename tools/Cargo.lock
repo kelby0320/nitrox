@@ -162,6 +162,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libusers"
+version = "0.1.0"
+dependencies = [
+ "libcrypto",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +234,7 @@ dependencies = [
  "libdraw",
  "libterm",
  "libui",
+ "libusers",
  "png",
 ]
 

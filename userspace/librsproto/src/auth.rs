@@ -1,7 +1,9 @@
-//! The `Auth` category (`op = 0x08xx`) bodies — credential validation. See
-//! `docs/spec/rsproto-auth-ops.md`. `Authenticate` (`0x0800`) is the only op:
-//! `(username, password) → { AUTHENTICATED, principal, home } | DENIED`. A denied
-//! credential is a normal reply (`result = DENIED`), not an `RsFlags::ERROR`.
+//! The `Auth` category (`op = 0x08xx`) bodies — credential validation, and the administration of
+//! the accounts it validates against. See `docs/spec/rsproto-auth-ops.md`. `Authenticate`
+//! (`0x0800`): `(username, password) → { AUTHENTICATED, principal, home } | DENIED`. A denied
+//! credential is a normal reply (`result = DENIED`), not an `RsFlags::ERROR`. `List`, `Add`,
+//! `Remove` and `SetPassword` (`0x0801`–`0x0804`, administration Part D.1) are asked on an admin
+//! session, and a refusal there *is* an error reply.
 //!
 //! Bodies are little-endian, byte-serialised into a caller buffer (the `IpcMsg`
 //! payload), like the other categories. The password crosses the channel in
@@ -140,9 +142,186 @@ pub fn parse_authenticate_reply(body: &[u8]) -> Option<AuthenticateReply<'_>> {
     })
 }
 
+// --- Administration (administration Part D.1) -------------------------------
+
+/// `Auth::List` — every account's name and home. Asked on an admin session.
+pub const OP_AUTH_LIST: u16 = 0x0801;
+/// `Auth::Add` — a new account: a name and a password. Its home is `/home/<name>`.
+pub const OP_AUTH_ADD: u16 = 0x0802;
+/// `Auth::Remove` — an account, by name.
+pub const OP_AUTH_REMOVE: u16 = 0x0803;
+/// `Auth::SetPassword` — a new password for an account, by name.
+pub const OP_AUTH_SET_PASSWORD: u16 = 0x0804;
+
+/// Write an `Add` or `SetPassword` body: a name and a password, laid out as `Authenticate`'s
+/// request.
+pub fn build_account_request(out: &mut [u8], name: &[u8], password: &[u8]) -> Option<usize> {
+    build_authenticate_request(out, name, password)
+}
+
+/// Parse an `Add` or `SetPassword` body. **Its lengths must account for it exactly**: a body with
+/// bytes left over is malformed, as `Storage`'s are, where `Authenticate` has always let them pass.
+pub fn parse_account_request(body: &[u8]) -> Option<AuthenticateRequest<'_>> {
+    let r = parse_authenticate_request(body)?;
+    (AUTH_REQUEST_PREFIX_LEN + r.username.len() + r.password.len() == body.len()).then_some(r)
+}
+
+/// Writes `List`'s reply: `count: u16`, then per account `name_len: u8`, the name, `home_len: u8`,
+/// the home.
+pub struct AccountListWriter<'a> {
+    out: &'a mut [u8],
+    at: usize,
+    count: u16,
+}
+
+impl<'a> AccountListWriter<'a> {
+    /// A writer over `out`; `None` if it cannot hold even the count.
+    pub fn new(out: &'a mut [u8]) -> Option<AccountListWriter<'a>> {
+        (out.len() >= 2).then_some(AccountListWriter { out, at: 2, count: 0 })
+    }
+
+    /// Add an account. `None`, and nothing written, if a field is over 255 bytes or it will not
+    /// fit.
+    pub fn push(&mut self, name: &[u8], home: &[u8]) -> Option<()> {
+        if name.len() > 255 || home.len() > 255 || self.count == u16::MAX {
+            return None;
+        }
+        let end = self.at + 2 + name.len() + home.len();
+        if end > self.out.len() {
+            return None;
+        }
+        let mut at = self.at;
+        self.out[at] = name.len() as u8;
+        at += 1;
+        self.out[at..at + name.len()].copy_from_slice(name);
+        at += name.len();
+        self.out[at] = home.len() as u8;
+        at += 1;
+        self.out[at..at + home.len()].copy_from_slice(home);
+        self.at = end;
+        self.count += 1;
+        Some(())
+    }
+
+    /// The body's length, with the count written.
+    pub fn finish(self) -> usize {
+        put_u16(self.out, 0, self.count);
+        self.at
+    }
+}
+
+/// A parsed `List` reply, every entry checked when it was parsed.
+#[derive(Copy, Clone, Debug)]
+pub struct AccountList<'a> {
+    body: &'a [u8],
+    count: u16,
+}
+
+/// Parse a `List` reply. `None` if an entry runs past the body, or the entries do not account for
+/// it exactly.
+pub fn parse_account_list(body: &[u8]) -> Option<AccountList<'_>> {
+    if body.len() < 2 {
+        return None;
+    }
+    let count = get_u16(body, 0);
+    let list = AccountList { body, count };
+    let mut end = 2;
+    for _ in 0..count {
+        end = list.entry_end(end)?;
+    }
+    (end == body.len()).then_some(list)
+}
+
+impl<'a> AccountList<'a> {
+    /// How many accounts.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Each account's `(name, home)`, in the order the service gave them.
+    pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + '_ {
+        let body = self.body;
+        let mut at = 2;
+        (0..self.count).map(move |_| {
+            let nl = body[at] as usize;
+            let name = &body[at + 1..at + 1 + nl];
+            let h = at + 1 + nl;
+            let hl = body[h] as usize;
+            let home = &body[h + 1..h + 1 + hl];
+            at = h + 1 + hl;
+            (name, home)
+        })
+    }
+
+    /// Where the entry starting at `at` ends, if it fits.
+    fn entry_end(&self, at: usize) -> Option<usize> {
+        let nl = *self.body.get(at)? as usize;
+        let h = at.checked_add(1 + nl)?;
+        let hl = *self.body.get(h)? as usize;
+        let end = h.checked_add(1 + hl)?;
+        (end <= self.body.len()).then_some(end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A list round-trips**, in order.
+    #[test]
+    fn an_account_list_round_trips() {
+        let mut buf = [0u8; 128];
+        let mut w = AccountListWriter::new(&mut buf).unwrap();
+        w.push(b"alice", b"/home/alice").unwrap();
+        w.push(b"bob", b"/home/bob").unwrap();
+        let n = w.finish();
+        let l = parse_account_list(&buf[..n]).unwrap();
+        assert_eq!(l.len(), 2);
+        let got: std::vec::Vec<_> = l.iter().collect();
+        assert_eq!(got, [(&b"alice"[..], &b"/home/alice"[..]), (&b"bob"[..], &b"/home/bob"[..])]);
+        let empty = AccountListWriter::new(&mut buf).unwrap().finish();
+        assert!(parse_account_list(&buf[..empty]).unwrap().is_empty());
+    }
+
+    /// **The reader, on bytes a correct writer never makes**: a count past the entries, an entry
+    /// past the body, and bytes left over.
+    #[test]
+    fn an_account_list_that_does_not_add_up_is_refused() {
+        assert!(parse_account_list(&[]).is_none());
+        assert!(parse_account_list(&[1, 0]).is_none(), "one entry promised, none there");
+        assert!(parse_account_list(&[1, 0, 5, b'a']).is_none(), "a name past the end");
+        assert!(parse_account_list(&[1, 0, 1, b'a', 0]).is_some());
+        assert!(parse_account_list(&[1, 0, 1, b'a', 0, 9]).is_none(), "a byte left over");
+        assert!(parse_account_list(&[0, 0, 7]).is_none(), "bytes after an empty list");
+    }
+
+    /// **A list that will not fit writes nothing of the entry that did not fit.**
+    #[test]
+    fn an_account_list_writer_stops_at_its_buffer() {
+        let mut buf = [0u8; 10];
+        let mut w = AccountListWriter::new(&mut buf).unwrap();
+        w.push(b"ab", b"/h").unwrap(); // 2 + 1 + 2 + 1 + 2 = 8
+        assert!(w.push(b"c", b"/").is_none());
+        let n = w.finish();
+        assert_eq!(parse_account_list(&buf[..n]).unwrap().len(), 1);
+    }
+
+    /// **An account request must be exactly its fields**, where `Authenticate`'s parser lets trailing
+    /// bytes pass.
+    #[test]
+    fn an_account_request_is_exact() {
+        let mut buf = [0u8; 32];
+        let n = build_account_request(&mut buf, b"bob", b"pw").unwrap();
+        let r = parse_account_request(&buf[..n]).unwrap();
+        assert_eq!((r.username, r.password), (&b"bob"[..], &b"pw"[..]));
+        assert!(parse_account_request(&buf[..n + 1]).is_none());
+        assert!(parse_authenticate_request(&buf[..n + 1]).is_some(), "the old parser, as it was");
+    }
 
     #[test]
     fn request_round_trip() {

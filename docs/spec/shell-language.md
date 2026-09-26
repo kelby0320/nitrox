@@ -1296,6 +1296,7 @@ it applies rather than either camp uninspected:**
 | `sleep` | duration | Suspends the calling pipeline stage for the given duration; not schema-producing. |
 | `whoami` | — | Emits current user identity as a value. |
 | `disk` | block devices and mounted filesystems | `--list` emits the storage service's `Table<{name, kind, size, filesystem, label, mounted, by, mode, clean}>`, from any session. `--mount DEVICE [LABEL]` and `--unmount LABEL` each emit a one-row table, and need the view broker's `storage` grant: without it they fail naming `with` (administration Part C.7, [`storage.md`](../architecture/storage.md)). |
+| `account` | the accounts | `--list` emits `Table<{name, home, sessions, administers}>`, from any session: the view broker's `Accounts`. `--password` changes the person's own, asking for the current one and then a new one twice, on the stage's terminal with echo off, through the session's `/dev/views`. `--add NAME`, `--remove NAME [--home]` and `--password NAME` need the broker's `accounts` grant: without it they fail naming `with`. `--password NAME --users FILE` edits a users file directly, with no service, for recovery from the live image. Each change says what happened as a sentence, the broker's own, on `stderr` and the console; a password is never read from a stream, echoed, or logged (administration Part D.4, [`rsproto-views-ops.md`](rsproto-views-ops.md)). |
 
 ### 10e. Aliasing — namespace binding, not a new shell feature
 

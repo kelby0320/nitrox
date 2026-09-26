@@ -7,6 +7,9 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libcrypto = { path = "../libcrypto" }
 librsproto = { path = "../librsproto" }
+# The user database's format, and the edits an administrator's request makes to it (administration
+# Part D.1). `core` only, so this server stays free of `alloc`.
+libusers = { path = "../libusers" }
 
 # A library + binary split (mirroring fs-server-ext4/profile-server): the library
 # holds the host-testable credential logic (user-DB parse + PBKDF2 verify + the

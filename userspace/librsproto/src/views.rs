@@ -41,6 +41,36 @@ pub const OP_VIEWS_LIST: u16 = 0x0E06;
 /// `Started` meaning "valid", `Denied` with the reason otherwise. No authority needed: judging a
 /// file installs nothing.
 pub const OP_VIEWS_CHECK: u16 = 0x0E07;
+/// Policy endpoint → broker: the policy's text. Body: empty. Reply: the text, at most
+/// [`POLICY_MAX`] bytes (administration Part D.2). Asked on a channel resolved through the `views`
+/// grant's `/dev/policy`, never on a client channel: the policy is not every session's to read.
+pub const OP_VIEWS_SHOW: u16 = 0x0E08;
+/// Policy endpoint → broker: install this text as the policy. Body: the text. Reply: an
+/// [`Outcome`] — `Started` meaning installed, `Denied` with the reason otherwise: it does not read,
+/// or no account that exists could administer under it.
+pub const OP_VIEWS_INSTALL: u16 = 0x0E09;
+/// Client → broker: every account (administration Part D.3). Body: empty. Reply: rows,
+/// [`push_account`] — name, home, open sessions, and whether it could administer. Anyone may ask,
+/// as a Unix `passwd` file is anyone's to read.
+pub const OP_VIEWS_ACCOUNTS: u16 = 0x0E0A;
+/// Client → broker: change this session's principal's own password. Body
+/// [`build_password_change`]: the current password, then the new one. Reply: an [`Outcome`]. The
+/// current password is checked under the session's delay, as `Password` is.
+pub const OP_VIEWS_CHANGE_PASSWORD: u16 = 0x0E0B;
+/// Accounts endpoint → broker: add an account. Body: a name and a password, laid out as
+/// `Auth::Add`'s ([`crate::auth::build_account_request`]). Reply: an [`Outcome`]. Asked on a
+/// channel resolved through the `accounts` grant's `/dev/accounts`, never on a client channel.
+pub const OP_VIEWS_ADD_ACCOUNT: u16 = 0x0E0C;
+/// Accounts endpoint → broker: remove an account. Body [`build_remove_account`]. Reply: an
+/// [`Outcome`].
+pub const OP_VIEWS_REMOVE_ACCOUNT: u16 = 0x0E0D;
+/// Accounts endpoint → broker: set an account's password, without its current one. Body: a name
+/// and a password, as [`OP_VIEWS_ADD_ACCOUNT`]'s. Reply: an [`Outcome`].
+pub const OP_VIEWS_SET_PASSWORD: u16 = 0x0E0E;
+
+/// The longest policy `Show` answers with and `Install` takes: one message's body, with room for
+/// its header.
+pub const POLICY_MAX: usize = 3584;
 
 /// The broker's answer to a `Request`, a `Password` or a `Check`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -342,6 +372,107 @@ pub fn parse_rows(body: &[u8], mut each: impl FnMut(Row<'_>)) -> Option<usize> {
     (at == body.len()).then_some(n)
 }
 
+// --- Accounts (administration Part D.3) ---------------------------------------
+
+/// One row of `Accounts`' reply.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AccountRow<'a> {
+    /// The account's name.
+    pub name: &'a [u8],
+    /// Its home.
+    pub home: &'a [u8],
+    /// How many sessions it has open.
+    pub sessions: u16,
+    /// Whether it could administer under the policy as it stands — `false` for every account when
+    /// the policy does not read.
+    pub administers: bool,
+}
+
+/// Append `row` to an `Accounts` reply being built in `out` at `*at`, counting it in the `u16` at
+/// offset 0, as [`push_row`] does: `name_len: u8`, the name, `home_len: u8`, the home,
+/// `sessions: u16`, `administers: u8`. `None`, and nothing written, if a field is over 255 bytes
+/// or the row does not fit.
+pub fn push_account(out: &mut [u8], at: &mut usize, row: &AccountRow<'_>) -> Option<()> {
+    if *at < 2 || out.len() < 2 || row.name.len() > 255 || row.home.len() > 255 {
+        return None;
+    }
+    let need = 1 + row.name.len() + 1 + row.home.len() + 2 + 1;
+    if out.len() < *at + need {
+        return None;
+    }
+    let count = get_u16(out, 0).checked_add(1)?;
+    let mut w = *at;
+    out[w] = row.name.len() as u8;
+    out[w + 1..w + 1 + row.name.len()].copy_from_slice(row.name);
+    w += 1 + row.name.len();
+    out[w] = row.home.len() as u8;
+    out[w + 1..w + 1 + row.home.len()].copy_from_slice(row.home);
+    w += 1 + row.home.len();
+    put_u16(out, w, row.sessions);
+    out[w + 2] = row.administers as u8;
+    *at += need;
+    put_u16(out, 0, count);
+    Some(())
+}
+
+/// Parse an `Accounts` reply into its rows. `None` if a row runs past the body, an `administers`
+/// byte is neither 0 nor 1, or bytes are left over.
+pub fn parse_accounts(body: &[u8], mut each: impl FnMut(AccountRow<'_>)) -> Option<usize> {
+    let n = get_u16(body.get(..2)?, 0) as usize;
+    let mut at = 2usize;
+    for _ in 0..n {
+        let nl = *body.get(at)? as usize;
+        let name = body.get(at + 1..at + 1 + nl)?;
+        let h = at + 1 + nl;
+        let hl = *body.get(h)? as usize;
+        let home = body.get(h + 1..h + 1 + hl)?;
+        let s = h + 1 + hl;
+        let sessions = get_u16(body.get(s..s + 2)?, 0);
+        let administers = *body.get(s + 2)?;
+        if administers > 1 {
+            return None;
+        }
+        each(AccountRow { name, home, sessions, administers: administers == 1 });
+        at = s + 3;
+    }
+    (at == body.len()).then_some(n)
+}
+
+/// Write a `ChangePassword` body: the current password, then the new one, laid out as
+/// `Auth::Add`'s name and password are.
+pub fn build_password_change(out: &mut [u8], current: &[u8], new: &[u8]) -> Option<usize> {
+    crate::auth::build_account_request(out, current, new)
+}
+
+/// Parse a `ChangePassword` body into `(current, new)`, **accounted for exactly**.
+pub fn parse_password_change(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    crate::auth::parse_account_request(body).map(|r| (r.username, r.password))
+}
+
+/// `RemoveAccount`'s flag: remove the account's home too. Without it the home is kept.
+pub const REMOVE_HOME: u8 = 1 << 0;
+
+/// Write a `RemoveAccount` body: a flags byte ([`REMOVE_HOME`]), then the name.
+pub fn build_remove_account(out: &mut [u8], name: &[u8], home: bool) -> Option<usize> {
+    let n = 1 + name.len();
+    if name.is_empty() || out.len() < n {
+        return None;
+    }
+    out[0] = if home { REMOVE_HOME } else { 0 };
+    out[1..n].copy_from_slice(name);
+    Some(n)
+}
+
+/// Parse a `RemoveAccount` body into `(name, remove the home)`. `None` for an empty name or a flag
+/// this codec does not know.
+pub fn parse_remove_account(body: &[u8]) -> Option<(&[u8], bool)> {
+    let (&flags, name) = body.split_first()?;
+    if flags & !REMOVE_HOME != 0 || name.is_empty() {
+        return None;
+    }
+    Some((name, flags & REMOVE_HOME != 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +580,62 @@ mod tests {
         bad[0] = 3;
         assert!(parse_rows(&bad, |_| {}).is_none(), "a count past the rows");
         assert!(parse_rows(&buf[..at - 1], |_| {}).is_none(), "a truncated last row");
+    }
+
+    #[test]
+    fn accounts_round_trip_and_a_reader_refuses_what_no_writer_makes() {
+        let mut buf = [0u8; 128];
+        let mut at = 2;
+        let alice = AccountRow { name: b"alice", home: b"/home/alice", sessions: 2, administers: true };
+        let bob = AccountRow { name: b"bob", home: b"/home/bob", sessions: 0, administers: false };
+        push_account(&mut buf, &mut at, &alice).unwrap();
+        push_account(&mut buf, &mut at, &bob).unwrap();
+        let mut seen = Vec::new();
+        let n = parse_accounts(&buf[..at], |r| {
+            seen.push((r.name.to_vec(), r.home.to_vec(), r.sessions, r.administers));
+        });
+        assert_eq!(n, Some(2));
+        assert_eq!(seen[0], (b"alice".to_vec(), b"/home/alice".to_vec(), 2, true));
+        assert_eq!(seen[1], (b"bob".to_vec(), b"/home/bob".to_vec(), 0, false));
+
+        let mut bad = buf[..at].to_vec();
+        *bad.last_mut().unwrap() = 2;
+        assert!(parse_accounts(&bad, |_| {}).is_none(), "an administers byte that is not a bool");
+        let mut bad = buf[..at].to_vec();
+        bad[0] = 3;
+        assert!(parse_accounts(&bad, |_| {}).is_none(), "a count past the rows");
+        assert!(parse_accounts(&buf[..at - 1], |_| {}).is_none(), "a truncated last row");
+        let mut long = buf[..at].to_vec();
+        long.push(0);
+        assert!(parse_accounts(&long, |_| {}).is_none(), "a byte left over");
+
+        let mut small = [0u8; 2 + 1 + 5 + 1 + 11 + 2];
+        let mut at = 2;
+        assert!(push_account(&mut small, &mut at, &alice).is_none(), "one byte short");
+        assert_eq!((at, get_u16(&small, 0)), (2, 0), "and nothing written");
+    }
+
+    #[test]
+    fn a_removal_carries_its_name_and_whether_the_home_goes() {
+        let mut buf = [0u8; 64];
+        let n = build_remove_account(&mut buf, b"bob", true).unwrap();
+        assert_eq!(parse_remove_account(&buf[..n]), Some((&b"bob"[..], true)));
+        let n = build_remove_account(&mut buf, b"bob", false).unwrap();
+        assert_eq!(parse_remove_account(&buf[..n]), Some((&b"bob"[..], false)));
+        assert!(parse_remove_account(&[REMOVE_HOME]).is_none(), "no name");
+        assert!(parse_remove_account(&[0b10, b'b']).is_none(), "a flag nobody defined");
+        assert!(parse_remove_account(&[]).is_none());
+        assert!(build_remove_account(&mut buf, b"", true).is_none());
+    }
+
+    #[test]
+    fn a_password_change_is_two_passwords_accounted_for_exactly() {
+        let mut buf = [0u8; 64];
+        let n = build_password_change(&mut buf, b"old", b"new one").unwrap();
+        assert_eq!(parse_password_change(&buf[..n]), Some((&b"old"[..], &b"new one"[..])));
+        assert!(parse_password_change(&buf[..n - 1]).is_none(), "short");
+        let mut long = buf[..n].to_vec();
+        long.push(b'x');
+        assert!(parse_password_change(&long).is_none(), "a byte left over");
     }
 }

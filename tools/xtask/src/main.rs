@@ -144,6 +144,28 @@ mod browser {
 const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
+/// A second account `test-interactive` adds, logs in as, and removes (administration Part D.4):
+/// a fixture like `DEMO_PASSWORD`, for an account that exists only for the length of one step.
+const BOB_PASSWORD: &str = "bob's first password";
+/// What bob changes his password to.
+const BOB_NEW_PASSWORD: &str = "bob's second password";
+/// A second copy that does not match the first, typed once to be refused.
+const BOB_MISTYPED_PASSWORD: &str = "bob's second pasword";
+/// The wrong password `test-interactive` types at the login prompt, before the right one.
+const LOGIN_WRONG_PASSWORD: &str = "wrong-password";
+/// The wrong password it types at `with`'s prompt, in step 20b.
+const WITH_WRONG_PASSWORD: &str = "not-the-password-4271";
+/// **Every password `test-interactive` types**, none of which may appear in what the guest prints:
+/// each is typed at a prompt with echo off, and a copy on the console is a copy in every log.
+/// Step 20b checks its two early, so a failure there names the step; this is the whole run's.
+const TYPED_PASSWORDS: &[&str] = &[
+    DEMO_PASSWORD,
+    LOGIN_WRONG_PASSWORD,
+    WITH_WRONG_PASSWORD,
+    BOB_PASSWORD,
+    BOB_NEW_PASSWORD,
+    BOB_MISTYPED_PASSWORD,
+];
 
 /// The greeter's window, `GREETER_W`×`GREETER_H` — **this file's own copy** of
 /// `desktop-session-mgr`'s pair, as every chrome metric here is a copy (M11 decision 2).
@@ -360,6 +382,7 @@ fn main() -> ExitCode {
         "check-storage",
         "check-report",
         "check-install",
+        "check-recovery",
         "shot",
         "bench-compose",
         "qemu",
@@ -443,6 +466,7 @@ fn main() -> ExitCode {
         Some("check-live") => cmd_check_live(accel, gate_size),
         Some("check-storage") => cmd_check_storage(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
+        Some("check-recovery") => cmd_check_recovery(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
@@ -487,6 +511,7 @@ fn print_help() {
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
            check-install     install to a blank disk from the live menu, then boot that disk\n  \
+           check-recovery    reset a password on an installed disk from the live image, then boot it\n  \
            check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
@@ -578,6 +603,9 @@ const COREUTILS: &[&str] = &[
     // The machine's disks (administration Part C.7): `--list` from any session, and `--mount` and
     // `--unmount` from a view with the `storage` grant.
     "disk",
+    // The accounts (administration Part D.4): `--list` and your own `--password` from any session,
+    // the rest from a view with the `accounts` grant, or on a users file for recovery.
+    "account",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -1376,6 +1404,16 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
     match result {
         Ok(n) => {
             check_diagnostic_colour(&transcript)?;
+            // **No password typed at a prompt reached the console** (administration Part D.4).
+            // Every prompt here turns echo off — the login, `with`'s, `account`'s — so a password
+            // in the transcript is a prompt that did not, and it would be in every log that keeps
+            // this one.
+            if let Some(p) = TYPED_PASSWORDS.iter().position(|p| transcript.contains(p)) {
+                return Err(format!(
+                    "password {p} of TYPED_PASSWORDS appears in the serial transcript: a prompt echoed it"
+                )
+                .into());
+            }
             println!("\nxtask: interactive tests PASSED ({n} steps)");
             Ok(())
         }
@@ -1408,7 +1446,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    one so a broken denial cannot hide behind a successful login.
     s.send("alice")?;
     s.expect("password:")?;
-    s.send("wrong-password")?;
+    s.send(LOGIN_WRONG_PASSWORD)?;
     s.expect("login incorrect")?;
     s.expect("nitrox login:")?;
     steps += 1;
@@ -1923,7 +1961,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          storage service what is in use first, and `/dev/blk/0` holds `init`'s root, so the
     //          listing never names it. Until C.6 this step expected `/dev/blk/0` — the disk under
     //          a live server, handed over raw.
-    const WRONG: &str = "not-the-password-4271";
+    const WRONG: &str = WITH_WRONG_PASSWORD;
     s.send("with admin nxinstall")?;
     s.expect("[with admin] password (1 of 3): ")?;
     s.send(WRONG)?;
@@ -2018,6 +2056,189 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("[with admin] password (1 of 3): ")?;
     s.send(DEMO_PASSWORD)?;
     s.expect("it holds no filesystem this service can serve")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20d. **The policy, changed and put back** (administration Part D.2).
+    //      (a) Outside a view with the `views` grant there is no `/dev/policy`, and `with` names
+    //          the view to use.
+    s.send("with --show")?;
+    s.expect("with: cannot show the policy without the views grant")?;
+    s.expect("/home>")?;
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    //      (b) A copy of the policy, to put back at the end.
+    admin(s, "with --show ./policy.txt")?;
+    s.expect("with: wrote the policy to a copy")?;
+    s.expect("/home>")?;
+    //      (c) **An edited copy, one view more**, typed as lists of lines — `save` writes a list of
+    //          strings a line each, where a single string would be a character per line. **In
+    //          parts, each under the console's 256-byte input ring**
+    //          (`kernel/src/drivers/console.rs`): a longer line can overrun it, lose its end and
+    //          its newline, and never reach the shell. The parts are joined by `open`, whose rows
+    //          are mapped back to strings.
+    let lines = |ls: &[&str]| {
+        let quoted: Vec<String> = ls.iter().map(|l| format!("\"{}\"", l.replace('"', "\\\""))).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let part = |s: &mut Session, file: &str, ls: &[&str]| -> R<()> {
+        let command = format!("{} | save ./{file}", lines(ls));
+        if command.len() >= 240 {
+            return Err(format!(
+                "a typed line of {} bytes would overrun the console's 256-byte input ring",
+                command.len()
+            )
+            .into());
+        }
+        s.send(&command)?;
+        s.expect("/home>")?;
+        Ok(())
+    };
+    part(s, "e1.txt", &[
+        "[profile.admin]",
+        "grants = [\"disks\", \"storage\", \"views\", \"accounts\"]",
+        "[profile.install]",
+        "grants = [\"disks\"]",
+        "[profile.d2test]",
+        "grants = []",
+    ])?;
+    part(s, "e2.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"admin\"]", "run = [\"*\"]", "auth = \"password\""])?;
+    part(s, "e3.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"install\"]", "run = [\"nxinstall\"]", "auth = \"password\""])?;
+    part(s, "e4.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"d2test\"]", "run = [\"nxsh\"]", "auth = \"none\""])?;
+    s.send("open ./e1.txt ./e2.txt ./e3.txt ./e4.txt | map { |r| r.line } | save ./edited.txt")?;
+    s.expect("/home>")?;
+    admin(s, "with --install ./edited.txt")?;
+    s.expect("with: install: the policy is installed")?;
+    s.expect("/home>")?;
+    //      (d) The broker reads the new policy for the next request, so the new view is there.
+    let rows = "format(\"d2test-rows={}\", (with --list | filter view == \"d2test\" | count))";
+    s.send(rows)?;
+    s.expect("d2test-rows=1")?;
+    s.expect("/home>")?;
+    //      (e) **A copy nobody could administer is refused**: its admin profile has lost `views`.
+    part(s, "orphaned.txt", &[
+        "[profile.admin]",
+        "grants = [\"disks\", \"storage\"]",
+        "[[rule]]",
+        "who = [\"alice\"]",
+        "use = [\"admin\"]",
+        "run = [\"*\"]",
+        "auth = \"password\"",
+    ])?;
+    admin(s, "with --install ./orphaned.txt")?;
+    s.expect("no account that exists could use `views` for every program")?;
+    s.expect("/home>")?;
+    //      (f) The original, put back, and the view gone with it.
+    admin(s, "with --install ./policy.txt")?;
+    s.expect("with: install: the policy is installed")?;
+    s.expect("/home>")?;
+    s.send(rows)?;
+    s.expect("d2test-rows=0")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20e. **An account's life at the real prompt** (administration Part D.4): `account`, a
+    //      person's way to the accounts the view broker fronts. Bob is a fixture this step makes
+    //      and removes, like `alice`'s build-input password; nothing persists past it.
+    //
+    //      (a) `account --list` from any session: alice, administering, in one session — this one.
+    let rows = |what: &str| format!("format(\"{what}={{}}\", (account --list | filter name == \"{what}\" | count))");
+    s.send("format(\"alice-row={}\", (account --list | filter name == \"alice\" | filter administers == true | filter sessions == 1 | count))")?;
+    s.expect("alice-row=1")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=0")?;
+    s.expect("/home>")?;
+    //      (b) **Added through the `accounts` grant**: alice's password for the view, then bob's
+    //          twice, echo off, on the terminal `with` handed on.
+    s.send("with admin account --add bob")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("new password for bob: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("account: added bob, with a new home at /home/bob")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=1")?;
+    s.expect("/home>")?;
+    //      (c) **Bob logs in**, at the same prompt alice did, into the home the broker made — with
+    //          the three folders a file browser offers already in it.
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("whoami")?;
+    s.expect("bob")?;
+    s.expect("/home>")?;
+    s.send("list .")?;
+    s.expect_all(&["Documents", "Downloads", "Pictures"])?;
+    s.expect("/home>")?;
+    //      (d) **His own password**, with no view: the current one, then a new one twice. A
+    //          mismatch first, which changes nothing and is said before anything is sent.
+    s.send("account --password")?;
+    s.expect("current password: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("new password: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_MISTYPED_PASSWORD)?;
+    s.expect("account: the two passwords did not match; nothing was changed")?;
+    s.expect("/home>")?;
+    s.send("account --password")?;
+    s.expect("current password: ")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("new password: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("account: your password is changed")?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    //      (e) The old password refused, and the new one taken.
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    //      (f) **Back as alice, bob removed** with his home — he is logged out, so the broker lets
+    //          it happen — after which the list has no bob and his login is refused.
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("with admin account --remove bob --home")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("account: removed bob, and /home/bob with it")?;
+    s.expect("/home>")?;
+    s.send(&rows("bob"))?;
+    s.expect("bob=0")?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send("bob")?;
+    s.expect("password:")?;
+    s.send(BOB_NEW_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -3976,30 +4197,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
 /// the file holding the pattern.
 fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
     let fs_img = storage_root_fs(disk, work)?;
-    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
-    // `check_installed_root` reads it.
-    let out = Command::new("e2fsck")
-        .args(["-fn", &fs_img.display().to_string()])
-        .output()
-        .map_err(|e| format!("run e2fsck: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    if text.contains("? no") || !text.contains(" files (") {
-        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
-    }
-    println!("  ok: e2fsck -fn finds it clean");
-    let state = ext4_s_state(&fs_img)?;
-    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
-        return Err(format!(
-            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
-             set. The unmount's `Meta::Unmount` is what records it clean"
-        )
-        .into());
-    }
-    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    check_left_clean(&fs_img)?;
     let path = format!("/{STORAGE_PATTERN_FILE}");
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
     match debugfs_cat(&fs_img, &path)? {
@@ -4016,6 +4214,308 @@ fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
         None => return Err(format!("{path} is not on the disk").into()),
     }
     println!("  ok: {path} holds the pattern, {STORAGE_PATTERN_LEN} bytes, read by debugfs");
+    Ok(())
+}
+
+/// **What an unmount through the storage service must leave**, read on the host from the carved
+/// filesystem `fs_img`: `e2fsck -fn` clean, and the superblock's `s_state` recording a clean
+/// unmount with no error — `check-storage`'s and `check-recovery`'s.
+fn check_left_clean(fs_img: &Path) -> R<()> {
+    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
+    // `check_installed_root` reads it.
+    let out = Command::new("e2fsck")
+        .args(["-fn", &fs_img.display().to_string()])
+        .output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
+    }
+    println!("  ok: e2fsck -fn finds it clean");
+    let state = ext4_s_state(fs_img)?;
+    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
+        return Err(format!(
+            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
+             set. The unmount's `Meta::Unmount` is what records it clean"
+        )
+        .into());
+    }
+    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    Ok(())
+}
+
+/// The password `check-recovery` resets `alice`'s to, on the installed disk — a fixture like
+/// `DEMO_PASSWORD`, for a disk the gate made and throws away.
+const RECOVERED_PASSWORD: &str = "alice after recovery";
+
+/// `cargo xtask check-recovery` — **a forgotten password, reset from the live image**
+/// (administration Part D.5), on demand like `check-install`: two boots and a disk image.
+///
+/// Recovery is the one account path nobody exercises until they need it, and then there is no
+/// administrator to ask: the person has forgotten the password `with admin` wants. So the gate is
+/// the path a person takes on the laptop, with no view and no service writing the file.
+///
+/// **The first boot** is the live image as a USB stick beside **a copy of the release disk**,
+/// its root marked not cleanly unmounted as an installed machine's is. On the serial console,
+/// logged in as the live image's own `alice`:
+/// - the disk's `nitrox-root` is auto-mounted read-only; `with admin disk` unmounts it and mounts
+///   it writable — the live image's `alice` is its administrator, not the installed one's;
+/// - `account --password alice --users /storage/nitrox-root/system/users` sets a new password in
+///   **that disk's** file, typed twice;
+/// - `with admin disk --unmount` leaves it clean;
+/// - and the live system's own `alice` still logs in with the old password: the file edited was
+///   the disk's, not the running system's, which no session can reach.
+///
+/// **Between the boots, on the host**: the filesystem carved out of the disk is clean, and its
+/// `/system/users` differs from what the release disk shipped **in `alice`'s line alone**.
+///
+/// **The second boot** is that disk alone, with no stick: the old password is refused at the
+/// login, and the new one taken. And neither boot printed either password.
+fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    require_tool("e2fsck")?;
+    require_tool("debugfs")?;
+    // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
+    // wrote.
+    cmd_image(BuildMode::Normal)?;
+    let work = build_cache().join("check-recovery");
+    fs::create_dir_all(&work)?;
+    let disk = work.join("disk.img");
+    let _ = fs::remove_file(&disk);
+    fs::copy(image_path(), &disk)?;
+    mark_root_not_clean(&disk)?;
+    let shipped = debugfs_cat(&storage_root_fs(&disk, &work)?, "/system/users")?
+        .ok_or("the release disk has no /system/users")?;
+    cmd_image_live()?;
+    let ovmf = locate_ovmf()?;
+    let secrets = [DEMO_PASSWORD, RECOVERED_PASSWORD];
+    let leaked = |transcript: &str| secrets.iter().position(|p| transcript.contains(p));
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-drive")
+        .arg(format!("if=none,id=disk,format=raw,file={}", disk.display()))
+        .arg("-device")
+        .arg("ide-hd,drive=disk,bus=ide.0")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: recovery gate — booting the live image beside a copy of the release disk…\n");
+    let mut session = Session::spawn(cmd, "check-recovery")?;
+    let result = run_recovery_steps(&mut session);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    if let Some(p) = leaked(&transcript) {
+        return Err(format!("password {p} reached the console on the live boot: a prompt echoed it").into());
+    }
+
+    println!("\nxtask: the machine is stopped; the disk, on the host:");
+    let fs_img = storage_root_fs(&disk, &work)?;
+    check_left_clean(&fs_img)?;
+    let users = debugfs_cat(&fs_img, "/system/users")?.ok_or("the disk has no /system/users")?;
+    check_recovered_users(&shipped, &users)?;
+
+    println!("\nxtask: booting the disk alone…\n");
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", disk.display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut session = Session::spawn(cmd, "check-recovery-boot")?;
+    let result = run_recovered_boot_steps(&mut session);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    if let Some(p) = leaked(&transcript) {
+        return Err(format!("password {p} reached the console on the disk's boot: a prompt echoed it").into());
+    }
+    println!("\nxtask: a password reset from the live image logs in on the installed disk ✓");
+    Ok(())
+}
+
+/// Wait for the serial login prompt, searched for in the whole transcript as `check-live` does:
+/// it and the greeter come up together, so an `expect` could scan past it.
+fn await_serial_login(s: &mut Session) -> R<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !s.transcript().contains("nitrox login:") {
+        if std::time::Instant::now() > deadline {
+            return Err("no `nitrox login:` prompt on the serial column".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The live boot: the disk's root made writable, `alice`'s password set in its file, and unmounted.
+fn run_recovery_steps(s: &mut Session) -> R<()> {
+    let users = format!("/storage/{ROOT_PARTLABEL}/system/users");
+
+    // 1. **The disk's root, auto-mounted read-only**, the boot being a live one; its name is read
+    //    off the line the storage service reports it on.
+    let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
+    s.expect(&reported)?;
+    let line = s
+        .transcript()
+        .lines()
+        .find(|l| l.contains(&reported))
+        .map(str::to_string)
+        .ok_or("the report line went missing from the transcript")?;
+    let name = line
+        .split_whitespace()
+        .find(|w| w.starts_with("blk-"))
+        .ok_or_else(|| format!("no `blk-<n>` in {line:?}"))?
+        .to_string();
+    let index = name.trim_start_matches("blk-").to_string();
+    if !line.contains(&format!("mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
+        return Err(format!("the disk's {ROOT_PARTLABEL} is not auto-mounted read-only: {line:?}").into());
+    }
+    println!("  ok: {name}, the disk's {ROOT_PARTLABEL}, auto-mounted read-only on a live boot");
+
+    // 2. The live image's `alice`, on the serial column.
+    await_serial_login(s)?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+
+    // 3. **Writable**, through the live image's own administrator.
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    admin(s, &format!("disk --mount /dev/blk/{index}"))?;
+    s.expect(&format!("storage-service: mounted {ROOT_PARTLABEL} (rw), as asked"))?;
+    s.expect(&format!("disk: mounted {name} at /storage/{ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: `with admin disk` unmounted it and mounted it writable");
+
+    // 4. **The reset**: no view and no service — `libusers` on the disk's file.
+    s.send(&format!("account --password alice --users {users}"))?;
+    s.expect("new password for alice: ")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect(&format!("account: set a new password for alice in {users}"))?;
+    s.expect("/home>")?;
+    println!("  ok: account --password alice --users set it in the disk's file");
+
+    // 5. Unmounted, and left clean.
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+
+    // 6. **The running system's own file is untouched**: its `alice` logs in as before.
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    println!("  ok: unmounted clean, and the live system's own alice logs in as before");
+    Ok(())
+}
+
+/// `alice`'s line changed, **and nothing else**: every other line of `shipped` is in `now` byte for
+/// byte, and `alice`'s new record takes the recovered password and refuses the old one.
+fn check_recovered_users(shipped: &[u8], now: &[u8]) -> R<()> {
+    let lines = |b: &[u8]| -> Vec<Vec<u8>> { b.split(|&c| c == b'\n').map(|l| l.to_vec()).collect() };
+    let (before, after) = (lines(shipped), lines(now));
+    let is_alice = |l: &[u8]| l.starts_with(format!("{DEMO_USER}:").as_bytes());
+    if before.len() != after.len() {
+        return Err(format!("/system/users went from {} lines to {}", before.len(), after.len()).into());
+    }
+    for (b, a) in before.iter().zip(&after) {
+        if is_alice(b) != is_alice(a) || (!is_alice(b) && b != a) {
+            return Err(format!(
+                "a line other than alice's changed in /system/users: {:?} became {:?}",
+                String::from_utf8_lossy(b),
+                String::from_utf8_lossy(a)
+            )
+            .into());
+        }
+        if is_alice(b) && b == a {
+            return Err("alice's line in the disk's /system/users is as the release disk shipped it".into());
+        }
+    }
+    let alice = libusers::find(now, DEMO_USER.as_bytes()).ok_or("the disk's /system/users has no alice")?;
+    if !alice.verifies(RECOVERED_PASSWORD.as_bytes()) || alice.verifies(DEMO_PASSWORD.as_bytes()) {
+        return Err("alice's new record does not take the recovered password, or still takes the old one".into());
+    }
+    // **Under a fresh salt**: a whole one, from the entropy source, and not the build's.
+    let salt_of = |file: &[u8]| {
+        let mut out = [0u8; libusers::SALT_MAX];
+        let n = libusers::find(file, DEMO_USER.as_bytes()).and_then(|r| r.salt(&mut out)).unwrap_or(0);
+        out[..n].to_vec()
+    };
+    let (old, new) = (salt_of(shipped), salt_of(now));
+    if new.len() != libusers::SALT_LEN || new.iter().all(|&b| b == 0) || new == old {
+        return Err(format!(
+            "alice's new salt is {} bytes {:02x?}: not a fresh {}-byte one from the entropy source",
+            new.len(),
+            new,
+            libusers::SALT_LEN
+        )
+        .into());
+    }
+    println!("  ok: /system/users changed in alice's line alone, to the recovered password, under a fresh salt");
+    Ok(())
+}
+
+/// The disk alone: the old password refused at the login, and the new one taken.
+fn run_recovered_boot_steps(s: &mut Session) -> R<()> {
+    s.expect(&format!("init:   /: fs-server-ext4 on gpt-partlabel:{ROOT_PARTLABEL} (rw)"))?;
+    await_serial_login(s)?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect("/home>")?;
+    println!("  ok: on the disk alone, alice's old password is refused and the recovered one logs in");
     Ok(())
 }
 
@@ -11750,6 +12250,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libusers` — the user database's format and its edits, shared by `auth-service`, `account`
+    // and this build since administration Part D.1.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libusers")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libinittoml` — the `init.toml` parser, shared by `init` and the storage service since
     // administration Part C.5, and its tests with it.
     run(Command::new("cargo")
@@ -14235,7 +14745,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\
@@ -14911,27 +15421,28 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // `/system/users` — the auth-service credential DB (passwd-style:
     // `name:salt_hex:iterations:verifier_hex:home`). Seeded here so NO plaintext or
     // verifier is committed to the source tree: the stored value is the one-way
-    // PBKDF2 of the fixture password, computed with the *same* libcrypto the
-    // on-target auth-service verifies with (no drift). The fixture credential is a
-    // build input for the emulator demo user, not a secret; init's login selftest
-    // (auth Part E) uses the same literals. See docs/architecture/session-and-auth.md.
+    // PBKDF2 of the fixture password. The fixture credential is a build input for the
+    // emulator demo user, not a secret. See docs/architecture/session-and-auth.md.
+    //
+    // **Written by `libusers::write_record`** (administration Part D.1), the function
+    // `auth-service` rewrites the file with and `account`'s offline mode edits it with — so the
+    // seeded line is one the service reads by construction, where it was formatted by hand here
+    // until then.
     {
-        use std::fmt::Write as _;
-        let iters = libcrypto::password::DEFAULT_ITERATIONS;
-        let verifier = libcrypto::password::derive(DEMO_PASSWORD.as_bytes(), &DEMO_SALT, iters);
-        let mut users = String::new();
-        users.push_str("# Nitrox user database (auth-service).\n");
-        users.push_str("# name:salt_hex:iterations:verifier_hex:home\n");
-        write!(users, "{DEMO_USER}:").unwrap();
-        for b in &DEMO_SALT {
-            write!(users, "{b:02x}").unwrap();
-        }
-        write!(users, ":{iters}:").unwrap();
-        for b in &verifier {
-            write!(users, "{b:02x}").unwrap();
-        }
-        writeln!(users, ":{DEMO_HOME}").unwrap();
-        fs::write(staging.join("system").join("users"), users.as_bytes())?;
+        let mut users = Vec::from(
+            &b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n"[..],
+        );
+        let mut line = [0u8; libusers::MAX_FILE];
+        let n = libusers::write_record(
+            &mut line,
+            DEMO_USER.as_bytes(),
+            DEMO_HOME.as_bytes(),
+            DEMO_PASSWORD.as_bytes(),
+            &DEMO_SALT,
+        )
+        .map_err(|r| format!("seed the demo account: {}", String::from_utf8_lossy(r.why())))?;
+        users.extend_from_slice(&line[..n]);
+        fs::write(staging.join("system").join("users"), &users)?;
     }
     // `/system/views.toml` — the view broker's policy (administration Part A.6). The demo account
     // administers the machine, as it is the only account the build makes; `install` is a narrower
@@ -14966,9 +15477,10 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
             "xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)"
         );
     }
-    // **The folders the browser's sidebar offers** (M14 Part D). Staged here while there is one
-    // demo home; the right answer once there are real users is for the session to make them on
-    // first login, which is `TODO(home-folders)` rather than built.
+    // **The folders the browser's sidebar offers** (M14 Part D). Staged here for the demo home.
+    // Whoever makes a home makes them: the view broker for every account an administrator adds
+    // (administration Part D.3), and Part G's installer for the first, which is what
+    // `TODO(home-folders)` still waits on.
     //
     // **Spelled twice, and checked by a boot rather than by the compiler.** `libfs` names the
     // same three in `HOME_FOLDERS` and this crate does not link it — that is the same reason the

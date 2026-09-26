@@ -66,6 +66,7 @@ cargo xtask image --live   # the live image: release root as a RAM-disk module, 
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
 cargo xtask check-install  # install to a blank disk from the live menu, then boot that disk
+cargo xtask check-recovery # reset a password on an installed disk from the live image, then boot it
 cargo xtask image --live --selftest # the test live image: the live stick with the test packages
 cargo xtask check-storage  # that stick beside a copy of the release disk; the host checks the disk
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
@@ -96,7 +97,7 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
 `cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 31 steps,
+the real prompt over the serial console and matches on what comes back — 33 steps,
 expect-driven rather than sleep-driven.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
@@ -179,6 +180,17 @@ group 0**, done with the allocator the guest runs because a size assertion passe
 with allocation confined to the first group. The file goes to a copy, so the disk that boots is
 the one the installer made. The second boot is that disk alone, with no stick, and a greeter on
 it.
+
+`cargo xtask check-recovery` is the **recovery gate** (administration Part D.5), on demand like
+`check-install`: two boots and a copy of the release disk. It is the one account path nobody
+exercises until they need it, when there is no administrator to ask. The first boot is the live
+image beside that copy, logged in on serial as the live image's own `alice`: `with admin disk`
+remounts the disk's root writable, and `account --password alice --users
+/storage/nitrox-root/system/users` sets a new password in **that disk's** file — `libusers` on the
+file, no view and no service — before an unmount leaves it clean. The host then carves the
+partition out: `e2fsck -fn` clean, and `/system/users` changed in `alice`'s line alone, under a
+fresh salt. The second boot is the disk alone: the old password is refused at the login and the
+new one taken. Neither boot may print either password.
 
 `cargo xtask check-storage` is the **storage gate** (administration Part C.8), and the one whose
 verdict is a disk. It boots the **test live image** (`image --live --selftest`: the live stick with

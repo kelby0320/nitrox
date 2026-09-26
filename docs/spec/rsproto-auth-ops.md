@@ -8,9 +8,11 @@ kernel knows nothing of users or credentials; this is a pure userspace
 request/reply between two userspace processes (typically session-mgr → auth-service).
 
 **Status:** Pre-stabilization. Introduced with the Auth + session-mgr slice
-(`docs/architecture/session-and-auth.md`). Only `Authenticate` is defined;
-credential *management* ops (add/remove user, change password) are deferred with
-their consumers.
+(`docs/architecture/session-and-auth.md`). `Authenticate` is the oracle's op. **The
+management ops — `List`, `Add`, `Remove`, `SetPassword` — arrived with administration Part
+D.1 (2026-09-25)**, on an admin session of their own (§ *Administration*). The view broker asks
+`List` from Part D.2, to judge a policy, and since Part D.3 fronts all four for people
+([`rsproto-views-ops.md`](rsproto-views-ops.md)).
 
 ## Why a dedicated category
 
@@ -92,10 +94,54 @@ An `RsFlags::ERROR` reply (per the [envelope spec](rsproto-wire-format.md)) is u
 all — a truncated/malformed body, or an internal fault. A wrong or unknown
 credential is **not** an error; it is `result = DENIED`.
 
+## Administration (`op = 0x0801`–`0x0804`, administration Part D.1)
+
+**An admin session is a second kind of session**, opened by resolving `/svc/auth/admin` — the
+suffix `admin` — where `/svc/auth` itself opens an oracle session. An admin session answers only
+the four ops below; `Authenticate` there is refused `Unsupported`, and an admin op on an oracle
+session is an error reply too. Any other suffix is `NotFound`, answered with the whole twelve-byte
+`ErrorBody`.
+
+**Who may open one.** The view broker, which fronts every account operation and applies the guards
+(`administration.md` § *Part D in detail*), is the one client meant to. It holds one from Part
+D.2, opened on first need, and asks `List` to learn which accounts exist when it judges a policy
+([`rsproto-views-ops.md`](rsproto-views-ops.md) § `Check`). Since Part D.3 it sends `Add`,
+`Remove` and `SetPassword` there too, once its own guards have passed. The session is resolved
+from the root namespace, so **anything holding the root namespace can open one** — the boundary
+`/svc/auth` has always had (`TODO(svc-auth-ungated)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md)). It adds no authority there: a root
+holder can already map `/system/users` writable.
+
+**A refusal is an error reply**, unlike `Authenticate`'s `DENIED`: the standard
+[`ErrorBody`](rsproto-wire-format.md#error-replies), with a reason.
+
+| Op | Request body | Reply body |
+|---|---|---|
+| `List` (`0x0801`) | empty | `count: u16`, then per account `name_len: u8`, the name, `home_len: u8`, the home, in the file's order |
+| `Add` (`0x0802`) | a name and a password, laid out as `Authenticate`'s request, **accounted for exactly** | empty. The home is `/home/<name>`, not sent |
+| `Remove` (`0x0803`) | the name's bytes | empty |
+| `SetPassword` (`0x0804`) | a name and a password, as `Add`'s | empty. The record keeps its name, its place in the file and its home |
+
+| Refusal | When |
+|---|---|
+| `InvalidArgument` | a name that is not 1 to 32 bytes of a lowercase letter or `_` then lowercase letters, digits, `_` or `-` — for `Add`, `Remove` and `SetPassword` alike, **before the account is looked for**, so a mistyped name is never reported missing; a password not 1 to 128 bytes, likewise first; a body that does not account for itself exactly |
+| `AlreadyExists` | `Add` of a name an account has |
+| `NotFound` | `Remove` or `SetPassword` of a name no account has |
+| `TooLarge` | the file would be larger than `libusers::MAX_FILE`, 4 KiB, the most the service loads at boot; or the account list does not fit in one message |
+| `IoError` | the write did not hold; the reason names the step. The file and the service's copy are as they were |
+| `Unsupported` | `Authenticate`, or any other op, on an admin session |
+
+**A write is atomic.** The new file is written to `/system/users.new`, synced, then renamed over
+`/system/users`. A leftover `users.new`, from a write that died, is cut to nothing first. The
+service's copy in memory changes only once the rename has held. A new password gets a fresh
+16-byte salt from the kernel's entropy source and `libcrypto`'s `DEFAULT_ITERATIONS`; each record
+keeps its own count.
+
+**The file's format is `libusers`'**, the crate `auth-service`, the build's seeder and `account`
+all write it through.
+
 ## Deferred
 
-- User *management* ops (create/delete user, change password) — the DB is read-only
-  in the introducing slice.
 - Roles / group membership in the reply (the principal is a bare identity today);
   role-to-capability mapping is a session-mgr/privilege-broker concern.
 - Session *tokens* (a reusable post-login credential) — each login re-authenticates.

@@ -1,0 +1,9 @@
+[package]
+name = "libusers"
+version = "0.1.0"
+edition = "2024"
+
+# `core` only, like `libcrypto` beneath it: the file is at most `MAX_FILE` bytes, and every edit
+# writes into a buffer its caller owns, so `auth-service` can stay free of `alloc`.
+[dependencies]
+libcrypto = { path = "../libcrypto" }

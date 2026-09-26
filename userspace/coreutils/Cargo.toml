@@ -21,6 +21,9 @@ libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
+# The user database's rules and its edits: `account` checks a name and a password against them
+# before sending either, and its offline mode edits a users file with them (administration D.4).
+libusers = { path = "../libusers" }
 
 [lib]
 name = "coreutils"
@@ -71,3 +74,10 @@ path = "src/bin/whoami.rs"
 [[bin]]
 name = "disk"
 path = "src/bin/disk.rs"
+
+# The accounts (administration Part D.4): the list for anyone, a person's own password through
+# `/dev/views`, and adding, removing and setting passwords through the `accounts` grant — or, from
+# the live image, in a users file directly.
+[[bin]]
+name = "account"
+path = "src/bin/account.rs"

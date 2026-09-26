@@ -11,6 +11,9 @@ libstream = { path = "../libstream", features = ["io"] }
 libsession = { path = "../libsession" }
 libfs = { path = "../libfs" }
 liblog = { path = "../liblog" }
+# The user database's rules — a name and a password — checked here before a name reaches a path
+# (`/home/<name>`) or a log line (administration Part D.3).
+libusers = { path = "../libusers" }
 
 # The library/binary split every resource server here uses: the library is the part that can
 # be wrong about who may do what — the `views.toml` reader, rule evaluation, the

@@ -29881,3 +29881,440 @@ blocking problem and two worth fixing, and made three optional points. All six a
 - **What every session can read is decided**: the account list and its own policy rows. The
   policy's text moved behind the `views` grant, as `sudoers` is readable by root alone.
 
+
+## 2026-09-25 — Administration D.1: `libusers`, and `auth-service` writes the user database
+
+**What landed:**
+- **`libusers`**, a new `core`-only crate over `libcrypto`, holds the file's format:
+  - parse a record, and write one;
+  - the name rules (1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_`
+    or `-`) and the password bounds (1 to 128 bytes);
+  - `MAX_FILE`, 4 KiB;
+  - three no-`alloc` edits, `add`, `remove` and `set_password`. Each writes the whole new file
+    into its caller's buffer and keeps every other line byte for byte.
+
+  `auth-service`'s parser moved out into it, and the build's seeder now writes the demo account
+  through `write_record`, where it formatted the line by hand.
+- **`auth-service`'s admin session**, opened by resolving `/svc/auth/admin`, answers four ops:
+  `List`, `Add`, `Remove` and `SetPassword` (`rsproto-auth-ops.md` § *Administration*,
+  `0x0801`–`0x0804`). How it is served:
+  - `serve_admin`, in the host-tested library, decides each request: a reply, a new file, or a
+    refusal with its `KError` and reason.
+  - The server draws a 16-byte salt from the kernel's entropy source for each new password.
+  - It installs a new file atomically: a leftover `users.new` is cut to nothing, then the new one
+    is created, written through a mapping, unmapped, synced and renamed over `/system/users`.
+  - **It changes its copy in memory only once the rename has held.** It zeroes the request buffer
+    after every session request, since three ops carry passwords.
+  - It stays `no_std` with no `alloc`.
+- **`Add` takes no home**: it is always `/home/<name>`, where the pass said "a name, a password and
+  a home".
+
+**A pre-existing bug, fixed on the way.** `auth-service` refused a resolve with a 4-byte error body,
+and the kernel reads anything shorter than the 12-byte `ErrorBody` on a forwarded resolve as
+malformed, handing the caller `KernelError`. So `WouldBlock` for a full table, and now `NotFound`
+for an unknown suffix, arrived as `KernelError`. The view broker had the same bug, fixed in PR #329's
+review. The probe now asserts that `/svc/auth/nope` is `NotFound`.
+
+**D's share of `TODO(svc-auth-ungated)` is recorded now**, not with D's docs, because the admin
+session exists from this piece on.
+
+**A control passed at first, and it was the test's fault.** With `libusers`' bound moved off by
+one, every test still passed. The tests' output buffer was exactly `MAX_FILE` long, so the buffer's
+own length check refused the extra byte before the bound could. The tests now edit into a buffer
+twice that, and the same control fails both boundary tests.
+
+**Gates:**
+- Host tests:
+  - `libusers` (16): the format both ways, including a record written by hand as the build's
+    was; each rule at its edges; each edit keeping the rest byte for byte; the bound at exactly
+    `MAX_FILE` and one byte more, for an add and for a password change that grows the salt from 8
+    bytes to 16.
+  - `auth-service` (10), which now authenticates through `libusers`: a record added, changed and
+    removed through `serve_admin`, authenticating as each file says; `List`; each refusal with its
+    error.
+  - `librsproto` (4 new): the account list and account requests both ways, and the list reader
+    fed bytes no correct writer makes.
+- **`boot-probe`** drives the admin session:
+  - an unknown suffix is `NotFound`;
+  - `List` names `alice`;
+  - an account is added and authenticates on an oracle session, with its home;
+  - its password is set, after which the old one is refused and the new one accepted;
+  - it is removed and refused, and a second removal is `NotFound`;
+  - a duplicate add, a bad name, `Authenticate` on the admin session and `List` on an oracle one
+    are each refused.
+
+  **After each write, `/system/users` is read raw from the device** through the ext4 library, and
+  `alice`'s line is the same bytes throughout.
+
+**Controls:**
+- 3 on host tests, each failing its own test:
+  - `add` not refusing a taken name;
+  - the bound off by one (after the buffer fix above);
+  - a new password appended instead of put in place.
+- 3 `test-qemu --kvm` boots, each failing at its check:
+  - **the install skipping the rename**: the oracle still authenticated the new account from
+    memory, and only the device read failed, which is what that read is for;
+  - the 4-byte resolve error again;
+  - memory not updated after an install.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.2: the policy, the `views` grant, and what an administrator is
+
+**What landed.** `with --show [FILE]` and `with --install FILE` read and replace
+`/system/views.toml`, through a new `views` grant. The seeded `admin` profile gains `views`.
+- **The grant binds the broker's policy endpoint** at `/dev/policy` in the view, with the base
+  `/policy/<session>`. A resolve there reaches the broker as that session's **policy channel**, one
+  wait-set slot, which answers `Show` (`0x0E08`) and `Install` (`0x0E09`). Nothing else answers
+  them: on a client channel they are `Unsupported`, because a session does not hold `/system`, and
+  the policy is not every session's to read.
+- **The broker binds its own forwarding endpoint**, which `init` holds and binds at `/svc/views`.
+  It keeps a duplicate made before `Meta::Ready` hands the original over.
+- **`Install` is judged as `Check` is, then replaced atomically:** `views.toml.new` is written,
+  synced, and renamed over the file. Every install and every refusal, with its reason, goes to the
+  audit log as the session's principal. A text is at most `POLICY_MAX`, 3584 bytes, one message's
+  body.
+- `CloseSession` closes the session's policy channels and unbinds `/dev/policy` in its running
+  views.
+
+**An administrator is an account that exists, which a rule lets use a profile granting `views`
+with `run = ["*"]`** (`Policy::administrators`). This is PR #337's review definition, now in code:
+- The grant decides, not the profile's name.
+- A rule for one program does not count.
+- `who = ["*"]` counts every account; a name with no account counts nothing.
+- `with --check` and `Install` judge with the same list and definition. A policy that reads but
+  leaves nobody is refused by both, with the file untouched.
+
+**Which accounts exist is asked of `auth-service`.** The broker opens an admin session of its own
+at `/svc/auth/admin` on first need, and sends it D.1's `List`. **It fails closed**: if the service
+cannot be asked or does not answer within five seconds, the policy is refused and the session is
+dropped, so the next judgement opens a new one. A policy cannot be said to leave an administrator
+when nobody knows who exists.
+
+**`with --show FILE` writes a file; bare `with --show` prints the text.** Piping it to `save` was
+the obvious shape, but text piped to `save` is written a record per line, `{ line: … }`, which
+does not read back as a policy.
+
+**A kernel console limit, found by the gate, not fixed here.** `test-interactive` first typed each
+policy as one line of about 600 bytes. The echo stopped at about 255 characters and the shell
+never saw the command. The kernel console's input ring is 256 bytes (`RING_CAP`), and it drops a
+byte that arrives when it is full; a line written in one piece evidently arrives faster than it is
+drained, and lines under the ring pass. The line discipline allows 1024 bytes, so **a paste longer
+than the ring can lose its end and its newline over serial.** A person typing does not meet it.
+The gate now builds each policy from typed parts under 256 bytes, joined with `open`, and refuses
+to send a longer line.
+
+**Gates:**
+- **Host tests** (`view-broker`, 21, 4 new):
+  - `views` for every program makes an administrator, and one step away on each axis does not:
+    a single program, a profile without `views`, nobody;
+  - an `admin` profile without `views` is not an administrator, and a profile under another name
+    with it is;
+  - only accounts that exist count, for each shape of `who`;
+  - `check` refuses a policy that reads but leaves nobody, for that reason and not another.
+
+  Every negative case parses first, so an empty answer is the guard's and not the reader's.
+- **`boot-probe`** opens a session as a supervisor does and resolves `/svc/views/policy/<id>`,
+  the suffix the grant's binding forwards to:
+  - a session that is not open has none;
+  - `Show` is the file as the device holds it, read raw, and a client channel refuses it;
+  - a policy whose `admin` lost `views`, and one naming only an account that does not exist, are
+    refused by `Check` and by `Install`, with the device's file unchanged;
+  - a policy with one more view is installed, `Show` and the device hold it, and `List` names it;
+  - the original goes back, and `List` no longer names the view;
+  - after `CloseSession`, the policy channel answers nothing.
+- **`test-interactive`** (32 steps), at the real prompt as `alice`:
+  - `with --show` outside a view is refused, naming the grant;
+  - `with admin with --show` writes a copy;
+  - an edited copy is installed, after which `with --list` shows its view;
+  - a copy leaving no administrator is refused;
+  - the original goes back, and the view is gone.
+
+**Controls:**
+- 4 host, each failing its tests:
+  - the `views` grant ignored;
+  - `run = ["*"]` ignored;
+  - `who` ignored;
+  - `check` without its guard.
+- 3 boots, each failing at its own check:
+  - `Install` skipping the judgement: `test-qemu`, "Install took a policy nobody could
+    administer";
+  - the grant binding nothing: `test-interactive`, at `with admin with --show`;
+  - a closed session keeping its policy channel: `test-qemu`, "a closed session's policy channel
+    still answered".
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.3: the broker fronts accounts
+
+**What landed.** The `accounts` grant binds the broker's forwarding endpoint at `/dev/accounts`,
+with the base `/accounts/<session>`, as D.2's `views` grant binds `/dev/policy`. A resolve there
+is that session's **accounts channel**, one wait-set slot, which answers three ops:
+- `AddAccount` (`0x0E0C`);
+- `RemoveAccount` (`0x0E0D`), with a flag to remove the home;
+- `SetPassword` (`0x0E0E`), someone's password without their current one.
+
+Every session's client channel gains two more, needing no grant:
+- `Accounts` (`0x0E0A`): each account's name, home, open sessions, and whether it could
+  administer;
+- `ChangePassword` (`0x0E0B`): the person's own, proved with the current one.
+
+The seeded `admin` profile gains `accounts`. The broker asks `auth-service`'s admin session
+(D.1) for every write, once its own checks have passed.
+
+**How an add goes, and why in that order.** The name and password are checked against `libusers`'
+rules first, so **a name reaches a path (`/home/<name>`) and a log line only once it is one**; a
+refused name is not echoed back. A taken name is refused before `/home` is touched. Then the home
+is made with `libfs::HOME_FOLDERS`' three folders, or adopted if a removal kept it, and only then
+is the record added. If `auth-service` refuses the record, a home made for it is removed again, so
+a failure leaves nothing. The plan allowed an empty directory.
+
+**The guards, in the library where the host tests reach them** (`view_broker::accounts`):
+- no account of that name;
+- **logged in**: a session the broker opened for it is still open;
+- **the policy does not read**: a removal is refused, since whether an administrator would remain
+  cannot be said;
+- **no account left could administer**, by D.2's definition, over the accounts that would remain.
+
+**`ChangePassword` is held in the same queue as `with`'s passwords.** The new password is checked
+against the rules at once, then the request waits for the session's delay, and a wrong current
+password is a failure like any other. So a program cannot guess faster by switching between
+`Password` and `ChangePassword`, or by opening channels.
+
+**Replies are outcomes with reasons** — what was done ("added d3probe, with a new home at
+/home/d3probe"), or the guard that refused — as `Check` and `Install` answer, so D.4's `account`
+prints what the broker says. **Every write is recorded twice**: the broker's audit names who asked
+and what happened, and `auth-service` logs each write by account name. No password appears in
+either; the gate's log was searched for the probe's.
+
+**`TODO(home-folders)` is resolved for every home an administrator adds**, by the maintainer's
+Part D call that whoever makes a home makes its folders. It stays open for the first account's
+home, which Part G's installer makes.
+
+**A narrower case of a named gap.** The broker learns of a session only from the supervisor's
+`OpenSession`. So a removal between a login's `Authenticate` and that `OpenSession` passes the
+logged-in guard. It is the class Part D's *Left alone* already names for a failed `OpenSession`,
+and it stays open for the same reason: closing it would put the broker on every login's path.
+
+**The probe's shape.** "Through a view as the grant builds it" is met for the binding: `list /dev`
+in the admin view names `accounts` there. The ops are asked at the protocol, on
+`/svc/views/accounts/<id>`, as D.2's were, until D.4's `account` drives them through the binding.
+The helper that runs a program in the admin view, `in_admin_view`, was lifted out of C.7's
+`storage_grant_test`, which now uses it too.
+
+`view-broker` depends on `libusers` now, for the rules; `userspace/Cargo.lock` changes with it.
+
+**Gates:**
+- **Host tests**:
+  - `view-broker` (23, 2 new): the removal guards, each at its neighbour, in the order they are
+    said; `Accounts` counting each account's own sessions, and showing nobody administering when
+    the policy does not read.
+  - `librsproto` (3 new): the account rows both ways, and a reader fed bytes no writer makes; the
+    removal body and its flag; the password change accounted for exactly.
+- **`boot-probe`** (`accounts_test`):
+  - `list /dev` in the admin view names `accounts` and `policy`;
+  - an add refused on a client channel, and a name that is not one refused without a directory;
+  - `d3probe` added with its home and three folders, authenticating;
+  - `Accounts` showing it with no session, then one;
+  - its removal refused while logged in;
+  - `ChangePassword` refused for a wrong current password, then answered only after the delay
+    (2.06 s on the first run), the new password taken and the old refused;
+  - `SetPassword` from the accounts channel;
+  - `alice`'s removal refused as the only administrator;
+  - `d3probe` removed keeping its home, added again adopting it, removed with it, and a second
+    removal refused;
+  - a closed session's accounts channel answering nothing.
+
+**Controls:**
+- 6 host, each failing its test: the logged-in guard gone; the removed account still counted as
+  remaining; an unread policy letting a removal through; an unread policy showing administrators;
+  sessions counted for everyone; an `administers` byte of 2 read.
+- 7 `test-qemu --kvm` boots, each failing at its own check:
+  - the logged-in guard shown no sessions;
+  - `ChangePassword` checked at once instead of held;
+  - a wrong current password starting no delay;
+  - the `accounts` grant binding nothing;
+  - a closed session keeping its accounts channel;
+  - a new home without its folders;
+  - a removal asked to take the home keeping it.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.4: `account`
+
+**What landed.** `account`, a coreutil with five forms, each reaching the authority it needs and
+no more:
+- `--list`: `Table<{name, home, sessions, administers}>`, from the broker's `Accounts` on the
+  session's `/dev/views`. Anyone may read it.
+- `--password`: the person's own. The current password, then a new one twice, sent as
+  `ChangePassword`, which the broker checks under the session's delay.
+- `--add NAME`, `--remove NAME [--home]` and `--password NAME`: on `/dev/accounts`, which only the
+  `accounts` grant binds. So they run as `with admin account …`, and without the grant they fail
+  naming it.
+- `--password NAME --users FILE`: recovery with no service. It edits a users file with `libusers`
+  under a fresh salt from the entropy source, then writes `FILE.new` and renames it over.
+
+**The prompt moved into `coreutils`**, as Part D's detail pass said it would once it had two users:
+- `coreutils::prompt`: `ask_password`, and `ask_new_password`, which asks twice and `confirm`s;
+- `coreutils::ipc`: the send, receive and call plumbing `with` had, which zeroes every buffer a
+  password passes through.
+
+`with` lost 177 lines to them, and gained only the imports and a line of its doc. **`confirm` is
+a pure function, and host-tested**: a mismatch, or a password outside `libusers`' 1 to 128 bytes,
+is refused before anything is sent. So a typing mistake changes nothing, and says so.
+
+**A change is reported as a sentence, not a row.** Part D's detail pass said "`account` writes one
+row". What the broker answers is the result: "added bob, adopting /home/bob, which was already
+there", or the guard that refused. So `account` writes it on `stderr` and, escaped, on the console,
+and `--list` stays the one table. A row would only repeat the name back.
+
+**A new check for all of `test-interactive`: no password it types may appear in the serial
+transcript.** Every prompt the gate answers turns echo off: the login's, `with`'s and `account`'s.
+Until now only step 20b held them to it, and only for the two passwords typed before it; a prompt
+that echoed would put the password in every log that keeps a transcript. The six passwords the
+gate types are listed in `TYPED_PASSWORDS`, and a pass requires none of them in what the guest
+printed.
+
+**The root `CLAUDE.md`'s step count was stale**: it said 31 when D.2 had made it 32. It says 33 now.
+
+**Gates:**
+- **Host tests**: `coreutils` (1 new): `confirm` takes the password typed twice within the rules,
+  and refuses a mismatch — a trailing space included — an empty one, and one byte over the
+  longest.
+- **`test-interactive`**, step 20e (33 steps), at the real prompt:
+  - `account --list` shows alice administering, in one session, and no bob;
+  - `with admin account --add bob`: alice's password for the view, then bob's twice, and the
+    broker's "added bob, with a new home at /home/bob";
+  - bob logs in, `whoami` names him, and `list .` finds `Documents`, `Downloads` and `Pictures`;
+  - `account --password`: a mismatched pair refused before anything is sent, then the change;
+  - the old password is refused at the login and the new one taken;
+  - back as alice, `with admin account --remove bob --home`, after which the list has no bob and
+    his login is refused.
+
+  The removal takes the home, where the plan's step kept it, so that the gate leaves nothing
+  behind. **And no password the gate types reaches the transcript**, checked at the end of the
+  run.
+
+**Controls:**
+- 2 host, each failing its test: the second copy not compared; the rules not applied.
+- 6 `test-interactive --kvm` boots, each failing at its own check:
+  - `confirm` not comparing: the mismatch step;
+  - `ChangePassword` sent with the two swapped: "your password is changed" never comes;
+  - the sessions column always 0: `alice-row=1`;
+  - `--home` not sent: the removal keeps the home;
+  - **echo left on at every prompt**: caught first by step 20b's own check, on `with`'s prompt.
+    That proved nothing about the new check, so a second control left echo on at `account`'s
+    prompts alone, and the new check caught bob's password.
+
+No kernel change and no ABI hash impact. `coreutils` gains `libusers`, so `userspace/Cargo.lock`
+changes.
+
+## 2026-09-25 — Administration D.5: `check-recovery`, and Part D is complete
+
+**What landed.** `cargo xtask check-recovery`, on demand like `check-install`: two boots and a copy
+of the release disk. Recovery is the one account path nobody exercises until they need it, and
+then there is no administrator to ask. So the gate takes the path a person would take on the
+laptop, with a stick in it.
+
+**The first boot** is the live image as a USB stick beside the copy. The copy's root is marked not
+cleanly unmounted first, as an installed machine's is until Part E's `shutdown`, as `check-storage`
+does. On the serial console, as the live image's own `alice`:
+- the disk's `nitrox-root` is found auto-mounted read-only;
+- `with admin disk` unmounts it and mounts it writable. The live image's administrator is the
+  authority here, not the installed one's, which is the point: that person has forgotten it;
+- `account --password alice --users /storage/nitrox-root/system/users` sets a new password in the
+  disk's file, typed twice. That is `libusers` on the file, with no view and no service;
+- `with admin disk --unmount` leaves the filesystem clean;
+- then the live system's own `alice` logs in with the old password, so the file edited was the
+  disk's.
+
+**Between the boots, on the host**, the partition is carved out and checked:
+- `e2fsck -fn` finds it clean, and the superblock records a clean unmount;
+- `/system/users` differs from what the release disk shipped **in `alice`'s line alone**;
+- that line takes the new password and refuses the old;
+- **its salt is fresh**: `libusers::SALT_LEN` bytes, not all zero, and not the build's.
+
+The host's clean checks moved out of `check-storage` into `check_left_clean`, which both gates
+call.
+
+**The second boot is that disk alone**: the old password is refused at the login, and the new one
+logs in. Neither boot may print either password.
+
+**Part D is complete**, D.1–D.5, on `admin/part-d`. Its Docs item is ticked: each document landed
+with the piece that changed it. Here, `session-and-auth.md`'s account of who reaches the
+credential oracle now names Part D's share: the admin session, and the broker's accounts and
+policy endpoints.
+
+**The local gate set grows to 32.** `check-recovery` joins `check-install` among the on-demand gates
+the full set runs, and CI does not.
+
+**Gates:** `check-recovery --kvm`, first run and again with the salt check added.
+
+**Controls:** 3 `check-recovery --kvm` boots, each failing at its own check:
+- the offline edit writing `FILE.new` and never renaming it: the host finds `alice`'s line as the
+  release disk shipped it;
+- a salt of zeros: the host's salt check;
+- echo left on at `account`'s prompts: the live boot's transcript holds the new password.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Part D, reviewed (PR #338): a slow add keeps its home, and a bad name is one
+
+The review found nothing blocking, one thing worth fixing and five optional. All six are fixed.
+
+**Worth fixing.** **`graphical-session.md` still called `auth-service` a read-only verifier**, "a
+read handle to the user DB" and "PAM's *verifier* and nothing more". Since D.1 it is the user
+database's only writer. A reader judging what a bug in it reaches would conclude it can read
+verifiers, when it can rewrite every account. **The same claim stood twice in
+`session-and-auth.md`**: its cast table, and the opening of *Credential validation*. Neither was
+in the finding, and a sweep for the phrase found both. All three now say what it writes, and how.
+
+**Optional, each fixed:**
+- **An add whose answer never came removed the home it had made.** `add_account` undid on every
+  error, and "auth-service did not answer" after five seconds is one. But `auth-service` has the
+  request, and serves one at a time. So a slow add would leave an account without its home, and a
+  retry would say it exists. Now **any answer but success is settled by the account list, asked
+  again** (`view_broker::accounts::settled`):
+  - the account there: the add happened, and the home stays;
+  - absent: it was refused, and a home this add made is removed;
+  - the list unanswered too: nobody can say, the home is kept, and the answer says so.
+
+  **A removal is settled the same way**, since it has the same shape: its home goes only once
+  the account is known gone. The finding named the add alone.
+- **`an_account_is_added_changed_and_removed` took 21 s**, because `serve_admin` always derived at
+  the real count. `serve_admin_with` takes the count, as `libusers`' `*_with` edits do. The admin
+  tests use 2, and write their existing records at 2 too. The test takes 2.65 s alone, most of it
+  `authenticate`'s deliberate dummy verify at the real count for an unknown name. The suite takes
+  10.6 s, where it took 21, and what remains is the crate's slowest test before this PR.
+- **Nothing held `line_of` and `find` to the same record.** With `line_of` taking the last of a
+  duplicated name, all 16 `libusers` tests passed. **`find` now goes through `line_of`**, so there
+  is one lookup, and a new test edits a file naming `alice` twice. The review's control now fails
+  two tests.
+- **`Remove` and `SetPassword` answered a bad name `NotFound`**, where the spec's refusal table says
+  `InvalidArgument`. The cause was one layer down: `libusers::remove` and `set_password` looked
+  before they checked, and `add` did not. **They check the rules first now**, so every caller —
+  `auth-service`, and `account`'s offline mode — refuses a bad name as one. A hand-edited record
+  under such a name is edited by no tool, which the broker, refusing the name first, already
+  ensured. The spec row says "before the account is looked for".
+- **Two text nits**: `libcrypto/CLAUDE.md` put the user-DB format and cost policy in `auth-service`
+  (they are `libusers`'), and D.4's entry said "four passwords" where there are six. The same
+  paragraph said nothing had held the prompts to echo off, when step 20b had checked two. Both are
+  corrected in place, the entry being in this open PR.
+
+**The review's controls** included one this PR's log did not list: `auth-service`'s install
+skipping `SYS_FILE_SYNC`, caught by `boot-probe` at "the added account is not on the device". That
+check backs "synced, then renamed", which is what makes an install crash-safe.
+
+**Controls for the fixes**, 6 host, each failing its test:
+- `libusers::remove` not checking the name;
+- `set_password` not checking the name;
+- `set_password` not checking the password before it looks;
+- `settled` ignoring the list;
+- `settled` reading a removal as an add;
+- `auth-service`'s refusal test against the old `remove`.
+
+The review's `line_of`-takes-the-last control was run again, and now fails two tests. The wiring
+in `main.rs` — settling after a failed add or removal — has no boot exercise, since no gate can make
+`auth-service` take five seconds. The decision it applies is the host-tested function.
+
+No kernel change and no ABI hash impact.
