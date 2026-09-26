@@ -41,6 +41,18 @@ pub const OP_VIEWS_LIST: u16 = 0x0E06;
 /// `Started` meaning "valid", `Denied` with the reason otherwise. No authority needed: judging a
 /// file installs nothing.
 pub const OP_VIEWS_CHECK: u16 = 0x0E07;
+/// Policy endpoint → broker: the policy's text. Body: empty. Reply: the text, at most
+/// [`POLICY_MAX`] bytes (administration Part D.2). Asked on a channel resolved through the `views`
+/// grant's `/dev/policy`, never on a client channel: the policy is not every session's to read.
+pub const OP_VIEWS_SHOW: u16 = 0x0E08;
+/// Policy endpoint → broker: install this text as the policy. Body: the text. Reply: an
+/// [`Outcome`] — `Started` meaning installed, `Denied` with the reason otherwise: it does not read,
+/// or no account that exists could administer under it.
+pub const OP_VIEWS_INSTALL: u16 = 0x0E09;
+
+/// The longest policy `Show` answers with and `Install` takes: one message's body, with room for
+/// its header.
+pub const POLICY_MAX: usize = 3584;
 
 /// The broker's answer to a `Request`, a `Password` or a `Check`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

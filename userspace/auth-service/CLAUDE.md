@@ -25,8 +25,8 @@ one channel pair minted at startup made it a **one-client** oracle by constructi
 **And the user database's only writer, since administration Part D.1.** A resolve of
 `/svc/auth/admin` opens an **admin session**, which answers `List`, `Add`, `Remove` and
 `SetPassword` (`docs/spec/rsproto-auth-ops.md` § *Administration*). The view broker is the one
-client meant to hold one; the root namespace can reach it too, the boundary `/svc/auth` has
-always had (`TODO(svc-auth-ungated)`).
+client meant to hold one, and does from Part D.2, asking `List` to judge a policy; the root
+namespace can reach it too, the boundary `/svc/auth` has always had (`TODO(svc-auth-ungated)`).
 
 ## Structure
 

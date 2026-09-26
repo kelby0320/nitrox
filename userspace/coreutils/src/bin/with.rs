@@ -5,7 +5,15 @@
 //! with admin disk --mount /dev/blk/1     # mount a disk, through the view's storage grant
 //! with --list                            # the views you may use
 //! with --check policy.toml               # whether a file is a valid policy
+//! with admin with --show ./views.toml    # a copy of the policy to edit (the `views` grant)
+//! with admin with --install ./views.toml # install an edited copy (the `views` grant)
 //! ```
+//!
+//! **The policy is changed by `--show` and `--install`** (administration Part D.2), not edited in
+//! place: `--show FILE` writes a copy, any editor changes it, and `--install FILE` has the broker
+//! check it — it must read, and an account that exists must still be able to administer — and
+//! replace the policy atomically. Both reach the broker through `/dev/policy`, which only a view
+//! with the `views` grant binds, so outside one they say which view to use.
 //!
 //! **What `with` never gets is the authority.** It sends the view broker a *copy* of its own
 //! namespace (`sys_ns_derive`), the broker copies that again and builds the view there, and the
@@ -49,6 +57,8 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const HELP: &[u8] = b"usage: with VIEW PROGRAM [ARG...]\n\
     \x20      with --list\n\
     \x20      with --check FILE\n\
+    \x20      with --show [FILE]\n\
+    \x20      with --install FILE\n\
     \n\
     Run PROGRAM in VIEW: this session's namespace plus what the view grants,\n\
     when /system/views.toml says you may. Asks for your password when the\n\
@@ -56,6 +66,8 @@ const HELP: &[u8] = b"usage: with VIEW PROGRAM [ARG...]\n\
     \n\
     \x20     --list     the views you may use, as a table\n\
     \x20     --check    whether FILE is a valid policy\n\
+    \x20     --show     the policy, or a copy of it written to FILE (needs the views grant)\n\
+    \x20     --install  check FILE and install it as the policy (needs the views grant)\n\
     \x20     --help     show this help and exit\n\
     \x20     --version  show version information and exit\n";
 
@@ -261,6 +273,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Some("--version") => stage.die(VERSION, EXIT_OK),
         Some("--list") if argv.len() == 1 => list(&stage),
         Some("--check") if argv.len() == 2 => check(&stage, argv[1]),
+        Some("--show") if argv.len() <= 2 => show(&stage, argv.get(1).copied()),
+        Some("--install") if argv.len() == 2 => install(&stage, argv[1]),
         Some(flag) if flag.starts_with("--") => stage.die(HELP, EXIT_USAGE),
         Some(_) if argv.len() >= 2 => run(&stage, argv[0], argv[1], &argv[2..]),
         _ => stage.die(HELP, EXIT_USAGE),
@@ -332,6 +346,70 @@ fn check(stage: &Stage, file: &str) -> ! {
         _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
     say(stage, &alloc::format!("{file}: {why}"));
+    exit(if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE })
+}
+
+/// The broker's policy endpoint, through the `views` grant's `/dev/policy`. Outside a view with the
+/// grant there is none, and `with` says which view to use rather than failing without a word.
+fn policy_endpoint(stage: &Stage, verb: &str) -> u64 {
+    let ch = lookup(stage.namespace, b"/dev/policy", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if ch == 0 {
+        say(
+            stage,
+            &alloc::format!(
+                "cannot {verb} the policy here -- that needs the views grant: `with admin with --{verb} ...`"
+            ),
+        );
+        libkern::kprint(alloc::format!("with: cannot {verb} the policy without the views grant\n").as_bytes());
+        exit(EXIT_FAILURE);
+    }
+    ch
+}
+
+/// `with --show [FILE]`: the policy, printed, or written to FILE for editing. **A file, not a
+/// pipe**: the shell's `save` writes a record per line as `{ line: … }`, so a copy made through it
+/// would not read back as a policy.
+fn show(stage: &Stage, file: Option<&str>) -> ! {
+    let ch = policy_endpoint(stage, "show");
+    let text = match call(ch, OP_VIEWS_SHOW, 1, &[], &[]) {
+        Some((false, body)) => body,
+        _ => stage.die(b"with: the broker would not show the policy\n", EXIT_FAILURE),
+    };
+    match file {
+        Some(f) => {
+            let path = stage.path(f.as_bytes());
+            if libfs::write_file(stage.namespace, &path, &text).is_err() {
+                say(stage, &alloc::format!("cannot write `{f}`"));
+                exit(EXIT_FAILURE);
+            }
+            say(stage, &alloc::format!("wrote the policy to {f} ({} bytes)", text.len()));
+            libkern::kprint(alloc::format!("with: wrote the policy to a copy ({} bytes)\n", text.len()).as_bytes());
+        }
+        None => stage.diag(&text),
+    }
+    exit(EXIT_OK)
+}
+
+/// `with --install FILE`: check FILE and install it as the policy, through the broker.
+fn install(stage: &Stage, file: &str) -> ! {
+    let path = stage.path(file.as_bytes());
+    let Ok(text) = libfs::read_file(stage.namespace, &path) else {
+        say(stage, &alloc::format!("cannot read `{file}`"));
+        exit(EXIT_FAILURE);
+    };
+    if text.len() > POLICY_MAX {
+        say(stage, &alloc::format!("{file}: a policy is at most {POLICY_MAX} bytes"));
+        exit(EXIT_FAILURE);
+    }
+    let ch = policy_endpoint(stage, "install");
+    let (o, why) = match call(ch, OP_VIEWS_INSTALL, 1, &text, &[]) {
+        Some((false, body)) => outcome(&body),
+        _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
+    };
+    say(stage, &alloc::format!("{file}: {why}"));
+    // On the console too, since a terminal on a release image renders nothing a gate can read.
+    // Escaped: a reason can quote the policy's own text back.
+    libkern::debug::Line::new().s(b"with: install: ").untrusted(why.as_bytes()).end();
     exit(if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE })
 }
 

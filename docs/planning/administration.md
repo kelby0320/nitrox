@@ -1510,7 +1510,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         checks that an unknown suffix is `NotFound`.*
       - *D's share of `TODO(svc-auth-ungated)` is recorded now, since the admin session exists
         from D.1.)*
-- [ ] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
+- [x] **D.2 — the policy: `with --show`, `with --install`, the `views` grant, and what an
       administrator is.** *Before the accounts front*, since the guard that front applies needs this
       definition, and the definition needs the grant.
       - The policy endpoint, with `Show` and `Install`: the text must parse, and an existing account
@@ -1533,6 +1533,24 @@ from "lost at exit" to "lost at power-off unless something syncs it".
            change;
         3. a copy leaving no administrator refused;
         4. the original restored.
+
+      *(Landed 2026-09-25.*
+      - *`boot-probe` asks at the protocol, as a supervisor can: it opens a session and resolves
+        `/svc/views/policy/<id>`, the suffix the grant's binding forwards to. "`Show` refused
+        without the grant" became `Show` refused on the session's client channel, which is what a
+        session without the grant holds. The binding itself is proved by `test-interactive`, where
+        `with --show` outside a view is refused naming the grant, and `with admin with --show`
+        works.*
+      - *Also in the probe: a policy installed with a profile the original lacks, found in `List`,
+        and gone again once the original is restored; and a closed session's policy channel
+        answering nothing.*
+      - *`with --show FILE` writes the text to a file, and bare `with --show` prints it. Piped to
+        `save`, each line would be written as a record, `{ line: … }`, which does not read back as
+        a policy.*
+      - *`test-interactive` builds each policy in typed parts of under 256 bytes, the kernel
+        console's input ring, which drops what does not fit. A longer line loses its end and its
+        newline, and the shell never sees the command.*
+      - *`Install` is audited, as its session's principal, whether it installs or is refused.)*
 - [ ] **D.3 — the broker fronts accounts.**
       - The `accounts` grant and the accounts endpoint: `AddAccount`, `RemoveAccount` and
         `SetPassword`, with the home made or removed there.

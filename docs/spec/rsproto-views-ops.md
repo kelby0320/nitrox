@@ -1,9 +1,10 @@
 # rsproto — Views operations (`0x0Exx`)
 
-**Status: normative for what is built (2026-09-23).** Every op below is implemented in
+**Status: normative for what is built (2026-09-25).** Every op below is implemented in
 `userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`. Written with
-administration Part A.3; see [`administration.md`](../planning/administration.md) § *Part A in detail*
-for the design and why each piece is shaped as it is.
+administration Part A.3; the policy endpoint, `Show` and `Install` since Part D.2. See
+[`administration.md`](../planning/administration.md) § *Part A in detail* for the design and why
+each piece is shaped as it is.
 
 ## The shape
 
@@ -19,22 +20,26 @@ principal.
 | forwarding endpoint | bound by `init` at `/svc/views`; by a login supervisor at `/dev/views` in each session, with the subtree base `/s/<session>` | — | `Namespace::Resolve` |
 | supervisor channel | `/svc/views/session`, from the root namespace | `session` | `OpenSession`, `CloseSession` |
 | client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Check`; receives `Exited` |
+| policy channel | `/dev/policy`, from inside a view with the `views` grant, which the broker binds there with the base `/policy/<session>` | `policy/<session>` | `Show`, `Install` |
 
 A session id is decimal, non-zero, with no leading zero; any other suffix is `NotFound`, as is the
 base of a session that is not open. **Ids increase and are never reused within a boot** — a program
-that ignored its session's end still holds a namespace with that base in it.
+that ignored its session's end still holds a namespace with that base in it. **A policy channel's
+identity is the session whose view bound it**: `Install` is audited as that session's principal.
 
 **A resolve the broker has no room for is `WouldBlock`.** It waits on every channel in one wait
 set of `MAX_WAIT_HANDLES`, and **counts a client channel as two slots from the moment it is let
 in** — the channel, and the life channel of the program it may start (`view_broker::slots`) — so a
-client it admits can always start its program with its exit heard.
+client it admits can always start its program with its exit heard. A policy channel starts
+nothing, and counts as one.
 
 **Only `Request` carries handles.** Any handle sent with another op is closed unread.
 
-**The boundary.** Anything holding the unscoped root namespace can resolve `/svc/views/session` and
-`/svc/views/s/<id>`, and so act as any session — the same boundary `/svc/auth` has
-(`TODO(svc-auth-ungated)`), and the same fix. A program in a session cannot: its namespace is
-built, and binds only its own base. **One process in a session can**: `desktop-shell`, the
+**The boundary.** Anything holding the unscoped root namespace can resolve `/svc/views/session`,
+`/svc/views/s/<id>` and `/svc/views/policy/<id>`, and so act as any session, installing a policy
+included — the same boundary `/svc/auth` has (`TODO(svc-auth-ungated)`), and the same fix. A
+program in a session cannot: its namespace is built, and binds only its own base. **One process in
+a session can**: `desktop-shell`, the
 graphical session's leader, holds the raw forwarding endpoint and `BIND_NAMESPACE` so that it can
 bind `/dev/views` into the applications it launches, and could bind any base. That adds no one to
 the trusted set — it already holds the whole-tree filesystem endpoint — but the graphical
@@ -60,8 +65,8 @@ Sent by a login supervisor after it has authenticated someone.
 
 Request: a session id, 8 bytes. Reply: empty.
 The broker asks every program it started for the session to stop (`sys_process_terminate` — a
-request), unbinds their grants, and answers nothing further under the session's base. Closing a
-session that is not open is not an error.
+request), unbinds their grants, closes the session's policy channels, and answers nothing further
+under the session's base. Closing a session that is not open is not an error.
 
 ### `Request` (`0x0E02`) — client
 
@@ -131,12 +136,38 @@ that does not read is an error reply (`InvalidArgument`).
 
 ### `Check` (`0x0E07`) — client
 
-Request: a policy's text. Reply: `Started` if it reads and leaves someone able to administer the
-system; `Denied` with the reason otherwise. Installs nothing, so it needs no grant.
+Request: a policy's text. Reply: `Started` if it reads and leaves an administrator — **an account
+that exists** and could use `views` for every program
+([`views-toml-schema.md`](views-toml-schema.md) § *Administrators, and the guard*); `Denied` with
+the reason otherwise. Installs nothing, so it needs no grant.
+
+**Which accounts exist is asked of `auth-service`**: the broker holds an admin session of its own
+at `/svc/auth/admin`, opened on first need, and sends it `List`
+([`rsproto-auth-ops.md`](rsproto-auth-ops.md) § *Administration*). If that cannot be asked or
+does not answer within five seconds, the policy is refused — a policy cannot be said to leave an
+administrator when nobody knows who exists — and the session is dropped, so the next judgement
+opens a new one.
+
+### `Show` (`0x0E08`) — policy channel
+
+Request: empty. Reply: the text of `/system/views.toml`, at most `POLICY_MAX` bytes (3584 — one
+message's body, with room for its header). A longer file is `TooLarge`; one that cannot be read is
+`NotFound`. **Only a policy channel answers it**: on a client channel it is `Unsupported`, because
+a session's namespace does not hold `/system` and the policy is not every session's to read.
+
+### `Install` (`0x0E09`) — policy channel
+
+Request: a policy's text, at most `POLICY_MAX` bytes. Reply: `Started` once it is installed;
+`Denied`, with `retry` 0 and the reason, otherwise. It is judged as `Check` judges it, by the same
+account list and the same definition, and then **replaced atomically**: written to
+`/system/views.toml.new`, synced, and renamed over `/system/views.toml`. The broker reads the file
+for every request, so the next one is decided by the new policy. Every install, and every refusal
+with its reason, is written to the audit log as the session's principal.
 
 ## References
 
 - [`views-toml-schema.md`](views-toml-schema.md) — the policy file
+- [`rsproto-auth-ops.md`](rsproto-auth-ops.md) — the `List` the broker judges a policy with
 - [`rsproto-wire-format.md`](rsproto-wire-format.md) — framing, request ids, error replies
 - [`rsproto-namespace-ops.md`](rsproto-namespace-ops.md) — how a resolve mints a channel
 - [`pipeline-stdio.md`](pipeline-stdio.md) — the setup message the program receives

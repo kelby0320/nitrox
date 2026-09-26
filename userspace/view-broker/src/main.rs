@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
+use librsproto::auth::{OP_AUTH_LIST, parse_account_list};
 use librsproto::storage::{OP_STORAGE_IN_USE, parse_in_use};
 use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -154,7 +155,17 @@ struct Broker {
     root_ns: u64,
     notif: u64,
     serve_end: u64,
+    /// **A duplicate of this broker's own forwarding endpoint** — the one `init` binds at
+    /// `/svc/views` — kept to bind into a view with a base of the broker's choosing: the `views`
+    /// grant's `/dev/policy` (administration Part D.2). `0` if it would not duplicate, and then
+    /// that grant is refused rather than given without its binding.
+    forwarding: u64,
     auth_ch: u64,
+    /// An admin session on `auth-service` (`/svc/auth/admin`), opened on first need, for the
+    /// account list the policy is judged against. `0` until then, or after it failed.
+    auth_admin: u64,
+    /// Policy channels, each resolved through a view's `/dev/policy`: the channel and its session.
+    policies: Vec<(u64, u64)>,
     supervisors: Vec<u64>,
     clients: Vec<Client>,
     sessions: Sessions,
@@ -268,6 +279,12 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 
 /// Where the `storage` grant is bound in a view.
 const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
+/// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
+const POLICY_GRANT: &[u8] = b"/dev/policy";
+/// Where a new policy is written before it is renamed over the old one.
+const POLICY_NEW: &[u8] = b"/system/views.toml.new";
+/// How long the broker waits for `auth-service`'s account list.
+const ACCOUNTS_WAIT_NS: u64 = 5_000_000_000;
 
 /// Wait on `h` until `deadline`. `true` if it became ready.
 fn wait_until(h: u64, deadline: u64) -> bool {
@@ -364,18 +381,26 @@ impl Broker {
             Some(r) if op == OP_NS_RESOLVE => suffix::parse(r.suffix),
             _ => Suffix::Unknown,
         };
-        let session = match asked {
-            Suffix::Supervisor => None,
-            Suffix::Client(id) if self.sessions.get(id).is_some() => Some(id),
+        let (session, policy) = match asked {
+            Suffix::Supervisor => (None, false),
+            Suffix::Client(id) if self.sessions.get(id).is_some() => (Some(id), false),
+            // **The policy endpoint, as the `views` grant binds it** (administration Part D.2): a
+            // channel of its own, on which only `Show` and `Install` are answered.
+            Suffix::Policy(id) if self.sessions.get(id).is_some() => (Some(id), true),
             _ => {
                 reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::NotFound);
                 return;
             }
         };
         // Every channel is a slot in the one wait set this process has, and a client's program
-        // will need a second.
+        // will need a second. A policy channel starts no program, so it is one slot, as a
+        // supervisor's is.
         let load = self.load();
-        let fits = if session.is_none() { load.admits_supervisor(MAX_WAIT_HANDLES) } else { load.admits_client(MAX_WAIT_HANDLES) };
+        let fits = if session.is_none() || policy {
+            load.admits_supervisor(MAX_WAIT_HANDLES)
+        } else {
+            load.admits_client(MAX_WAIT_HANDLES)
+        };
         if !fits {
             reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock);
             return;
@@ -393,6 +418,7 @@ impl Broker {
         }
         match session {
             None => self.supervisors.push(ours),
+            Some(id) if policy => self.policies.push((ours, id)),
             Some(id) => self.clients.push(Client { ch: ours, session: id, state: State::Idle }),
         }
     }
@@ -451,9 +477,12 @@ impl Broker {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
                     unsafe { syscall1(SYS_PROCESS_TERMINATE, *process) };
                     libsession::unbind_block_devices(*view_ns);
-                    // The `storage` grant too; `NotFound` for a view that was not given it.
-                    // SAFETY: valid namespace handle and path.
-                    unsafe { syscall3(SYS_NS_UNBIND, *view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64) };
+                    // The `storage` and `views` grants too; `NotFound` for a view not given one.
+                    // SAFETY: valid namespace handle and paths.
+                    unsafe {
+                        syscall3(SYS_NS_UNBIND, *view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64);
+                        syscall3(SYS_NS_UNBIND, *view_ns, POLICY_GRANT.as_ptr() as u64, POLICY_GRANT.len() as u64);
+                    };
                 }
                 State::Password(p) => {
                     p.handles.close();
@@ -468,7 +497,107 @@ impl Broker {
                 _ => {}
             }
         }
+        // Its policy channels close with it: nothing more is heard under its base.
+        let (gone, kept): (Vec<(u64, u64)>, Vec<(u64, u64)>) = self.policies.drain(..).partition(|p| p.1 == id);
+        self.policies = kept;
+        gone.iter().for_each(|&(ch, _)| close(ch));
         Line::new().s(b"view-broker: session ").u(id).s(b" ended").end();
+    }
+
+    /// **The accounts that exist**, from `auth-service`'s `List` on an admin session of the
+    /// broker's own, opened on first need. `None` if it cannot be asked or does not answer — and
+    /// then the session is dropped, so the next ask opens a new one. Judging a policy fails closed
+    /// without it: a policy cannot be said to leave an administrator when nobody knows who exists.
+    fn accounts(&mut self) -> Option<Vec<String>> {
+        if self.auth_admin == 0 {
+            self.auth_admin = ns_lookup(self.root_ns, b"/svc/auth/admin", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+        }
+        let admin = self.auth_admin;
+        if admin == 0 {
+            return None;
+        }
+        let asked = send(admin, OP_AUTH_LIST, 1, 0, &[], &[]);
+        let deadline = now_ns().saturating_add(ACCOUNTS_WAIT_NS);
+        let listed = asked
+            .then(|| loop {
+                match recv(admin) {
+                    Ok(Some((op, 1, body))) if op == OP_AUTH_LIST => break Some(body),
+                    Ok(Some(_)) => received().into_iter().for_each(close),
+                    Ok(None) if wait_until(admin, deadline) => {}
+                    _ => break None,
+                }
+            })
+            .flatten();
+        let names = listed.as_deref().and_then(|b| {
+            let l = parse_account_list(b)?;
+            Some(l.iter().map(|(n, _)| String::from_utf8_lossy(n).into_owned()).collect())
+        });
+        if names.is_none() {
+            close(admin);
+            self.auth_admin = 0;
+        }
+        names
+    }
+
+    /// **Judge a policy's text** as `Check` and `Install` do: it must be text, it must read, and an
+    /// account that exists must be able to administer under it (`policy::check`). The reason, if
+    /// not.
+    fn judge(&mut self, text: &[u8]) -> Result<policy::Policy, String> {
+        let text = core::str::from_utf8(text).map_err(|_| String::from("the file is not text"))?;
+        let accounts = self
+            .accounts()
+            .ok_or_else(|| String::from("the accounts could not be listed, so the policy cannot be judged"))?;
+        let names: Vec<&str> = accounts.iter().map(String::as_str).collect();
+        policy::check(text, &names).map_err(|e| alloc::format!("{e}"))
+    }
+
+    /// **A policy channel**: `Show` and `Install`, and nothing else (administration Part D.2).
+    /// From a session it is reached only through the `views` grant's `/dev/policy`, so holding it
+    /// is the authority.
+    fn serve_policy(&mut self, i: usize) {
+        let (ch, session) = self.policies[i];
+        let (op, request_id, body) = match recv(ch) {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(()) => {
+                close(ch);
+                self.policies.remove(i);
+                return;
+            }
+        };
+        received().into_iter().for_each(close);
+        let who = self.principal(session).unwrap_or_default();
+        match op {
+            OP_VIEWS_SHOW => match libfs::read_file(self.root_ns, POLICY_PATH) {
+                Ok(text) if text.len() <= POLICY_MAX => {
+                    let _ = send(ch, op, request_id, RS_FLAG_REPLY, &text, &[]);
+                }
+                Ok(_) => reply_error(ch, op, request_id, KError::TooLarge),
+                Err(_) => reply_error(ch, op, request_id, KError::NotFound),
+            },
+            OP_VIEWS_INSTALL => {
+                let installed = if body.len() > POLICY_MAX {
+                    Err(alloc::format!("a policy is at most {POLICY_MAX} bytes"))
+                } else {
+                    self.judge(&body).and_then(|_| {
+                        libfs::write_file(self.root_ns, POLICY_NEW, &body)
+                            .and_then(|()| libfs::rename(self.root_ns, POLICY_NEW, POLICY_PATH, true))
+                            .map_err(|_| String::from("the policy could not be written"))
+                    })
+                };
+                match installed {
+                    Ok(()) => {
+                        self.audit(&alloc::format!("policy: {who} installed a new policy"));
+                        reply_outcome(ch, op, request_id, Outcome::Started, "the policy is installed");
+                    }
+                    Err(why) => {
+                        self.audit(&alloc::format!("policy: {who}'s policy was refused: {why}"));
+                        reply_outcome(ch, op, request_id, Outcome::Denied { retry: false }, &why);
+                    }
+                }
+            }
+            _ => reply_error(ch, op, request_id, KError::Unsupported),
+        }
     }
 
     /// A client's channel: requests, passwords, stops, listings and checks.
@@ -513,10 +642,7 @@ impl Broker {
             }
             OP_VIEWS_LIST => self.list(ch, request_id, &principal),
             OP_VIEWS_CHECK => {
-                let verdict = match core::str::from_utf8(&body) {
-                    Ok(text) => policy::check(text).map(|_| ()).map_err(|e| alloc::format!("{e}")),
-                    Err(_) => Err(String::from("the file is not text")),
-                };
+                let verdict = self.judge(&body).map(|_| ());
                 match verdict {
                     Ok(()) => reply_outcome(ch, op, request_id, Outcome::Started, "the policy is valid"),
                     Err(e) => reply_outcome(ch, op, request_id, Outcome::Denied { retry: false }, &e),
@@ -729,6 +855,30 @@ impl Broker {
                         return fail(self, &mut p, "the storage service is not there to grant");
                     }
                 }
+                // **Changing the policy** (administration Part D.2): the broker's own forwarding
+                // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
+                // reaches the broker as this session's policy channel.
+                Grant::Views => {
+                    let base = alloc::format!("/policy/{}", self.clients[i].session);
+                    // SAFETY: a namespace this broker made, a valid path and base, and an endpoint
+                    // it holds.
+                    let bound = self.forwarding != 0
+                        && unsafe {
+                            syscall6(
+                                SYS_NS_BIND,
+                                view_ns,
+                                POLICY_GRANT.as_ptr() as u64,
+                                POLICY_GRANT.len() as u64,
+                                self.forwarding,
+                                base.as_ptr() as u64,
+                                base.len() as u64,
+                            )
+                        } == 0;
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "the policy endpoint could not be granted");
+                    }
+                }
             }
         }
         // **Resolved in the broker's own namespace, not the view** — a caller can prune its copy,
@@ -912,7 +1062,7 @@ impl Broker {
                 clients += 1;
             }
         }
-        Load { supervisors: self.supervisors.len(), clients, singles }
+        Load { supervisors: self.supervisors.len(), clients, singles: singles + self.policies.len() }
     }
 
     /// The soonest a held password may be checked.
@@ -964,6 +1114,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"view-broker: channel create FAIL\n");
         exit(1);
     };
+    // Kept before `Ready` moves the endpoint to `init`: the `views` grant binds it into a view.
+    // SAFETY: duplicating an endpoint this process holds, with every right it has.
+    let forwarding = unsafe { syscall2(SYS_HANDLE_DUPLICATE, client_end, u64::MAX) };
+    let forwarding = if forwarding > 0 { forwarding as u64 } else { 0 };
     if !send_ready(control, client_end) {
         kprint(b"view-broker: Ready send FAIL\n");
         exit(1);
@@ -973,7 +1127,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         root_ns,
         notif,
         serve_end,
+        forwarding,
         auth_ch: 0,
+        auth_admin: 0,
+        policies: Vec::new(),
         supervisors: Vec::new(),
         clients: Vec::new(),
         sessions: Sessions::new(),
@@ -997,6 +1154,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             push(b.notif);
             for &s in &b.supervisors {
                 push(s);
+            }
+            for &(ch, _) in &b.policies {
+                push(ch);
             }
             for c in &b.clients {
                 if c.ch != 0 {
@@ -1034,6 +1194,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     b.drain_notifications();
                 } else if let Some(i) = b.supervisors.iter().position(|&s| s == h) {
                     b.serve_supervisor(i);
+                } else if let Some(i) = b.policies.iter().position(|&(ch, _)| ch == h) {
+                    b.serve_policy(i);
                 } else if let Some(i) = b.clients.iter().position(|c| c.ch == h && h != 0) {
                     b.serve_client(i);
                 } else if b.clients.iter().any(|c| matches!(c.state, State::Running { life, .. } if life == h)) {

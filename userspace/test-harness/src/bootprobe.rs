@@ -1374,7 +1374,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_mount_test(root_ns)
         & storage_admin_test(root_ns)
         & storage_grant_test(root_ns)
-        & auth_admin_test(root_ns);
+        & auth_admin_test(root_ns)
+        & policy_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -2852,6 +2853,164 @@ fn storage_grant_test(root_ns: u64) -> bool {
     }
     kprint(b"boot-probe: storage grant: disk --unmount and disk --mount ran in the admin view, each answered its table, the service agreed, and a busy service was named as busy ok\n");
     finish(true)
+}
+
+/// **The policy endpoint: `Show` and `Install`, and what an administrator is** (administration
+/// Part D.2).
+///
+/// Asked on the channel the `views` grant's `/dev/policy` resolves to — reached here as
+/// `/svc/views/policy/<id>`, the root namespace's boundary (`TODO(svc-auth-ungated)`), for a
+/// session the probe opens as a supervisor does.
+/// - `Show` is the file as the device holds it.
+/// - **Two policies no existing account could administer are refused**, by `Check` and by
+///   `Install` alike, and the file stays as it was: one whose `admin` profile has lost `views`, the
+///   review's case, and one naming only an account that does not exist.
+/// - A policy with one more view is installed, `Show` and the device hold it, and `List` names the
+///   new view. The original is then installed again.
+/// - A closed session's policy channel is closed with it, and a session that is not open has no
+///   policy endpoint.
+fn policy_test(root_ns: u64) -> bool {
+    use librsproto::views::*;
+    use libkern::KError;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: policy: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => parse_session_id(&body),
+        _ => None,
+    };
+    let Some(session) = session else {
+        close(sup);
+        return fail(b"OpenSession");
+    };
+    let close_session = |sup: u64| {
+        let mut id = [0u8; 8];
+        let n = build_session_id(&mut id, session).unwrap_or(0);
+        let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &id[..n], &[], &mut alloc::vec::Vec::new());
+    };
+    let finish = |ok: bool| {
+        close_session(sup);
+        close(sup);
+        ok
+    };
+    match ns_lookup(root_ns, b"/svc/views/policy/999999", chan) {
+        (st, _) if st == KError::NotFound.as_i32() => {}
+        _ => return finish(fail(b"a session that is not open has a policy endpoint")),
+    }
+    let (sp, pol) = ns_lookup(root_ns, alloc::format!("/svc/views/policy/{session}").as_bytes(), chan);
+    let (sc, cli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
+    if sp != 0 || pol == 0 || sc != 0 || cli == 0 {
+        return finish(fail(b"no policy channel and client channel for the session"));
+    }
+    let Some(dev) = RootDevice::open(root_ns) else {
+        close(pol);
+        close(cli);
+        return finish(fail(b"the root device would not open"));
+    };
+    let finish = |ok: bool| {
+        close(pol);
+        close(cli);
+        finish(ok)
+    };
+    let on_device = || -> Option<alloc::vec::Vec<u8>> {
+        let size = fs_server_ext4::ext4::stat_file(&dev, b"/system/views.toml").ok()?;
+        dev.read_file(b"/system/views.toml", 0, size)
+    };
+    let next = core::cell::Cell::new(10u64);
+    let mut ask = |ch: u64, op: u16, body: &[u8]| {
+        next.set(next.get() + 1);
+        views_call(ch, op, next.get(), body, &[], &mut exited)
+    };
+    let outcome_of = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
+        r.filter(|(err, _)| !err).and_then(|(_, b)| {
+            parse_outcome(&b).map(|(o, why)| (o == Outcome::Started, alloc::vec::Vec::from(why)))
+        })
+    };
+    let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
+
+    let Some((false, original)) = ask(pol, OP_VIEWS_SHOW, &[]) else {
+        return finish(fail(b"Show was not answered"));
+    };
+    if on_device().as_deref() != Some(&original[..]) {
+        return finish(fail(b"Show is not the file on the device"));
+    }
+    if !says(&original, b"\"views\"") {
+        return finish(fail(b"the seeded admin profile does not grant views"));
+    }
+    if !ask(cli, OP_VIEWS_SHOW, &[]).is_some_and(|(err, _)| err) {
+        return finish(fail(b"a client channel answered Show"));
+    }
+
+    // Two policies nobody could administer, refused by `Check` and by `Install`, the file kept.
+    let lost_views = b"[profile.admin]\ngrants = [\"disks\", \"storage\"]\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
+    let nobody = b"[profile.admin]\ngrants = [\"disks\", \"storage\", \"views\"]\n\n[[rule]]\nwho = [\"kelby\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
+    for (bad, what) in [(&lost_views[..], &b"an admin profile without views"[..]), (&nobody[..], b"a rule naming no account that exists")] {
+        match outcome_of(ask(cli, OP_VIEWS_CHECK, bad)) {
+            Some((false, why)) if says(&why, b"views") => {}
+            _ => return finish(fail(b"Check passed a policy nobody could administer")),
+        }
+        match outcome_of(ask(pol, OP_VIEWS_INSTALL, bad)) {
+            Some((false, why)) if says(&why, b"views") => {}
+            _ => {
+                Line::new().s(b"boot-probe: policy: ").s(what).s(b" was installed").end();
+                return finish(fail(b"Install took a policy nobody could administer"));
+            }
+        }
+        if on_device().as_deref() != Some(&original[..]) {
+            return finish(fail(b"a refused Install changed the file"));
+        }
+    }
+    if outcome_of(ask(cli, OP_VIEWS_CHECK, &original)).map(|o| o.0) != Some(true) {
+        return finish(fail(b"Check refused the seeded policy"));
+    }
+
+    // One more view: installed, shown, on the device, and listed.
+    let mut more = original.clone();
+    more.extend_from_slice(b"\n[profile.d2probe]\ngrants = []\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"d2probe\"]\nrun = [\"nxsh\"]\nauth = \"none\"\n");
+    if outcome_of(ask(pol, OP_VIEWS_INSTALL, &more)).map(|o| o.0) != Some(true) {
+        return finish(fail(b"a policy with one more view was not installed"));
+    }
+    if ask(pol, OP_VIEWS_SHOW, &[]).map(|(_, b)| b).as_deref() != Some(&more[..]) || on_device().as_deref() != Some(&more[..]) {
+        return finish(fail(b"the installed policy is not what Show and the device hold"));
+    }
+    let lists = |r: Option<(bool, alloc::vec::Vec<u8>)>, view: &[u8]| {
+        r.filter(|(err, _)| !err).is_some_and(|(_, b)| {
+            let mut found = false;
+            parse_rows(&b, |row| found |= row.view == view).is_some() && found
+        })
+    };
+    if !lists(ask(cli, OP_VIEWS_LIST, &[]), b"d2probe") {
+        return finish(fail(b"List does not name the installed view"));
+    }
+
+    // Put back.
+    if outcome_of(ask(pol, OP_VIEWS_INSTALL, &original)).map(|o| o.0) != Some(true)
+        || on_device().as_deref() != Some(&original[..])
+    {
+        return finish(fail(b"the original policy did not go back"));
+    }
+    if lists(ask(cli, OP_VIEWS_LIST, &[]), b"d2probe") {
+        return finish(fail(b"List still names the view after the original went back"));
+    }
+
+    // A closed session's policy channel closes with it.
+    close_session(sup);
+    let answered = ask(pol, OP_VIEWS_SHOW, &[]).is_some();
+    close(pol);
+    close(cli);
+    close(sup);
+    if answered {
+        return fail(b"a closed session's policy channel still answered");
+    }
+    kprint(b"boot-probe: policy: Show is the device's file; a policy with no views administrator and one naming no account refused by Check and Install; one more view installed, listed, and put back; a closed session's channel closed ok\n");
+    true
 }
 
 /// **`auth-service`'s admin session, and the file it writes** (administration Part D.1).

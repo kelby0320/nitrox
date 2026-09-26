@@ -10,8 +10,8 @@ request/reply between two userspace processes (typically session-mgr → auth-se
 **Status:** Pre-stabilization. Introduced with the Auth + session-mgr slice
 (`docs/architecture/session-and-auth.md`). `Authenticate` is the oracle's op. **The
 management ops — `List`, `Add`, `Remove`, `SetPassword` — arrived with administration Part
-D.1 (2026-09-25)**, on an admin session of their own (§ *Administration*); the view broker
-fronts them for people from Part D.3.
+D.1 (2026-09-25)**, on an admin session of their own (§ *Administration*). The view broker asks
+`List` from Part D.2, to judge a policy, and fronts the rest for people from Part D.3.
 
 ## Why a dedicated category
 
@@ -102,7 +102,9 @@ session is an error reply too. Any other suffix is `NotFound`, answered with the
 `ErrorBody`.
 
 **Who may open one.** The view broker, which fronts every account operation and applies the guards
-(`administration.md` § *Part D in detail*), is the one client meant to. The session is resolved
+(`administration.md` § *Part D in detail*), is the one client meant to. It holds one from Part
+D.2, opened on first need, and asks `List` to learn which accounts exist when it judges a policy
+([`rsproto-views-ops.md`](rsproto-views-ops.md) § `Check`). The session is resolved
 from the root namespace, so **anything holding the root namespace can open one** — the boundary
 `/svc/auth` has always had (`TODO(svc-auth-ungated)` in
 [`deferred-decisions.md`](../rationale/deferred-decisions.md)). It adds no authority there: a root

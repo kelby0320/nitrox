@@ -1,13 +1,14 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-09-25, when `auth-service` became the user database's writer — administration Part D.1; earlier
-that day, when each session gained `/storage` and `/dev/storage`, the storage service's session
-endpoint at the bases `/fs` and `/info` — administration Part C.6; before that 2026-09-24, when
-each session gained `/dev/devices`, the device manager's tables at the base `/info` — Part B.4;
-before that 2026-09-23, when each session gained a
-view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document described
-before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
+2026-09-25, when the view broker opened an admin session of its own to judge a policy — Part D.2;
+earlier that day, when `auth-service` became the user database's writer — administration Part
+D.1; earlier that day, when each session gained `/storage` and `/dev/storage`, the storage
+service's session endpoint at the bases `/fs` and `/info` — administration Part C.6; before that
+2026-09-24, when each session gained `/dev/devices`, the device manager's tables at the base
+`/info` — Part B.4; before that 2026-09-23, when each session gained a view-broker session and
+`/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the binding this document
+described before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
 under "Credential validation" is the current shape; the history is kept because a doc that
 quietly starts being right again teaches nobody why it was wrong. The full
 path — login → authenticate → per-user namespace → sandboxed user shell → home write —
@@ -168,8 +169,9 @@ replaces the file atomically: `/system/users.new`, synced, renamed over. A new p
 from the kernel's entropy source. **The format is `libusers`'**
 (`userspace/libusers/`): the service, the build's seeder and, from Part D.4, `account`'s offline
 mode all read and write the file through it, and it bounds the file at the 4 KiB the service loads
-at boot. The view broker is meant to be the one client of the admin session, fronting it for
-people with its guards; that front is Part D.3's.
+at boot. **The view broker holds one from Part D.2**, and asks it `List` when it judges a policy,
+since an administrator must be an account that exists. It is meant to be the admin session's one
+client, and its front for people, with its guards, is Part D.3's.
 
 ## Session construction — subtree-scoped namespaces
 

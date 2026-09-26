@@ -2021,6 +2021,88 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 20d. **The policy, changed and put back** (administration Part D.2).
+    //      (a) Outside a view with the `views` grant there is no `/dev/policy`, and `with` names
+    //          the view to use.
+    s.send("with --show")?;
+    s.expect("with: cannot show the policy without the views grant")?;
+    s.expect("/home>")?;
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    //      (b) A copy of the policy, to put back at the end.
+    admin(s, "with --show ./policy.txt")?;
+    s.expect("with: wrote the policy to a copy")?;
+    s.expect("/home>")?;
+    //      (c) **An edited copy, one view more**, typed as lists of lines — `save` writes a list of
+    //          strings a line each, where a single string would be a character per line. **In
+    //          parts, each under the console's 256-byte input ring**
+    //          (`kernel/src/drivers/console.rs`): a longer line can overrun it, lose its end and
+    //          its newline, and never reach the shell. The parts are joined by `open`, whose rows
+    //          are mapped back to strings.
+    let lines = |ls: &[&str]| {
+        let quoted: Vec<String> = ls.iter().map(|l| format!("\"{}\"", l.replace('"', "\\\""))).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let part = |s: &mut Session, file: &str, ls: &[&str]| -> R<()> {
+        let command = format!("{} | save ./{file}", lines(ls));
+        if command.len() >= 240 {
+            return Err(format!(
+                "a typed line of {} bytes would overrun the console's 256-byte input ring",
+                command.len()
+            )
+            .into());
+        }
+        s.send(&command)?;
+        s.expect("/home>")?;
+        Ok(())
+    };
+    part(s, "e1.txt", &[
+        "[profile.admin]",
+        "grants = [\"disks\", \"storage\", \"views\"]",
+        "[profile.install]",
+        "grants = [\"disks\"]",
+        "[profile.d2test]",
+        "grants = []",
+    ])?;
+    part(s, "e2.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"admin\"]", "run = [\"*\"]", "auth = \"password\""])?;
+    part(s, "e3.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"install\"]", "run = [\"nxinstall\"]", "auth = \"password\""])?;
+    part(s, "e4.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"d2test\"]", "run = [\"nxsh\"]", "auth = \"none\""])?;
+    s.send("open ./e1.txt ./e2.txt ./e3.txt ./e4.txt | map { |r| r.line } | save ./edited.txt")?;
+    s.expect("/home>")?;
+    admin(s, "with --install ./edited.txt")?;
+    s.expect("with: install: the policy is installed")?;
+    s.expect("/home>")?;
+    //      (d) The broker reads the new policy for the next request, so the new view is there.
+    let rows = "format(\"d2test-rows={}\", (with --list | filter view == \"d2test\" | count))";
+    s.send(rows)?;
+    s.expect("d2test-rows=1")?;
+    s.expect("/home>")?;
+    //      (e) **A copy nobody could administer is refused**: its admin profile has lost `views`.
+    part(s, "orphaned.txt", &[
+        "[profile.admin]",
+        "grants = [\"disks\", \"storage\"]",
+        "[[rule]]",
+        "who = [\"alice\"]",
+        "use = [\"admin\"]",
+        "run = [\"*\"]",
+        "auth = \"password\"",
+    ])?;
+    admin(s, "with --install ./orphaned.txt")?;
+    s.expect("no account that exists could use `views` for every program")?;
+    s.expect("/home>")?;
+    //      (f) The original, put back, and the view gone with it.
+    admin(s, "with --install ./policy.txt")?;
+    s.expect("with: install: the policy is installed")?;
+    s.expect("/home>")?;
+    s.send(rows)?;
+    s.expect("d2test-rows=0")?;
+    s.expect("/home>")?;
+    steps += 1;
+
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     //
@@ -14245,7 +14327,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\"]\n\
+         grants = [\"disks\", \"storage\", \"views\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

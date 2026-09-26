@@ -29958,3 +29958,89 @@ twice that, and the same control fails both boundary tests.
   - memory not updated after an install.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Administration D.2: the policy, the `views` grant, and what an administrator is
+
+**What landed.** `with --show [FILE]` and `with --install FILE` read and replace
+`/system/views.toml`, through a new `views` grant. The seeded `admin` profile gains `views`.
+- **The grant binds the broker's policy endpoint** at `/dev/policy` in the view, with the base
+  `/policy/<session>`. A resolve there reaches the broker as that session's **policy channel**, one
+  wait-set slot, which answers `Show` (`0x0E08`) and `Install` (`0x0E09`). Nothing else answers
+  them: on a client channel they are `Unsupported`, because a session does not hold `/system`, and
+  the policy is not every session's to read.
+- **The broker binds its own forwarding endpoint**, which `init` holds and binds at `/svc/views`.
+  It keeps a duplicate made before `Meta::Ready` hands the original over.
+- **`Install` is judged as `Check` is, then replaced atomically:** `views.toml.new` is written,
+  synced, and renamed over the file. Every install and every refusal, with its reason, goes to the
+  audit log as the session's principal. A text is at most `POLICY_MAX`, 3584 bytes, one message's
+  body.
+- `CloseSession` closes the session's policy channels and unbinds `/dev/policy` in its running
+  views.
+
+**An administrator is an account that exists, which a rule lets use a profile granting `views`
+with `run = ["*"]`** (`Policy::administrators`). This is PR #337's review definition, now in code:
+- The grant decides, not the profile's name.
+- A rule for one program does not count.
+- `who = ["*"]` counts every account; a name with no account counts nothing.
+- `with --check` and `Install` judge with the same list and definition. A policy that reads but
+  leaves nobody is refused by both, with the file untouched.
+
+**Which accounts exist is asked of `auth-service`.** The broker opens an admin session of its own
+at `/svc/auth/admin` on first need, and sends it D.1's `List`. **It fails closed**: if the service
+cannot be asked or does not answer within five seconds, the policy is refused and the session is
+dropped, so the next judgement opens a new one. A policy cannot be said to leave an administrator
+when nobody knows who exists.
+
+**`with --show FILE` writes a file; bare `with --show` prints the text.** Piping it to `save` was
+the obvious shape, but text piped to `save` is written a record per line, `{ line: … }`, which
+does not read back as a policy.
+
+**A kernel console limit, found by the gate, not fixed here.** `test-interactive` first typed each
+policy as one line of about 600 bytes. The echo stopped at about 255 characters and the shell
+never saw the command. The kernel console's input ring is 256 bytes (`RING_CAP`), and it drops a
+byte that arrives when it is full; a line written in one piece evidently arrives faster than it is
+drained, and lines under the ring pass. The line discipline allows 1024 bytes, so **a paste longer
+than the ring can lose its end and its newline over serial.** A person typing does not meet it.
+The gate now builds each policy from typed parts under 256 bytes, joined with `open`, and refuses
+to send a longer line.
+
+**Gates:**
+- **Host tests** (`view-broker`, 21, 4 new):
+  - `views` for every program makes an administrator, and one step away on each axis does not:
+    a single program, a profile without `views`, nobody;
+  - an `admin` profile without `views` is not an administrator, and a profile under another name
+    with it is;
+  - only accounts that exist count, for each shape of `who`;
+  - `check` refuses a policy that reads but leaves nobody, for that reason and not another.
+
+  Every negative case parses first, so an empty answer is the guard's and not the reader's.
+- **`boot-probe`** opens a session as a supervisor does and resolves `/svc/views/policy/<id>`,
+  the suffix the grant's binding forwards to:
+  - a session that is not open has none;
+  - `Show` is the file as the device holds it, read raw, and a client channel refuses it;
+  - a policy whose `admin` lost `views`, and one naming only an account that does not exist, are
+    refused by `Check` and by `Install`, with the device's file unchanged;
+  - a policy with one more view is installed, `Show` and the device hold it, and `List` names it;
+  - the original goes back, and `List` no longer names the view;
+  - after `CloseSession`, the policy channel answers nothing.
+- **`test-interactive`** (32 steps), at the real prompt as `alice`:
+  - `with --show` outside a view is refused, naming the grant;
+  - `with admin with --show` writes a copy;
+  - an edited copy is installed, after which `with --list` shows its view;
+  - a copy leaving no administrator is refused;
+  - the original goes back, and the view is gone.
+
+**Controls:**
+- 4 host, each failing its tests:
+  - the `views` grant ignored;
+  - `run = ["*"]` ignored;
+  - `who` ignored;
+  - `check` without its guard.
+- 3 boots, each failing at its own check:
+  - `Install` skipping the judgement: `test-qemu`, "Install took a policy nobody could
+    administer";
+  - the grant binding nothing: `test-interactive`, at `with admin with --show`;
+  - a closed session keeping its policy channel: `test-qemu`, "a closed session's policy channel
+    still answered".
+
+No kernel change and no ABI hash impact.
