@@ -3,7 +3,8 @@
 ## Status
 
 **Built, and checked 2026-09-25** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2. On 2026-09-25 administration Part C.6 gave sessions and applications
+2026-08-25, revision 2. On 2026-09-25 administration Part D.1 made `auth-service` the user
+database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and applications
 `/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
 supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
 them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
@@ -92,7 +93,9 @@ Nitrox does not need the registry yet — [`session-and-auth.md`](../architectur
 defers "concurrent logins (one console, one session at a time)". It is named here so a future
 multi-seat or switch-user answer has somewhere obvious to go, and so nothing built now
 forecloses it. **`auth-service` is not that registry and should not become it**: it is PAM's
-*verifier* and nothing more — one question, one answer, no session state (§2).
+*verifier* — one question, one answer, no session state (§2) — and, since administration Part
+D.1, the user database's only writer, on an admin session the view broker asks. Neither role keeps
+a session.
 
 ## 2. The cast
 
@@ -100,7 +103,7 @@ Everything below `desktop-session-mgr` already exists. Only the two right-hand r
 
 | Component | Role | Holds | State |
 |---|---|---|---|
-| **auth-service** | Credential oracle: "is this password right, and who is this?" | a read handle to the user DB; **no** `BIND_NAMESPACE` | built |
+| **auth-service** | Credential oracle: "is this password right, and who is this?" — and, since administration Part D.1, the user DB's only writer: adding and removing accounts and setting passwords, on an admin session ([`session-and-auth.md`](session-and-auth.md) § *The user database*) | the user DB, read at boot and replaced atomically on each write; **no** `BIND_NAMESPACE` | built |
 | **profile-server** | Projects the **system** profile at `/bin` | the store | built |
 | **fs-server** | The root filesystem | the block device | built |
 | **compositor** | Pixels, surfaces, windows, input routing, focus | the framebuffer, the input stream | built |

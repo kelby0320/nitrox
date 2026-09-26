@@ -41,7 +41,7 @@ supervisors composing those mechanisms.
 
 | Component | Role | Holds |
 |---|---|---|
-| **auth-service** | Credential oracle: "is this password right, and who is this?" | a read handle to the user DB; **no** `BIND_NAMESPACE` |
+| **auth-service** | Credential oracle: "is this password right, and who is this?" — and, since administration Part D.1, the user DB's only writer (§ *The user database*) | the user DB, read at boot and replaced atomically on each write; **no** `BIND_NAMESPACE` |
 | **session-mgr** | Session supervisor: login, per-user namespace construction, user-shell lifecycle | `BIND_NAMESPACE` (re-delegated from service-mgr); the endpoint handles it composes sessions from |
 | **user shell** | The session leaf: the process the human actually drives | only what its session namespace + (empty) syscaps grant |
 | **`libcrypto`** | Shared hand-rolled crypto (SHA-256 / HMAC / PBKDF2) | — (a pure library) |
@@ -84,8 +84,10 @@ constructs it and hands down an attenuated view.
 ## Credential validation
 
 auth-service is an ordinary userspace resource server that answers one question. It
-holds a read handle to the user DB and nothing else — no namespace-construction
-authority, no device access. session-mgr reaches it over an rsproto channel.
+holds the user DB and nothing else — no namespace-construction authority, no device
+access. session-mgr reaches it over an rsproto channel. **Since administration Part D.1 it also
+writes the DB**, on an admin session of its own (§ *The user database*); the oracle described
+here is unchanged by that.
 
 **That channel is resolved from a namespace, as of M7 Part C.** `init` spawns
 `auth-service` and binds its forwarding endpoint at `/svc/auth`; a supervisor resolves that

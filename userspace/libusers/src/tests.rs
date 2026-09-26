@@ -66,6 +66,21 @@ fn only_well_formed_lines_are_records() {
     assert!(find(text.as_bytes(), b"bob").is_none());
 }
 
+/// **In a file naming someone twice, the edits act on the record a login reads** — the first — and
+/// leave the other as it was (PR #338 review: nothing held `line_of` and `find` to the same one).
+#[test]
+fn a_duplicated_name_is_edited_where_it_is_read() {
+    let first = line("alice", "a", b"s1");
+    let second = line("alice", "b", b"s2");
+    let text = format!("{HEADER}{first}{second}");
+    let set = edit(|o| set_password_with(text.as_bytes(), o, b"alice", b"c", b"s3", IT)).unwrap();
+    assert!(find(set.as_bytes(), b"alice").unwrap().verifies(b"c"), "the record a login reads");
+    assert!(set.ends_with(&second), "the second line, byte for byte");
+    let removed = edit(|o| remove(text.as_bytes(), o, b"alice")).unwrap();
+    assert!(find(removed.as_bytes(), b"alice").unwrap().verifies(b"b"), "the first went");
+    assert_eq!(removed, format!("{HEADER}{second}"));
+}
+
 /// **A salt or verifier that is not hex matches no password**, rather than panicking or matching.
 #[test]
 fn a_record_whose_hex_is_broken_verifies_nothing() {
@@ -137,6 +152,24 @@ fn an_add_is_refused_for_each_reason() {
     assert_eq!(edit(|o| add_with(f, o, b"alice", b"x", b"s", IT)), Err(Refusal::Exists));
     assert_eq!(edit(|o| add_with(f, o, b"Bob", b"x", b"s", IT)), Err(Refusal::BadName));
     assert_eq!(edit(|o| add_with(f, o, b"bob", b"", b"s", IT)), Err(Refusal::BadPassword));
+}
+
+/// **Every edit refuses a bad name as one, before it looks** — even a name a hand-edited file
+/// holds a record under — and `set_password` a bad password too (PR #338 review: `remove` and
+/// `set_password` used to look first, and answer `NoSuchAccount`).
+#[test]
+fn an_edit_refuses_the_rules_before_it_looks() {
+    let hand_edited = line("bob", "b", b"s2").replacen("bob", "Bob", 1);
+    let file = format!("{HEADER}{}{hand_edited}", line("alice", "a", b"s1"));
+    let f = file.as_bytes();
+    assert!(find(f, b"Bob").is_some(), "the file does hold a record under the bad name");
+    assert_eq!(edit(|o| remove(f, o, b"Bob")), Err(Refusal::BadName));
+    assert_eq!(edit(|o| set_password_with(f, o, b"Bob", b"x", b"s", IT)), Err(Refusal::BadName));
+    assert_eq!(edit(|o| set_password_with(f, o, b"Bad Name", b"x", b"s", IT)), Err(Refusal::BadName));
+    assert_eq!(edit(|o| set_password_with(f, o, b"alice", b"", b"s", IT)), Err(Refusal::BadPassword));
+    assert_eq!(edit(|o| set_password_with(f, o, b"dave", b"x", b"s", IT)), Err(Refusal::NoSuchAccount));
+    // The order, where it shows: a bad password for someone absent is still a bad password.
+    assert_eq!(edit(|o| set_password_with(f, o, b"dave", b"", b"s", IT)), Err(Refusal::BadPassword));
 }
 
 /// **A removal takes out that record's line and nothing else.**

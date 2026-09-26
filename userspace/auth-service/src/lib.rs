@@ -128,13 +128,27 @@ impl Refused {
 }
 
 /// **Serve one administrator's request** on `db`: `List`, `Add`, `Remove` or `SetPassword`. A new
-/// password is derived under `salt`, which the caller draws fresh for each request. A write goes
-/// into `new_db`, and a reply into `reply`.
+/// password is derived under `salt`, which the caller draws fresh for each request, at
+/// `libusers::ITERATIONS`. A write goes into `new_db`, and a reply into `reply`.
 pub fn serve_admin(
     op: u16,
     body: &[u8],
     db: &[u8],
     salt: &[u8; libusers::SALT_LEN],
+    new_db: &mut [u8],
+    reply: &mut [u8],
+) -> Admin {
+    serve_admin_with(op, body, db, salt, libusers::ITERATIONS, new_db, reply)
+}
+
+/// [`serve_admin`], deriving at `iterations` — for a test that cannot afford the real count, as
+/// `libusers`' `*_with` edits are (PR #338 review: one admin test took 21 s at the real count).
+pub fn serve_admin_with(
+    op: u16,
+    body: &[u8],
+    db: &[u8],
+    salt: &[u8; libusers::SALT_LEN],
+    iterations: u32,
     new_db: &mut [u8],
     reply: &mut [u8],
 ) -> Admin {
@@ -158,12 +172,12 @@ pub fn serve_admin(
             Admin::Reply(w.finish())
         }
         OP_AUTH_ADD => match parse_account_request(body) {
-            Some(r) => edit(libusers::add(db, new_db, r.username, r.password, salt)),
+            Some(r) => edit(libusers::add_with(db, new_db, r.username, r.password, salt, iterations)),
             None => Admin::Refused(Refused::Malformed),
         },
         OP_AUTH_REMOVE => edit(libusers::remove(db, new_db, body)),
         OP_AUTH_SET_PASSWORD => match parse_account_request(body) {
-            Some(r) => edit(libusers::set_password(db, new_db, r.username, r.password, salt)),
+            Some(r) => edit(libusers::set_password_with(db, new_db, r.username, r.password, salt, iterations)),
             None => Admin::Refused(Refused::Malformed),
         },
         _ => Admin::Refused(Refused::NotAdmin),
@@ -252,12 +266,24 @@ mod tests {
     // --- administration ------------------------------------------------------------------------
 
     const SALT: [u8; libusers::SALT_LEN] = *b"0123456789abcdef";
+    /// The iteration count a test derives at: the real one costs seconds per derivation, and each
+    /// record keeps its own count, so `authenticate` reads these back at this one.
+    const IT: u32 = 2;
+
+    /// [`db_line`] at [`IT`]: an administrator's request never derives the existing records, and a
+    /// login checked against one here should not cost the real count either.
+    fn cheap_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
+        let mut out = [0u8; libusers::MAX_FILE];
+        let n = libusers::write_record_with(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt, IT)
+            .unwrap();
+        std::string::String::from_utf8(out[..n].to_vec()).unwrap()
+    }
 
     /// One admin request against `db`: what it came to, and the new file if it wrote one.
     fn admin(op: u16, body: &[u8], db: &str) -> (Admin, std::string::String) {
         let mut new_db = [0u8; libusers::MAX_FILE];
         let mut reply = [0u8; 4096];
-        let a = serve_admin(op, body, db.as_bytes(), &SALT, &mut new_db, &mut reply);
+        let a = serve_admin_with(op, body, db.as_bytes(), &SALT, IT, &mut new_db, &mut reply);
         let file = match a {
             Admin::Write(n) => std::string::String::from_utf8(new_db[..n].to_vec()).unwrap(),
             _ => std::string::String::new(),
@@ -276,7 +302,7 @@ mod tests {
     /// administrator's request does to the database.
     #[test]
     fn an_account_is_added_changed_and_removed() {
-        let db = format!("# header\n{}", db_line("alice", "apw", b"s1", "/home/alice"));
+        let db = format!("# header\n{}", cheap_line("alice", "apw", b"s1", "/home/alice"));
 
         let (a, db) = admin(OP_AUTH_ADD, &account("bob", "first"), &db);
         assert!(matches!(a, Admin::Write(_)));
@@ -305,8 +331,8 @@ mod tests {
     fn a_list_names_every_account() {
         let db = format!(
             "# header\n{}{}",
-            db_line("alice", "a", b"s1", "/home/alice"),
-            db_line("bob", "b", b"s2", "/home/bob")
+            cheap_line("alice", "a", b"s1", "/home/alice"),
+            cheap_line("bob", "b", b"s2", "/home/bob")
         );
         let mut new_db = [0u8; libusers::MAX_FILE];
         let mut reply = [0u8; 4096];
@@ -322,7 +348,7 @@ mod tests {
     #[test]
     fn an_admin_request_is_refused_for_each_reason() {
         use libusers::Refusal;
-        let db = db_line("alice", "a", b"s1", "/home/alice");
+        let db = cheap_line("alice", "a", b"s1", "/home/alice");
         let refused = |op, body: &[u8]| match admin(op, body, &db).0 {
             Admin::Refused(r) => Some((r, r.kerror())),
             _ => None,
@@ -332,6 +358,16 @@ mod tests {
         assert_eq!(refused(OP_AUTH_ADD, &account("Bob", "x")), edit(Refusal::BadName, KError::InvalidArgument));
         assert_eq!(refused(OP_AUTH_ADD, &account("bob", "")), edit(Refusal::BadPassword, KError::InvalidArgument));
         assert_eq!(refused(OP_AUTH_REMOVE, b"bob"), edit(Refusal::NoSuchAccount, KError::NotFound));
+        // **A bad name is refused as one by every op**, not reported missing (PR #338 review).
+        assert_eq!(refused(OP_AUTH_REMOVE, b"Bad Name"), edit(Refusal::BadName, KError::InvalidArgument));
+        assert_eq!(
+            refused(OP_AUTH_SET_PASSWORD, &account("Bad Name", "x")),
+            edit(Refusal::BadName, KError::InvalidArgument)
+        );
+        assert_eq!(
+            refused(OP_AUTH_SET_PASSWORD, &account("bob", "")),
+            edit(Refusal::BadPassword, KError::InvalidArgument)
+        );
         assert_eq!(
             refused(OP_AUTH_SET_PASSWORD, &account("bob", "x")),
             Some((Refused::Edit(Refusal::NoSuchAccount), KError::NotFound))
@@ -351,7 +387,7 @@ mod tests {
     /// read as the whole of it.
     #[test]
     fn a_list_that_does_not_fit_is_refused() {
-        let db = db_line("alice", "a", b"s1", "/home/alice");
+        let db = cheap_line("alice", "a", b"s1", "/home/alice");
         let mut new_db = [0u8; libusers::MAX_FILE];
         let mut reply = [0u8; 8];
         assert_eq!(

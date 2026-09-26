@@ -712,6 +712,30 @@ pub mod accounts {
             .collect()
     }
 
+    /// **What a write that did not say it succeeded came to** (PR #338 review). An answer that
+    /// never came is not a refusal: `auth-service` has the request, serves one at a time, and may
+    /// well carry it out after the broker stopped waiting. So an add or a removal whose answer was
+    /// anything but success is settled by **the account list, asked again**: `listed`, or `None` if
+    /// that went unanswered too.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Settled {
+        /// The list shows it done — `name` there after an add, gone after a removal.
+        Done,
+        /// The list shows it not done.
+        NotDone,
+        /// Nobody can say.
+        Unknown,
+    }
+
+    /// Settle a write to `name`: an add when `added`, a removal otherwise.
+    pub fn settled(listed: Option<&[(String, String)]>, name: &str, added: bool) -> Settled {
+        match listed {
+            None => Settled::Unknown,
+            Some(l) if l.iter().any(|(n, _)| n == name) == added => Settled::Done,
+            Some(_) => Settled::NotDone,
+        }
+    }
+
     /// **Why removing `name` is refused**, if it is. The guards, in the order a person should
     /// hear them:
     /// - no account of `accounts` has that name;
@@ -1352,6 +1376,21 @@ auth = "password"
 
         let last = accounts::refuse_removal("alice", &["alice"], &sessions, Ok(&policy("[\"*\"]")));
         assert!(last.is_some(), "`*` of nobody is nobody: the last account is never removed");
+    }
+
+    /// **A write that did not say it succeeded is settled by the list asked again**: done if the
+    /// list shows it, not done if it shows otherwise, and unknown if the list went unanswered too —
+    /// for an add and for a removal, which read the same list the opposite way.
+    #[test]
+    fn an_unanswered_write_is_settled_by_the_list() {
+        use accounts::{Settled, settled};
+        let l = alloc::vec![(String::from("alice"), String::from("/home/alice"))];
+        assert_eq!(settled(Some(&l), "alice", true), Settled::Done, "added after all");
+        assert_eq!(settled(Some(&l), "bob", true), Settled::NotDone, "refused, or never done");
+        assert_eq!(settled(Some(&l), "bob", false), Settled::Done, "removed after all");
+        assert_eq!(settled(Some(&l), "alice", false), Settled::NotDone, "still there");
+        assert_eq!(settled(None, "alice", true), Settled::Unknown);
+        assert_eq!(settled(None, "bob", false), Settled::Unknown);
     }
 
     /// **`Accounts` shows each account's sessions and whether it administers** — and, when the

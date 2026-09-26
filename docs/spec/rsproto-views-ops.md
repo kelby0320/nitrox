@@ -196,7 +196,11 @@ or `Denied` with `retry` 0 and the reason. In order:
 2. An account of that name is refused.
 3. **The home**, `/home/<name>`, is made, with the three folders of `libfs::HOME_FOLDERS`. A home
    already there — one a removal kept — is adopted, and the answer says so.
-4. `auth-service` adds the record. If it refuses, a home made in step 3 is removed again.
+4. `auth-service` adds the record. **An answer other than success is settled by the account list,
+   asked again** (`view_broker::accounts::settled`): one that never came may be an add
+   `auth-service` still carries out. A home made in step 3 is removed again only if the account
+   is not there; if the list cannot be had either, the home is kept and the answer says whether
+   the add happened cannot be said.
 
 ### `RemoveAccount` (`0x0E0D`) — accounts channel
 
@@ -210,7 +214,8 @@ in the order they are said (`view_broker::accounts::refuse_removal`):
 - **no account left could administer** ([`views-toml-schema.md`](views-toml-schema.md)
   § *Administrators, and the guard*).
 
-Then `auth-service` removes the record, and the home goes only if asked. A home that could not be
+Then `auth-service` removes the record, settled as an add's is when the answer is not success,
+and the home goes only if asked and only once the account is known gone. A home that could not be
 removed is said in the `Started` reason: the account is gone either way.
 
 ### `SetPassword` (`0x0E0E`) — accounts channel

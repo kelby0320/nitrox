@@ -150,11 +150,16 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> + '_ {
 
 /// The first record named `name`. The first, because that is the one `auth-service` has always
 /// authenticated against.
+///
+/// **Found by [`line_of`], the lookup the edits use**, so the record a password is set on is the
+/// record a login is checked against even in a file that names someone twice — a hand-edited one,
+/// being recovered with `account --users`, say (PR #338 review). Two lookups could drift apart.
 pub fn find<'a>(file: &'a [u8], name: &[u8]) -> Option<Record<'a>> {
-    records(file).find(|r| r.name == name)
+    let (s, e) = line_of(file, name)?;
+    record_of(&file[s..e])
 }
 
-/// Where the record named `name` is: its line's `(start, end)`.
+/// Where the first record named `name` is: its line's `(start, end)`.
 fn line_of(file: &[u8], name: &[u8]) -> Option<(usize, usize)> {
     lines(file).find(|&(s, e)| record_of(&file[s..e]).is_some_and(|r| r.name == name))
 }
@@ -257,7 +262,14 @@ pub fn add_with(
 }
 
 /// **The file with `name`'s record taken out**, every other line kept byte for byte.
+///
+/// **A name the rules refuse is refused as one**, before the lookup, as [`add`] refuses it — not
+/// reported missing (PR #338 review). So a record a hand-edited file holds under such a name is
+/// never edited by any tool, which the view broker, refusing the name first, already ensured.
 pub fn remove(file: &[u8], out: &mut [u8], name: &[u8]) -> Result<usize, Refusal> {
+    if !valid_name(name) {
+        return Err(Refusal::BadName);
+    }
     let (s, e) = line_of(file, name).ok_or(Refusal::NoSuchAccount)?;
     splice(out, &[&file[..s], &file[e..]])
 }
@@ -285,6 +297,13 @@ pub fn set_password_with(
     salt: &[u8],
     iterations: u32,
 ) -> Result<usize, Refusal> {
+    // The rules first, as [`remove`] and [`add`] apply them: a bad name is not a missing one.
+    if !valid_name(name) {
+        return Err(Refusal::BadName);
+    }
+    if !valid_password(password) {
+        return Err(Refusal::BadPassword);
+    }
     let (s, e) = line_of(file, name).ok_or(Refusal::NoSuchAccount)?;
     let old = record_of(&file[s..e]).ok_or(Refusal::NoSuchAccount)?;
     let mut line = [0u8; MAX_FILE];

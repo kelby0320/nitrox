@@ -1025,7 +1025,10 @@ impl Broker {
 
     /// **`AddAccount`**: the name and password checked, the home and its folders made — or an
     /// existing home adopted — and then the record, by `auth-service`. A home this made is taken
-    /// away again if the record is refused, so a failure leaves nothing behind.
+    /// away again **only when the record is known not to be there**: an answer other than success
+    /// is settled by the account list asked again ([`accounts::settled`]), since one that never
+    /// came may be an add still carried out. So a refusal leaves nothing behind, and a slow add
+    /// never leaves an account without its home.
     fn add_account(&mut self, body: &[u8]) -> Result<String, String> {
         let r = parse_account_request(body).ok_or_else(|| String::from("the request does not read"))?;
         if !libusers::valid_name(r.username) {
@@ -1067,12 +1070,21 @@ impl Broker {
             None => Err(String::from("the request does not fit")),
         };
         scrub(&mut req);
-        match asked {
-            Ok(()) if made => Ok(alloc::format!("added {name}, with a new home at {home}")),
-            Ok(()) => Ok(alloc::format!("added {name}, adopting {home}, which was already there")),
-            Err(why) => {
+        // **A home is taken away only when the record is known not to be there** — an answer that
+        // never came may be an add `auth-service` still carries out (PR #338 review).
+        let (settled, why) = match asked {
+            Ok(()) => (accounts::Settled::Done, String::new()),
+            Err(why) => (accounts::settled(self.accounts().as_deref(), &name, true), why),
+        };
+        match settled {
+            accounts::Settled::Done if made => Ok(alloc::format!("added {name}, with a new home at {home}")),
+            accounts::Settled::Done => Ok(alloc::format!("added {name}, adopting {home}, which was already there")),
+            accounts::Settled::NotDone => {
                 undo();
                 Err(why)
+            }
+            accounts::Settled::Unknown => {
+                Err(alloc::format!("{why}; whether {name} was added cannot be said, so {home} is kept"))
             }
         }
     }
@@ -1093,8 +1105,19 @@ impl Broker {
         if let Some(why) = accounts::refuse_removal(&name, &names, &self.sessions, policy) {
             return Err(why);
         }
-        self.ask_auth(OP_AUTH_REMOVE, name.as_bytes())?;
         let home = alloc::format!("/home/{name}");
+        // Settled the same way as an add: a removal whose answer never came may have happened.
+        if let Err(why) = self.ask_auth(OP_AUTH_REMOVE, name.as_bytes()) {
+            match accounts::settled(self.accounts().as_deref(), &name, false) {
+                accounts::Settled::Done => {}
+                accounts::Settled::NotDone => return Err(why),
+                accounts::Settled::Unknown => {
+                    return Err(alloc::format!(
+                        "{why}; whether {name} was removed cannot be said, so {home} is kept"
+                    ));
+                }
+            }
+        }
         if !home_too {
             return Ok(alloc::format!("removed {name}, keeping {home}"));
         }

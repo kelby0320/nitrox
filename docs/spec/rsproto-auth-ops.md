@@ -124,7 +124,7 @@ holder can already map `/system/users` writable.
 
 | Refusal | When |
 |---|---|
-| `InvalidArgument` | a name that is not 1 to 32 bytes of a lowercase letter or `_` then lowercase letters, digits, `_` or `-`; a password not 1 to 128 bytes; a body that does not account for itself exactly |
+| `InvalidArgument` | a name that is not 1 to 32 bytes of a lowercase letter or `_` then lowercase letters, digits, `_` or `-` — for `Add`, `Remove` and `SetPassword` alike, **before the account is looked for**, so a mistyped name is never reported missing; a password not 1 to 128 bytes, likewise first; a body that does not account for itself exactly |
 | `AlreadyExists` | `Add` of a name an account has |
 | `NotFound` | `Remove` or `SetPassword` of a name no account has |
 | `TooLarge` | the file would be larger than `libusers::MAX_FILE`, 4 KiB, the most the service loads at boot; or the account list does not fit in one message |

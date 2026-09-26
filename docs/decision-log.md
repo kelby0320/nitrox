@@ -30170,9 +30170,10 @@ and `--list` stays the one table. A row would only repeat the name back.
 
 **A new check for all of `test-interactive`: no password it types may appear in the serial
 transcript.** Every prompt the gate answers turns echo off: the login's, `with`'s and `account`'s.
-Until now nothing held them to it, and a prompt that echoed would put the password in every log
-that keeps a transcript. The four passwords the gate types are listed in `TYPED_PASSWORDS`, and a
-pass requires none of them in what the guest printed.
+Until now only step 20b held them to it, and only for the two passwords typed before it; a prompt
+that echoed would put the password in every log that keeps a transcript. The six passwords the
+gate types are listed in `TYPED_PASSWORDS`, and a pass requires none of them in what the guest
+printed.
 
 **The root `CLAUDE.md`'s step count was stale**: it said 31 when D.2 had made it 32. It says 33 now.
 
@@ -30254,5 +30255,66 @@ the full set runs, and CI does not.
   release disk shipped it;
 - a salt of zeros: the host's salt check;
 - echo left on at `account`'s prompts: the live boot's transcript holds the new password.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-25 — Part D, reviewed (PR #338): a slow add keeps its home, and a bad name is one
+
+The review found nothing blocking, one thing worth fixing and five optional. All six are fixed.
+
+**Worth fixing.** **`graphical-session.md` still called `auth-service` a read-only verifier**, "a
+read handle to the user DB" and "PAM's *verifier* and nothing more". Since D.1 it is the user
+database's only writer. A reader judging what a bug in it reaches would conclude it can read
+verifiers, when it can rewrite every account. **The same claim stood twice in
+`session-and-auth.md`**: its cast table, and the opening of *Credential validation*. Neither was
+in the finding, and a sweep for the phrase found both. All three now say what it writes, and how.
+
+**Optional, each fixed:**
+- **An add whose answer never came removed the home it had made.** `add_account` undid on every
+  error, and "auth-service did not answer" after five seconds is one. But `auth-service` has the
+  request, and serves one at a time. So a slow add would leave an account without its home, and a
+  retry would say it exists. Now **any answer but success is settled by the account list, asked
+  again** (`view_broker::accounts::settled`):
+  - the account there: the add happened, and the home stays;
+  - absent: it was refused, and a home this add made is removed;
+  - the list unanswered too: nobody can say, the home is kept, and the answer says so.
+
+  **A removal is settled the same way**, since it has the same shape: its home goes only once
+  the account is known gone. The finding named the add alone.
+- **`an_account_is_added_changed_and_removed` took 21 s**, because `serve_admin` always derived at
+  the real count. `serve_admin_with` takes the count, as `libusers`' `*_with` edits do. The admin
+  tests use 2, and write their existing records at 2 too. The test takes 2.65 s alone, most of it
+  `authenticate`'s deliberate dummy verify at the real count for an unknown name. The suite takes
+  10.6 s, where it took 21, and what remains is the crate's slowest test before this PR.
+- **Nothing held `line_of` and `find` to the same record.** With `line_of` taking the last of a
+  duplicated name, all 16 `libusers` tests passed. **`find` now goes through `line_of`**, so there
+  is one lookup, and a new test edits a file naming `alice` twice. The review's control now fails
+  two tests.
+- **`Remove` and `SetPassword` answered a bad name `NotFound`**, where the spec's refusal table says
+  `InvalidArgument`. The cause was one layer down: `libusers::remove` and `set_password` looked
+  before they checked, and `add` did not. **They check the rules first now**, so every caller —
+  `auth-service`, and `account`'s offline mode — refuses a bad name as one. A hand-edited record
+  under such a name is edited by no tool, which the broker, refusing the name first, already
+  ensured. The spec row says "before the account is looked for".
+- **Two text nits**: `libcrypto/CLAUDE.md` put the user-DB format and cost policy in `auth-service`
+  (they are `libusers`'), and D.4's entry said "four passwords" where there are six. The same
+  paragraph said nothing had held the prompts to echo off, when step 20b had checked two. Both are
+  corrected in place, the entry being in this open PR.
+
+**The review's controls** included one this PR's log did not list: `auth-service`'s install
+skipping `SYS_FILE_SYNC`, caught by `boot-probe` at "the added account is not on the device". That
+check backs "synced, then renamed", which is what makes an install crash-safe.
+
+**Controls for the fixes**, 6 host, each failing its test:
+- `libusers::remove` not checking the name;
+- `set_password` not checking the name;
+- `set_password` not checking the password before it looks;
+- `settled` ignoring the list;
+- `settled` reading a removal as an add;
+- `auth-service`'s refusal test against the old `remove`.
+
+The review's `line_of`-takes-the-last control was run again, and now fails two tests. The wiring
+in `main.rs` — settling after a failed add or removal — has no boot exercise, since no gate can make
+`auth-service` take five seconds. The decision it applies is the host-tested function.
 
 No kernel change and no ABI hash impact.
