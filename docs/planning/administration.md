@@ -1611,13 +1611,29 @@ from "lost at exit" to "lost at power-off unless something syncs it".
         transcript.** Every prompt turns echo off, and this is what holds them to it.*
       - *The offline mode, `--users FILE`, is built here and gated by D.5's `check-recovery`,
         as planned.)*
-- [ ] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
+- [x] **D.5 — the recovery gate, `cargo xtask check-recovery`**, on demand like `check-install`.
       First boot: the live image beside a copy of the release disk. Log in on serial, run
       `with admin disk --unmount nitrox-root` and `--mount` it writable, then
       `account --password alice --users /storage/nitrox-root/system/users` with a new password,
       then unmount. Second boot: that disk alone. `alice` logs in with the new password, and the
       old one is refused.
-- [ ] **Docs.**
+
+      *(Landed 2026-09-25.*
+      - *The disk's root is marked not cleanly unmounted first, as an installed machine's is,
+        as `check-storage` does.*
+      - *Between the boots the host carves the partition out and checks it. `e2fsck -fn` finds it
+        clean, the superblock records a clean unmount, and `/system/users` differs from the
+        release disk's in `alice`'s line alone. That line takes the new password, under a fresh
+        16-byte salt that is neither zeros nor the build's.*
+      - *After the unmount, the live system's own `alice` logs in with the old password: the file
+        edited was the disk's.*
+      - *Neither boot may print either password.*
+      - *The host's clean checks moved out of `check-storage` into `check_left_clean`, which both
+        gates call.)*
+- [x] **Docs.** *(Each landed with its piece: D.1 the user database and D's share of
+      `TODO(svc-auth-ungated)`; D.2 and D.3 the three specs and what an administrator is; D.3
+      `TODO(home-folders)`; D.4 `shell-language.md` §10d and the deferred item; D.5 the boundary,
+      in `session-and-auth.md` § Credential validation.)*
       - `session-and-auth.md`:
         - the user database is written, by `auth-service` alone;
         - the deferred item for user creation and password change is resolved;

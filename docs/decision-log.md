@@ -30207,3 +30207,52 @@ pass requires none of them in what the guest printed.
 
 No kernel change and no ABI hash impact. `coreutils` gains `libusers`, so `userspace/Cargo.lock`
 changes.
+
+## 2026-09-25 — Administration D.5: `check-recovery`, and Part D is complete
+
+**What landed.** `cargo xtask check-recovery`, on demand like `check-install`: two boots and a copy
+of the release disk. Recovery is the one account path nobody exercises until they need it, and
+then there is no administrator to ask. So the gate takes the path a person would take on the
+laptop, with a stick in it.
+
+**The first boot** is the live image as a USB stick beside the copy. The copy's root is marked not
+cleanly unmounted first, as an installed machine's is until Part E's `shutdown`, as `check-storage`
+does. On the serial console, as the live image's own `alice`:
+- the disk's `nitrox-root` is found auto-mounted read-only;
+- `with admin disk` unmounts it and mounts it writable. The live image's administrator is the
+  authority here, not the installed one's, which is the point: that person has forgotten it;
+- `account --password alice --users /storage/nitrox-root/system/users` sets a new password in the
+  disk's file, typed twice. That is `libusers` on the file, with no view and no service;
+- `with admin disk --unmount` leaves the filesystem clean;
+- then the live system's own `alice` logs in with the old password, so the file edited was the
+  disk's.
+
+**Between the boots, on the host**, the partition is carved out and checked:
+- `e2fsck -fn` finds it clean, and the superblock records a clean unmount;
+- `/system/users` differs from what the release disk shipped **in `alice`'s line alone**;
+- that line takes the new password and refuses the old;
+- **its salt is fresh**: `libusers::SALT_LEN` bytes, not all zero, and not the build's.
+
+The host's clean checks moved out of `check-storage` into `check_left_clean`, which both gates
+call.
+
+**The second boot is that disk alone**: the old password is refused at the login, and the new one
+logs in. Neither boot may print either password.
+
+**Part D is complete**, D.1–D.5, on `admin/part-d`. Its Docs item is ticked: each document landed
+with the piece that changed it. Here, `session-and-auth.md`'s account of who reaches the
+credential oracle now names Part D's share: the admin session, and the broker's accounts and
+policy endpoints.
+
+**The local gate set grows to 32.** `check-recovery` joins `check-install` among the on-demand gates
+the full set runs, and CI does not.
+
+**Gates:** `check-recovery --kvm`, first run and again with the salt check added.
+
+**Controls:** 3 `check-recovery --kvm` boots, each failing at its own check:
+- the offline edit writing `FILE.new` and never renaming it: the host finds `alice`'s line as the
+  release disk shipped it;
+- a salt of zeros: the host's salt check;
+- echo left on at `account`'s prompts: the live boot's transcript holds the new password.
+
+No kernel change and no ABI hash impact.

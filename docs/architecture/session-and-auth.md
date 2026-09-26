@@ -110,7 +110,13 @@ made this Milestone 7's problem rather than a tidiness question.
 
 **The binding is unscoped among the processes that hold the root namespace**, and that is
 tracked — `TODO(svc-auth-ungated)` in
-[`deferred-decisions.md`](../rationale/deferred-decisions.md).
+[`deferred-decisions.md`](../rationale/deferred-decisions.md). **Since administration Part D the
+same set reaches what writes accounts**: `/svc/auth/admin`, the admin session that adds, removes
+and sets the password of any account, and the view broker's `/svc/views/accounts/<id>` and
+`/svc/views/policy/<id>`, which act as any open session's `accounts` or `views` grant without a
+password. The broker is meant to be the admin session's one client, and that is a convention of
+the trusted set rather than a property. It adds no authority: a root holder can already map
+`/system/users` writable.
 
 **That set does not include a user's shell**, and saying otherwise would contradict the whole
 point of §Session construction below. A session gets a **constructed** namespace holding

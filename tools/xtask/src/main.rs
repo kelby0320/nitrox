@@ -382,6 +382,7 @@ fn main() -> ExitCode {
         "check-storage",
         "check-report",
         "check-install",
+        "check-recovery",
         "shot",
         "bench-compose",
         "qemu",
@@ -465,6 +466,7 @@ fn main() -> ExitCode {
         Some("check-live") => cmd_check_live(accel, gate_size),
         Some("check-storage") => cmd_check_storage(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
+        Some("check-recovery") => cmd_check_recovery(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
@@ -509,6 +511,7 @@ fn print_help() {
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
            check-install     install to a blank disk from the live menu, then boot that disk\n  \
+           check-recovery    reset a password on an installed disk from the live image, then boot it\n  \
            check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
@@ -4194,30 +4197,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
 /// the file holding the pattern.
 fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
     let fs_img = storage_root_fs(disk, work)?;
-    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
-    // `check_installed_root` reads it.
-    let out = Command::new("e2fsck")
-        .args(["-fn", &fs_img.display().to_string()])
-        .output()
-        .map_err(|e| format!("run e2fsck: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    if text.contains("? no") || !text.contains(" files (") {
-        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
-    }
-    println!("  ok: e2fsck -fn finds it clean");
-    let state = ext4_s_state(&fs_img)?;
-    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
-        return Err(format!(
-            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
-             set. The unmount's `Meta::Unmount` is what records it clean"
-        )
-        .into());
-    }
-    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    check_left_clean(&fs_img)?;
     let path = format!("/{STORAGE_PATTERN_FILE}");
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
     match debugfs_cat(&fs_img, &path)? {
@@ -4234,6 +4214,308 @@ fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
         None => return Err(format!("{path} is not on the disk").into()),
     }
     println!("  ok: {path} holds the pattern, {STORAGE_PATTERN_LEN} bytes, read by debugfs");
+    Ok(())
+}
+
+/// **What an unmount through the storage service must leave**, read on the host from the carved
+/// filesystem `fs_img`: `e2fsck -fn` clean, and the superblock's `s_state` recording a clean
+/// unmount with no error — `check-storage`'s and `check-recovery`'s.
+fn check_left_clean(fs_img: &Path) -> R<()> {
+    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
+    // `check_installed_root` reads it.
+    let out = Command::new("e2fsck")
+        .args(["-fn", &fs_img.display().to_string()])
+        .output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
+    }
+    println!("  ok: e2fsck -fn finds it clean");
+    let state = ext4_s_state(fs_img)?;
+    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
+        return Err(format!(
+            "the superblock's s_state is {state:#06x}: not recorded clean, or with its error bit \
+             set. The unmount's `Meta::Unmount` is what records it clean"
+        )
+        .into());
+    }
+    println!("  ok: the superblock records it cleanly unmounted (s_state {state:#06x})");
+    Ok(())
+}
+
+/// The password `check-recovery` resets `alice`'s to, on the installed disk — a fixture like
+/// `DEMO_PASSWORD`, for a disk the gate made and throws away.
+const RECOVERED_PASSWORD: &str = "alice after recovery";
+
+/// `cargo xtask check-recovery` — **a forgotten password, reset from the live image**
+/// (administration Part D.5), on demand like `check-install`: two boots and a disk image.
+///
+/// Recovery is the one account path nobody exercises until they need it, and then there is no
+/// administrator to ask: the person has forgotten the password `with admin` wants. So the gate is
+/// the path a person takes on the laptop, with no view and no service writing the file.
+///
+/// **The first boot** is the live image as a USB stick beside **a copy of the release disk**,
+/// its root marked not cleanly unmounted as an installed machine's is. On the serial console,
+/// logged in as the live image's own `alice`:
+/// - the disk's `nitrox-root` is auto-mounted read-only; `with admin disk` unmounts it and mounts
+///   it writable — the live image's `alice` is its administrator, not the installed one's;
+/// - `account --password alice --users /storage/nitrox-root/system/users` sets a new password in
+///   **that disk's** file, typed twice;
+/// - `with admin disk --unmount` leaves it clean;
+/// - and the live system's own `alice` still logs in with the old password: the file edited was
+///   the disk's, not the running system's, which no session can reach.
+///
+/// **Between the boots, on the host**: the filesystem carved out of the disk is clean, and its
+/// `/system/users` differs from what the release disk shipped **in `alice`'s line alone**.
+///
+/// **The second boot** is that disk alone, with no stick: the old password is refused at the
+/// login, and the new one taken. And neither boot printed either password.
+fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    require_tool("e2fsck")?;
+    require_tool("debugfs")?;
+    // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
+    // wrote.
+    cmd_image(BuildMode::Normal)?;
+    let work = build_cache().join("check-recovery");
+    fs::create_dir_all(&work)?;
+    let disk = work.join("disk.img");
+    let _ = fs::remove_file(&disk);
+    fs::copy(image_path(), &disk)?;
+    mark_root_not_clean(&disk)?;
+    let shipped = debugfs_cat(&storage_root_fs(&disk, &work)?, "/system/users")?
+        .ok_or("the release disk has no /system/users")?;
+    cmd_image_live()?;
+    let ovmf = locate_ovmf()?;
+    let secrets = [DEMO_PASSWORD, RECOVERED_PASSWORD];
+    let leaked = |transcript: &str| secrets.iter().position(|p| transcript.contains(p));
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-drive")
+        .arg(format!("if=none,id=disk,format=raw,file={}", disk.display()))
+        .arg("-device")
+        .arg("ide-hd,drive=disk,bus=ide.0")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: recovery gate — booting the live image beside a copy of the release disk…\n");
+    let mut session = Session::spawn(cmd, "check-recovery")?;
+    let result = run_recovery_steps(&mut session);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    if let Some(p) = leaked(&transcript) {
+        return Err(format!("password {p} reached the console on the live boot: a prompt echoed it").into());
+    }
+
+    println!("\nxtask: the machine is stopped; the disk, on the host:");
+    let fs_img = storage_root_fs(&disk, &work)?;
+    check_left_clean(&fs_img)?;
+    let users = debugfs_cat(&fs_img, "/system/users")?.ok_or("the disk has no /system/users")?;
+    check_recovered_users(&shipped, &users)?;
+
+    println!("\nxtask: booting the disk alone…\n");
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", disk.display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut session = Session::spawn(cmd, "check-recovery-boot")?;
+    let result = run_recovered_boot_steps(&mut session);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    if let Some(p) = leaked(&transcript) {
+        return Err(format!("password {p} reached the console on the disk's boot: a prompt echoed it").into());
+    }
+    println!("\nxtask: a password reset from the live image logs in on the installed disk ✓");
+    Ok(())
+}
+
+/// Wait for the serial login prompt, searched for in the whole transcript as `check-live` does:
+/// it and the greeter come up together, so an `expect` could scan past it.
+fn await_serial_login(s: &mut Session) -> R<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !s.transcript().contains("nitrox login:") {
+        if std::time::Instant::now() > deadline {
+            return Err("no `nitrox login:` prompt on the serial column".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The live boot: the disk's root made writable, `alice`'s password set in its file, and unmounted.
+fn run_recovery_steps(s: &mut Session) -> R<()> {
+    let users = format!("/storage/{ROOT_PARTLABEL}/system/users");
+
+    // 1. **The disk's root, auto-mounted read-only**, the boot being a live one; its name is read
+    //    off the line the storage service reports it on.
+    let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
+    s.expect(&reported)?;
+    let line = s
+        .transcript()
+        .lines()
+        .find(|l| l.contains(&reported))
+        .map(str::to_string)
+        .ok_or("the report line went missing from the transcript")?;
+    let name = line
+        .split_whitespace()
+        .find(|w| w.starts_with("blk-"))
+        .ok_or_else(|| format!("no `blk-<n>` in {line:?}"))?
+        .to_string();
+    let index = name.trim_start_matches("blk-").to_string();
+    if !line.contains(&format!("mounted at /storage/{ROOT_PARTLABEL} (ro)")) {
+        return Err(format!("the disk's {ROOT_PARTLABEL} is not auto-mounted read-only: {line:?}").into());
+    }
+    println!("  ok: {name}, the disk's {ROOT_PARTLABEL}, auto-mounted read-only on a live boot");
+
+    // 2. The live image's `alice`, on the serial column.
+    await_serial_login(s)?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+
+    // 3. **Writable**, through the live image's own administrator.
+    let admin = |s: &mut Session, command: &str| -> R<()> {
+        s.send(&format!("with admin {command}"))?;
+        s.expect("[with admin] password (1 of 3): ")?;
+        s.send(DEMO_PASSWORD)?;
+        Ok(())
+    };
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    admin(s, &format!("disk --mount /dev/blk/{index}"))?;
+    s.expect(&format!("storage-service: mounted {ROOT_PARTLABEL} (rw), as asked"))?;
+    s.expect(&format!("disk: mounted {name} at /storage/{ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: `with admin disk` unmounted it and mounted it writable");
+
+    // 4. **The reset**: no view and no service — `libusers` on the disk's file.
+    s.send(&format!("account --password alice --users {users}"))?;
+    s.expect("new password for alice: ")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect("again: ")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect(&format!("account: set a new password for alice in {users}"))?;
+    s.expect("/home>")?;
+    println!("  ok: account --password alice --users set it in the disk's file");
+
+    // 5. Unmounted, and left clean.
+    admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
+    s.expect("/home>")?;
+
+    // 6. **The running system's own file is untouched**: its `alice` logs in as before.
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    println!("  ok: unmounted clean, and the live system's own alice logs in as before");
+    Ok(())
+}
+
+/// `alice`'s line changed, **and nothing else**: every other line of `shipped` is in `now` byte for
+/// byte, and `alice`'s new record takes the recovered password and refuses the old one.
+fn check_recovered_users(shipped: &[u8], now: &[u8]) -> R<()> {
+    let lines = |b: &[u8]| -> Vec<Vec<u8>> { b.split(|&c| c == b'\n').map(|l| l.to_vec()).collect() };
+    let (before, after) = (lines(shipped), lines(now));
+    let is_alice = |l: &[u8]| l.starts_with(format!("{DEMO_USER}:").as_bytes());
+    if before.len() != after.len() {
+        return Err(format!("/system/users went from {} lines to {}", before.len(), after.len()).into());
+    }
+    for (b, a) in before.iter().zip(&after) {
+        if is_alice(b) != is_alice(a) || (!is_alice(b) && b != a) {
+            return Err(format!(
+                "a line other than alice's changed in /system/users: {:?} became {:?}",
+                String::from_utf8_lossy(b),
+                String::from_utf8_lossy(a)
+            )
+            .into());
+        }
+        if is_alice(b) && b == a {
+            return Err("alice's line in the disk's /system/users is as the release disk shipped it".into());
+        }
+    }
+    let alice = libusers::find(now, DEMO_USER.as_bytes()).ok_or("the disk's /system/users has no alice")?;
+    if !alice.verifies(RECOVERED_PASSWORD.as_bytes()) || alice.verifies(DEMO_PASSWORD.as_bytes()) {
+        return Err("alice's new record does not take the recovered password, or still takes the old one".into());
+    }
+    // **Under a fresh salt**: a whole one, from the entropy source, and not the build's.
+    let salt_of = |file: &[u8]| {
+        let mut out = [0u8; libusers::SALT_MAX];
+        let n = libusers::find(file, DEMO_USER.as_bytes()).and_then(|r| r.salt(&mut out)).unwrap_or(0);
+        out[..n].to_vec()
+    };
+    let (old, new) = (salt_of(shipped), salt_of(now));
+    if new.len() != libusers::SALT_LEN || new.iter().all(|&b| b == 0) || new == old {
+        return Err(format!(
+            "alice's new salt is {} bytes {:02x?}: not a fresh {}-byte one from the entropy source",
+            new.len(),
+            new,
+            libusers::SALT_LEN
+        )
+        .into());
+    }
+    println!("  ok: /system/users changed in alice's line alone, to the recovered password, under a fresh salt");
+    Ok(())
+}
+
+/// The disk alone: the old password refused at the login, and the new one taken.
+fn run_recovered_boot_steps(s: &mut Session) -> R<()> {
+    s.expect(&format!("init:   /: fs-server-ext4 on gpt-partlabel:{ROOT_PARTLABEL} (rw)"))?;
+    await_serial_login(s)?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    s.send(DEMO_USER)?;
+    s.expect("password:")?;
+    s.send(RECOVERED_PASSWORD)?;
+    s.expect("/home>")?;
+    println!("  ok: on the disk alone, alice's old password is refused and the recovered one logs in");
     Ok(())
 }
 
