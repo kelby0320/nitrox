@@ -6,8 +6,10 @@ Constraints for the **emergency shell** (`eshell`). Loaded when working under
 ## What this is
 
 The first **interactive** userspace program (Phase 2 slice 9): a minimal shell on
-the serial console. init spawns it after boot (an interactive `eshell>` prompt) and
-drops to it on a critical-path failure. It reads keyboard input from `/dev/console`
+the serial console. init drops to it on a critical-path failure of its own, or when
+`service-mgr` asks over the terminal channel because a `critical` server did not come up at
+boot (administration Part E.1a). It used to be spawned after every boot too, before
+`service-mgr` existed. It reads keyboard input from `/dev/console`
 (a char `DeviceNode`) via the universal `sys_io_submit(Read)` + `sys_wait` path, does
 its own echo + line editing, and runs a few inspection commands.
 

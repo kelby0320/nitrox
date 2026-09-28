@@ -12,11 +12,15 @@ decides *who you are*; it does **not** construct namespaces or issue authority �
 is session-mgr's job. Keeping the two split keeps the password DB out of the
 `BIND_NAMESPACE`-holding supervisor. See `docs/architecture/session-and-auth.md`.
 
-**A namespace forwarder as of M7 Part C**, like fs-server / profile-server: `init` binds its
-endpoint at `/svc/auth`, it answers `Namespace::Resolve` there, and each caller gets a session
-channel of its own to send `Authenticate` on. It still holds **no** `BIND_NAMESPACE` and no
-device access — binding is init's, and answering a resolve is not the same authority as making
-one.
+**A namespace forwarder as of M7 Part C**, like fs-server / profile-server: `/svc/auth` reaches
+its endpoint, it answers `Namespace::Resolve` there, and each caller gets a session channel of its
+own to send `Authenticate` on. It still holds **no** `BIND_NAMESPACE` and no device access —
+binding is its supervisor's, and answering a resolve is not the same authority as making one.
+
+**Started and bound by `service-mgr`** since administration Part E.1a (2026-09-28), the first
+server it starts; `init` did both until then. It is a `critical` declaration: if it does not come
+up at boot, `service-mgr` starts nothing more and `init` starts the emergency shell, the backstop
+it had when `init` started it.
 
 This paragraph said the opposite until 2026-08-25, and the reason it changed is worth keeping:
 one channel pair minted at startup made it a **one-client** oracle by construction, which
@@ -75,8 +79,8 @@ account write a person asks it for; the root namespace can reach it too, the bou
 - Committing a password or verifier to the source tree (even in tests).
 - Holding `BIND_NAMESPACE` or constructing namespaces. **Answering `Namespace::Resolve` is
   no longer forbidden** — M7 Part C made it a forwarder so two supervisors can each hold a
-  session — but *binding* remains init's, and this server must never acquire the capability
-  to bind its own path.
+  session — but *binding* remains its supervisor's, and this server must never acquire the
+  capability to bind its own path.
 - Disclosing *why* a credential was denied (unknown user vs. wrong password). An
   administrative refusal *does* say why — "no account has that name" — because the admin
   session is already the authority to list every account.

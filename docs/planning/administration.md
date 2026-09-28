@@ -1,18 +1,17 @@
 # Administration: views, devices, and the tools an installed system needs
 
 **Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C complete
-(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28); scoped 2026-09-22 and
-revised after the PR #326 review.** Scheduled after
-[the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
-architecture below were agreed with the maintainer on 2026-09-22. The review then found that
-several mechanisms depend on things the code does not have, and **the maintainer took the four
-resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
-(*Part B in detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D**
-(*Part D in detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*,
-2026-09-28) and is next to build; the other parts are sketched. The plan began as a stub on
-2026-09-16, written while building the installer — the first program that needed authority an
-ordinary session cannot have.
+(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28) and in progress — E.1a
+built the same day; scoped 2026-09-22 and revised after the PR #326 review.** Scheduled after [the
+desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
+architecture below were agreed with the maintainer on 2026-09-22. The review then found that several
+mechanisms depend on things the code does not have, and **the maintainer took the four resolutions
+that needed a decision the same day** (the last item under *Decisions*). **Part A has had its detail
+pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B** (*Part B in
+detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D** (*Part D in
+detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*, 2026-09-28) and is
+being built, E.1a first; the other parts are sketched. The plan began as a stub on 2026-09-16, written while
+building the installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
 
@@ -1984,6 +1983,26 @@ A reboot is the same, with `reboot: true` and a reset at the end.
           profile server, `service-mgr` and the emergency shell, and no longer restarts
           `service-mgr`.
         - The sessions keep their bindings for now, so nothing a session sees changes yet.
+        - *(Landed 2026-09-28.* Three things landed here rather than as written:
+          - **The login chain's place, and the supervisors' handles kept**, both listed under
+            E.1b. The chain needs the servers' endpoints, so once the servers moved it had to
+            start after the last of them. It does, after the last `endpoint` declaration —
+            `restart-probe` in a test image, so `heartbeat` starts before the chain there.
+          - **"`init`'s log names only its mounts, `/bin` and `service-mgr`"** is a transcript
+            check in `test-qemu` (`check_servers_are_service_mgrs`), not `boot-probe`'s: it is a
+            claim about who logs what. Every existing probe reaches its server through the root
+            path, which now runs through `service-mgr`'s endpoint.
+          - **The restart is a server exiting, not a control path.** `restart-probe`, a
+            test-image server, exits when asked; `boot-probe` then reaches the new instance at
+            `/svc/restart-probe` within 10 s. A restart *through* `service-mgr` is E.2's
+            `service`, and the session half of the gate is E.1b's.
+
+          Found building it: **a `service-mgr` that cannot be spawned now takes `init`'s
+          emergency path.** It used to leave the machine idle but with its servers up; since E.1a
+          it would leave nothing up at all. Controls: the root bound to the server's own
+          endpoint, the registry never unbound, a blocking wait for `Ready`, an unstartable
+          critical server, and an unspawnable `service-mgr` each fail the boot, the last two
+          into the emergency shell.)*
       - **E.1b — sessions through `service-mgr`.**
         - The login chain starts after the last server, and `service-mgr` keeps its handles.
         - Both supervisors, and `desktop-shell`'s application namespaces, bind `service-mgr`'s

@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+# The resource-server protocol: `Meta::Ready` from the servers it starts, and the resolves its
+# endpoint answers with `SUBNAMESPACE` into its registry (administration Part E.1).
+librsproto = { path = "../librsproto" }
+# Whole-file reads of the declarations, sized from the object rather than a guessed mapping.
+libfs = { path = "../libfs" }
 
 # A library + binary split (mirroring init): the library holds the host-testable
 # internals (the service-declaration parser), the binary is the bare-target

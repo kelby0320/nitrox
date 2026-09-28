@@ -89,6 +89,37 @@ For a service that exits (a one-shot), finishing *is* readiness. There is no rea
 
 A dependency graph with topological sorting is the general answer and is not built; nothing yet needs one. Cycles are therefore not rejected at parse time, and they do not deadlock either: of two services naming each other, the first does not wait at all (its dependency has not started) and the second waits out the bound.
 
+### `endpoint` (optional, string)
+
+**Since administration Part E.1a (2026-09-28).** Makes the service a **server**, reached at this
+path in the root namespace. An absolute path with no empty, `.` or `..` component and nothing but
+visible ASCII; a declaration whose `endpoint` does not read is **skipped whole**, rather than
+started as a server nothing can reach.
+
+For a server, the service manager spawns it with a control channel it can send on — `SEND`,
+`RECV`, `TRANSFER` and `WAIT` — and **no log handoff**, since a server resolves its own log. It
+waits for the server's `Meta::Ready`, within 30 s, and binds the endpoint in its **registry** under
+the service's name, and the path to its own endpoint with `/<name>` as the base
+(`docs/architecture/service-manager.md` § *Servers, and the registry*). So a restart reaches every
+binding of the path. The next declaration does not start until the server is ready, or has failed
+to be.
+
+The service's name must then be 1 to 32 bytes of lowercase letters, digits and `-`, since it is
+the name the registry binds.
+
+### `critical` (optional, boolean; default `false`)
+
+**Since administration Part E.1a.** A server the boot cannot go on without. If it does not come up
+**at boot**, the service manager starts nothing more and asks `init` for the emergency shell. At
+runtime its death is its restart policy's: the terminal server holds the console by then, and the
+emergency shell could not take it. Only `true` is true.
+
+### `essential` (optional, boolean; default `false`)
+
+**Since administration Part E.1a**, and read by Part E.2's `service`: a service `service --stop`
+and `--restart` refuse, since its absence would lock the administrator out or lose state nothing
+rebuilds.
+
 ### `before` (optional, array of strings; default `[]`)
 
 Inverse of `after`. Naming services that should be started after this one. Equivalent to those services declaring `after = [<this service>]`. Provided for ergonomic flexibility.

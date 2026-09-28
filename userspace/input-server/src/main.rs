@@ -71,7 +71,7 @@ const SUBSCRIPTION: &[u8] = b"/svc/devices/input";
 ///
 /// The manager queues the whole replay before the subscription's resolve completes, so `Settled`
 /// is waiting the moment the channel is; this bounds a manager that is not behaving, well inside
-/// the thirty seconds `init` gives a `Ready`. Anything that arrives after it still joins.
+/// the thirty seconds `service-mgr` gives a `Ready`. Anything that arrives after it still joins.
 const SETTLE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// Consumers served at once.

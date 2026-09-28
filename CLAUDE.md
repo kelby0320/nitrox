@@ -137,9 +137,9 @@ display arm exists for a person rather than for a test: everything else display-
 *before* the shell it will eventually show, so Parts E and F land against a gate that exists.
 
 **It must boot the release image**, not the test one. In a `--selftest` boot the greeter is
-bottom-most — `service-mgr` brings the login chain up before declared services, which is what
-keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
-typed reaches it.
+bottom-most — `service-mgr` brings the login chain up after the servers and before every other
+declared service, which is what keeps `check-display`'s reference windows undisturbed — so it holds
+no keyboard and nothing typed reaches it.
 
 `cargo xtask check-fbcon` is the **no-serial-port gate** (Phase 5 Part B): the laptop Phase 5
 targets has no COM1, so the kernel draws everything COM1 receives on the screen until a client is

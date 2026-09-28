@@ -10,12 +10,14 @@ for the design and its reasons.
 ## The shape
 
 The **storage service** owns every block device, reports what each holds, and mounts what it can
-serve. `init` binds its forwarding endpoint at `/svc/storage` in the root namespace. Mounting and
+serve. `service-mgr` starts it and binds `/svc/storage` in the root namespace to reach its
+forwarding endpoint, through `service-mgr`'s registry (administration Part E.1a; `init` did both
+until then). Mounting and
 unmounting are asked for on an **admin session**, and nothing else speaks this category.
 
 | Role | Resolved as | Suffix the service sees | Answer |
 |---|---|---|---|
-| forwarding endpoint | bound by `init` at `/svc/storage` | — | `Namespace::Resolve` |
+| forwarding endpoint | `/svc/storage`, bound by `service-mgr` | — | `Namespace::Resolve` |
 | admin endpoint | `/svc/storage/admin-endpoint`, from the root namespace | `admin-endpoint` | a forwarding endpoint of the service's own |
 | admin session | any resolve on an admin endpoint — the view broker's `/dev/storage/admin` | any | a channel carrying the requests below |
 

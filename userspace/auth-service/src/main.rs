@@ -4,7 +4,7 @@
 //! rsproto category (`Authenticate { username, password } → { AUTHENTICATED,
 //! principal, home } | DENIED`, `docs/spec/rsproto-auth-ops.md`) on a plain IPC
 //! channel. Like the fs / profile servers it **is** a namespace forwarder as of M7 Part C:
-//! `init` binds its endpoint at `/svc/auth` and it mints a session channel per caller that
+//! `service-mgr` binds `/svc/auth` to reach it and it mints a session channel per caller that
 //! resolves there, which is what lets `session-mgr` and `desktop-session-mgr` each hold one.
 //! Before that it minted a single pair at startup and was a one-client oracle by
 //! construction. The credential logic (user-DB parse + PBKDF2 verify) is the

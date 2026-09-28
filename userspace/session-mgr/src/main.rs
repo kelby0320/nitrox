@@ -178,11 +178,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // An info-only endpoint of the device manager's (administration Part B.4), bound into every
     // session at `/dev/devices` with the base `/info`. `0` on a boot without a manager.
     let devices_endpoint = recv_handoff(control);
-    // **The auth channel is resolved, not couriered** (M7 Part C). **`init`** binds
-    // `auth-service` at `/svc/auth` — not `service-mgr`, which spawned it and cannot bind,
-    // because a declared service holds an inherited LOOKUP-only root — and every supervisor
-    // asks the namespace for a session of
-    // its own — which is what lets `desktop-session-mgr` have one too. Before this it arrived
+    // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` starts
+    // `auth-service` and binds `/svc/auth` (administration Part E.1a; `init` did until then), and
+    // every supervisor asks the namespace for a session of its own — which is what lets
+    // `desktop-session-mgr` have one too. Before this it arrived
     // here positionally as a fourth handle, and there was only ever one to hand out.
     //
     // Resolved once, at startup rather than per login: the oracle's lifetime is the machine's,

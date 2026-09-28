@@ -1,6 +1,7 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-28, when administration Part E.1a moved the nine system
+servers from `init` to `service-mgr` (steps 5 and 6); before that 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -27,18 +28,22 @@ UEFI firmware (OVMF under QEMU)
                           ├─ read /initramfs/etc/init.toml
                           ├─ mount critical path (spawn fs-server per mount)
                           ├─ bind profile-server at /bin
-                          ├─ bind auth-service at /svc/auth
-                          ├─ bind logging-service at /log
-                          ├─ bind tty-server at /dev/tty
-                          ├─ bind clipboard-server at /dev/clipboard
-                          ├─ bind view-broker at /svc/views
-                          ├─ bind device-mgr at /svc/devices
-                          ├─ bind storage-service at /svc/storage
-                          ├─ bind input-server at /dev/input/new
-                          ├─ bind compositor at /dev/draw
                           └─► service-mgr
+                                ├─ read /initramfs/etc/services.toml
+                                ├─ auth-service       /svc/auth
+                                ├─ logging-service    /log
+                                ├─ tty-server         /dev/tty
+                                ├─ clipboard-server   /dev/clipboard
+                                ├─ view-broker        /svc/views
+                                ├─ device-mgr         /svc/devices
+                                ├─ storage-service    /svc/storage
+                                ├─ input-server       /dev/input/new
+                                ├─ compositor         /dev/draw
                                 └─► session-mgr ─► login ─► nxsh
 ```
+
+Each server `service-mgr` starts is bound in its registry, and at its path in the root to
+`service-mgr` itself (§6).
 
 Failure on the critical path drops to `eshell`, the emergency shell (see § "The
 emergency path").
@@ -261,35 +266,25 @@ than an implementation detail.
    server reads the superblock and the root directory **before** it answers, and a device
    it cannot serve gets a refusal instead, which init prints:
    `init: fs-server-ext4 for / on gpt-partlabel:nitrox-live refused: no ext4 filesystem: …`.
-3. **Bind the system servers**, each by the same spawn → `Ready` → bind handshake:
-   `profile-server` at `/bin` (projecting the store), `auth-service` at `/svc/auth`,
-   `logging-service` at `/log`, `tty-server` at `/dev/tty`, `clipboard-server` at
-   `/dev/clipboard`, `view-broker` at `/svc/views`, **`device-mgr` at `/svc/devices`**
-   (administration Part B), which reads `/dev/registry` and hands each device to the owner of
-   its class ([`device-manager.md`](device-manager.md)), and **`storage-service` at
-   `/svc/storage`** (administration Part C.5a), which takes `block` and reports what the disks
-   hold and which of them are `init`'s ([`storage.md`](storage.md)). The first three are
-   critical-path.
+3. **Bind the profile server at `/bin`**, by the same spawn → `Ready` → bind handshake, projecting
+   the store. Critical-path: `service-mgr` and every server are spawned from `/bin`.
+4. **Hand off** to `service-mgr` — a root handle with `init`'s own rights and the root filesystem's
+   and profile server's endpoints, down a channel `init` then keeps as the **terminal channel** —
+   and stay resident, reaping.
 
-   The rest are **non-fatal**: if the tty server fails, init logs "no terminal server; sessions
-   will have no `/dev/tty`" and continues, and each of the others says what goes without it.
-   **The device manager comes late in the step because the display arm depends on it**: from
-   Part B.3 `input-server` takes its devices from `/svc/devices`. **The storage service follows it
-   directly**, because a class's owner is whoever subscribes first, and it must be `block`'s
-   before any declared service runs (`TODO(svc-auth-ungated)`).
-4. **Bring up the display arm** — `input-server` at `/dev/input/new`, then `compositor` at
-   `/dev/draw`. Both non-fatal. The input server takes its devices from `/svc/devices/input`
-   (administration Part B.3) and serves with whatever arrived: a machine with no i8042, or a
-   boot without the device manager, has an input server with no devices, which says so.
+**The servers are `service-mgr`'s, since administration Part E.1a (2026-09-28).** `init` used to
+start nine more here, between the profile server and the hand-off: `auth-service`,
+`logging-service`, `tty-server`, `clipboard-server`, the view broker, `device-mgr`,
+`storage-service`, `input-server` and the compositor. They are declarations now, started in that
+order (§6). `init` starts only what it takes to reach `service-mgr`, which is what
+[`service-manager.md`](service-manager.md) has said since Phase 3.
 
-   **The order within the step is load-bearing**: the compositor resolves `/dev/input/new`
-   during its own startup, before it answers `Ready`. Spawned the other way round it would
-   serve the display with no input for the life of the boot, with only a log line to say so.
-
-   **This step is after step 3, not before it** (since 2026-08-11): both are spawned from
-   `/bin`, so they cannot start until the profile server has provided it. They used to come
-   first only because they were initramfs-resident.
-5. **Hand off** to `service-mgr` and stay resident as supervisor.
+**Its two critical-path servers keep the backstop.** A boot without `auth-service` or
+`logging-service` dropped to the emergency shell here; they are `critical` declarations now, and
+`service-mgr` asks for the shell over the terminal channel if one does not come up. **`init` no
+longer restarts `service-mgr`**: its death, learned from the terminal channel closing, is reported,
+and the machine needs a restart ([`service-manager.md`](service-manager.md) § *Capability
+posture*).
 
 **`init` runs the same code in both images**, bar one namespace binding (retrofit Part C1
 2026-08-21, Part C2 2026-08-24). The demo chain, the display self-test, `nxterm` and the two graphical test
@@ -299,13 +294,13 @@ test image. Their order is the file's order, and `after` holds `boot-probe` unti
 chain has exited — the sequencing this function used to enforce by running the chain
 synchronously.
 
-Step 5 is therefore unconditional: spawn `service-mgr` and supervise it. That branch was
+Step 4 is therefore unconditional: spawn `service-mgr` and supervise it. That branch was
 `#[cfg(not(feature = "selftest"))]`, so a test image reaped the demo `parent` as its primary
 child instead and PID 1's restart-on-death was code no gate could reach.
 
 **The filesystem checks are no longer init's** (retrofit Part C1, 2026-08-21): the large-file
 read, overwrite, grow, create and subtree-bind checks moved to `boot-probe`, a declared
-service `service-mgr` starts, so they run *after* the step-5 handoff rather than between
+service `service-mgr` starts, so they run *after* the step-4 handoff rather than between
 steps 2 and 3. They also gate the boot verdict now, which they never did here — every failure
 path in init was a bare `return` after a `FAIL` print. The one thing they need from init — a
 second name on the root, `/subtreetest` scoped to `/system` — is data too since Phase 5 Part C.1:
@@ -316,20 +311,29 @@ for a critical-path boot failure — a demo chain that dies partway is caught by
 transcript check rather than by init reading an exit code. See
 [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md).
 
-## 6. service-mgr → session-mgr → login
+## 6. service-mgr → the servers → session-mgr → login
 
-`service-mgr` reads service declarations, constructs each service's namespace and handle
-set, spawns it and supervises it. On the login path specifically:
+`service-mgr` reads service declarations, spawns each and supervises it. **The servers come
+first** (administration Part E.1a): each is a declaration with an `endpoint`, started in `init`'s
+old order — `auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the view broker,
+`device-mgr`, `storage-service`, `input-server`, the compositor — and each `Meta::Ready` is awaited
+before the next. The orders that mattered under `init` still hold: the broker after the log it
+audits to, the device manager before the storage service and the input server, and **the input
+server before the compositor**, which resolves `/dev/input/new` during its own startup.
+
+Each server's endpoint is bound in `service-mgr`'s **registry**, and its path in the root to
+`service-mgr`'s own endpoint with the server's name as the base, so a resolve there continues into
+whichever server is bound now, and a restart reaches every binding
+([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
+
+**Then the login chain**, after the last server and before any other declaration:
 
 1. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the fs-server,
-   profile-server and tty-server endpoints. It resolves `/svc/auth` itself.
-2. **`desktop-session-mgr`** — the same, with its own duplicates of those three endpoints.
+   profile-server and the servers' endpoints — the terminal server's, the clipboard's, the view
+   broker's, and an info-only one of the device manager's. It resolves `/svc/auth` itself.
+2. **`desktop-session-mgr`** — the same, with its own duplicates, and the compositor's too.
    Non-fatal if it fails: a machine with a serial login is degraded, one with neither is
    unreachable.
-
-**`auth-service` is not spawned here.** It was until M7 Part C; it is a resource server bound
-at `/svc/auth`, and only `init` can bind into the root namespace — a declared service holds an
-inherited LOOKUP-only root. Both supervisors resolve their own session from that path.
 
 Each supervisor presents a login, authenticates against `auth-service`, constructs a session
 namespace and spawns a leader into it with empty syscaps: `nxsh` for the serial column
@@ -343,8 +347,9 @@ is what keeps serial the recovery path by construction.
 
 ## The emergency path
 
-Failure on the critical path — no usable manifest, a mount that will not come up, a
-required system server that will not bind — drops to `eshell`, a minimal interactive shell
+Failure on the critical path — no usable manifest, a mount that will not come up, the profile
+server, or a `critical` server `service-mgr` cannot bring up, which it tells `init` over the
+terminal channel — drops to `eshell`, a minimal interactive shell
 bundled in the initramfs with enough capability to inspect block devices, edit `init.toml`
 and reboot. Recovery from a misconfigured boot does not need a rescue USB.
 

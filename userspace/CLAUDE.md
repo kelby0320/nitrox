@@ -117,12 +117,12 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
     [`graphical-session.md`](../docs/architecture/graphical-session.md) §3.
   - **`view-broker`** (administration Part A) binds a profile's grants into the views it builds —
     each a copy it made itself of the namespace its caller sent — and is registered at
-    `/svc/views` by `init`, like any server. See
+    `/svc/views` by `service-mgr`, like any server. See
     [`rsproto-views-ops.md`](../docs/spec/rsproto-views-ops.md).
   - **`storage-service`** (administration Part C.5b) builds a namespace for each filesystem it
     mounts, binding that filesystem's server at its `/`, and hands the namespace on in a
     `SUBNAMESPACE` reply. It binds into nothing it did not create, and is registered at
-    `/svc/storage` by `init`. See [`storage.md`](../docs/architecture/storage.md).
+    `/svc/storage` by `service-mgr`. See [`storage.md`](../docs/architecture/storage.md).
 
   Read §3 before copying the pattern: the trusted set widens when a process does both, and that
   cost is named there.

@@ -107,6 +107,31 @@ pub struct ServiceDecl {
     pub after: Vec<String>,
     /// The restart configuration.
     pub restart: RestartConfig,
+    /// **A server's path in the root namespace** (administration Part E.1): `service-mgr` waits
+    /// for its `Meta::Ready`, binds the endpoint in its registry, and binds this path to its own
+    /// endpoint with the server's name as the base, so a restart reaches every binding. `None`
+    /// for a service that is not a server. Absolute, and no `.` or `..` component; a declaration
+    /// whose `endpoint` is not is skipped, rather than started as a server nothing can reach.
+    pub endpoint: Option<String>,
+    /// **A server the boot cannot go on without** — `auth-service` and `logging-service`, which
+    /// `init` treated as critical-path. If one cannot be brought up at boot, `service-mgr` asks
+    /// `init` for the emergency shell and starts nothing more. Only at bring-up: at runtime the
+    /// terminal server holds the console, which the emergency shell would need.
+    pub critical: bool,
+    /// **A service `service --stop` and `--restart` refuse** (Part E.2): one whose absence would
+    /// lock the administrator out, or lose state nothing rebuilds.
+    pub essential: bool,
+}
+
+/// Whether `path` may be a server's root path: absolute, not the root itself, and made of
+/// non-empty components that are neither `.` nor `..`, with nothing but visible ASCII.
+pub fn valid_endpoint(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+        && path.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// `SysCaps` bit for each name the schema recognises, taken from `libkern` rather than
@@ -162,6 +187,10 @@ struct RestartSeen {
     after: bool,
     /// `syscaps`, same reason.
     syscaps: bool,
+    /// `endpoint`, `critical` and `essential`, same reason.
+    endpoint: bool,
+    critical: bool,
+    essential: bool,
     policy: bool,
     max_attempts: bool,
     backoff: bool,
@@ -263,6 +292,10 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     let mut executable: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
     let mut syscaps: Vec<String> = Vec::new();
+    // `Some(None)` is an `endpoint` that did not read: the declaration is then skipped whole.
+    let mut endpoint: Option<Option<String>> = None;
+    let mut critical = false;
+    let mut essential = false;
     let mut restart = RestartConfig::default();
     let mut seen = RestartSeen::default();
     let mut section = Section::None;
@@ -274,6 +307,7 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
         () => {
             if let (Some(n), Some(e)) = (name.take(), executable.take())
                 && !out.iter().any(|d: &ServiceDecl| d.name == n)
+                && !matches!(endpoint, Some(None))
             {
                 // The parser cannot log; carry unrecognised names out so the caller does.
                 let (bits, unknown) = parse_syscaps(&syscaps);
@@ -284,6 +318,9 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
                     unknown_syscaps: unknown,
                     after: after.clone(),
                     restart,
+                    endpoint: endpoint.clone().flatten(),
+                    critical,
+                    essential,
                 });
             }
             // **This is the only thing that resets them**, and it has to cover both paths:
@@ -319,6 +356,9 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
                         // Nothing from the closed declaration may reach the next one.
                         restart = RestartConfig::default();
                         seen = RestartSeen::default();
+                        endpoint = None;
+                        critical = false;
+                        essential = false;
                         name = Some(String::from(svc));
                     }
                     section = Section::Root;
@@ -356,6 +396,18 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
             Section::Root if key == "syscaps" && !seen.syscaps => {
                 seen.syscaps = true;
                 syscaps = parse_string_array(value);
+            }
+            Section::Root if key == "endpoint" && !seen.endpoint => {
+                seen.endpoint = true;
+                endpoint = Some(unquote(value).filter(|p| valid_endpoint(p)).map(String::from));
+            }
+            Section::Root if key == "critical" && !seen.critical => {
+                seen.critical = true;
+                critical = value == "true";
+            }
+            Section::Root if key == "essential" && !seen.essential => {
+                seen.essential = true;
+                essential = value == "true";
             }
             // Every arm is guarded on **not yet seen** — see [`RestartSeen`].
             Section::Restart => match key {
@@ -751,5 +803,60 @@ backoff_max = \"2s\"\n";
     fn an_empty_file_yields_nothing() {
         assert!(parse_all("").is_empty());
         assert!(parse_all("# just a comment\n").is_empty());
+    }
+
+    /// **A server's keys** (administration Part E.1): its root path, and whether the boot needs
+    /// it or `service` may stop it. Off unless said, and per declaration.
+    #[test]
+    fn a_server_declares_its_path_and_whether_it_is_critical_or_essential() {
+        let v = parse_all(
+            "[service.auth-service]\nexecutable=\"/bin/auth-service\"\nendpoint=\"/svc/auth\"\n\
+             critical=true\nessential=true\n\
+             [service.heartbeat]\nexecutable=\"/bin/heartbeat\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].endpoint.as_deref(), Some("/svc/auth"));
+        assert!(v[0].critical && v[0].essential);
+        assert_eq!(v[1].endpoint, None, "a server's path does not leak to the next service");
+        assert!(!v[1].critical && !v[1].essential, "nor do its flags");
+        let first = parse_all(
+            "[service.a]\nexecutable=\"/a\"\nendpoint=\"/x\"\nendpoint=\"/y\"\n\
+             critical=true\ncritical=false\n",
+        );
+        assert_eq!(first[0].endpoint.as_deref(), Some("/x"), "first value wins");
+        assert!(first[0].critical, "first value wins");
+        let yes = parse_all("[service.a]\nexecutable=\"/a\"\ncritical=yes\n");
+        assert!(!yes[0].critical, "only `true` is true");
+    }
+
+    /// **An endpoint that does not read skips the declaration**, and only that one: a server
+    /// started with nowhere to bind would be running and unreachable.
+    #[test]
+    fn a_declaration_with_a_bad_endpoint_is_skipped_and_the_next_is_not() {
+        let bads = [
+            "\"svc/auth\"",
+            "\"/\"",
+            "\"/svc/../auth\"",
+            "\"/svc//auth\"",
+            "\"/svc/ auth\"",
+            "/svc/auth",
+        ];
+        for bad in bads {
+            let v = parse_all(&alloc::format!(
+                "[service.a]\nexecutable=\"/a\"\nendpoint={bad}\n[service.b]\nexecutable=\"/b\"\n"
+            ));
+            assert_eq!(v.len(), 1, "{bad}");
+            assert_eq!(v[0].name, "b", "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_is_an_absolute_path_of_plain_components() {
+        for ok in ["/log", "/svc/auth", "/dev/input/new", "/dev/draw"] {
+            assert!(valid_endpoint(ok), "{ok}");
+        }
+        for bad in ["", "/", "log", "/svc/", "/svc//auth", "/./x", "/x/..", "/a b"] {
+            assert!(!valid_endpoint(bad), "{bad}");
+        }
     }
 }

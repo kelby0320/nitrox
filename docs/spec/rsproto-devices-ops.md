@@ -11,16 +11,17 @@ detail* for the design and why each piece is shaped as it is.
 
 The **device manager** learns what devices the machine has from
 [`/dev/registry`](device-node.md#the-registry-devregistry) and hands each to the service that owns
-its class. It does not drive devices. It is spawned by `init`, which binds its forwarding endpoint
-at `/svc/devices` in the root namespace.
+its class. It does not drive devices. It is spawned by `service-mgr`, which binds `/svc/devices` in
+the root namespace to reach its forwarding endpoint, through `service-mgr`'s registry
+(administration Part E.1a; `init` did both until then).
 
 | Role | Resolved as | Suffix the manager sees | Answer |
 |---|---|---|---|
-| forwarding endpoint | bound by `init` at `/svc/devices` | — | `Namespace::Resolve` |
+| forwarding endpoint | `/svc/devices`, bound by `service-mgr` | — | `Namespace::Resolve` |
 | class owner | `/svc/devices/<class>`, from the root namespace | `input` or `block` | a channel; receives `Arrived`, `Settled`, `Departed` |
 | directory | `/svc/devices/info` | `info` | a channel answering `File::ReadDir` |
 | table | `/svc/devices/info/<name>.tsm` | `info/<name>.tsm` | a read-only memory object: a TSM1 table |
-| info-only endpoint | `/svc/devices/info-endpoint`, asked for once by `init` | `info-endpoint` | a forwarding endpoint of the manager's own — see below |
+| info-only endpoint | `/svc/devices/info-endpoint`, asked for once by `service-mgr` | `info-endpoint` | a forwarding endpoint of the manager's own — see below |
 
 Any other suffix is `NotFound`, as is a table for a name no device has. **A directory session the
 manager has no room for is `WouldBlock`**: it waits on every channel in one wait set of
@@ -68,14 +69,14 @@ handle it carries is closed unread.
 `info` is a directory of TSM1 tables ([typed-stream-format](typed-stream-format.md)), for anyone
 to read: `all.tsm`, every device a row in registry order, then one `<name>.tsm` per device.
 
-**A session reaches it through an info-only endpoint** (Part B.4). Resolving `info-endpoint` on
-the root endpoint answers a channel that is itself a **forwarding endpoint**: bound in a namespace,
-the kernel forwards resolves on it to the manager like any server's. **On it the manager answers
-the directory and the tables, and nothing else** — a class, or `info-endpoint` again, is
-`NotFound` whatever the suffix — so its holder cannot subscribe and cannot mint an endpoint that
-could. `init` asks for one at boot and couriers it down Part A's chain; both login supervisors bind
-it at `/dev/devices` with the subtree base `/info`, and `desktop-shell` binds it the same way into
-each application. The base names what a session reaches — `/dev/devices` is the directory,
+**A session reaches it through an info-only endpoint** (Part B.4). Resolving `info-endpoint` on the
+root endpoint answers a channel that is itself a **forwarding endpoint**: bound in a namespace, the
+kernel forwards resolves on it to the manager like any server's. **On it the manager answers the
+directory and the tables, and nothing else** — a class, or `info-endpoint` again, is `NotFound`
+whatever the suffix — so its holder cannot subscribe and cannot mint an endpoint that could.
+`service-mgr` asks for one at boot and couriers it to the login supervisors; both login supervisors
+bind it at `/dev/devices` with the subtree base `/info`, and `desktop-shell` binds it the same way
+into each application. The base names what a session reaches — `/dev/devices` is the directory,
 `/dev/devices/all.tsm` a table — and **the endpoint is the boundary**. The base alone would not be:
 `desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so it could bind it with no base, where
 `block` on the root endpoint is a subscription to every disk.

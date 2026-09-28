@@ -636,14 +636,14 @@ const SYSTEM_SERVICES: &[&str] = &[
     // The kill ring (M12 Part E). A store package like the rest: nothing about a clipboard is
     // needed to reach a mounted root, and its only client runs long after one.
     "clipboard-server",
-    // The view broker (administration Part A). `init` spawns it — only `init` can bind a server
-    // into the root namespace — from here, as it does `auth-service`.
+    // The view broker (administration Part A). `service-mgr` spawns it from here, as it does
+    // `auth-service` — `init` did, until administration Part E.1a.
     "view-broker",
-    // The device manager (administration Part B). `init` spawns it before `input-server`, which
-    // takes its devices from it, and binds it at `/svc/devices`.
+    // The device manager (administration Part B). `service-mgr` spawns it before `input-server`,
+    // which takes its devices from it, and binds it at `/svc/devices`.
     "device-mgr",
-    // The storage service (administration Part C.5). `init` spawns it straight after the device
-    // manager, so it owns `block` from boot on, and binds it at `/svc/storage`.
+    // The storage service (administration Part C.5). `service-mgr` spawns it straight after the
+    // device manager, so it owns `block` from boot on, and binds it at `/svc/storage`.
     "storage-service",
 ];
 
@@ -667,6 +667,9 @@ const TEST_PROGRAMS: &[&str] = &[
     // `check-storage`'s writer and reader (administration Part C.8): no release program writes
     // through a mapping and lets go without a sync.
     "test-pattern",
+    // A server that exits when asked (administration Part E.1), for `boot-probe`'s proof that a
+    // restarted server is reached again at its path.
+    "restart-probe",
 ];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
@@ -1431,13 +1434,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     // 1. The machine reaches a login prompt at all — the release image's first claim.
     //
-    //    **And `init` asked the device manager for an info-only endpoint** (administration Part
-    //    B.4) — the one it couriers for every session's `/dev/devices`. This is the only place a
-    //    gate sees that: the sessions below would list the same tables through a duplicate of the
-    //    root endpoint, and only an info-only one keeps `desktop-shell`, which could bind it with
-    //    no base, from subscribing through it. The manager logs before replying, so the order is
-    //    causal: `init`'s bind, the mint, then everything after, the login included.
-    s.expect("init: device-mgr bound at /svc/devices")?;
+    //    **And `service-mgr` asked the device manager for an info-only endpoint** (administration
+    //    Part B.4, and `service-mgr`'s since Part E.1) — the one it couriers for every session's
+    //    `/dev/devices`. This is the only place a gate sees that: the sessions below would list the
+    //    same tables through a duplicate of the root endpoint, and only an info-only one keeps
+    //    `desktop-shell`, which could bind it with no base, from subscribing through it. The
+    //    manager logs before replying, so the order is causal: the bind, the mint as the login
+    //    chain starts, then everything after, the login included.
+    s.expect("service-mgr: device-mgr bound at /svc/devices")?;
     s.expect("device-mgr: an info-only endpoint minted")?;
     s.expect("nitrox login:")?;
     steps += 1;
@@ -2348,8 +2352,8 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
     qmp.screen = Some(size);
 
     // The compositor is a consumer of the same merged stream — it resolves `/dev/input/new`
-    // during startup, which is why init binds the input server first. Asserted *before* the
-    // test client's `listening`, which is the ordering init fixes: the compositor is spawned
+    // during startup, which is why the input server is bound first. Asserted *before* the
+    // test client's `listening`, which is the ordering `service-mgr` fixes: the compositor is spawned
     // and answers `Meta::Ready` well before the selftest client runs.
     //
     // This proves the compositor is **attached**, not that a key reached a window: with no
@@ -4947,14 +4951,16 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
 
     // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
     //
-    // **The handout group's first line is `init`'s auth-service bind, not the kernel's last line**
-    // (administration Part B.4). It was the kernel's last line until the boot grew past what one
-    // frame shows: Part B's device manager put 41 lines between it and `compositor: up`, against
-    // the 36 a held frame guarantees. The kernel's own lines are the early group's claim; this
-    // group's is that `sys_kprint` lines reach the screen up to the handout, which any userspace
-    // line proves. 25 lines before the handout today, so eleven more fit before it moves again.
+    // **The handout group's first line is the input server's bind, not the kernel's last line**
+    // (administration Part B.4, moved again by Part E.1). It was the kernel's last line until the
+    // boot grew past what one frame shows: Part B's device manager put 41 lines between it and
+    // `compositor: up`, against the 36 a held frame guarantees. Then it was `init`'s auth-service
+    // bind, until `service-mgr` took the servers over and logs two lines for each between. The
+    // input server is bound just before the compositor starts. The kernel's own lines are the
+    // early group's claim; this group's is that `sys_kprint` lines reach the screen up to the
+    // handout, which any userspace line proves.
     const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
-    const HANDOUT: &[&str] = &["init: auth-service bound at /svc/auth", "compositor: up"];
+    const HANDOUT: &[&str] = &["service-mgr: input-server bound at /dev/input/new", "compositor: up"];
     let (mut early, mut handout, mut console_seen) = (false, false, false);
     let mut rows = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -11554,6 +11560,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_block_read_selftest(&transcript)?;
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
+            check_servers_are_service_mgrs(&transcript)?;
             check_hardware_facts(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
@@ -11840,7 +11847,16 @@ fn check_display_selftest(transcript: &[u8]) -> R<()> {
 /// day it is added, and there is nothing to keep in step (PR #229 review, finding 1).
 fn check_every_service_started(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
-    for pat in ["service-mgr: image not found", "service-mgr: spawn FAIL"] {
+    // And, since `service-mgr` starts the servers (administration Part E.1), each way one fails to
+    // come up: no `Ready`, a refusal, or a path it could not be bound at.
+    for pat in [
+        "service-mgr: image not found",
+        "service-mgr: spawn FAIL",
+        "did not come up",
+        "sent no Ready within",
+        "service-mgr: bind FAIL at",
+        "registry bind FAIL",
+    ] {
         if let Some(i) = text.find(pat) {
             let line: String = text[i..].lines().next().unwrap_or(pat).into();
             return Err(format!(
@@ -11881,6 +11897,41 @@ fn check_demo_chain(transcript: &[u8]) -> R<()> {
     Ok(())
 }
 
+/// The servers `service-mgr` starts, and the root path each is bound at (administration Part
+/// E.1). **Written down a second time here**, from `SERVICES_TOML`, so the gate does not take its
+/// aim from the declarations it checks.
+const SERVICE_MGR_SERVERS: &[(&str, &str)] = &[
+    ("auth-service", "/svc/auth"),
+    ("logging-service", "/log"),
+    ("tty-server", "/dev/tty"),
+    ("clipboard-server", "/dev/clipboard"),
+    ("view-broker", "/svc/views"),
+    ("device-mgr", "/svc/devices"),
+    ("storage-service", "/svc/storage"),
+    ("input-server", "/dev/input/new"),
+    ("compositor", "/dev/draw"),
+];
+
+/// **`service-mgr` bound every server, and `init` bound none of them** (administration Part E.1).
+/// `init` starts only its mounts, the profile server at `/bin`, and `service-mgr`; a line of
+/// `init`'s naming one of these servers' paths would be the old arrangement back.
+fn check_servers_are_service_mgrs(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    for (name, path) in SERVICE_MGR_SERVERS {
+        let line = format!("service-mgr: {name} bound at {path}");
+        if !text.contains(&line) {
+            return Err(format!("`{line}` is not in the transcript: service-mgr did not bind {name}").into());
+        }
+        if text.lines().any(|l| l.starts_with("init: ") && l.contains(name)) {
+            return Err(
+                format!("init's log names {name}, which service-mgr starts since administration Part E.1").into()
+            );
+        }
+    }
+    println!("xtask: service-mgr bound all {} servers, and init none of them ✓", SERVICE_MGR_SERVERS.len());
+    Ok(())
+}
+
 /// Assert that the login chain came up — `session-mgr` holding the endpoints it needs to
 /// build a session.
 ///
@@ -11894,16 +11945,16 @@ fn check_demo_chain(transcript: &[u8]) -> R<()> {
 /// `cargo xtask test-interactive`'s question, on the release image.
 ///
 /// **It depends on an ordering that is not causal, which is worth naming rather than
-/// discovering.** `service-mgr` queues session-mgr's four handoffs before `supervise` starts
-/// any declared service, so the *send* is ordered — but session-mgr still has to be scheduled
+/// discovering.** `service-mgr` queues session-mgr's handoffs before it starts any declaration
+/// after the last server, so the *send* is ordered — but session-mgr still has to be scheduled
 /// to print this line before `boot-probe`, spawned afterwards, fires PASS and terminates the
 /// machine. If that ever inverts, a healthy boot fails here, which is the expensive kind of
 /// red.
 ///
-/// The margin is large and was measured rather than assumed: session-mgr's line lands **six
-/// lines and one ELF materialisation** before `service-mgr: starting service 'heartbeat'`, and
-/// `boot-probe` starts after that — session-mgr has four queued receives to do while
-/// `service-mgr` resolves and spawns two programs. If this ever goes red on a boot that looks
+/// The margin is large and was measured rather than assumed. It was six lines before
+/// administration Part E.1a; on E.1a's first passing boot session-mgr's line landed **252
+/// lines** before `service-mgr: starting service 'boot-probe'`, with the display self-test,
+/// `nxterm` and the graphical test clients started between. If this ever goes red on a boot that looks
 /// healthy, check that ordering first, and consider asserting on
 /// `service-mgr: login chain up` instead: that line *is* causally before `boot-probe`, at the
 /// cost of proving only that the handoffs were sent, not that they arrived.
@@ -14475,6 +14526,91 @@ subtree = \"/scratch\"\n";
 /// (the real userspace path), not the initramfs `/sbin` staging.
 const SERVICES_TOML: &str = "\
 # Nitrox service declarations.\n\
+#\n\
+# **The servers first, in the order `init` started them** (administration Part E.1): each\n\
+# `endpoint` is waited on for its `Meta::Ready` before the next starts, which keeps the orders\n\
+# `init`'s comments called load-bearing. `never` restarts them, as `init` never did.\n\
+[service.auth-service]\n\
+executable = \"/bin/auth-service\"\n\
+description = \"The credential oracle, and the user database's writer\"\n\
+endpoint = \"/svc/auth\"\n\
+critical = true\n\
+essential = true\n\
+\n\
+[service.auth-service.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.logging-service]\n\
+executable = \"/bin/logging-service\"\n\
+description = \"The service log, and the audit\"\n\
+endpoint = \"/log\"\n\
+critical = true\n\
+essential = true\n\
+\n\
+[service.logging-service.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.tty-server]\n\
+executable = \"/bin/tty-server\"\n\
+description = \"Terminals, over the console\"\n\
+endpoint = \"/dev/tty\"\n\
+\n\
+[service.tty-server.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.clipboard-server]\n\
+executable = \"/bin/clipboard-server\"\n\
+description = \"The clipboard\"\n\
+endpoint = \"/dev/clipboard\"\n\
+\n\
+[service.clipboard-server.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.view-broker]\n\
+executable = \"/bin/view-broker\"\n\
+description = \"Views, and the policy and accounts it fronts\"\n\
+endpoint = \"/svc/views\"\n\
+essential = true\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
+\n\
+[service.view-broker.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.device-mgr]\n\
+executable = \"/bin/device-mgr\"\n\
+description = \"The device manager\"\n\
+endpoint = \"/svc/devices\"\n\
+essential = true\n\
+\n\
+[service.device-mgr.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.storage-service]\n\
+executable = \"/bin/storage-service\"\n\
+description = \"Disks, and the filesystems on them\"\n\
+endpoint = \"/svc/storage\"\n\
+essential = true\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
+\n\
+[service.storage-service.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.input-server]\n\
+executable = \"/bin/input-server\"\n\
+description = \"Keyboards and pointers, merged\"\n\
+endpoint = \"/dev/input/new\"\n\
+\n\
+[service.input-server.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.compositor]\n\
+executable = \"/bin/compositor\"\n\
+description = \"The display\"\n\
+endpoint = \"/dev/draw\"\n\
+\n\
+[service.compositor.restart]\n\
+policy = \"never\"\n\
+\n\
 [service.heartbeat]\n\
 executable = \"/bin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
@@ -14499,6 +14635,21 @@ backoff_max = \"2s\"\n";
 /// store package, which is itself absent from a release image, so the declaration and the
 /// executable appear and disappear together.
 const BOOT_PROBE_TOML: &str = "\
+\n\
+# **A server that exits when asked** (administration Part E.1): `boot-probe` resolves it, has it\n\
+# exit, and resolves the same path until the restarted instance answers. Declared **first** of\n\
+# the test services, since it is a server: the login chain starts after the last server, and must\n\
+# still start before the clients below.\n\
+[service.restart-probe]\n\
+executable = \"/bin/restart-probe\"\n\
+description = \"A server that exits when asked\"\n\
+endpoint = \"/svc/restart-probe\"\n\
+\n\
+[service.restart-probe.restart]\n\
+policy = \"always\"\n\
+max_attempts = 5\n\
+backoff = \"linear\"\n\
+backoff_initial = \"100ms\"\n\
 \n\
 # The graphical self-tests and demo clients. `init` spawned these under `selftest` until\n\
 # retrofit Part C2; they are data now, so `init` is byte-identical in both images.\n\
@@ -14909,7 +15060,7 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
          path = \"{cu_store}\"\n"
     );
     // The test package, in selftest/test-harness builds only. Projected into `/bin` like any
-    // other package, so `init` spawns `/bin/ui-testclient` by exactly the path it spawns
+    // other package, so `service-mgr` spawns `/bin/ui-testclient` by exactly the path it spawns
     // `/bin/logging-service` by — one mechanism, not a test-only one.
     if mode.stages_test_data() {
         let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
@@ -16455,6 +16606,46 @@ LLVM version: 22.1.2
     fn parse_host_returns_none_when_absent() {
         let sample = "rustc 1.95.0\nrelease: 1.95.0\n";
         assert!(parse_host_from_rustc_vv(sample).is_none());
+    }
+
+    /// The declarations' names in file order, each with whether it says `critical = true`.
+    fn declared(text: &str) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for line in text.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix("[service.").and_then(|r| r.strip_suffix(']')) {
+                if !name.contains('.') {
+                    out.push((name.to_string(), false));
+                }
+            } else if line == "critical = true" {
+                out.last_mut().expect("a key before any table").1 = true;
+            }
+        }
+        out
+    }
+
+    /// **The emergency shell and the terminal server never hold the console together**
+    /// (`console-and-tty.md` § *`eshell` is separate*). `service-mgr` asks `init` for the shell
+    /// only when a `critical` server does not come up at boot, so the invariant is this file's
+    /// order: every critical server is declared before `tty-server`, and so has failed, if it
+    /// fails, before anything holds the console. Checked in every image's declarations.
+    #[test]
+    fn every_critical_server_is_declared_before_the_terminal_server() {
+        let test = format!("{SERVICES_TOML}{BOOT_PROBE_TOML}");
+        let bench = test.replace(BOOT_PROBE_TOML, BENCH_TOML);
+        for (image, text) in [("release", SERVICES_TOML), ("test", &test[..]), ("bench", &bench[..])] {
+            let decls = declared(text);
+            let tty = decls.iter().position(|(n, _)| n == "tty-server").expect("tty-server is declared");
+            let critical: Vec<usize> = (0..decls.len()).filter(|&i| decls[i].1).collect();
+            assert!(!critical.is_empty(), "{image}: no critical server is declared at all");
+            for i in critical {
+                assert!(i < tty, "{image}: '{}' is critical and declared after tty-server", decls[i].0);
+            }
+        }
+        // The scan reads what it is aimed at: a critical declaration moved past the terminal
+        // server is found.
+        let moved = format!("{SERVICES_TOML}[service.late]\nexecutable = \"/bin/late\"\ncritical = true\n");
+        let decls = declared(&moved);
+        assert_eq!(decls.last(), Some(&("late".to_string(), true)));
     }
 }
 

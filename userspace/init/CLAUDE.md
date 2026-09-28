@@ -10,9 +10,16 @@ PID 1. The first userspace process. Spawned directly by the kernel with the full
 2. Read `/etc/init.toml` from the initramfs
 3. Process critical-path mounts in dependency order, spawning fs-servers and binding their endpoints
 4. Read `/system/current-generation` and spawn the system profile server
-5. Spawn the service manager with delegated capabilities
-6. Once boot is stable, release the initramfs
-7. Enter main loop: reap orphaned processes, handle shutdown notifications
+5. Spawn the service manager, handing it a root handle with init's own rights and the root
+   filesystem's and profile server's endpoints, and keep the channel they went down as the
+   **terminal channel**
+6. Enter main loop: reap orphaned processes, and answer the terminal channel
+
+**It starts no other server** (administration Part E.1a, 2026-09-28). The nine system servers —
+`auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the view broker,
+`device-mgr`, `storage-service`, `input-server`, the compositor — were started and bound here
+until then; they are `service-mgr`'s declarations now. A server added to the system is a
+declaration, not a function in this crate.
 
 Init is deliberately minimal. It is the most critical-path code in the system. A crash of PID 1 is unrecoverable — the kernel cannot restart it.
 
@@ -59,6 +66,13 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
 - `SYSTEM_CLOCK` — delegated to time-sync service
 
+**`service-mgr` sits in init's trust tier** (administration Part E, the maintainer's call,
+2026-09-28). The root handle init hands it carries init's own rights, `BIND` and `UNBIND` among
+them, because a spawned process only ever gets a lookup-only root and `service-mgr` binds the
+servers. That is the one handle here that is deliberately *not* attenuated: `service-mgr` could
+rebind `/`, `/bin` or `/store` with it, and is trusted not to. See
+`docs/architecture/service-manager.md` § Capability posture.
+
 When spawning the service manager, init delegates the subset of capabilities the service manager needs (via `SpawnArgs.syscaps`; the kernel computes `child = parent & args`, so a child can never be granted a cap init lacks). The service manager doesn't get `PHYSICAL_MEMORY`, for example. Note init cannot *drop* a syscap from **itself** — syscaps are immutable after spawn (`docs/architecture/syscaps.md`); init only attenuates what it passes to children. So init retains its full cap set (including `BIND_NAMESPACE`) for life; that is accepted (init is tiny and critical-path). See `docs/architecture/service-manager.md` § Capability posture.
 
 When spawning fs-servers, init grants only the device handles, log channel, and minimal namespace each fs-server needs. fs-servers do NOT get `BIND_NAMESPACE` — init does the binding on their behalf via the Resource Server Startup Protocol.
@@ -92,6 +106,18 @@ Init reads files from the in-kernel initramfs resource server bound at `/initram
 Use the namespace handle and `sys_ns_lookup` + `sys_io_submit` (Read opcode) to access these. There's no special initramfs API — it's a regular resource server.
 
 **The initramfs is never released.** `sys_release_initramfs()` does not exist — it is specified in [`syscall-abi.md`](../../docs/spec/syscall-abi.md) and was never built, and the initramfs must stay resident regardless: the root fs-server's restart image can only come from it, since `/store/…/bin/fs-server-ext4` is unreadable without the very server being restarted. `/initramfs/...` paths stay valid for the life of the machine. See [`deferred-decisions.md`](../../docs/rationale/deferred-decisions.md). (This file said init calls the syscall after bootstrap until 2026-08-18; audit D.5f.)
+
+## The terminal channel
+
+The handoff channel to `service-mgr` stays open for the rest of the boot, and init waits on it
+beside its notification channel:
+
+- **`TERMINAL_OP_EMERGENCY`** (`libkern::abi`): a `critical` server did not come up at boot, and
+  `service-mgr` has started nothing more. Init fires the failing verdict and spawns `eshell` —
+  the backstop init itself gave `auth-service` and `logging-service` when it started them.
+- **Its closing** means `service-mgr` has died. Init reports it and **does not restart it**: a
+  fresh `service-mgr` could not re-adopt the running servers or the registry that reached them.
+  The machine needs a restart.
 
 ## Reaping
 

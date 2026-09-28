@@ -1,7 +1,8 @@
 # The Device Manager
 
 **Status: built — administration Part B, B.1–B.5, 2026-09-24; `block` owned by the storage service
-since Part C.5a, 2026-09-25; last checked 2026-09-25.** What exists:
+since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a; last checked
+2026-09-28.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -52,18 +53,21 @@ component extended: it hands a driver process a `Handle<DeviceNode>` the same wa
    RAM disks are published, so it scans them too — then the console and the i8042's keyboard and
    mouse. The table is append-only, and a block node's served index is the number of block nodes
    before it ([`device-node.md`](../spec/device-node.md) § *The registry* has the order whole).
-2. **`init` spawns `device-mgr`**, after the view broker and before the display arm. The manager
+2. **`service-mgr` spawns `device-mgr`**, after the view broker and before the display arm
+   (`init` did until administration Part E.1a). The manager
    reads `/dev/registry` once. Every node registers before userspace starts, so one read is
    complete coldplug. It then takes each class device's node from `/dev/registry/<id>` and answers
-   `Meta::Ready`. A manager with no registry to read refuses instead, and `init` prints its reason.
-3. **`init` binds `/svc/devices`**, then resolves `/svc/devices/info-endpoint` for the endpoint it
-   will courier to the sessions (§5).
-4. **`init` spawns `input-server`, which resolves `/svc/devices/input`.** The manager has already
-   queued the whole replay on the channel it answers with: an `Arrived` per keyboard and mouse,
-   each carrying the owner's duplicate of its node, then `Settled`. So `input-server` holds every
-   device the moment its resolve completes. It arms a read on each, answers `Meta::Ready`, and
-   `init` binds `/dev/input/new`, as before the manager existed. **The storage service** is spawned
-   before it, straight after the manager, and takes `block` the same way ([`storage.md`](storage.md)).
+   `Meta::Ready`. A manager with no registry to read refuses instead, and `service-mgr` prints its
+   reason.
+3. **`service-mgr` binds `/svc/devices`** — the manager's endpoint in its registry, the root path
+   to `service-mgr`'s own — and, starting the login chain, resolves `info-endpoint` there for the
+   endpoint it couriers to the sessions (§5).
+4. **`service-mgr` spawns `input-server`, which resolves `/svc/devices/input`.** The manager has
+   already queued the whole replay on the channel it answers with: an `Arrived` per keyboard and
+   mouse, each carrying the owner's duplicate of its node, then `Settled`. So `input-server` holds
+   every device the moment its resolve completes. It arms a read on each, answers `Meta::Ready`, and
+   `service-mgr` binds `/dev/input/new`. **The storage service** is spawned before it, straight
+   after the manager, and takes `block` the same way ([`storage.md`](storage.md)).
 5. **A person types `list /dev/devices`**, or opens `/dev/devices/all.tsm` and filters it. The
    resolve reaches the manager as `info` or `info/all.tsm`, and the shell decodes the table with no
    device code of its own.
@@ -144,7 +148,7 @@ records the shape: attenuation by construction, for authority no right on a hand
 
 The first row is the same ungated boundary `/svc/auth` and `/svc/views` have
 (`TODO(svc-auth-ungated)` in [`deferred-decisions.md`](../rationale/deferred-decisions.md)), with
-the same fix to come. The manager holds no syscaps and binds nothing; `init` binds it.
+the same fix to come. The manager holds no syscaps and binds nothing; `service-mgr` binds it.
 
 ## 7. The rest of the system reads the table, not a probe
 

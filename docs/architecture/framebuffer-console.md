@@ -155,13 +155,15 @@ whole in a single frame. Measured with dumps slowed to about 34 ms, twice CI's i
 runs passed; with both holds removed, 2 of 3 failed the handout group.
 
 1. **The boot is on the screen.** Held after the timer: `Nitrox kernel — diagnostics online` (the
-   first line, and an em dash from the Unicode table) with `allocators up`, both before PCI. Held
-   at the handout: `init: auth-service bound at /svc/auth` (a `sys_kprint` line from `init`'s
-   bring-up) and `compositor: up`. The handout frame shows at least the last 36 lines at the gates'
-   1360×768 — 48 rows less a quarter-screen jump; 38 of 50 at QEMU's 1280×800, where the gate ran
-   until Phase 5 Part E — and the auth-service line is 25 lines before the handout, so a boot that
-   grows past that fails this group deterministically and says why. **It was the kernel's last
-   line** (`init: spawned init (pid 1); handing off to userspace`) with `init: mounted
+   first line, and an em dash from the Unicode table) with `allocators up`, both before PCI. Held at
+   the handout: `service-mgr: input-server bound at /dev/input/new` (a `sys_kprint` line from
+   `service-mgr`'s bring-up, the last bind before the compositor starts) and `compositor: up`. The
+   handout frame shows at least the last 36 lines at the gates' 1360×768 — 48 rows less a
+   quarter-screen jump; 38 of 50 at QEMU's 1280×800, where the gate ran until Phase 5 Part E — so a
+   boot that grows past that between the two fails this group deterministically and says why. **It
+   was `init: auth-service bound at /svc/auth`** until administration Part E.1a, when `service-mgr`
+   took the servers over and began logging more lines for each. **Before that it was the kernel's
+   last line** (`init: spawned init (pid 1); handing off to userspace`) with `init: mounted
    fs-server-ext4 at /` until administration Part B.4, when the device manager and the input
    server's devices put 41 lines between that and the handout. The kernel's own lines are the early
    group's claim; this group's is that `sys_kprint` lines reach the screen up to the handout, which

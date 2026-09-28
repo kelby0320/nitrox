@@ -30433,3 +30433,77 @@ returns.
 
 E.2's `clip` gate, which the review showed could not pass, stands again: through the registry, a
 restart does reach the same session.
+
+## 2026-09-28 — Administration Part E.1a: `service-mgr` starts the servers, through a registry
+
+`init` starts its mounts, the profile server at `/bin`, `service-mgr` and — when it must — the
+emergency shell, and nothing else. The nine servers it also started are declarations `service-mgr`
+starts in `init`'s order: `auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the
+view broker, `device-mgr`, `storage-service`, `input-server` and the compositor. Each is bound in
+`service-mgr`'s registry, and its root path is bound once to `service-mgr`'s own endpoint. What a
+session sees has not changed; that is E.1b.
+
+**The registry is a namespace `service-mgr` creates** (`sys_ns_create`), with each server's endpoint
+at `/<name>`. A root path such as `/svc/devices` is bound to `service-mgr`'s endpoint with the base
+`/device-mgr`. A resolve arriving there is routed on its first component and answered with a
+`SUBNAMESPACE` continuation into the registry, so the server sees the suffix it always saw. A
+restart unbinds and rebinds `/<name>` in the registry and touches the root not at all. A resolve
+through `/svc/storage` is continued twice — into the registry, then into a mount's namespace — two
+of the kernel's four.
+
+**`service-mgr` must never block on anything that can wait on it**, since every server path now
+runs through it. Its main wait is one loop over its notifications, its endpoint and every running
+service's control channel, timed to the nearest deadline: a `Ready` awaited (30 s), a backoff, an
+`after`. The grace wait for an exit code answers resolves while it waits. What it still waits on
+outright is `ns_lookup`: `/bin`, the registry, and a server's log endpoint. Those reach the root
+filesystem, the profile server and servers already serving, none of which waits on it. **The
+device manager's info endpoint is minted in the registry** (`/device-mgr/info-endpoint`), not
+through the root's `/svc/devices`: that path leads back to `service-mgr`, which would be waiting on
+itself.
+
+**The login chain starts after the last `endpoint` declaration**, as the review asked, and
+`service-mgr` keeps both supervisors' handles — both listed under E.1b, and needed here once the
+supervisors took their endpoints from `service-mgr`'s servers. In a test image the last server is
+`restart-probe`, so `heartbeat` starts before the chain there and after it in a release image.
+E.1c takes `heartbeat` out of the release image.
+
+**`init`'s side:**
+- **The terminal channel** — the handoff channel, kept open — carries three handoffs down: the
+  root handle with `init`'s rights, the root filesystem's endpoint and the profile server's. It
+  carries `TERMINAL_OP_EMERGENCY` back up when a `critical` server does not come up at boot, and
+  `init` starts the emergency shell. It is `libkern::abi`'s, beside `CTRL_OP_SHUTDOWN`: a constant
+  between two userspace processes, which the kernel never reads.
+- **Its closing** is how `init` learns `service-mgr` died. `init` reports that the machine needs a
+  restart and does not respawn it, as the review decided.
+- **A `service-mgr` that cannot be spawned takes the emergency path.** Found building this. It used
+  to leave the machine idle with its servers up; since E.1a it would leave nothing up at all,
+  `auth-service` and `logging-service` included — the pair whose failure the emergency path caught
+  when `init` started them. Nothing holds the console yet, so the shell can take it.
+
+**The emergency shell never meets the terminal server** (`console-and-tty.md`'s invariant) only
+because both critical servers are declared before `tty-server`. That is the declarations' order,
+not code, so an `xtask` host test pins it in the release, test and bench declarations; a
+`critical = true` added to `clipboard-server` fails it.
+
+**Every server's restart policy is `never`**, as `init` never restarted them. `restart-probe`, a
+test-image server that exits when asked, has `always`, and is what proves a restart reaches the root
+path: `boot-probe` takes its token, asks it to exit, and resolves `/svc/restart-probe` until a
+different token answers — 100 ms of backoff later on the first passing boot.
+
+**Checked in the negative, each on a boot:**
+- the root bound to the server's own endpoint — `boot-probe`'s restart check fails;
+- the registry never unbound — the rebind fails (`registry bind FAIL`), and so does the restart
+  check;
+- a blocking wait for `Ready` — `storage-service` and `input-server` never come up;
+- an unstartable critical server — `init` starts the emergency shell and the boot fails;
+- an unspawnable `service-mgr` — the same.
+
+And on the host:
+- the login chain placed first;
+- a critical failure carrying on;
+- a route taking the whole suffix;
+- an `endpoint` unchecked.
+
+**`check-fbcon`'s handout group** starts at `service-mgr: input-server bound at /dev/input/new`, the
+last bind before the compositor. `init`'s auth-service line, its first line until now, is too many
+lines back once `service-mgr` logs its own for each server.
