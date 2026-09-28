@@ -29,6 +29,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use libkern::*;
+use libkern::control::Control;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
@@ -44,10 +45,12 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// One `sys_wait` slot goes to the serving endpoint and one to the outstanding console read.
-/// **The rest is halved**, because since Part C a terminal can also own a backend channel that
-/// has to be waited on — worst case one per terminal, when every terminal is a window's.
-const MAX_TTYS: usize = (libkern::abi::MAX_WAIT_HANDLES - 2) / 2;
+/// One `sys_wait` slot goes to the serving endpoint, one to the outstanding console read, and one
+/// to the control channel — `service --stop`'s, since administration Part E.2, which made this 14
+/// from 15. **The rest is halved**, because since Part C a terminal can also own a backend channel
+/// that has to be waited on — worst case one per terminal, when every terminal is a window's.
+const MAX_TTYS: usize = (libkern::abi::MAX_WAIT_HANDLES - 3) / 2;
+const _: () = assert!(3 + 2 * MAX_TTYS <= libkern::abi::MAX_WAIT_HANDLES);
 /// Bytes per console read submission.
 const READ_CHUNK: u64 = 64;
 
@@ -552,7 +555,7 @@ fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
 
 /// The serve loop: the forwarding endpoint, every open terminal, and one outstanding
 /// console read, all in one `sys_wait`.
-fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
+fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut control: u64) -> ! {
     kprint(b"tty-server: serving /dev/tty over the console\n");
     let mut reg = Registry::new();
     let mut read_po: u64 = 0;
@@ -600,11 +603,17 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
         }
         let count = {
             // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots; `n` is bounded by
-            // 1 + MAX_TTYS + MAX_TTYS + 1, which is that limit by construction — see
+            // 1 + MAX_TTYS + MAX_TTYS + 1 + 1, which is inside that limit by construction — see
             // `MAX_TTYS`, which is halved for exactly this.
             unsafe {
                 WAIT_HANDLES[0] = serve_end;
                 let mut n = 1usize;
+                // The control channel, for `service --stop` — until its supervisor has gone, when
+                // it would stay signalled for good.
+                if control != 0 {
+                    WAIT_HANDLES[n] = control;
+                    n += 1;
+                }
                 for ch in reg.channels() {
                     WAIT_HANDLES[n] = ch;
                     n += 1;
@@ -646,6 +655,17 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
             };
             if h == serve_end {
                 drain_resolves(serve_end, &mut reg);
+            } else if control != 0 && h == control {
+                match libkern::control::recv(control) {
+                    // Every terminal ends with this process: its programs' next read or write
+                    // finds the channel closed, as when a window's emulator goes.
+                    Control::Op(CTRL_OP_SHUTDOWN) => {
+                        kprint(b"tty-server: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    Control::Closed => control = 0,
+                    _ => {}
+                }
             } else if read_po != 0 && h == read_po {
                 let n = console_bytes(off);
                 let mut bytes: Vec<u8> = Vec::with_capacity(n as usize);
@@ -778,7 +798,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         kprint(b"tty-server: Ready send FAIL\n");
         exit(1);
     }
-    serve_loop(serve_end, console, buf_h, buf_addr as u64);
+    serve_loop(serve_end, console, buf_h, buf_addr as u64, control);
 }
 
 #[panic_handler]

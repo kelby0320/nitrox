@@ -2060,10 +2060,16 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - `check-images`, including a control that adds a file to one root.
 - [ ] **E.2 — `service`.**
       - `/svc/services` and its three endpoints, with `List`, `Start`, `Stop` and `Restart`
-        (`rsproto-services-ops.md`, which E.2 writes). <!-- check-docs: allow-missing -->
+        (`rsproto-services-ops.md`, which E.2 writes).
       - Each stoppable server exits on `CTRL_OP_SHUTDOWN`; an essential one is refused.
       - The `services` grant, and the seeded `admin` profile gains it.
       - `service` itself.
+      - *(E.2a landed 2026-09-28:* `/svc/services`, its admin endpoint and sessions, and the four
+        stoppable servers, with `boot-probe`'s gate. **The list is a table, `all.tsm`, not a
+        `List` request**, as `/dev/devices` and `/dev/storage` are — `service --list` reads it as
+        `disk --list` does. Each request is answered once it has happened; a stop not honoured in
+        5 s is answered "asked, and still running". The session endpoint, the grant, `service` and
+        the `clip` gate are E.2b's.)*
       - Gates:
         - `boot-probe`: `List`; `clipboard-server` stopped, started and restarted through the admin
           endpoint; an essential stop refused;

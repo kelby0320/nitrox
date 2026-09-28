@@ -430,6 +430,7 @@ dependencies = [
  "libheap",
  "libkern",
  "librsproto",
+ "libstream",
 ]
 
 [[package]]

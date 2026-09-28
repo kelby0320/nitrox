@@ -75,7 +75,8 @@ The 16-bit `op` field decomposes:
 | `Views` | `0x0Exx` | Running a program in a view, served by `view-broker` at `/svc/views` and a session's `/dev/views`. See [Views operations spec](rsproto-views-ops.md). |
 | `Devices` | `0x0Fxx` | Devices handed to the owner of their class, served by `device-mgr` at `/svc/devices`. See [Devices operations spec](rsproto-devices-ops.md). |
 | `Storage` | `0x10xx` | Mounting and unmounting, on an admin session of the storage service's (`/svc/storage/admin-endpoint`). See [Storage operations spec](rsproto-storage-ops.md). |
-| (reserved) | `0x11xx` – `0xFExx` | Future categories |
+| `Services` | `0x11xx` | Starting, stopping and restarting services, on an admin session of `service-mgr`'s (`/svc/services/admin-endpoint`). See [Services operations spec](rsproto-services-ops.md). |
+| (reserved) | `0x12xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 **This table is the allocation, and every category in it must be distinct.** That sounds

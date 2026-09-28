@@ -5,7 +5,8 @@ the service set and performing supervisor-side namespace binding. Verified 2026-
 checked 2026-09-28, when it took over starting and binding the servers `init` used to — the
 boundary below, as built at last — through a registry of its own (administration Part E.1a),
 and began handing the sessions its own routes to them (Part E.1b), and reading its declarations
-from the root (Part E.1c);
+from the root (Part E.1c), and serving `/svc/services` — the list, and starting and stopping on
+an admin session (Part E.2a);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -226,6 +227,32 @@ chain with no `auth-service` behind it. Every skipped declaration is logged by n
 **The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
 handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
 then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
+
+### `/svc/services`: the list, and starting and stopping
+
+*(Administration Part E.2a, 2026-09-28.)* `service-mgr` serves `/svc/services` from an endpoint of
+its own, bound there in the root ([`rsproto-services-ops.md`](../spec/rsproto-services-ops.md)):
+- **`all.tsm`**, a table with a row per declaration — `name`, `state` and `restarts` — for anyone
+  who can reach it;
+- **`admin-endpoint`**, which mints an endpoint on which any resolve opens an admin session, where
+  `Start`, `Stop` and `Restart` are asked. The view broker's `services` grant is what binds one
+  into a view.
+
+**Every request is answered once it has happened**, and never by a wait: a stop is `Held` until
+the service's exit, a start until its `Meta::Ready` — deadlines in the one loop, like every other.
+A stop is `CTRL_OP_SHUTDOWN` on the service's control channel, **a request**: one not honoured in 5
+s is answered "asked, and still running", stays asked, and is still a stop if it comes later. There
+is no forcible kill. An `essential` service's stop and restart are refused here, whoever asks.
+
+**Which services exit when asked**: `heartbeat`, and the four servers `essential` does not cover —
+the terminal server, the clipboard, the input server and the compositor. Each waits on its control
+channel beside its work, through `libkern::control`, and **takes it out of its wait set if it
+closes**, since a closed channel stays signalled for good. A stopped server's registry entry goes
+with it, so its path answers `NotFound` until it is started again, and every binding reaches the
+new one then.
+
+**The wait set pays for it**: `/svc/services`' endpoint, a session endpoint, two admin endpoints
+and four admin sessions (`services::SLOTS`), which is what took `MAX_ROUTES` from 16 to 14.
 
 ## Capability posture
 

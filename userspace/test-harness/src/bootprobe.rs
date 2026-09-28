@@ -1377,7 +1377,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & auth_admin_test(root_ns)
         & policy_test(root_ns)
         & accounts_test(root_ns)
-        & restart_test(root_ns);
+        & restart_test(root_ns)
+        & services_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -3121,6 +3122,142 @@ fn restart_test(root_ns: u64) -> bool {
     kprint(b"boot-probe: restart: a server that exited was restarted, and its path reached the new instance ok\n");
     kprint(b"boot-probe: restart: a namespace bound before the restart reached it too ok\n");
     true
+}
+
+/// **Starting, stopping and restarting services** (administration Part E.2), on an admin session
+/// opened as the view broker's `services` grant will open one: the endpoint
+/// `/svc/services/admin-endpoint` mints, bound in a namespace the probe builds, and resolved there.
+/// 1. `/svc/services/all.tsm` lists the declarations, `clipboard-server` running.
+/// 2. **A stop is answered once it has happened**: the table then says `stopped`, and
+///    `/dev/clipboard` answers `NotFound` — its registry entry went with the server.
+/// 3. A start is answered once the server is up, and `/dev/clipboard` opens again.
+/// 4. A restart is answered once the new instance is up, and the table counts it.
+/// 5. The refusals: an essential service's stop and restart, a name nothing declares, a start of a
+///    running service.
+fn services_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
+    use libstream::wire::{Table, Value};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: services: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
+    // A service's row: its state and its restarts.
+    let row = |name: &str| -> Option<(alloc::string::String, i64)> {
+        let (st, h) = ns_lookup(root_ns, b"/svc/services/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        let t = Table::decode(&bytes?).ok()?;
+        let col = |n: &str| t.schema.fields.iter().position(|f| f.name == n);
+        let (cn, cs, cr) = (col("name")?, col("state")?, col("restarts")?);
+        let r = t.rows.iter().find(|r| r[cn] == Value::Str(alloc::string::String::from(name)))?;
+        match (&r[cs], &r[cr]) {
+            (Value::Str(s), Value::Int(n)) => Some((s.clone(), *n)),
+            _ => None,
+        }
+    };
+    let state = |name: &str| row(name).map(|r| r.0);
+    let clipboard_opens = || {
+        let (st, h) = ns_lookup(root_ns, b"/dev/clipboard", chan);
+        close(h);
+        st
+    };
+
+    // 1. The list.
+    if state("clipboard-server").as_deref() != Some("running") || state("auth-service").is_none() {
+        return fail(b"all.tsm does not list clipboard-server running, and auth-service");
+    }
+
+    // The admin session, as the view broker will reach it.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/services/admin-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no admin endpoint at /svc/services/admin-endpoint");
+    }
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if ns <= 0 {
+        close(endpoint);
+        return fail(b"no namespace to bind the admin endpoint into");
+    }
+    let ns = ns as u64;
+    let at = b"/dev/services/admin";
+    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+    let bound = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) };
+    close(endpoint);
+    let (st, admin) = if bound == 0 { ns_lookup(ns, at, chan) } else { (-1, 0) };
+    close(ns);
+    if st != 0 || admin == 0 {
+        return fail(b"/dev/services/admin opened no admin session");
+    }
+    let mut next = 0u64;
+    let mut ask = |op: u16, body: &[u8]| -> Option<Received> {
+        next += 1;
+        if !rs_send(admin, op, next, body, &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 40_000_000_000;
+        loop {
+            let m = receive(admin, deadline)?;
+            m.handles.iter().for_each(|&h| close(h));
+            if m.request_id == next {
+                return Some(m);
+            }
+        }
+    };
+    let refused = |m: &Option<Received>, err: KError| {
+        m.as_ref().is_some_and(|m| m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32()))
+    };
+    let answered = |m: &Option<Received>| m.as_ref().is_some_and(|m| !m.error);
+    let finish = |ok: bool| {
+        close(admin);
+        ok
+    };
+
+    // 2. Stopped.
+    if !answered(&ask(OP_SERVICES_STOP, b"clipboard-server")) {
+        return finish(fail(b"a stop of clipboard-server was not answered"));
+    }
+    if state("clipboard-server").as_deref() != Some("stopped") {
+        return finish(fail(b"clipboard-server stopped, and the table does not say so"));
+    }
+    if clipboard_opens() != KError::NotFound.as_i32() {
+        return finish(fail(b"/dev/clipboard did not answer NotFound with its server stopped"));
+    }
+    // 3. Started.
+    if !answered(&ask(OP_SERVICES_START, b"clipboard-server")) {
+        return finish(fail(b"a start of clipboard-server was not answered"));
+    }
+    if state("clipboard-server").as_deref() != Some("running") || clipboard_opens() != 0 {
+        return finish(fail(b"clipboard-server started, and is not running at /dev/clipboard"));
+    }
+    // 4. Restarted.
+    let before = row("clipboard-server").map_or(-1, |r| r.1);
+    if !answered(&ask(OP_SERVICES_RESTART, b"clipboard-server")) {
+        return finish(fail(b"a restart of clipboard-server was not answered"));
+    }
+    let after = row("clipboard-server");
+    if after.as_ref().map(|r| (r.0.as_str(), r.1)) != Some(("running", before + 1)) || clipboard_opens() != 0 {
+        return finish(fail(b"clipboard-server restarted, and is not running, counted once, at /dev/clipboard"));
+    }
+    // 5. Refused.
+    if !refused(&ask(OP_SERVICES_STOP, b"auth-service"), KError::NoAccess)
+        || !refused(&ask(OP_SERVICES_RESTART, b"auth-service"), KError::NoAccess)
+    {
+        return finish(fail(b"an essential service's stop or restart was not refused NoAccess"));
+    }
+    if !refused(&ask(OP_SERVICES_STOP, b"no-such-service"), KError::NotFound) {
+        return finish(fail(b"a stop of a name nothing declares was not refused NotFound"));
+    }
+    if !refused(&ask(OP_SERVICES_START, b"clipboard-server"), KError::AlreadyExists) {
+        return finish(fail(b"a start of a running service was not refused AlreadyExists"));
+    }
+    if state("auth-service").as_deref() != Some("running") {
+        return finish(fail(b"auth-service is not running after its refused stop"));
+    }
+    kprint(b"boot-probe: services: listed, clipboard-server stopped, started and restarted, each answered once done ok\n");
+    kprint(b"boot-probe: services: an essential stop, an unknown name and a second start refused ok\n");
+    finish(true)
 }
 
 /// **Accounts, fronted by the broker** (administration Part D.3).

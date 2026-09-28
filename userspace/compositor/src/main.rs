@@ -94,14 +94,15 @@ const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 const MAX_BODY: usize = 4 + librsproto::surface::MAX_TITLE;
 const _: () = assert!(MAX_BODY >= 4 + librsproto::surface::MAX_TITLE);
 
-/// Two less than the wait limit: the forwarding endpoint takes the first slot and the
-/// input-server consumer channel the second.
+/// Four less than the wait limit: the forwarding endpoint, the input-server consumer channel, the
+/// manager channel, and since administration Part E.2 the control channel `service --stop` asks
+/// on. It was two less when this was written, and the history below is that version's.
 ///
 /// It is `- 2` rather than `- 1` because the wait set is built from *all* of them at once.
 /// Leaving it at `- 1` would overrun `WAIT_HANDLES` by exactly one entry on the boot where
 /// every session slot is in use and input connected — the rarest configuration, and the
 /// only one that would ever have shown it.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 3;
+const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 4;
 
 /// The wait-set bound, as a compile error rather than a comment.
 ///
@@ -111,8 +112,8 @@ const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 3;
 /// re-reading prose (PR #180 review, finding 4).
 ///
 /// It worked: the manager channel is the **third** fixed handle (M6 Part B), and this line is
-/// what said so.
-const _: () = assert!(3 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+/// what said so. The control channel is the fourth (administration Part E.2).
+const _: () = assert!(4 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
 ///
@@ -2831,7 +2832,12 @@ fn handle_session_request(
 }
 
 /// The serve loop: the forwarding endpoint plus every open session.
-fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Server) -> ! {
+fn serve_loop(
+    serve_end: u64,
+    mut screen: Screen<RawFramebuffer>,
+    srv: &mut Server,
+    mut control: u64,
+) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
@@ -2850,12 +2856,16 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             parked = flush_outboxes(srv);
         }
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // `3 + MAX_SESSIONS` — `serve_end`, the input channel when connected, the manager
-        // channel when one is attached, then the sessions — which the `const _` beside
-        // `MAX_SESSIONS` holds to that limit.
+        // `4 + MAX_SESSIONS` — `serve_end`, the control channel until its supervisor has gone, the
+        // input channel when connected, the manager channel when one is attached, then the
+        // sessions — which the `const _` beside `MAX_SESSIONS` holds to that limit.
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            if control != 0 {
+                WAIT_HANDLES[n] = control;
+                n += 1;
+            }
             if srv.input_ch != 0 {
                 WAIT_HANDLES[n] = srv.input_ch;
                 n += 1;
@@ -2919,6 +2929,20 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             };
             if h == serve_end {
                 serve_signalled = true;
+                continue;
+            }
+            // **`service --stop`** (administration Part E.2). Every window goes with this process:
+            // its clients find their channels closed. A compositor started again takes the screen
+            // again — the kernel hands `/dev/framebuffer` out on each resolve.
+            if control != 0 && h == control {
+                match libkern::control::recv(control) {
+                    libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) => {
+                        kprint(b"compositor: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    libkern::control::Control::Closed => control = 0,
+                    _ => {}
+                }
                 continue;
             }
             if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
@@ -3120,7 +3144,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         exit(1);
     }
 
-    serve_loop(serve_end, screen, &mut srv);
+    serve_loop(serve_end, screen, &mut srv, ctrl);
 }
 
 #[panic_handler]

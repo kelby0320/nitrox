@@ -113,14 +113,18 @@ pub mod registry {
     use alloc::string::String;
 
     /// Routes `service-mgr` serves at once: one per server, and one per [`DERIVED`] endpoint.
-    /// Bounded by its wait set, which holds the notification channel, every route and the control
-    /// channel of each server still starting (see [`STARTING_ROOM`]).
-    pub const MAX_ROUTES: usize = 16;
+    /// Bounded by its wait set, which holds the notification channel, every route, the handles
+    /// that serve `/svc/services` ([`crate::services::SLOTS`]) and the control channel of each
+    /// server still starting (see [`STARTING_ROOM`]). Sixteen until administration Part E.2 made
+    /// room for the services.
+    pub const MAX_ROUTES: usize = 14;
 
     /// The control channels of starting servers the wait set has room for, beside the
-    /// notification channel and [`MAX_ROUTES`] routes, within the kernel's 32. One more starting
-    /// at once is still seen, on the next pass: the wait is level-triggered and looks at everything.
-    pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES;
+    /// notification channel, [`MAX_ROUTES`] routes and the services' handles, within the kernel's
+    /// 32. One more starting at once is still seen, on the next pass: the wait is level-triggered
+    /// and looks at everything.
+    pub const STARTING_ROOM: usize =
+        libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
 
     /// **Endpoints a server mints for sessions**, each reached through a route of its own
     /// (Part E.1b): `(server, suffix)` — resolving `suffix` on the server answers a forwarding
@@ -159,6 +163,154 @@ pub mod registry {
         let mut b = String::from("/");
         b.push_str(name);
         b
+    }
+}
+
+pub mod services {
+    //! **`/svc/services`** (administration Part E.2): the list of services, for anyone, and
+    //! starting, stopping and restarting them, on an admin session.
+    //!
+    //! - The list is a table, `all.tsm`, resolved from `/svc/services` or a session endpoint's
+    //!   `/dev/services`, as the device manager's and the storage service's are: `name`, `state`
+    //!   and `restarts`.
+    //! - `admin-endpoint`, resolved from `/svc/services` only, mints a forwarding endpoint on which
+    //!   any resolve opens an admin session. The view broker's `services` grant binds one at
+    //!   `/dev/services/admin`.
+    //! - On an admin session, `Start`, `Stop` and `Restart` (`librsproto::services`), each answered
+    //!   once it has happened.
+
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use libkern::error::KError;
+    use libstream::wire::{Schema, StreamFlags, Table, TypeModifiers, TypeTag, Value};
+
+    /// Admin endpoints at once. The view broker asks for one the first time a view needs it; the
+    /// second is headroom.
+    pub const MAX_ADMIN_ENDPOINTS: usize = 2;
+    /// Admin sessions open at once: a `service --stop` or `--restart` is one, briefly.
+    pub const MAX_ADMIN_SESSIONS: usize = 4;
+    /// Wait-set slots the services take: `/svc/services`' own endpoint, the session endpoint, and
+    /// the admin endpoints and sessions.
+    pub const SLOTS: usize = 2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS;
+
+    /// Where a service is, as the table says it.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum State {
+        /// Spawned, and a server whose `Meta::Ready` has not come.
+        Starting,
+        /// Running.
+        Running,
+        /// Not running, and not for a failure: asked to stop, finished cleanly, or never started.
+        Stopped,
+        /// Not running, because it failed: an exit other than `0`, or one whose code never came.
+        Failed,
+    }
+
+    impl State {
+        /// The word the table uses.
+        pub fn word(self) -> &'static str {
+            match self {
+                State::Starting => "starting",
+                State::Running => "running",
+                State::Stopped => "stopped",
+                State::Failed => "failed",
+            }
+        }
+    }
+
+    /// A service's state: whether it is `running` and still `starting`, whether its stop was
+    /// `requested`, and how it last `exited` — `None` if it never has, `Some(None)` if its code
+    /// never came.
+    pub fn state(running: bool, starting: bool, requested: bool, exited: Option<Option<i32>>) -> State {
+        match (running, starting) {
+            (true, true) => State::Starting,
+            (true, false) => State::Running,
+            _ if requested => State::Stopped,
+            _ => match exited {
+                None | Some(Some(0)) => State::Stopped,
+                Some(_) => State::Failed,
+            },
+        }
+    }
+
+    /// The table's schema: `name`, `state`, `restarts`.
+    pub fn schema() -> Schema {
+        Schema::new()
+            .field("name", TypeTag::String, TypeModifiers::NONE)
+            .field("state", TypeTag::String, TypeModifiers::NONE)
+            .field("restarts", TypeTag::Int, TypeModifiers::NONE)
+    }
+
+    /// `all.tsm`: a row per service, in the declarations' order.
+    pub fn table(rows: &[(&str, State, u32)]) -> Vec<u8> {
+        let rows = rows
+            .iter()
+            .map(|&(name, state, restarts)| {
+                alloc::vec![
+                    Value::Str(String::from(name)),
+                    Value::Str(String::from(state.word())),
+                    Value::Int(restarts as i64),
+                ]
+            })
+            .collect();
+        let mut out = Vec::new();
+        // A `Vec` sink cannot fail, and every row has the schema's shape by construction.
+        let _ = Table { flags: StreamFlags::NONE, schema: schema(), rows }.encode(&mut out);
+        out
+    }
+
+    /// What a suffix on `/svc/services` or a session endpoint asks for.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Asked {
+        /// `all.tsm`: the table.
+        Table,
+        /// `admin-endpoint`: an admin endpoint. **Only on `/svc/services`**: a session endpoint
+        /// answers it `NotFound`, so a session cannot reach starting and stopping at all.
+        AdminEndpoint,
+        /// Anything else.
+        Unknown,
+    }
+
+    /// Classify `suffix`, as asked on a `session` endpoint or on `/svc/services` itself.
+    pub fn asked(suffix: &[u8], session: bool) -> Asked {
+        match suffix {
+            b"all.tsm" => Asked::Table,
+            b"admin-endpoint" if !session => Asked::AdminEndpoint,
+            _ => Asked::Unknown,
+        }
+    }
+
+    /// What `service-mgr` does for an admin request.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Action {
+        /// Start it; answer once it is up.
+        Start,
+        /// Ask it to stop; answer once it has exited.
+        Stop,
+        /// Ask it to stop, then start it; answer once the new one is up.
+        StopThenStart,
+    }
+
+    /// The request `op` (`librsproto::services`) for a service found as `(essential, running)`,
+    /// or not found: what to do, or why not.
+    pub fn decide(op: u16, found: Option<(bool, bool)>) -> Result<Action, (KError, &'static str)> {
+        use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
+        let Some((essential, running)) = found else {
+            return Err((KError::NotFound, "no service is declared by that name"));
+        };
+        match op {
+            OP_SERVICES_START if running => Err((KError::AlreadyExists, "it is already running")),
+            OP_SERVICES_START => Ok(Action::Start),
+            OP_SERVICES_STOP | OP_SERVICES_RESTART if essential => Err((
+                KError::NoAccess,
+                "it is essential: without it the system cannot be administered, or loses what it holds",
+            )),
+            OP_SERVICES_STOP if !running => Err((KError::InvalidArgument, "it is not running")),
+            OP_SERVICES_STOP => Ok(Action::Stop),
+            OP_SERVICES_RESTART if running => Ok(Action::StopThenStart),
+            OP_SERVICES_RESTART => Ok(Action::Start),
+            _ => Err((KError::Unsupported, "not a Services request")),
+        }
     }
 }
 
@@ -205,6 +357,62 @@ mod tests {
         assert_eq!(order(&[S]), [Start(0), LoginChain, Done]);
     }
 
+    /// **What each admin request does, and what refuses it** (administration Part E.2).
+    #[test]
+    fn an_admin_request_is_decided_by_the_service_it_names() {
+        use super::services::{Action, decide};
+        use librsproto::services::{
+            OP_SERVICES_RESTART as RESTART, OP_SERVICES_START as START, OP_SERVICES_STOP as STOP,
+        };
+        use libkern::error::KError;
+        let (plain_up, plain_down) = (Some((false, true)), Some((false, false)));
+        let essential_up = Some((true, true));
+        assert_eq!(decide(START, plain_down), Ok(Action::Start));
+        assert_eq!(decide(START, plain_up).map_err(|e| e.0), Err(KError::AlreadyExists));
+        assert_eq!(decide(STOP, plain_up), Ok(Action::Stop));
+        assert_eq!(decide(STOP, plain_down).map_err(|e| e.0), Err(KError::InvalidArgument));
+        assert_eq!(decide(RESTART, plain_up), Ok(Action::StopThenStart));
+        assert_eq!(decide(RESTART, plain_down), Ok(Action::Start), "a stopped one's restart starts it");
+        // An essential service is refused a stop and a restart, running or not, and not a start.
+        for op in [STOP, RESTART] {
+            assert_eq!(decide(op, essential_up).map_err(|e| e.0), Err(KError::NoAccess));
+            assert_eq!(decide(op, Some((true, false))).map_err(|e| e.0), Err(KError::NoAccess));
+        }
+        assert_eq!(decide(START, Some((true, false))), Ok(Action::Start));
+        assert_eq!(decide(STOP, None).map_err(|e| e.0), Err(KError::NotFound));
+        assert_eq!(decide(0x1103, plain_up).map_err(|e| e.0), Err(KError::Unsupported));
+    }
+
+    /// **A service's state**, as the table says it.
+    #[test]
+    fn a_state_is_told_from_how_a_service_last_ended() {
+        use super::services::{State, state};
+        assert_eq!(state(true, true, false, None), State::Starting);
+        assert_eq!(state(true, false, false, Some(Some(1))), State::Running, "running is running");
+        assert_eq!(state(false, false, true, Some(Some(1))), State::Stopped, "asked to stop");
+        assert_eq!(state(false, false, false, None), State::Stopped, "never started");
+        assert_eq!(state(false, false, false, Some(Some(0))), State::Stopped, "finished cleanly");
+        assert_eq!(state(false, false, false, Some(Some(-1))), State::Failed);
+        assert_eq!(state(false, false, false, Some(None)), State::Failed, "a code that never came");
+    }
+
+    /// **The table is a TSM1 table** a reader decodes, a row per service, and a session endpoint
+    /// cannot mint an admin endpoint.
+    #[test]
+    fn the_list_is_a_table_and_a_session_cannot_reach_the_admin_endpoint() {
+        use super::services::{Asked, State, asked, table};
+        let bytes = table(&[("tty-server", State::Running, 0), ("heartbeat", State::Failed, 3)]);
+        let t = libstream::wire::Table::decode(&bytes).expect("a table");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1][0], libstream::wire::Value::Str("heartbeat".into()));
+        assert_eq!(t.rows[1][1], libstream::wire::Value::Str("failed".into()));
+        assert_eq!(t.rows[1][2], libstream::wire::Value::Int(3));
+        assert_eq!(asked(b"all.tsm", true), Asked::Table);
+        assert_eq!(asked(b"admin-endpoint", false), Asked::AdminEndpoint);
+        assert_eq!(asked(b"admin-endpoint", true), Asked::Unknown);
+        assert_eq!(asked(b"", false), Asked::Unknown);
+    }
+
     /// **A file that has lost its critical servers is an emergency**, however it lost them.
     #[test]
     fn declarations_without_a_critical_server_are_unfit_to_boot_with() {
@@ -248,7 +456,8 @@ mod tests {
     /// their derived endpoints and a test image's server fit the routes.
     #[test]
     fn the_routes_and_a_starting_server_fit_one_wait() {
-        assert!(1 + MAX_ROUTES + STARTING_ROOM <= libkern::abi::MAX_WAIT_HANDLES);
+        let used = 1 + MAX_ROUTES + crate::services::SLOTS + STARTING_ROOM;
+        assert!(used <= libkern::abi::MAX_WAIT_HANDLES);
         assert!(STARTING_ROOM >= 1);
         assert!(9 + DERIVED.len() + 1 <= MAX_ROUTES);
     }

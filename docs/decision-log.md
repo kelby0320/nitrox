@@ -30685,3 +30685,76 @@ resolver, and creates and renames still work behind a route. All seven are addre
 **Also**: `init`'s emergency line says the reason is `service-mgr`'s, printed above it. It
 said "a critical server did not come up", which a lost file is not quite. And test images now
 fail on three new lines: `' skipped: `, `' could not be restarted`, `-- starting nothing`.
+
+## 2026-09-28 — Administration Part E.2a: `/svc/services`, and a stop answered once it has happened
+
+`service-mgr` serves **`/svc/services`** from an endpoint of its own, bound there in the root
+(`rsproto-services-ops.md`, new; `Services` is category `0x11xx`):
+- `all.tsm` is the list, a table of `name`, `state` and `restarts`;
+- `admin-endpoint` mints an admin endpoint, and any resolve on it opens an admin session;
+- on an admin session, `Start`, `Stop` and `Restart`.
+
+The session endpoint, the `services` grant, `service` itself and `test-interactive`'s `clip` gate
+are E.2b's.
+
+**The list is a table, not the `List` request the detail pass named.** The device manager's
+`/dev/devices/all.tsm` and the storage service's `/dev/storage/all.tsm` are tables answered on a
+resolve, and `disk --list` reads one. Following them costs `service-mgr` no channel per reader,
+and lets a pipeline `open` and `filter` the list like the others. `service --list` will read it
+the way `disk --list` does.
+
+**A request is answered once it has happened, and never by a wait.** Every resolve on a server's
+path waits on `service-mgr`, so it cannot sit in a wait for an exit.
+- A stop is **held** until the service's exit, and a start until its `Meta::Ready`. Each is a
+  deadline in the one loop, as a server's `Ready` was.
+- A stop is `CTRL_OP_SHUTDOWN` on the control channel: a request, with no forcible kill. One not
+  honoured in 5 s is answered `TimedOut`, "asked, and still running". It stays asked, and a later
+  exit is still a stop, so it is not restarted.
+- A restart is a held stop, then a held start.
+- **A second request for the same service is refused `WouldBlock`.** Two held requests for one
+  service would race to answer the same event.
+- `boot-probe` reads the table straight after each answer, so a reply sent early is caught.
+
+**Which services exit when asked**: `heartbeat`, and the four `essential` does not cover — the
+terminal server, the clipboard, the input server and the compositor.
+- Each waits on its control channel beside its work, through **`libkern::control`**. That module
+  is new; five programs read the control channel, and a helper with two consumers belongs below
+  both.
+- A closed control channel is `Control::Closed`, and each takes the channel out of its wait set.
+  **`heartbeat`'s own copy did not**: a closed channel stays signalled, so `heartbeat` would have
+  spun from the moment `service-mgr` died. Found moving it to the shared helper.
+- The terminal server's `MAX_TTYS` goes from 15 to 14, and the compositor's `MAX_SESSIONS` loses
+  one, to make room in their wait sets. The clipboard's loses one too.
+- A restarted compositor takes the screen again: the kernel hands `/dev/framebuffer` out on each
+  resolve.
+
+**The wait set pays for it.** `/svc/services`' endpoint, a session endpoint (E.2b's), two admin
+endpoints and four admin sessions take eight slots, so `MAX_ROUTES` goes from 16 to 14. Twelve are
+used in a test image.
+
+**`start` returns whether it spawned**, and each caller handles a failure:
+- bring-up, through the bring-up rule;
+- a restart by policy, through the policy (PR #340's fix, moved to `due`);
+- a start asked for, by refusing it.
+
+`reap` records how a service exited, for the table's `state`, and `restarts` counts restarts by
+policy and by request over the boot, which `attempts` does not.
+
+**Gate: `boot-probe`'s services test.** On an admin session, opened as the grant will open one:
+- the list;
+- `clipboard-server` stopped (then `stopped` in the table, and `/dev/clipboard` `NotFound`),
+  started (running, and it opens) and restarted (counted once);
+- `auth-service`'s stop and restart refused `NoAccess`, an unknown name `NotFound`, and a second
+  start `AlreadyExists`.
+
+**Controls, each a boot:**
+- the clipboard ignoring `CTRL_OP_SHUTDOWN`: the stop is answered `TimedOut` after 5 s, and the
+  test fails;
+- a restart not counted: the test fails on the count.
+
+Host tests cover the decisions (`services::decide`, `state`, `asked`) and the budget.
+
+**Only the clipboard's stop is booted.** Stopping the terminal, input or compositor server in the
+test image would break the gates that boot that image after `boot-probe`: `check-terminal` and
+`check-input` need all three. Their handling is the clipboard's, through the same helper, and is
+built but unexercised.

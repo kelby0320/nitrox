@@ -25,6 +25,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod abi;
+pub mod control;
 pub mod debug;
 pub mod device;
 pub mod error;

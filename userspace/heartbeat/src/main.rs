@@ -28,6 +28,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use libkern::*;
+use libkern::control::Control;
 use liblog::Logger;
 use libstream::wire::Result as StreamResult;
 use libstream::{Schema, SliceSink, TableWriter, TypeModifiers, TypeTag, TypedRecord, Value, WireError};
@@ -117,31 +118,6 @@ fn exit(code: i64) -> ! {
     loop {
         core::hint::spin_loop();
     }
-}
-
-/// Read the control-channel message that just signalled and return its opcode (the
-/// first payload byte), or `None` on a failed/empty receive.
-fn recv_control_op(control: u64) -> Option<u8> {
-    // SAFETY: valid recv out-params; on success the kernel writes the message.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            control,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel filled RECV_MSG's header + payload.
-    let plen = unsafe { (&raw const RECV_MSG.header.payload_len).read() };
-    if plen < 1 {
-        return None;
-    }
-    // SAFETY: payload[0] is within the message buffer.
-    Some(unsafe { (&raw const RECV_MSG.payload[0]).read() })
 }
 
 /// Read the monotonic clock (nanoseconds).
@@ -289,9 +265,16 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
         };
         if waited >= 1 {
             // The control endpoint signalled — a message is waiting.
-            match recv_control_op(control) {
-                Some(CTRL_OP_SHUTDOWN) => {
+            match libkern::control::recv(control) {
+                Control::Op(CTRL_OP_SHUTDOWN) => {
                     kprint(b"heartbeat: shutdown requested, exiting\n");
+                    exit(0);
+                }
+                // **Its supervisor has gone**, and the channel would stay signalled for good: a
+                // loop that waited on it again would spin (administration Part E.2). It is the one
+                // thing this waits on, so there is nothing left to do.
+                Control::Closed => {
+                    kprint(b"heartbeat: its supervisor has gone, exiting\n");
                     exit(0);
                 }
                 _ => { /* unknown/empty op — ignore and keep beating */ }

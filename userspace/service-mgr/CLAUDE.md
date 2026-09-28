@@ -52,9 +52,14 @@ and the slice plan all live there.
   (`wait_serving`, `lookup_serving`) answer them too. The lookups it waits on outright
   (`ns_lookup`: `/bin`, a server's log endpoint) reach the root filesystem, the profile server and
   servers already serving, none of which waits on it.
-- **The wait set is budgeted**: the notification channel, `registry::MAX_ROUTES` routes and
-  `registry::STARTING_ROOM` starting servers make the kernel's 32. A running service's channel is
-  not in it — a death queues `ChildExited`, which wakes the pass that finds it.
+- **The wait set is budgeted**: the notification channel, `registry::MAX_ROUTES` routes, the
+  handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` starting
+  servers make the kernel's 32. A running service's channel is not in it — a death queues
+  `ChildExited`, which wakes the pass that finds it.
+- **An admin request is answered once it has happened, never by a wait** (administration Part
+  E.2): a stop is `Held` until the exit, a start until the `Ready`. A reply sent before the thing is
+  done is a lie a gate cannot always catch; `boot-probe`'s services test reads the table straight
+  after each answer.
 - **Answer every resolve.** A forwarded resolve has no deadline: one dropped is a caller hung for
   good. A failed reply is answered with an error, and the endpoint's ring is `SERVE_DEPTH` (64)
   deep, because a full one answers the caller `WouldBlock` at once.
