@@ -175,6 +175,9 @@ enum Endpoint {
 
 struct Broker {
     storage: Storage,
+    /// `service-mgr`'s admin endpoint, which the `services` grant binds into a view (administration
+    /// Part E.2b). **Resolved when first needed**, as the storage service's is; `0` until then.
+    services_admin: u64,
     root_ns: u64,
     notif: u64,
     serve_end: u64,
@@ -309,6 +312,10 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 
 /// Where the `storage` grant is bound in a view.
 const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
+/// Where `service-mgr` mints an admin endpoint (administration Part E.2b).
+const SERVICES_ADMIN: &[u8] = b"/svc/services/admin-endpoint";
+/// Where the `services` grant is bound in a view.
+const SERVICES_GRANT: &[u8] = b"/dev/services/admin";
 /// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
 /// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
@@ -347,6 +354,18 @@ const NAME_RULE: &str =
     "a name is 1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_` or `-`";
 
 impl Broker {
+    /// `service-mgr`'s admin endpoint, resolved on first need. `0` if it could not be.
+    fn services_endpoint(&mut self) -> u64 {
+        if self.services_admin == 0 {
+            self.services_admin = ns_lookup(
+                self.root_ns,
+                SERVICES_ADMIN,
+                RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_TRANSFER,
+            );
+        }
+        self.services_admin
+    }
+
     /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
     /// there.
     fn storage_endpoint(&mut self) -> u64 {
@@ -1216,6 +1235,22 @@ impl Broker {
                         return fail(self, &mut p, "the storage service is not there to grant");
                     }
                 }
+                // **Starting and stopping services** (administration Part E.2b): `service-mgr`'s admin
+                // endpoint at `/dev/services/admin`. It answers every request on a session opened
+                // there, bar an essential service's stop, so holding this binding is the authority.
+                Grant::Services => {
+                    let endpoint = self.services_endpoint();
+                    // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
+                    let bound = endpoint != 0
+                        && unsafe {
+                            let (p, l) = (SERVICES_GRANT.as_ptr() as u64, SERVICES_GRANT.len() as u64);
+                            syscall4(SYS_NS_BIND, view_ns, p, l, endpoint)
+                        } == 0;
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "service-mgr's admin endpoint is not there to grant");
+                    }
+                }
                 // **Changing the policy** (administration Part D.2): the broker's own forwarding
                 // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
@@ -1484,6 +1519,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     }
     let mut b = Broker {
         storage: Storage::default(),
+        services_admin: 0,
         root_ns,
         notif,
         serve_end,

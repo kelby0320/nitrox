@@ -192,6 +192,15 @@ pub struct NamespaceSpec<'a> {
     /// bound, so `desktop-shell`, which holds it with `BIND_NAMESPACE`, cannot mint an admin
     /// endpoint from it either.
     pub storage_endpoint: u64,
+    /// `service-mgr`'s **session endpoint** for its services, bound at `/dev/services`
+    /// (administration Part E.2b), so `/dev/services/all.tsm` is the table of every service. `0`
+    /// binds nothing.
+    ///
+    /// **The endpoint is the boundary again.** It answers the table and nothing else:
+    /// `admin-endpoint` is `NotFound` there however it is bound, so no session starts or stops a
+    /// service without the view broker's `services` grant, which binds an admin endpoint at
+    /// `/dev/services/admin` in a view.
+    pub services_endpoint: u64,
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -375,6 +384,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         views_base,
         devices_endpoint,
         storage_endpoint,
+        services_endpoint,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
@@ -615,6 +625,17 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         });
     if storage_endpoint != 0 && !has_storage {
         kprint(b"libsession: /storage bind FAIL (no filesystems in this session)\n");
+    }
+
+    // `/dev/services` → `service-mgr`'s session endpoint (administration Part E.2b), with no base:
+    // its one answer is `all.tsm`, the table of services. Non-fatal, like `/dev/devices`.
+    if services_endpoint != 0 {
+        let at = b"/dev/services";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let r = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, services_endpoint, 0, 0) };
+        if r != 0 {
+            kprint(b"libsession: /dev/services bind FAIL (no service list in this session)\n");
+        }
     }
 
     // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`

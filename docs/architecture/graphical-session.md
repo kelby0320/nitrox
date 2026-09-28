@@ -259,18 +259,25 @@ base at all. That trusts it with nothing new: it already holds the whole-tree fi
 it** (administration Part B.4). It binds `/dev/devices` into each application at the base `/info`,
 and with `BIND_NAMESPACE` it could bind any base too; on the endpoint bound at `/svc/devices`, a
 bare `block` is a subscription to every disk — raw write access to the ESP and every partition,
-which the whole-tree filesystem endpoint does not give. So `init` asks the manager for an
-**info-only endpoint**, on which only the tables are answered whatever suffix arrives, and that is
-what travels down this chain. The shell can bind it however it likes and reach nothing but the
-tables ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
+which the whole-tree filesystem endpoint does not give. So `service-mgr` asks the manager for an
+**info-only endpoint**, on which only the tables are answered whatever suffix arrives, and a route
+to that is what travels down this chain (`init` asked, until administration Part E.1a). The shell
+can bind it however it likes and reach nothing but the tables
+([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 **The storage service's endpoint is shaped the same way** (administration Part C.6). The shell binds
 it into each application twice — `/storage` at the base `/fs`, `/dev/storage` at `/info` — and
 could bind it at any base. On the endpoint bound at `/svc/storage`, `admin-endpoint` mints the
-endpoint that mounts and unmounts. So `desktop-session-mgr` resolves a **session endpoint**, on
-which the service answers the filesystems and the table and nothing else, and hands that to the
-shell as its eighth extra ([`storage.md`](storage.md) §7). Mounting reaches a program only through
-the view broker's `storage` grant.
+endpoint that mounts and unmounts. So `desktop-session-mgr` is handed a route to a **session
+endpoint**, on which the service answers the filesystems and the table and nothing else (it
+resolved one itself until administration Part E.1b), and hands that to the shell as its eighth
+extra ([`storage.md`](storage.md) §7). Mounting reaches a program only through the view broker's
+`storage` grant.
+
+**`service-mgr`'s services endpoint too** (administration Part E.2b): its ninth extra, bound at
+`/dev/services` in every application. It is a session endpoint of `service-mgr`'s own, answering
+the table of services and nothing else; starting and stopping reach a program only through the
+`services` grant ([`rsproto-services-ops.md`](../spec/rsproto-services-ops.md)).
 
 ## 4. The session recipe, and what the two supervisors share
 

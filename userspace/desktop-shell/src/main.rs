@@ -662,6 +662,7 @@ fn build_app_namespace(
     views_base: &str,
     devices: u64,
     storage: u64,
+    services: u64,
 ) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -916,6 +917,18 @@ fn build_app_namespace(
             if sr != 0 {
                 kprint(b"desktop-shell: application /storage bind FAIL\n");
             }
+        }
+    }
+
+    // **`/dev/services`** (administration Part E.2b) — `service-mgr`'s session endpoint, so a
+    // program launched here lists the services. It answers the table and nothing else, so however
+    // this shell binds it, no path under it starts or stops one.
+    if services != 0 {
+        let at = b"/dev/services";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let r = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, services, 0, 0) };
+        if r != 0 {
+            kprint(b"desktop-shell: application /dev/services bind FAIL\n");
         }
     }
     ns
@@ -1223,6 +1236,8 @@ struct Launcher<'a> {
     /// The storage service's session endpoint, bound at `/storage` and `/dev/storage`
     /// (administration Part C.6).
     storage: u64,
+    /// `service-mgr`'s services endpoint, bound at `/dev/services` (administration Part E.2b).
+    services: u64,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
     /// The environment record an application reads its `HOME` from.
@@ -1252,13 +1267,13 @@ impl Launcher<'_> {
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
         (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
-    let (views, views_base, devices, storage) = (l.views, l.views_base, l.devices, l.storage);
+    let (views, views_base, devices, storage, services) = (l.views, l.views_base, l.devices, l.storage, l.services);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
     let app_ns = build_app_namespace(
-        draw, fs, tty, profile, home, desktop, clipboard, views, views_base, devices, storage,
+        draw, fs, tty, profile, home, desktop, clipboard, views, views_base, devices, storage, services,
     );
     if app_ns == 0 {
         return false;
@@ -1721,6 +1736,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // nothing else, so this shell cannot mount anything with it, however it binds it. Absent means
     // applications get no `/storage`.
     let storage_endpoint = recv_handle(setup);
+    // `service-mgr`'s services endpoint (administration Part E.2b), bound at `/dev/services` in
+    // every application namespace: the table of services, and nothing that starts or stops one.
+    let services_endpoint = recv_handle(setup);
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
     }
@@ -1860,6 +1878,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 views_base,
                 devices_endpoint,
                 storage_endpoint,
+                services_endpoint,
             );
         if app_ns != 0 {
             may_launch = verify_app_namespace(
@@ -1888,6 +1907,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         views_base,
         devices: devices_endpoint,
         storage: storage_endpoint,
+        services: services_endpoint,
         home,
         env: &env,
         enabled: may_launch,

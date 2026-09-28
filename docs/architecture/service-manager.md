@@ -236,7 +236,10 @@ its own, bound there in the root ([`rsproto-services-ops.md`](../spec/rsproto-se
   who can reach it;
 - **`admin-endpoint`**, which mints an endpoint on which any resolve opens an admin session, where
   `Start`, `Stop` and `Restart` are asked. The view broker's `services` grant is what binds one
-  into a view.
+  into a view (Part E.2b).
+- **A session endpoint**, made at startup and handed to both login supervisors, which bind it at
+  `/dev/services` in every session and, through `desktop-shell`, every application (Part E.2b). It
+  answers the table and nothing else, so no session starts or stops a service without the grant.
 
 **Every request is answered once it has happened**, and never by a wait: a stop is `Held` until
 the service's exit, a start until its `Meta::Ready` — deadlines in the one loop, like every other.

@@ -59,6 +59,10 @@ pub mod policy {
         /// `SetPassword` (administration Part D.3). The broker checks the guards and asks
         /// `auth-service`, the accounts' only writer.
         Accounts,
+        /// **Starting, stopping and restarting services**: `service-mgr`'s admin endpoint, bound at
+        /// `/dev/services/admin` (administration Part E.2b). `service-mgr` refuses an essential
+        /// service's stop itself, whoever holds this.
+        Services,
     }
 
     impl Grant {
@@ -69,6 +73,7 @@ pub mod policy {
                 "storage" => Some(Grant::Storage),
                 "views" => Some(Grant::Views),
                 "accounts" => Some(Grant::Accounts),
+                "services" => Some(Grant::Services),
                 _ => None,
             }
         }
@@ -80,12 +85,14 @@ pub mod policy {
                 Grant::Storage => "storage",
                 Grant::Views => "views",
                 Grant::Accounts => "accounts",
+                Grant::Services => "services",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
-    pub const KNOWN_GRANTS: &[Grant] = &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts];
+    pub const KNOWN_GRANTS: &[Grant] =
+        &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts, Grant::Services];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1027,6 +1034,9 @@ auth = "password"
         assert_eq!(p.profiles[0].grants, [Grant::Disks, Grant::Storage]);
         assert_eq!(Grant::from_name("storage"), Some(Grant::Storage));
         assert_eq!(Grant::Storage.name(), "storage");
+        assert_eq!(Grant::from_name("services"), Some(Grant::Services));
+        assert_eq!(Grant::Services.name(), "services");
+        assert!(KNOWN_GRANTS.contains(&Grant::Services));
         let e = parse("[profile.admin]\ngrants = [\"power\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
         // And `views` (administration Part D.2).

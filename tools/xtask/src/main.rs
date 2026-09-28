@@ -606,6 +606,9 @@ const COREUTILS: &[&str] = &[
     // The accounts (administration Part D.4): `--list` and your own `--password` from any session,
     // the rest from a view with the `accounts` grant, or on a users file for recovery.
     "account",
+    // The services (administration Part E.2): `--list` from any session, and `--start`, `--stop`
+    // and `--restart` from a view with the `services` grant.
+    "service",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -2257,6 +2260,39 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send(DEMO_USER)?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20f. **`service`, and a restart the session survives** (administration Part E.2b).
+    //      (a) `--list` is `service-mgr`'s table, from any session: the clipboard running.
+    s.send("service --list | filter name == \"clipboard-server\"")?;
+    s.expect("running")?;
+    s.expect("/home>")?;
+    //      (b) **A stop without the grant is refused before `service-mgr` is asked**: the
+    //          session's `/dev/services/admin` is its session endpoint, where nothing answers.
+    s.send("service --stop clipboard-server")?;
+    s.expect("need the services grant")?;
+    s.expect("/home>")?;
+    //      (c) **An essential service is refused by `service-mgr` itself**, grant or not.
+    s.send("with admin service --stop auth-service")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("it is essential")?;
+    s.expect("/home>")?;
+    //      (d) **The clipboard restarted, from this session**, answered once the new one is up.
+    s.send("with admin service --restart clipboard-server")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("service: restarted clipboard-server")?;
+    s.expect("/home>")?;
+    //      (e) **And the same session copies and pastes through it.** This session bound
+    //          `/dev/clipboard` at login, before the restart, and never again: what it reaches is
+    //          `service-mgr`'s route, which continues into whichever clipboard server is running
+    //          (Part E.1b). Bound to the server's own endpoint, `clip` would find it gone.
+    s.send("\"after-restart\" | clip --copy")?;
+    s.expect("/home>")?;
+    s.send("clip")?;
+    s.expect("after-restart")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -15094,7 +15130,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

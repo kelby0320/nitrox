@@ -243,14 +243,15 @@ fn now_ns() -> u64 {
 /// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
 fn create_control_channel() -> Option<(u64, u64)> {
     // **Depth 10, and the number bounds the send count rather than being a round one.** The
-    // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring
-    // shorter than the number of them does not block — it **drops the last handle silently**.
-    // This was 4 while the graphical column sent four; M12 Part E's clipboard made it five, and
-    // the symptom was a session whose namespace had no `/dev/clipboard` and a copy that failed
-    // two processes away, with the send reporting success. **Eight since administration Part
-    // E.1b** go to `desktop-session-mgr`, the storage service's route the eighth, so it is ten
-    // deep for two spare. `libsession::spawn_leader` carries the same warning from the same
-    // failure in M7 Part F — which is what named this one on sight.
+    // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring shorter
+    // than the number of them does not block — it **drops the last handle silently**. This was 4
+    // while the graphical column sent four; M12 Part E's clipboard made it five, and the symptom
+    // was a session whose namespace had no `/dev/clipboard` and a copy that failed two processes
+    // away, with the send reporting success. **Nine since administration Part E.2b** go to
+    // `desktop-session-mgr` — the storage service's route the eighth since E.1b, and
+    // `service-mgr`'s own services endpoint the ninth — so it is ten deep for one spare.
+    // `libsession::spawn_leader` carries the same warning from the same failure in M7 Part F —
+    // which is what named this one on sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0)
@@ -623,13 +624,26 @@ struct ChainEndpoints {
     views: u64,
     devices: u64,
     storage: u64,
+    /// `service-mgr`'s own session endpoint for `/svc/services` (administration Part E.2b): the
+    /// table of services, and nothing that starts or stops one.
+    services: u64,
 }
 
 impl ChainEndpoints {
     /// Every handle, in the order `desktop-session-mgr` receives them; `session-mgr` receives the
     /// same with no `draw`.
-    fn all(&self) -> [u64; 8] {
-        [self.fs, self.profile, self.tty, self.draw, self.clip, self.views, self.devices, self.storage]
+    fn all(&self) -> [u64; 9] {
+        [
+            self.fs,
+            self.profile,
+            self.tty,
+            self.draw,
+            self.clip,
+            self.views,
+            self.devices,
+            self.storage,
+            self.services,
+        ]
     }
 
     /// A second set of everything but `draw`, which only one column takes. `TRANSFER |
@@ -646,6 +660,7 @@ impl ChainEndpoints {
                 views: dup_endpoint(self.views),
                 devices: dup_endpoint(self.devices),
                 storage: dup_endpoint(self.storage),
+                services: dup_endpoint(self.services),
             }
         }
     }
@@ -693,9 +708,10 @@ fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
     // its home over IPC to the profile server. The fs server's, the profile server's, then the
     // routes to the terminal server, the clipboard (M12 Part E), the view broker (administration
     // Part A.4), the device manager's info-only endpoint (Part B.4) and the storage service's
-    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b).
+    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b), then this
+    // manager's own session endpoint for `/svc/services` (Part E.2b).
     let s = &serial;
-    for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage] {
+    for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage, s.services] {
         send_handle(sess_ctrl, h);
     }
     // **Kept, not closed** (administration Part E.1): shutdown asks the supervisors to end their
@@ -729,7 +745,7 @@ fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
         set.close();
         return false;
     }
-    // The serial column's order with the compositor's fourth — eight of the control channel's
+    // The serial column's order with the compositor's fourth — nine of the control channel's
     // ten, see `create_control_channel`.
     for h in set.all() {
         send_handle(ctrl, h);
@@ -1166,6 +1182,10 @@ const STOP_TIMEOUT_NS: u64 = 5_000_000_000;
 struct Services {
     /// The end this manager answers `/svc/services` on.
     serve: u64,
+    /// **The session endpoint** (Part E.2b), and the end it is answered on: the table and nothing
+    /// else. Every login binds a duplicate at `/dev/services`.
+    session_client: u64,
+    session_serve: u64,
     admin_ends: alloc::vec::Vec<u64>,
     admin_sessions: alloc::vec::Vec<u64>,
 }
@@ -1271,6 +1291,7 @@ impl Mgr {
                     push(r.serve);
                 }
                 push(self.services.serve);
+                push(self.services.session_serve);
                 for &h in self.services.admin_ends.iter().chain(&self.services.admin_sessions) {
                     push(h);
                 }
@@ -1929,6 +1950,17 @@ impl Mgr {
         close(client);
         self.services.serve = serve;
         kprint(b"service-mgr: serving /svc/services\n");
+        // The session endpoint: made once, answered on its own end, so its holder is told apart —
+        // a session reaches the table and never an admin endpoint.
+        match make_channel(SERVE_DEPTH) {
+            Some((client, serve)) => {
+                self.services.session_client = client;
+                self.services.session_serve = serve;
+            }
+            None => {
+                kprint(b"service-mgr: services session endpoint create FAIL -- no /dev/services\n")
+            }
+        }
     }
 
     /// The table: a row per declaration, in file order.
@@ -1959,6 +1991,17 @@ impl Mgr {
                     self.services.serve = 0;
                     break;
                 }
+            }
+        }
+        // A session endpoint's holders are the logins and what they spawn; this manager holds its
+        // other end, so it cannot close.
+        let session = self.services.session_serve;
+        while session != 0 {
+            match recv_request(session) {
+                Ok(Some((op, request_id, body))) => {
+                    self.answer_resolve(session, op, request_id, &body, true)
+                }
+                _ => break,
             }
         }
         let mut k = 0;
@@ -2151,6 +2194,8 @@ impl Mgr {
             views: self.route_copy("view-broker", None),
             devices: self.route_copy("device-mgr", Some("info-endpoint")),
             storage: self.route_copy("storage-service", Some("session-endpoint")),
+            // SAFETY: a channel end this process holds, or `0`.
+            services: unsafe { dup_endpoint(self.services.session_client) },
         };
         bring_up_login_chain(self.root_ns, chain);
     }

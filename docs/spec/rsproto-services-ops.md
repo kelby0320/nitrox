@@ -2,9 +2,10 @@
 
 **Status: normative for what is built (2026-09-28).** `Start`, `Stop` and `Restart`, and the table
 `all.tsm`, are implemented in `userspace/service-mgr/` and encoded by
-`userspace/librsproto/src/services.rs` (administration Part E.2a). The decisions — what each
-request does, and what refuses it — are `service_mgr::services`, host-tested. See
-[`service-manager.md`](../architecture/service-manager.md) for the manager, and
+`userspace/librsproto/src/services.rs` (administration Part E.2a); the session endpoint every login
+binds at `/dev/services`, the view broker's `services` grant and `service` itself are Part E.2b's.
+The decisions — what each request does, and what refuses it — are `service_mgr::services`,
+host-tested. See [`service-manager.md`](../architecture/service-manager.md) for the manager, and
 [`administration.md`](../planning/administration.md) § *Part E in detail* for the design and its
 reasons.
 
@@ -19,6 +20,7 @@ to it can read.
 | forwarding endpoint | `/svc/services`, bound by `service-mgr` | — | `Namespace::Resolve` |
 | table | `/svc/services/all.tsm` | `all.tsm` | a read-only memory object: a TSM1 table |
 | admin endpoint | `/svc/services/admin-endpoint`, from the root namespace | `admin-endpoint` | a forwarding endpoint of `service-mgr`'s own |
+| session endpoint | handed to both login supervisors at spawn, bound at `/dev/services` in every session and application | `all.tsm` | the table; any other suffix, `admin-endpoint` among them, is `NotFound` |
 | admin session | any resolve on an admin endpoint | any | a channel carrying the requests below |
 
 Any other suffix is `NotFound`.

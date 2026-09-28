@@ -1,6 +1,6 @@
 # `views.toml` — the view broker's policy
 
-**Status: normative for what is built (2026-09-25, Part D.3).** Read by `userspace/view-broker/`
+**Status: normative for what is built (2026-09-28, Part E.2b).** Read by `userspace/view-broker/`
 (`view_broker::policy`) from `/system/views.toml`, **for every request**. The build seeds one;
 an installed system's comes from the installer (administration Part G).
 
@@ -12,7 +12,7 @@ syntax. A view is a profile's grants added to the caller's own namespace; see
 
 ```toml
 [profile.admin]
-grants = ["disks", "storage", "views", "accounts"]
+grants = ["disks", "storage", "views", "accounts", "services"]
 
 [profile.install]
 grants = ["disks"]
@@ -57,6 +57,7 @@ names its line.
 | `storage` | the storage service's admin endpoint at `/dev/storage/admin`: mounting and unmounting ([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) | Part C.6 |
 | `views` | the broker's policy endpoint at `/dev/policy`: reading this file and installing a new one, which `with --show` and `with --install` use ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `Show`, `Install`). **Not** `/system/views.toml` writable: an install is judged first, so a policy that leaves no administrator never reaches the disk | Part D.2 |
 | `accounts` | the broker's accounts endpoint at `/dev/accounts`: adding and removing accounts and setting their passwords ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `AddAccount`, `RemoveAccount`, `SetPassword`). **Not** `/system/users` or `/home` writable: the broker checks the guards — a removal waits for logout and must leave an administrator — makes and removes homes, and asks `auth-service`, the file's only writer. Listing accounts and changing one's own password need no grant | Part D.3 |
+| `services` | `service-mgr`'s admin endpoint at `/dev/services/admin`: starting, stopping and restarting services ([`rsproto-services-ops.md`](rsproto-services-ops.md)). `service-mgr` refuses an `essential` service's stop and restart itself, whoever holds this. Listing the services needs no grant: every session's `/dev/services` is the table | Part E.2b |
 
 Each later part of the administration phase adds its grant to this table.
 

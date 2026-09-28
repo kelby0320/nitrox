@@ -30758,3 +30758,50 @@ Host tests cover the decisions (`services::decide`, `state`, `asked`) and the bu
 test image would break the gates that boot that image after `boot-probe`: `check-terminal` and
 `check-input` need all three. Their handling is the clipboard's, through the same helper, and is
 built but unexercised.
+
+## 2026-09-28 — Administration Part E.2b: `service`, the grant, and a session that survives a restart
+
+**Every session and application binds `/dev/services`**, `service-mgr`'s own session endpoint: the
+table of services and nothing else. `admin-endpoint` is `NotFound` there however it is bound, so no
+session starts or stops a service without the grant.
+- `service-mgr` makes the endpoint at startup and hands it down the login chain, the way E.1b hands
+  its routes down. That makes it the eighth handoff to `session-mgr` and the ninth to
+  `desktop-session-mgr`, whose control channel now holds nine of its ten slots.
+- `desktop-shell` receives it as its ninth extra and binds it into every application.
+- **Handed, not resolved.** `service-mgr` is the one that spawns the supervisors, so it has no
+  reason to make them ask for an endpoint it already holds. E.1b moved the storage service's session
+  endpoint the same way.
+
+**The `services` grant** binds `service-mgr`'s admin endpoint at `/dev/services/admin`. The broker
+resolves it lazily at `/svc/services/admin-endpoint`, as it does the storage service's. The seeded
+`admin` profile gains it. `service-mgr` still refuses an essential service's stop itself, whoever
+holds the grant.
+
+**`service`**, a coreutil modelled on `disk`:
+- `--list` reads `/dev/services/all.tsm`;
+- `--start`, `--stop` and `--restart NAME` ask on `/dev/services/admin`, and wait for the answer,
+  which comes once the thing is done;
+- without the grant, the admin path resolves through the session endpoint to `NotFound`, and
+  `service` names `with`.
+
+**`test-interactive` step 20f** (34 steps), from a serial session:
+- the list shows the clipboard running;
+- a stop without the grant is refused, naming the grant;
+- `with admin service --stop auth-service` is refused as essential;
+- `with admin service --restart clipboard-server` is answered once the new one is up;
+- **the same session then copies and pastes through `clip`.**
+
+**That last step is the first proof of E.1b's claim end to end**: a session bound before a restart
+reaches the new server. Until now only `boot-probe`'s copy of the root stood in for it.
+- The control hands the supervisors the clipboard server's own endpoint instead of the route,
+  which is what E.1a did. The restart succeeds, and `clip` then finds `no /dev/clipboard in this
+  namespace`, so the step fails.
+- E.1b's plan note named this gate as the one that would do it.
+
+**A doc comment went astray again** while adding the broker's `services_endpoint`: it was anchored
+on `fn storage_endpoint`, whose doc sat above it. Caught by reading before the sweep ran, and
+restored.
+
+**Two more lines E.1a's sweep missed**, in `graphical-session.md` §3, are fixed here: `init` asking
+the device manager for the info-only endpoint, and `desktop-session-mgr` resolving the storage
+session endpoint itself.

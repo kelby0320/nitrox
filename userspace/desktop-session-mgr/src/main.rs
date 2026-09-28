@@ -141,6 +141,7 @@ fn run_session(
     views_sup: u64,
     devices: u64,
     storage: u64,
+    services: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -183,6 +184,7 @@ fn run_session(
         views_base: &views_base[..base_len],
         devices_endpoint: devices,
         storage_endpoint: storage,
+        services_endpoint: services,
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
@@ -276,12 +278,13 @@ fn run_session(
         "desktop-shell",
         &[home_str, base_str],
         SYSCAP_BIND_NAMESPACE,
-        // **Eight now.** The fifth is the clipboard (M12 Part E), the sixth the view broker
-        // (administration Part A.4), the seventh the device manager (Part B.4) and the eighth the
-        // storage service's session endpoint (Part C.6); the shell binds each into every
-        // application namespace it constructs, for the same reason as the rest — a binding
-        // resolves to a kernel registration and never back to an endpoint.
-        &[draw, fs, tty, profile, clipboard, views_for_shell, devices, storage],
+        // **Nine now.** The fifth is the clipboard (M12 Part E), the sixth the view broker
+        // (administration Part A.4), the seventh the device manager (Part B.4), the eighth the
+        // storage service's session endpoint (Part C.6) and the ninth `service-mgr`'s services
+        // endpoint (Part E.2b); the shell binds each into every application namespace it
+        // constructs, for the same reason as the rest — a binding resolves to a kernel
+        // registration and never back to an endpoint.
+        &[draw, fs, tty, profile, clipboard, views_for_shell, devices, storage, services],
     );
     // **Tell the broker the session ended**, as the serial column does.
     if let Some((id, _)) = opened {
@@ -328,6 +331,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // it was resolved here, which minted one that died with the service; `service-mgr` asks for it
     // each time the service comes up, and this is the route to whichever is current.
     let storage_endpoint = recv_handoff(control);
+    // **`service-mgr`'s services endpoint** (administration Part E.2b) — the ninth, and the sixth
+    // both take: `/dev/services`, the table of services, in every session and application.
+    let services_endpoint = recv_handoff(control);
     // A supervisor channel to it, resolved once, as the serial column does: this process opens a
     // session for each login and closes it when the shell exits.
     let views_sup = if views_endpoint != 0 {
@@ -494,7 +500,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
                 draw_endpoint, clipboard_endpoint, views_endpoint, views_sup, devices_endpoint,
-                storage_endpoint, &user[..ul], &pass[..pl],
+                storage_endpoint, services_endpoint, &user[..ul], &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.

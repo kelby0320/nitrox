@@ -2058,7 +2058,7 @@ A reboot is the same, with `reboot: true` and a reset at the end.
           path again**, in the root and in a namespace built as a supervisor builds one, and
           reaches the new server;
         - `check-images`, including a control that adds a file to one root.
-- [ ] **E.2 — `service`.**
+- [x] **E.2 — `service`.** *(Complete 2026-09-28, in two parts.)*
       - `/svc/services` and its three endpoints, with `List`, `Start`, `Stop` and `Restart`
         (`rsproto-services-ops.md`, which E.2 writes).
       - Each stoppable server exits on `CTRL_OP_SHUTDOWN`; an essential one is refused.
@@ -2070,6 +2070,12 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         `disk --list` does. Each request is answered once it has happened; a stop not honoured in
         5 s is answered "asked, and still running". The session endpoint, the grant, `service` and
         the `clip` gate are E.2b's.)*
+      - *(E.2b landed 2026-09-28:* `/dev/services` in every session and application — a session
+        endpoint of `service-mgr`'s own, handed down the login chain as E.1b's routes are, rather
+        than resolved — the `services` grant, seeded into `admin`, and `service`. `test-interactive`
+        step 20f restarts the clipboard from a serial session and copies and pastes through it
+        afterwards: **the first gate to prove E.1b's claim end to end**, and a control handing the
+        supervisors the clipboard's own endpoint fails it, `clip` finding no clipboard.)*
       - Gates:
         - `boot-probe`: `List`; `clipboard-server` stopped, started and restarted through the admin
           endpoint; an essential stop refused;
