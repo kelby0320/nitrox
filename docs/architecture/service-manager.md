@@ -218,7 +218,10 @@ treated as critical-path. If one does not come up at boot, `service-mgr` starts 
 asks `init` for the emergency shell over the **terminal channel** (below); the console is still
 free, since both start before the terminal server. At runtime a critical server's death is its
 restart policy's, because the terminal server holds the console by then. Every server's policy is
-`never` today, as `init` never restarted them.
+`never` today, as `init` never restarted them. **A declarations file that has lost its critical
+servers is an emergency too** (`bringup::unfit`, PR #340 review): a critical declaration that is
+skipped, a missing or empty file, or none critical — each would otherwise go straight to a login
+chain with no `auth-service` behind it. Every skipped declaration is logged by name.
 
 **The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
 handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
@@ -377,7 +380,11 @@ The [service-toml schema](../spec/service-toml-schema.md) is the **full aspirati
 contract**. Several of its assumptions do not exist yet, and the *first* slice must
 be scoped to what is buildable:
 
-| Schema assumes | Reality today | Implication for slice 1 |
+*(This is slice 1's table, and its "today" is 2026-07-15's. Several rows have moved since: spawn
+is by path through `/bin`, a logging service exists, and the declarations are
+`/system/services.toml` on the root (administration Part E.1c). It is kept as the scoping record.)*
+
+| Schema assumes | Reality at slice 1 | Implication for slice 1 |
 |---|---|---|
 | `executable = "/store/…"` path spawns | Spawn is a **kernel-embedded `ImageId` enum** (no ELF-from-namespace loader) | Slice-1 services are embedded images selected by `ImageId`; the `executable` field maps to a known image, not an arbitrary path. Full path-based spawn is a later slice (needs a userspace ELF loader). |
 | Declarations in `/store/…-system-services/` projected to `/etc/services/` | No content store, no profile server | Declarations come from the **initramfs**, like `init.toml`. **One file** — `/initramfs/etc/services.toml` — not a directory: nothing can enumerate one (schema changed 2026-08-21). |

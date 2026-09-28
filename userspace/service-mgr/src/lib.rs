@@ -73,6 +73,28 @@ pub mod bringup {
     pub fn failed_at_boot(entry: Entry) -> Failed {
         if entry.critical { Failed::Emergency } else { Failed::Continue }
     }
+
+    /// **Why a set of declarations is not one to boot with**, or `None` (PR #340 review, finding
+    /// 2). `service-mgr` then starts nothing and asks `init` for the emergency shell, as for a
+    /// critical server that did not come up — which each of these is, before it is started:
+    /// - a declaration that said `critical = true` and could not be read (`skipped_critical`);
+    /// - no declarations at all: a missing, unreadable or unparseable file;
+    /// - none that is critical. The two critical servers are what a boot cannot go on without,
+    ///   and a file declaring neither has lost them rather than meant it.
+    ///
+    /// Before administration Part E.1, `init` started those two unconditionally and took the
+    /// emergency path if either failed, so no edit to a file could lose them.
+    pub fn unfit(entries: &[Entry], skipped_critical: bool) -> Option<&'static str> {
+        if skipped_critical {
+            Some("a critical declaration could not be read")
+        } else if entries.is_empty() {
+            Some("no declaration could be read")
+        } else if !entries.iter().any(|e| e.critical) {
+            Some("no declaration is critical")
+        } else {
+            None
+        }
+    }
 }
 
 pub mod registry {
@@ -181,6 +203,18 @@ mod tests {
         assert_eq!(order(&[N, N]), [LoginChain, Start(0), Start(1), Done]);
         assert_eq!(order(&[]), [LoginChain, Done]);
         assert_eq!(order(&[S]), [Start(0), LoginChain, Done]);
+    }
+
+    /// **A file that has lost its critical servers is an emergency**, however it lost them.
+    #[test]
+    fn declarations_without_a_critical_server_are_unfit_to_boot_with() {
+        use super::bringup::unfit;
+        assert_eq!(unfit(&[C, S, N], false), None);
+        assert_eq!(unfit(&[S, C], false), None, "critical anywhere counts");
+        assert_eq!(unfit(&[], false), Some("no declaration could be read"));
+        assert_eq!(unfit(&[S, S, N], false), Some("no declaration is critical"));
+        assert_eq!(unfit(&[C, S], true), Some("a critical declaration could not be read"));
+        assert_eq!(unfit(&[], true), Some("a critical declaration could not be read"));
     }
 
     #[test]

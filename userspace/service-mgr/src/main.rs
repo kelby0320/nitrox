@@ -322,19 +322,33 @@ fn send_control(ctrl: u64, op: u8) {
 ///
 /// This is what lets a **test image differ from a release image by data**: the same
 /// `service-mgr` binary reads a file with one more table in it.
-fn load_declarations(root_ns: u64) -> alloc::vec::Vec<ServiceDecl> {
+///
+/// **With whether a critical declaration was skipped**: each skipped one is said here, by name and
+/// reason, since the parser cannot log, and a critical one is a critical server that did not come
+/// up (`bringup::unfit`).
+fn load_declarations(root_ns: u64) -> (alloc::vec::Vec<ServiceDecl>, bool) {
     let read = libfs::read_file(root_ns, b"/system/services.toml").ok();
     let text = match read.and_then(|b| String::from_utf8(b).ok()) {
         Some(t) => t,
         None => {
-            kprint(b"service-mgr: no service declarations found\n");
-            return alloc::vec::Vec::new();
+            kprint(b"service-mgr: no service declarations found at /system/services.toml\n");
+            return (alloc::vec::Vec::new(), false);
         }
     };
-    let mut decls = service_toml::parse_all(&text);
+    let (mut decls, skipped) = service_toml::parse_all_reporting(&text);
+    for s in &skipped {
+        let mut l = Line::new();
+        l.s(b"service-mgr: declaration '").s(s.name.as_bytes()).s(b"' skipped: ");
+        l.s(s.why.describe().as_bytes());
+        if s.critical {
+            l.s(b" -- and it is critical");
+        }
+        l.end();
+    }
+    let skipped_critical = skipped.iter().any(|s| s.critical);
     if decls.is_empty() {
         kprint(b"service-mgr: declaration parse error\n");
-        return decls;
+        return (decls, skipped_critical);
     }
     // More than the wait set can hold: keep the first `MAX_SERVICES` and **say** which
     // were dropped. A silent truncation would read as "everything declared is running".
@@ -359,7 +373,7 @@ fn load_declarations(root_ns: u64) -> alloc::vec::Vec<ServiceDecl> {
             .s(b")")
             .end();
     }
-    decls
+    (decls, skipped_critical)
 }
 
 /// Spawn the service `decl` names (image already resolved), with a fresh control
@@ -771,7 +785,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
             0
         }
     };
-    let decls = load_declarations(root_ns);
+    let (decls, skipped_critical) = load_declarations(root_ns);
     let entries: alloc::vec::Vec<Entry> =
         decls.iter().map(|d| Entry { server: d.endpoint.is_some(), critical: d.critical }).collect();
     let svcs = decls
@@ -807,6 +821,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         halted: false,
         reported: false,
     };
+    // **A file that has lost its critical servers starts nothing** (PR #340 review, finding 2):
+    // with no declarations, or none critical, bring-up would go straight to a login chain with no
+    // `auth-service` behind it, and no critical server would be there to fail.
+    if let Some(why) = bringup::unfit(&m.entries, skipped_critical) {
+        Line::new().s(b"service-mgr: ").s(why.as_bytes()).s(b" -- starting nothing").end();
+        m.ask_for_the_emergency_shell();
+    }
     m.run()
 }
 
@@ -1154,7 +1175,9 @@ impl Mgr {
 
     /// The soonest thing that is due: a server's `Ready` deadline, a restart, an `after`.
     fn next_deadline(&self) -> u64 {
-        let mut d = self.after_until.unwrap_or(u64::MAX);
+        // **Not an `after` once halted**: nothing more starts, so nothing clears it, and a deadline
+        // left in the past would spin this loop (PR #340 review, finding 3).
+        let mut d = if self.halted { u64::MAX } else { self.after_until.unwrap_or(u64::MAX) };
         for s in &self.svcs {
             if let Phase::Starting { deadline } = s.phase {
                 d = d.min(deadline);
@@ -1211,7 +1234,7 @@ impl Mgr {
                         return;
                     }
                     self.started += 1;
-                    self.start(i);
+                    self.start(i, true);
                 }
             }
         }
@@ -1278,7 +1301,7 @@ impl Mgr {
     }
 
     /// Spawn declaration `i`. A server becomes `Starting`, and bring-up waits for its `Ready`.
-    fn start(&mut self, i: usize) {
+    fn start(&mut self, i: usize, bringup: bool) {
         let server = self.svcs[i].decl.endpoint.is_some();
         let (h, ctrl) = spawn_service(self.root_ns, self.registry, &self.svcs[i].decl);
         let s = &mut self.svcs[i];
@@ -1291,7 +1314,9 @@ impl Mgr {
             } else {
                 Phase::Up
             };
-            if server {
+            // **Only bring-up waits** (PR #340 review, finding 3): a restart after boot holds
+            // nothing up, and one during bring-up must not displace the server it is waiting on.
+            if server && bringup {
                 self.awaiting = Some(i);
             }
             if s.ctrl == 0 {
@@ -1301,10 +1326,20 @@ impl Mgr {
                     .s(b"' has no control channel -- its exit cannot be attributed")
                     .end();
             }
-        } else if server {
+        } else if bringup && server {
             // The spawn already said why. A server that is not running did not come up.
             self.awaiting = Some(i);
             self.failed_to_start(i);
+        } else if !bringup {
+            // **A restart that could not spawn is a restart that failed**, and its policy decides
+            // what next — never the bring-up rule, which would ask for the emergency shell with
+            // the terminal server holding the console (PR #340 review, finding 3).
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(self.svcs[i].decl.name.as_bytes())
+                .s(b"' could not be restarted")
+                .end();
+            self.apply_policy(i, Some(-1), Phase::Down);
         }
     }
 
@@ -1462,7 +1497,15 @@ impl Mgr {
         close(s.endpoint);
         s.endpoint = endpoint;
         s.phase = Phase::Up;
-        Line::new().s(b"service-mgr: ").s(name.as_bytes()).s(b" bound at ").s(path.as_bytes()).end();
+        // **Said only when it is so** (PR #340 review, finding 4): a gate reads this line as the
+        // server reachable at its path. Without the root binding it is reachable through the
+        // routes the sessions hold, and not at its path.
+        if s.root_bound {
+            Line::new().s(b"service-mgr: ").s(name.as_bytes()).s(b" bound at ").s(path.as_bytes()).end();
+        } else {
+            let mut l = Line::new();
+            l.s(b"service-mgr: ").s(name.as_bytes()).s(b" is up, unbound at ").s(path.as_bytes()).end();
+        }
         for through in registry::derives(&name) {
             self.derive(i, through);
         }
@@ -1544,6 +1587,14 @@ impl Mgr {
         }
     }
 
+    /// Start nothing more, and ask `init` for the emergency shell over the terminal channel. Only
+    /// ever before the terminal server is up, which is what lets the shell take the console.
+    fn ask_for_the_emergency_shell(&mut self) {
+        self.halted = true;
+        kprint(b"service-mgr: asking init for the emergency shell\n");
+        send_control(self.terminal, TERMINAL_OP_EMERGENCY);
+    }
+
     /// Server `i` did not come up. At bring-up, a critical one stops the boot and asks `init` for
     /// the emergency shell; any other is reported and passed.
     fn failed_to_start(&mut self, i: usize) {
@@ -1555,14 +1606,12 @@ impl Mgr {
         let name = self.svcs[i].decl.name.clone();
         match bringup::failed_at_boot(self.entries[i]) {
             Failed::Emergency => {
-                self.halted = true;
                 Line::new()
                     .s(b"service-mgr: '")
                     .s(name.as_bytes())
-                    .s(b"' is critical and did not come up -- starting nothing more; ")
-                    .s(b"asking init for the emergency shell")
+                    .s(b"' is critical and did not come up -- starting nothing more")
                     .end();
-                send_control(self.terminal, TERMINAL_OP_EMERGENCY);
+                self.ask_for_the_emergency_shell();
             }
             Failed::Continue => {
                 Line::new()
@@ -1611,6 +1660,13 @@ impl Mgr {
                 r.target = 0;
             }
         }
+        self.apply_policy(i, code, was);
+    }
+
+    /// Apply service `i`'s restart policy to an exit with `code` — or to a restart that could not
+    /// spawn, as a failure. `was` is its phase before: one that died starting and will not be
+    /// restarted did not come up.
+    fn apply_policy(&mut self, i: usize, code: Option<i32>, was: Phase) {
         let s = &self.svcs[i];
         let restarting = !s.requested_shutdown
             && should_restart(s.decl.restart.policy, code.unwrap_or(-1))
@@ -1669,13 +1725,10 @@ impl Mgr {
             if self.svcs[i].restart_at.is_some_and(|at| at <= now) {
                 self.svcs[i].restart_at = None;
                 self.svcs[i].attempts += 1;
-                let awaiting = self.awaiting;
-                self.start(i);
-                // A restart after boot does not hold bring-up up; one during it replaces the
-                // attempt bring-up was already waiting on.
-                if awaiting != Some(i) && self.awaiting == Some(i) {
-                    self.awaiting = awaiting;
-                }
+                // A restart is bring-up's only when it is of the server bring-up is waiting on —
+                // one that died starting, and replaces the attempt that did.
+                let bringup = self.awaiting == Some(i);
+                self.start(i, bringup);
             }
             if let Phase::Starting { deadline } = self.svcs[i].phase
                 && deadline <= now
@@ -1760,17 +1813,18 @@ fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
 /// `sys_channel_recv` distinguishes the two empty cases — `WouldBlock` (`-11`) when the
 /// ring is merely empty and the peer is alive, `PeerClosed` (`-13`) when it is empty and
 /// the peer is gone. That difference is what makes a control channel an exit
-/// discriminator; see [`supervise`].
+/// discriminator; see [`Mgr::poll`].
 ///
 /// **A drain, not a single receive**, because a receive that returns `0` has *consumed* a
 /// message: a queued message would otherwise mask the close behind it and be silently
-/// eaten on the way. Today nothing can be queued here — a service's control end is granted
-/// `RECV | WAIT` and no `SEND` (`spawn_service`), so the channel is one-way by capability —
-/// but "the answer is right because the peer holds no send right" is a fact about a
-/// neighbouring function, and this one should not depend on it silently.
+/// eaten on the way. A service that is not a server cannot send here — its control end is
+/// granted `RECV | WAIT` and no `SEND` (`spawn_service`) — but **a server can**, since it sends
+/// its `Meta::Ready` on this channel (administration Part E.1a), and this is where a `Ready` lands
+/// that came after its deadline.
 ///
-/// A message that *is* found is reported rather than dropped: there is no service→manager
-/// control protocol, so its arrival would mean the grant changed.
+/// A message found here is reported, and **every handle it carried is closed** (PR #340 review,
+/// finding 5): a late `Ready` carries the server's endpoint, which nothing binds now, and a server
+/// whose endpoint has closed ends itself — its exit is then attributed here, as any other's.
 fn channel_peer_closed(ch: u64) -> bool {
     loop {
         // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; this is a
@@ -1790,7 +1844,17 @@ fn channel_peer_closed(ch: u64) -> bool {
         if r != 0 {
             return false; // WouldBlock (alive and quiet), or an error we cannot act on
         }
-        kprint(b"service-mgr: unexpected message on a control channel (dropped)\n");
+        // SAFETY: the kernel wrote the count and installed that many handles, ours to close.
+        let count = unsafe { (&raw const RDY_COUNT).read() }.min(8);
+        for k in 0..count {
+            // SAFETY: a handle the kernel just installed in this process.
+            close(unsafe { (&raw const RDY_HANDLES[k]).read() });
+        }
+        Line::new()
+            .s(b"service-mgr: unexpected message on a control channel (dropped, and ")
+            .u(count as u64)
+            .s(b" handle(s) it carried closed)")
+            .end();
     }
 }
 

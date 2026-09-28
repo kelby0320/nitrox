@@ -770,10 +770,10 @@ fn spawn_eshell(root_ns: u64) {
     }
 }
 
-/// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
-/// is init's child; service-mgr's death is a critical fault init must observe). Unlike
-/// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
-/// `ChildExited` for it. Returns the process handle, or a negative error.
+/// Spawn the service manager — the normal boot handoff. Returns the process handle, or a negative
+/// error. [`supervise`] closes the handle at once: `service-mgr`'s death, a critical fault init
+/// must observe, is learned from the **terminal channel** closing (administration Part E.1a),
+/// which names it exactly, where a `ChildExited` names only a pid.
 ///
 /// **`handles[0]` is a handoff channel, not an endpoint.** It carried the fs-server
 /// endpoint directly until a second endpoint (the profile server's) needed to go the same
@@ -950,9 +950,10 @@ fn emergency(notif: u64, root_ns: u64) -> ! {
 /// terminal channel.
 ///
 /// **The terminal channel** (administration Part E.1) carries one request today:
-/// `TERMINAL_OP_EMERGENCY`, sent when a critical server did not come up at boot. The emergency
-/// shell is started then, once; the console is still free, since the critical servers start
-/// before the terminal server.
+/// `TERMINAL_OP_EMERGENCY`, sent when a critical server did not come up at boot, or the
+/// declarations have lost their critical servers and nothing was started. The emergency shell is
+/// started then, once; the console is still free, since the critical servers start before the
+/// terminal server.
 ///
 /// **Its closing is `service-mgr`'s death**, which is attributed exactly, as a control channel
 /// closing is — `KIND_CHILD_EXITED` names a pid, and nothing maps a handle to one. That death is
@@ -1051,7 +1052,7 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
             if len >= 1 && op == TERMINAL_OP_EMERGENCY && !shell_started {
                 Line::new()
                     .s(b"init: service-mgr asks for the emergency shell -- ")
-                    .s(b"a critical server did not come up")
+                    .s(b"the boot cannot go on without what it could not start (it says what above)")
                     .end();
                 // The same verdict a critical-path failure here gives: the boot failed.
                 test_exit(false);

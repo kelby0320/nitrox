@@ -11872,6 +11872,11 @@ fn check_every_service_started(transcript: &[u8]) -> R<()> {
         "registry bind FAIL",
         "service-mgr: no route for",
         "-- sessions will not reach it",
+        // A declaration the parser could not take, a restart that could not spawn, and a file
+        // that lost its critical servers (PR #340 review, findings 2 and 3).
+        "' skipped: ",
+        "' could not be restarted",
+        "-- starting nothing",
     ] {
         if let Some(i) = text.find(pat) {
             let line: String = text[i..].lines().next().unwrap_or(pat).into();
@@ -16852,9 +16857,14 @@ LLVM version: 22.1.2
     /// fails, before anything holds the console. Checked in every image's declarations.
     #[test]
     fn every_critical_server_is_declared_before_the_terminal_server() {
-        let test = format!("{SERVICES_TOML}{BOOT_PROBE_TOML}");
-        let bench = test.replace(BOOT_PROBE_TOML, BENCH_TOML);
-        for (image, text) in [("release", SERVICES_TOML), ("test", &test[..]), ("bench", &bench[..])] {
+        // **What ships, from the one function that builds it** (PR #340 review, finding 7): a copy
+        // assembled here missed `HEARTBEAT_TOML` the day E.1c put it between the two.
+        let images = [
+            ("release", services_toml(BuildMode::Normal)),
+            ("test", services_toml(BuildMode::TestHarness)),
+            ("bench", services_toml(BuildMode::Bench)),
+        ];
+        for (image, text) in &images {
             let decls = declared(text);
             let tty = decls.iter().position(|(n, _)| n == "tty-server").expect("tty-server is declared");
             let critical: Vec<usize> = (0..decls.len()).filter(|&i| decls[i].1).collect();

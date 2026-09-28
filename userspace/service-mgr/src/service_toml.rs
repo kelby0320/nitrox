@@ -287,7 +287,49 @@ fn parse_duration_ns(v: &str) -> Option<u64> {
 /// (it says so in its own doc), and `profile-server` projects only packages' `bin/`.
 /// See the decision log.
 pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
+    parse_all_reporting(text).0
+}
+
+/// A declaration [`parse_all_reporting`] could not take. **The parser cannot log**, so it
+/// carries each one out for the caller to say — a server skipped in silence is a boot that comes
+/// up without it and never says why (PR #340 review, finding 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// The name from its `[service.<name>]` header.
+    pub name: String,
+    /// Why it was not taken.
+    pub why: SkipReason,
+    /// Whether it said `critical = true`. A critical server whose declaration cannot be read is
+    /// one that did not come up.
+    pub critical: bool,
+}
+
+/// Why a declaration was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// It names nothing to run.
+    NoExecutable,
+    /// A declaration of that name came earlier.
+    Duplicate,
+    /// Its `endpoint` is not an absolute path of plain components ([`valid_endpoint`]).
+    BadEndpoint,
+}
+
+impl SkipReason {
+    /// The reason, as a log line says it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SkipReason::NoExecutable => "it has no executable",
+            SkipReason::Duplicate => "a declaration of that name came earlier",
+            SkipReason::BadEndpoint => "its endpoint is not an absolute path of plain components",
+        }
+    }
+}
+
+/// [`parse_all`], and every declaration it skipped, in file order.
+pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
     let mut out: Vec<ServiceDecl> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     let mut name: Option<String> = None;
     let mut executable: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
@@ -305,10 +347,19 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     // there is nothing left to leak into.
     macro_rules! flush {
         () => {
-            if let (Some(n), Some(e)) = (name.take(), executable.take())
-                && !out.iter().any(|d: &ServiceDecl| d.name == n)
-                && !matches!(endpoint, Some(None))
-            {
+            let (n, e) = (name.take(), executable.take());
+            let why = match (&n, &e) {
+                (None, _) => None,
+                (Some(_), None) => Some(SkipReason::NoExecutable),
+                (Some(n), Some(_)) if out.iter().any(|d: &ServiceDecl| &d.name == n) => {
+                    Some(SkipReason::Duplicate)
+                }
+                (Some(_), Some(_)) if matches!(endpoint, Some(None)) => Some(SkipReason::BadEndpoint),
+                _ => None,
+            };
+            if let (Some(n), Some(why)) = (n.clone(), why) {
+                skipped.push(Skipped { name: n, why, critical });
+            } else if let (Some(n), Some(e)) = (n, e) {
                 // The parser cannot log; carry unrecognised names out so the caller does.
                 let (bits, unknown) = parse_syscaps(&syscaps);
                 out.push(ServiceDecl {
@@ -455,7 +506,7 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     }
 
     flush!();
-    out
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -848,6 +899,33 @@ backoff_max = \"2s\"\n";
             assert_eq!(v.len(), 1, "{bad}");
             assert_eq!(v[0].name, "b", "{bad}");
         }
+    }
+
+    /// **Every skipped declaration is reported**, with why and whether it was critical — the
+    /// parser cannot log, and a critical server whose declaration does not read is one that did
+    /// not come up (PR #340 review, finding 2).
+    #[test]
+    fn a_skipped_declaration_is_reported_with_why_and_whether_it_was_critical() {
+        let text = "[service.auth-service]\nexecutable=\"/a\"\nendpoint=\"svc/auth\"\ncritical=true\n\
+                    [service.no-exe]\ndescription=\"x\"\n\
+                    [service.ok]\nexecutable=\"/b\"\n\
+                    [service.log]\nexecutable=\"/c\"\ncritical=true\n\
+                    [service.ok]\nexecutable=\"/d\"\n";
+        let (decls, skipped) = parse_all_reporting(text);
+        let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["ok", "log"]);
+        let s = |name: &str, why, critical| Skipped { name: String::from(name), why, critical };
+        assert_eq!(
+            skipped,
+            [
+                s("auth-service", SkipReason::BadEndpoint, true),
+                s("no-exe", SkipReason::NoExecutable, false),
+                s("ok", SkipReason::Duplicate, false),
+            ]
+        );
+        // `parse_all` is the same parse, without the report.
+        assert_eq!(parse_all(text).len(), 2);
+        assert!(parse_all_reporting("[service.a]\nexecutable=\"/a\"\n").1.is_empty());
     }
 
     #[test]

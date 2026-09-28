@@ -111,8 +111,19 @@ the name the registry binds.
 
 **Since administration Part E.1a.** A server the boot cannot go on without. If it does not come up
 **at boot**, the service manager starts nothing more and asks `init` for the emergency shell. At
-runtime its death is its restart policy's: the terminal server holds the console by then, and the
-emergency shell could not take it. Only `true` is true.
+runtime its death is its restart policy's — and so is a restart of it that cannot even be
+spawned: the terminal server holds the console by then, and the emergency shell could not take it.
+Only `true` is true.
+
+**The file is held to its critical servers too** (PR #340 review). The service manager starts
+nothing, and asks for the emergency shell, when:
+- a declaration that says `critical = true` is skipped — an `endpoint` that does not read, no
+  `executable`, a repeated name — since that is a critical server that did not come up;
+- the file is missing, unreadable, or declares nothing that can be started;
+- no declaration is critical: the critical servers are what the boot cannot go on without, and a
+  file with none has lost them.
+
+Every skipped declaration is logged by name and reason, critical or not.
 
 ### `essential` (optional, boolean; default `false`)
 

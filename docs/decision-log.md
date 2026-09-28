@@ -30622,3 +30622,66 @@ a stop until E.2's `service --stop`, and `service-mgr`'s requested-shutdown path
 
 **E.1 is complete.** The restart through `service-mgr`'s control path, which the plan's E.1 gates
 name, is E.2's `service`.
+
+## 2026-09-28 — Part E.1, reviewed (PR #340): a file can lose the critical servers, and a restart is not bring-up
+
+The review found one blocking problem (docs), two worth fixing and four optional. It confirmed
+three things from the kernel: a route cannot reach past its server, the registry never reaches a
+resolver, and creates and renames still work behind a route. All seven are addressed.
+
+**Blocking — two crate rules files still stated the old handoff contract.**
+- `session-mgr/CLAUDE.md` listed six handoffs, all "forwarding endpoints". E.1b made it seven:
+  items 3–7 are `service-mgr`'s routes, and the storage route is the seventh, on a 10-deep channel.
+  It also said `/storage` was resolved by the supervisor.
+- `desktop-session-mgr/CLAUDE.md` still said the login chain starts before every declaration.
+- That list had already been wrong once, three parts behind (PR #333). This time it was one part
+  behind.
+
+**Worth fixing, 1 — a declarations file could lose the critical servers without an emergency.**
+- With `/system/services.toml` missing, empty or unparseable, bring-up went straight to a login
+  chain with no `auth-service`, and nothing sent `TERMINAL_OP_EMERGENCY`. The same happened if one
+  typo in `auth-service`'s `endpoint` skipped the declaration: its `critical = true` went with it,
+  and the parser could not say so.
+- Before E.1, `init` started both critical servers unconditionally. E.1c made the file editable,
+  so this was reachable by an edit.
+- **Now**, `parse_all_reporting` returns every declaration it skipped: its name, why, and whether
+  it said `critical`. `service-mgr` logs each one.
+- `bringup::unfit` asks for the emergency shell and starts nothing when:
+  - a skipped declaration was critical;
+  - there are no declarations;
+  - none is critical. A file that declares neither critical server has lost them rather than
+    meant it.
+- Both paths were booted and reach the emergency shell with the reason said:
+  - with the file missing: `no declaration could be read -- starting nothing`;
+  - with `auth-service`'s `endpoint` as `svc/auth`: `declaration 'auth-service' skipped: its
+    endpoint is not an absolute path of plain components -- and it is critical`.
+
+**Worth fixing, 2 — a restart that could not spawn was treated as bring-up.**
+- `start` set `awaiting` and applied the bring-up rule to every server spawn, restarts included.
+  The reviewer demonstrated it: a critical `restart-probe` whose restart failed to spawn asked
+  `init` for the emergency shell long after boot, beside a terminal server holding the console.
+- The same branch also displaced the server bring-up was waiting on. And once halted, a pending
+  `after` deadline would have spun the loop.
+- **Now**, `start` takes whether it is a bring-up start: an ordinary start, or a restart of the
+  server bring-up is waiting on. Only bring-up sets `awaiting` or applies the bring-up rule.
+- A restart that cannot spawn goes to `apply_policy`, split out of `reap`, as a failed exit. That
+  schedules the next attempt, or gives up.
+- A halted manager's `next_deadline` ignores `after`.
+- The reviewer's injection, booted again after the fix: `'restart-probe' could not be restarted`,
+  then attempt 2 succeeds, and the boot passes.
+
+**Optional, all taken:**
+- `register` says `bound at` only when the root binding exists, and `is up, unbound at` otherwise.
+- A dropped control-channel message has every handle it carried closed. A late `Ready`'s endpoint
+  used to leak; a server whose endpoint closes ends itself, and its exit is attributed as usual.
+  `channel_peer_closed`'s doc, which said no service can send on that channel, is corrected: a
+  server can.
+- `init`'s comment said it keeps `service-mgr`'s handle. Its death has been learned from the
+  terminal channel since E.1a.
+- `service-manager.md`'s slice-1 table is marked as dated. Its "today" is 2026-07-15's.
+- The critical-order host test builds its strings with `services_toml(mode)`: its own copy had
+  missed `HEARTBEAT_TOML`.
+
+**Also**: `init`'s emergency line says the reason is `service-mgr`'s, printed above it. It
+said "a critical server did not come up", which a lost file is not quite. And test images now
+fail on three new lines: `' skipped: `, `' could not be restarted`, `-- starting nothing`.

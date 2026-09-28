@@ -358,10 +358,10 @@ is what keeps serial the recovery path by construction.
 ## The emergency path
 
 Failure on the critical path — no usable manifest, a mount that will not come up, the profile
-server, or a `critical` server `service-mgr` cannot bring up, which it tells `init` over the
-terminal channel — drops to `eshell`, a minimal interactive shell
-bundled in the initramfs with enough capability to inspect block devices, edit `init.toml`
-and reboot. Recovery from a misconfigured boot does not need a rescue USB.
+server, or a `critical` server `service-mgr` cannot bring up — or a declarations file that has lost
+its critical servers — which it tells `init` over the terminal channel — drops to `eshell`, a
+minimal interactive shell bundled in the initramfs with enough capability to inspect block devices,
+edit `init.toml` and reboot. Recovery from a misconfigured boot does not need a rescue USB.
 
 `eshell` deliberately keeps `kprint` and talks to the raw console device rather than the
 tty server: its whole precondition is that the normal path failed. See
