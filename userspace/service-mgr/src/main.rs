@@ -3,13 +3,15 @@
 //! Spawned by init once critical-path boot is stable, it starts, supervises, and
 //! restarts the system's services. See `docs/architecture/service-manager.md`.
 //!
-//! **The supervision spine:** parse the declarations from the initramfs
-//! (`service_toml`), start **every** service in the file, and on a child's exit apply
-//! *that child's* restart policy + backoff. Each service gets a **control channel**:
-//! service-mgr keeps one end, moves the other to the service at spawn, and can send
-//! lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-requested
-//! shutdown is distinguished from an unexpected exit, so it is *not* restarted even
-//! under `policy = always`.
+//! **The supervision spine:** parse the declarations from `/system/services.toml` on the root
+//! (`service_toml`; the initramfs until administration Part E.1c), start **every** service in
+//! the file, and on a child's exit apply *that child's* restart policy + backoff. Each service
+//! gets a **control channel**: service-mgr keeps one end, moves the other to the service at
+//! spawn, and can send lifecycle commands — a graceful `CTRL_OP_SHUTDOWN`. A
+//! supervisor-requested shutdown is distinguished from an unexpected exit, so it is *not*
+//! restarted even under `policy = always`. **Nothing requests one today**: the 1.1 s demo stop
+//! went with Part E.1a, since it stopped the *first* declared service, `auth-service` by then;
+//! `service --stop` (Part E.2) is the real one.
 //!
 //! That control channel is also how a child's exit is **attributed**: `KIND_CHILD_EXITED`
 //! names a child by pid and nothing maps a process handle to a pid, so the discriminator
@@ -47,8 +49,9 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// per running service was, which capped this at 31.
 ///
 /// Twenty-four. Since administration Part E.1 a release image declares the **nine servers**
-/// `init` used to start, and `heartbeat`; a test image adds seven more. It was twelve while
-/// only the demo and the test clients were declared.
+/// `init` used to start, and nothing else since E.1c took `heartbeat` out of it; a test image
+/// adds `heartbeat` and seven more. It was twelve while only the demo and the test clients were
+/// declared.
 const MAX_SERVICES: usize = 24;
 /// The most `sys_wait` takes at once.
 const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
@@ -305,9 +308,11 @@ fn send_control(ctrl: u64, op: u8) {
     }
 }
 
-/// Read + parse the service declarations. Empty (with a logged reason) if the file is
-/// absent or holds nothing well-formed. Each `executable` is resolved to a `MemoryObject`
-/// at spawn time.
+/// Read + parse the service declarations, **from the root filesystem** at
+/// `/system/services.toml` (administration Part E.1c; the initramfs's `etc/services.toml` until
+/// then). `init` has mounted the root before it spawns this process, and there the file can be
+/// edited. Empty (with a logged reason) if the file is absent or holds nothing well-formed. Each
+/// `executable` is resolved to a `MemoryObject` at spawn time.
 ///
 /// **One file, every service in it.** The schema said each file declares one service and
 /// the manager scans the directory; nothing can enumerate a directory of `.toml` files
@@ -318,7 +323,7 @@ fn send_control(ctrl: u64, op: u8) {
 /// This is what lets a **test image differ from a release image by data**: the same
 /// `service-mgr` binary reads a file with one more table in it.
 fn load_declarations(root_ns: u64) -> alloc::vec::Vec<ServiceDecl> {
-    let read = libfs::read_file(root_ns, b"/initramfs/etc/services.toml").ok();
+    let read = libfs::read_file(root_ns, b"/system/services.toml").ok();
     let text = match read.and_then(|b| String::from_utf8(b).ok()) {
         Some(t) => t,
         None => {

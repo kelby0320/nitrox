@@ -12,7 +12,8 @@ it composes with per-process namespaces and rights.
 
 Status: **implemented, slice 1** (Phase 3), and **projecting a second directory since
 2026-09-04** (M14 Part H): the same server also projects each package's `applications/` at
-`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live.
+`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live. Its manifest has
+been read from the root since administration Part E.1c (2026-09-28; § *Manifest schema*).
 
 **Every bind of the endpoint is scoped, and the first component of the suffix names the
 projection.** `/bin` bound with base `/bin` forwards `bin` and `bin/list`; `/applications` bound
@@ -130,9 +131,11 @@ spawns it via `/bin/heartbeat`.
 
 ## Manifest schema
 
-A profile manifest is TOML, stored in the store (content-addressed like everything
-else) — transitionally in the initramfs for slice 1, per the plan. It lists the
-generation's packages:
+A profile manifest is TOML, meant to be stored in the store (content-addressed like
+everything else). Today the system one is **`/system/profiles/system.toml` on the root
+filesystem** (administration Part E.1c, 2026-09-28) — in the initramfs for slice 1, per the plan,
+until then, where it could not be edited and had no bootstrap reason to be: `init` mounts the root
+before it spawns the profile server. It lists the generation's packages:
 
 ```toml
 # System profile manifest (one generation).
@@ -219,7 +222,7 @@ with a control channel, awaits `Meta::Ready`, binds the endpoint). Profile serve
 | | Slice 1 | Deferred |
 |---|---|---|
 | Profile server RS (resolve-by-probe over `/bin`) | ✅ | `/lib` (needs dynamic linking) |
-| System profile manifest | ✅ (in initramfs, transitional) | manifest in the store |
+| System profile manifest | ✅ (on the root, `/system/profiles/system.toml`, since administration E.1c; the initramfs before) | manifest in the store |
 | init binds `/store` RO + profile server at `/bin` | ✅ | — |
 | Generations | ✅ one static | runtime switch / rollback |
 | Per-user profile overlays | — | ✅ designed; session-mgr |

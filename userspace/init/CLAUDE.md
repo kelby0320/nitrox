@@ -101,7 +101,10 @@ Init reads files from the in-kernel initramfs resource server bound at `/initram
 - `/initramfs/sbin/init` — itself (already running)
 - `/initramfs/sbin/fs-server-*` — filesystem driver binaries
 - `/initramfs/sbin/eshell` — emergency shell
-- `/initramfs/etc/init.toml` — bootstrap manifest
+- `/initramfs/sbin/profile-server` — `/bin` does not exist until it runs
+- `/initramfs/etc/init.toml` — bootstrap manifest, and the only one: the service declarations and
+  the profile manifest are on the root (`/system/services.toml`, `/system/profiles/system.toml`)
+  since administration Part E.1c
 
 Use the namespace handle and `sys_ns_lookup` + `sys_io_submit` (Read opcode) to access these. There's no special initramfs API — it's a regular resource server.
 

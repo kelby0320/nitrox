@@ -21,7 +21,7 @@
 //! the whole reason `fp_gate` was moved out of the demo `parent` in the first place — see
 //! its own doc comment.
 //!
-//! **Started by `service-mgr`** from `/initramfs/etc/services.toml`, which carries a
+//! **Started by `service-mgr`** from `/system/services.toml` on the root, which carries a
 //! `[service.boot-probe]` table only in selftest / test-harness images. It is an ordinary
 //! declared service: a control channel at `rdx`, a LOOKUP-only view of the root namespace
 //! at `rsi`, no syscaps, and `policy = "never"` — start once, do not restart.

@@ -6,7 +6,7 @@ This document specifies the schema of service declaration files read by the serv
 
 ## Location and discovery
 
-Service declarations live in **one file**, read by the service manager at startup. Today that is `/initramfs/etc/services.toml`; it will move into the system profile when profile projection can carry something other than a package's `bin/`.
+Service declarations live in **one file**, read by the service manager at startup: **`/system/services.toml`, on the root filesystem** (administration Part E.1c, 2026-09-28). It was `/initramfs/etc/services.toml` until then, where it could not be edited — the initramfs is a boot archive on the FAT ESP, which nothing writes — and had no bootstrap reason to be: `init` mounts the root before it spawns the service manager. It may move into the system profile when profile projection can carry something other than a package's `bin/`.
 
 **One file holding many services — changed 2026-08-21.** This section previously read: declarations live at `/store/<hash>-system-services/services/*.toml`, projected into `/etc/services/*.toml`, and "the service manager scans this directory at startup". Nothing in Nitrox can enumerate a directory of `.toml` files, so that scan was never implementable:
 

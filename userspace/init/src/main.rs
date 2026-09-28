@@ -1124,7 +1124,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     //
     // The display self-test, the GUI terminal and the two test clients used to be spawned
     // here under `selftest`. They are **service declarations** now (retrofit Part C2), started
-    // by `service-mgr` from `/initramfs/etc/services.toml` — which carries them only in a test
+    // by `service-mgr` from `/system/services.toml` on the root — which carries them only in a test
     // image, so this file is byte-identical in both. Their order is the file's order: `nxterm`
     // before `ui-testclient`, so that the terminal's window exists by the time `ui-testclient`
     // raises its reference windows over it. (Creation order was the stacking until

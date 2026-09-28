@@ -1,7 +1,8 @@
 # Boot Flow
 
 **Status:** Current (last checked 2026-09-28, when administration Part E.1a moved the nine system
-servers from `init` to `service-mgr` (steps 5 and 6); before that 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
+servers from `init` to `service-mgr` (steps 5 and 6), and E.1c their declarations and the profile
+manifest from the initramfs to the root; before that 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -29,7 +30,7 @@ UEFI firmware (OVMF under QEMU)
                           ├─ mount critical path (spawn fs-server per mount)
                           ├─ bind profile-server at /bin
                           └─► service-mgr
-                                ├─ read /initramfs/etc/services.toml
+                                ├─ read /system/services.toml
                                 ├─ auth-service       /svc/auth
                                 ├─ logging-service    /log
                                 ├─ tty-server         /dev/tty
@@ -108,15 +109,22 @@ stick built with the test data a `--selftest` image carries: its kernel, its ini
 with the test packages. `check-storage` boots it. `check-images` holds its first two claims to a
 `--selftest` image; the third is the release stick's alone, since nobody installs from a test one.
 
-The initramfs holds **four programs and two manifests**, and the rule is narrow: a program is
-in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads it),
-`fs-server-ext4` (it *is* the root mount), `eshell` (the recovery path *for a failed mount*),
-and `profile-server` (`/bin` does not exist until it runs). Everything else — the services,
-the coreutils, the display arm, the test programs — lives in the content-addressed store and
-is projected into `/bin`. The list is the same in every build mode, so the boot path a test
-exercises is the boot path that ships. See `tools/xtask/src/main.rs`'s `INITRAMFS_PROGRAMS`,
-which pairs each entry with its reason, and the ceiling that fails the build if the list
-grows.
+The initramfs holds **four programs and one manifest**, `init.toml`, and the rule is narrow: a
+program is in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads
+it), `fs-server-ext4` (it *is* the root mount), `eshell` (the recovery path *for a failed mount*),
+and `profile-server` (`/bin` does not exist until it runs). Everything else — the services, the
+coreutils, the display arm, the test programs — lives in the content-addressed store and is
+projected into `/bin`. The list is the same in every build mode, so the boot path a test exercises
+is the boot path that ships. See `tools/xtask/src/main.rs`'s `INITRAMFS_PROGRAMS`, which pairs each
+entry with its reason, and the ceiling that fails the build if the list grows.
+
+**The service declarations and the profile manifest are on the root** (administration Part E.1c,
+2026-09-28): `/system/services.toml`, which `service-mgr` reads, and `/system/profiles/system.toml`,
+which the profile server reads. Both are read after `init` has mounted the root, so neither had a
+bootstrap reason to be in the boot image, and there they can be edited. `check-images` holds a
+test root to a release one the way it holds the initramfs: they may differ in those two files, the
+test package, and `nxterm` — built with `test-harness` in a test image, to report its rows for
+`check-terminal` — and nothing else.
 
 The second partition rides the same boot disk on purpose: the GPT driver enumerates every
 non-empty entry and binds `/dev/disk/by-partlabel/nitrox-root`, so no separate QEMU drive
@@ -289,7 +297,7 @@ posture*).
 **`init` runs the same code in both images**, bar one namespace binding (retrofit Part C1
 2026-08-21, Part C2 2026-08-24). The demo chain, the display self-test, `nxterm` and the two graphical test
 clients used to be spawned here under `selftest`; they are **service declarations** now,
-started by `service-mgr` from `/initramfs/etc/services.toml`, which carries them only in a
+started by `service-mgr` from `/system/services.toml` on the root, which carries them only in a
 test image. Their order is the file's order, and `after` holds `boot-probe` until the demo
 chain has exited — the sequencing this function used to enforce by running the chain
 synchronously.

@@ -30568,3 +30568,57 @@ the maintainer agreed to one per server the same day**:
 **Two current-behaviour lines E.1a's sweep missed** are fixed here: `device-manager.md` §5 still
 said `init` resolves the info-only endpoint, and `service-mgr`'s own login-chain comment said
 `auth-service` is `init`'s. The sweep had grepped phrasings, and these used others.
+
+## 2026-09-28 — Administration Part E.1c: the declarations on the root, and a root comparison that found a program
+
+**The service declarations and the profile manifest are on the root**: `/system/services.toml`,
+read by `service-mgr`, and `/system/profiles/system.toml`, read by the profile server. Both are
+read after `init` has mounted the root, which is before either process runs. So neither had a
+bootstrap reason to be in the initramfs, and there neither could be edited, since the initramfs is
+a boot archive on the FAT ESP. The initramfs now holds `init.toml` and its four programs (and the
+live image's marker). **An installed disk gets both** without any change to `nxinstall`, which
+copies the whole root tree.
+
+**`check-images` compares the roots.**
+- It already held a test initramfs to a release one. That caught a program differing only if the
+  program was one of the four in the initramfs.
+- It now builds both images, carves each root partition out and compares the trees. Store paths
+  are compared with their hash taken out (`unhashed`), so a package with one differing file
+  compares file by file, rather than as two unrelated directories.
+- A test root may differ in the two files, the test package, and one program (below). Anything else
+  fails, on either side.
+
+**It found a program on its first run.** The detail pass said the roots may differ "in those two
+files and the test packages' store paths, and nothing else". I checked that claim by which files
+each root stages, not by their contents, and repeated it to the maintainer.
+- **`nxterm`, in the coreutils package, is built with `test-harness` in a test-harness image.**
+  That build reports each completed row on the debug console for `check-terminal`. The review of
+  PR #194 kept it out of a release image, and the retrofit plan lists its prints as an accepted
+  residue.
+- So the coreutils package has a different hash in a test image, and every comparison of the
+  roots would have said so. The initramfs comparison never could.
+- **It is allowed by name** (`ROOT_DIVERGENCE_ALLOWED`), as `store/coreutils-0.1.0/bin/nxterm`.
+  Every other file in that package, and every other program on the root, is held byte for byte.
+  Removing the divergence would mean a `check-terminal` that reads the grid some other way, which
+  is not this part's to decide.
+
+**Controls**, each a `check-images` run:
+- a file added to the test root fails as `system/extra: only on the test root`;
+- a byte appended to the test root's `tty-server` fails as
+  `store/system-0.1.0/bin/tty-server: differs`.
+
+A host test covers the rule itself, including a second coreutils program differing, which the
+`nxterm` allowance must not cover.
+
+**`heartbeat` left the release image.** It was Phase 3's demo, and the only declaration a release
+image carried besides the servers. It is now the test package's, built from its own crate beside
+`test-harness`'s bins, and declared only in a test image, before `restart-probe`, where it
+sat before. `check_service_attribution` still leans on it: as the one `always` service running
+the whole boot, it shows a misattributed exit as a restart.
+
+**The 1.1 s demo stop went with E.1a, and was not recorded then.** It sent `CTRL_OP_SHUTDOWN` to
+the *first* declared service, which E.1a made `auth-service`, so it had to go. Nothing requests
+a stop until E.2's `service --stop`, and `service-mgr`'s requested-shutdown path waits for it.
+
+**E.1 is complete.** The restart through `service-mgr`'s control path, which the plan's E.1 gates
+name, is E.2's `service`.

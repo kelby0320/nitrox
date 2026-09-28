@@ -1972,7 +1972,8 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 
 ### The pieces, in dependency order
 
-- [ ] **E.1 — `service-mgr` starts the servers**, in three parts, as C.5 was.
+- [x] **E.1 — `service-mgr` starts the servers**, in three parts, as C.5 was. *(Complete
+      2026-09-28; the restart through `service-mgr`'s control path is E.2's, below.)*
       - **E.1a — `service-mgr`'s loop, its endpoint, and the registry.**
         - `service-mgr` rebuilt around one wait, with every wait a deadline.
         - Its forwarding endpoint, answering `SUBNAMESPACE` into its registry.
@@ -2032,6 +2033,22 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - `/system/services.toml` and `/system/profiles/system.toml`.
         - `heartbeat` leaves the release image.
         - `check-images` gains the root comparison.
+        - *(Landed 2026-09-28.* As written, with one finding: **the roots differ in a program**.
+          The detail pass said a test root may differ from a release one "in those two files and
+          the test packages' store paths, and nothing else", and it checked which *files* each
+          root stages, not their contents. `check-images`' first root comparison found
+          `nxterm`, in the coreutils package, built with `test-harness` in a test-harness image —
+          its row reports for `check-terminal` (PR #194), which the retrofit accepted. The
+          initramfs comparison never saw it, since `nxterm` is not in the initramfs. It is
+          allowed by name, with store paths compared with their hashes taken out so that only
+          `bin/nxterm` may differ in that package; every other program is held byte for byte,
+          the store's included. Controls: a file added to the test root, and a system program
+          altered in it, each fail.
+          - **`heartbeat` is the test package's**, built from its own crate beside
+            `test-harness`'s bins, and declared in a test image only, before `restart-probe`.
+          - **The 1.1 s demo stop went with E.1a**, unrecorded then: it asked the *first*
+            declared service to stop, which E.1a made `auth-service`. Nothing requests a stop
+            until E.2's `service --stop`.)*
       - Gates:
         - **every existing gate**, unchanged in what it asserts, since they are the regression
           suite for the move; the lines that named `init`'s binds name `service-mgr`'s;

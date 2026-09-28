@@ -152,14 +152,17 @@ a self-adjudicating image cannot afterwards be typed at. `test-interactive` coul
 the test image with the device absent — that is what `check-terminal` does — but then it would
 not boot the **release** image, which is its whole justification.
 
-That justification survives the retrofit, and the measurement is `cargo xtask check-images`: of
-the initramfs's seven files, four are byte-identical between the two images, and the three that
-differ are all data: two declaration files and the mount manifest, whose test copy adds two
-`[[bind]]`s. Every program is byte-identical (`sbin/init` differed until Phase 5 Part C.1). The
-kernel differs (`test-harness`),
-and the store carries a package a release image does not. The gates also assert different
-things: `test-qemu` adjudicates the substrate, `test-interactive` drives the path a person
-takes.
+That justification survives the retrofit, and the measurement is `cargo xtask check-images`: of the
+initramfs's five files, four are byte-identical between the two images, and the one that differs is
+data — the mount manifest, whose test copy adds two `[[bind]]`s. The declaration file and the
+profile manifest differ too, **on the root** since administration Part E.1c, which `check-images`
+compares as well: the two roots are identical but for those two files, the test package, and **one
+program — `nxterm`**, built with `test-harness` in a test-harness image so that it reports each
+completed row for `check-terminal` (PR #194). Every other program is byte-identical, the store's as
+well as the initramfs's (`sbin/init` differed until Phase 5 Part C.1); `nxterm` went unseen until
+E.1c, because the initramfs was all that was compared. The kernel differs (`test-harness`), and the
+store carries a package a release image does not. The gates also assert different things:
+`test-qemu` adjudicates the substrate, `test-interactive` drives the path a person takes.
 
 ## The `test-harness` feature
 

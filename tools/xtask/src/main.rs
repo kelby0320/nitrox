@@ -623,7 +623,6 @@ const SYSTEM_SERVICES: &[&str] = &[
     "desktop-shell",
     "auth-service",
     "logging-service",
-    "heartbeat",
     "fs-server-ext4",
     "tty-server",
     // The display arm's two servers. They were initramfs-resident until 2026-08-11 for one
@@ -672,6 +671,17 @@ const TEST_PROGRAMS: &[&str] = &[
     "restart-probe",
 ];
 
+/// The `test` package's programs built from a crate of their own rather than `test-harness`'s:
+/// **`heartbeat`**, Phase 3's demo service, which left the release image with administration
+/// Part E.1c. It was the only declaration a release image carried; a test image keeps it, as the
+/// one `always` service that runs for the whole boot.
+const TEST_CRATE_PROGRAMS: &[&str] = &["heartbeat"];
+
+/// Everything in the `test` package: [`TEST_PROGRAMS`], then [`TEST_CRATE_PROGRAMS`].
+fn test_package() -> Vec<&'static str> {
+    TEST_PROGRAMS.iter().chain(TEST_CRATE_PROGRAMS).copied().collect()
+}
+
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
@@ -683,6 +693,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.stages_test_data() {
         build_userspace_crate("test-harness", TEST_PROGRAMS, None)?;
+        for prog in TEST_CRATE_PROGRAMS {
+            build_userspace_bin(prog, None)?;
+        }
     }
     // **`None` in every mode** (Phase 5 Part C.1), like `session-mgr` below. The last
     // test-only branch in `init` — the `/subtreetest` and `/scratch` binds — is a `[[bind]]` in
@@ -692,7 +705,6 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("fs-server-ext4", None)?;
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
-    build_userspace_bin("heartbeat", None)?;
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
     // a bin per program, so the crate directory is named separately from the bins.
     build_userspace_crate("coreutils", COREUTILS, None)?;
@@ -9032,9 +9044,9 @@ fn check_service_attribution(transcript: &[u8]) -> R<()> {
             .into());
     }
     // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a
-    // misattributed exit shows up as a restart of a service that never stopped. Its
-    // *requested* shutdown is a different line and is expected — this boot runs long
-    // enough to reach it, which `test-qemu` never did.
+    // misattributed exit shows up as a restart of a service that never stopped. Nothing asks
+    // it to stop any more: the 1.1 s demo stop sent `CTRL_OP_SHUTDOWN` to the *first*
+    // declared service, which administration Part E.1a made `auth-service`, and it went.
     if text.contains("service-mgr: restarting 'heartbeat'") {
         return Err("service-mgr restarted 'heartbeat', which never exited — \
              boot-probe's exit was misattributed to it"
@@ -13263,7 +13275,7 @@ fn carve_partition(disk: &Path, n: u32, out: &Path) -> R<()> {
 }
 
 /// One entry of a filesystem tree: a directory, or a file's size and a hash of its bytes.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum TreeEntry {
     Dir,
     File { size: u64, hash: u64 },
@@ -13369,13 +13381,81 @@ fn tree_problems(
 ///
 /// **Everything else must be byte-identical**, and that is the whole claim of the retrofit:
 /// the software under test is the software that ships. Every program is, today.
-const IMAGE_DIVERGENCE_ALLOWED: &[&str] =
-    &["etc/init.toml", "etc/profiles/system.toml", "etc/services.toml"];
+///
+/// **One since administration Part E.1c**, which moved the declarations and the profile manifest
+/// onto the root: `init.toml`, whose test copy adds two binds. The other two are on the root's
+/// list, [`ROOT_DIVERGENCE_ALLOWED`].
+const IMAGE_DIVERGENCE_ALLOWED: &[&str] = &["etc/init.toml"];
+
+/// The root-filesystem files a **test** root is allowed to differ from a **release** root in,
+/// beside the test package's store directory, which only a test root has (administration Part
+/// E.1c). Store paths are compared with their hash taken out ([`unhashed`]):
+/// - **the declarations**, with the test services in them;
+/// - **the profile manifest**, which lists the test package — and the coreutils package by a
+///   different hash, for the next reason;
+/// - **`nxterm`**, the one program built differently: a test-harness image's reports each
+///   completed grid row on the debug console for `check-terminal`, and a release one must not
+///   narrate itself to the kernel log (PR #194 review, finding 3). The initramfs comparison
+///   never saw it, since it is not in the initramfs; this one found it the first time it ran.
+///
+/// **Every other file on the two roots must be byte-identical**, and on a root that means the
+/// system and coreutils packages too — every program a release image runs, where the initramfs
+/// comparison reaches only the four it carries.
+const ROOT_DIVERGENCE_ALLOWED: &[&str] =
+    &["system/services.toml", "system/profiles/system.toml", "store/coreutils-0.1.0/bin/nxterm"];
+
+/// A root path with a store package's hash taken out: `store/<hash>-<name>-<version>/…` becomes
+/// `store/<name>-<version>/…`. A package with one differing file then compares file by file,
+/// rather than as two unrelated directories whose every entry is "only on one root".
+fn unhashed(path: &str) -> String {
+    match path.strip_prefix("store/").and_then(|rest| rest.split_once('-')) {
+        Some((hash, tail)) if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("store/{tail}")
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// Every way a test root departs from a release root that [`ROOT_DIVERGENCE_ALLOWED`] and the test
+/// package at `test_store` (relative, as the trees' paths are) do not account for, named by path
+/// with store hashes taken out.
+fn root_divergence(
+    release: &BTreeMap<String, TreeEntry>,
+    test: &BTreeMap<String, TreeEntry>,
+    test_store: &str,
+) -> Vec<String> {
+    let unhash = |t: &BTreeMap<String, TreeEntry>| -> BTreeMap<String, TreeEntry> {
+        t.iter().map(|(k, v)| (unhashed(k), v.clone())).collect()
+    };
+    let (release, test, test_store) = (unhash(release), unhash(test), unhashed(test_store));
+    let in_test_package =
+        |p: &str| p == test_store || p.strip_prefix(test_store.as_str()).is_some_and(|r| r.starts_with('/'));
+    let mut problems = Vec::new();
+    for (path, entry) in &release {
+        if in_test_package(path) {
+            problems.push(format!("{path}: the test package, on a release root"));
+            continue;
+        }
+        match test.get(path) {
+            None => problems.push(format!("{path}: only on the release root")),
+            Some(e) if e != entry && !ROOT_DIVERGENCE_ALLOWED.contains(&path.as_str()) => {
+                problems.push(format!("{path}: differs"))
+            }
+            Some(_) => {}
+        }
+    }
+    for path in test.keys().filter(|p| !release.contains_key(*p) && !in_test_package(p)) {
+        problems.push(format!("{path}: only on the test root"));
+    }
+    problems
+}
 
 /// `cargo xtask check-images` — a test image may differ from a release image only in **data**.
 ///
-/// Builds both initramfs archives and compares them file by file. A new divergence fails,
-/// which is what makes the retrofit's result a wall rather than a measurement.
+/// Builds both initramfs archives and compares them file by file, and since administration Part
+/// E.1c both root filesystems too, where the declarations and the profile manifest now are and
+/// every program but four ([`root_divergence`]). A new divergence fails, which is what makes the
+/// retrofit's result a wall rather than a measurement.
 ///
 /// **What it actually catches**, stated precisely because the first version of this comment
 /// overstated it (PR #230 review, finding 1): wiring `mode.features()` into a build that does
@@ -13459,6 +13539,38 @@ fn cmd_check_images() -> R<()> {
         r.len(),
         r.len() - differ.len(),
         differ
+    );
+
+    // **And the roots** (administration Part E.1c). The declarations and the profile manifest
+    // live there now, so a test image's data differs on its root rather than in its initramfs —
+    // and the root is where every program but four is, so this is also the comparison that holds
+    // the system and coreutils packages byte for byte.
+    require_tool("debugfs")?;
+    let mut trees = Vec::new();
+    for (mode, name) in [(BuildMode::Normal, "release"), (BuildMode::TestHarness, "test")] {
+        cmd_image(mode)?;
+        let fs_img = dir.join(format!("{name}-root.ext4"));
+        carve_partition(&image_path(), 2, &fs_img)?;
+        trees.push(ext4_tree(&fs_img, &dir.join(format!("{name}-root")))?);
+    }
+    let test_store = store_path_for_all(&test_package(), "test", "0.1.0")?;
+    let test_store = test_store.trim_start_matches('/');
+    let problems = root_divergence(&trees[0], &trees[1], test_store);
+    if !problems.is_empty() {
+        return Err(format!(
+            "a test root and a release root now differ in {problems:?}. A test root may differ in \
+             {ROOT_DIVERGENCE_ALLOWED:?} and the test package ({test_store}), and nothing else: \
+             a program that differs is the divergence `docs/planning/test-path-retrofit.md` \
+             removed, and a new file is a test image carrying something a release one does not. \
+             If it is deliberate data, add it to `ROOT_DIVERGENCE_ALLOWED` with the reason."
+        )
+        .into());
+    }
+    let tested = trees[1].keys().filter(|p| !p.starts_with(test_store)).count();
+    println!(
+        "check-images: {} root entries, identical between a test and a release root but for \
+         {ROOT_DIVERGENCE_ALLOWED:?} and the test package ✓",
+        tested
     );
     Ok(())
 }
@@ -14526,7 +14638,8 @@ path = \"/scratch\"\n\
 source = \"/\"\n\
 subtree = \"/scratch\"\n";
 
-/// The service declarations, read by `service-mgr` from `/initramfs/etc/services.toml`.
+/// The service declarations every image carries, read by `service-mgr` from
+/// `/system/services.toml` on the root — [`services_toml`] adds a test image's.
 ///
 /// **One file, many `[service.<name>]` tables** — the 2026-08-21 change to
 /// `docs/spec/service-toml-schema.md`. It previously said each file declares one service
@@ -14621,7 +14734,15 @@ description = \"The display\"\n\
 endpoint = \"/dev/draw\"\n\
 \n\
 [service.compositor.restart]\n\
-policy = \"never\"\n\
+policy = \"never\"\n";
+
+/// **`heartbeat`, in a test image only** (administration Part E.1c). Phase 3's demo service, and
+/// until then the one declaration a release image carried beyond the servers. A test image keeps
+/// it as a service that runs for the whole boot under `always`, which is what
+/// `check_service_attribution` leans on: a misattributed exit shows up as a restart of it.
+/// Declared before [`BOOT_PROBE_TOML`] — and so before `restart-probe` and the login chain — as it
+/// was when it sat at the end of [`SERVICES_TOML`].
+const HEARTBEAT_TOML: &str = "\
 \n\
 [service.heartbeat]\n\
 executable = \"/bin/heartbeat\"\n\
@@ -14633,6 +14754,66 @@ max_attempts = 3\n\
 backoff = \"exponential\"\n\
 backoff_initial = \"200ms\"\n\
 backoff_max = \"2s\"\n";
+
+/// The declarations file for `mode`, staged at `/system/services.toml` on the root
+/// (administration Part E.1c; it was `/initramfs/etc/services.toml` until then). Its **content**
+/// is what differs between a test image and a release image — see [`BOOT_PROBE_TOML`]. The
+/// programs do not differ.
+fn services_toml(mode: BuildMode) -> String {
+    let mut services = String::from(SERVICES_TOML);
+    if mode.stages_test_data() {
+        services.push_str(HEARTBEAT_TOML);
+        services.push_str(BOOT_PROBE_TOML);
+    }
+    // **`compose-bench` instead of `boot-probe`, not beside it.** `boot-probe` fires the boot
+    // verdict, so anything declared after it never runs; and a measurement wants the screen to
+    // itself, which is why this mode exists at all rather than the bench being one more service
+    // in the harness image.
+    if matches!(mode, BuildMode::Bench) {
+        services = services.replace(BOOT_PROBE_TOML, BENCH_TOML);
+    }
+    services
+}
+
+/// The system profile manifest for `mode`, staged at `/system/profiles/system.toml` on the root
+/// (administration Part E.1c; `/initramfs/etc/profiles/system.toml` until then). The profile
+/// server reads it and projects the listed packages' `bin/` into `/bin`. Generated rather than a
+/// constant because it names store paths, whose hashes are content-derived at build time and must
+/// match the store directories on the same root. See
+/// `docs/architecture/profiles-and-namespace-projection.md`.
+fn system_profile(mode: BuildMode) -> R<String> {
+    let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
+    let cu_store = store_path_for_all(&profile_programs(), "coreutils", "0.1.0")?;
+    let mut system_profile = format!(
+        "# System profile manifest (generation 1).\n\
+         [profile]\n\
+         name = \"system\"\n\
+         generation = 1\n\
+         \n\
+         [[package]]\n\
+         name = \"system\"\n\
+         version = \"0.1.0\"\n\
+         path = \"{sys_store}\"\n\
+         \n\
+         [[package]]\n\
+         name = \"coreutils\"\n\
+         version = \"0.1.0\"\n\
+         path = \"{cu_store}\"\n"
+    );
+    // The test package, in selftest/test-harness builds only. Projected into `/bin` like any
+    // other package, so `service-mgr` spawns `/bin/ui-testclient` by exactly the path it spawns
+    // `/bin/logging-service` by — one mechanism, not a test-only one.
+    if mode.stages_test_data() {
+        let test_store = store_path_for_all(&test_package(), "test", "0.1.0")?;
+        system_profile.push_str(&format!(
+            "\n[[package]]\n\
+             name = \"test\"\n\
+             version = \"0.1.0\"\n\
+             path = \"{test_store}\"\n"
+        ));
+    }
+    Ok(system_profile)
+}
 
 /// The `boot-probe` declaration, **appended to [`SERVICES_TOML`] in selftest and
 /// test-harness images and absent from a release image**.
@@ -15019,20 +15200,11 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
             b"This image may run an installer session when the boot says `install`.\n",
         );
     }
-    // The declarations file. Its **content** is what differs between a test image and a
-    // release image — see `BOOT_PROBE_TOML`. The programs below do not differ.
-    let mut services = String::from(SERVICES_TOML);
-    if mode.stages_test_data() {
-        services.push_str(BOOT_PROBE_TOML);
-    }
-    // **`compose-bench` instead of `boot-probe`, not beside it.** `boot-probe` fires the boot
-    // verdict, so anything declared after it never runs; and a measurement wants the screen to
-    // itself, which is why this mode exists at all rather than the bench being one more service
-    // in the harness image.
-    if matches!(mode, BuildMode::Bench) {
-        services = services.replace(BOOT_PROBE_TOML, BENCH_TOML);
-    }
-    cpio_entry(&mut buf, 2, "etc/services.toml", services.as_bytes());
+    // **The declarations and the profile manifest are not here** (administration Part E.1c): both
+    // are on the root, at `/system/services.toml` and `/system/profiles/system.toml`, read after
+    // `init` has mounted it. Neither has a bootstrap reason, and neither could be edited here —
+    // this is a boot archive on the FAT ESP, which nothing writes.
+    //
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
     // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
     // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.
@@ -15041,7 +15213,7 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     // the initramfs a release boots, so the boot path under test is the boot path that ships.
     // Until 2026-08-11 a test image's was 680 KB against a release's 323 KB, and both carried
     // programs with no bootstrap role at all.
-    let mut ino = 3u32;
+    let mut ino = 2u32;
     for (name, _why) in INITRAMFS_PROGRAMS {
         let elf = userspace_bin_path(name);
         let bytes =
@@ -15049,41 +15221,6 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
         cpio_entry(&mut buf, ino, &format!("sbin/{name}"), &bytes);
         ino += 1;
     }
-    // The system profile manifest — the profile server reads it and projects the listed
-    // packages' `bin/` into `/bin`. Generated (not a static const) because it references
-    // the store path, whose hash is content-derived at build time (must match the ext4
-    // store dir). See `docs/architecture/profiles-and-namespace-projection.md`.
-    let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
-    let cu_store = store_path_for_all(&profile_programs(), "coreutils", "0.1.0")?;
-    let mut system_profile = format!(
-        "# System profile manifest (generation 1).\n\
-         [profile]\n\
-         name = \"system\"\n\
-         generation = 1\n\
-         \n\
-         [[package]]\n\
-         name = \"system\"\n\
-         version = \"0.1.0\"\n\
-         path = \"{sys_store}\"\n\
-         \n\
-         [[package]]\n\
-         name = \"coreutils\"\n\
-         version = \"0.1.0\"\n\
-         path = \"{cu_store}\"\n"
-    );
-    // The test package, in selftest/test-harness builds only. Projected into `/bin` like any
-    // other package, so `service-mgr` spawns `/bin/ui-testclient` by exactly the path it spawns
-    // `/bin/logging-service` by — one mechanism, not a test-only one.
-    if mode.stages_test_data() {
-        let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
-        system_profile.push_str(&format!(
-            "\n[[package]]\n\
-             name = \"test\"\n\
-             version = \"0.1.0\"\n\
-             path = \"{test_store}\"\n"
-        ));
-    }
-    cpio_entry(&mut buf, ino, "etc/profiles/system.toml", system_profile.as_bytes());
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     // The tripwire. Checked before the write so a build that trips it does not leave an image
     // behind that boots and looks fine.
@@ -15553,6 +15690,14 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         staging.join("system").join("current-generation"),
         b"nitrox-rootfs generation 1\n",
     )?;
+    // **The declarations and the profile manifest** (administration Part E.1c): read by
+    // `service-mgr` and the profile server after `init` has mounted this filesystem. The only two
+    // files, beside the test package, in which a test root may differ from a release one
+    // (`ROOT_DIVERGENCE_ALLOWED`), and on the root because they can be edited here — the
+    // initramfs they came from is a boot archive nothing writes.
+    fs::write(staging.join("system").join("services.toml"), services_toml(mode))?;
+    fs::create_dir_all(staging.join("system").join("profiles"))?;
+    fs::write(staging.join("system").join("profiles").join("system.toml"), system_profile(mode)?)?;
     // `system/large.bin` — the slice-8 Part-5 large-file milestone fixture: a file
     // past the old 64 KiB eager cap, spanning several pages, with **position-
     // sensitive** content so init's verifier catches a mis-faulted page. Each byte
@@ -15734,17 +15879,15 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // The `test` package: the guest-side gates and the programs they drive. Absent from a
     // release image — `cmd_build` does not even build them outside selftest modes.
     if mode.stages_test_data() {
-        let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
+        let programs = test_package();
+        let test_store = store_path_for_all(&programs, "test", "0.1.0")?;
         let test_bin = staging.join(test_store.trim_start_matches('/')).join("bin");
         fs::create_dir_all(&test_bin)?;
-        for prog in TEST_PROGRAMS {
+        for prog in &programs {
             fs::copy(userspace_bin_path(prog), test_bin.join(prog))
                 .map_err(|e| format!("stage {prog} into the store: {e}"))?;
         }
-        println!(
-            "xtask: store package {test_store}/bin/ ({} test programs)",
-            TEST_PROGRAMS.len()
-        );
+        println!("xtask: store package {test_store}/bin/ ({} test programs)", programs.len());
     }
 
     // `/system/fonts` — the faces the desktop draws with, and their licence beside them.
@@ -16618,6 +16761,73 @@ LLVM version: 22.1.2
     fn parse_host_returns_none_when_absent() {
         let sample = "rustc 1.95.0\nrelease: 1.95.0\n";
         assert!(parse_host_from_rustc_vv(sample).is_none());
+    }
+
+    /// **A test root may differ in the two data files and its own package, and nothing else**
+    /// (administration Part E.1c) — including the control the plan names: a file added to one
+    /// root, on either side.
+    #[test]
+    fn a_test_root_differs_from_a_release_one_only_where_allowed() {
+        use std::collections::BTreeMap;
+        let file = |n: u64| TreeEntry::File { size: n, hash: n };
+        let pkg = "store/abc-test-0.1.0";
+        let release: BTreeMap<String, TreeEntry> = [
+            ("system", TreeEntry::Dir),
+            ("system/services.toml", file(1)),
+            ("system/profiles/system.toml", file(2)),
+            ("store/def-system-0.1.0/bin/service-mgr", file(3)),
+            ("store/0a1-coreutils-0.1.0/bin/list", file(8)),
+            ("store/0a1-coreutils-0.1.0/bin/nxterm", file(9)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut test: BTreeMap<String, TreeEntry> = [
+            ("system", TreeEntry::Dir),
+            ("system/services.toml", file(10)),
+            ("system/profiles/system.toml", file(20)),
+            ("store/def-system-0.1.0/bin/service-mgr", file(3)),
+            // The same package under another hash, since its `nxterm` is the test-harness build.
+            ("store/fe2-coreutils-0.1.0/bin/list", file(8)),
+            ("store/fe2-coreutils-0.1.0/bin/nxterm", file(90)),
+            (pkg, TreeEntry::Dir),
+            ("store/abc-test-0.1.0/bin/boot-probe", file(4)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(root_divergence(&release, &test, pkg), Vec::<String>::new());
+        // A file added to the test root, outside its package.
+        test.insert("system/extra".into(), file(5));
+        assert_eq!(root_divergence(&release, &test, pkg), ["system/extra: only on the test root"]);
+        test.remove("system/extra");
+        // A program that differs.
+        test.insert("store/def-system-0.1.0/bin/service-mgr".into(), file(6));
+        assert_eq!(root_divergence(&release, &test, pkg), ["store/system-0.1.0/bin/service-mgr: differs"]);
+        test.insert("store/def-system-0.1.0/bin/service-mgr".into(), file(3));
+        // Another program in the package `nxterm` is in, differing too: only `nxterm` may.
+        test.insert("store/fe2-coreutils-0.1.0/bin/list".into(), file(80));
+        assert_eq!(root_divergence(&release, &test, pkg), ["store/coreutils-0.1.0/bin/list: differs"]);
+        test.insert("store/fe2-coreutils-0.1.0/bin/list".into(), file(8));
+        // A file added to the release root, and the test package on a release root.
+        let mut release2 = release;
+        release2.insert("system/extra".into(), file(5));
+        release2.insert("store/abc-test-0.1.0/bin/boot-probe".into(), file(4));
+        let mut got = root_divergence(&release2, &test, pkg);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "store/test-0.1.0/bin/boot-probe: the test package, on a release root",
+                "system/extra: only on the release root",
+            ]
+        );
+        assert_eq!(unhashed("store/0a1-coreutils-0.1.0/bin/x"), "store/coreutils-0.1.0/bin/x");
+        assert_eq!(unhashed("store/not-hex-0.1.0"), "store/not-hex-0.1.0", "no hash to take out");
+        assert_eq!(unhashed("system/users"), "system/users");
+        // A name that only begins like the package is not in it.
+        test.insert("store/abc-test-0.1.0x".into(), file(7));
+        assert_eq!(root_divergence(&release2, &test, pkg).len(), 3);
     }
 
     /// The declarations' names in file order, each with whether it says `critical = true`.

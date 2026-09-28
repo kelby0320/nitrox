@@ -4,7 +4,8 @@
 the service set and performing supervisor-side namespace binding. Verified 2026-08-05; last
 checked 2026-09-28, when it took over starting and binding the servers `init` used to — the
 boundary below, as built at last — through a registry of its own (administration Part E.1a),
-and began handing the sessions its own routes to them (Part E.1b);
+and began handing the sessions its own routes to them (Part E.1b), and reading its declarations
+from the root (Part E.1c);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -86,7 +87,8 @@ boundary is:
 
 ### Several services, and how their exits are told apart
 
-`service-mgr` supervises every declaration in `/initramfs/etc/services.toml`, up to
+`service-mgr` supervises every declaration in `/system/services.toml`, on the root (the
+initramfs's `etc/services.toml` until administration Part E.1c), up to
 `MAX_SERVICES` (24), and applies each one's own restart policy. It says which declarations it
 dropped rather than truncating silently.
 
@@ -416,12 +418,14 @@ Settled in review (2026-07-15):
 
 1. **Slice-A demo service**: a purpose-built trivial **heartbeat** service — a clean,
    controllable restart/backoff demonstration (not a reused image).
-2. **Declaration source**: the **initramfs** — `/initramfs/etc/services.toml`, mirroring
-   `init.toml` — which exercises the real parse path and sidesteps the profile-server
-   bootstrap ordering. **One file holding every service**, revised 2026-08-21 from
-   `/etc/services/*.toml`: a directory of declarations needs enumeration, and neither the
-   initramfs (a CPIO archive the kernel looks up by name) nor `profile-server` (which
-   projects packages' `bin/` only) can do it. See `docs/spec/service-toml-schema.md`.
+2. **Declaration source**: the **initramfs** — `/initramfs/etc/services.toml`, mirroring `init.toml`
+   — which exercises the real parse path and sidesteps the profile-server bootstrap ordering.
+   *(Moved to `/system/services.toml` on the root by administration Part E.1c, 2026-09-28: `init`
+   mounts the root before it spawns `service-mgr`, so the ordering needed no sidestepping, and on
+   the root the file can be edited.)* **One file holding every service**, revised 2026-08-21 from
+   `/etc/services/*.toml`: a directory of declarations needs enumeration, and neither the initramfs
+   (a CPIO archive the kernel looks up by name) nor `profile-server` (which projects packages'
+   `bin/` only) can do it. See `docs/spec/service-toml-schema.md`.
 3. **fs-server ownership**: **stays in init for slice A** (critical path — init must
    reach a mounted root to find service-mgr's declarations); service-mgr owns only
    *additional* services in A. Whether service-mgr re-adopts the root fs-server is a
