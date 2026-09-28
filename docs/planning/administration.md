@@ -1720,9 +1720,21 @@ from "lost at exit" to "lost at power-off unless something syncs it".
     `heartbeat`, Phase 3's demo; a test image declares seven.
   - A declaration cannot say "bind my endpoint at a path", and `spawn_service` does not wait for
     `Meta::Ready`.
-  - It starts the login supervisors itself, outside the declarations.
+  - It starts the login supervisors itself, outside the declarations and before them, and closes
+    their process handles and control channels right after the handoff. So nothing can later ask
+    them to stop.
+  - A declared service's end of its control channel has `RECV` and `WAIT` only, where a server
+    needs `SEND` and `TRANSFER` to send `Meta::Ready`. And its first message is a log handoff,
+    which none of the nine expects.
   - It has no client endpoint, and the one stop it sends is a demo: `CTRL_OP_SHUTDOWN` to the
     first declared service, after 1.1 s.
+- **Only `init` can bind into the root namespace** (found by the PR #339 review). A spawned process
+  only ever gets a lookup-only root handle, whatever syscaps it holds, and binding onto an occupied
+  path is `AlreadyBound`. That is why `init` does the binding today, as its own comments,
+  `service-mgr`'s and this plan's Part A spike each record.
+- **A session binds a server's endpoint object, not its name** (the same review). The login
+  supervisors bind the endpoints they were handed at startup into every session, and keep them
+  for the rest of the boot. A restarted server's new endpoint reaches no session.
 - **No server answers a stop.** Only `heartbeat` reads `CTRL_OP_SHUTDOWN`. None of the nine,
   `profile-server` or `fs-server-ext4` handles `CTRL_OP_SHUTDOWN` or a terminate request.
 - **A login supervisor drops a stop request.** Both wait on their session's leader in
@@ -1769,23 +1781,95 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 - **A graphical session menu — log out, shut down, restart — is Part F's**, the desktop's share.
   Part E builds the mechanism and `shutdown`.
 
+**And two more, after the PR #339 review found the first version's mechanism would not work:**
+
+- **`service-mgr` sits in `init`'s trust tier.** `init` hands it a root handle with the rights
+  `init`'s own has, `BIND` and `UNBIND` included. A spawned process otherwise only ever gets a
+  lookup-only root handle, which is why `init` has done every root binding until now. This is over
+  `service-manager.md`'s *Capability posture*, which gave `service-mgr` bind rights only to the
+  subtrees it manages, and that section changes with E.1.
+- **A restart reaches every session, live ones included.** A session's `/dev/clipboard` is bound at
+  login to the clipboard server's endpoint object, not to a name. A restarted server has a new
+  endpoint, so every session would keep the dead one, and re-resolving would reach it again. So
+  every binding of a server's path is **`service-mgr`'s own endpoint**, and `service-mgr` passes
+  each resolve on to the server that is current (*The registry*, below). This is over refreshing a
+  session's bindings only at its next login.
+
 **Derived from the spike and the calls:**
 
-- **A declaration can describe a server.** `endpoint = "<path>"` makes `service-mgr` wait for
-  `Meta::Ready`, with `init`'s bound, and bind the endpoint at that path in its root namespace. It
-  holds `BIND_NAMESPACE` for exactly this. The rest is keys the schema has:
-  - `syscaps`, for the view broker's and the storage service's `BIND_NAMESPACE`;
-  - `after`, for order beyond the file's.
+- **The registry.** `service-mgr` creates a namespace of its own and binds each server's endpoint
+  there under the server's name.
+  - **Every other binding of a server's path is `service-mgr`'s forwarding endpoint with a base**
+    naming the server. That covers the root's `/log`, `/svc/auth` and `/dev/clipboard`, a
+    session's `/dev/clipboard`, `/dev/tty` and `/dev/views`, and `desktop-shell`'s application
+    namespaces.
+  - A resolve there reaches `service-mgr`, which answers **`SUBNAMESPACE`**: its registry, at the
+    server's name (C.4, as `/storage` works). So the resolve continues into whichever server is
+    bound there now.
+  - **Bases compose.** A session's `/dev/views` is `service-mgr`'s endpoint with the base
+    `/view-broker/s/<session>`, and the broker still sees `s/<session>`.
+  - **A restart unbinds and rebinds in the registry, and nothing else changes.** A program whose
+    channel closed resolves the same path and reaches the new server, in any session. That is the
+    ordinary daemon model: the connection closes, and the client connects again.
+  - **The cost is one hop through `service-mgr`** per resolve on those paths.
+    - `SUBNAMESPACE` continues at most four times. The deepest path today, a session's
+      `/storage/<label>/…`, takes two: `service-mgr`, then the storage service.
+    - An endpoint a server mints on request, such as `device-mgr`'s info endpoint or the storage
+      service's session endpoint, is bound in the registry under a name of its own. A server's
+      restart mints it again.
+- **`service-mgr` never blocks**, since every resolve on those paths now waits on it. Its waits
+  become deadlines in one event loop, as the view broker's held password checks are:
+  - for a server's `Meta::Ready` at bring-up;
+  - for a stopped service's exit;
+  - for the sessions at shutdown.
 
-  Declarations start in file order, and a server's `Ready` is awaited before the next starts. That
-  keeps `init`'s load-bearing orders: `logging-service` first, `device-mgr` before `storage-service`
-  and `input-server`, and `input-server` before the compositor.
-- **`init` hands `service-mgr` two endpoints**, the root filesystem's and the profile server's, not
-  seven. `service-mgr` keeps a copy of each endpoint it binds, and gives the login supervisors
-  theirs. It mints `device-mgr`'s info endpoint itself, as `init` did.
-- **`critical = true` keeps the backstop** for the two servers `init` treats as critical-path,
-  `auth-service` and `logging-service`. If one cannot be brought up within its restart policy,
-  `service-mgr` asks `init` for the emergency shell. That uses the channel `init` now keeps (below).
+  Today it blocks in `await_dependencies`, and in the login chain's handoffs. E.1 rebuilds it
+  around one wait.
+- **`init` hands `service-mgr` the root handle and two endpoints**, the root filesystem's and the
+  profile server's, not seven. The handoff channel then stays open as the terminal channel.
+  `service-mgr` binds the root's server paths to its own endpoint once, at bring-up. It never
+  touches them again, since a restart rebinds in the registry. It binds `/svc/services` itself.
+- **A declaration can describe a server**: `endpoint = "<path>"`, the path in the root. For such a
+  declaration, `service-mgr` does four things:
+  - spawns it with **the control channel `init` gives a server**: `SEND`, `RECV`, `TRANSFER` and
+    `WAIT`. A declared service gets `RECV` and `WAIT` today, and its first message is a log
+    handoff that none of the nine expects. A server resolves its own log, as it does now;
+  - waits for its `Meta::Ready`, to `init`'s bound;
+  - binds the endpoint in the registry;
+  - binds the root path to its own endpoint, the first time only.
+
+  The schema's `syscaps` covers the view broker's and the storage service's `BIND_NAMESPACE`.
+- **In `init`'s order**: `auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the
+  view broker, `device-mgr`, `storage-service`, `input-server`, the compositor. Declarations start
+  in file order, and each server's `Ready` is awaited before the next starts. That keeps the orders
+  `init`'s comments call load-bearing: the broker after the log it audits to, `device-mgr` before
+  the two that take its devices, and `input-server` before the compositor. **`after` is no use
+  here**: it waits for the named service to *exit*, which a server never does.
+- **The login chain starts after the last `endpoint` declaration and before the rest.**
+  - The supervisors need the servers.
+  - The test image's clients must start after the greeter, which is what keeps `check-display`'s
+    reference windows on top (the root `CLAUDE.md`). `check_login_chain`'s timing leans on that
+    order too.
+  - Each supervisor gets three endpoints: the root filesystem's, the profile server's, and
+    `service-mgr`'s. It binds `service-mgr`'s with a base per path, in place of each server's own.
+  - **`service-mgr` keeps the supervisors' process handles and control channels**, where today it
+    closes both after the handoff. Shutdown sends them a terminate request.
+- **`critical = true`, at bring-up only**, for the two servers `init` treats as critical-path,
+  `auth-service` and `logging-service`.
+  - Both start before `tty-server`. So if one cannot be brought up within its restart policy at
+    boot, `service-mgr` asks `init` for the emergency shell over the terminal channel, and the
+    console is still free for it.
+  - **At runtime, a critical server that exhausts its restarts is reported, not an emergency.**
+    `tty-server` holds the console by then, the console allows one reader, and `eshell` and the
+    tty server "never overlap" (`console-and-tty.md`).
+- **`service-mgr`'s own death is no longer recovered by restarting it.**
+  - Every server path in every session goes through its endpoint, so its death takes them all.
+  - A second `service-mgr` would start a second copy of every server.
+  - The emergency shell cannot take a console `tty-server` still holds.
+
+  So `init` reports the death, and the machine needs a restart. `service-mgr/CLAUDE.md` already
+  calls its death a critical fault that a fresh one cannot recover from. Surviving it is left
+  alone.
 - **`essential = true` refuses `--stop` and `--restart`** for a service whose absence would lock
   the administrator out or lose state nothing can rebuild:
   - the view broker, since `with admin service --start` needs it;
@@ -1817,8 +1901,9 @@ from "lost at exit" to "lost at power-off unless something syncs it".
   - `power-endpoint`: `Shutdown { reboot }`. The `power` grant binds it at `/dev/power`.
 
   A new rsproto category, `Services` (`0x11xx`), carries them. A restarted server is bound again
-  at its path. Clients holding the old channel see it close, and re-resolving is theirs:
-  `clip` resolves `/dev/clipboard` on every run, and the compositor's windows do not survive.
+  in the registry, so every path reaches it. Clients holding the old channel see it close, and
+  reconnecting is theirs: `clip` resolves `/dev/clipboard` on every run, and the compositor's
+  windows do not survive.
 - **`service`, a coreutil**:
   - `--list`: `Table<{name, state, restarts}>`, where state is `running`, `stopped`, `failed` or
     `starting`;
@@ -1842,6 +1927,9 @@ from "lost at exit" to "lost at power-off unless something syncs it".
     the i8042's reset pulse, and a triple fault.
   - **No AML**: power-off through S5 stays deferred with ACPICA. The laptop stays on showing the
     message until its button is held.
+  - **Outside the async-first rule, deliberately.** A blocking operation hands back a
+    `PendingOperation`, but `sys_power` never returns, so there is nothing to hand back. Its flush
+    waits in the kernel, bounded.
 - **FADT is parsed** for three things: its flags, the reset register and value, and the RTC century
   register. The hardware report prints them, so the laptop's report says whether it can reset by
   register, and the RTC uses the century register when there is one.
@@ -1853,6 +1941,8 @@ from "lost at exit" to "lost at power-off unless something syncs it".
     declaration gains it, and `service-mgr`, which `init` now grants it, passes it on.
   - `date --set` takes ISO 8601 in UTC (`2026-09-28T14:30:00Z`), with the inverse of
     `libtime::civil_from_days` added.
+  - **`clock.rs` promises that `CLOCK_REALTIME` "cannot jump backwards"**, and a set breaks that:
+    it steps the clock. `CLOCK_MONOTONIC` keeps the promise, and `clock.rs` says so when E.5 lands.
 - **The log.**
   - `logging-service` gains a **read endpoint**, minted by resolving `read-endpoint` from the root
     namespace, which answers `Read { after_sequence, max }` with records.
@@ -1866,10 +1956,10 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 1. `alice` types `with power shutdown`. The policy asks no password for `power`. The broker builds
    the view, binding `service-mgr`'s power endpoint at `/dev/power`, and `shutdown` sends
    `Shutdown { reboot: false }` there. The broker records it.
-2. **Sessions.** `service-mgr` sends a terminate request to both login supervisors. Each forwards it
-   to its leader, `nxsh` or `desktop-shell`, and closes the session at the broker, which asks the
-   session's programs to stop. Each waits a bounded time for its leader and exits. `service-mgr`
-   waits for both, bounded.
+2. **Sessions.** `service-mgr` sends a terminate request to both login supervisors, on the process
+   handles it now keeps. Each forwards it to its leader, `nxsh` or `desktop-shell`, and closes the
+   session at the broker, which asks the session's programs to stop. Each waits a bounded time for
+   its leader and exits. `service-mgr` waits for both, as a deadline in its loop.
 3. **Services, last started first.** `service-mgr` sends `CTRL_OP_SHUTDOWN` to each, and waits a
    bounded time for each. The storage service unmounts everything it mounted on the way out. A
    service still running past its bound is noted, and the sequence goes on.
@@ -1883,19 +1973,33 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 
 ### The pieces, in dependency order
 
-- [ ] **E.1 — `service-mgr` starts the servers.**
-      - The declaration keys: `endpoint`, `critical` and `essential`.
-      - The nine servers move from `init` into declarations. `init` keeps its mounts, the profile
-        server, `service-mgr` and the emergency shell.
-      - The handoff shrinks to two endpoints, and the channel stays open as the terminal channel.
-      - The declarations and the profile manifest move to `/system`, and `heartbeat` leaves the
-        release image.
-      - `check-images` gains the root comparison.
+- [ ] **E.1 — `service-mgr` starts the servers**, in three parts, as C.5 was.
+      - **E.1a — `service-mgr`'s loop, its endpoint, and the registry.**
+        - `service-mgr` rebuilt around one wait, with every wait a deadline.
+        - Its forwarding endpoint, answering `SUBNAMESPACE` into its registry.
+        - The root handle and the two endpoints from `init`, and the terminal channel.
+        - The declaration keys `endpoint`, `critical` and `essential`.
+        - The nine servers move into declarations, in `init`'s order, each bound in the registry
+          and at its root path through `service-mgr`'s endpoint. `init` keeps its mounts, the
+          profile server, `service-mgr` and the emergency shell, and no longer restarts
+          `service-mgr`.
+        - The sessions keep their bindings for now, so nothing a session sees changes yet.
+      - **E.1b — sessions through `service-mgr`.**
+        - The login chain starts after the last server, and `service-mgr` keeps its handles.
+        - Both supervisors, and `desktop-shell`'s application namespaces, bind `service-mgr`'s
+          endpoint with a base per path, in place of each server's own.
+      - **E.1c — the declarations on root.**
+        - `/system/services.toml` and `/system/profiles/system.toml`.
+        - `heartbeat` leaves the release image.
+        - `check-images` gains the root comparison.
       - Gates:
-        - every existing gate unchanged in what it asserts, since they are the regression suite for
-          the move; the lines that named `init`'s binds name `service-mgr`'s;
-        - `boot-probe` checks each server is bound at its path, with `init`'s log naming only its
-          mounts, `/bin` and `service-mgr`;
+        - **every existing gate**, unchanged in what it asserts, since they are the regression
+          suite for the move; the lines that named `init`'s binds name `service-mgr`'s;
+        - `boot-probe` checks each server is reached at its root path, with `init`'s log naming only
+          its mounts, `/bin` and `service-mgr`;
+        - **`boot-probe` restarts a server through `service-mgr`'s control path and resolves its
+          path again**, in the root and in a namespace built as a supervisor builds one, and
+          reaches the new server;
         - `check-images`, including a control that adds a file to one root.
 - [ ] **E.2 — `service`.**
       - `/svc/services` and its three endpoints, with `List`, `Start`, `Stop` and `Restart`
@@ -1907,7 +2011,8 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - `boot-probe`: `List`; `clipboard-server` stopped, started and restarted through the admin
           endpoint; an essential stop refused;
         - `test-interactive`: `service --list`, then `with admin service --restart
-          clipboard-server`, after which `clip` still copies and pastes.
+          clipboard-server`, after which `clip` still copies and pastes **in the same session**,
+          through the registry.
 - [ ] **E.3 — the kernel: the system-control object, FADT, and the power op.**
       - The object in `init`'s boot grant.
       - `sys_power`: flush, stop, then the message or the reset chain.
@@ -1950,16 +2055,30 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - `test-interactive`: `with admin log view-broker` shows an audit record an earlier step
           wrote, and `log` without the grant names it.
 - [ ] **Docs.**
-      - `service-manager.md`: the boundary as built, the declaration keys, the endpoints and the
-        shutdown.
+      - `service-manager.md`: the boundary as built, the declaration keys, the registry, the
+        endpoints and the shutdown; and its *Capability posture*, which gives `service-mgr` bind
+        rights to the whole root now (the maintainer's call).
       - `service-toml-schema.md`; `rsproto-services-ops.md`, new; `logging.md`'s read op. <!-- check-docs: allow-missing -->
-      - `boot-flow.md` and `init/CLAUDE.md`: what `init` starts.
+      - `boot-flow.md` and `init/CLAUDE.md`: what `init` starts. `boot-flow.md` also says "only
+        `init` can bind into the root namespace", which stops being true.
+      - **Every current-behaviour doc that names `init` as a moving server's spawner or binder**,
+        listed by the PR #339 review and a sweep after it:
+        - `session-and-auth.md` § *Credential validation*;
+        - `graphical-session.md`, and its process tree;
+        - `console-and-tty.md`'s handoff chain;
+        - `namespace-and-resource-servers.md`, on `/svc/devices` and its info endpoint;
+        - `device-manager.md` and `storage.md`;
+        - `rsproto-devices-ops.md`, `rsproto-storage-ops.md`, `rsproto-tty-ops.md`,
+          `rsproto-surface-ops.md` and `rsproto-views-ops.md`;
+        - `theme-toml-schema.md`, on the compositor;
+        - `userspace/CLAUDE.md`'s *Capability discipline*, and `auth-service/CLAUDE.md`.
+      - `clock.rs` and its doc: `CLOCK_REALTIME` can now step; `CLOCK_MONOTONIC` cannot.
       - `views-toml-schema.md`: the four grants.
       - `shell-language.md` §10d: `service`, `shutdown`, `date --set` and `log`.
       - The root `CLAUDE.md`: `check-shutdown`.
 
-**E.1 comes first**, since every later piece stands on `service-mgr` owning the services. **E.3
-comes before E.4**, and E.5 and E.6 can go anywhere after E.1.
+**E.1 comes first**, a before b before c, since every later piece stands on `service-mgr` owning
+the services. **E.3 comes before E.4**, and E.5 and E.6 can go anywhere after E.1.
 
 ### What to compare on the day
 
@@ -1973,9 +2092,11 @@ comes before E.4**, and E.5 and E.6 can go anywhere after E.1.
 - **The gates that wait on `init`'s bind lines** — `test-interactive`'s `init: device-mgr bound at
   /svc/devices`, and a display gate's `init: auth-service bound at /svc/auth` — wait on
   `service-mgr`'s.
-- **Parts A–C's docs name `init` as the binder** of the broker, the device manager and the storage
-  service: `userspace/CLAUDE.md`'s *Capability discipline*, `rsproto-views-ops.md`,
-  `device-manager.md` and `storage.md`. Each says `service-mgr`.
+- **Parts A–C's docs, and older ones, name `init` as the spawner or binder** of the servers that
+  move. The *Docs* box above lists each, as the PR #339 review and a sweep after it found them.
+  Each says `service-mgr`.
+- **`desktop-shell`'s couriered endpoints** — the extras it binds into application namespaces —
+  become `service-mgr`'s one endpoint with a base per path, as the supervisors' do.
 - **`TODO(svc-auth-ungated)` is unchanged in substance**: the binder is `service-mgr`, and the
   boundary is still the root namespace.
 - **Part G's installer** writes `/system/services.toml` and the profile manifest with the root it
@@ -1989,7 +2110,11 @@ comes before E.4**, and E.5 and E.6 can go anywhere after E.1.
 - **The session menu**: Part F.
 - **Enabling and disabling a service persistently.** With `/system/services.toml` on root this is a
   small edit, and still nothing wants it.
-- **Clients that reconnect** to a restarted server.
+- **Clients that reconnect** to a restarted server. The registry means reconnecting works: a
+  program resolves the same path and reaches the new server. Doing it is each client's.
+- **Surviving `service-mgr`'s death.** A new `service-mgr` could inherit its predecessor's endpoint
+  if `init` kept a duplicate of it. But a resolve the dead one had taken and not answered would
+  then never be answered, since forwarded resolves have no deadline.
 - **The kernel's log** (`/dev/log`) beside the service log: two rings, as `logging.md` describes.
 - **Timezones, and network time.**
 

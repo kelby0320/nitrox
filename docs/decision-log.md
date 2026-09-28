@@ -30371,3 +30371,65 @@ which E.5's reboot check of the clock's write-back depends. It is the first thin
 
 **Two stale markers from Part D, corrected here**: the plan's Status line still said Part D was
 "detailed", and the *Parts* list had its box unticked. Both now say it was completed 2026-09-25.
+
+## 2026-09-28 — Part E's detail pass, reviewed (PR #339): `service-mgr` in `init`'s trust tier, and a registry
+
+The review found two blocking problems, five worth fixing and two optional, all in the plan. The
+spike's claims checked out against the source. **Two mechanisms did not work as written.**
+
+**Blocking, and each needed the maintainer:**
+- **`service-mgr` cannot bind into the root namespace.**
+  - `sys_ns_bind` needs `Rights::BIND` on the namespace handle, as well as the syscap.
+  - A spawned process only ever gets a lookup-only root handle, and only `init` holds one that
+    binds.
+  - A bind onto an occupied path is `AlreadyBound`, so a restart would need `UNBIND` too.
+  - E.1 as written would have bound nothing, and every boot would have dropped to the emergency
+    shell.
+
+  **The maintainer's call: `service-mgr` sits in `init`'s trust tier**, and `init` hands it a root
+  handle with `init`'s own rights. `service-manager.md`'s *Capability posture*, which gave it bind
+  rights only to its own subtrees, changes with E.1.
+- **A restarted server reached no session.** A session binds a server's endpoint object at login,
+  not its name, and the supervisors keep those copies for the boot. So after a restart, re-resolving
+  in a session reaches the dead server. That holds for a crash-restart as much as for `service
+  --restart`, so it is intrinsic to supervising servers, not to the command. **The maintainer's
+  call, after asking what the issue was: a restart reaches every session.**
+  - It is the ordinary daemon model once one level is fixed. A client's own connection closing is
+    the notification, and connecting again is the client's. What must not break is the path.
+  - So **every binding of a server's path is `service-mgr`'s own endpoint with a base**, and
+    `service-mgr` answers each resolve with `SUBNAMESPACE` into a namespace of its own — the
+    *registry* — where each server is bound, and where a restart rebinds. `/storage` already
+    works this way.
+  - The cost is one hop through `service-mgr` per resolve on those paths. So **`service-mgr` never
+    blocks**: its waits become deadlines in one event loop.
+
+**Worth fixing, each fixed in the pass:**
+- **The login chain is placed**: after the last server and before the other declarations. The
+  supervisors need the servers, and the test clients must still start after the greeter.
+- **`critical` is limited to bring-up.** At runtime `tty-server` holds the console, which allows one
+  reader, so an emergency shell could not take a key. And **`init` no longer restarts
+  `service-mgr`**: under the registry its death takes every server path in every session, a second
+  one would start a second copy of every server, and the emergency shell cannot take the console.
+- **Two facts the spike missed are in it now**:
+  - `service-mgr` closes the login supervisors' handles after the handoff, and shutdown needs them;
+  - a declared service's control end cannot send `Meta::Ready`, and its first message is a log
+    handoff no server expects. An `endpoint` declaration gets `init`'s channel shape and no
+    handoff.
+- **`after` waits for a service to exit**, so it is no use for a server's order. The order is
+  `init`'s own, `auth-service` first, where the pass had written "`logging-service` first".
+- **The docs list** gains every current-behaviour doc that names `init` as a moving server's
+  spawner or binder. There are eleven more than the pass had. The reviewer listed eight, and a
+  sweep found three besides: `theme-toml-schema.md`, `namespace-and-resource-servers.md`, and
+  `boot-flow.md`'s "only `init` can bind into the root namespace".
+
+**Optional, both taken:** `clock.rs`'s promise that `CLOCK_REALTIME` cannot jump backwards is named
+for E.5; and `sys_power`'s in-kernel flush is marked outside the async-first rule, since it never
+returns.
+
+**E.1 is now three parts**, as C.5 was:
+- a: the loop, the registry and the servers;
+- b: the sessions through `service-mgr`;
+- c: the declarations on root.
+
+E.2's `clip` gate, which the review showed could not pass, stands again: through the registry, a
+restart does reach the same session.
