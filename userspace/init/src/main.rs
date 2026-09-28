@@ -957,7 +957,7 @@ fn emergency(notif: u64, root_ns: u64) -> ! {
 /// **Its closing is `service-mgr`'s death**, which is attributed exactly, as a control channel
 /// closing is — `KIND_CHILD_EXITED` names a pid, and nothing maps a handle to one. That death is
 /// **reported, and not answered with a restart**, which `init` did until E.1. Every server path, in
-/// every session, now goes through `service-mgr`'s endpoint, so its death takes them all; a second
+/// every session, now goes through `service-mgr`'s routes, so its death takes them all; a second
 /// one would start a second copy of every server; and the emergency shell cannot take a console
 /// the terminal server still holds. So the machine needs a restart.
 fn reap_loop(notif: u64, root_ns: u64) -> ! {

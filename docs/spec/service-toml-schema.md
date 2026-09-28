@@ -96,13 +96,13 @@ path in the root namespace. An absolute path with no empty, `.` or `..` componen
 visible ASCII; a declaration whose `endpoint` does not read is **skipped whole**, rather than
 started as a server nothing can reach.
 
-For a server, the service manager spawns it with a control channel it can send on — `SEND`,
-`RECV`, `TRANSFER` and `WAIT` — and **no log handoff**, since a server resolves its own log. It
-waits for the server's `Meta::Ready`, within 30 s, and binds the endpoint in its **registry** under
-the service's name, and the path to its own endpoint with `/<name>` as the base
-(`docs/architecture/service-manager.md` § *Servers, and the registry*). So a restart reaches every
-binding of the path. The next declaration does not start until the server is ready, or has failed
-to be.
+For a server, the service manager spawns it with a control channel it can send on — `SEND`, `RECV`,
+`TRANSFER` and `WAIT` — and **no log handoff**, since a server resolves its own log. It waits for
+the server's `Meta::Ready`, within 30 s, and binds the endpoint in its **registry** under the
+service's name, and the path to the server's **route**, an endpoint of its own that continues every
+resolve there (`docs/architecture/service-manager.md` § *Servers, and the registry*). So a restart
+reaches every binding of the path, a session's included. The next declaration does not start until
+the server is ready, or has failed to be.
 
 The service's name must then be 1 to 32 bytes of lowercase letters, digits and `-`, since it is
 the name the registry binds.

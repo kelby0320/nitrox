@@ -1,7 +1,8 @@
 # Storage
 
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
-`service-mgr` since Part E.1a; last checked 2026-09-28.**
+`service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
+since Part E.1b; last checked 2026-09-28.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -169,15 +170,18 @@ lacked `TRANSFER`.
 
 **Sessions reach the service through an endpoint of their own**, as they reach the device manager.
 Resolving `/svc/storage/session-endpoint` on the root endpoint mints a forwarding endpoint, and on
-it the service answers `info…` and `fs…` and nothing else. C.6's login supervisors will bind it
-twice into every session:
+it the service answers `info…` and `fs…` and nothing else. `service-mgr` resolves one each time
+the service comes up, binds it in its registry, and hands the login supervisors a **route** to it
+(administration Part E.1b; the supervisors resolved one each until then). They bind that twice
+into every session:
 - at `/storage` with the base `/fs`, so `/storage/<label>/…` is the filesystem;
 - at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table.
 
 **The endpoint, not the base, is the boundary.** A holder with `BIND_NAMESPACE` could bind it with
 no base, and on the root endpoint that would let it resolve `session-endpoint` and mint more. On a
-session endpoint that suffix is `NotFound`, however it is bound. Four session endpoints can exist
-at once: one for each login supervisor, and headroom.
+session endpoint that suffix is `NotFound`, however it is bound, and the route in front of it
+reaches that endpoint and nothing else. Four session endpoints can exist at once; since Part E.1b
+`service-mgr`'s is the only one, the rest headroom.
 
 ## 8. Mounting and unmounting by request
 

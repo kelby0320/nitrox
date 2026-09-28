@@ -2007,6 +2007,27 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - The login chain starts after the last server, and `service-mgr` keeps its handles.
         - Both supervisors, and `desktop-shell`'s application namespaces, bind `service-mgr`'s
           endpoint with a base per path, in place of each server's own.
+        - *(Landed 2026-09-28.* **Not one endpoint with a base per path, but one endpoint per
+          server** — a *route* — the maintainer agreeing the same day. A single endpoint handed
+          to `desktop-shell`, which holds `BIND_NAMESPACE`, could be bound at any base, and
+          would reach `/auth-service/admin` or `/device-mgr/input` from an application; E.1a's
+          root used one, safely, since nothing hands a root binding out. So:
+          - every server's root path, and every session's and application's binding of it, is
+            that server's route, the same object;
+          - the device manager's `info-endpoint` and the storage service's `session-endpoint`
+            each get a route of their own, re-derived by `service-mgr` each time the server
+            comes up (`registry::DERIVED`), and the supervisors are handed the storage one
+            rather than resolving it;
+          - `service-mgr`'s wait holds the routes and the servers still starting, not every
+            running service, to stay inside the kernel's 32 handles.
+
+          **The gate** is a copy of the root made before `restart-probe` restarts, which holds
+          the same binding and is never rebound: it must reach the new instance too. A control
+          that rebinds the root to the server's own endpoint on each start passes the root half
+          and fails this one. **What no gate reaches**: a restart of a server behind a derived
+          route. Both are `essential`, with policy `never`, so the re-derivation waits for one of
+          them to have a policy; and a live session reaching a restarted server end to end is
+          E.2's `clip` gate, since nothing restarts a session's server before `service`.)*
       - **E.1c — the declarations on root.**
         - `/system/services.toml` and `/system/profiles/system.toml`.
         - `heartbeat` leaves the release image.

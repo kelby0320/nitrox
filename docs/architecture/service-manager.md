@@ -3,7 +3,8 @@
 **Status:** Implemented (Phase 3) — `userspace/service-mgr`, spawned by `init`, supervising
 the service set and performing supervisor-side namespace binding. Verified 2026-08-05; last
 checked 2026-09-28, when it took over starting and binding the servers `init` used to — the
-boundary below, as built at last — through a registry of its own (administration Part E.1a);
+boundary below, as built at last — through a registry of its own (administration Part E.1a),
+and began handing the sessions its own routes to them (Part E.1b);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -94,8 +95,9 @@ dropped rather than truncating silently.
 so a supervisor with two children would learn *that* one exited and never *which*
 (`TODO(child-exit-attribution)` in [deferred-decisions](../rationale/deferred-decisions.md)).
 Each service instead gets its own control channel; when the child dies its end is destroyed,
-the kernel signals the survivor on the same path `sys_wait` uses, and a non-blocking
-`sys_channel_recv` on the handle that woke answers `PeerClosed` rather than `WouldBlock`. A
+and a non-blocking `sys_channel_recv` on the survivor answers `PeerClosed` rather than
+`WouldBlock`. Each pass tries every running service's channel, and the death's `ChildExited`
+is what wakes the pass (since Part E.1b; the channels themselves were waited on before). A
 handle cannot be recycled under its holder the way a pid can, so this is exact.
 
 The exit **code** is still taken from the notification queue in arrival order, since it
@@ -149,23 +151,44 @@ from the **initramfs**.
 
 ### Servers, and the registry
 
-*(Administration Part E.1a, 2026-09-28.)*
+*(Administration Parts E.1a and E.1b, 2026-09-28.)*
 
 **A declaration can describe a server.** `endpoint = "<path>"` names the path in the root the
 server is reached at (`service-toml-schema.md`). For such a declaration, `service-mgr`:
 - spawns it with the control channel `init` gave a server — `SEND`, `RECV`, `TRANSFER` and `WAIT`,
   and no log handoff, since a server resolves its own log;
 - waits for its `Meta::Ready`, within 30 s;
-- binds the endpoint in **its registry**, a namespace of its own, under the server's name;
-- and, the first time only, binds the root path to **its own endpoint**, with `/<name>` as the
-  base.
+- binds the endpoint in **its registry**, a namespace of its own, at `/<name>`;
+- and, the first time only, binds the root path to the server's **route**: an endpoint of
+  `service-mgr`'s own, made for that server and kept for the boot.
 
-A resolve on that path reaches `service-mgr` first, with the server's name at the front of the
-suffix. It answers `SUBNAMESPACE` into its registry, at `/<name>`, and the resolve continues into
-whichever server is bound there now — as `/storage` works. **A restart rebinds in the registry and
-nowhere else**, so every binding of the path reaches the new server, and a program whose
-connection closed resolves the same path and reaches it. A path whose server is not up answers
-`NotFound`.
+A resolve on that path reaches `service-mgr` first, on the route. It answers `SUBNAMESPACE` into
+its registry at `/<name>`, the whole suffix continuing, and the resolve goes on into whichever
+server is bound there now — as `/storage` works. **A restart rebinds in the registry and nowhere
+else**, so every binding of the path reaches the new server, and a program whose connection closed
+resolves the same path and reaches it. A route whose server is not up answers `NotFound`.
+
+**The sessions bind the same routes** (Part E.1b). The login supervisors are handed a duplicate of
+the route to each server a session binds — the terminal server, the clipboard, the view broker,
+the compositor — never the server's own endpoint, so a session built before a restart reaches the
+new server too; `desktop-shell` passes the same handles into every application. `boot-probe`
+proves it with a copy of the root made before a restart, which holds the same binding and is never
+rebound.
+
+**One route reaches one server.** Part E.1a bound every root path to a single endpoint, with the
+server's name as the base, and routed on the suffix. That could not be handed to a session:
+`desktop-shell` holds what it is handed with `BIND_NAMESPACE`, and could have bound it with any
+base — `/auth-service/admin`, `/device-mgr/input`. A route per server is attenuation by
+construction, like the device manager's info-only endpoint.
+
+**Two servers mint an endpoint for sessions**, narrower than their root one, and each gets a
+route of its own (`service_mgr::registry::DERIVED`): the device manager's `info-endpoint`, which
+answers its tables and never a class, and the storage service's `session-endpoint`, which answers
+the filesystems and never an admin endpoint. Each time one comes up, `service-mgr` resolves it in
+the registry — answering resolves while it waits — and binds what it gets at `/<name>.<suffix>`,
+a place no server's name can take. The supervisors are handed the route to it, and resolved the
+storage one themselves until Part E.1b. **No restart reaches either today**: both are `essential`,
+and every server's policy is `never`; the re-derivation is written for when one has a policy.
 
 **Declarations start in file order, each server's `Ready` awaited before the next**, which keeps
 the orders `init` relied on: the broker after the log it audits to, the device manager before the
@@ -177,10 +200,16 @@ supervisors' process handles and control channels, which shutdown will use.
 **`service-mgr` never blocks on anything that can wait on it.** Every resolve on a server's path
 waits on it, so a blocking wait for a server that is itself resolving one — the broker opens its
 log at startup — would be two processes waiting on each other. So a server's `Ready`, a restart's
-backoff and an `after` are deadlines in its one wait, and resolves are answered on every pass.
-The lookups it does make wait on the root filesystem, the profile server and servers already
-serving, none of which waits on it. Its endpoint's ring is 64 deep, since a full one answers a
-resolve `WouldBlock` at once.
+backoff and an `after` are deadlines in its one wait, and resolves are answered on every pass, as
+they are while it waits for an exit code or a derived endpoint. The lookups it does make outright
+wait on the root filesystem, the profile server and servers already serving, none of which waits
+on it. Each route's ring is 64 deep, since a full one answers a resolve `WouldBlock` at once.
+
+**Its wait holds the notification channel, every route, and the control channel of each server
+still starting** — whose `Ready` is the one thing a control channel brings. A death needs no slot:
+it closes the channel and queues `ChildExited`, and each pass looks at every channel. That keeps
+the wait inside the kernel's 32 handles with sixteen routes (`registry::MAX_ROUTES`); until Part
+E.1b it held every running service's channel, which capped the services at 31 and left no room.
 
 **`critical = true`, at bring-up only**, marks `auth-service` and `logging-service`, the two `init`
 treated as critical-path. If one does not come up at boot, `service-mgr` starts nothing more and

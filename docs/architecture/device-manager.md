@@ -1,8 +1,8 @@
 # The Device Manager
 
 **Status: built — administration Part B, B.1–B.5, 2026-09-24; `block` owned by the storage service
-since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a; last checked
-2026-09-28.** What exists:
+since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a, the info-only
+endpoint reached through its route since E.1b; last checked 2026-09-28.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -60,8 +60,8 @@ component extended: it hands a driver process a `Handle<DeviceNode>` the same wa
    `Meta::Ready`. A manager with no registry to read refuses instead, and `service-mgr` prints its
    reason.
 3. **`service-mgr` binds `/svc/devices`** — the manager's endpoint in its registry, the root path
-   to `service-mgr`'s own — and, starting the login chain, resolves `info-endpoint` there for the
-   endpoint it couriers to the sessions (§5).
+   to the manager's route — then resolves `info-endpoint` in the registry, binds what it gets there
+   too, and hands the sessions a route to it (§5).
 4. **`service-mgr` spawns `input-server`, which resolves `/svc/devices/input`.** The manager has
    already queued the whole replay on the channel it answers with: an `Arrived` per keyboard and
    mouse, each carrying the owner's duplicate of its node, then `Settled`. So `input-server` holds
@@ -124,16 +124,18 @@ page-sized, and `Table::decode` stops at its terminator.
 
 **A session reaches the tables through an info-only endpoint.** Resolving
 `/svc/devices/info-endpoint` answers a channel that is itself a forwarding endpoint, and on it the
-manager answers the directory and the tables and nothing else, whatever suffix arrives. `init`
-resolves one at boot and couriers it down the same chain as the view broker's: `service-mgr`,
-both login supervisors, then `desktop-shell`. Each binds it at `/dev/devices` with the base
-`/info`.
+manager answers the directory and the tables and nothing else, whatever suffix arrives.
+`service-mgr` resolves one each time the manager comes up and binds it in its registry, and a
+**route** of its own to that is what travels the view broker's chain: both login supervisors, then
+`desktop-shell` (administration Part E.1b; the endpoint itself travelled until then, resolved by
+`init` until Part E.1a). Each binds it at `/dev/devices` with the base `/info`.
 
-**The endpoint, not the base, is the boundary.** The base keeps an ordinary session's suffixes
-under `info`. But `desktop-shell` holds what is couriered, and `BIND_NAMESPACE`, so it could bind it
-with no base. On the endpoint bound at `/svc/devices`, a bare `block` is a subscription to every
-disk: raw write access to the ESP and every partition, which nothing else the shell holds gives. On
-the info-only endpoint it is `NotFound`, however it is bound.
+**The endpoint, not the base, is the boundary.** The base keeps an ordinary session's suffixes under
+`info`. But `desktop-shell` holds what is couriered, and `BIND_NAMESPACE`, so it could bind it with
+no base. The route reaches the info-only endpoint and nothing else. On the endpoint bound at
+`/svc/devices`, a bare `block` is a subscription to every disk: raw write access to the ESP and
+every partition, which nothing else the shell holds gives. On the info-only endpoint it is
+`NotFound`, however it is bound.
 [`namespace-and-resource-servers.md`](namespace-and-resource-servers.md) § *Userspace Servers*
 records the shape: attenuation by construction, for authority no right on a handle can express.
 

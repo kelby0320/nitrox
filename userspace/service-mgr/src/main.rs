@@ -41,25 +41,25 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 /// How many declared services this supervisor holds at once.
 ///
-/// Bounded by the wait set: `sys_wait` takes at most `MAX_WAIT_HANDLES` handles, and this
-/// supervisor spends one on its notification channel and one per running service's control
-/// channel — so the ceiling is 31.
+/// **No longer bounded by the wait set** (administration Part E.1b): only a server that is still
+/// starting has its control channel waited on — for its `Ready` — since a death is also a
+/// `ChildExited` on the notification channel, and each pass looks at every channel. Until then one
+/// per running service was, which capped this at 31.
 ///
 /// Twenty-four. Since administration Part E.1 a release image declares the **nine servers**
 /// `init` used to start, and `heartbeat`; a test image adds seven more. It was twelve while
 /// only the demo and the test clients were declared.
 const MAX_SERVICES: usize = 24;
-/// The wait set's fixed slots: the notification channel, this manager's serving endpoint, and
-/// the terminal channel to `init`.
-const FIXED_WAIT: usize = 3;
+/// The most `sys_wait` takes at once.
+const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
 
-/// The fixed slots, then one control-channel handle per running service — the wait set
-/// [`Mgr::run`] builds. Other callers use the first slot with a count of one.
-static mut WAIT_HANDLES: [u64; FIXED_WAIT + MAX_SERVICES] = [0; FIXED_WAIT + MAX_SERVICES];
+/// The wait set [`Mgr::run`] builds: the notification channel, every route's serving end, and the
+/// control channel of each server still starting (`registry::STARTING_ROOM` of them). Other
+/// callers use the first slot with a count of one.
+static mut WAIT_HANDLES: [u64; WAIT_MAX] = [0; WAIT_MAX];
 /// One 24-byte `IoResult` per waited handle.
-static mut WAIT_RESULTS: [u8; 24 * (FIXED_WAIT + MAX_SERVICES)] = [0; 24 * (FIXED_WAIT + MAX_SERVICES)];
-const _: () = assert!(FIXED_WAIT + MAX_SERVICES <= libkern::abi::MAX_WAIT_HANDLES);
-/// The serving endpoint's receive buffers: resolves, forwarded from every server path.
+static mut WAIT_RESULTS: [u8; 24 * WAIT_MAX] = [0; 24 * WAIT_MAX];
+/// The routes' receive buffers: resolves, forwarded from every binding of a server's path.
 static mut SRV_MSG: [u8; 4096] = [0; 4096];
 static mut SRV_HANDLES: [u64; 8] = [0; 8];
 static mut SRV_COUNT: usize = 0;
@@ -67,9 +67,9 @@ static mut SRV_COUNT: usize = 0;
 /// Part E.1: shutdown (E.4) asks them to end their sessions. They used to be closed after the
 /// handoff.
 static mut SUPERVISORS: [u64; 4] = [0; 4];
-/// How deep this manager's serving endpoint is. Every forwarded resolve on a server's path
-/// queues here, and a full ring answers the resolver `WouldBlock` at once, so it is far deeper
-/// than a server's usual four.
+/// How deep each route is. Every forwarded resolve on a server's path queues on its route, and a
+/// full ring answers the resolver `WouldBlock` at once, so it is far deeper than a server's usual
+/// four.
 const SERVE_DEPTH: u64 = 64;
 static mut NOTIF: Notification = Notification::zeroed();
 static mut CLOCK_BUF: u64 = 0;
@@ -238,18 +238,18 @@ fn now_ns() -> u64 {
 /// Create a connected control-channel pair (depth 4). Returns `(smgr_end, svc_end)`:
 /// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
 fn create_control_channel() -> Option<(u64, u64)> {
-    // **Depth 8, and the number bounds the send count rather than being a round one.** The
+    // **Depth 10, and the number bounds the send count rather than being a round one.** The
     // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring
     // shorter than the number of them does not block — it **drops the last handle silently**.
     // This was 4 while the graphical column sent four; M12 Part E's clipboard made it five, and
     // the symptom was a session whose namespace had no `/dev/clipboard` and a copy that failed
-    // two processes away, with the send reporting success. **Seven since administration Part
-    // B.4** go to `desktop-session-mgr`, so one slot is left. `libsession::spawn_leader` carries
-    // the same warning from the same failure in M7 Part F — which is what named this one on
-    // sight.
+    // two processes away, with the send reporting success. **Eight since administration Part
+    // E.1b** go to `desktop-session-mgr`, the storage service's route the eighth, so it is ten
+    // deep for two spare. `libsession::spawn_leader` carries the same warning from the same
+    // failure in M7 Part F — which is what named this one on sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 8, 0)
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0)
     };
     if cr != 0 {
         return None;
@@ -557,21 +557,6 @@ fn recv_handoff(ctrl: u64) -> u64 {
     unsafe { (&raw const RDY_HANDLES[0]).read() }
 }
 
-/// Close whichever endpoints we still hold. Used on the login-chain abort paths, where
-/// both are ours and neither has moved.
-///
-/// # Safety
-/// Single-threaded service-mgr; both are its own handles, closed at most once.
-unsafe fn close_endpoints(fs_endpoint: u64, profile_endpoint: u64) {
-    // SAFETY: closing our own handles.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, fs_endpoint);
-        if profile_endpoint != 0 {
-            syscall1(SYS_HANDLE_CLOSE, profile_endpoint);
-        }
-    }
-}
-
 /// Transfer a single `handle` to a child over its control channel (`ctrl`) — an IPC
 /// message with one moved handle and no payload (the child receives it as its next
 /// control message). On failure the handle did not move; it is closed.
@@ -600,108 +585,99 @@ fn send_handle(ctrl: u64, handle: u64) {
     }
 }
 
-/// Bring up the login chain: spawn `auth-service` (await its `Meta::Ready` → the auth
-/// client channel), then spawn `session-mgr` with re-delegated `BIND_NAMESPACE` and hand
-/// it the fs-server endpoint, the profile-server endpoint, and the auth channel over its
-/// control channel. Both endpoints come from init over the handoff channel at `rdx`.
-///
-/// service-mgr does not *use* either endpoint. It is a courier: neither the fs-server's
-/// `/home` nor the profile's `/bin` is service-mgr's to bind, and holding them any longer
-/// than the trip down would be authority it has no use for.
-fn bring_up_login_chain(
-    root_ns: u64,
-    fs_endpoint: u64,
-    profile_endpoint: u64,
-    tty_endpoint: u64,
-    draw_endpoint: u64,
-    clip_endpoint: u64,
-    views_endpoint: u64,
-    devices_endpoint: u64,
-) {
-    if fs_endpoint == 0 {
-        kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
-        // SAFETY: closing our own handles — the broker's and the device manager's endpoints are
-        // no use without a session.
+/// **What the login supervisors are handed**, in the order they receive it. `fs` and `profile` are
+/// `init`'s servers' own endpoints, couriered: this manager does not *use* either, and holds
+/// neither longer than the trip down. Every other is a **route** of this manager's (administration
+/// Part E.1b) — a duplicate of the one the server's root path is bound to, or of the one to an
+/// endpoint the server mints for sessions — so a restarted server is reached again from every
+/// session bound before it. `0` for one this boot does not have, and a session binds nothing
+/// there.
+#[derive(Default)]
+struct ChainEndpoints {
+    fs: u64,
+    profile: u64,
+    tty: u64,
+    /// The compositor's, which only the graphical column takes: a serial session has no screen.
+    draw: u64,
+    clip: u64,
+    views: u64,
+    devices: u64,
+    storage: u64,
+}
+
+impl ChainEndpoints {
+    /// Every handle, in the order `desktop-session-mgr` receives them; `session-mgr` receives the
+    /// same with no `draw`.
+    fn all(&self) -> [u64; 8] {
+        [self.fs, self.profile, self.tty, self.draw, self.clip, self.views, self.devices, self.storage]
+    }
+
+    /// A second set of everything but `draw`, which only one column takes. `TRANSFER |
+    /// DUPLICATE` is what the hand-down needs and all it needs.
+    fn duplicate(&self) -> ChainEndpoints {
+        // SAFETY: each is a handle this process holds, or `0`.
         unsafe {
-            close_one(views_endpoint);
-            close_one(devices_endpoint);
+            ChainEndpoints {
+                fs: dup_endpoint(self.fs),
+                profile: dup_endpoint(self.profile),
+                tty: dup_endpoint(self.tty),
+                draw: 0,
+                clip: dup_endpoint(self.clip),
+                views: dup_endpoint(self.views),
+                devices: dup_endpoint(self.devices),
+                storage: dup_endpoint(self.storage),
+            }
         }
-        // A profile endpoint without an fs endpoint is no more usable — a session with
-        // programs but no home is not a session. Don't retain it.
-        if profile_endpoint != 0 {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, profile_endpoint) };
+    }
+
+    /// Close every handle in a set no supervisor took. This manager never exits, so a set
+    /// dropped on an abort path would be held for the life of the boot.
+    fn close(&self) {
+        for h in self.all() {
+            close(h);
         }
+    }
+}
+
+/// Bring up the login chain: `session-mgr`, then `desktop-session-mgr`, each spawned with
+/// re-delegated `BIND_NAMESPACE` and handed its endpoints over its control channel. Both resolve
+/// `/svc/auth` themselves.
+///
+/// **The serial column's set is duplicated before it is sent**, since `send_handle` moves: a
+/// failure here then costs the graphical login, not both.
+fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
+    if chain.fs == 0 {
+        // A profile endpoint without an fs endpoint is no more usable — a session with programs
+        // but no home is not a session — and nor is any route.
+        kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
+        chain.close();
         return;
     }
-    // Not fatal: a session without `/bin` is the pre-Part-F shell — usable for the
-    // in-process language, unable to spawn. Losing the login entirely over it would be a
-    // worse trade, so this reports and continues.
-    if profile_endpoint == 0 {
+    // Not fatal: a session without `/bin` is the pre-Part-F shell — usable for the in-process
+    // language, unable to spawn. Losing the login entirely over it would be a worse trade.
+    if chain.profile == 0 {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
-    // auth-service is **init's** now (M7 Part C). It is a resource server bound at
-    // `/svc/auth`, and only init can bind into the root namespace: a declared service is
-    // spawned with `namespace: 0`, an inherited LOOKUP-only root. This was written here
-    // first and the bind came back FAIL, which is how the constraint was found.
-
-    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint.
-    // Duplicated **before** the serial column takes its set, since `send_handle` moves.
-    // `TRANSFER | DUPLICATE` is what the hand-down needs and all it needs.
-    // SAFETY: duplicating our own endpoint handles with attenuated rights.
-    // **The clipboard is duplicated here too, and it is the first endpoint *both* columns
-    // want for the same reason.** `/dev/draw` goes only to the graphical twin because a serial
-    // session has no compositor; the clipboard is reachable as a path precisely so a pipeline
-    // can use it (M12 decision 4), and pipelines run in both.
-    // **And the view broker's** (administration Part A.4), for the clipboard's reason: both
-    // columns open sessions with it, since `with` is typed at a shell in either. **And the device
-    // manager's** (Part B.4): both columns bind `/dev/devices`.
-    let (fs_dup, profile_dup, tty_dup, clip_dup, views_dup, devices_dup) = unsafe {
-        (
-            dup_endpoint(fs_endpoint),
-            dup_endpoint(profile_endpoint),
-            dup_endpoint(tty_endpoint),
-            dup_endpoint(clip_endpoint),
-            dup_endpoint(views_endpoint),
-            dup_endpoint(devices_endpoint),
-        )
-    };
+    let mut serial = chain;
+    let draw = core::mem::take(&mut serial.draw);
+    let mut desktop = serial.duplicate();
+    desktop.draw = draw;
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
-        // Both sets: the duplicates were minted before this spawn, so this path owns six
-        // handles rather than three. service-mgr never exits, so a leak here is permanent.
-        // SAFETY: closing our own handles (nothing handed off).
-        unsafe {
-            close_endpoints(fs_endpoint, profile_endpoint);
-            close_endpoints(fs_dup, profile_dup);
-            close_one(tty_endpoint);
-            close_one(tty_dup);
-            close_one(clip_endpoint);
-            close_one(clip_dup);
-            close_one(views_endpoint);
-            close_one(views_dup);
-            close_one(devices_endpoint);
-            close_one(devices_dup);
-        }
+        serial.close();
+        desktop.close();
         return;
     }
-    // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
-    // (3) the tty server's forwarding endpoint, (4) the auth channel. session-mgr
-    // receives them positionally, so the order is the
-    // contract — a reorder here silently makes a session bind its home over IPC to the
-    // profile server.
-    send_handle(sess_ctrl, fs_endpoint);
-    send_handle(sess_ctrl, profile_endpoint);
-    send_handle(sess_ctrl, tty_endpoint);
-    // (4) the clipboard server's forwarding endpoint (M12 Part E).
-    send_handle(sess_ctrl, clip_endpoint);
-    // (5) the view broker's forwarding endpoint (administration Part A.4).
-    send_handle(sess_ctrl, views_endpoint);
-    // (6) the device manager's forwarding endpoint (administration Part B.4).
-    send_handle(sess_ctrl, devices_endpoint);
-    // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
-    // session of its own, and so will `desktop-session-mgr`.
+    // **Positional**, so the order is the contract: a reorder here silently makes a session bind
+    // its home over IPC to the profile server. The fs server's, the profile server's, then the
+    // routes to the terminal server, the clipboard (M12 Part E), the view broker (administration
+    // Part A.4), the device manager's info-only endpoint (Part B.4) and the storage service's
+    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b).
+    let s = &serial;
+    for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage] {
+        send_handle(sess_ctrl, h);
+    }
     // **Kept, not closed** (administration Part E.1): shutdown asks the supervisors to end their
     // sessions, which takes their process handles.
     // SAFETY: single-threaded; the supervisors' slots.
@@ -709,20 +685,7 @@ fn bring_up_login_chain(
         SUPERVISORS[0] = sess_h as u64;
         SUPERVISORS[1] = sess_ctrl;
     }
-    // **The graphical twin.** It needs the same three endpoints, and `send_handle` *moves*
-    // them — so they are duplicated before the serial column is given its set. Duplicating
-    // first rather than after means a failure here costs the graphical login, not both:
-    // init makes the same argument where it retains the profile endpoint before binding it.
-    if !bring_up_desktop_session(
-        root_ns,
-        fs_dup,
-        profile_dup,
-        tty_dup,
-        draw_endpoint,
-        clip_dup,
-        views_dup,
-        devices_dup,
-    ) {
+    if !bring_up_desktop_session(root_ns, desktop) {
         // Non-fatal by design. A machine with a serial login and no graphical one is
         // degraded; a machine with neither is unreachable, and the serial column is already
         // up by this point.
@@ -731,62 +694,26 @@ fn bring_up_login_chain(
     kprint(b"service-mgr: login chain up (auth-service + session-mgr)\n");
 }
 
-/// Spawn `desktop-session-mgr` and hand it its own copies of the three endpoints.
-///
-/// `false` if it could not be started. Its greeter is a compositor client, so unlike
-/// `session-mgr` it also needs `/dev/draw` — which it resolves itself from the inherited root
-/// namespace, exactly as every other graphical client does.
-fn bring_up_desktop_session(
-    root_ns: u64,
-    fs: u64,
-    profile: u64,
-    tty: u64,
-    draw: u64,
-    clip: u64,
-    views: u64,
-    devices: u64,
-) -> bool {
-    if fs == 0 {
-        // The duplicates are this function's to release once it declines to use them.
-        // SAFETY: closing our own handles.
-        unsafe {
-            close_one(profile);
-            close_one(tty);
-            close_one(draw);
-            close_one(clip);
-            close_one(views);
-            close_one(devices);
-        }
+/// Spawn `desktop-session-mgr` and hand it its set, `draw` included. `false` if it could not be
+/// started. Its greeter is a compositor client too, which resolves `/dev/draw/new` from the
+/// inherited root, as every other graphical client does.
+fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
+    if set.fs == 0 {
+        set.close();
         return false;
     }
     let (h, ctrl) =
         spawn_with_control(root_ns, b"/bin/desktop-session-mgr", &raw mut SPAWN_DESKTOP_SESSION);
     if h < 0 || ctrl == 0 {
         kprint(b"service-mgr: desktop-session-mgr spawn FAIL\n");
-        // SAFETY: closing our own handles (nothing handed off).
-        unsafe {
-            close_endpoints(fs, profile);
-            close_one(tty);
-            close_one(draw);
-            close_one(clip);
-            close_one(views);
-            close_one(devices);
-        }
+        set.close();
         return false;
     }
-    // The same positional order `session-mgr` receives in, for the same reason.
-    send_handle(ctrl, fs);
-    send_handle(ctrl, profile);
-    send_handle(ctrl, tty);
-    // The fourth, and the one the serial column does not get.
-    send_handle(ctrl, draw);
-    // The fifth: the clipboard, which both columns get (M12 Part E).
-    send_handle(ctrl, clip);
-    // The sixth: the view broker's, which both columns get too (administration Part A.4).
-    send_handle(ctrl, views);
-    // The seventh: the device manager's, which both columns bind at `/dev/devices` (Part B.4).
-    // Seven of the control channel's eight — see `create_control_channel`.
-    send_handle(ctrl, devices);
+    // The serial column's order with the compositor's fourth — eight of the control channel's
+    // ten, see `create_control_channel`.
+    for h in set.all() {
+        send_handle(ctrl, h);
+    }
     // Kept, as `session-mgr`'s are: shutdown asks this one to end its sessions too.
     // SAFETY: single-threaded; the supervisors' slots.
     unsafe {
@@ -794,17 +721,6 @@ fn bring_up_desktop_session(
         SUPERVISORS[3] = ctrl;
     }
     true
-}
-
-/// Close one handle if there is one.
-///
-/// # Safety
-/// `h` must be a handle this process owns, or `0`.
-unsafe fn close_one(h: u64) {
-    if h != 0 {
-        // SAFETY: the caller guarantees `h` is ours.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
 }
 
 /// Duplicate an endpoint handle for a second supervisor, or `0` if there was none.
@@ -850,10 +766,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
             0
         }
     };
-    let (forwarding, serve_end) = make_channel(SERVE_DEPTH).unwrap_or_else(|| {
-        kprint(b"service-mgr: endpoint create FAIL -- no server can be reached\n");
-        (0, 0)
-    });
     let decls = load_declarations(root_ns);
     let entries: alloc::vec::Vec<Entry> =
         decls.iter().map(|d| Entry { server: d.endpoint.is_some(), critical: d.critical }).collect();
@@ -877,8 +789,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         root_ns,
         root_bind,
         registry,
-        forwarding,
-        serve_end,
+        routes: alloc::vec::Vec::new(),
         terminal,
         fs_endpoint,
         profile_endpoint,
@@ -1089,6 +1000,31 @@ enum Phase {
     Up,
 }
 
+/// **A route**: one of this manager's own endpoints, reaching one place in the registry
+/// (administration Part E.1b). Every binding of a server's path — the root's, each session's,
+/// each application's — is a route, never the server's own endpoint, so a restart is reached from
+/// all of them. And one route reaches **one** server: an endpoint that reached any server by the
+/// suffix could not be handed to a session, since `desktop-shell` holds what it is handed with
+/// `BIND_NAMESPACE` and could bind it at a base of its choosing.
+struct Route {
+    /// The server, as an index into `Mgr::svcs`.
+    svc: usize,
+    /// `None` for the server's own path; `Some(suffix)` for an endpoint the server mints for
+    /// sessions by a resolve of `suffix` (`registry::DERIVED`).
+    through: Option<&'static str>,
+    /// Where in the registry each resolve continues: `/<name>` or `/<name>.<suffix>`.
+    base: String,
+    /// The end every binding holds.
+    client: u64,
+    /// The end this manager answers on.
+    serve: u64,
+    /// A derived route's endpoint, as the server minted it, bound at `base`. `0` otherwise, and
+    /// while there is none.
+    target: u64,
+    /// Whether something is bound at `base`. A resolve while it is not is `NotFound`.
+    live: bool,
+}
+
 /// One supervised service: its declaration, its child, and the state the restart
 /// policy needs across exits.
 struct Supervised {
@@ -1127,9 +1063,9 @@ struct Supervised {
 /// the profile server and servers already serving, none of which waits on this.
 ///
 /// **The registry.** Each server's endpoint is bound in a namespace of this manager's own, under
-/// the server's name, and every other binding of the server's path is this manager's endpoint
-/// with `/<name>` as its base. A resolve there is answered `SUBNAMESPACE` into the registry, so it
-/// continues into whichever server is bound there now, and a restart rebinds there alone.
+/// the server's name, and every other binding of the server's path is one of this manager's
+/// [`Route`]s. A resolve there is answered `SUBNAMESPACE` into the registry, so it continues into
+/// whichever server is bound there now, and a restart rebinds there alone.
 struct Mgr {
     notif: u64,
     /// The root, lookup-only, as this process was spawned with: for lookups.
@@ -1137,9 +1073,9 @@ struct Mgr {
     /// The root with `init`'s rights, for binding the servers' paths. `0` without one.
     root_bind: u64,
     registry: u64,
-    /// This manager's endpoint: what every server path in the root is bound to.
-    forwarding: u64,
-    serve_end: u64,
+    /// This manager's own endpoints, one per server path and derived endpoint, made as each is
+    /// first needed and kept for the boot.
+    routes: alloc::vec::Vec<Route>,
     terminal: u64,
     /// The login chain's endpoints from `init`, until the chain takes them.
     fs_endpoint: u64,
@@ -1163,20 +1099,25 @@ impl Mgr {
     fn run(&mut self) -> ! {
         loop {
             self.advance();
+            // **The notification channel, every route, and the servers still starting** — whose
+            // `Ready` is the one thing a control channel brings. A death needs no slot: it closes
+            // the channel and queues `ChildExited` on the notification channel, and each pass looks
+            // at every channel ([`Mgr::poll`]).
             let mut count = 0usize;
-            // SAFETY: WAIT_HANDLES holds FIXED_WAIT + MAX_SERVICES slots, and at most that many
-            // are pushed: MAX_SERVICES is the declarations' cap.
+            // SAFETY: WAIT_HANDLES holds WAIT_MAX slots, and `push` stops there.
             unsafe {
                 let mut push = |h: u64| {
-                    if h != 0 && count < FIXED_WAIT + MAX_SERVICES {
+                    if h != 0 && count < WAIT_MAX {
                         WAIT_HANDLES[count] = h;
                         count += 1;
                     }
                 };
                 push(self.notif);
-                push(self.serve_end);
+                for r in &self.routes {
+                    push(r.serve);
+                }
                 for s in &self.svcs {
-                    if s.running {
+                    if s.running && matches!(s.phase, Phase::Starting { .. }) {
                         push(s.ctrl);
                     }
                 }
@@ -1220,30 +1161,20 @@ impl Mgr {
         d
     }
 
-    /// Answer every resolve queued on this manager's endpoint: `SUBNAMESPACE` into the registry
-    /// for a server that is up, `NotFound` for anything else.
+    /// Answer every resolve queued on every route: `SUBNAMESPACE` into the registry at the route's
+    /// base — the whole suffix continuing — while something is bound there, `NotFound` while not.
     fn serve_resolves(&mut self) {
-        if self.serve_end == 0 {
-            return;
-        }
-        while let Some((op, request_id, body)) = recv_serve(self.serve_end) {
-            if op != librsproto::OP_NS_RESOLVE {
-                reply_error(self.serve_end, op, request_id, KError::Unsupported);
-                continue;
-            }
-            let routed = librsproto::namespace::parse_resolve_request(&body)
-                .and_then(|r| registry::route(r.suffix));
-            let up = routed.filter(|(name, _)| {
-                self.svcs.iter().any(|s| s.decl.name == *name && s.phase == Phase::Up && s.endpoint != 0)
-            });
-            match up {
-                Some((name, consumed)) => {
-                    let at = registry::base(name);
-                    let (ch, ns) = (self.serve_end, self.registry);
-                    reply_subnamespace(ch, request_id, ns, consumed, at.as_bytes());
-                }
-                None => {
-                    reply_error(self.serve_end, librsproto::OP_NS_RESOLVE, request_id, KError::NotFound)
+        for r in &self.routes {
+            while let Some((op, request_id, body)) = recv_serve(r.serve) {
+                let resolve = librsproto::OP_NS_RESOLVE;
+                if op != resolve {
+                    reply_error(r.serve, op, request_id, KError::Unsupported);
+                } else if librsproto::namespace::parse_resolve_request(&body).is_none() {
+                    reply_error(r.serve, resolve, request_id, KError::InvalidArgument);
+                } else if r.live {
+                    reply_subnamespace(r.serve, request_id, self.registry, 0, r.base.as_bytes());
+                } else {
+                    reply_error(r.serve, resolve, request_id, KError::NotFound);
                 }
             }
         }
@@ -1423,19 +1354,62 @@ impl Mgr {
     /// Wait on the notification channel until `deadline` — answering resolves meanwhile, since
     /// they wait on this process. `false` once the deadline has passed.
     fn wait_codes(&mut self, deadline: u64) -> bool {
-        let handles = [self.notif, self.serve_end];
-        let n = if self.serve_end != 0 { 2 } else { 1 };
-        let mut results = [0u8; 48];
-        // SAFETY: valid wait arrays on this frame.
-        let w = unsafe {
-            syscall4(SYS_WAIT, handles.as_ptr() as u64, n, results.as_mut_ptr() as u64, deadline)
-        };
+        let w = self.wait_serving(self.notif, deadline).is_some();
         self.serve_resolves();
-        w >= 1
+        w
+    }
+
+    /// Wait for `h` or any route until `deadline`: `h`'s 24-byte result if it was ready, `None`
+    /// if not. The routes are only woken on; the caller answers them.
+    fn wait_serving(&self, h: u64, deadline: u64) -> Option<[u8; 24]> {
+        let mut handles = [0u64; WAIT_MAX];
+        let mut n = 0;
+        for x in core::iter::once(h).chain(self.routes.iter().map(|r| r.serve)) {
+            if x != 0 && n < WAIT_MAX {
+                handles[n] = x;
+                n += 1;
+            }
+        }
+        let mut results = [0u8; 24 * WAIT_MAX];
+        // SAFETY: valid wait arrays on this frame, `n` entries.
+        let w = unsafe {
+            syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, deadline)
+        };
+        (0..w.max(0) as usize).map(|k| &results[24 * k..24 * (k + 1)]).find_map(|e| {
+            (u64::from_le_bytes(e[..8].try_into().ok()?) == h).then(|| e.try_into().ok()).flatten()
+        })
+    }
+
+    /// Resolve `path` in `ns`, **answering resolves until it completes** or `deadline` passes:
+    /// the handle, or `0`. What a server mints for sessions is asked for this way, since the
+    /// server may be resolving through a route at that moment itself.
+    fn lookup_serving(&mut self, ns: u64, path: &[u8], rights: u64, deadline: u64) -> u64 {
+        // SAFETY: a namespace handle this process holds, and a valid path.
+        let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
+        if po <= 0 {
+            return 0;
+        }
+        let po = po as u64;
+        let got = loop {
+            let done = self.wait_serving(po, deadline);
+            self.serve_resolves();
+            if let Some(e) = done {
+                // IoResult: status at 8..12, the resolved handle at 16..24.
+                let status = i32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+                let handle = u64::from_le_bytes(e[16..24].try_into().unwrap_or([0; 8]));
+                break if status == 0 { handle } else { 0 };
+            }
+            if now_ns() >= deadline {
+                break 0;
+            }
+        };
+        close(po);
+        got
     }
 
     /// A server's `Meta::Ready` arrived: bind its endpoint in the registry — replacing a
-    /// predecessor's — and, the first time, its root path to this manager's endpoint.
+    /// predecessor's — and, the first time, its root path to its route. Then ask it for each
+    /// endpoint it mints for sessions.
     fn register(&mut self, i: usize, endpoint: u64) {
         let name = self.svcs[i].decl.name.clone();
         let path = self.svcs[i].decl.endpoint.clone().unwrap_or_default();
@@ -1457,10 +1431,16 @@ impl Mgr {
             self.failed_to_start(i);
             return;
         }
+        let Some(r) = self.route(i, None) else {
+            unbind(self.registry, at.as_bytes());
+            close(endpoint);
+            self.failed_to_start(i);
+            return;
+        };
+        self.routes[r].live = true;
         if !self.svcs[i].root_bound {
-            let bound = self.root_bind != 0
-                && self.forwarding != 0
-                && bind(self.root_bind, path.as_bytes(), self.forwarding, Some(at.as_bytes())) == 0;
+            let client = self.routes[r].client;
+            let bound = self.root_bind != 0 && bind(self.root_bind, path.as_bytes(), client, None) == 0;
             if bound {
                 self.svcs[i].root_bound = true;
             } else {
@@ -1478,8 +1458,84 @@ impl Mgr {
         s.endpoint = endpoint;
         s.phase = Phase::Up;
         Line::new().s(b"service-mgr: ").s(name.as_bytes()).s(b" bound at ").s(path.as_bytes()).end();
+        for through in registry::derives(&name) {
+            self.derive(i, through);
+        }
         if self.awaiting == Some(i) {
             self.awaiting = None;
+        }
+    }
+
+    /// Ask server `i` for the endpoint it mints for sessions by a resolve of `through`, and bind
+    /// it at its place in the registry, where the route to it continues. Each time the server
+    /// comes up: the last one went with its predecessor. A server that does not answer is said,
+    /// and its sessions are not handed the route.
+    fn derive(&mut self, i: usize, through: &'static str) {
+        let name = self.svcs[i].decl.name.clone();
+        let path = format!("{}/{}", registry::base(&name), through);
+        let deadline = now_ns().saturating_add(DERIVE_TIMEOUT_NS);
+        let rights = RIGHT_TRANSFER | RIGHT_DUPLICATE;
+        let h = self.lookup_serving(self.registry, path.as_bytes(), rights, deadline);
+        let at = registry::derived(&name, through);
+        unbind(self.registry, at.as_bytes());
+        let route = if h == 0 { None } else { self.route(i, Some(through)) };
+        let bound = route.is_some() && bind(self.registry, at.as_bytes(), h, None) == 0;
+        let Some(r) = route.filter(|_| bound) else {
+            close(h);
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(name.as_bytes())
+                .s(b"' gave no ")
+                .s(through.as_bytes())
+                .s(b" -- sessions will not reach it")
+                .end();
+            return;
+        };
+        let route = &mut self.routes[r];
+        close(route.target);
+        route.target = h;
+        route.live = true;
+        Line::new()
+            .s(b"service-mgr: sessions reach ")
+            .s(name.as_bytes())
+            .s(b" through its ")
+            .s(through.as_bytes())
+            .end();
+    }
+
+    /// The route for server `i`'s own path (`through` = `None`) or a derived endpoint of its,
+    /// made the first time it is needed. `None` when there is no room, which is said.
+    fn route(&mut self, i: usize, through: Option<&'static str>) -> Option<usize> {
+        if let Some(r) = self.routes.iter().position(|r| r.svc == i && r.through == through) {
+            return Some(r);
+        }
+        let name = &self.svcs[i].decl.name;
+        let room = self.routes.len() < registry::MAX_ROUTES;
+        let made = if room { make_channel(SERVE_DEPTH) } else { None };
+        let Some((client, serve)) = made else {
+            let why: &[u8] = if room { b"channel create FAIL" } else { b"all in use" };
+            Line::new().s(b"service-mgr: no route for '").s(name.as_bytes()).s(b"' -- ").s(why).end();
+            return None;
+        };
+        let base = match through {
+            None => registry::base(name),
+            Some(t) => registry::derived(name, t),
+        };
+        self.routes.push(Route { svc: i, through, base, client, serve, target: 0, live: false });
+        Some(self.routes.len() - 1)
+    }
+
+    /// A duplicate of the route to server `name` — its own path, or `through` one it minted —
+    /// for a login supervisor, while something is bound there; `0` otherwise, and the sessions
+    /// bind nothing.
+    fn route_copy(&self, name: &str, through: Option<&str>) -> u64 {
+        let found = self.routes.iter().find(|r| {
+            r.live && r.through == through && self.svcs[r.svc].decl.name == name
+        });
+        match found {
+            // SAFETY: a channel end this process holds.
+            Some(r) => unsafe { dup_endpoint(r.client) },
+            None => 0,
         }
     }
 
@@ -1535,11 +1591,19 @@ impl Mgr {
             };
             l.end();
             // **Its path answers `NotFound` until it is back**, rather than reaching a server that
-            // has gone.
+            // has gone — and so does every endpoint it minted for sessions.
             if s.endpoint != 0 {
                 unbind(self.registry, registry::base(&s.decl.name).as_bytes());
                 close(s.endpoint);
                 s.endpoint = 0;
+            }
+        }
+        for r in self.routes.iter_mut().filter(|r| r.svc == i) {
+            r.live = false;
+            if r.target != 0 {
+                unbind(self.registry, r.base.as_bytes());
+                close(r.target);
+                r.target = 0;
             }
         }
         let s = &self.svcs[i];
@@ -1623,39 +1687,26 @@ impl Mgr {
         }
     }
 
-    /// A server's endpoint, duplicated for a login supervisor, or `0` if it is not up.
-    fn endpoint_copy(&self, name: &str) -> u64 {
-        match self.svcs.iter().find(|s| s.decl.name == name && s.phase == Phase::Up) {
-            // SAFETY: an endpoint handle this process holds.
-            Some(s) => unsafe { dup_endpoint(s.endpoint) },
-            None => 0,
-        }
-    }
-
-    /// Start the login chain with the servers' endpoints, as `init` used to hand them over. The
-    /// device manager's info endpoint is minted by resolving it **in the registry**: through the
-    /// root's `/svc/devices` it would come to this process, which would be waiting on itself.
+    /// Start the login chain with `init`'s two endpoints and a route to each server a session
+    /// binds — never the server's own endpoint, so a session reaches a restarted server too.
     fn start_login_chain(&mut self) {
-        let devices = if self.svcs.iter().any(|s| s.decl.name == "device-mgr" && s.phase == Phase::Up) {
-            ns_lookup(self.registry, b"/device-mgr/info-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE)
-        } else {
-            0
+        let chain = ChainEndpoints {
+            fs: core::mem::take(&mut self.fs_endpoint),
+            profile: core::mem::take(&mut self.profile_endpoint),
+            tty: self.route_copy("tty-server", None),
+            draw: self.route_copy("compositor", None),
+            clip: self.route_copy("clipboard-server", None),
+            views: self.route_copy("view-broker", None),
+            devices: self.route_copy("device-mgr", Some("info-endpoint")),
+            storage: self.route_copy("storage-service", Some("session-endpoint")),
         };
-        let (fs, profile) = (self.fs_endpoint, self.profile_endpoint);
-        self.fs_endpoint = 0;
-        self.profile_endpoint = 0;
-        bring_up_login_chain(
-            self.root_ns,
-            fs,
-            profile,
-            self.endpoint_copy("tty-server"),
-            self.endpoint_copy("compositor"),
-            self.endpoint_copy("clipboard-server"),
-            self.endpoint_copy("view-broker"),
-            devices,
-        );
+        bring_up_login_chain(self.root_ns, chain);
     }
 }
+
+/// How long a server has to answer for an endpoint it mints for sessions — resolves answered
+/// meanwhile. It answers from its serving loop, already up, so this only bounds one that is not.
+const DERIVE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// How long to wait for a service named in another's `after` to finish.
 ///

@@ -3039,17 +3039,22 @@ fn policy_test(root_ns: u64) -> bool {
 /// comes back — from the instance `service-mgr` started in its place.
 ///
 /// **What this proves is the registry.** The root's `/svc/restart-probe` is bound once, to
-/// `service-mgr`'s endpoint, and never again: only the registry binding changes on a restart. A
-/// root binding to the server's own endpoint would reach the dead one, which answers `PeerClosed`,
-/// however long this waited.
+/// `service-mgr`'s route for the server, and never again: only the registry binding changes on a
+/// restart. A root binding to the server's own endpoint would reach the dead one, which answers
+/// `PeerClosed`, however long this waited.
+///
+/// **And that a binding made before the restart reaches the new instance** (Part E.1b), in a copy
+/// of the root made before it. That is a session's case: its bindings are made at login, of the
+/// same route the root binds, and nothing rebinds them. A restart that rebound the root's path
+/// alone passes the first half and fails this one.
 fn restart_test(root_ns: u64) -> bool {
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: restart: ").s(what).s(b" FAIL").end();
         false
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
-    let token = || -> Option<u64> {
-        let (st, ch) = ns_lookup(root_ns, b"/svc/restart-probe/id", chan);
+    let token = |ns: u64| -> Option<u64> {
+        let (st, ch) = ns_lookup(ns, b"/svc/restart-probe/id", chan);
         if st != 0 || ch == 0 {
             return None;
         }
@@ -3059,9 +3064,23 @@ fn restart_test(root_ns: u64) -> bool {
         m.handles.iter().for_each(|&h| close(h));
         Some(u64::from_le_bytes(m.body.get(..8)?.try_into().ok()?))
     };
-    let Some(first) = token() else {
+    let Some(first) = token(root_ns) else {
         return fail(b"/svc/restart-probe answered no token");
     };
+    // **A namespace bound before the restart, and never touched again** — a session's, as a
+    // supervisor builds one (administration Part E.1b). A copy of the root holds the same binding
+    // objects the root does, and later changes to the root do not reach it: a restart that
+    // rebound the root's path alone would leave this one at the server that exited.
+    // SAFETY: a namespace handle this process holds; the copy is its own to close.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if copy <= 0 {
+        return fail(b"a copy of the root could not be made");
+    }
+    let copy = copy as u64;
+    if token(copy) != Some(first) {
+        close(copy);
+        return fail(b"the copy of the root did not reach the instance the root does");
+    }
     let (st, h) = ns_lookup(root_ns, b"/svc/restart-probe/exit", chan);
     close(h);
     if st == 0 {
@@ -3073,7 +3092,7 @@ fn restart_test(root_ns: u64) -> bool {
     let timer = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
     let deadline = clock_ns() + 10_000_000_000;
     let second = loop {
-        match token() {
+        match token(root_ns) {
             Some(t) if t != first => break Some(t),
             _ if clock_ns() > deadline => break None,
             _ if timer > 0 => {
@@ -3090,10 +3109,17 @@ fn restart_test(root_ns: u64) -> bool {
         }
     };
     close(if timer > 0 { timer as u64 } else { 0 });
-    if second.is_none() {
+    let Some(second) = second else {
+        close(copy);
         return fail(b"no new instance answered at /svc/restart-probe within 10 s of the old one exiting");
+    };
+    let in_copy = token(copy);
+    close(copy);
+    if in_copy != Some(second) {
+        return fail(b"the copy of the root, made before the restart, did not reach the new instance");
     }
     kprint(b"boot-probe: restart: a server that exited was restarted, and its path reached the new instance ok\n");
+    kprint(b"boot-probe: restart: a namespace bound before the restart reached it too ok\n");
     true
 }
 

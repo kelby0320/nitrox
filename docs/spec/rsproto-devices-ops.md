@@ -21,7 +21,7 @@ the root namespace to reach its forwarding endpoint, through `service-mgr`'s reg
 | class owner | `/svc/devices/<class>`, from the root namespace | `input` or `block` | a channel; receives `Arrived`, `Settled`, `Departed` |
 | directory | `/svc/devices/info` | `info` | a channel answering `File::ReadDir` |
 | table | `/svc/devices/info/<name>.tsm` | `info/<name>.tsm` | a read-only memory object: a TSM1 table |
-| info-only endpoint | `/svc/devices/info-endpoint`, asked for once by `service-mgr` | `info-endpoint` | a forwarding endpoint of the manager's own — see below |
+| info-only endpoint | `/svc/devices/info-endpoint`, asked for by `service-mgr` each time the manager comes up | `info-endpoint` | a forwarding endpoint of the manager's own — see below |
 
 Any other suffix is `NotFound`, as is a table for a name no device has. **A directory session the
 manager has no room for is `WouldBlock`**: it waits on every channel in one wait set of
@@ -74,12 +74,13 @@ root endpoint answers a channel that is itself a **forwarding endpoint**: bound 
 kernel forwards resolves on it to the manager like any server's. **On it the manager answers the
 directory and the tables, and nothing else** — a class, or `info-endpoint` again, is `NotFound`
 whatever the suffix — so its holder cannot subscribe and cannot mint an endpoint that could.
-`service-mgr` asks for one at boot and couriers it to the login supervisors; both login supervisors
-bind it at `/dev/devices` with the subtree base `/info`, and `desktop-shell` binds it the same way
-into each application. The base names what a session reaches — `/dev/devices` is the directory,
-`/dev/devices/all.tsm` a table — and **the endpoint is the boundary**. The base alone would not be:
-`desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so it could bind it with no base, where
-`block` on the root endpoint is a subscription to every disk.
+`service-mgr` asks for one each time the manager comes up, binds it in its registry, and couriers a
+**route** of its own to it (administration Part E.1b), which reaches that endpoint and nothing else;
+both login supervisors bind the route at `/dev/devices` with the subtree base `/info`, and
+`desktop-shell` binds it the same way into each application. The base names what a session reaches —
+`/dev/devices` is the directory, `/dev/devices/all.tsm` a table — and **the endpoint is the
+boundary**. The base alone would not be: `desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so
+it could bind it with no base, where `block` on the root endpoint is a subscription to every disk.
 
 **A device's name is its path's**, so a name says which binding would reach it:
 

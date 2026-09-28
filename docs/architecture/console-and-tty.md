@@ -181,10 +181,12 @@ channel produces a namespace entry that answers `Namespace::Resolve` with `Unsup
 `/dev/tty` that exists and cannot be opened. Both are `IpcChannel`s; only the role differs,
 and only the binder knows which it holds.
 
-So a session binds the **forwarding endpoint**, handed down service-mgr → session-mgr alongside the
-fs and profile endpoints `init` handed `service-mgr`, sharing the endpoint `service-mgr` registered
-exactly as `/home` shares the fs-server's. (`init` started and bound the terminal server until
-administration Part E.1a.) Every program in the session then resolves its own terminal.
+So a session binds a **forwarding endpoint**: `service-mgr`'s route to the terminal server, handed
+down service-mgr → session-mgr alongside the fs and profile endpoints `init` handed `service-mgr`,
+and the same object the root's `/dev/tty` is bound to, as `/home` shares the fs-server's. A resolve
+on it continues into whichever terminal server is running (administration Part E.1b; the server's
+own endpoint was handed down until then, and `init` started and bound the server until Part E.1a).
+Every program in the session then resolves its own terminal.
 
 **A stage's terminal is not resolved; it is handed down** (administration Part A.2, 2026-09-23).
 A resolve mints a terminal on the console, so a stage that resolved `/dev/tty` inside `nxterm`

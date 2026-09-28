@@ -321,17 +321,19 @@ before the next. The orders that mattered under `init` still hold: the broker af
 audits to, the device manager before the storage service and the input server, and **the input
 server before the compositor**, which resolves `/dev/input/new` during its own startup.
 
-Each server's endpoint is bound in `service-mgr`'s **registry**, and its path in the root to
-`service-mgr`'s own endpoint with the server's name as the base, so a resolve there continues into
-whichever server is bound now, and a restart reaches every binding
+Each server's endpoint is bound in `service-mgr`'s **registry**, and its path in the root to the
+server's **route** — an endpoint of `service-mgr`'s own, one per server — so a resolve there
+continues into whichever server is bound now, and a restart reaches every binding
 ([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
 
 **Then the login chain**, after the last server and before any other declaration:
 
-1. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the fs-server,
-   profile-server and the servers' endpoints — the terminal server's, the clipboard's, the view
-   broker's, and an info-only one of the device manager's. It resolves `/svc/auth` itself.
-2. **`desktop-session-mgr`** — the same, with its own duplicates, and the compositor's too.
+1. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the fs-server's
+   and profile server's endpoints and **the routes** a session binds: to the terminal server, the
+   clipboard, the view broker, the device manager's info-only endpoint and the storage service's
+   session endpoint (administration Part E.1b; the servers' own endpoints until then). It
+   resolves `/svc/auth` itself.
+2. **`desktop-session-mgr`** — the same, with its own duplicates, and the compositor's route too.
    Non-fatal if it fails: a machine with a serial login is degraded, one with neither is
    unreachable.
 

@@ -108,8 +108,8 @@ pub struct ServiceDecl {
     /// The restart configuration.
     pub restart: RestartConfig,
     /// **A server's path in the root namespace** (administration Part E.1): `service-mgr` waits
-    /// for its `Meta::Ready`, binds the endpoint in its registry, and binds this path to its own
-    /// endpoint with the server's name as the base, so a restart reaches every binding. `None`
+    /// for its `Meta::Ready`, binds the endpoint in its registry, and binds this path to the
+    /// server's route, an endpoint of its own, so a restart reaches every binding. `None`
     /// for a service that is not a server. Absolute, and no `.` or `..` component; a declaration
     /// whose `endpoint` is not is skipped, rather than started as a server nothing can reach.
     pub endpoint: Option<String>,

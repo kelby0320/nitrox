@@ -164,7 +164,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     kprint(b"session-mgr: up\n");
     // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
     // server endpoint, (3) tty server endpoint. Positional — service-mgr sends an empty message
-    // for an endpoint it does not have, so a missing one shortens no one's count.
+    // for an endpoint it does not have, so a missing one shortens no one's count. **All but the
+    // first two are `service-mgr`'s routes** (administration Part E.1b), not the servers' own
+    // endpoints, so a session bound before a server restarts still reaches it after.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
@@ -178,6 +180,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // An info-only endpoint of the device manager's (administration Part B.4), bound into every
     // session at `/dev/devices` with the base `/info`. `0` on a boot without a manager.
     let devices_endpoint = recv_handoff(control);
+    // **The storage service's session endpoint** (administration Part C.6), bound at `/storage`
+    // and `/dev/storage` in every session. `0` on a boot without the service. **Couriered since
+    // Part E.1b**: it was resolved here, which minted one that died with the service;
+    // `service-mgr` asks for it each time the service comes up, and this is the route to whichever
+    // is current.
+    let storage_endpoint = recv_handoff(control);
     // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` starts
     // `auth-service` and binds `/svc/auth` (administration Part E.1a; `init` did until then), and
     // every supervisor asks the namespace for a session of its own — which is what lets
@@ -221,12 +229,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     if views_endpoint != 0 && views_sup == 0 {
         kprint(b"session-mgr: /svc/views/session resolve FAIL; sessions will have no `with`\n");
     }
-    // **The storage service's session endpoint** (administration Part C.6), resolved rather than
-    // couriered, for `/svc/views/session`'s reason: nothing new travels the handoff channels.
-    // Bound at `/storage` and `/dev/storage` in every session. `0` on a boot without the service,
-    // whose sessions have no `/storage`.
-    let (_, storage_endpoint) =
-        ns_lookup(root_ns, b"/svc/storage/session-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
     // the shell into it, and reap it — the same way in every build.

@@ -30507,3 +30507,64 @@ And on the host:
 **`check-fbcon`'s handout group** starts at `service-mgr: input-server bound at /dev/input/new`, the
 last bind before the compositor. `init`'s auth-service line, its first line until now, is too many
 lines back once `service-mgr` logs its own for each server.
+
+## 2026-09-28 — Administration Part E.1b: a route per server, and the sessions bind them
+
+**The sessions and applications bind `service-mgr`'s routes now, not the servers' own endpoints**,
+so a server restarted after a session was built is reached from it. The plan said "`service-mgr`'s
+endpoint with a base per path". **Building it showed one endpoint could not be handed out, and
+the maintainer agreed to one per server the same day**:
+- **`desktop-shell` holds what it is handed with `BIND_NAMESPACE`**, and binds it into every
+  application. E.1a's single endpoint routed on the first component of the suffix. Bound with the
+  base `/auth-service/admin` — or `/device-mgr/input` — it would have reached the user database's
+  admin session, or every keyboard, from an application.
+- **E.1a's root was safe with it**, because nothing hands a root binding out: a binding resolves to
+  a registration, never back to an endpoint. It was the hand-out that was new.
+- So **a route reaches one place in the registry**, whatever it is bound at. This is attenuation
+  by construction, the device manager's info-only endpoint's shape: no right on a handle can say
+  "this server only".
+
+**What changed:**
+- **One route per server**, made at its first `Ready` and kept for the boot. The root path is
+  bound to it once; the login supervisors are handed duplicates of it; `desktop-shell` passes those
+  on. The root and every session hold the same object, so a restart is one registry rebind for
+  all of them. E.1a's suffix routing is gone.
+- **Two derived routes.**
+  - The device manager's `info-endpoint` and the storage service's `session-endpoint` are
+    endpoints each server mints. One minted once dies with its server.
+  - So `service-mgr` resolves each in the registry every time the server comes up, binds it at
+    `/<name>.<suffix>`, and routes to that. The `.` is what keeps it apart from every server's
+    place, since no name the registry binds can have one.
+  - While it waits for the answer, it answers resolves (`lookup_serving`), since the server may be
+    resolving through a route itself.
+- **The supervisors are handed the storage route** instead of resolving
+  `/svc/storage/session-endpoint` themselves, so `desktop-session-mgr` receives eight handoffs.
+  Its control channel is 10 deep, up from 8, which it would have filled exactly.
+- **The wait set lost every running service's control channel.**
+  - It holds the notification channel, every route (`MAX_ROUTES` 16), and the channel of each server
+    still starting (`STARTING_ROOM`). A death needs no slot: it queues `ChildExited`, and each pass
+    already looks at every channel.
+  - Without that, sixteen routes and 24 running services would not fit the kernel's 32. The old
+    cap of 31 services was the wait set's, not a design choice.
+- **The login chain's eight endpoints travel as one struct** (`ChainEndpoints`). It replaces eight
+  positional parameters, and each abort path closes the whole set. The old `fs == 0` path closed
+  only three of them.
+
+**The gate is a copy of the root** (`sys_ns_derive`), made before `restart-probe` restarts:
+- A copy holds the same binding objects and is never rebound, which is a session's case exactly.
+  After the restart it must reach the new instance, as the root must.
+- The control rebinds the root path to the server's own endpoint on every start: the review's
+  "rebind the root" alternative. The root half passes and the copy fails:
+  `the copy of the root, made before the restart, did not reach the new instance`.
+
+**What no gate reaches, said rather than hidden:**
+- **A restart of a server behind a derived route.** `device-mgr` and `storage-service` are both
+  `essential`, with policy `never`, so nothing restarts either. The re-derivation is the same
+  `derive` the boot runs, and waits for one of them to have a restart policy.
+- **A live session reaching a restarted server, end to end.** Nothing restarts a session-facing
+  server before E.2's `service`. Its `clip` gate is the first to, in `test-interactive`'s
+  release image.
+
+**Two current-behaviour lines E.1a's sweep missed** are fixed here: `device-manager.md` §5 still
+said `init` resolves the info-only endpoint, and `service-mgr`'s own login-chain comment said
+`auth-service` is `init`'s. The sweep had grepped phrasings, and these used others.

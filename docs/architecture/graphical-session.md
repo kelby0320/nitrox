@@ -4,11 +4,12 @@
 
 **Built, and checked 2026-09-28** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
 revision 2. On 2026-09-28 administration Part E.1a moved the servers from `init`'s children to
-`service-mgr`'s (§3's diagram). On 2026-09-25 administration Part D.1 made `auth-service` the user
-database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and applications
-`/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
-supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
-them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+`service-mgr`'s (§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them
+in place of the servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service`
+the user database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and
+applications `/storage` and `/dev/storage`, through a session endpoint of the storage service's that
+each supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4
+gave them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
 supervisor is now handed. Two things changed under it before that: the session namespace also binds
 `/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
 records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
@@ -147,20 +148,23 @@ kernel ─spawns→ init (full SysCaps)
     ├─spawns with BIND_NAMESPACE, binds /svc/storage→ storage-service (a namespace per mount)
     ├─spawns, binds→ logging, tty, clipboard, input and the compositor (no caps)
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
-    │      + fs, profile, tty, clipboard and view-broker endpoints, and an info-only
-    │        device endpoint;  auth resolved from /svc/auth
+    │      + fs and profile endpoints, and service-mgr's routes to tty, clipboard,
+    │        the view broker, an info-only device endpoint and a storage session
+    │        endpoint;  auth resolved from /svc/auth
     │      └─on login→ session ns ─spawns→ nxsh
     │
     └─spawns, re-delegates BIND_NAMESPACE→ desktop-session-mgr        ← new
-           + the same, and /dev/draw
+           + the same, and the compositor's route
            └─on login→ desktop session ns ─spawns, re-delegates
                        BIND_NAMESPACE→ desktop-shell                   ← new
                           └─per application→ app ns ─spawns→ nxterm, …
 ```
 
 The servers were `init`'s children, bound by `init`, until administration Part E.1a (2026-09-28);
-each "binds" above is `service-mgr`'s registry and, once, the root path to `service-mgr`'s own
-endpoint ([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
+each "binds" above is `service-mgr`'s registry and, once, the root path to the server's route — an
+endpoint of `service-mgr`'s own, reaching that server alone. The supervisors, and through them
+`desktop-shell`, are handed the same routes since Part E.1b, so a session reaches a restarted
+server ([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
 
 Every arrow attenuates, bar one: `service-mgr`'s root handle carries `init`'s own rights, since it
 binds the servers (§ *Capability posture* there). The new rows extend the existing concentration

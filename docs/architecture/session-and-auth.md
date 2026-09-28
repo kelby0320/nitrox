@@ -298,13 +298,14 @@ without `/dev/devices`, and says so.
 ### The storage service's filesystems
 
 **Every session reaches every mounted filesystem; none can mount one** (administration Part C.6).
-Each supervisor resolves a **session endpoint** at `/svc/storage/session-endpoint` itself, once,
-as it resolves `/svc/views/session`, so nothing new travels the handoff channels. It binds it
-twice: at `/storage` with the base `/fs`, so `/storage/<label>/…` continues into that filesystem's
-own namespace, and at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table
-of what each disk holds and where it is mounted. `desktop-session-mgr` hands the endpoint to
-`desktop-shell` as its eighth extra, and the shell binds it the same two ways into every
-application ([`storage.md`](storage.md)).
+Each supervisor is handed `service-mgr`'s route to a **session endpoint** of the service's, which
+`service-mgr` resolves at `session-endpoint` each time the service comes up (administration Part
+E.1b; each supervisor resolved `/svc/storage/session-endpoint` itself until then, and held an
+endpoint that would have died with the service). It binds it twice: at `/storage` with the base
+`/fs`, so `/storage/<label>/…` continues into that filesystem's own namespace, and at `/dev/storage`
+with the base `/info`, so `/dev/storage/all.tsm` is the table of what each disk holds and where it
+is mounted. `desktop-session-mgr` hands the endpoint to `desktop-shell` as its eighth extra, and the
+shell binds it the same two ways into every application ([`storage.md`](storage.md)).
 
 **The endpoint is the boundary, again.** On a session endpoint the service answers the filesystems
 and the table, and `admin-endpoint` is `NotFound` however it is bound, so the shell, holding it

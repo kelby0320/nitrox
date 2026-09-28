@@ -78,12 +78,52 @@ pub mod bringup {
 pub mod registry {
     //! **The registry**: where `service-mgr` binds each server's endpoint, under the server's
     //! name, in a namespace of its own (administration Part E.1). Every other binding of a
-    //! server's path is `service-mgr`'s endpoint with `/<name>` as its base, so a forwarded
-    //! resolve arrives with the name first. `service-mgr` answers `SUBNAMESPACE` — the registry,
-    //! at `/<name>` — and the resolve continues into whichever server is bound there now. A
-    //! restart rebinds there and nowhere else.
+    //! server's path is one of `service-mgr`'s own endpoints — a **route** — which answers every
+    //! resolve with `SUBNAMESPACE` into the registry at one place, and the resolve continues into
+    //! whichever server is bound there now. A restart rebinds there and nowhere else.
+    //!
+    //! **A route reaches one server, never more** (Part E.1b). A single endpoint for every server,
+    //! routing on the suffix, is what Part E.1a's root used, and it could not be handed to a
+    //! session: `desktop-shell` holds what it is handed with `BIND_NAMESPACE`, and could have bound
+    //! it with any base — `/auth-service/admin`, or `/device-mgr/input`. A route is attenuation by
+    //! construction, as the device manager's info-only endpoint is.
 
     use alloc::string::String;
+
+    /// Routes `service-mgr` serves at once: one per server, and one per [`DERIVED`] endpoint.
+    /// Bounded by its wait set, which holds the notification channel, every route and the control
+    /// channel of each server still starting (see [`STARTING_ROOM`]).
+    pub const MAX_ROUTES: usize = 16;
+
+    /// The control channels of starting servers the wait set has room for, beside the
+    /// notification channel and [`MAX_ROUTES`] routes, within the kernel's 32. One more starting
+    /// at once is still seen, on the next pass: the wait is level-triggered and looks at everything.
+    pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES;
+
+    /// **Endpoints a server mints for sessions**, each reached through a route of its own
+    /// (Part E.1b): `(server, suffix)` — resolving `suffix` on the server answers a forwarding
+    /// endpoint of its own, narrower than its root one. `service-mgr` resolves it each time the
+    /// server comes up, binds it at [`derived`], and hands the login supervisors the route to it,
+    /// so a restart re-derives it and every session reaches the new one.
+    /// - `device-mgr`'s `info-endpoint` answers its tables and never a class (Part B.4);
+    /// - `storage-service`'s `session-endpoint` answers the filesystems and the tables and never an
+    ///   admin endpoint (Part C.6).
+    pub const DERIVED: &[(&str, &str)] =
+        &[("device-mgr", "info-endpoint"), ("storage-service", "session-endpoint")];
+
+    /// The suffixes `name` derives endpoints from, in [`DERIVED`]'s order.
+    pub fn derives(name: &str) -> impl Iterator<Item = &'static str> + '_ {
+        DERIVED.iter().filter(move |(n, _)| *n == name).map(|&(_, s)| s)
+    }
+
+    /// Where a derived endpoint is bound in the registry: `/<name>.<suffix>`. **The `.` is what
+    /// keeps it apart from every server**: no name the registry binds has one ([`valid_name`]).
+    pub fn derived(name: &str, suffix: &str) -> String {
+        let mut b = base(name);
+        b.push('.');
+        b.push_str(suffix);
+        b
+    }
 
     /// A name the registry binds a server under: 1 to 32 bytes of lowercase letters, digits and
     /// `-`, as the declarations' names are.
@@ -92,15 +132,7 @@ pub mod registry {
             && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     }
 
-    /// The server a forwarded suffix names — its first component — and how many bytes of the
-    /// suffix that is. `None` for an empty or invalid name.
-    pub fn route(suffix: &[u8]) -> Option<(&str, usize)> {
-        let end = suffix.iter().position(|&b| b == b'/').unwrap_or(suffix.len());
-        let name = core::str::from_utf8(&suffix[..end]).ok()?;
-        valid_name(name).then_some((name, end))
-    }
-
-    /// Where `name` is bound in the registry, which is also the base its bindings forward with.
+    /// Where `name` is bound in the registry: its route continues every resolve there.
     pub fn base(name: &str) -> String {
         let mut b = String::from("/");
         b.push_str(name);
@@ -111,7 +143,9 @@ pub mod registry {
 #[cfg(test)]
 mod tests {
     use super::bringup::{Entry, Failed, Step, chain_at, failed_at_boot, next};
-    use super::registry::{base, route, valid_name};
+    use super::registry::{
+        DERIVED, MAX_ROUTES, STARTING_ROOM, base, derived, derives, valid_name,
+    };
 
     const S: Entry = Entry { server: true, critical: false };
     const C: Entry = Entry { server: true, critical: true };
@@ -155,16 +189,33 @@ mod tests {
         assert_eq!(failed_at_boot(S), Failed::Continue);
     }
 
-    /// **A forwarded suffix names its server first**, and the rest goes on to it.
+    /// **Each server has one place in the registry, and each derived endpoint another** that no
+    /// server's name can take.
     #[test]
-    fn a_suffix_names_the_server_it_goes_to() {
-        assert_eq!(route(b"logging-service/system/heartbeat"), Some(("logging-service", 15)));
-        assert_eq!(route(b"clipboard-server"), Some(("clipboard-server", 16)));
-        assert_eq!(route(b"view-broker/s/7"), Some(("view-broker", 11)));
-        for bad in [&b""[..], b"/x", b"Upper/x", b"../x", b"a b", b"\xff"] {
-            assert_eq!(route(bad), None, "{bad:?}");
-        }
+    fn a_derived_endpoint_is_bound_where_no_server_can_be() {
         assert_eq!(base("auth-service"), "/auth-service");
         assert!(valid_name(&"a".repeat(32)) && !valid_name(&"a".repeat(33)));
+        for bad in ["", "Upper", "a b", "a/b", "a.b", ".."] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+        assert_eq!(derived("device-mgr", "info-endpoint"), "/device-mgr.info-endpoint");
+        for &(name, suffix) in DERIVED {
+            assert!(valid_name(name), "{name}");
+            let at = derived(name, suffix);
+            assert!(!valid_name(&at[1..]), "{at} is a name a server could have");
+            assert!(!suffix.contains('/') && !suffix.is_empty(), "{suffix}");
+        }
+        assert_eq!(derives("device-mgr").collect::<std::vec::Vec<_>>(), ["info-endpoint"]);
+        assert_eq!(derives("storage-service").collect::<std::vec::Vec<_>>(), ["session-endpoint"]);
+        assert_eq!(derives("tty-server").count(), 0);
+    }
+
+    /// **The wait set fits the kernel's**, with room for a server starting — and the nine servers,
+    /// their derived endpoints and a test image's server fit the routes.
+    #[test]
+    fn the_routes_and_a_starting_server_fit_one_wait() {
+        assert!(1 + MAX_ROUTES + STARTING_ROOM <= libkern::abi::MAX_WAIT_HANDLES);
+        assert!(STARTING_ROOM >= 1);
+        assert!(9 + DERIVED.len() + 1 <= MAX_ROUTES);
     }
 }

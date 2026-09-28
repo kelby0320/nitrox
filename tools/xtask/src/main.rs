@@ -1439,10 +1439,12 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    `/dev/devices`. This is the only place a gate sees that: the sessions below would list the
     //    same tables through a duplicate of the root endpoint, and only an info-only one keeps
     //    `desktop-shell`, which could bind it with no base, from subscribing through it. The
-    //    manager logs before replying, so the order is causal: the bind, the mint as the login
-    //    chain starts, then everything after, the login included.
+    //    manager logs before replying, so the order is causal: the bind, the mint straight after
+    //    it — asked for each time the manager comes up, since Part E.1b — then `service-mgr`
+    //    binding it behind the route the sessions are handed, then the login.
     s.expect("service-mgr: device-mgr bound at /svc/devices")?;
     s.expect("device-mgr: an info-only endpoint minted")?;
+    s.expect("service-mgr: sessions reach device-mgr through its info-endpoint")?;
     s.expect("nitrox login:")?;
     steps += 1;
 
@@ -11856,6 +11858,8 @@ fn check_every_service_started(transcript: &[u8]) -> R<()> {
         "sent no Ready within",
         "service-mgr: bind FAIL at",
         "registry bind FAIL",
+        "service-mgr: no route for",
+        "-- sessions will not reach it",
     ] {
         if let Some(i) = text.find(pat) {
             let line: String = text[i..].lines().next().unwrap_or(pat).into();
@@ -11926,6 +11930,14 @@ fn check_servers_are_service_mgrs(transcript: &[u8]) -> R<()> {
             return Err(
                 format!("init's log names {name}, which service-mgr starts since administration Part E.1").into()
             );
+        }
+    }
+    // **And the endpoints two of them mint for sessions** (Part E.1b), each behind a route of its
+    // own: what the login supervisors are handed for `/dev/devices` and `/storage`.
+    for (name, through) in [("device-mgr", "info-endpoint"), ("storage-service", "session-endpoint")] {
+        let line = format!("service-mgr: sessions reach {name} through its {through}");
+        if !text.contains(&line) {
+            return Err(format!("`{line}` is not in the transcript: no route to it for sessions").into());
         }
     }
     println!("xtask: service-mgr bound all {} servers, and init none of them ✓", SERVICE_MGR_SERVERS.len());
