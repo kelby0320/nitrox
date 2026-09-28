@@ -1,16 +1,18 @@
 # Administration: views, devices, and the tools an installed system needs
 
 **Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C complete
-(2026-09-25), Part D detailed (2026-09-25); scoped 2026-09-22 and revised after the PR #326
-review.** Scheduled after
+(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28); scoped 2026-09-22 and
+revised after the PR #326 review.** Scheduled after
 [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
 architecture below were agreed with the maintainer on 2026-09-22. The review then found that
 several mechanisms depend on things the code does not have, and **the maintainer took the four
 resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
 had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
-(*Part B in detail*, 2026-09-24), as is **Part C** (*Part C in detail*, 2026-09-25). **Part D has had
-its detail pass** (*Part D in detail*) and is next to build; the other parts are sketched. The plan began as a stub on 2026-09-16, written while building the
-installer — the first program that needed authority an ordinary session cannot have.
+(*Part B in detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D**
+(*Part D in detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*,
+2026-09-28) and is next to build; the other parts are sketched. The plan began as a stub on
+2026-09-16, written while building the installer — the first program that needed authority an
+ordinary session cannot have.
 
 ## Scope
 
@@ -392,6 +394,11 @@ view such as the installer. What a person browses is a *filesystem*, which appea
 
 ## Services
 
+**`service-mgr` starts the servers, and `init` starts only what it takes to reach it** — its mounts,
+the profile server at `/bin`, `service-mgr`, and the emergency shell (the maintainer's call,
+2026-09-28, in *Part E in detail*). The nine servers `init` starts today become declarations, as
+`service-manager.md` has said since Phase 3.
+
 `service-mgr` gains an admin endpoint: **list** — each service's name, state and restart count, for
 anyone — and **start, stop and restart** under the `services` grant.
 
@@ -399,7 +406,8 @@ anyone — and **start, stop and restart** under the `services` grant.
 reason to be in the initramfs (above), and it cannot be edited there: the initramfs is a boot archive
 on the FAT EFI partition, which nothing here writes. On root, `service-mgr` reads it after `init` has
 mounted the filesystem it lives on, and **enabling and disabling become a small edit** — still
-deferred, since no service wants disabling yet. `profiles/system.toml` probably follows it. The live
+deferred, since no service wants disabling yet. `profiles/system.toml` follows it (*Part E in
+detail*). The live
 image then gets it through `root.img` like everything else on root, with no special case.
 **`check-images` changes shape**: test and release images will then differ in a root-filesystem file
 rather than an initramfs one, which its allow-list has to learn.
@@ -442,7 +450,7 @@ Network time belongs to networking.
 | `account --password <name> --users <file>` | the offline mode, for recovery | the file |
 | `service --list` | each service's state and restart count | nothing |
 | `service --start\|--stop\|--restart <name>` | | `services` |
-| `shutdown` · `shutdown --reboot` | the orderly sequence, then a message or a reset | `power` |
+| `shutdown` · `shutdown --reboot` | the orderly sequence, then a message or a reset | `power` — everyone's, with no password, in the seeded policy |
 | `date --set <time>` | set the clock | `clock` |
 | `log [<service>]` | read the system log, audit records included | `logs` |
 
@@ -460,9 +468,9 @@ The review's main lesson is that this is not only a userspace phase. Collected i
 | `OBJECT_KIND_SUBNAMESPACE` — a resolve continuing in another namespace | `/storage` with nothing re-bound | C |
 | One cached `FileObject` per file, keyed by the server's file id, kept while dirty; `File::Forget`; `sys_ns_sync` | unmount and shutdown without losing mapped writes, and two mappings of a file that agree | C |
 | `IoOpcode::Flush`, and `FLUSH CACHE` in the AHCI driver (`TODO(ahci-flush)`) | the last link of every unmount | C |
-| A system-control object in `init`'s boot grant, and a power operation | `shutdown` | E |
-| FADT parsing, and a reset (FADT → i8042 → triple fault) | `shutdown --reboot` | E |
-| `SYSTEM_CLOCK` wired, and the RTC written back | `date --set` | E |
+| A system-control object in `init`'s boot grant, and a power operation that flushes every block device before it stops the machine | `shutdown` | E |
+| FADT parsing — flags, reset register, century register — and a reset (FADT → i8042 → triple fault) | `shutdown --reboot`, and the RTC's century | E |
+| `SYSTEM_CLOCK` wired: `sys_clock_set`, and the RTC written back | `date --set` | E |
 
 ## Parts — sketched
 
@@ -485,12 +493,14 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `OBJECT_KIND_SUBNAMESPACE`; the storage service — mount, unmount, auto-mount (read-only on a
       live boot), `/storage` bound into sessions and application namespaces, refusing a raw grant of
       a mounted device; `disk`.
-- [ ] **D — accounts** — *detailed below, D.1–D.5.* `auth-service`'s admin ops and atomic rewrite;
+- [x] **D — accounts** — *detailed below, D.1–D.5; complete 2026-09-25.* `auth-service`'s admin ops and atomic rewrite;
       `account`, including the offline mode; removal refused when it would leave no administrator,
       or while the account is logged in; **`with --show`, `with --install` and the `views` grant**
       (moved here from A by its detail pass — who administers the system is what this part lets a
       person change).
-- [ ] **E — services, power, the clock and the log.** `services.toml` moved onto the root
+- [ ] **E — services, power, the clock and the log** — *detailed below, E.1–E.6.* **`service-mgr`
+      starting the servers `init` starts today** (the maintainer's call, 2026-09-28, and what
+      `service-manager.md` has always said); `services.toml` moved onto the root
       filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
 - [ ] **F — the desktop's share.** `desktop-shell` building application namespaces in the same
@@ -1690,6 +1700,299 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 - **Groups, and per-account policy fragments** — the policy's *For later* list.
 - **The graphical prompt**, Part F's.
 
+## Part E in detail *(2026-09-28)*
+
+### The spike: what already exists, and what is missing
+
+- **`init` starts nine servers that are not its to start.** Besides its mounts and the profile
+  server at `/bin`, it spawns `auth-service`, `logging-service`, `tty-server`, `clipboard-server`,
+  the view broker, `device-mgr`, `storage-service`, `input-server` and the compositor. It gives
+  each a control channel and `init`'s root namespace, waits for `Meta::Ready`, binds the endpoint
+  at a path, and keeps copies of five for `service-mgr` to pass to the login supervisors: seven
+  handoffs, with the root filesystem's and the profile server's. Two are critical-path: a boot
+  without `auth-service` or `logging-service` drops to the emergency shell.
+- **`service-manager.md` already says otherwise.** *The init / service-mgr boundary* gives `init`
+  "the irreducible minimum to reach service-mgr (the root fs-server; eventually the profile
+  server…) plus the emergency eshell", and everything else to `service-mgr`. The code never caught
+  up.
+- **`service-mgr` supervises declarations it cannot use for a server.**
+  - It reads `/initramfs/etc/services.toml`, which in a release image declares one service,
+    `heartbeat`, Phase 3's demo; a test image declares seven.
+  - A declaration cannot say "bind my endpoint at a path", and `spawn_service` does not wait for
+    `Meta::Ready`.
+  - It starts the login supervisors itself, outside the declarations.
+  - It has no client endpoint, and the one stop it sends is a demo: `CTRL_OP_SHUTDOWN` to the
+    first declared service, after 1.1 s.
+- **No server answers a stop.** Only `heartbeat` reads `CTRL_OP_SHUTDOWN`. None of the nine,
+  `profile-server` or `fs-server-ext4` handles `CTRL_OP_SHUTDOWN` or a terminate request.
+- **A login supervisor drops a stop request.** Both wait on their session's leader in
+  `libsession::spawn_leader`, on the notification channel, and handle only `ChildExited`. A
+  terminate request wakes them and is drained unread.
+- **`init` keeps no way to unmount its own filesystems.** It closes each `fs-server-ext4`'s control
+  channel after `Meta::Ready` and drops the process handle, so C.3's `Meta::Unmount` cannot reach
+  the root.
+- **The storage service unmounts one filesystem at a time, and refuses while a file is held**
+  (C.5c). There is no "unmount everything".
+- **The kernel has no system-control object and no power operation.** `init` is spawned with
+  `SysCaps::all()`, its notification channel and the root namespace; `rdx` is unused.
+  `Cpu::stop_the_machine` already halts every CPU and hands the screen back to the framebuffer
+  console, for a panic.
+- **ACPI stops at the MADT and the MCFG.** The table walk and the hardware report see the FADT
+  (`FACP`) and parse nothing in it. That includes the reset register and the century register, so
+  the RTC's century is a guess (`rtc.rs` says so). The gates' QEMU machine is q35.
+- **The clock can be read and not set.** `CLOCK_REALTIME` is the monotonic count plus an offset
+  fixed at boot from the RTC, and `clock.rs` names setting it "a single atomic store… deliberately
+  not built". `SysCaps::SYSTEM_CLOCK` is defined and checked nowhere, and there is no clock-set
+  syscall. `date` has no `--set`, and `libtime` formats a time without parsing one.
+- **The log cannot be read back.** `logging-service` keeps 256 records in a ring, with a serial
+  sink, and has no read op. Sessions have no `/log`.
+- **`check-images` compares initramfs archives, and never the test and release roots.** The live
+  images' roots are compared, each to its own image. `profiles/system.toml` is read by
+  `profile-server` from the initramfs, though root is mounted before it starts.
+- **The desktop has no log-out, shut-down or restart**, and its design draws none.
+
+### The shape
+
+**The maintainer's calls, 2026-09-28:**
+
+- **`service-mgr` starts the servers; `init` starts only what it takes to reach `service-mgr`.**
+  That is its mounts, the profile server at `/bin` (which `service-mgr` is spawned from),
+  `service-mgr`, and the emergency shell when it must. This is what `service-manager.md` has said
+  since Phase 3, and it is Part E's first piece.
+- **Anyone at the machine may shut down or restart it, with no password**, as with a desktop's
+  power button. The seeded policy gives a `power` view to everyone, for `shutdown` only;
+  administrators have `power` in `admin` too.
+- **At shutdown, ask, wait, then proceed.** Every session and service is asked to stop and given a
+  bounded time, then every filesystem is synced and unmounted **whether or not a file is held**.
+  A write made after the final sync is lost, as at a power cut, but every filesystem is left
+  clean. This is over refusing while a file is held, and over refusing while others are logged in.
+- **A graphical session menu — log out, shut down, restart — is Part F's**, the desktop's share.
+  Part E builds the mechanism and `shutdown`.
+
+**Derived from the spike and the calls:**
+
+- **A declaration can describe a server.** `endpoint = "<path>"` makes `service-mgr` wait for
+  `Meta::Ready`, with `init`'s bound, and bind the endpoint at that path in its root namespace. It
+  holds `BIND_NAMESPACE` for exactly this. The rest is keys the schema has:
+  - `syscaps`, for the view broker's and the storage service's `BIND_NAMESPACE`;
+  - `after`, for order beyond the file's.
+
+  Declarations start in file order, and a server's `Ready` is awaited before the next starts. That
+  keeps `init`'s load-bearing orders: `logging-service` first, `device-mgr` before `storage-service`
+  and `input-server`, and `input-server` before the compositor.
+- **`init` hands `service-mgr` two endpoints**, the root filesystem's and the profile server's, not
+  seven. `service-mgr` keeps a copy of each endpoint it binds, and gives the login supervisors
+  theirs. It mints `device-mgr`'s info endpoint itself, as `init` did.
+- **`critical = true` keeps the backstop** for the two servers `init` treats as critical-path,
+  `auth-service` and `logging-service`. If one cannot be brought up within its restart policy,
+  `service-mgr` asks `init` for the emergency shell. That uses the channel `init` now keeps (below).
+- **`essential = true` refuses `--stop` and `--restart`** for a service whose absence would lock
+  the administrator out or lose state nothing can rebuild:
+  - the view broker, since `with admin service --start` needs it;
+  - `auth-service`;
+  - `logging-service`, the audit;
+  - `device-mgr` and `storage-service`, whose subscriptions and mounts would be lost.
+
+  The rest — `tty-server`, `clipboard-server`, `input-server`, the compositor — may be stopped.
+- **The declarations and the profile manifest move onto root**: `/system/services.toml` and
+  `/system/profiles/system.toml`, read after `init` has mounted it. The initramfs then holds
+  `init.toml` and its four programs, and the live image's marker, as the 2026-09-22 decision says
+  it should.
+  - **`check-images` gains a root comparison**: test and release roots may differ in those two
+    files and the test packages' store paths, and nothing else. The initramfs allow-list shrinks
+    to `init.toml`.
+- **`heartbeat` leaves the release image.** It is Phase 3's demo, and its declaration was the only
+  one a release image carried. It stays in the test image. The 1.1 s demo stop goes, since
+  `service --stop` is the real one.
+- **Every stoppable service exits on `CTRL_OP_SHUTDOWN`**, on the control channel it must hold
+  until it exits anyway: `service-mgr` tells deaths apart by that channel closing. Each adds the
+  channel to its wait set. A stop is a request, as every stop here is. One not honoured within a
+  bound is reported "asked, and still running", and there is still no forcible kill.
+- **`service-mgr` serves `/svc/services`**, as the storage service serves `/svc/storage`. Resolving
+  from the root namespace mints one of three endpoints:
+  - `session-endpoint`: `List`, for anyone. Both login supervisors bind it into every session at
+    `/dev/services`.
+  - `admin-endpoint`: `Start`, `Stop` and `Restart`. The `services` grant binds it at
+    `/dev/services/admin`.
+  - `power-endpoint`: `Shutdown { reboot }`. The `power` grant binds it at `/dev/power`.
+
+  A new rsproto category, `Services` (`0x11xx`), carries them. A restarted server is bound again
+  at its path. Clients holding the old channel see it close, and re-resolving is theirs:
+  `clip` resolves `/dev/clipboard` on every run, and the compositor's windows do not survive.
+- **`service`, a coreutil**:
+  - `--list`: `Table<{name, state, restarts}>`, where state is `running`, `stopped`, `failed` or
+    `starting`;
+  - `--start`, `--stop` and `--restart NAME`, through the `services` grant.
+- **The shutdown sequence**, owned by `service-mgr` and finished by `init`, as `service-manager.md`
+  splits it (*A shutdown, end to end*, below).
+  - **The login supervisors** forward a terminate request to their session's leader and close the
+    session at the broker, which asks what it started to stop. They wait for the leader for a
+    bounded time, and exit. This is a change in `libsession::spawn_leader`, shared by both.
+  - **The storage service**, on `CTRL_OP_SHUTDOWN`, unmounts everything it mounted and exits: sync,
+    `Meta::Unmount`, flush. It skips the held check, by the maintainer's call.
+  - **`init` keeps its mounts' control channels**, and the handoff channel to `service-mgr` as a
+    *terminal channel*: `Finish { reboot }` one way, `Emergency` the other.
+- **The system-control object**: a new kernel object, created at boot and given to `init` in `rdx`.
+  `init` never delegates it; it is the one process that stops the machine.
+  - `sys_power(handle, op)`, for `halt` and `reboot`, first **flushes every block device**
+    (`IoOpcode::Flush`, bounded), then stops every CPU through `stop_the_machine`'s path.
+  - Then `halt` writes **"It is now safe to turn off your computer."** on COM1 and the framebuffer
+    console, and halts.
+  - `reboot` tries, in order: the FADT's reset register if it advertises one (`RESET_REG_SUP`),
+    the i8042's reset pulse, and a triple fault.
+  - **No AML**: power-off through S5 stays deferred with ACPICA. The laptop stays on showing the
+    message until its button is held.
+- **FADT is parsed** for three things: its flags, the reset register and value, and the RTC century
+  register. The hardware report prints them, so the laptop's report says whether it can reset by
+  register, and the RTC uses the century register when there is one.
+- **The clock.** `sys_clock_set(CLOCK_REALTIME, ns)` requires `SYSTEM_CLOCK`.
+  - It is one atomic store of the offset, as `clock.rs` intends.
+  - It also writes the RTC back, in UTC and in the chip's own BCD or binary, 12- or 24-hour form,
+    with the century register when FADT names one.
+  - **The `clock` grant is `SYSTEM_CLOCK` passed at spawn.** So the broker must hold it: its
+    declaration gains it, and `service-mgr`, which `init` now grants it, passes it on.
+  - `date --set` takes ISO 8601 in UTC (`2026-09-28T14:30:00Z`), with the inverse of
+    `libtime::civil_from_days` added.
+- **The log.**
+  - `logging-service` gains a **read endpoint**, minted by resolving `read-endpoint` from the root
+    namespace, which answers `Read { after_sequence, max }` with records.
+  - **Its ring grows**: 256 records is smaller than one boot's log, and the audit is in it.
+  - The `logs` grant binds the read endpoint at `/dev/logs`. `/dev/log` stays the kernel's own ring,
+    which this does not merge.
+  - `log [PRINCIPAL]` writes `Table<{time, principal, tier, level, message}>`.
+
+### A shutdown, end to end
+
+1. `alice` types `with power shutdown`. The policy asks no password for `power`. The broker builds
+   the view, binding `service-mgr`'s power endpoint at `/dev/power`, and `shutdown` sends
+   `Shutdown { reboot: false }` there. The broker records it.
+2. **Sessions.** `service-mgr` sends a terminate request to both login supervisors. Each forwards it
+   to its leader, `nxsh` or `desktop-shell`, and closes the session at the broker, which asks the
+   session's programs to stop. Each waits a bounded time for its leader and exits. `service-mgr`
+   waits for both, bounded.
+3. **Services, last started first.** `service-mgr` sends `CTRL_OP_SHUTDOWN` to each, and waits a
+   bounded time for each. The storage service unmounts everything it mounted on the way out. A
+   service still running past its bound is noted, and the sequence goes on.
+4. `service-mgr` sends `init` `Finish { reboot: false }` on the terminal channel.
+5. **`init`'s own mounts, last first**: `sys_ns_sync` on the mount point, then `Meta::Unmount` on
+   its control channel. The server writes back, records the filesystem clean, and exits.
+6. `init` calls `sys_power(system-control, halt)`. The kernel flushes every block device, stops
+   every CPU, and writes *"It is now safe to turn off your computer."* on the screen and COM1.
+
+A reboot is the same, with `reboot: true` and a reset at the end.
+
+### The pieces, in dependency order
+
+- [ ] **E.1 — `service-mgr` starts the servers.**
+      - The declaration keys: `endpoint`, `critical` and `essential`.
+      - The nine servers move from `init` into declarations. `init` keeps its mounts, the profile
+        server, `service-mgr` and the emergency shell.
+      - The handoff shrinks to two endpoints, and the channel stays open as the terminal channel.
+      - The declarations and the profile manifest move to `/system`, and `heartbeat` leaves the
+        release image.
+      - `check-images` gains the root comparison.
+      - Gates:
+        - every existing gate unchanged in what it asserts, since they are the regression suite for
+          the move; the lines that named `init`'s binds name `service-mgr`'s;
+        - `boot-probe` checks each server is bound at its path, with `init`'s log naming only its
+          mounts, `/bin` and `service-mgr`;
+        - `check-images`, including a control that adds a file to one root.
+- [ ] **E.2 — `service`.**
+      - `/svc/services` and its three endpoints, with `List`, `Start`, `Stop` and `Restart`
+        (`rsproto-services-ops.md`, which E.2 writes). <!-- check-docs: allow-missing -->
+      - Each stoppable server exits on `CTRL_OP_SHUTDOWN`; an essential one is refused.
+      - The `services` grant, and the seeded `admin` profile gains it.
+      - `service` itself.
+      - Gates:
+        - `boot-probe`: `List`; `clipboard-server` stopped, started and restarted through the admin
+          endpoint; an essential stop refused;
+        - `test-interactive`: `service --list`, then `with admin service --restart
+          clipboard-server`, after which `clip` still copies and pastes.
+- [ ] **E.3 — the kernel: the system-control object, FADT, and the power op.**
+      - The object in `init`'s boot grant.
+      - `sys_power`: flush, stop, then the message or the reset chain.
+      - FADT's flags, reset register and century register, in the hardware report.
+      - Gates:
+        - host tests for the FADT parser, including a table too short to hold a reset register;
+        - `test-qemu`: the FADT facts q35 has;
+        - `check-report`: the same lines, read off the live image's report.
+- [ ] **E.4 — `shutdown`.**
+      - The sequence: sessions, services in reverse order, the storage service's unmount of
+        everything, `init`'s mounts, the power op.
+      - The `power` grant, and the seeded policy's `power` view for everyone.
+      - `shutdown [--reboot]`.
+      - **`cargo xtask check-shutdown`**, in CI's QEMU job. It boots a `--selftest` disk image, and
+        on serial:
+        1. `test-pattern` writes a pattern under `/home` through a mapping, without a sync;
+        2. `with power shutdown`;
+        3. the message is read off the screen with `check-fbcon`'s decoder, and off COM1;
+        4. then the host checks the disk: `e2fsck -fn` clean, `s_state` clean, and the pattern
+           present.
+
+        A second boot runs `with power shutdown --reboot`, and QEMU is watched through a second
+        boot.
+- [ ] **E.5 — the clock.**
+      - `sys_clock_set` and the RTC's write-back.
+      - `SYSTEM_CLOCK` from `init` to `service-mgr`, and to the broker.
+      - The `clock` grant, and `date --set`.
+      - Gates:
+        - host tests for the RTC's encodings and for parsing a time;
+        - `test-interactive`: `with admin date --set`, then `date`;
+        - `check-shutdown`'s reboot half: the clock set before the reboot reads back after it —
+          **if QEMU keeps the RTC's registers across a guest reset**, which is unverified and is the
+          first thing E.5 checks. If it does not, the write-back needs another witness, such as a
+          host read of CMOS.
+- [ ] **E.6 — the log.**
+      - The read endpoint and `Read`, and a larger ring.
+      - The `logs` grant, `/dev/logs`, and `log`.
+      - Gates:
+        - host tests for `Read`'s encoding, including a reader fed bytes no writer makes;
+        - `test-interactive`: `with admin log view-broker` shows an audit record an earlier step
+          wrote, and `log` without the grant names it.
+- [ ] **Docs.**
+      - `service-manager.md`: the boundary as built, the declaration keys, the endpoints and the
+        shutdown.
+      - `service-toml-schema.md`; `rsproto-services-ops.md`, new; `logging.md`'s read op. <!-- check-docs: allow-missing -->
+      - `boot-flow.md` and `init/CLAUDE.md`: what `init` starts.
+      - `views-toml-schema.md`: the four grants.
+      - `shell-language.md` §10d: `service`, `shutdown`, `date --set` and `log`.
+      - The root `CLAUDE.md`: `check-shutdown`.
+
+**E.1 comes first**, since every later piece stands on `service-mgr` owning the services. **E.3
+comes before E.4**, and E.5 and E.6 can go anywhere after E.1.
+
+### What to compare on the day
+
+- **Every gate, for E.1**: nothing a person sees changes when `service-mgr` starts what `init` did.
+- **`check-shutdown`**, new in CI: a clean filesystem after a write nothing synced, and a reboot.
+- **`check-images`**: the roots, as well as the initramfs archives.
+- **`test-interactive`**: `service`, `date --set` and `log`.
+
+### Consequences for earlier parts
+
+- **The gates that wait on `init`'s bind lines** — `test-interactive`'s `init: device-mgr bound at
+  /svc/devices`, and a display gate's `init: auth-service bound at /svc/auth` — wait on
+  `service-mgr`'s.
+- **Parts A–C's docs name `init` as the binder** of the broker, the device manager and the storage
+  service: `userspace/CLAUDE.md`'s *Capability discipline*, `rsproto-views-ops.md`,
+  `device-manager.md` and `storage.md`. Each says `service-mgr`.
+- **`TODO(svc-auth-ungated)` is unchanged in substance**: the binder is `service-mgr`, and the
+  boundary is still the root namespace.
+- **Part G's installer** writes `/system/services.toml` and the profile manifest with the root it
+  installs, since they no longer ride in the initramfs.
+
+### Left alone
+
+- **Power-off through ACPI S5**, which needs AML: with ACPICA.
+- **A forcible kill.** A service or program that ignores its stop outlives it until the machine
+  stops.
+- **The session menu**: Part F.
+- **Enabling and disabling a service persistently.** With `/system/services.toml` on root this is a
+  small edit, and still nothing wants it.
+- **Clients that reconnect** to a restarted server.
+- **The kernel's log** (`/dev/log`) beside the service log: two rings, as `logging.md` describes.
+- **Timezones, and network time.**
+
 ## Gates
 
 | Part | What proves it |
@@ -1698,7 +2001,7 @@ from "lost at exit" to "lost at power-off unless something syncs it".
 | B | `/dev/registry` and the subscriptions, in `test-qemu`; `/dev/devices` from a session, in `test-interactive`; every key and click through the manager, in `check-input` and its `--no-ps2-irq` variant; the RAM disk's record, in `check-live`; the session line, in `check-login`; and the installer's graphical path, in `check-install` on demand |
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, `check-recovery`, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
-| E | **a shutdown gate**: write through a mapping without syncing, run `shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot |
+| E | **every existing gate** unchanged, for `service-mgr` starting what `init` did; **`check-shutdown`**, in CI: write through a mapping without syncing, run `with power shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot, with the clock set before it read back after; `check-images` comparing the roots; `service`, `date --set` and `log` in `test-interactive` |
 | G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |
 
 ## Deferred from this phase
