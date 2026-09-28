@@ -220,7 +220,7 @@ keep coherent. **Both built-in schemes are `0`, flat, since the refresh** — th
 gradient in it — and the key stays because a bevel is still a theme somebody may want.
 
 **`cursor_body`, `cursor_outline`, `outline` and `desktop` are read but do not take effect.** They are drawn
-by the *compositor*, which `init` starts rather than the session — so it never sees a setup
+by the *compositor*, which `service-mgr` starts rather than the session — so it never sees a setup
 record and uses the built-in values. They are listed because they are part of one theme and a
 file that omitted them would be describing a different thing than the type does. **Trigger for
 making them live: a control panel that wants to restyle the cursor** — the mechanism is a manager

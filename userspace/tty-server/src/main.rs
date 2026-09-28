@@ -1,8 +1,9 @@
 //! `tty-server` — the userspace terminal server.
 //!
-//! Bound at `/dev/tty` by init. A client resolving it gets a **fresh per-caller channel**
-//! (an `OBJECT_KIND_CHANNEL` resolve reply, the same shape the logging service uses), and
-//! then speaks `Tty::ReadLine` / `Write` / `SetMode` / `Close` on it.
+//! Bound at `/dev/tty` by `service-mgr` (by `init` until administration Part E.1a). A client
+//! resolving it gets a **fresh per-caller channel** (an `OBJECT_KIND_CHANNEL` resolve reply, the
+//! same shape the logging service uses), and then speaks `Tty::ReadLine` / `Write` / `SetMode` /
+//! `Close` on it.
 //!
 //! ## Why it exists
 //!
@@ -214,7 +215,7 @@ fn make_channel() -> Option<(u64, u64)> {
     Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
 }
 
-/// Send `Meta::Ready` on `control`, transferring the endpoint init binds at `/dev/tty`.
+/// Send `Meta::Ready` on `control`, transferring the endpoint `service-mgr` binds at `/dev/tty`.
 fn send_ready(control: u64, kernel_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(body_len) = librsproto::meta::ready(&mut body, b"tty-server") else {
@@ -740,7 +741,7 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
 }
 
 /// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root
-/// namespace (resolves `/dev/console`), `rdx` = init's control endpoint, `rcx` unused.
+/// namespace (resolves `/dev/console`), `rdx` = its supervisor's control endpoint, `rcx` unused.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"tty-server: up\n");

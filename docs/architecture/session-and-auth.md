@@ -1,11 +1,12 @@
 # Sessions and authentication
 
-**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-25,
-when `account` arrived — administration Part D.4; earlier that day, when the view broker began
-fronting account operations — Part D.3; earlier that day, when it opened an admin session of its own
-to judge a policy — Part D.2; earlier that day, when `auth-service` became the user database's
-writer — administration Part D.1; earlier that day, when each session gained `/storage` and
-`/dev/storage`, the storage service's session endpoint at the bases `/fs` and `/info` —
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-28,
+when `service-mgr` began starting and binding `auth-service` — administration Part E.1a; before that
+2026-09-25, when `account` arrived — administration Part D.4; earlier that day, when the view broker
+began fronting account operations — Part D.3; earlier that day, when it opened an admin session of
+its own to judge a policy — Part D.2; earlier that day, when `auth-service` became the user
+database's writer — administration Part D.1; earlier that day, when each session gained `/storage`
+and `/dev/storage`, the storage service's session endpoint at the bases `/fs` and `/info` —
 administration Part C.6; before that 2026-09-24, when each session gained `/dev/devices`, the device
 manager's tables at the base `/info` — Part B.4; before that 2026-09-23, when each session gained a
 view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the
@@ -89,20 +90,25 @@ access. session-mgr reaches it over an rsproto channel. **Since administration P
 writes the DB**, on an admin session of its own (§ *The user database*); the oracle described
 here is unchanged by that.
 
-**That channel is resolved from a namespace, as of M7 Part C.** `init` spawns
-`auth-service` and binds its forwarding endpoint at `/svc/auth`; a supervisor resolves that
+**That channel is resolved from a namespace, as of M7 Part C.** `service-mgr` starts
+`auth-service`, the first server it starts, and binds `/svc/auth` to reach its forwarding
+endpoint (administration Part E.1a; `init` did both before that); a supervisor resolves that
 path and gets a session channel of its own, minted per caller — the same shape
 `profile-server` serves `/bin` and the tty server serves `/dev/tty` with. `session-mgr` does
 this at startup, and so does `desktop-session-mgr` — once, not per attempt: the oracle's
 lifetime is the machine's.
 
-**Bound by `init`, not by the supervisor that used to spawn it.** `service-mgr` spawned
-`auth-service` until Part C, and the resource-server protocol says the supervisor that starts a
-server registers it — but a declared service is spawned with `namespace: 0`, an inherited
-**LOOKUP-only** root, so it cannot bind into it. The bind was written in `service-mgr` first
-and came back `FAIL`, which is how the constraint was found rather than deduced. init owns the
-root namespace and already binds `/bin`, `/log`, `/dev/tty`, `/dev/input/new` and `/dev/draw`;
-this is the sixth.
+**Bound by `service-mgr`, which starts it — again.** `service-mgr` spawned `auth-service` until
+M7 Part C, and the resource-server protocol says the supervisor that starts a server registers
+it — but a spawned process gets an inherited **LOOKUP-only** root, so it cannot bind into it. The
+bind was written in `service-mgr` first and came back `FAIL`, which is how the constraint was
+found rather than deduced, and `init` started and bound the oracle from then until
+administration Part E.1a. Since then `init` hands `service-mgr` a root handle with its own
+rights, and `service-mgr` starts and binds every server
+([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
+
+**`auth-service` is `critical`**: if it does not come up at boot, `service-mgr` starts nothing
+more and `init` starts the emergency shell — the backstop the oracle had when `init` started it.
 
 **What this replaced, and why it had to go.** `auth-service` created **one** channel pair at
 startup and transferred the client end in its `Meta::Ready`, which `service-mgr` couriered to
@@ -292,13 +298,14 @@ without `/dev/devices`, and says so.
 ### The storage service's filesystems
 
 **Every session reaches every mounted filesystem; none can mount one** (administration Part C.6).
-Each supervisor resolves a **session endpoint** at `/svc/storage/session-endpoint` itself, once,
-as it resolves `/svc/views/session`, so nothing new travels the handoff channels. It binds it
-twice: at `/storage` with the base `/fs`, so `/storage/<label>/…` continues into that filesystem's
-own namespace, and at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table
-of what each disk holds and where it is mounted. `desktop-session-mgr` hands the endpoint to
-`desktop-shell` as its eighth extra, and the shell binds it the same two ways into every
-application ([`storage.md`](storage.md)).
+Each supervisor is handed `service-mgr`'s route to a **session endpoint** of the service's, which
+`service-mgr` resolves at `session-endpoint` each time the service comes up (administration Part
+E.1b; each supervisor resolved `/svc/storage/session-endpoint` itself until then, and held an
+endpoint that would have died with the service). It binds it twice: at `/storage` with the base
+`/fs`, so `/storage/<label>/…` continues into that filesystem's own namespace, and at `/dev/storage`
+with the base `/info`, so `/dev/storage/all.tsm` is the table of what each disk holds and where it
+is mounted. `desktop-session-mgr` hands the endpoint to `desktop-shell` as its eighth extra, and the
+shell binds it the same two ways into every application ([`storage.md`](storage.md)).
 
 **The endpoint is the boundary, again.** On a session endpoint the service answers the filesystems
 and the table, and `admin-endpoint` is `NotFound` however it is bound, so the shell, holding it

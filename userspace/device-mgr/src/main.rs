@@ -6,11 +6,12 @@
 //!
 //! 1. Read `/dev/registry` once: every node's record, then each class device's node by id. Every
 //!    node registers before userspace starts, so one read is complete coldplug.
-//! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `init` binds it at `/svc/devices`.
+//! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
+//!    `/svc/devices`.
 //! 3. Serve. `<class>` makes the resolver that class's owner and replays its devices; `info` is a
 //!    directory session; `info/<name>.tsm` is a table, as a fresh read-only memory object; and
 //!    `info-endpoint` is a forwarding endpoint of the manager's own, on which only the last two
-//!    are answered — what `init` couriers to the supervisors for a session's `/dev/devices`.
+//!    are answered — what `service-mgr` couriers to the supervisors for a session's `/dev/devices`.
 
 #![no_std]
 #![no_main]
@@ -42,8 +43,8 @@ const MSG_LEN: usize = 4096;
 /// the owner is busy. The replay itself is always room made: sends do not block, so a channel
 /// shallower than the replay would cut it short, and `Settled` would count what fit.
 const SUBSCRIPTION_HEADROOM: usize = 32;
-/// Info-only endpoints at once. `init` asks for one at boot and couriers it for every session;
-/// the second is headroom, not a use.
+/// Info-only endpoints at once. `service-mgr` asks for one at boot and couriers it for every
+/// session; the second is headroom, not a use.
 const MAX_INFO_ENDPOINTS: usize = 2;
 /// Directory sessions open at once: the wait set, less the endpoint, the info-only endpoints and
 /// an owner per class.
@@ -270,8 +271,8 @@ impl Manager {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
         // **Said before the reply, not after**, so the line is ordered against what the asker
-        // does next rather than racing it: a gate reads it as `init` having asked for the endpoint
-        // it couriers, before any login exists.
+        // does next rather than racing it: a gate reads it as `service-mgr` having asked for the
+        // endpoint it couriers, before any login exists.
         kprint(b"device-mgr: an info-only endpoint minted\n");
         if reply_channel(reply_to, request_id, client_end) {
             self.info_ends.push(ours);
@@ -396,7 +397,8 @@ impl Manager {
     }
 }
 
-/// Send `init` `Meta::Ready`, naming this server and carrying the forwarding endpoint's client end.
+/// Send `Meta::Ready` to `service-mgr`, naming this server and carrying the forwarding endpoint's
+/// client end.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(n) = librsproto::meta::ready(&mut body, b"device-mgr") else {
@@ -405,8 +407,8 @@ fn send_ready(control: u64, client_end: u64) -> bool {
     send(control, librsproto::OP_READY, 0, 0, &body[..n], &[client_end])
 }
 
-/// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `init` prints
-/// `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
+/// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `service-mgr`
+/// prints `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
 fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 64];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
@@ -415,7 +417,7 @@ fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
 }
 
 /// Bootstrap registers: `rdi` = notification channel, `rsi` = the inherited root namespace,
-/// `rdx` = the control channel `init` installed, `rcx` = `arg0`.
+/// `rdx` = the control channel `service-mgr` installed, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"device-mgr: up\n");
@@ -495,7 +497,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 // **A root endpoint with no peer is the end of this manager**, not a message to
                 // skip: the kernel keeps a peer-closed channel signalled, so going round again
                 // would spin a CPU for the life of the boot (PR #333 review, finding 1). It happens
-                // when `init`'s bind at `/svc/devices` fails — `init` has closed the only other
+                // when `service-mgr`'s bind in its registry fails — it has closed the only other
                 // handle — and then nothing can reach this manager to subscribe anyway. Exiting is
                 // what `input-server` does in the same place.
                 if !m.serve_resolve(h, false) {

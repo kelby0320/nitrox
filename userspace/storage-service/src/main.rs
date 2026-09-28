@@ -5,9 +5,9 @@
 //! ## Shape (administration Part C.5a)
 //!
 //! 1. **Own `block`.** Resolve `/svc/devices/block`: the device manager has already queued an
-//!    `Arrived` per disk, partition and RAM disk, each carrying this service's own duplicate of
-//!    the device's node, then `Settled`. `init` spawns this service straight after the manager, so
-//!    it is the class's owner from boot on and nothing else can take the disks.
+//!    `Arrived` per disk, partition and RAM disk, each carrying this service's own duplicate of the
+//!    device's node, then `Settled`. `service-mgr` spawns this service straight after the manager,
+//!    so it is the class's owner from boot on and nothing else can take the disks.
 //! 2. **Read what is there.** Each device is probed as its server would read it: ext4 through
 //!    `fs-server-ext4`'s own checks, FAT from its boot sector, or nothing. Each disk's partition
 //!    table is read too, for `init.toml`'s UUID sources.
@@ -17,7 +17,7 @@
 //! 4. **Mount what it can serve** (C.5b): every ext4 `init` did not mount, read-only on a live
 //!    boot. Each gets an `fs-server-ext4` spawned over it and a namespace of its own with that
 //!    server bound at `/`, and is named by its label.
-//! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `init` binds it at
+//! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/storage`. `info` is a directory session, `info/<name>.tsm` a table as a fresh
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
 //!    reply: the kernel continues the resolve in the mount's namespace, so a file fills through

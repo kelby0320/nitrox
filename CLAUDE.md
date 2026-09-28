@@ -59,7 +59,7 @@ cargo xtask shot           # boot the release image and photograph the whole des
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
-cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
+cargo xtask check-images   # test vs release initramfs and root: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
@@ -114,11 +114,12 @@ in `init.toml`** and got one in Phase 5 Part C.1: a `[[bind]]` in the test image
 (`docs/spec/init-toml-schema.md`). `init` takes no cargo feature in any mode, so a test image and
 a release image carry the same `init`.
 
-`cargo xtask check-images` is what keeps the property: it fails if a test image and a release
-image start differing in anything new. It holds the **live image** to the same rule: its initramfs
-may differ from the release one only in `etc/init.toml`, and the filesystem inside its `root.img`
-must be the release root partition's, file for file. The **test live image** `check-storage` boots
-is held the same way to a `--selftest` image.
+`cargo xtask check-images` is what keeps the property: it fails if a test image and a release image
+start differing in anything new — in their initramfs, and since administration Part E.1c in their
+roots, where the service declarations and the profile manifest now are. It holds the **live image**
+to the same rule: its initramfs may differ from the release one only in `etc/init.toml`, and the
+filesystem inside its `root.img` must be the release root partition's, file for file. The **test
+live image** `check-storage` boots is held the same way to a `--selftest` image.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
@@ -137,9 +138,9 @@ display arm exists for a person rather than for a test: everything else display-
 *before* the shell it will eventually show, so Parts E and F land against a gate that exists.
 
 **It must boot the release image**, not the test one. In a `--selftest` boot the greeter is
-bottom-most — `service-mgr` brings the login chain up before declared services, which is what
-keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
-typed reaches it.
+bottom-most — `service-mgr` brings the login chain up after the servers and before every other
+declared service, which is what keeps `check-display`'s reference windows undisturbed — so it holds
+no keyboard and nothing typed reaches it.
 
 `cargo xtask check-fbcon` is the **no-serial-port gate** (Phase 5 Part B): the laptop Phase 5
 targets has no COM1, so the kernel draws everything COM1 receives on the screen until a client is

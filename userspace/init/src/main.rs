@@ -12,8 +12,11 @@
 //!    `sys_ns_bind`ing its forwarding endpoint at the mount point (the Resource
 //!    Server Startup Protocol); then reads `/system/current-generation` through the
 //!    freshly-mounted root (the slice-7 milestone — the whole stack end to end);
-//! 3. spawns `parent` (the slice-1/2/3 demo chain: `parent` → `child`);
-//! 4. enters the reaping loop, closing the process handle of each exited child.
+//! 3. binds the profile server at `/bin`;
+//! 4. spawns `service-mgr`, handing it a root handle with init's own rights and the root
+//!    filesystem's and profile server's endpoints — **`service-mgr` starts the system's servers**
+//!    since administration Part E.1a, which init did before;
+//! 5. enters the reaping loop, which also answers the terminal channel to `service-mgr`.
 //!
 //! Per `userspace/init/CLAUDE.md`, init uses `libkern` + `alloc` only and never
 //! `panic!`s in normal operation.
@@ -43,8 +46,10 @@ const PAGE: u64 = 4096;
 /// not wait forever for a server that never reports up.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// The notification channel and the terminal channel: what [`reap_loop`] waits on. Other
+/// callers use the first slot with a count of one.
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 static mut NOTIF: Notification = Notification::zeroed();
 
 /// Control-channel endpoints for an fs-server handshake (init keeps `[0]`, the
@@ -65,47 +70,11 @@ static mut FS_ENDPOINT: u64 = 0;
 /// root namespace can *use* `/bin` but can never obtain the thing needed to bind it
 /// elsewhere. Retaining it here is what makes the projection delegable at all.
 static mut PROFILE_ENDPOINT: u64 = 0;
-/// The tty server's **forwarding** endpoint, retained after the `/dev/tty` bind so init can
-/// hand it to service-mgr (→ session-mgr binds it into each session, sharing the one
-/// registration exactly as `/home` and `/bin` do).
-///
-/// A session must bind *this* — the channel the kernel forwards resolves down — and not a
-/// tty channel minted from it. Both are `IpcChannel`s and the kernel adopts any bound
-/// channel as a server, so binding a client channel silently produces a namespace entry
-/// that answers `Namespace::Resolve` with `Unsupported`.
-static mut TTY_ENDPOINT: u64 = 0;
-
-/// The compositor's **forwarding** endpoint, retained after the `/dev/draw` bind so init can
-/// hand it down for a *graphical session* namespace to bind.
-///
-/// The fourth endpoint to make this trip, and the first that only one of the two login
-/// columns wants: a serial session has no use for a compositor. `desktop-shell` needs
-/// `/dev/draw` bound in the session namespace it runs in — a connection handle would not do,
-/// because the shell resolves `manage` as well as `new`, and Part E gates *applications* by
-/// binding the two paths differently.
-static mut DRAW_ENDPOINT: u64 = 0;
-
-/// The clipboard server's **forwarding** endpoint, retained after the `/dev/clipboard` bind so
-/// init can hand it down for *both* session columns to bind (M12 Part E).
-///
-/// The fifth to make this trip, and the first that both columns want for the same reason: M12
-/// decision 4 makes the clipboard reachable as a path so a *pipeline* can use it, and the
-/// pipeline lives in the serial session as much as the graphical one. `/dev/draw` is the
-/// counter-example — one column has no use for a compositor.
-static mut CLIPBOARD_ENDPOINT: u64 = 0;
-/// The view broker's forwarding endpoint, retained for the handoff to `service-mgr` and on to
-/// both login supervisors (administration Part A.4): each binds it into every session it builds, at
-/// `/dev/views` with that session's base, which is how the broker knows whose request it is.
-static mut VIEWS_ENDPOINT: u64 = 0;
-/// **An info-only endpoint of the device manager's**, resolved at `/svc/devices/info-endpoint` and
-/// retained for the handoff to `service-mgr` and on to both login supervisors (administration
-/// Part B.4): each binds it into every session at `/dev/devices` with the base `/info`.
-///
-/// **Not a duplicate of the endpoint bound at `/svc/devices`**, which is the difference between a
-/// capability and a convention. The manager answers only its tables on this one, whatever suffix
-/// arrives — and `desktop-shell`, which holds what is couriered and `BIND_NAMESPACE`, could bind it
-/// with no base, where a suffix like `block` would otherwise subscribe to every disk.
-static mut DEVICES_ENDPOINT: u64 = 0;
+/// **The terminal channel** to `service-mgr` (administration Part E.1): the handoff channel,
+/// kept open once its three handoffs are sent. `service-mgr` asks for the emergency shell on it
+/// when a critical server does not come up at boot, and its closing is how `init` learns that
+/// `service-mgr` has gone. `0` while there is none.
+static mut TERMINAL: u64 = 0;
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -141,146 +110,6 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the system `logging-service` (slice: logging): one moved handle — the
-/// control channel — in `handles[0]` (delivered in `rdx`). It resolves nothing (clients
-/// bring their own log endpoint), so its inherited LOOKUP-only namespace is unused; it
-/// answers forwarded `/log/...` resolves by minting per-principal log channels.
-/// Spawn args for the `tty-server`: one moved handle — the control channel — in
-/// `handles[0]`. It resolves `/dev/console` through its inherited LOOKUP-only root
-/// namespace and holds it exclusively thereafter.
-static mut SPAWN_TTY: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/tty-server
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
-
-/// Spawn args for the `clipboard-server`: one moved handle — the control channel — in
-/// `handles[0]`. It resolves nothing at all: the ring is `.bss`, so its inherited LOOKUP-only
-/// namespace goes unused.
-static mut SPAWN_CLIPBOARD: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/clipboard-server
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
-
-static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/logging-service
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
-/// Spawn args for `auth-service`: one moved handle — the control channel it sends
-/// `Meta::Ready` on — and an inherited LOOKUP-only namespace through which it resolves
-/// `/system/users`. **No syscaps**: like every resource server it does not hold
-/// `BIND_NAMESPACE`; init binds its endpoint on its behalf.
-static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/auth-service
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
-/// Spawn args for the `view-broker` (administration Part A): the control endpoint, moved, as
-/// `auth-service`'s — and **`BIND_NAMESPACE`**, which only it and the storage service, of the
-/// resource servers `init` spawns, hold.
-/// The broker binds a profile's grants into the views it builds; it binds only into namespaces it
-/// created, and never registers itself (`docs/architecture/graphical-session.md` §3 is the same
-/// reconciliation, for `desktop-shell`).
-static mut SPAWN_VIEWS: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/view-broker
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE,
-};
-/// Spawn args for the `device-mgr` (administration Part B): the control endpoint, moved. **No
-/// syscaps**: it binds nothing — `init` binds it at `/svc/devices` — and it reads the device table
-/// through `/dev/registry`, which the root namespace it inherits already holds.
-static mut SPAWN_DEVICES: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/device-mgr
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0,
-};
-/// Spawn args for the `storage-service` (administration Part C.5): the control endpoint, moved,
-/// and **`BIND_NAMESPACE`** since C.5b. It builds a namespace for each filesystem it mounts, with
-/// that filesystem's server bound at `/`, and binds into no namespace it did not create — the view
-/// broker's reconciliation (`userspace/CLAUDE.md` § Capability discipline). `init` binds the
-/// service itself at `/svc/storage`. It takes its disks from `/svc/devices/block`, which the root
-/// namespace it inherits reaches, as `input-server` takes its devices from `input`.
-static mut SPAWN_STORAGE: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/storage-service
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE,
-};
-/// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
-/// control channel — and a LOOKUP-only namespace handle through which it resolves
-/// `/svc/devices/input`, where the device manager hands it its devices (administration Part
-/// B.3). **No syscaps**: like every resource server, it does not hold `BIND_NAMESPACE`; init
-/// binds its endpoint on its behalf.
-///
-/// **It is the only process that should ever read the raw nodes**, and it is the input class's
-/// one owner at the manager, which refuses a second. The nodes' paths, `/dev/input/raw/*`, are
-/// bound in the root namespace and nowhere else, and no session namespace projects them or
-/// `/svc/devices` — reading one unfiltered is a keylogger, and the binding is the whole of that
-/// boundary (`docs/architecture/input-subsystem.md` §5).
-static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/input-server
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    // `TRANSFER` is the one that is easy to omit and fails late: `Meta::Ready` carries the
-    // forwarding endpoint as a handle transfer, so without it the server comes up, takes its
-    // devices, and only then cannot announce itself.
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
-
-/// Spawn args for the `compositor` (display arm M2 Part B): no handles, and it inherits a
-/// LOOKUP-only handle to init's root namespace so it resolves `/dev/framebuffer`.
-/// **No syscaps** — it binds nothing; init does the binding, as for every other resource
-/// server (`docs/rationale/why-supervisor-registration.md`).
-static mut SPAWN_COMPOSITOR: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/compositor
-    handle_count: 1,
-    move_mask: 1, // move handle 0 (the control endpoint) to the child
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0, // a resource server holds no ambient capabilities
-};
 /// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
 /// inherit a LOOKUP-only handle to init's root namespace (so it resolves
 /// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
@@ -298,16 +127,14 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// Spawn args for the service manager (the normal handoff). It inherits a LOOKUP-only
 /// handle to init's root namespace and holds `BIND_NAMESPACE` — its defining
 /// supervisor capability (registering service endpoints, re-delegating to
-/// session-mgr). See `docs/architecture/service-manager.md` § Capability posture. In
-/// slice A it supervises a leaf service and binds nothing yet; the bind-righted
-/// namespace handle (the second gate) and the `LOAD_MODULE`/`SYSTEM_CLOCK`
-/// pass-through caps arrive with the RS protocol + those services (slice B onward).
-/// `handles[0]` is a **handoff channel** end, moved to service-mgr, over which init sends
-/// the fs-server and profile-server forwarding endpoints (in that order) for service-mgr
-/// to carry down to session-mgr. It carries `TRANSFER` so those endpoints can be handed
-/// onward, and `SEND`/`RECV`/`WAIT` so the channel itself works. Spawned in **both**
-/// boots now (the selftest boot brings the login chain up after the demo chain reaps so
-/// it is exercised under `test-qemu`).
+/// session-mgr). See `docs/architecture/service-manager.md` § Capability posture. The
+/// bind-righted root it binds the servers with — the second gate — is sent down the
+/// handoff channel rather than inherited (administration Part E.1a).
+/// `handles[0]` is that **handoff channel** end, moved to service-mgr, over which init sends
+/// the root handle, then the fs-server and profile-server forwarding endpoints, in that
+/// order. It carries `TRANSFER` so those endpoints can be handed onward, and
+/// `SEND`/`RECV`/`WAIT` so the channel itself works; init keeps its own end as the
+/// **terminal channel**. Spawned in **both** boots.
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/service-mgr
     handle_count: 1,
@@ -862,608 +689,6 @@ fn bind_profile_server(root_ns: u64) -> bool {
     true
 }
 
-/// Spawn the system logging service and bind its forwarding endpoint at `/log` (the RS
-/// startup protocol, minus a device — it needs none). Clients then resolve
-/// `/log/<tier>/<principal>` to obtain a per-principal log channel. Bound before the
-/// service manager starts so services can log from launch. Returns `true` once bound.
-fn bind_logging_service(root_ns: u64) -> bool {
-    // 1. Create the control channel (init keeps end 0, the server gets end 1).
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; mounts + profile bind
-    // already completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // 2. Spawn the logging service, moving the control endpoint into it (in rdx).
-    // SAFETY: SPAWN_LOGGING is a valid writable arg block; spawn_program resolves the ELF
-    // image from the initramfs, stamps it, spawns, and closes the image handle.
-    let ls_h = unsafe {
-        SPAWN_LOGGING.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/logging-service", &raw mut SPAWN_LOGGING)
-    };
-    if ls_h < 0 {
-        kprint(b"init: logging-service spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init, &[b"logging-service".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // 4. Bind the forwarding endpoint at `/log`.
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/log".as_ptr() as u64, 4, endpoint) };
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: logging-service bind FAIL at /log\n");
-        return false;
-    }
-
-    kprint(b"init: logging service bound at /log\n");
-    // init keeps `ls_h` (the long-lived server's process handle).
-    let _ = ls_h;
-    true
-}
-
-/// Spawn the credential oracle and bind its forwarding endpoint at `/svc/auth`.
-///
-/// **Bound by init because only init can.** `service-mgr` spawned `auth-service` until M7
-/// Part C and would have been the natural binder — the supervisor that starts a resource
-/// server registers it — but a declared service is spawned with `namespace: 0`, an inherited
-/// **LOOKUP-only** root, so it cannot bind into it at all. Demonstrated rather than reasoned:
-/// the bind was written there first and came back `FAIL`. init owns the root namespace, and
-/// `session-and-auth.md` already calls auth-service "an ordinary userspace resource server",
-/// which is exactly what the other five bound here are.
-///
-/// Critical-path: without it no session can authenticate, which is a machine with no way in.
-fn bind_auth_service(root_ns: u64) -> bool {
-    // 1. Create the control channel (init keeps end 0, the server gets end 1).
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // 2. Spawn it, moving the control endpoint into it (in rdx).
-    // SAFETY: SPAWN_AUTH is a valid writable arg block; spawn_program resolves the ELF,
-    // stamps it, spawns, and closes the image handle.
-    let as_h = unsafe {
-        SPAWN_AUTH.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/auth-service", &raw mut SPAWN_AUTH)
-    };
-    if as_h < 0 {
-        kprint(b"init: auth-service spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init, &[b"auth-service".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // 4. Bind at `/svc/auth`.
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/svc/auth".as_ptr() as u64, 9, endpoint) };
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: auth-service bind FAIL at /svc/auth\n");
-        return false;
-    }
-
-    // `TODO(svc-auth-ungated)` — bound into the **root namespace**, which every process
-    // inherits, so anything can resolve the oracle and attempt a password. Recorded rather
-    // than glossed. It closes with the same namespace-construction work that closed
-    // `manage-ungated` in M7 Part E: a supervisor that gets a *constructed* namespace rather
-    // than an inherited one.
-    kprint(b"init: auth-service bound at /svc/auth\n");
-    // init keeps `as_h` (the long-lived server's process handle).
-    let _ = as_h;
-    true
-}
-
-/// Spawn the view broker and bind its forwarding endpoint at `/svc/views` (administration Part A).
-///
-/// **Bound by init for `auth-service`'s reason**: a service `service-mgr` starts holds an inherited
-/// `LOOKUP`-only root and cannot bind into it. And the same boundary follows: anything holding the
-/// root namespace can resolve `/svc/views/…`, including a session's base, which is
-/// `TODO(svc-auth-ungated)`'s reasoning and its fix. Sessions cannot — their namespaces are built,
-/// and hold only `/dev/views` at their own base.
-///
-/// Not critical-path: `false` is logged by the caller and the boot goes on.
-fn bind_view_broker(root_ns: u64) -> bool {
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-    // SAFETY: SPAWN_VIEWS is a valid writable arg block; spawn_program resolves the ELF, stamps
-    // it, spawns, and closes the image handle.
-    let vb_h = unsafe {
-        SPAWN_VIEWS.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/view-broker", &raw mut SPAWN_VIEWS)
-    };
-    if vb_h < 0 {
-        kprint(b"init: view-broker spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-    let endpoint = match wait_ready(ctrl_init, &[b"view-broker".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-    // Duplicate *before* binding, for `bind_clipboard_server`'s reason: the supervisors bind this
-    // endpoint into every session, so a broker bound where no session can be given it is no use.
-    // SAFETY: duplicating our own endpoint handle with attenuated rights.
-    let retained =
-        unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-    let path = b"/svc/views";
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
-    };
-    if br == 0 && retained >= 0 {
-        // SAFETY: single-threaded init.
-        unsafe { VIEWS_ENDPOINT = retained as u64 };
-    } else if retained >= 0 {
-        // SAFETY: the bind failed; nothing will use the duplicate.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
-    }
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: view-broker bind FAIL at /svc/views\n");
-        return false;
-    }
-    kprint(b"init: view-broker bound at /svc/views\n");
-    // init keeps `vb_h` (the long-lived server's process handle).
-    let _ = vb_h;
-    true
-}
-
-/// Spawn the device manager and bind its forwarding endpoint at `/svc/devices` (administration
-/// Part B). Before `input-server`, which takes its devices from it. Non-critical: without it a
-/// machine has no devices handed to anyone, which `input-server` reports; nothing else is
-/// stopped.
-fn bind_device_mgr(root_ns: u64) -> bool {
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-    // SAFETY: SPAWN_DEVICES is a valid writable arg block; spawn_program resolves the ELF,
-    // stamps it, spawns, and closes the image handle.
-    let dm_h = unsafe {
-        SPAWN_DEVICES.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/device-mgr", &raw mut SPAWN_DEVICES)
-    };
-    if dm_h < 0 {
-        kprint(b"init: device-mgr spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-    let endpoint = match wait_ready(ctrl_init, &[b"device-mgr".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-    let path = b"/svc/devices";
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
-    };
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: device-mgr bind FAIL at /svc/devices\n");
-        return false;
-    }
-    kprint(b"init: device-mgr bound at /svc/devices\n");
-    // **What the sessions get is asked for, not duplicated** (administration Part B.4): an
-    // endpoint on which the manager answers its tables and nothing else. `TRANSFER | DUPLICATE`
-    // is what the courier needs and all it needs — the supervisors only bind it. Non-fatal: the
-    // manager still hands devices to their owners, and sessions go without a listing.
-    let (st, info) =
-        ns_lookup_wait(root_ns, b"/svc/devices/info-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
-    if st == 0 && info != 0 {
-        // SAFETY: single-threaded init.
-        unsafe { DEVICES_ENDPOINT = info };
-    } else {
-        kprint(b"init: no info-only device endpoint; sessions will have no /dev/devices\n");
-    }
-    // init keeps `dm_h` (the long-lived server's process handle).
-    let _ = dm_h;
-    true
-}
-
-/// Spawn the storage service and bind its forwarding endpoint at `/svc/storage` (administration
-/// Part C.5). **Straight after the device manager**, so it takes `block` before anything else can:
-/// the class has one owner, and the first to subscribe is it (`TODO(svc-auth-ungated)` records
-/// why that is the rule for now). Non-critical: without it the disks are unowned and the table is
-/// missing, and nothing `init` mounted is affected.
-fn bind_storage_service(root_ns: u64) -> bool {
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-    // SAFETY: SPAWN_STORAGE is a valid writable arg block; spawn_program resolves the ELF,
-    // stamps it, spawns, and closes the image handle.
-    let ss_h = unsafe {
-        SPAWN_STORAGE.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/storage-service", &raw mut SPAWN_STORAGE)
-    };
-    if ss_h < 0 {
-        kprint(b"init: storage-service spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-    let endpoint = match wait_ready(ctrl_init, &[b"storage-service".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-    let path = b"/svc/storage";
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, endpoint)
-    };
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: storage-service bind FAIL at /svc/storage\n");
-        return false;
-    }
-    kprint(b"init: storage-service bound at /svc/storage\n");
-    // init keeps `ss_h` (the long-lived server's process handle).
-    let _ = ss_h;
-    true
-}
-
-/// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
-///
-/// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
-/// reach the raw device at all. A client resolving `/dev/tty` receives a fresh per-caller
-/// channel, the same shape the logging service uses. Non-critical: a boot without a
-/// terminal server still reaches `eshell`, which owns the raw device precisely because it
-/// runs when this does not. See `docs/architecture/console-and-tty.md`.
-fn bind_tty_server(root_ns: u64) -> bool {
-    // 1. Create the control channel (init keeps end 0, the server gets end 1).
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; mounts + profile bind
-    // already completed).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // 2. Spawn the tty server, moving the control endpoint into it (in rdx).
-    // SAFETY: SPAWN_TTY is a valid writable arg block; spawn_program resolves the ELF
-    // image from the initramfs, stamps it, spawns, and closes the image handle.
-    let ls_h = unsafe {
-        SPAWN_TTY.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/tty-server", &raw mut SPAWN_TTY)
-    };
-    if ls_h < 0 {
-        kprint(b"init: tty-server spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init, &[b"tty-server".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: closing our own control endpoint.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing our own control endpoint (handshake done).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // 4. Bind the forwarding endpoint at `/log`.
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    // Keep a second handle *before* binding, for session-mgr to bind into each session.
-    // Duplicating first means a failure here is a failure to bind at all, rather than a
-    // bound `/dev/tty` no session can be given.
-    // SAFETY: duplicating our own endpoint handle with attenuated rights.
-    let retained = unsafe {
-        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
-    };
-    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/tty".as_ptr() as u64, 8, endpoint) };
-    if br == 0 && retained >= 0 {
-        // SAFETY: single-threaded init.
-        unsafe { TTY_ENDPOINT = retained as u64 };
-    } else if retained >= 0 {
-        // SAFETY: the bind failed; nothing will use the duplicate.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
-    }
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: tty-server bind FAIL at /dev/tty\n");
-        return false;
-    }
-
-    kprint(b"init: tty server bound at /dev/tty\n");
-    // init keeps `ls_h` (the long-lived server's process handle).
-    let _ = ls_h;
-    true
-}
-
-/// Spawn the clipboard server and bind its forwarding endpoint at `/dev/clipboard`.
-///
-/// The Resource Server Startup Protocol, as everywhere: spawn with a control channel, wait for
-/// `Meta::Ready`, bind the forwarding endpoint it carries. The server binds nothing itself and
-/// holds no `BIND_NAMESPACE`.
-///
-/// **Deliberately not critical-path.** A boot without a clipboard is a boot where copy and paste
-/// do nothing; every other thing the system does still works. Like `bind_tty_server`, a failure
-/// here says so and the boot continues.
-///
-/// **The root binding is not what applications use.** It exists so the endpoint has a home and
-/// so a program running outside any session can reach it; what an application resolves is the
-/// `/dev/clipboard` its *session* namespace carries, which is bound from the duplicate retained
-/// here. That is the same two-level arrangement `/dev/tty` has, and it is what makes the
-/// clipboard attenuable per session rather than ambient.
-fn bind_clipboard_server(root_ns: u64) -> bool {
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // SAFETY: SPAWN_CLIPBOARD is a valid writable arg block.
-    let h = unsafe {
-        SPAWN_CLIPBOARD.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/clipboard-server", &raw mut SPAWN_CLIPBOARD)
-    };
-    if h < 0 {
-        kprint(b"init: clipboard-server spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    let endpoint = match wait_ready(ctrl_init, &[b"clipboard-server".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: done with the control channel either way.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing init's own control endpoint — the `PeerClosed` the server expects.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // Duplicate *before* binding, for `bind_tty_server`'s reason: a failure here should be a
-    // failure to bind at all, rather than a bound `/dev/clipboard` no session can be given.
-    // SAFETY: duplicating our own endpoint handle with attenuated rights.
-    let retained =
-        unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, root_ns, b"/dev/clipboard".as_ptr() as u64, 14, endpoint)
-    };
-    if br == 0 && retained >= 0 {
-        // SAFETY: single-threaded init.
-        unsafe { CLIPBOARD_ENDPOINT = retained as u64 };
-    } else if retained >= 0 {
-        // SAFETY: the bind failed; nothing will use the duplicate.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
-    }
-    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: clipboard-server bind FAIL at /dev/clipboard\n");
-        return false;
-    }
-    kprint(b"init: clipboard server bound at /dev/clipboard\n");
-    true
-}
-
-/// Spawn the input server and bind its endpoint at `/dev/input/new`.
-///
-/// The Resource Server Startup Protocol, as everywhere: spawn with a control channel, wait
-/// for `Meta::Ready`, bind the forwarding endpoint it carries. The server never binds
-/// anything itself and holds no `BIND_NAMESPACE`.
-///
-/// Returns `false` on any failure, which is not fatal to the boot. A machine with no i8042 is not
-/// one: the server takes its devices from `/svc/devices/input`, bound before it, and serves with
-/// none.
-fn bind_input_server(root_ns: u64) -> bool {
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // SAFETY: SPAWN_INPUT_SERVER is a valid writable arg block.
-    let h = unsafe {
-        SPAWN_INPUT_SERVER.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/input-server", &raw mut SPAWN_INPUT_SERVER)
-    };
-    if h < 0 {
-        kprint(b"init: input-server spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    let endpoint = match wait_ready(ctrl_init, &[b"input-server".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: done with the control channel either way.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // SAFETY: closing init's own control endpoint — the `PeerClosed` the server expects.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // SAFETY: binding the server's forwarding endpoint at /dev/input/new.
-    let br =
-        unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/input/new".as_ptr() as u64, 14, endpoint) };
-    // The binding takes its own reference, so init's handle goes either way.
-    // SAFETY: closing init's reference to the endpoint.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: input-server bind FAIL at /dev/input/new\n");
-        return false;
-    }
-    kprint(b"init: input-server bound at /dev/input/new\n");
-    true
-}
-
-/// Spawn the compositor and bind its endpoint at `/dev/draw`.
-///
-/// **Non-fatal.** A machine with no usable framebuffer still boots to a serial console,
-/// and every existing test path is serial; the display arm is the only consumer. Returns
-/// `false` if the display is unavailable, which the caller reports but does not treat as a
-/// boot failure.
-///
-/// The binding is a **subtree** — the compositor answers resolves for everything beneath
-/// `/dev/draw`, the same shape `/home` uses — so `/dev/draw/new` forwards `new` to it and
-/// nobody calls `sys_ns_bind` when a window opens.
-fn bind_compositor(root_ns: u64) -> bool {
-    // 1. Control channel: init keeps end 0, the server gets end 1.
-    // SAFETY: CTRL0/CTRL1 are valid writable out-params; earlier binds have completed.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        return false;
-    }
-    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
-    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
-
-    // 2. Spawn, moving the control endpoint in.
-    // SAFETY: SPAWN_COMPOSITOR is a valid writable arg block.
-    let h = unsafe {
-        SPAWN_COMPOSITOR.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/bin/compositor", &raw mut SPAWN_COMPOSITOR)
-    };
-    if h < 0 {
-        kprint(b"init: compositor spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-        return false;
-    }
-
-    // 3. Await Meta::Ready and take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init, &[b"compositor".as_slice()]) {
-        Some(e) => e,
-        None => {
-            // SAFETY: done with the control channel either way.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
-        }
-    };
-    // The control channel has served its purpose. Closing it is not tidiness: it is the
-    // `PeerClosed` every other server observes when init is finished with it.
-    // SAFETY: closing init's own control endpoint.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-
-    // Keep a second handle *before* binding, for the graphical supervisor to bind into each
-    // session — the same ordering argument `/dev/tty` makes: duplicating first means a failure
-    // is a failure to bind at all, rather than a bound `/dev/draw` no session can be given.
-    // SAFETY: duplicating our own endpoint handle with attenuated rights.
-    let retained = unsafe {
-        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
-    };
-    // SAFETY: binding the compositor's forwarding endpoint as a subtree at /dev/draw.
-    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/draw".as_ptr() as u64, 9, endpoint) };
-    if br == 0 && retained >= 0 {
-        // SAFETY: single-threaded init.
-        unsafe { DRAW_ENDPOINT = retained as u64 };
-    } else if retained >= 0 {
-        // SAFETY: the bind failed; nothing will use the duplicate.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
-    }
-    // The binding takes its own reference, so init's handle goes either way.
-    // SAFETY: closing init's reference to the endpoint.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    if br != 0 {
-        kprint(b"init: compositor bind FAIL at /dev/draw\n");
-        return false;
-    }
-    kprint(b"init: compositor bound at /dev/draw\n");
-    true
-}
-
 /// The slice-7 milestone: look up `/system/current-generation` through the just-
 /// mounted root fs-server (the kernel forwards the lookup, the server reads the
 /// file and replies a `MemoryObject`), map it, and log its content — proving the
@@ -1545,10 +770,10 @@ fn spawn_eshell(root_ns: u64) {
     }
 }
 
-/// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
-/// is init's child; service-mgr's death is a critical fault init must observe). Unlike
-/// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
-/// `ChildExited` for it. Returns the process handle, or a negative error.
+/// Spawn the service manager — the normal boot handoff. Returns the process handle, or a negative
+/// error. [`supervise`] closes the handle at once: `service-mgr`'s death, a critical fault init
+/// must observe, is learned from the **terminal channel** closing (administration Part E.1a),
+/// which names it exactly, where a `ChildExited` names only a pid.
 ///
 /// **`handles[0]` is a handoff channel, not an endpoint.** It carried the fs-server
 /// endpoint directly until a second endpoint (the profile server's) needed to go the same
@@ -1559,43 +784,16 @@ fn spawn_eshell(root_ns: u64) {
 /// a third endpoint later is now one more `send_handle`, not another ABI question.
 fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
-    // Nothing to hand over — a **restart**, since the endpoints moved to the first
-    // service-mgr and cannot move twice. Spawn with no `handles[0]` at all, so the child
-    // reads `rdx == 0` and takes its documented "no endpoints; skipping login chain" path.
-    // Handing it a live but permanently empty channel would leave it blocked on a handoff
-    // that is never coming, turning a degraded restart into a hung one.
-    // SAFETY: single-threaded init.
-    if unsafe {
-        FS_ENDPOINT == 0
-            && PROFILE_ENDPOINT == 0
-            && TTY_ENDPOINT == 0
-            && DRAW_ENDPOINT == 0
-            && CLIPBOARD_ENDPOINT == 0
-            && VIEWS_ENDPOINT == 0
-            && DEVICES_ENDPOINT == 0
-    } {
-        kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
-        // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
-        return unsafe {
-            SPAWN_SERVICE_MGR.handles[0] = 0;
-            SPAWN_SERVICE_MGR.handle_count = 0;
-            SPAWN_SERVICE_MGR.move_mask = 0;
-            spawn_program(root_ns, b"/bin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
-        };
-    }
-
-    // The handoff channel. **Depth 8, and the number is the send count's bound rather than a
-    // round one**: the sends below are `SENDMODE_NOBLOCK` against a child that has not run yet,
-    // so a ring shorter than the number of handoffs drops the last one silently. It was 4 for
-    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth. **Seven since
-    // administration Part B.4**, so one slot is left: an eighth handoff fits, a ninth needs this
-    // raised in the same change.
+    // **The terminal channel.** Depth 4: three handoffs, queued before `service-mgr` runs — a ring
+    // shorter than the sends drops the last one silently — and then the ops it sends back.
     // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 8, 0)
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
     };
     if cr != 0 {
         kprint(b"init: service-mgr handoff channel FAIL\n");
+        // SAFETY: nothing was handed off; the endpoints are ours to close.
+        unsafe { close_retained_endpoints() };
         return -1;
     }
     let (init_end, child_end) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
@@ -1619,29 +817,26 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         return h;
     }
 
-    // The handoffs, in the order service-mgr receives them: the fs-server endpoint, then
-    // the profile server's. Both are queued in the child's inbox; it has not run yet.
-    // SAFETY: single-threaded init; each endpoint moves once, and the sends null the
-    // statics so a later path cannot close a handle it no longer owns.
+    // The handoffs, in the order service-mgr receives them (administration Part E.1):
+    //
+    // 1. **The root, with init's own rights**, `BIND` and `UNBIND` among them. A spawned process
+    //    only ever gets a lookup-only root, which is why every server was bound here until now;
+    //    `service-mgr` sits in init's trust tier since E.1, the maintainer's call, and binds them.
+    // 2. The root filesystem's endpoint, and 3. the profile server's, for the login chain.
+    // SAFETY: duplicating init's own root handle with every right it holds; single-threaded init,
+    // and each endpoint moves once — the sends null the statics.
     unsafe {
+        let root = syscall2(SYS_HANDLE_DUPLICATE, root_ns, u64::MAX);
+        if root <= 0 {
+            kprint(b"init: root handle duplicate FAIL -- service-mgr will bind nothing\n");
+        }
+        send_handle(init_end, if root > 0 { root as u64 } else { 0 });
         send_handle(init_end, FS_ENDPOINT);
         FS_ENDPOINT = 0;
         send_handle(init_end, PROFILE_ENDPOINT);
         PROFILE_ENDPOINT = 0;
-        send_handle(init_end, TTY_ENDPOINT);
-        TTY_ENDPOINT = 0;
-        send_handle(init_end, DRAW_ENDPOINT);
-        DRAW_ENDPOINT = 0;
-        send_handle(init_end, CLIPBOARD_ENDPOINT);
-        CLIPBOARD_ENDPOINT = 0;
-        // The sixth (administration Part A.4): the view broker's, which both supervisors bind.
-        send_handle(init_end, VIEWS_ENDPOINT);
-        VIEWS_ENDPOINT = 0;
-        // The seventh (administration Part B.4): the device manager's, which both supervisors
-        // bind at `/dev/devices`. Seven of the channel's eight.
-        send_handle(init_end, DEVICES_ENDPOINT);
-        DEVICES_ENDPOINT = 0;
-        syscall1(SYS_HANDLE_CLOSE, init_end);
+        // Kept: the terminal channel, for the rest of the boot.
+        TERMINAL = init_end;
     }
     h
 }
@@ -1695,32 +890,6 @@ unsafe fn close_retained_endpoints() {
             syscall1(SYS_HANDLE_CLOSE, PROFILE_ENDPOINT);
             PROFILE_ENDPOINT = 0;
         }
-        if TTY_ENDPOINT != 0 {
-            syscall1(SYS_HANDLE_CLOSE, TTY_ENDPOINT);
-            TTY_ENDPOINT = 0;
-        }
-        // **These two were missing.** The list is a list of names, so each endpoint added since
-        // it was written had to be remembered here separately, and `DRAW_ENDPOINT` was not —
-        // a failed `service-mgr` spawn leaked the compositor's forwarding endpoint, keeping the
-        // compositor alive with nothing able to reach it, which is the exact failure
-        // `send_handle`'s doc says this function exists to prevent. Found while adding the
-        // clipboard beside it (M12 Part E).
-        if DRAW_ENDPOINT != 0 {
-            syscall1(SYS_HANDLE_CLOSE, DRAW_ENDPOINT);
-            DRAW_ENDPOINT = 0;
-        }
-        if CLIPBOARD_ENDPOINT != 0 {
-            syscall1(SYS_HANDLE_CLOSE, CLIPBOARD_ENDPOINT);
-            CLIPBOARD_ENDPOINT = 0;
-        }
-        if VIEWS_ENDPOINT != 0 {
-            syscall1(SYS_HANDLE_CLOSE, VIEWS_ENDPOINT);
-            VIEWS_ENDPOINT = 0;
-        }
-        if DEVICES_ENDPOINT != 0 {
-            syscall1(SYS_HANDLE_CLOSE, DEVICES_ENDPOINT);
-            DEVICES_ENDPOINT = 0;
-        }
     }
 }
 
@@ -1751,7 +920,16 @@ unsafe fn close_retained_endpoints() {
 /// (retrofit Part B) only because of the sequencing below.
 fn supervise(notif: u64, root_ns: u64) -> ! {
     let service_mgr_h = spawn_service_mgr(root_ns);
-    reap_loop(notif, root_ns, service_mgr_h);
+    if service_mgr_h <= 0 {
+        // No `service-mgr` is no server at all since E.1, `auth-service` and `logging-service`
+        // among them — the pair this path caught when init started them. The console is free:
+        // nothing that holds it has started.
+        emergency(notif, root_ns);
+    }
+    // SAFETY: closing init's reference to the process; it runs independently. Its death is
+    // learned from the terminal channel closing, not from a handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, service_mgr_h as u64) };
+    reap_loop(notif, root_ns);
 }
 
 /// The **emergency** path: a critical-path boot failure (bad manifest, failed
@@ -1765,27 +943,39 @@ fn emergency(notif: u64, root_ns: u64) -> ! {
     // emergency shell below — which is what an operator wants on real hardware.
     test_exit(false);
     spawn_eshell(root_ns);
-    reap_loop(notif, root_ns, 0);
+    reap_loop(notif, root_ns);
 }
 
-/// Reap exited children forever (init is the eventual parent of every orphan).
+/// Reap exited children forever (init is the eventual parent of every orphan), and answer the
+/// terminal channel.
 ///
-/// `parent_h` is the handle of the one child whose exit init reacts to: **`service-mgr`**,
-/// whose death is a critical fault, in every build since retrofit Part C2 unified `supervise`.
-/// It used to be the demo `parent` under `selftest`, which is why the restart below was
-/// `#[cfg(not(feature = "selftest"))]` — so PID 1's supervision of `service-mgr`, and its
-/// recovery when it dies, were the code a test image did *not* run. `0` if none is pending;
-/// all other orphans are logged and released.
-fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
+/// **The terminal channel** (administration Part E.1) carries one request today:
+/// `TERMINAL_OP_EMERGENCY`, sent when a critical server did not come up at boot, or the
+/// declarations have lost their critical servers and nothing was started. The emergency shell is
+/// started then, once; the console is still free, since the critical servers start before the
+/// terminal server.
+///
+/// **Its closing is `service-mgr`'s death**, which is attributed exactly, as a control channel
+/// closing is — `KIND_CHILD_EXITED` names a pid, and nothing maps a handle to one. That death is
+/// **reported, and not answered with a restart**, which `init` did until E.1. Every server path, in
+/// every session, now goes through `service-mgr`'s routes, so its death takes them all; a second
+/// one would start a second copy of every server; and the emergency shell cannot take a console
+/// the terminal server still holds. So the machine needs a restart.
+fn reap_loop(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: entering reaping loop\n");
+    let mut shell_started = false;
     loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        // SAFETY: single-threaded init; the terminal channel is read only here.
+        let terminal = unsafe { TERMINAL };
+        let count = if terminal != 0 { 2 } else { 1 };
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers for two entries.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
+            WAIT_HANDLES[1] = terminal;
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                count,
                 (&raw mut WAIT_RESULTS) as u64,
                 u64::MAX,
             )
@@ -1814,40 +1004,60 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     // `as u64` prints 18446744073709551615 (PR #181 review, finding 8).
                     .i(code as i64)
                     .end();
-                // Release init's reference to the primary child on its exit. Reparented
-                // orphans have no handle here — the kernel tears them down; init observes.
-                //
-                // **This does not compare `cpid`, and init has more than one child.**
-                // `KIND_CHILD_EXITED` names a child by pid, and nothing maps a process handle
-                // to a pid — so whichever child exits first is taken for the primary, and
-                // `service-mgr` gets respawned beside a live one.
-                //
-                // **Newly reachable, and still latent.** Under `selftest` this loop used to
-                // run with `parent_h = 0`, so the branch below could not fire at all; retrofit
-                // Part C2 made `supervise` unconditional, so a test image now runs it with
-                // `parent_h = service_mgr_h`. init's remaining children — the servers it
-                // binds — are not expected to exit, which is the only thing keeping this
-                // quiet. The graphical clients and the demo chain are `service-mgr`'s children
-                // now, not init's. See `TODO(child-exit-attribution)`; the trigger named
-                // "retrofit Part C" has arrived and the fix has not, because it needs a
-                // mechanism (a pid for a handle) rather than an edit here.
-                if parent_h != 0 {
-                    // SAFETY: closing our own process handle.
-                    unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
-                    parent_h = 0;
-                    {
-                        // Primary = service-mgr; its death is a critical fault. Interim
-                        // recovery until a reboot path exists: bring a fresh one up. This
-                        // was `#[cfg(not(feature = "selftest"))]`, so a test image ran a
-                        // different branch and never exercised it.
-                        let _ = code;
-                        let smgr_h = spawn_service_mgr(root_ns);
-                        if smgr_h >= 0 {
-                            // SAFETY: closing init's reference; service-mgr runs independently.
-                            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
-                        }
-                    }
+            }
+        }
+        if terminal == 0 {
+            continue;
+        }
+        // The terminal channel: requests, or its closing.
+        loop {
+            // SAFETY: IPC_MSG/IPC_HANDLES/IPC_COUNT are valid writable out-params.
+            let rr = unsafe {
+                syscall4(
+                    SYS_CHANNEL_RECV,
+                    terminal,
+                    (&raw mut IPC_MSG) as u64,
+                    (&raw mut IPC_HANDLES) as u64,
+                    (&raw mut IPC_COUNT) as u64,
+                )
+            };
+            if rr == KError::PeerClosed.as_i32() as i64 {
+                Line::new()
+                    .s(b"init: service-mgr has exited -- nothing supervises the services now, ")
+                    .s(b"and the machine needs a restart")
+                    .end();
+                // SAFETY: closing our own handle; the static is nulled so it is not waited on
+                // again.
+                unsafe {
+                    syscall1(SYS_HANDLE_CLOSE, terminal);
+                    TERMINAL = 0;
                 }
+                break;
+            }
+            if rr != 0 {
+                break; // WouldBlock: nothing more
+            }
+            // SAFETY: the kernel wrote the message; one payload byte at offset 24.
+            let (len, op, handles) = unsafe {
+                (
+                    u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]),
+                    IPC_MSG[24],
+                    (&raw const IPC_COUNT).read(),
+                )
+            };
+            for k in 0..handles.min(init::ready::IPC_HANDLE_MAX) {
+                // SAFETY: a handle the kernel installed, which no request carries.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read()) };
+            }
+            if len >= 1 && op == TERMINAL_OP_EMERGENCY && !shell_started {
+                Line::new()
+                    .s(b"init: service-mgr asks for the emergency shell -- ")
+                    .s(b"the boot cannot go on without what it could not start (it says what above)")
+                    .end();
+                // The same verdict a critical-path failure here gives: the boot failed.
+                test_exit(false);
+                spawn_eshell(root_ns);
+                shell_started = true;
             }
         }
     }
@@ -1900,87 +1110,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
         emergency(notif, root_ns);
     }
 
-    // Spawn the credential oracle and bind it at `/svc/auth`. After `/bin` (it resolves
-    // `/bin/auth-service`) and before the service manager, so a session-mgr that starts
-    // immediately finds the oracle already there. Critical-path: no oracle, no way in.
-    if !bind_auth_service(root_ns) {
-        emergency(notif, root_ns);
-    }
-
-    // Spawn the system logging service and bind it at `/log`, before the service manager,
-    // so services can resolve `/log/<tier>/<principal>` and log from launch. Critical-path.
-    if !bind_logging_service(root_ns) {
-        emergency(notif, root_ns);
-    }
-
-    // The terminal server, after `/bin` (it is spawned from there) and deliberately **not**
-    // critical-path: a boot without it still reaches `eshell`, which holds the raw console
-    // for exactly the case where this server is absent.
-    if !bind_tty_server(root_ns) {
-        kprint(b"init: no terminal server; sessions will have no /dev/tty\n");
-    }
-
-    // The clipboard, beside the terminal server and for the same reasons: spawned from `/bin`,
-    // and not critical-path. Both columns want it — M12 decision 4 makes it reachable from a
-    // pipeline, and a pipeline runs in a serial session too.
-    if !bind_clipboard_server(root_ns) {
-        kprint(b"init: no clipboard server; copy and paste will do nothing\n");
-    }
-
-    // The view broker (administration Part A), after the logging service — it opens its audit
-    // log at startup — and before the service manager, whose login supervisors resolve
-    // `/svc/views` for every session. **Not critical-path**: a machine without it still logs in;
-    // `with` just has nobody to ask.
-    if !bind_view_broker(root_ns) {
-        kprint(b"init: no view broker; `with` will have nothing to ask\n");
-    }
-
-    // The device manager (administration Part B), **before the display arm**: `input-server`
-    // takes its devices from it, so it has to be bound at `/svc/devices` before the input server
-    // resolves it — the display arm's order-is-load-bearing reason, one step earlier. Not
-    // critical-path: without it no device is handed to its owner, which the owner reports.
-    if !bind_device_mgr(root_ns) {
-        kprint(b"init: no device manager; no device will be handed to its owner\n");
-    }
-
-    // The storage service (administration Part C.5), **straight after the device manager**: it
-    // owns `block`, and a class's owner is whoever subscribes first. Not critical-path: `init`'s
-    // own mounts are already up, and a machine without it only goes without the table.
-    if !bind_storage_service(root_ns) {
-        kprint(b"init: no storage service; the disks have no owner and /svc/storage is missing\n");
-    }
-
-    // ---- the display arm ----
+    // **The servers are `service-mgr`'s to start** (administration Part E.1). `init` used to start
+    // nine here — `auth-service`, `logging-service`, the terminal server, the clipboard, the view
+    // broker, the device manager, the storage service, the input server and the compositor —
+    // and bind each in the root namespace. They are declarations now, started by `service-mgr` in
+    // that order, each `Meta::Ready` awaited before the next, and bound through its registry so a
+    // restart reaches every binding. `init` starts only what it takes to reach `service-mgr`:
+    // its mounts, the profile server at `/bin`, and `service-mgr` itself, which is what
+    // `docs/architecture/service-manager.md` has said since Phase 3.
     //
-    // **After `/bin`, since 2026-08-11.** The compositor and the input server used to come up
-    // here *before* the profile server, for one reason: they were in the initramfs, which is
-    // available from the first instruction. They are store packages now — nothing about a
-    // display is needed to reach a mounted root, and a client cannot even load a font before
-    // there is a filesystem — so they are spawned from `/bin` like every other service, and
-    // that means after the thing that provides `/bin`.
+    // Two of them were critical-path here: a boot without `auth-service` or `logging-service`
+    // dropped to the emergency shell. They still are, as `critical` declarations: `service-mgr`
+    // asks for the shell over the terminal channel, and `reap_loop` starts it.
     //
-    // The display arm's guest-side gate runs as its own program (`display-selftest`), not
-    // inline here: compositing is not init's job, and `userspace/init/CLAUDE.md` calls this
-    // critical-path code. It supersedes the inline framebuffer demo that proved M1 Part B.
-    //
-    // The input server first, and **the order is load-bearing**: the compositor resolves
-    // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
-    // other way round it would find nothing bound and serve the display with no input, for
-    // the life of the boot, with only a log line to say so. Not fatal either way — the input
-    // server takes its devices from the device manager and serves with whatever arrived, so a
-    // machine with no i8042 has an input server with no devices, and everything else comes up
-    // normally.
-    if !bind_input_server(root_ns) {
-        kprint(b"init: no input server; /dev/input/new unavailable\n");
-    }
-
-    if !bind_compositor(root_ns) {
-        kprint(b"init: no compositor; /dev/draw unavailable\n");
-    }
-
     // The display self-test, the GUI terminal and the two test clients used to be spawned
     // here under `selftest`. They are **service declarations** now (retrofit Part C2), started
-    // by `service-mgr` from `/initramfs/etc/services.toml` — which carries them only in a test
+    // by `service-mgr` from `/system/services.toml` on the root — which carries them only in a test
     // image, so this file is byte-identical in both. Their order is the file's order: `nxterm`
     // before `ui-testclient`, so that the terminal's window exists by the time `ui-testclient`
     // raises its reference windows over it. (Creation order was the stacking until

@@ -95,9 +95,15 @@ pub struct NamespaceSpec<'a> {
     pub fs_endpoint: u64,
     /// The profile-server endpoint, bound whole-tree at `/bin`.
     pub profile_endpoint: u64,
-    /// The tty-server endpoint, bound at `/dev/tty`.
+    /// The tty server's, bound at `/dev/tty`.
+    ///
+    /// **This and every server endpoint below is `service-mgr`'s route to the server**
+    /// (administration Part E.1b), not the server's own endpoint: a resolve on it continues into
+    /// whichever instance is running, so a session built before a server restarts reaches the new
+    /// one. Each route reaches one server and nothing else, which is what lets `desktop-shell` be
+    /// handed them.
     pub tty_endpoint: u64,
-    /// The clipboard-server endpoint, bound at `/dev/clipboard`. `0` binds nothing.
+    /// The clipboard server's, bound at `/dev/clipboard`. `0` binds nothing.
     ///
     /// **Both columns get it, and that makes it the odd one out.** `/dev/draw` goes only to
     /// the graphical session because a serial one has no compositor; the clipboard is
@@ -150,7 +156,7 @@ pub struct NamespaceSpec<'a> {
     /// authenticating, and nothing here changes: the authority is a binding a supervisor made,
     /// which is what that phase is for.
     pub bind_blk: bool,
-    /// The view broker's forwarding endpoint, bound at `/dev/views` with
+    /// The view broker's, bound at `/dev/views` with
     /// [`views_base`](Self::views_base) as its subtree base. `0` binds nothing — a boot where
     /// the broker did not start, whose sessions simply have no `with`.
     ///
@@ -167,11 +173,11 @@ pub struct NamespaceSpec<'a> {
     /// subtree base `/info` (administration Part B.4). `0` binds nothing — a boot where the
     /// manager did not start, whose sessions simply have no device listing.
     ///
-    /// **The endpoint, not the base, is what keeps a session from taking a device.** `init`
-    /// resolves it at `/svc/devices/info-endpoint`, and the manager answers only its tables on it,
-    /// whatever suffix arrives; a class to subscribe to is reachable only through `/svc/devices`
-    /// in the root namespace. The base names what a session reaches: `/dev/devices` is the
-    /// directory, `/dev/devices/all.tsm` a table.
+    /// **The endpoint, not the base, is what keeps a session from taking a device.** `service-mgr`
+    /// resolves it at `info-endpoint` each time the manager comes up and hands on its route to it,
+    /// and the manager answers only its tables on it, whatever suffix arrives; a class to subscribe
+    /// to is reachable only through `/svc/devices` in the root namespace. The base names what a
+    /// session reaches: `/dev/devices` is the directory, `/dev/devices/all.tsm` a table.
     pub devices_endpoint: u64,
     /// A **session endpoint** of the storage service's, bound twice (administration Part C.6):
     /// at `/storage` with the base `/fs`, so `/storage/<label>/…` is a mounted filesystem, and
@@ -179,9 +185,10 @@ pub struct NamespaceSpec<'a> {
     /// each disk holds. `0` binds nothing — a boot without the service, whose sessions have no
     /// `/storage`.
     ///
-    /// **The endpoint, not the bases, is what keeps a session from mounting.** Each supervisor
-    /// resolves it at `/svc/storage/session-endpoint`, and the service answers the filesystems and
-    /// the tables on it and nothing else: `admin-endpoint` is `NotFound` there however it is
+    /// **The endpoint, not the bases, is what keeps a session from mounting.** `service-mgr`
+    /// resolves it at `session-endpoint` each time the service comes up and hands on its route to
+    /// it (each supervisor resolved one until Part E.1b), and the service answers the filesystems
+    /// and the tables on it and nothing else: `admin-endpoint` is `NotFound` there however it is
     /// bound, so `desktop-shell`, which holds it with `BIND_NAMESPACE`, cannot mint an admin
     /// endpoint from it either.
     pub storage_endpoint: u64,

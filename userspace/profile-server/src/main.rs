@@ -144,10 +144,13 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     }
 }
 
-/// Read + parse the system profile manifest from the initramfs. Returns the ordered
-/// package list (empty on any failure — the server then resolves nothing).
+/// Read + parse the system profile manifest, **from the root filesystem** at
+/// `/system/profiles/system.toml` (administration Part E.1c; the initramfs's
+/// `etc/profiles/system.toml` until then). `init` has mounted the root before it spawns this
+/// process — the store it projects is on it too. Returns the ordered package list (empty on any
+/// failure — the server then resolves nothing).
 fn read_manifest(root_ns: u64) -> Vec<Package> {
-    let mem = ns_lookup(root_ns, b"/initramfs/etc/profiles/system.toml", RIGHT_MAP_READ);
+    let mem = ns_lookup(root_ns, b"/system/profiles/system.toml", RIGHT_MAP_READ);
     if mem == 0 {
         kprint(b"profile-server: no system profile manifest\n");
         return Vec::new();
@@ -709,12 +712,12 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
 }
 
 /// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited
-/// root namespace (used — resolves `/store` + `/initramfs`), `rdx` = the control-channel
+/// root namespace (used — resolves `/store` and its manifest under `/system`), `rdx` = the control-channel
 /// endpoint init installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"profile-server: up\n");
-    // Read the manifest now — before init releases the initramfs.
+    // Read the manifest first: nothing can be resolved without it.
     let packages = read_manifest(root_ns);
     kprint(b"profile-server: manifest loaded\n");
 

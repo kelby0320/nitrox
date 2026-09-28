@@ -215,6 +215,12 @@ pub const SENDMODE_BLOCKBOUNDED: u64 = 2;
 /// and call `sys_process_exit(0)`.
 pub const CTRL_OP_SHUTDOWN: u8 = 1;
 
+/// `service-mgr` → `init`, on the **terminal channel** (administration Part E.1): a critical server
+/// did not come up at boot — or the declarations lost their critical servers, and nothing was
+/// started — so start the emergency shell. The console is still free then: the critical servers
+/// start before the terminal server. One byte of payload, as the control ops.
+pub const TERMINAL_OP_EMERGENCY: u8 = 1;
+
 /// The fixed 24-byte IPC message header. `sender_pid`/`timestamp` are stamped by
 /// the kernel at send and cannot be forged.
 #[repr(C)]

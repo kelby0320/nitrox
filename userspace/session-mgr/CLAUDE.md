@@ -5,13 +5,13 @@ Constraints for the session manager. Loaded when working under
 
 ## What this is
 
-The Tier-5 supervisor that logs a user in and hands them a sandboxed shell: it
-authenticates a credential (via auth-service), constructs a **per-user namespace**,
-and spawns the user shell into it. It holds re-delegated `BIND_NAMESPACE` (from
-service-mgr) and the building-block endpoints it composes sessions from — the forwarding
-endpoints of the fs-server, the profile server, the tty server, the clipboard server and the view
-broker, and an info-only endpoint of the device manager's — and resolves a channel to auth-service
-itself. See `docs/architecture/session-and-auth.md`.
+The Tier-5 supervisor that logs a user in and hands them a sandboxed shell: it authenticates a
+credential (via auth-service), constructs a **per-user namespace**, and spawns the user shell into
+it. It holds re-delegated `BIND_NAMESPACE` (from service-mgr) and the building-block endpoints it
+composes sessions from — the fs-server's and the profile server's forwarding endpoints, and
+**`service-mgr`'s routes** to the tty server, the clipboard server, the view broker, the device
+manager's info-only endpoint and the storage service's session endpoint — and resolves a channel to
+auth-service itself. See `docs/architecture/session-and-auth.md`.
 
 ## The session loop
 
@@ -79,16 +79,24 @@ service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
 `BIND_NAMESPACE`, then transfers, in order:
 1. the fs-server forwarding endpoint;
 2. the **profile-server** forwarding endpoint;
-3. the **tty-server** forwarding endpoint;
-4. the **clipboard server**'s forwarding endpoint (M12 Part E);
-5. the **view broker**'s forwarding endpoint (administration Part A.4);
-6. an **info-only endpoint of the device manager's** (administration Part B.4) — not the one bound
-   at `/svc/devices`, which could subscribe to a device class.
+3. the route to the **tty server**;
+4. the route to the **clipboard server** (M12 Part E);
+5. the route to the **view broker** (administration Part A.4);
+6. the route to an **info-only endpoint of the device manager's** (administration Part B.4) — not
+   the one reached at `/svc/devices`, which could subscribe to a device class;
+7. the route to the **storage service's session endpoint** (administration Part C.6; resolved
+   here from `/svc/storage/session-endpoint` until Part E.1b).
 
-session-mgr `recv`s all six before doing anything. The control channel is depth 8, and a seventh
-would fit; `service-mgr`'s `create_control_channel` says why the depth is a bound on the count
-rather than a round number. This list was three long until the PR #333 review, three parts after
-it had stopped being true.
+**3–7 are `service-mgr`'s routes, not the servers' own endpoints** (administration Part E.1b): each
+is an endpoint of `service-mgr`'s that continues every resolve into whichever instance of that one
+server is running, so a session bound before a restart reaches the new server. `0` for a server
+that did not come up; the session then binds nothing there.
+
+session-mgr `recv`s all seven before doing anything. `desktop-session-mgr` gets the same with the
+compositor's route fourth, eight in all, and the control channels are 10 deep; `service-mgr`'s
+`create_control_channel` says why the depth is a bound on the count rather than a round number.
+This list was three long until the PR #333 review, three parts after it had stopped being true,
+and six long until the PR #340 review, one part after.
 
 **There is no auth handoff as of M7 Part C.** This list said the third was the auth channel —
 wrong twice over, since the third has been the tty endpoint for some time and the auth channel
@@ -115,7 +123,7 @@ the tty endpoint where the profile endpoint belongs.
 - `/dev/views` — the view broker, at the session's base `/s/<id>`, which is its identity there;
 - `/dev/devices` — the device manager's tables, through an info-only endpoint at the base `/info`;
 - `/storage` and `/dev/storage` — the storage service's session endpoint, at the bases `/fs` (every
-  mounted filesystem) and `/info` (the table), resolved by this supervisor itself;
+  mounted filesystem) and `/info` (the table), through the route `service-mgr` hands over;
 - `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
 - **on an installer boot only**, the machine's block devices, each bound individually with its

@@ -22,7 +22,7 @@ Since Part C there is a third role, the **backend channel**, held by a terminal 
 
 | Role | Speaks | Who holds it |
 |---|---|---|
-| forwarding endpoint | `Namespace::Resolve` | bound by init at `/dev/tty`; by session-mgr in each session |
+| forwarding endpoint | `Namespace::Resolve` | `/dev/tty`, bound by service-mgr; by session-mgr in each session |
 | terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` | the program using the terminal |
 | backend channel | `Output` (server→emulator), `Input` (emulator→server) | a terminal emulator |
 

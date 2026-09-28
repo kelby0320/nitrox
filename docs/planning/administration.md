@@ -1,18 +1,17 @@
 # Administration: views, devices, and the tools an installed system needs
 
 **Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C complete
-(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28); scoped 2026-09-22 and
-revised after the PR #326 review.** Scheduled after
-[the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
-architecture below were agreed with the maintainer on 2026-09-22. The review then found that
-several mechanisms depend on things the code does not have, and **the maintainer took the four
-resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
-had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
-(*Part B in detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D**
-(*Part D in detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*,
-2026-09-28) and is next to build; the other parts are sketched. The plan began as a stub on
-2026-09-16, written while building the installer — the first program that needed authority an
-ordinary session cannot have.
+(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28) and in progress — E.1a
+built the same day; scoped 2026-09-22 and revised after the PR #326 review.** Scheduled after [the
+desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
+architecture below were agreed with the maintainer on 2026-09-22. The review then found that several
+mechanisms depend on things the code does not have, and **the maintainer took the four resolutions
+that needed a decision the same day** (the last item under *Decisions*). **Part A has had its detail
+pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B** (*Part B in
+detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D** (*Part D in
+detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*, 2026-09-28) and is
+being built, E.1a first; the other parts are sketched. The plan began as a stub on 2026-09-16, written while
+building the installer — the first program that needed authority an ordinary session cannot have.
 
 ## Scope
 
@@ -1973,7 +1972,8 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 
 ### The pieces, in dependency order
 
-- [ ] **E.1 — `service-mgr` starts the servers**, in three parts, as C.5 was.
+- [x] **E.1 — `service-mgr` starts the servers**, in three parts, as C.5 was. *(Complete
+      2026-09-28; the restart through `service-mgr`'s control path is E.2's, below.)*
       - **E.1a — `service-mgr`'s loop, its endpoint, and the registry.**
         - `service-mgr` rebuilt around one wait, with every wait a deadline.
         - Its forwarding endpoint, answering `SUBNAMESPACE` into its registry.
@@ -1984,14 +1984,71 @@ A reboot is the same, with `reboot: true` and a reset at the end.
           profile server, `service-mgr` and the emergency shell, and no longer restarts
           `service-mgr`.
         - The sessions keep their bindings for now, so nothing a session sees changes yet.
+        - *(Landed 2026-09-28.* Three things landed here rather than as written:
+          - **The login chain's place, and the supervisors' handles kept**, both listed under
+            E.1b. The chain needs the servers' endpoints, so once the servers moved it had to
+            start after the last of them. It does, after the last `endpoint` declaration —
+            `restart-probe` in a test image, so `heartbeat` starts before the chain there.
+          - **"`init`'s log names only its mounts, `/bin` and `service-mgr`"** is a transcript
+            check in `test-qemu` (`check_servers_are_service_mgrs`), not `boot-probe`'s: it is a
+            claim about who logs what. Every existing probe reaches its server through the root
+            path, which now runs through `service-mgr`'s endpoint.
+          - **The restart is a server exiting, not a control path.** `restart-probe`, a
+            test-image server, exits when asked; `boot-probe` then reaches the new instance at
+            `/svc/restart-probe` within 10 s. A restart *through* `service-mgr` is E.2's
+            `service`, and the session half of the gate is E.1b's.
+
+          Found building it: **a `service-mgr` that cannot be spawned now takes `init`'s
+          emergency path.** It used to leave the machine idle but with its servers up; since E.1a
+          it would leave nothing up at all. Controls: the root bound to the server's own
+          endpoint, the registry never unbound, a blocking wait for `Ready`, an unstartable
+          critical server, and an unspawnable `service-mgr` each fail the boot, the last two
+          into the emergency shell.)*
       - **E.1b — sessions through `service-mgr`.**
         - The login chain starts after the last server, and `service-mgr` keeps its handles.
         - Both supervisors, and `desktop-shell`'s application namespaces, bind `service-mgr`'s
           endpoint with a base per path, in place of each server's own.
+        - *(Landed 2026-09-28.* **Not one endpoint with a base per path, but one endpoint per
+          server** — a *route* — the maintainer agreeing the same day. A single endpoint handed
+          to `desktop-shell`, which holds `BIND_NAMESPACE`, could be bound at any base, and
+          would reach `/auth-service/admin` or `/device-mgr/input` from an application; E.1a's
+          root used one, safely, since nothing hands a root binding out. So:
+          - every server's root path, and every session's and application's binding of it, is
+            that server's route, the same object;
+          - the device manager's `info-endpoint` and the storage service's `session-endpoint`
+            each get a route of their own, re-derived by `service-mgr` each time the server
+            comes up (`registry::DERIVED`), and the supervisors are handed the storage one
+            rather than resolving it;
+          - `service-mgr`'s wait holds the routes and the servers still starting, not every
+            running service, to stay inside the kernel's 32 handles.
+
+          **The gate** is a copy of the root made before `restart-probe` restarts, which holds
+          the same binding and is never rebound: it must reach the new instance too. A control
+          that rebinds the root to the server's own endpoint on each start passes the root half
+          and fails this one. **What no gate reaches**: a restart of a server behind a derived
+          route. Both are `essential`, with policy `never`, so the re-derivation waits for one of
+          them to have a policy; and a live session reaching a restarted server end to end is
+          E.2's `clip` gate, since nothing restarts a session's server before `service`.)*
       - **E.1c — the declarations on root.**
         - `/system/services.toml` and `/system/profiles/system.toml`.
         - `heartbeat` leaves the release image.
         - `check-images` gains the root comparison.
+        - *(Landed 2026-09-28.* As written, with one finding: **the roots differ in a program**.
+          The detail pass said a test root may differ from a release one "in those two files and
+          the test packages' store paths, and nothing else", and it checked which *files* each
+          root stages, not their contents. `check-images`' first root comparison found
+          `nxterm`, in the coreutils package, built with `test-harness` in a test-harness image —
+          its row reports for `check-terminal` (PR #194), which the retrofit accepted. The
+          initramfs comparison never saw it, since `nxterm` is not in the initramfs. It is
+          allowed by name, with store paths compared with their hashes taken out so that only
+          `bin/nxterm` may differ in that package; every other program is held byte for byte,
+          the store's included. Controls: a file added to the test root, and a system program
+          altered in it, each fail.
+          - **`heartbeat` is the test package's**, built from its own crate beside
+            `test-harness`'s bins, and declared in a test image only, before `restart-probe`.
+          - **The 1.1 s demo stop went with E.1a**, unrecorded then: it asked the *first*
+            declared service to stop, which E.1a made `auth-service`. Nothing requests a stop
+            until E.2's `service --stop`.)*
       - Gates:
         - **every existing gate**, unchanged in what it asserts, since they are the regression
           suite for the move; the lines that named `init`'s binds name `service-mgr`'s;

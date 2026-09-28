@@ -21,7 +21,7 @@
 //! the whole reason `fp_gate` was moved out of the demo `parent` in the first place — see
 //! its own doc comment.
 //!
-//! **Started by `service-mgr`** from `/initramfs/etc/services.toml`, which carries a
+//! **Started by `service-mgr`** from `/system/services.toml` on the root, which carries a
 //! `[service.boot-probe]` table only in selftest / test-harness images. It is an ordinary
 //! declared service: a control channel at `rdx`, a LOOKUP-only view of the root namespace
 //! at `rsi`, no syscaps, and `policy = "never"` — start once, do not restart.
@@ -1376,7 +1376,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_grant_test(root_ns)
         & auth_admin_test(root_ns)
         & policy_test(root_ns)
-        & accounts_test(root_ns);
+        & accounts_test(root_ns)
+        & restart_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -2185,13 +2186,13 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"the registry does not read");
     };
 
-    // **`block` has its owner from boot on** (administration Part C.5): `init` spawns the storage
-    // service straight after the manager and waits for its `Ready`, which comes only after it has
-    // subscribed and settled. So `block` is refused here, as `input` is below. Until C.5 the probe
-    // took the class itself, to see the replay settle before its resolve completed, a second owner
-    // refused, and the class taken again once closed. Those stay the manager's host tests and B.2's
-    // recorded controls, since taking the class now would take the disks from their owner. That
-    // the replay reaches its owner is `storage_test`'s: a row per block record.
+    // **`block` has its owner from boot on** (administration Part C.5): `service-mgr` spawns the
+    // storage service straight after the manager and waits for its `Ready`, which comes only after
+    // it has subscribed and settled. So `block` is refused here, as `input` is below. Until C.5 the
+    // probe took the class itself, to see the replay settle before its resolve completed, a second
+    // owner refused, and the class taken again once closed. Those stay the manager's host tests and
+    // B.2's recorded controls, since taking the class now would take the disks from their owner.
+    // That the replay reaches its owner is `storage_test`'s: a row per block record.
     let (st, block) = ns_lookup(root_ns, b"/svc/devices/block", chan);
     close(block);
     if st != libkern::KError::AlreadyExists.as_i32() {
@@ -3027,6 +3028,98 @@ fn policy_test(root_ns: u64) -> bool {
         return fail(b"a closed session's policy channel still answered");
     }
     kprint(b"boot-probe: policy: Show is the device's file; a policy with no views administrator and one naming no account refused by Check and Install; one more view installed, listed, and put back; a closed session's channel closed ok\n");
+    true
+}
+
+/// **A restarted server is reached again at its path** (administration Part E.1).
+///
+/// `restart-probe` is a test image's server, declared with `endpoint = "/svc/restart-probe"` and
+/// `policy = "always"`. It answers `id` with a token unique to the instance, and exits when asked
+/// for `exit`. So: take its token, have it exit, and resolve the same path until a different token
+/// comes back — from the instance `service-mgr` started in its place.
+///
+/// **What this proves is the registry.** The root's `/svc/restart-probe` is bound once, to
+/// `service-mgr`'s route for the server, and never again: only the registry binding changes on a
+/// restart. A root binding to the server's own endpoint would reach the dead one, which answers
+/// `PeerClosed`, however long this waited.
+///
+/// **And that a binding made before the restart reaches the new instance** (Part E.1b), in a copy
+/// of the root made before it. That is a session's case: its bindings are made at login, of the
+/// same route the root binds, and nothing rebinds them. A restart that rebound the root's path
+/// alone passes the first half and fails this one.
+fn restart_test(root_ns: u64) -> bool {
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: restart: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let token = |ns: u64| -> Option<u64> {
+        let (st, ch) = ns_lookup(ns, b"/svc/restart-probe/id", chan);
+        if st != 0 || ch == 0 {
+            return None;
+        }
+        let m = receive(ch, clock_ns() + 5_000_000_000);
+        close(ch);
+        let m = m?;
+        m.handles.iter().for_each(|&h| close(h));
+        Some(u64::from_le_bytes(m.body.get(..8)?.try_into().ok()?))
+    };
+    let Some(first) = token(root_ns) else {
+        return fail(b"/svc/restart-probe answered no token");
+    };
+    // **A namespace bound before the restart, and never touched again** — a session's, as a
+    // supervisor builds one (administration Part E.1b). A copy of the root holds the same binding
+    // objects the root does, and later changes to the root do not reach it: a restart that
+    // rebound the root's path alone would leave this one at the server that exited.
+    // SAFETY: a namespace handle this process holds; the copy is its own to close.
+    let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+    if copy <= 0 {
+        return fail(b"a copy of the root could not be made");
+    }
+    let copy = copy as u64;
+    if token(copy) != Some(first) {
+        close(copy);
+        return fail(b"the copy of the root did not reach the instance the root does");
+    }
+    let (st, h) = ns_lookup(root_ns, b"/svc/restart-probe/exit", chan);
+    close(h);
+    if st == 0 {
+        return fail(b"asking restart-probe to exit was not refused, as the probe answers it");
+    }
+    // Its backoff is 100 ms. Resolve until the next instance answers, or give up — pausing
+    // twenty milliseconds between tries on a timer, since a wait on no handles is refused at once.
+    // SAFETY: register-only syscall; a one-shot timer this process owns.
+    let timer = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
+    let deadline = clock_ns() + 10_000_000_000;
+    let second = loop {
+        match token(root_ns) {
+            Some(t) if t != first => break Some(t),
+            _ if clock_ns() > deadline => break None,
+            _ if timer > 0 => {
+                let at = clock_ns() + 20_000_000;
+                let handles = [timer as u64];
+                let mut results = [0u8; 24];
+                // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
+                unsafe {
+                    syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
+                    syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, at + 1_000_000_000);
+                }
+            }
+            _ => {}
+        }
+    };
+    close(if timer > 0 { timer as u64 } else { 0 });
+    let Some(second) = second else {
+        close(copy);
+        return fail(b"no new instance answered at /svc/restart-probe within 10 s of the old one exiting");
+    };
+    let in_copy = token(copy);
+    close(copy);
+    if in_copy != Some(second) {
+        return fail(b"the copy of the root, made before the restart, did not reach the new instance");
+    }
+    kprint(b"boot-probe: restart: a server that exited was restarted, and its path reached the new instance ok\n");
+    kprint(b"boot-probe: restart: a namespace bound before the restart reached it too ok\n");
     true
 }
 

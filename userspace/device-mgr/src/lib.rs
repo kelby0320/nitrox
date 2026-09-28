@@ -277,11 +277,11 @@ pub mod suffix {
     //! from.
     //!
     //! **A session reaches the manager through an endpoint of its own**, not the one bound at
-    //! `/svc/devices` (administration Part B.4). `init` resolves `info-endpoint` once and the
-    //! supervisors bind what it gets at `/dev/devices`, with the base `/info`; a resolve arriving
-    //! there is [`info_only`] — **the information and nothing else**, whatever its suffix. The
-    //! base alone would not be enough: `desktop-shell` holds the endpoint and `BIND_NAMESPACE`, so
-    //! it could bind it with no base, and a suffix like `block` would then be a subscription to
+    //! `/svc/devices` (administration Part B.4). `service-mgr` resolves `info-endpoint` once and
+    //! the supervisors bind what it gets at `/dev/devices`, with the base `/info`; a resolve
+    //! arriving there is [`info_only`] — **the information and nothing else**, whatever its suffix.
+    //! The base alone would not be enough: `desktop-shell` holds the endpoint and `BIND_NAMESPACE`,
+    //! so it could bind it with no base, and a suffix like `block` would then be a subscription to
     //! every disk. An endpoint that cannot subscribe is a capability the shell can be handed.
 
     use crate::classes::Class;
@@ -292,7 +292,7 @@ pub mod suffix {
         /// `<class>`: become its owner.
         Subscribe(Class),
         /// `info-endpoint`: a forwarding endpoint of its own, every resolve on which is
-        /// [`info_only`] — what `init` couriers to the supervisors for `/dev/devices`.
+        /// [`info_only`] — what `service-mgr` couriers to the supervisors for `/dev/devices`.
         InfoEndpoint,
         /// `info`: the directory.
         Directory,

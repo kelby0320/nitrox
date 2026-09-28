@@ -30433,3 +30433,255 @@ returns.
 
 E.2's `clip` gate, which the review showed could not pass, stands again: through the registry, a
 restart does reach the same session.
+
+## 2026-09-28 — Administration Part E.1a: `service-mgr` starts the servers, through a registry
+
+`init` starts its mounts, the profile server at `/bin`, `service-mgr` and — when it must — the
+emergency shell, and nothing else. The nine servers it also started are declarations `service-mgr`
+starts in `init`'s order: `auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the
+view broker, `device-mgr`, `storage-service`, `input-server` and the compositor. Each is bound in
+`service-mgr`'s registry, and its root path is bound once to `service-mgr`'s own endpoint. What a
+session sees has not changed; that is E.1b.
+
+**The registry is a namespace `service-mgr` creates** (`sys_ns_create`), with each server's endpoint
+at `/<name>`. A root path such as `/svc/devices` is bound to `service-mgr`'s endpoint with the base
+`/device-mgr`. A resolve arriving there is routed on its first component and answered with a
+`SUBNAMESPACE` continuation into the registry, so the server sees the suffix it always saw. A
+restart unbinds and rebinds `/<name>` in the registry and touches the root not at all. A resolve
+through `/svc/storage` is continued twice — into the registry, then into a mount's namespace — two
+of the kernel's four.
+
+**`service-mgr` must never block on anything that can wait on it**, since every server path now
+runs through it. Its main wait is one loop over its notifications, its endpoint and every running
+service's control channel, timed to the nearest deadline: a `Ready` awaited (30 s), a backoff, an
+`after`. The grace wait for an exit code answers resolves while it waits. What it still waits on
+outright is `ns_lookup`: `/bin`, the registry, and a server's log endpoint. Those reach the root
+filesystem, the profile server and servers already serving, none of which waits on it. **The
+device manager's info endpoint is minted in the registry** (`/device-mgr/info-endpoint`), not
+through the root's `/svc/devices`: that path leads back to `service-mgr`, which would be waiting on
+itself.
+
+**The login chain starts after the last `endpoint` declaration**, as the review asked, and
+`service-mgr` keeps both supervisors' handles — both listed under E.1b, and needed here once the
+supervisors took their endpoints from `service-mgr`'s servers. In a test image the last server is
+`restart-probe`, so `heartbeat` starts before the chain there and after it in a release image.
+E.1c takes `heartbeat` out of the release image.
+
+**`init`'s side:**
+- **The terminal channel** — the handoff channel, kept open — carries three handoffs down: the
+  root handle with `init`'s rights, the root filesystem's endpoint and the profile server's. It
+  carries `TERMINAL_OP_EMERGENCY` back up when a `critical` server does not come up at boot, and
+  `init` starts the emergency shell. It is `libkern::abi`'s, beside `CTRL_OP_SHUTDOWN`: a constant
+  between two userspace processes, which the kernel never reads.
+- **Its closing** is how `init` learns `service-mgr` died. `init` reports that the machine needs a
+  restart and does not respawn it, as the review decided.
+- **A `service-mgr` that cannot be spawned takes the emergency path.** Found building this. It used
+  to leave the machine idle with its servers up; since E.1a it would leave nothing up at all,
+  `auth-service` and `logging-service` included — the pair whose failure the emergency path caught
+  when `init` started them. Nothing holds the console yet, so the shell can take it.
+
+**The emergency shell never meets the terminal server** (`console-and-tty.md`'s invariant) only
+because both critical servers are declared before `tty-server`. That is the declarations' order,
+not code, so an `xtask` host test pins it in the release, test and bench declarations; a
+`critical = true` added to `clipboard-server` fails it.
+
+**Every server's restart policy is `never`**, as `init` never restarted them. `restart-probe`, a
+test-image server that exits when asked, has `always`, and is what proves a restart reaches the root
+path: `boot-probe` takes its token, asks it to exit, and resolves `/svc/restart-probe` until a
+different token answers — 100 ms of backoff later on the first passing boot.
+
+**Checked in the negative, each on a boot:**
+- the root bound to the server's own endpoint — `boot-probe`'s restart check fails;
+- the registry never unbound — the rebind fails (`registry bind FAIL`), and so does the restart
+  check;
+- a blocking wait for `Ready` — `storage-service` and `input-server` never come up;
+- an unstartable critical server — `init` starts the emergency shell and the boot fails;
+- an unspawnable `service-mgr` — the same.
+
+And on the host:
+- the login chain placed first;
+- a critical failure carrying on;
+- a route taking the whole suffix;
+- an `endpoint` unchecked.
+
+**`check-fbcon`'s handout group** starts at `service-mgr: input-server bound at /dev/input/new`, the
+last bind before the compositor. `init`'s auth-service line, its first line until now, is too many
+lines back once `service-mgr` logs its own for each server.
+
+## 2026-09-28 — Administration Part E.1b: a route per server, and the sessions bind them
+
+**The sessions and applications bind `service-mgr`'s routes now, not the servers' own endpoints**,
+so a server restarted after a session was built is reached from it. The plan said "`service-mgr`'s
+endpoint with a base per path". **Building it showed one endpoint could not be handed out, and
+the maintainer agreed to one per server the same day**:
+- **`desktop-shell` holds what it is handed with `BIND_NAMESPACE`**, and binds it into every
+  application. E.1a's single endpoint routed on the first component of the suffix. Bound with the
+  base `/auth-service/admin` — or `/device-mgr/input` — it would have reached the user database's
+  admin session, or every keyboard, from an application.
+- **E.1a's root was safe with it**, because nothing hands a root binding out: a binding resolves to
+  a registration, never back to an endpoint. It was the hand-out that was new.
+- So **a route reaches one place in the registry**, whatever it is bound at. This is attenuation
+  by construction, the device manager's info-only endpoint's shape: no right on a handle can say
+  "this server only".
+
+**What changed:**
+- **One route per server**, made at its first `Ready` and kept for the boot. The root path is
+  bound to it once; the login supervisors are handed duplicates of it; `desktop-shell` passes those
+  on. The root and every session hold the same object, so a restart is one registry rebind for
+  all of them. E.1a's suffix routing is gone.
+- **Two derived routes.**
+  - The device manager's `info-endpoint` and the storage service's `session-endpoint` are
+    endpoints each server mints. One minted once dies with its server.
+  - So `service-mgr` resolves each in the registry every time the server comes up, binds it at
+    `/<name>.<suffix>`, and routes to that. The `.` is what keeps it apart from every server's
+    place, since no name the registry binds can have one.
+  - While it waits for the answer, it answers resolves (`lookup_serving`), since the server may be
+    resolving through a route itself.
+- **The supervisors are handed the storage route** instead of resolving
+  `/svc/storage/session-endpoint` themselves, so `desktop-session-mgr` receives eight handoffs.
+  Its control channel is 10 deep, up from 8, which it would have filled exactly.
+- **The wait set lost every running service's control channel.**
+  - It holds the notification channel, every route (`MAX_ROUTES` 16), and the channel of each server
+    still starting (`STARTING_ROOM`). A death needs no slot: it queues `ChildExited`, and each pass
+    already looks at every channel.
+  - Without that, sixteen routes and 24 running services would not fit the kernel's 32. The old
+    cap of 31 services was the wait set's, not a design choice.
+- **The login chain's eight endpoints travel as one struct** (`ChainEndpoints`). It replaces eight
+  positional parameters, and each abort path closes the whole set. The old `fs == 0` path closed
+  only three of them.
+
+**The gate is a copy of the root** (`sys_ns_derive`), made before `restart-probe` restarts:
+- A copy holds the same binding objects and is never rebound, which is a session's case exactly.
+  After the restart it must reach the new instance, as the root must.
+- The control rebinds the root path to the server's own endpoint on every start: the review's
+  "rebind the root" alternative. The root half passes and the copy fails:
+  `the copy of the root, made before the restart, did not reach the new instance`.
+
+**What no gate reaches, said rather than hidden:**
+- **A restart of a server behind a derived route.** `device-mgr` and `storage-service` are both
+  `essential`, with policy `never`, so nothing restarts either. The re-derivation is the same
+  `derive` the boot runs, and waits for one of them to have a restart policy.
+- **A live session reaching a restarted server, end to end.** Nothing restarts a session-facing
+  server before E.2's `service`. Its `clip` gate is the first to, in `test-interactive`'s
+  release image.
+
+**Two current-behaviour lines E.1a's sweep missed** are fixed here: `device-manager.md` §5 still
+said `init` resolves the info-only endpoint, and `service-mgr`'s own login-chain comment said
+`auth-service` is `init`'s. The sweep had grepped phrasings, and these used others.
+
+## 2026-09-28 — Administration Part E.1c: the declarations on the root, and a root comparison that found a program
+
+**The service declarations and the profile manifest are on the root**: `/system/services.toml`,
+read by `service-mgr`, and `/system/profiles/system.toml`, read by the profile server. Both are
+read after `init` has mounted the root, which is before either process runs. So neither had a
+bootstrap reason to be in the initramfs, and there neither could be edited, since the initramfs is
+a boot archive on the FAT ESP. The initramfs now holds `init.toml` and its four programs (and the
+live image's marker). **An installed disk gets both** without any change to `nxinstall`, which
+copies the whole root tree.
+
+**`check-images` compares the roots.**
+- It already held a test initramfs to a release one. That caught a program differing only if the
+  program was one of the four in the initramfs.
+- It now builds both images, carves each root partition out and compares the trees. Store paths
+  are compared with their hash taken out (`unhashed`), so a package with one differing file
+  compares file by file, rather than as two unrelated directories.
+- A test root may differ in the two files, the test package, and one program (below). Anything else
+  fails, on either side.
+
+**It found a program on its first run.** The detail pass said the roots may differ "in those two
+files and the test packages' store paths, and nothing else". I checked that claim by which files
+each root stages, not by their contents, and repeated it to the maintainer.
+- **`nxterm`, in the coreutils package, is built with `test-harness` in a test-harness image.**
+  That build reports each completed row on the debug console for `check-terminal`. The review of
+  PR #194 kept it out of a release image, and the retrofit plan lists its prints as an accepted
+  residue.
+- So the coreutils package has a different hash in a test image, and every comparison of the
+  roots would have said so. The initramfs comparison never could.
+- **It is allowed by name** (`ROOT_DIVERGENCE_ALLOWED`), as `store/coreutils-0.1.0/bin/nxterm`.
+  Every other file in that package, and every other program on the root, is held byte for byte.
+  Removing the divergence would mean a `check-terminal` that reads the grid some other way, which
+  is not this part's to decide.
+
+**Controls**, each a `check-images` run:
+- a file added to the test root fails as `system/extra: only on the test root`;
+- a byte appended to the test root's `tty-server` fails as
+  `store/system-0.1.0/bin/tty-server: differs`.
+
+A host test covers the rule itself, including a second coreutils program differing, which the
+`nxterm` allowance must not cover.
+
+**`heartbeat` left the release image.** It was Phase 3's demo, and the only declaration a release
+image carried besides the servers. It is now the test package's, built from its own crate beside
+`test-harness`'s bins, and declared only in a test image, before `restart-probe`, where it
+sat before. `check_service_attribution` still leans on it: as the one `always` service running
+the whole boot, it shows a misattributed exit as a restart.
+
+**The 1.1 s demo stop went with E.1a, and was not recorded then.** It sent `CTRL_OP_SHUTDOWN` to
+the *first* declared service, which E.1a made `auth-service`, so it had to go. Nothing requests
+a stop until E.2's `service --stop`, and `service-mgr`'s requested-shutdown path waits for it.
+
+**E.1 is complete.** The restart through `service-mgr`'s control path, which the plan's E.1 gates
+name, is E.2's `service`.
+
+## 2026-09-28 — Part E.1, reviewed (PR #340): a file can lose the critical servers, and a restart is not bring-up
+
+The review found one blocking problem (docs), two worth fixing and four optional. It confirmed
+three things from the kernel: a route cannot reach past its server, the registry never reaches a
+resolver, and creates and renames still work behind a route. All seven are addressed.
+
+**Blocking — two crate rules files still stated the old handoff contract.**
+- `session-mgr/CLAUDE.md` listed six handoffs, all "forwarding endpoints". E.1b made it seven:
+  items 3–7 are `service-mgr`'s routes, and the storage route is the seventh, on a 10-deep channel.
+  It also said `/storage` was resolved by the supervisor.
+- `desktop-session-mgr/CLAUDE.md` still said the login chain starts before every declaration.
+- That list had already been wrong once, three parts behind (PR #333). This time it was one part
+  behind.
+
+**Worth fixing, 1 — a declarations file could lose the critical servers without an emergency.**
+- With `/system/services.toml` missing, empty or unparseable, bring-up went straight to a login
+  chain with no `auth-service`, and nothing sent `TERMINAL_OP_EMERGENCY`. The same happened if one
+  typo in `auth-service`'s `endpoint` skipped the declaration: its `critical = true` went with it,
+  and the parser could not say so.
+- Before E.1, `init` started both critical servers unconditionally. E.1c made the file editable,
+  so this was reachable by an edit.
+- **Now**, `parse_all_reporting` returns every declaration it skipped: its name, why, and whether
+  it said `critical`. `service-mgr` logs each one.
+- `bringup::unfit` asks for the emergency shell and starts nothing when:
+  - a skipped declaration was critical;
+  - there are no declarations;
+  - none is critical. A file that declares neither critical server has lost them rather than
+    meant it.
+- Both paths were booted and reach the emergency shell with the reason said:
+  - with the file missing: `no declaration could be read -- starting nothing`;
+  - with `auth-service`'s `endpoint` as `svc/auth`: `declaration 'auth-service' skipped: its
+    endpoint is not an absolute path of plain components -- and it is critical`.
+
+**Worth fixing, 2 — a restart that could not spawn was treated as bring-up.**
+- `start` set `awaiting` and applied the bring-up rule to every server spawn, restarts included.
+  The reviewer demonstrated it: a critical `restart-probe` whose restart failed to spawn asked
+  `init` for the emergency shell long after boot, beside a terminal server holding the console.
+- The same branch also displaced the server bring-up was waiting on. And once halted, a pending
+  `after` deadline would have spun the loop.
+- **Now**, `start` takes whether it is a bring-up start: an ordinary start, or a restart of the
+  server bring-up is waiting on. Only bring-up sets `awaiting` or applies the bring-up rule.
+- A restart that cannot spawn goes to `apply_policy`, split out of `reap`, as a failed exit. That
+  schedules the next attempt, or gives up.
+- A halted manager's `next_deadline` ignores `after`.
+- The reviewer's injection, booted again after the fix: `'restart-probe' could not be restarted`,
+  then attempt 2 succeeds, and the boot passes.
+
+**Optional, all taken:**
+- `register` says `bound at` only when the root binding exists, and `is up, unbound at` otherwise.
+- A dropped control-channel message has every handle it carried closed. A late `Ready`'s endpoint
+  used to leak; a server whose endpoint closes ends itself, and its exit is attributed as usual.
+  `channel_peer_closed`'s doc, which said no service can send on that channel, is corrected: a
+  server can.
+- `init`'s comment said it keeps `service-mgr`'s handle. Its death has been learned from the
+  terminal channel since E.1a.
+- `service-manager.md`'s slice-1 table is marked as dated. Its "today" is 2026-07-15's.
+- The critical-order host test builds its strings with `services_toml(mode)`: its own copy had
+  missed `HEARTBEAT_TOML`.
+
+**Also**: `init`'s emergency line says the reason is `service-mgr`'s, printed above it. It
+said "a critical server did not come up", which a lost file is not quite. And test images now
+fail on three new lines: `' skipped: `, `' could not be restarted`, `-- starting nothing`.

@@ -64,6 +64,12 @@ path = "src/bootprobe.rs"
 name = "test-pattern"
 path = "src/pattern.rs"
 
+# A server that can be made to exit (administration Part E.1): `boot-probe` proves a restarted
+# server is reached again at its path, through `service-mgr`'s registry.
+[[bin]]
+name = "restart-probe"
+path = "src/restartprobe.rs"
+
 # The M13 Part A measurement: what composing a drag costs, and where. Its own binary because it
 # owns the screen for the length of a run — the bench image carries it *instead of* `boot-probe`,
 # and it fires the verdict itself.

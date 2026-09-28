@@ -1,10 +1,10 @@
 //! `eshell` — the emergency shell (Phase 2 slice 9).
 //!
-//! The first interactive userspace program: a minimal command shell on the serial
-//! console. init spawns it after boot (an interactive prompt) and on a critical-path
-//! failure. Keyboard input comes from `/dev/console` (a char `DeviceNode`) through
-//! the universal `sys_io_submit(Read)` + `sys_wait` path; eshell does its own echo +
-//! line editing and runs a few inspection commands. Output is `sys_kprint`.
+//! The first interactive userspace program: a minimal command shell on the serial console. init
+//! spawns it on a critical-path failure, its own or one `service-mgr` reports (administration Part
+//! E.1a). Keyboard input comes from `/dev/console` (a char `DeviceNode`) through the universal
+//! `sys_io_submit(Read)` + `sys_wait` path; eshell does its own echo + line editing and runs a few
+//! inspection commands. Output is `sys_kprint`.
 //!
 //! `#![no_std]` + `#![no_main]`, **no `alloc`**, `libkern` only (no rsproto/libos) —
 //! the init family's rules. See `userspace/eshell/CLAUDE.md`.

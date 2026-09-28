@@ -2,17 +2,19 @@
 
 ## Status
 
-**Built, and checked 2026-09-25** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2. On 2026-09-25 administration Part D.1 made `auth-service` the user
-database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and applications
-`/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
-supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
-them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+**Built, and checked 2026-09-28** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
+revision 2. On 2026-09-28 administration Part E.1a moved the servers from `init`'s children to
+`service-mgr`'s (§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them
+in place of the servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service`
+the user database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and
+applications `/storage` and `/dev/storage`, through a session endpoint of the storage service's that
+each supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4
+gave them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
 supervisor is now handed. Two things changed under it before that: the session namespace also binds
 `/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
 records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
-restyled the greeter's card and moved its pure half — the state, the keys it acts on itself and
-the view — into a library beside the binary, so the host tests it.
+restyled the greeter's card and moved its pure half — the state, the keys it acts on itself and the
+view — into a library beside the binary, so the host tests it.
 
 What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
 `/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,
@@ -121,8 +123,8 @@ credential validation was already separate from session lifecycle and namespace 
 (2026-08-25).** `auth-service` used to create exactly one channel pair at startup and transfer
 the one client end in `Meta::Ready`, with `service-mgr` couriering it to `session-mgr`: a
 single-client server, with no second endpoint for `desktop-session-mgr` to hold and no
-`/svc/auth` to resolve one from. It is a **namespace forwarder** now — `init` binds its endpoint
-at `/svc/auth` and it mints a session per caller — so `desktop-session-mgr` resolves its own,
+`/svc/auth` to resolve one from. It is a **namespace forwarder** now — `/svc/auth` reaches its
+endpoint and it mints a session per caller — so `desktop-session-mgr` resolves its own,
 and the protocol did not change. See
 [`session-and-auth.md`](../architecture/session-and-auth.md) for the built shape.
 
@@ -139,26 +141,36 @@ profile lookup in session construction today — per-user overlays are deferred
 
 ```
 kernel ─spawns→ init (full SysCaps)
-  init ─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
-  init ─spawns with BIND_NAMESPACE, binds /svc/views→ view-broker (builds views; see below)
-  init ─spawns, binds /svc/devices→ device-mgr (no caps; hands devices to their class's owner)
-  init ─spawns with BIND_NAMESPACE, binds /svc/storage→ storage-service (a namespace per mount)
-  init ─spawns, delegates BIND_NAMESPACE→ service-mgr
+  init ─spawns, delegates BIND_NAMESPACE and a full-rights root→ service-mgr
+    ├─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
+    ├─spawns with BIND_NAMESPACE, binds /svc/views→ view-broker (builds views; see below)
+    ├─spawns, binds /svc/devices→ device-mgr (no caps; hands devices to their class's owner)
+    ├─spawns with BIND_NAMESPACE, binds /svc/storage→ storage-service (a namespace per mount)
+    ├─spawns, binds→ logging, tty, clipboard, input and the compositor (no caps)
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
-    │      + fs, profile, tty, clipboard and view-broker endpoints, and an info-only
-    │        device endpoint;  auth resolved from /svc/auth
+    │      + fs and profile endpoints, and service-mgr's routes to tty, clipboard,
+    │        the view broker, an info-only device endpoint and a storage session
+    │        endpoint;  auth resolved from /svc/auth
     │      └─on login→ session ns ─spawns→ nxsh
     │
     └─spawns, re-delegates BIND_NAMESPACE→ desktop-session-mgr        ← new
-           + the same, and /dev/draw
+           + the same, and the compositor's route
            └─on login→ desktop session ns ─spawns, re-delegates
                        BIND_NAMESPACE→ desktop-shell                   ← new
                           └─per application→ app ns ─spawns→ nxterm, …
 ```
 
-Every arrow attenuates. The new rows extend the existing concentration rather than widening it:
-`BIND_NAMESPACE` reaches one more supervisor tier, and the reason is the same one that put it in
-`session-mgr` — **the process that composes a namespace must hold the endpoint handles it binds**
+The servers were `init`'s children, bound by `init`, until administration Part E.1a (2026-09-28);
+each "binds" above is `service-mgr`'s registry and, once, the root path to the server's route — an
+endpoint of `service-mgr`'s own, reaching that server alone. The supervisors, and through them
+`desktop-shell`, are handed the same routes since Part E.1b, so a session reaches a restarted
+server ([`service-manager.md`](service-manager.md) § *Servers, and the registry*).
+
+Every arrow attenuates, bar one: `service-mgr`'s root handle carries `init`'s own rights, since it
+binds the servers (§ *Capability posture* there). The new rows extend the existing concentration
+rather than widening it: `BIND_NAMESPACE` reaches one more supervisor tier, and the reason is the
+same one that put it in `session-mgr` — **the process that composes a namespace must hold the
+endpoint handles it binds**
 ([`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md)).
 
 **`desktop-shell` holding `BIND_NAMESPACE` is the one genuinely new grant, and it is load-bearing
@@ -197,14 +209,14 @@ property to preserve is not "the shell must not serve" but:
 > **`desktop-shell` does not register itself.** It holds `BIND_NAMESPACE` to construct
 > *application* namespaces — continuously, as its job — not to make itself reachable once.
 
-**Amended 2026-08-26; the substance held and the mechanism did not.** This block used to read
-"does not bind its own endpoint", and said `desktop-session-mgr` would bind `/dev/desktop` into
-the session namespace exactly as `init` binds the tty server's — the shell sending `Meta::Ready`
+**Amended 2026-08-26; the substance held and the mechanism did not.** This block used to read "does
+not bind its own endpoint", and said `desktop-session-mgr` would bind `/dev/desktop` into the
+session namespace exactly as `init` then bound the tty server's — the shell sending `Meta::Ready`
 and a supervisor binding it, like every other server. Planning Milestone 8 Part F found that
-mechanism has **no consumer**: the session namespace is the shell's own and nothing else runs in
-it, so the binding would exist for nobody. What actually needs to reach `/dev/desktop` is an
-application — a `desktop` command under a terminal's shell — and an application's namespace is
-one the shell *constructs*, where it already binds five endpoints.
+mechanism has **no consumer**: the session namespace is the shell's own and nothing else runs in it,
+so the binding would exist for nobody. What actually needs to reach `/dev/desktop` is an application
+— a `desktop` command under a terminal's shell — and an application's namespace is one the shell
+*constructs*, where it already binds five endpoints.
 
 So the shell binds its own endpoint **into the namespaces it constructs**, and none into the
 session namespace. The prohibited act is a resource server making itself reachable in a namespace
@@ -230,13 +242,13 @@ that now is cheaper than discovering it is impossible later.
 
 ### The view broker is the second, and its constructing is narrower
 
-`view-broker` (administration Part A, 2026-09-23) also serves and holds `BIND_NAMESPACE`, and
-it reconciles the same way: it binds only into namespaces it *created* — each view a copy it made of
-the namespace its caller sent, via `sys_ns_derive` — and it never registers itself (`init` binds it
-at `/svc/views`). Its constructing is narrower than the shell's, since it adds one profile's grants
-to a namespace that already exists rather than composing one from endpoints. What a bug in it
-reaches is set out in [`administration.md`](../planning/administration.md) § *Why one broker*: the
-raw disks, and whatever the domain services will do on request.
+`view-broker` (administration Part A, 2026-09-23) also serves and holds `BIND_NAMESPACE`, and it
+reconciles the same way: it binds only into namespaces it *created* — each view a copy it made of
+the namespace its caller sent, via `sys_ns_derive` — and it never registers itself (`service-mgr`
+binds it at `/svc/views`). Its constructing is narrower than the shell's, since it adds one
+profile's grants to a namespace that already exists rather than composing one from endpoints. What a
+bug in it reaches is set out in [`administration.md`](../planning/administration.md) § *Why one
+broker*: the raw disks, and whatever the domain services will do on request.
 
 **The shell holds the broker's raw endpoint**, to bind `/dev/views` into each application at the
 session's base, and with `BIND_NAMESPACE` it could bind any base — so the graphical session's

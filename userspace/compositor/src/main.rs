@@ -3105,7 +3105,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     // Clear **before** announcing readiness, so `Meta::Ready` means "I have taken the
     // screen" rather than "I am about to".
     //
-    // Announcing first left the clear racing whatever init spawned next: `bind_compositor`
+    // Announcing first left the clear racing whatever was spawned next: `bind_compositor`
     // would return while the clear was still pending, and on `-smp 4` two processes then
     // held `/dev/framebuffer` mapped read-write with nothing arbitrating. Ordering it here
     // costs nothing and removes the window entirely, where pacing it against a later signal

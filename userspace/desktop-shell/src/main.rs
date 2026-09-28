@@ -1694,6 +1694,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     if home.is_empty() {
         kprint(b"desktop-shell: no home in argv; applications get no /home\n");
     }
+    // **Every server's is `service-mgr`'s route to it** (administration Part E.1b), which reaches
+    // that server alone and whichever instance of it is running; `fs` and `profile` are `init`'s
+    // servers' own. So what this shell binds into an application reaches a restarted server, and
+    // holding them with `BIND_NAMESPACE` reaches nothing a route does not lead to.
     let draw_endpoint = recv_handle(setup);
     let fs_endpoint = recv_handle(setup);
     let tty_endpoint = recv_handle(setup);

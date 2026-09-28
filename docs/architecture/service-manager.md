@@ -2,7 +2,11 @@
 
 **Status:** Implemented (Phase 3) — `userspace/service-mgr`, spawned by `init`, supervising
 the service set and performing supervisor-side namespace binding. Verified 2026-08-05; last
-checked 2026-09-25, when a death found before its exit code learned to wait for it (below);
+checked 2026-09-28, when it took over starting and binding the servers `init` used to — the
+boundary below, as built at last — through a registry of its own (administration Part E.1a),
+and began handing the sessions its own routes to them (Part E.1b), and reading its declarations
+from the root (Part E.1c);
+before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
 
@@ -50,14 +54,15 @@ kernel_main
   └─ run_first_userspace → init (PID 1)
        ├─ read /etc/init.toml, process critical-path mounts (fs-server-ext4 → bind /)
        ├─ read /system/current-generation, spawn + bind the system profile server
-       ├─ delegate a capability subset + spawn service-mgr   ← THE HANDOFF
-       ├─ release the initramfs (once boot is stable)
-       └─ reap loop (orphans + shutdown notifications)
+       ├─ spawn service-mgr; hand it a full-rights root,     ← THE HANDOFF
+       │  the fs and profile endpoints, down the terminal channel
+       └─ reap loop (orphans + the terminal channel)
                                     │
 service-mgr ────────────────────────┘
-  ├─ read service declarations, build the dependency graph
-  ├─ start services in dependency order (RS protocol for RS-style ones)
-  ├─ supervise: reap + restart per policy
+  ├─ read service declarations
+  ├─ start the servers in order (RS protocol; bind in the registry and at each path)
+  ├─ the login chain, then the other declarations in the file's order
+  ├─ supervise: reap + restart per policy; answer resolves forwarded to it
   └─ lifecycle control channels
 ```
 
@@ -82,8 +87,9 @@ boundary is:
 
 ### Several services, and how their exits are told apart
 
-`service-mgr` supervises every declaration in `/initramfs/etc/services.toml`, up to
-`MAX_SERVICES`, and applies each one's own restart policy. It says which declarations it
+`service-mgr` supervises every declaration in `/system/services.toml`, on the root (the
+initramfs's `etc/services.toml` until administration Part E.1c), up to
+`MAX_SERVICES` (24), and applies each one's own restart policy. It says which declarations it
 dropped rather than truncating silently.
 
 **Which child exited is decided by the child's control channel, not by the notification.**
@@ -91,8 +97,9 @@ dropped rather than truncating silently.
 so a supervisor with two children would learn *that* one exited and never *which*
 (`TODO(child-exit-attribution)` in [deferred-decisions](../rationale/deferred-decisions.md)).
 Each service instead gets its own control channel; when the child dies its end is destroyed,
-the kernel signals the survivor on the same path `sys_wait` uses, and a non-blocking
-`sys_channel_recv` on the handle that woke answers `PeerClosed` rather than `WouldBlock`. A
+and a non-blocking `sys_channel_recv` on the survivor answers `PeerClosed` rather than
+`WouldBlock`. Each pass tries every running service's channel, and the death's `ChildExited`
+is what wakes the pass (since Part E.1b; the channels themselves were waited on before). A
 handle cannot be recycled under its holder the way a pid can, so this is exact.
 
 The exit **code** is still taken from the notification queue in arrival order, since it
@@ -117,16 +124,25 @@ init's irreducible list is short and bounded:
    based reparenting, `overview.md`). This reaping is **split**: service-mgr reaps its
    *own* service children to drive restart; a service's grandchildren, or anything
    orphaned when service-mgr itself dies, land on init. Two levels, not a conflict.
-4. **Release the initramfs** once boot is stable.
-5. **Terminal shutdown/reboot + emergency backstop** — **shutdown is split**:
+4. **Terminal shutdown/reboot + emergency backstop** — **shutdown is split**:
    service-mgr does *graceful, dependency-ordered* service teardown (via the control
    channels); init does the *terminal* step (it is the last process) and is the
-   recovery backstop when service-mgr can't come up or dies.
+   recovery backstop when service-mgr can't come up, or asks for it.
+
+(A fifth item, **releasing the initramfs** once boot is stable, stood here until administration
+Part E.1a. It was never built, and cannot be: the root fs-server's restart image can only come
+from the initramfs. See `userspace/init/CLAUDE.md` § *Initramfs interaction*.)
 
 Everything else — even things init *could* spawn (init may spawn more than one
 process) — should be a service. init spawns only the **irreducible minimum to reach
 service-mgr** (the root fs-server; eventually the profile server *if* declarations
 move to `/store`) plus the emergency eshell.
+
+**As built since administration Part E.1a (2026-09-28)**: `init` spawns its mounts' fs-servers,
+the profile server at `/bin` — which `service-mgr` is spawned from — `service-mgr`, and the
+emergency shell when it must. The nine servers it used to start as well are declarations:
+`auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the view broker, `device-mgr`,
+`storage-service`, `input-server` and the compositor (*Servers, and the registry*, below).
 
 **The bootstrap ordering to respect:** long-term, declarations come from `/store`
 projected by the profile server — but service-mgr needs its declarations *to start*.
@@ -134,6 +150,82 @@ So init must bring up "enough" (root fs, later the profile server) before servic
 reads anything: init owns the *minimum substrate*, service-mgr owns *everything
 policy-driven on top*. Slice A sidesteps the chicken-and-egg by reading declarations
 from the **initramfs**.
+
+### Servers, and the registry
+
+*(Administration Parts E.1a and E.1b, 2026-09-28.)*
+
+**A declaration can describe a server.** `endpoint = "<path>"` names the path in the root the
+server is reached at (`service-toml-schema.md`). For such a declaration, `service-mgr`:
+- spawns it with the control channel `init` gave a server — `SEND`, `RECV`, `TRANSFER` and `WAIT`,
+  and no log handoff, since a server resolves its own log;
+- waits for its `Meta::Ready`, within 30 s;
+- binds the endpoint in **its registry**, a namespace of its own, at `/<name>`;
+- and, the first time only, binds the root path to the server's **route**: an endpoint of
+  `service-mgr`'s own, made for that server and kept for the boot.
+
+A resolve on that path reaches `service-mgr` first, on the route. It answers `SUBNAMESPACE` into
+its registry at `/<name>`, the whole suffix continuing, and the resolve goes on into whichever
+server is bound there now — as `/storage` works. **A restart rebinds in the registry and nowhere
+else**, so every binding of the path reaches the new server, and a program whose connection closed
+resolves the same path and reaches it. A route whose server is not up answers `NotFound`.
+
+**The sessions bind the same routes** (Part E.1b). The login supervisors are handed a duplicate of
+the route to each server a session binds — the terminal server, the clipboard, the view broker,
+the compositor — never the server's own endpoint, so a session built before a restart reaches the
+new server too; `desktop-shell` passes the same handles into every application. `boot-probe`
+proves it with a copy of the root made before a restart, which holds the same binding and is never
+rebound.
+
+**One route reaches one server.** Part E.1a bound every root path to a single endpoint, with the
+server's name as the base, and routed on the suffix. That could not be handed to a session:
+`desktop-shell` holds what it is handed with `BIND_NAMESPACE`, and could have bound it with any
+base — `/auth-service/admin`, `/device-mgr/input`. A route per server is attenuation by
+construction, like the device manager's info-only endpoint.
+
+**Two servers mint an endpoint for sessions**, narrower than their root one, and each gets a
+route of its own (`service_mgr::registry::DERIVED`): the device manager's `info-endpoint`, which
+answers its tables and never a class, and the storage service's `session-endpoint`, which answers
+the filesystems and never an admin endpoint. Each time one comes up, `service-mgr` resolves it in
+the registry — answering resolves while it waits — and binds what it gets at `/<name>.<suffix>`,
+a place no server's name can take. The supervisors are handed the route to it, and resolved the
+storage one themselves until Part E.1b. **No restart reaches either today**: both are `essential`,
+and every server's policy is `never`; the re-derivation is written for when one has a policy.
+
+**Declarations start in file order, each server's `Ready` awaited before the next**, which keeps
+the orders `init` relied on: the broker after the log it audits to, the device manager before the
+two that take its devices, and the input server before the compositor. **The login chain starts
+after the last server and before the rest** (`service_mgr::bringup`): its supervisors need the
+servers, and a test image's clients must start after the greeter. `service-mgr` keeps the
+supervisors' process handles and control channels, which shutdown will use.
+
+**`service-mgr` never blocks on anything that can wait on it.** Every resolve on a server's path
+waits on it, so a blocking wait for a server that is itself resolving one — the broker opens its
+log at startup — would be two processes waiting on each other. So a server's `Ready`, a restart's
+backoff and an `after` are deadlines in its one wait, and resolves are answered on every pass, as
+they are while it waits for an exit code or a derived endpoint. The lookups it does make outright
+wait on the root filesystem, the profile server and servers already serving, none of which waits
+on it. Each route's ring is 64 deep, since a full one answers a resolve `WouldBlock` at once.
+
+**Its wait holds the notification channel, every route, and the control channel of each server
+still starting** — whose `Ready` is the one thing a control channel brings. A death needs no slot:
+it closes the channel and queues `ChildExited`, and each pass looks at every channel. That keeps
+the wait inside the kernel's 32 handles with sixteen routes (`registry::MAX_ROUTES`); until Part
+E.1b it held every running service's channel, which capped the services at 31 and left no room.
+
+**`critical = true`, at bring-up only**, marks `auth-service` and `logging-service`, the two `init`
+treated as critical-path. If one does not come up at boot, `service-mgr` starts nothing more and
+asks `init` for the emergency shell over the **terminal channel** (below); the console is still
+free, since both start before the terminal server. At runtime a critical server's death is its
+restart policy's, because the terminal server holds the console by then. Every server's policy is
+`never` today, as `init` never restarted them. **A declarations file that has lost its critical
+servers is an emergency too** (`bringup::unfit`, PR #340 review): a critical declaration that is
+skipped, a missing or empty file, or none critical — each would otherwise go straight to a login
+chain with no `auth-service` behind it. Every skipped declaration is logged by name.
+
+**The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
+handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
+then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
 
 ## Capability posture
 
@@ -164,10 +256,15 @@ the handles granted in `[service.<name>.handles]`, not from syscaps.
 
 **Binding is two-gated.** Every `sys_ns_bind` service-mgr issues is checked against
 *both* the ambient `BIND_NAMESPACE` syscap *and* `Rights::BIND` on the specific
-namespace handle being bound into. So service-mgr should hold BIND-righted handles
-only to the subtrees it actually manages — matching the rationale doc's "delegated
-`BIND_NAMESPACE` for the subtrees it manages." Holding the ambient cap is necessary
-but not sufficient; the per-handle right scopes *where* it can bind.
+namespace handle being bound into. A spawned process only ever gets a lookup-only root handle,
+which is why `init` did every root binding until administration Part E.1a.
+
+**`service-mgr` sits in `init`'s trust tier** since then — the maintainer's call, 2026-09-28. `init`
+hands it a root handle with `init`'s own rights, `BIND` and `UNBIND` among them, so it can bind the
+servers it starts. This section said service-mgr "should hold BIND-righted handles only to the
+subtrees it actually manages"; it holds the whole root now, which reaches `/`, `/bin` and `/store`
+as well. A kernel handle scoped to a subtree would restore the narrower posture, and nothing
+builds one.
 
 **init retains `BIND_NAMESPACE` for life — and that's fine.** Syscaps are *immutable
 after spawn* (`syscaps.md`): a process sheds authority only by spawning a
@@ -184,10 +281,18 @@ unsound regardless of capabilities: service-mgr's death orphans all its services
 (they reparent to init), kills their control channels, and leaves its namespace
 bindings stale in the system namespace — a fresh service-mgr would have to *re-adopt*
 that live state (a real checkpoint/re-attach feature, not a respawn). So service-mgr
-exiting is a **critical fault**: init logs it and reboots (once a reboot mechanism
-exists) or drops to the emergency eshell until then. init's retained `BIND_NAMESPACE`
-is latent capability we do not lean on — available if a restart-aware service-mgr is
-ever built.
+exiting is a **critical fault**.
+
+**As built since administration Part E.1a**, which is when the code stopped respawning it: `init`
+learns of the death from the terminal channel closing, and reports that the machine needs a
+restart. It cannot drop to the emergency shell, because the terminal server — `service-mgr`'s
+child, still running — holds the console. And every server path in every session goes through
+`service-mgr`'s endpoint, so the death takes them all. Until Part E.4's `shutdown`, the restart is
+the person's.
+
+**A `service-mgr` that never starts does get the emergency shell**: a spawn that fails leaves no
+server at all, `auth-service` and `logging-service` among them, and nothing holding the console.
+`init` takes the emergency path, as it did for that pair when it started them.
 
 ## The service lifecycle
 
@@ -275,7 +380,11 @@ The [service-toml schema](../spec/service-toml-schema.md) is the **full aspirati
 contract**. Several of its assumptions do not exist yet, and the *first* slice must
 be scoped to what is buildable:
 
-| Schema assumes | Reality today | Implication for slice 1 |
+*(This is slice 1's table, and its "today" is 2026-07-15's. Several rows have moved since: spawn
+is by path through `/bin`, a logging service exists, and the declarations are
+`/system/services.toml` on the root (administration Part E.1c). It is kept as the scoping record.)*
+
+| Schema assumes | Reality at slice 1 | Implication for slice 1 |
 |---|---|---|
 | `executable = "/store/…"` path spawns | Spawn is a **kernel-embedded `ImageId` enum** (no ELF-from-namespace loader) | Slice-1 services are embedded images selected by `ImageId`; the `executable` field maps to a known image, not an arbitrary path. Full path-based spawn is a later slice (needs a userspace ELF loader). |
 | Declarations in `/store/…-system-services/` projected to `/etc/services/` | No content store, no profile server | Declarations come from the **initramfs**, like `init.toml`. **One file** — `/initramfs/etc/services.toml` — not a directory: nothing can enumerate one (schema changed 2026-08-21). |
@@ -316,12 +425,14 @@ Settled in review (2026-07-15):
 
 1. **Slice-A demo service**: a purpose-built trivial **heartbeat** service — a clean,
    controllable restart/backoff demonstration (not a reused image).
-2. **Declaration source**: the **initramfs** — `/initramfs/etc/services.toml`, mirroring
-   `init.toml` — which exercises the real parse path and sidesteps the profile-server
-   bootstrap ordering. **One file holding every service**, revised 2026-08-21 from
-   `/etc/services/*.toml`: a directory of declarations needs enumeration, and neither the
-   initramfs (a CPIO archive the kernel looks up by name) nor `profile-server` (which
-   projects packages' `bin/` only) can do it. See `docs/spec/service-toml-schema.md`.
+2. **Declaration source**: the **initramfs** — `/initramfs/etc/services.toml`, mirroring `init.toml`
+   — which exercises the real parse path and sidesteps the profile-server bootstrap ordering.
+   *(Moved to `/system/services.toml` on the root by administration Part E.1c, 2026-09-28: `init`
+   mounts the root before it spawns `service-mgr`, so the ordering needed no sidestepping, and on
+   the root the file can be edited.)* **One file holding every service**, revised 2026-08-21 from
+   `/etc/services/*.toml`: a directory of declarations needs enumeration, and neither the initramfs
+   (a CPIO archive the kernel looks up by name) nor `profile-server` (which projects packages'
+   `bin/` only) can do it. See `docs/spec/service-toml-schema.md`.
 3. **fs-server ownership**: **stays in init for slice A** (critical path — init must
    reach a mounted root to find service-mgr's declarations); service-mgr owns only
    *additional* services in A. Whether service-mgr re-adopts the root fs-server is a

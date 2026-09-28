@@ -1,10 +1,10 @@
 //! `clipboard-server` — the kill ring, served at `/dev/clipboard`.
 //!
-//! A resource server in the ordinary shape: `init` spawns it with a control channel, it answers
-//! `Meta::Ready` with a forwarding endpoint, and `init` binds that endpoint. A client that
-//! resolves `/dev/clipboard` gets a session channel of its own and speaks the `Clipboard`
-//! category on it. It binds nothing itself and holds no `BIND_NAMESPACE` — the rule every
-//! resource server here follows (`docs/rationale/why-supervisor-registration.md`).
+//! A resource server in the ordinary shape: `service-mgr` spawns it with a control channel, it
+//! answers `Meta::Ready` with a forwarding endpoint, and `service-mgr` binds that endpoint. A
+//! client that resolves `/dev/clipboard` gets a session channel of its own and speaks the
+//! `Clipboard` category on it. It binds nothing itself and holds no `BIND_NAMESPACE` — the rule
+//! every resource server here follows (`docs/rationale/why-supervisor-registration.md`).
 //!
 //! **Why a server at all, rather than a slot in the compositor.** M12 decision 1: a clipboard is
 //! shared mutable state between mutually untrusting programs, and "anything running may read
@@ -466,8 +466,8 @@ fn serve_loop(serve_end: u64) -> ! {
     }
 }
 
-/// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root
-/// namespace (unused — this server reads nothing), `rdx` = the control channel `init` installed,
+/// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root namespace
+/// (unused — this server reads nothing), `rdx` = the control channel its supervisor installed,
 /// `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {

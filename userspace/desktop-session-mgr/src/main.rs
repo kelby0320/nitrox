@@ -302,7 +302,9 @@ fn run_session(
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"desktop-session-mgr: up\n");
 
-    // The endpoints, in `service-mgr`'s send order. Positional, like the serial column's.
+    // The endpoints, in `service-mgr`'s send order. Positional, like the serial column's. **All but
+    // the first two are `service-mgr`'s routes** (administration Part E.1b), not the servers' own
+    // endpoints, so a session bound before a server restarts still reaches it after.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
@@ -320,12 +322,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // the fourth both take: bound at `/dev/devices` with the base `/info`, in the session and in
     // every application. Info-only because the shell holds it with `BIND_NAMESPACE`.
     let devices_endpoint = recv_handoff(control);
-    // **The storage service's session endpoint** (administration Part C.6), resolved rather than
-    // couriered, as `/svc/views/session` is: nothing new travels the handoff channels. Once, since
-    // its lifetime is the machine's. Bound at `/storage` and `/dev/storage` in every session and,
-    // through the shell, every application. `0` on a boot without the service.
-    let (_, storage_endpoint) =
-        ns_lookup(root_ns, b"/svc/storage/session-endpoint", RIGHT_TRANSFER | RIGHT_DUPLICATE);
+    // **The storage service's session endpoint** (administration Part C.6) — the eighth, and the
+    // fifth both take. Bound at `/storage` and `/dev/storage` in every session and, through the
+    // shell, every application. `0` on a boot without the service. **Couriered since Part E.1b**:
+    // it was resolved here, which minted one that died with the service; `service-mgr` asks for it
+    // each time the service comes up, and this is the route to whichever is current.
+    let storage_endpoint = recv_handoff(control);
     // A supervisor channel to it, resolved once, as the serial column does: this process opens a
     // session for each login and closes it when the shell exits.
     let views_sup = if views_endpoint != 0 {

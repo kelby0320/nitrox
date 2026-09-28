@@ -40,8 +40,10 @@ before M7 Part D was `selftest`-gated.
   (`bind_console: false`, governing decision 3) because the console is the recovery path.
   Note that `/dev/tty` *is* bound and reaches the same physical console — see
   `TODO(gui-dev-tty)`, whose trigger fired with this crate.
-- **The greeter's window is created before every other client's**, because
-  `service-mgr` brings the login chain up before declared services. `check-display` and
+- **The greeter's window is created before every other client's**, because `service-mgr` brings
+  the login chain up after the last server and before every other declaration
+  (`service_mgr::bringup::chain_at`; before every declaration until administration Part E.1a,
+  when the servers became declarations) — and no server opens a client window. `check-display` and
   `check-terminal` depend on their reference windows stacking above it. A change to this
   window's size, position, role, or presentation is a change to what the display gate compares —
   `display.yml` path-filters on this directory for that reason.

@@ -586,14 +586,14 @@ reload, health, swap-in-place).
 **A narrower endpoint, minted on request** (administration Part B.4). A resolve answered with a
 channel hands the caller a channel end, and **any channel end binds as a forwarding endpoint** —
 `sys_ns_bind` adopts an `IpcChannel` whatever its origin. So a server can mint a second endpoint of
-its own and answer a resolve with it: resolves through wherever that is bound arrive on a
-serving end the server knows, and it can answer a narrower set there. The device manager is the
-first. On the endpoint `init` binds at `/svc/devices` it hands devices to their owners; on the
-**info-only** endpoint `init` resolves at `/svc/devices/info-endpoint` and couriers to the login
-supervisors, it answers only its tables. That is **attenuation by construction**, for authority no
-right on a handle can express: a process that holds the info-only endpoint with `BIND_NAMESPACE` can
-bind it with any base and still reach nothing but the tables. It is not self-registration — the
-server mints, and a supervisor still decides where it is bound
+its own and answer a resolve with it: resolves through wherever that is bound arrive on a serving
+end the server knows, and it can answer a narrower set there. The device manager is the first. On
+the endpoint `/svc/devices` reaches it hands devices to their owners; on the **info-only** endpoint
+`service-mgr` resolves at `info-endpoint` and reaches through a route it couriers to the login
+supervisors (administration Part E.1b), it answers only its tables. That is **attenuation by
+construction**, for authority no right on a handle can express: a process that holds the info-only
+endpoint with `BIND_NAMESPACE` can bind it with any base and still reach nothing but the tables. It
+is not self-registration — the server mints, and a supervisor still decides where it is bound
 ([`rsproto-devices-ops.md`](../spec/rsproto-devices-ops.md)).
 
 ### A server can hand back a namespace

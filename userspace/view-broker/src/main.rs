@@ -1,7 +1,7 @@
 //! `view-broker` — run a program in a **view**: its caller's namespace plus a profile's grants,
 //! when `/system/views.toml` says the caller may (`docs/planning/administration.md` § Part A).
 //!
-//! **What it holds, and so what a bug here reaches.** It is spawned by `init` with
+//! **What it holds, and so what a bug here reaches.** It is spawned by `service-mgr` with
 //! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and it inherits the
 //! root namespace, which is where the grants come from: every block device, for `disks`. **And the
 //! root filesystem**, through which it reads `/system/views.toml`, replaces it since Part D.2, and
@@ -10,8 +10,8 @@
 //! it copies that again before binding anything, so the caller cannot keep a handle to what it
 //! builds. It never touches a terminal: `with` reads the password.
 //!
-//! **Two kinds of channel off one forwarding endpoint**, which `init` binds at `/svc/views`: a
-//! login supervisor resolves `/svc/views/session` for a channel to open and close sessions on,
+//! **Two kinds of channel off one forwarding endpoint**, which `service-mgr` binds at `/svc/views`:
+//! a login supervisor resolves `/svc/views/session` for a channel to open and close sessions on,
 //! and binds the same endpoint into each session at `/dev/views` with the base `/s/<session>`, so a
 //! process there resolves a channel the broker already knows the session of. See
 //! `librsproto::views` for the ops.
@@ -154,9 +154,9 @@ const IN_USE_WAIT_NS: u64 = 5_000_000_000;
 /// which the `storage` grant binds into a view, and an admin session of the broker's own, on which
 /// it asks `InUse` before the `disks` grant.
 ///
-/// **Resolved when first needed, not at startup**: `init` spawns the broker before the device
-/// manager and the storage service, so at startup there is nothing to resolve. A failure is not
-/// remembered, so a service that came up later is found the next time.
+/// **Resolved when first needed, not at startup**: `service-mgr` spawns the broker before the
+/// device manager and the storage service, so at startup there is nothing to resolve. A failure is
+/// not remembered, so a service that came up later is found the next time.
 #[derive(Default)]
 struct Storage {
     endpoint: u64,
@@ -178,7 +178,7 @@ struct Broker {
     root_ns: u64,
     notif: u64,
     serve_end: u64,
-    /// **A duplicate of this broker's own forwarding endpoint** — the one `init` binds at
+    /// **A duplicate of this broker's own forwarding endpoint** — the one `service-mgr` binds at
     /// `/svc/views` — kept to bind into a view with a base of the broker's choosing: the `views`
     /// grant's `/dev/policy` (administration Part D.2). `0` if it would not duplicate, and then
     /// that grant is refused rather than given without its binding.
@@ -1455,8 +1455,8 @@ fn view_env(bytes: &[u8], view: &str) -> Record {
     record.with_str_field("view", view)
 }
 
-/// Send `init` `Meta::Ready`, naming this server and carrying the forwarding endpoint's client
-/// end — the handshake every server here speaks to the supervisor that binds it.
+/// Send `Meta::Ready` to `service-mgr`, naming this server and carrying the forwarding endpoint's
+/// client end — the handshake every server here speaks to the supervisor that binds it.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(n) = librsproto::meta::ready(&mut body, b"view-broker") else {
@@ -1466,7 +1466,7 @@ fn send_ready(control: u64, client_end: u64) -> bool {
 }
 
 /// Bootstrap registers: `rdi` = notification channel (where `ChildExited` arrives), `rsi` = the
-/// inherited root namespace, `rdx` = the control channel `init` installed, `rcx` = `arg0`.
+/// inherited root namespace, `rdx` = the control channel `service-mgr` installed, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"view-broker: up\n");
@@ -1474,8 +1474,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"view-broker: channel create FAIL\n");
         exit(1);
     };
-    // Kept before `Ready` moves the endpoint to `init`: the `views` grant binds it into a view.
-    // SAFETY: duplicating an endpoint this process holds, with every right it has.
+    // Kept before `Ready` moves the endpoint to `service-mgr`: the `views` grant binds it into a
+    // view. SAFETY: duplicating an endpoint this process holds, with every right it has.
     let forwarding = unsafe { syscall2(SYS_HANDLE_DUPLICATE, client_end, u64::MAX) };
     let forwarding = if forwarding > 0 { forwarding as u64 } else { 0 };
     if !send_ready(control, client_end) {

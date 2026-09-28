@@ -1,7 +1,8 @@
 # Storage
 
-**Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; last checked
-2026-09-25.**
+**Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
+`service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
+since Part E.1b; last checked 2026-09-28.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -65,8 +66,10 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 3. **It reads each device** (§4), and each disk's partition table.
 4. **It reads `/initramfs/etc/init.toml`** and matches each of `init`'s mounts to its device (§5).
 5. **It mounts what it can serve** (§6), and keeps every device's node, mounted or not.
-6. **It says what it found**, a line per device, then answers `Meta::Ready`, and `init` binds it
-   at `/svc/storage`.
+6. **It says what it found**, a line per device, then answers `Meta::Ready`, and `service-mgr`
+   binds it at `/svc/storage` (`init` did until administration Part E.1a). A resolve there is
+   continued twice — into `service-mgr`'s registry, then into a mount's namespace — two of the
+   four continuations the kernel allows.
 
 On a `test-qemu` boot the log reads, the RAM disk being the test image's scratch filesystem
 ([`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md)):
@@ -167,15 +170,18 @@ lacked `TRANSFER`.
 
 **Sessions reach the service through an endpoint of their own**, as they reach the device manager.
 Resolving `/svc/storage/session-endpoint` on the root endpoint mints a forwarding endpoint, and on
-it the service answers `info…` and `fs…` and nothing else. C.6's login supervisors will bind it
-twice into every session:
+it the service answers `info…` and `fs…` and nothing else. `service-mgr` resolves one each time
+the service comes up, binds it in its registry, and hands the login supervisors a **route** to it
+(administration Part E.1b; the supervisors resolved one each until then). They bind that twice
+into every session:
 - at `/storage` with the base `/fs`, so `/storage/<label>/…` is the filesystem;
 - at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table.
 
 **The endpoint, not the base, is the boundary.** A holder with `BIND_NAMESPACE` could bind it with
 no base, and on the root endpoint that would let it resolve `session-endpoint` and mint more. On a
-session endpoint that suffix is `NotFound`, however it is bound. Four session endpoints can exist
-at once: one for each login supervisor, and headroom.
+session endpoint that suffix is `NotFound`, however it is bound, and the route in front of it
+reaches that endpoint and nothing else. Four session endpoints can exist at once; since Part E.1b
+`service-mgr`'s is the only one, the rest headroom.
 
 ## 8. Mounting and unmounting by request
 
@@ -264,8 +270,8 @@ choice for one laptop with one person at it ([`administration.md`](../planning/a
 
 **The service holds `BIND_NAMESPACE`**, since C.5b. It builds a namespace per mount and binds into
 nothing it did not create, which is the view broker's reconciliation
-([`userspace/CLAUDE.md`](../../userspace/CLAUDE.md) § Capability discipline). `init` binds the
-service itself at `/svc/storage`.
+([`userspace/CLAUDE.md`](../../userspace/CLAUDE.md) § Capability discipline). `service-mgr`
+binds the service itself at `/svc/storage`.
 
 ## 11. What the gates prove
 

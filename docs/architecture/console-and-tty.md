@@ -181,9 +181,12 @@ channel produces a namespace entry that answers `Namespace::Resolve` with `Unsup
 `/dev/tty` that exists and cannot be opened. Both are `IpcChannel`s; only the role differs,
 and only the binder knows which it holds.
 
-So a session binds the **forwarding endpoint**, handed down init → service-mgr →
-session-mgr alongside the fs and profile endpoints, sharing init's registration exactly as
-`/home` shares the fs-server's. Every program in the session then resolves its own terminal.
+So a session binds a **forwarding endpoint**: `service-mgr`'s route to the terminal server, handed
+down service-mgr → session-mgr alongside the fs and profile endpoints `init` handed `service-mgr`,
+and the same object the root's `/dev/tty` is bound to, as `/home` shares the fs-server's. A resolve
+on it continues into whichever terminal server is running (administration Part E.1b; the server's
+own endpoint was handed down until then, and `init` started and bound the server until Part E.1a).
+Every program in the session then resolves its own terminal.
 
 **A stage's terminal is not resolved; it is handed down** (administration Part A.2, 2026-09-23).
 A resolve mints a terminal on the console, so a stage that resolved `/dev/tty` inside `nxterm`
@@ -397,7 +400,10 @@ a `Sink` enum and a routing split, and the discipline itself was not touched.
 **`eshell` is separate, and has to be.** It is the path that runs when the filesystem failed,
 so the tty server does not exist when it matters. It keeps the raw `/dev/console` and
 `SYS_DEBUG_KPRINT`. The two never overlap because eshell's precondition is the server's
-absence — and that is now a stated invariant rather than an accident of timing.
+absence — and that is now a stated invariant rather than an accident of timing. **It holds under
+`service-mgr` too** (administration Part E.1a): the emergency shell it can ask `init` for is only
+for a `critical` server that did not come up at boot, and both critical servers start before the
+terminal server does. A critical server that dies later is left to its restart policy.
 
 **`/dev/tty` is the name.** `/dev/console` stays the raw device, held by the server; `/dev/tty`
 is the session's cooked view. Close enough to Unix to be unsurprising.

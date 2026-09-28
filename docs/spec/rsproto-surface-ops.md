@@ -982,10 +982,10 @@ Request, 4 bytes: `scheme` (u32) — `0` light, `1` dark. Which built-in scheme 
 own drawing follows. `Malformed` for any other value or a short body, and the scheme is left as it
 was. Changing it repaints the whole screen; naming the scheme already in force changes nothing.
 
-**Why the compositor has to be told.** It is started by `init`, before any session, and never sees
-a theme file ([`theme-toml-schema.md`](theme-toml-schema.md), M11 decision 1) — but it draws every
-window's shadow, and the design makes a dark scheme's shadow much darker than a light one's. So the
-shell, which read the file, says which scheme it named. **That is all it decides today**: the
+**Why the compositor has to be told.** It is started by `service-mgr`, before any session, and never
+sees a theme file ([`theme-toml-schema.md`](theme-toml-schema.md), M11 decision 1) — but it draws
+every window's shadow, and the design makes a dark scheme's shadow much darker than a light one's.
+So the shell, which read the file, says which scheme it named. **That is all it decides today**: the
 cursor, the drag outline and the desktop's own ground are the same in both schemes, and a window's
 contents are its client's.
 

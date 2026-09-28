@@ -10,15 +10,16 @@ each piece is shaped as it is.
 ## The shape
 
 The **view broker** runs a program in a *view* — its caller's namespace plus a profile's grants —
-when [`/system/views.toml`](views-toml-schema.md) says the caller may. It is spawned by `init`,
-which binds its forwarding endpoint at `/svc/views` in the root namespace.
+when [`/system/views.toml`](views-toml-schema.md) says the caller may. It is spawned by
+`service-mgr`, which binds `/svc/views` in the root namespace to reach its forwarding endpoint,
+through `service-mgr`'s registry (administration Part E.1a; `init` did both until then).
 
 **Identity is the path a channel was resolved through.** Nothing a client sends names a
 principal.
 
 | Role | Resolved as | Suffix the broker sees | Speaks |
 |---|---|---|---|
-| forwarding endpoint | bound by `init` at `/svc/views`; by a login supervisor at `/dev/views` in each session, with the subtree base `/s/<session>` | — | `Namespace::Resolve` |
+| forwarding endpoint | `/svc/views`, bound by `service-mgr`; by a login supervisor at `/dev/views` in each session, with the subtree base `/s/<session>` | — | `Namespace::Resolve` |
 | supervisor channel | `/svc/views/session`, from the root namespace | `session` | `OpenSession`, `CloseSession` |
 | client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Check`, `Accounts`, `ChangePassword`; receives `Exited` |
 | policy channel | `/dev/policy`, from inside a view with the `views` grant, which the broker binds there with the base `/policy/<session>` | `policy/<session>` | `Show`, `Install` |

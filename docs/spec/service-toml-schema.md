@@ -6,7 +6,7 @@ This document specifies the schema of service declaration files read by the serv
 
 ## Location and discovery
 
-Service declarations live in **one file**, read by the service manager at startup. Today that is `/initramfs/etc/services.toml`; it will move into the system profile when profile projection can carry something other than a package's `bin/`.
+Service declarations live in **one file**, read by the service manager at startup: **`/system/services.toml`, on the root filesystem** (administration Part E.1c, 2026-09-28). It was `/initramfs/etc/services.toml` until then, where it could not be edited — the initramfs is a boot archive on the FAT ESP, which nothing writes — and had no bootstrap reason to be: `init` mounts the root before it spawns the service manager. It may move into the system profile when profile projection can carry something other than a package's `bin/`.
 
 **One file holding many services — changed 2026-08-21.** This section previously read: declarations live at `/store/<hash>-system-services/services/*.toml`, projected into `/etc/services/*.toml`, and "the service manager scans this directory at startup". Nothing in Nitrox can enumerate a directory of `.toml` files, so that scan was never implementable:
 
@@ -88,6 +88,48 @@ For a service that exits (a one-shot), finishing *is* readiness. There is no rea
 **`after` orders backwards only.** A dependency is matched against the services already started, so naming one declared *later* in the file does not wait for it — it is reported and the service starts. The file's order is the start order; `after` strengthens it rather than reordering it.
 
 A dependency graph with topological sorting is the general answer and is not built; nothing yet needs one. Cycles are therefore not rejected at parse time, and they do not deadlock either: of two services naming each other, the first does not wait at all (its dependency has not started) and the second waits out the bound.
+
+### `endpoint` (optional, string)
+
+**Since administration Part E.1a (2026-09-28).** Makes the service a **server**, reached at this
+path in the root namespace. An absolute path with no empty, `.` or `..` component and nothing but
+visible ASCII; a declaration whose `endpoint` does not read is **skipped whole**, rather than
+started as a server nothing can reach.
+
+For a server, the service manager spawns it with a control channel it can send on — `SEND`, `RECV`,
+`TRANSFER` and `WAIT` — and **no log handoff**, since a server resolves its own log. It waits for
+the server's `Meta::Ready`, within 30 s, and binds the endpoint in its **registry** under the
+service's name, and the path to the server's **route**, an endpoint of its own that continues every
+resolve there (`docs/architecture/service-manager.md` § *Servers, and the registry*). So a restart
+reaches every binding of the path, a session's included. The next declaration does not start until
+the server is ready, or has failed to be.
+
+The service's name must then be 1 to 32 bytes of lowercase letters, digits and `-`, since it is
+the name the registry binds.
+
+### `critical` (optional, boolean; default `false`)
+
+**Since administration Part E.1a.** A server the boot cannot go on without. If it does not come up
+**at boot**, the service manager starts nothing more and asks `init` for the emergency shell. At
+runtime its death is its restart policy's — and so is a restart of it that cannot even be
+spawned: the terminal server holds the console by then, and the emergency shell could not take it.
+Only `true` is true.
+
+**The file is held to its critical servers too** (PR #340 review). The service manager starts
+nothing, and asks for the emergency shell, when:
+- a declaration that says `critical = true` is skipped — an `endpoint` that does not read, no
+  `executable`, a repeated name — since that is a critical server that did not come up;
+- the file is missing, unreadable, or declares nothing that can be started;
+- no declaration is critical: the critical servers are what the boot cannot go on without, and a
+  file with none has lost them.
+
+Every skipped declaration is logged by name and reason, critical or not.
+
+### `essential` (optional, boolean; default `false`)
+
+**Since administration Part E.1a**, and read by Part E.2's `service`: a service `service --stop`
+and `--restart` refuse, since its absence would lock the administrator out or lose state nothing
+rebuilds.
 
 ### `before` (optional, array of strings; default `[]`)
 

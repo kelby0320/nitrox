@@ -433,11 +433,11 @@ pub const CURSOR_H: u32 = 17;
 /// a compositor with opinions about widgets is the wrong shape — so the value lives in
 /// `libdraw`, which both link. A `const fn` constructor is what keeps these constants.
 ///
-/// **Compiled in, and that is the one thing the theme *file* does not reach** (M11 decision 1).
-/// The compositor is started by `init` rather than by the session, so it never sees the setup
-/// record a theme is handed on. Named rather than skipped; the trigger for changing it is a
-/// control panel that wants to restyle the cursor or the drop highlight, and the mechanism would
-/// be a manager op on a channel the shell already holds.
+/// **Compiled in, and that is the one thing the theme *file* does not reach** (M11 decision 1). The
+/// compositor is started by `service-mgr` rather than by the session, so it never sees the setup
+/// record a theme is handed on. Named rather than skipped; the trigger for changing it is a control
+/// panel that wants to restyle the cursor or the drop highlight, and the mechanism would be a
+/// manager op on a channel the shell already holds.
 pub const CURSOR_BODY: Rgb = Theme::light().cursor_body;
 /// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
 pub const CURSOR_OUTLINE: Rgb = Theme::light().cursor_outline;
@@ -669,10 +669,10 @@ pub struct WindowStack {
     current_desktop: u32,
     /// Which scheme the compositor's own drawing follows — today, only how dark a shadow is.
     ///
-    /// **Told, never read**: the compositor is started by `init` and never sees a theme file (M11
-    /// decision 1), so the shell, which read one, says which scheme it named with the manager's
-    /// `SetScheme`. Light until then, which is what the built-in theme is and what a session with
-    /// no shell — every self-test boot — keeps.
+    /// **Told, never read**: the compositor is started by `service-mgr` and never sees a theme file
+    /// (M11 decision 1), so the shell, which read one, says which scheme it named with the
+    /// manager's `SetScheme`. Light until then, which is what the built-in theme is and what a
+    /// session with no shell — every self-test boot — keeps.
     scheme: Scheme,
     /// The window the user is interactively dragging, and where it was when the drag began.
     ///
