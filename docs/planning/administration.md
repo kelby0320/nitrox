@@ -497,13 +497,16 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       or while the account is logged in; **`with --show`, `with --install` and the `views` grant**
       (moved here from A by its detail pass — who administers the system is what this part lets a
       person change).
-- [ ] **E — services, power, the clock and the log** — *detailed below, E.1–E.6.* **`service-mgr`
+- [x] **E — services, power, the clock and the log** — *detailed below, E.1–E.6; complete
+      2026-09-29.* **`service-mgr`
       starting the servers `init` starts today** (the maintainer's call, 2026-09-28, and what
       `service-manager.md` has always said); `services.toml` moved onto the root
       filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
-- [ ] **F — the desktop's share.** `desktop-shell` building application namespaces in the same
-      vocabulary; the graphical prompt's design written down, with its trigger.
+- [ ] **F — the desktop's share** — *detailed below, F.1–F.4 (2026-09-29).* `desktop-shell`
+      building application namespaces in the same vocabulary; the graphical prompt's design
+      written down, with its trigger; and, handed on by Part E, **a power menu** — Log out,
+      Restart, Shut down — that **closes a session's windows first**.
 - [ ] **G — the installer, the broker's first client** (decided 2026-09-17). **The installer's boot
       entry stays** — it is still the one that loads the 33 MiB installable ESP, which is H.1's
       reasoning and still sound — **but its session stops being special**. It becomes an ordinary
@@ -2238,6 +2241,252 @@ the services. **E.3 comes before E.4**, and E.5 and E.6 can go anywhere after E.
 - **The kernel's log** (`/dev/log`) beside the service log: two rings, as `logging.md` describes.
 - **Timezones, and network time.**
 
+## Part F in detail *(2026-09-29)*
+
+**The desktop's share**: ending a session from the desktop, closing its windows first, and the
+desktop building applications' namespaces through the same code as sessions. Four items: the
+sketch's two, and two Part E handed on — the session menu (E's detail pass) and asking graphical
+programs to close with unsaved work in mind (E.4a).
+
+**The maintainer's calls (2026-09-29):**
+- **All four items are Part F's**, and F comes before G, as the sketch orders them.
+- **A power menu on the right of the top bar**: `[Applications][Places] ─── clock ─── [⏻]`,
+  labelled with a power icon, dropping down to **Log out**, **Restart** and **Shut down**. This
+  departs from the design, which has an `End session` row in the Applications menu.
+- **A window that has not closed is waited for, with End anyway and Cancel**. The shell names what
+  is still open and waits for the person. Cancel keeps the session; End anyway destroys the rest
+  and goes on.
+
+### The spike: what already exists, and what is missing
+
+- **There is no way to end a session from the desktop.** `desktop-shell` exits only when a
+  shutdown asks it to (E.4c). The desktop refresh left the design's `End session` row out for that
+  reason: "needs a logout path". A shutdown today is `with power shutdown`, typed in a terminal.
+- **`desktop-session-mgr` already handles a leader that exits.** It reaps it, tells the broker the
+  session ended, closes the namespace, and presents the greeter again. **A logout is
+  `desktop-shell` exiting.** Nothing else in the supervisor changes.
+- **Closing a window politely is built** (M9 Part C, M12 Part A). `Manage::RequestClose` sends the
+  window's client `CloseRequested`; `Manage::Close` destroys a window whose client will not. The
+  taskbar already asks on a middle-click and insists on a second, through `desktop-shell`'s own
+  `ask_to_close` and `insist_on_close`.
+- **The applications answer it.** `nxterm` and `nxfiles` exit. **`nxedit` asks** when any buffer is
+  modified: its confirmation offers saving, not saving, or keeping editing, and a second
+  `CloseRequested` does not bypass it. Its `main.rs` comment on the event still says the editor
+  "has no dialog to ask in"; its `lib.rs`, which decides, has one. A doc bug, fixed in F.2.
+- **`desktop-shell` cannot reach what it launched, only their windows.** It closes each process
+  handle at launch, deliberately: it is not their supervisor. **The windows are the handle it
+  has**: as the manager it is told of every window, whoever opened it — `nxedit` started from
+  `nxterm` included.
+- **Windows outlive their manager.** When `desktop-shell`'s manager channel closes, the compositor
+  drops its chords, snap zones and scheme (`close_manager`), and **leaves every application window
+  where it is**. A logout that did not close them first would put the greeter among the last
+  session's windows.
+- **At a shutdown, `desktop-shell` exits at once** and the windows go with the compositor. That was
+  E.4a's call; F makes the shell ask them first.
+- **The top bar has nothing on its right.** `panel::top_bar` lays out Applications, Places, and the
+  clock centred on the screen. A menu hangs from the left of its word (`menu_anchor`), which at the
+  right edge would run off the screen.
+- **`libui` has no power icon.** Its `IconKind` draws the three window controls from strokes —
+  `Minimise`, `Maximise`, `Close` — and a power symbol is the same kind of glyph. Its menus have
+  separators, disabled and destructive rows; no submenus, and F needs none.
+- **Shutting down needs the `power` grant, through the broker.** The seeded policy lets anyone run
+  `shutdown` in the `power` view with no password. `desktop-shell` runs in the session's namespace,
+  which has `/dev/views`, so it can ask as `with` does. **The client half of that exchange is in
+  `with`**, a coreutil; `desktop-shell` cannot reach it there.
+- **Three builders, and two of them differ.** `libsession::build_namespace` builds a session from a
+  `NamespaceSpec`. `desktop-shell` builds each application's namespace in its own
+  `build_app_namespace`, binding mostly the same pieces by hand, plus `/dev/draw/new` and
+  `/dev/desktop`. **Then `launch` passes on the session's disks**, outside the builder
+  (`rebind_block_devices(session_ns, app_ns)`): in an installer session every application gets
+  `/dev/blk/<n>`, which is how `nxinstall` typed in a desktop terminal finds a disk on the laptop
+  (PR #308 review). The view broker derives, so it builds nothing from a recipe.
+  - **Where they have drifted: an application has no `/session/user`**, so by reading, `whoami` in
+    a desktop terminal fails with "no session identity". F.1 confirms it booted before fixing it.
+- **The graphical prompt is designed only in this plan**, in *The prompt, and a terminal to prompt
+  on*, with its trigger: the first desktop action the policy will not allow without a password.
+  **F does not fire it**: logging out needs no authority, and the `power` rule needs no password.
+
+### The shape
+
+- **`desktop-shell` builds an application's namespace with `libsession::build_namespace`.** The
+  spec gains what an application has and a session does not: `/dev/draw/new`, narrowly, and
+  `/dev/desktop`. What a session has and an application does not becomes optional. **An
+  application gains `/session/user`**, the one piece it was missing, so `whoami` answers in a
+  desktop terminal. Otherwise an application sees what it saw — **the session's disks included**,
+  through the spec's existing `bind_blk` with the session's namespace as the one rebound from,
+  until Part G changes the installer's session (PR #345 review).
+- **The power menu**:
+  - a button at the right end of the top bar, drawn as `IconKind::Power` — a ring open at the top
+    with a bar through the gap — lit under the pointer and while open, as the other two are;
+  - its menu hangs **right-aligned** under the button, so it stays on the screen: `menu_anchor`
+    learns which edge a menu hangs from;
+  - three rows: **Log out**, **Restart**, **Shut down**. The last two are `destructive` rows, since
+    they end every session on the machine, not just this one.
+- **Ending a session closes its windows first.** Choosing any of the three:
+  1. `desktop-shell` sends `Manage::RequestClose` to every **normal** window it manages — the
+     taskbar's entries — and **not to a dialog**. A client answers for its dialogs through their
+     parent, and `nxedit` reads a manager's close on its question as *Keep editing*: asking a
+     second Log out's windows in creation order would take the question away and leave the logout
+     waiting on an editor with nothing on screen to answer (PR #345 review).
+  2. A window's client answers by closing, or by asking its own question — the editor's.
+  3. Once every window is gone, the shell does what was chosen.
+  4. **While any is left, after a moment**, a dialog names what is still open — each window's
+     title — with **End anyway** and **Cancel**. The moment is half a second, so a quick close is
+     never interrupted by it.
+  5. **Cancel** keeps the session: nothing more is asked, and the windows still open stay.
+     **End anyway** sends `Manage::Close` to each window still open, and goes on.
+- **Log out** is the shell exiting once its windows are gone. `desktop-session-mgr` does the rest,
+  as it does today at a shutdown.
+- **Restart and Shut down** go through the broker, as `with power shutdown` does:
+  - `desktop-shell` asks for `shutdown` — with `--reboot` for Restart — in the `power` view,
+    handing the broker **an application's namespace**, built by F.1's builder, rather than its
+    own. The session's binds `/dev/draw` whole and so reaches `manage`; a view derived from it
+    would give `shutdown` that too (PR #345 review);
+  - the policy decides, and the broker's audit records it, as it records `with`'s;
+  - `service-mgr`'s sequence then asks this session to end too. The shell has closed its windows
+    already, so it exits at once.
+  - **A refusal is shown**, in a dialog. The seeded policy never refuses, but a person's policy
+    may. **One that asks for a password is refused too**, and says why: the graphical prompt is
+    not built. That is the prompt's trigger firing, which the refusal names.
+- **The Views client moves below `with`**, into a library both reach, so the desktop's request is
+  the same code as the terminal's. It is the rule `libfs` was extracted under: a helper with two
+  consumers belongs below both.
+- **A shutdown started elsewhere** — `with power shutdown` in a terminal, or on the serial console
+  — reaches `desktop-shell` as a terminate request. The shell asks every window to close as above,
+  and exits once they have or after **3 s of its own**. **Inside `spawn_leader`'s 5 s for a leader,
+  with room**, since that clock starts when the request is sent and the shell learns of it later: a
+  wait as long as the supervisor's always ends after the supervisor has given up, and every
+  declining window would then be a leader "still running after it was asked to stop" (PR #345
+  review). `LEADER_STOP_NS` sits inside `service-mgr`'s 10 s the same way. **No dialog
+  there**: the person started it from a terminal, the machine is going down, and a question the
+  shell could not wait for would be a lie. A modified buffer in the editor is lost then, as it is
+  today.
+- **The graphical prompt's design is written down** in `docs/design/graphical-prompt.md`: what it <!-- check-docs: allow-missing -->
+  must guarantee, how, and its trigger. Nothing is built.
+
+### Logging out, end to end
+
+1. `alice` has `notes.txt` open in the editor, modified, and a terminal open. She opens the power
+   menu and chooses **Log out**.
+2. `desktop-shell` asks both windows to close. The terminal's `nxterm` exits. The editor asks
+   whether to save.
+3. Half a second later the shell's dialog says **"Waiting for 1 window to close"**, naming the
+   editor's, with End anyway and Cancel.
+4. `alice` answers the editor: **Don't save**. The editor exits. Its window is destroyed, and with
+   none left the shell's dialog goes too.
+5. `desktop-shell` exits. `desktop-session-mgr` reaps it, tells the broker the session ended — which
+   asks anything `alice` started through `with` to stop — closes the namespace, and presents the
+   greeter.
+
+Had she chosen **Cancel** at step 3, the editor's question would still be up, the terminal gone,
+and the session running. Had she chosen **End anyway**, the editor's window would be destroyed,
+and the session would end with the editor's process left to notice (*Left alone*).
+
+**Shut down** is the same to step 4. Then `desktop-shell` asks the broker for `shutdown` in the
+`power` view, and the rest is E.4's sequence.
+
+### The pieces, in dependency order
+
+- [ ] **F.1 — one vocabulary for namespaces.**
+      - `NamespaceSpec` gains `/dev/draw/new` and `/dev/desktop`, and makes optional what an
+        application does not get: `/applications` and the console.
+      - `desktop-shell` builds each application's namespace with `libsession::build_namespace`,
+        and `build_app_namespace` goes. **The session's disks still reach an application**:
+        `bind_blk`, rebinding from the session's namespace, in place of `launch`'s own rebind.
+      - An application gains `/session/user`.
+      - Gates:
+        - **every existing gate**, since an application sees what it saw;
+        - booted first: `whoami` in a desktop terminal, failing before and answering after;
+        - **`verify_app_namespace` checks `/session/user` too**, and its line — which
+          `check-login` already asserts, "grants new + /home + /dev/devices + /storage, withholds
+          manage" — names it. **Not `check-terminal`** (PR #345 review): its `nxterm` is a
+          test-image service in `service-mgr`'s namespace, in no session, and `whoami` there fails
+          by design.
+- [ ] **F.2 — the power menu, and Log out.**
+      - `IconKind::Power`, host-tested by painting and counting ink, as a present-but-invisible
+        widget would otherwise pass.
+      - The top bar's right-hand button, and `menu_anchor` hanging a menu from either edge.
+      - The menu: **Log out**, and Restart and Shut down **absent until F.3** — a row that does
+        nothing is worse than none, the refresh's rule.
+      - **Closing a session's windows**: `RequestClose` to each normal window, never a dialog; the
+        waiting dialog after half a second, naming what is left; Cancel and End anyway. The state is
+        `desktop-shell`'s library, host-tested: a window closing, one declining, the last one going,
+        Cancel, End anyway.
+      - **A terminate request asks the windows too**, and exits once they are gone or after 3 s,
+        inside the leader's 5 s.
+      - `nxedit`'s stale comment on `CloseRequested`.
+      - Gates: host tests, and **`cargo xtask check-logout`**, in CI's QEMU job, on the release
+        image:
+        1. log in at the greeter;
+        2. open the editor from the Applications menu, and type a line;
+        3. power menu, Log out: the editor asks, and the shell's dialog names the editor;
+        4. **Cancel**, and the session is still there;
+        5. Log out again, and **Don't save** in the editor: the greeter comes back;
+        6. log in again, open a terminal, Log out: nothing to ask, and the greeter comes back at
+           once.
+- [ ] **F.3 — Restart and Shut down.**
+      - The Views client's round trip moves out of `with` into a library `desktop-shell` reaches.
+      - The two rows, each through the broker's `power` view after the windows are closed; a
+        refusal shown in a dialog, and a request for a password refused naming the graphical
+        prompt.
+      - Gates: `check-logout` goes on, in the same QEMU run:
+        7. log in, open the editor, type a line, **Restart**, and **End anyway**: a second boot, and
+           its greeter;
+        8. log in, **Shut down**: "It is now safe to turn off your computer." read off the screen
+           with `check-fbcon`'s decoder.
+- [ ] **F.4 — the graphical prompt, written down.** `docs/design/graphical-prompt.md`: <!-- check-docs: allow-missing -->
+      - **only the broker can open it**, so no program can present a look-alike asking for a
+        password;
+      - the compositor draws it **above everything, the desktop dimmed behind it**, which no
+        client surface can do;
+      - it **holds the keyboard** while it is up, so nothing else on the desktop reads the password:
+        the remedy for the same-backend limit the PR #329 review recorded for the terminal prompt;
+      - **its trigger**, unchanged: the first desktop action the policy will not allow without a
+        password — unmounting a USB stick from Files (Phase 6), or a Settings application. A power
+        policy asking for a password would fire it early, and F.3's refusal says so.
+- [ ] **Docs.**
+      - `desktop-shell.md`: the power menu, ending a session, closing windows first.
+      - `graphical-session.md`: the logout path, and its process tree's ending.
+      - `views-toml-schema.md`: that the desktop asks for `power` as `with` does.
+      - `desktop-refresh.md`, which records `End session` as deferred for want of a logout path:
+        built, as the power menu.
+      - The root `CLAUDE.md`: `check-logout`.
+      - **Every current-behaviour doc F makes false** (PR #345 review):
+        `namespace-and-resource-servers.md` and `graphical-session.md` name
+        `build_app_namespace`, which F.1 deletes; `userspace/CLAUDE.md`'s layering names each
+        shared library, and F.3 moves the Views client into one; `qemu-integration-tests.md`
+        lists the screen gates, and `check-logout` joins them.
+
+**F.1 first**, since F.2 and F.3 are in `desktop-shell` too and the rebuild is easier on code that
+has not moved. **F.2 before F.3.** F.4 can go anywhere.
+
+### What to compare on the day
+
+- **Every gate, for F.1**: nothing an application sees changes, but `/session/user`.
+- **`check-logout`**, new in CI: a logout that waits for the editor's question, one cancelled, a
+  restart that ends a window anyway, and a shutdown, all from the desktop.
+- **`check-login`**, unchanged: the greeter, and a session.
+
+### Consequences for earlier parts
+
+- **E.4c's "`desktop-shell` exits"** becomes "`desktop-shell` asks its windows to close, then
+  exits", bounded as before.
+- **The desktop refresh's deferred `End session`** is built, in a different place, by the
+  maintainer's call: the power menu.
+- **`with`'s client code** moves into a library, and `with` keeps working as it does.
+
+### Left alone
+
+- **A forcible kill.** End anyway destroys a window, not a process. A program that goes on without
+  its window runs until the machine stops, as one that ignores its session's end does today.
+- **Asking programs with no window.** A program started from a terminal that has no window of its
+  own goes with the terminal's shell, as today.
+- **Suspend, hibernate and power-off.** The machine halts with the message; power-off needs AML.
+- **A lock screen, and switching users.**
+- **Building the graphical prompt**, until its trigger.
+- **The launcher**, and the design's `System` and `Run Application…` rows: the refresh's deferrals,
+  unchanged.
+
 ## Gates
 
 | Part | What proves it |
@@ -2247,6 +2496,7 @@ the services. **E.3 comes before E.4**, and E.5 and E.6 can go anywhere after E.
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, `check-recovery`, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **every existing gate** unchanged, for `service-mgr` starting what `init` did; **`check-shutdown`**, in CI: write through a mapping without syncing, run `with power shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot, with the clock set before it read back after; `check-images` comparing the roots; `service`, `date --set` and `log` in `test-interactive` |
+| F | **every existing gate**, for `desktop-shell` building applications' namespaces through `libsession`; `check-login` asserting an application's namespace grants `/session/user`; **`check-logout`**, in CI: from the desktop, a logout that waits for the editor's question, one cancelled, a restart that ends a window anyway, and a shutdown whose message is read off the screen |
 | G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |
 
 ## Deferred from this phase
