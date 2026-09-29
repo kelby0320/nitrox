@@ -31608,3 +31608,53 @@ capability gives it to every command typed at it.
 The full local gate set, 34, is green (fgb46).
 
 **ABI:** no hash impact.
+
+## 2026-09-29 — Administration Part F's detail pass: a power menu that closes windows first
+
+Part F was a one-line sketch, and the plan went from E's detail to G's gates. It is detailed now,
+in the plan as F.1–F.4, with the Gates table's F row.
+
+**The maintainer's calls:**
+- **All four items are F's, and F comes before G**, as the sketch orders them. Two are the
+  sketch's: `desktop-shell` building applications' namespaces in the same vocabulary as sessions,
+  and the graphical prompt's design written down. Two were handed on by Part E: a session menu
+  (E's detail pass), and asking graphical programs to close with unsaved work in mind (E.4a).
+- **A power menu on the right of the top bar**, labelled with a power icon, dropping down to Log
+  out, Restart and Shut down: `[Applications][Places] ─── clock ─── [⏻]`. This departs from the
+  design, which puts one `End session` row at the foot of the Applications menu.
+- **A window still open after being asked is waited for**, with End anyway and Cancel. The shell
+  names what is left and waits for the person, as Windows does, rather than a time limit that
+  would end the session under an open "save?" question.
+
+**What the spike found:**
+- **There is no logout path**: `desktop-shell` exits only when a shutdown asks it to.
+  `desktop-session-mgr` already handles a leader exiting, so a logout is the shell exiting.
+- **The polite close is built** (M9 Part C, M12 Part A), and the editor answers it with a question
+  when a buffer is modified. A comment in its `main.rs` says it has no dialog; its `lib.rs` has one.
+- **`desktop-shell` reaches its applications only through their windows**, since it closes each
+  process handle at launch. The windows are enough: as the manager it is told of every window,
+  whoever opened it.
+- **The compositor leaves an application's windows in place when the manager goes.** A logout
+  that did not close them first would put the greeter among the last session's windows.
+- **An application's namespace has no `/session/user`**, so by reading, `whoami` in a desktop
+  terminal fails. It is where `desktop-shell`'s own builder and `libsession`'s have drifted; F.1
+  boots it before fixing it.
+- **`libui` has no power icon**, but its window controls are glyphs drawn from strokes, and a power
+  symbol is one more.
+
+**Derived in the pass:**
+- **Restart and Shut down go through the broker's `power` view**, as `with power shutdown` does, so
+  the policy decides and the audit records it. The Views client moves out of `with` into a library
+  both reach.
+- **A policy asking a password for `power` is refused from the desktop, saying why.** That is the
+  graphical prompt's trigger firing, which the refusal names; F builds no prompt.
+- **A shutdown started elsewhere asks the windows too**, bounded by the leader's 5 s, with no
+  dialog: the machine is going down, and a question the shell could not wait for would be a lie.
+- **Restart and Shut down are absent from the menu until F.3 wires them**, by the desktop
+  refresh's rule that a row that does nothing is worse than none.
+- **One new gate, `check-logout`, in CI**, on the release image and in one boot:
+  - a logout waiting on the editor's question, cancelled;
+  - one completed with Don't save;
+  - one with nothing to ask;
+  - a restart ending a window anyway;
+  - a shutdown whose message is read off the screen.
