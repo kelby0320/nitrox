@@ -2,8 +2,9 @@
 
 ## Status
 
-**Built, and checked 2026-09-28** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
-revision 2. On 2026-09-28 administration Part E.1a moved the servers from `init`'s children to
+**Built, and checked 2026-09-29** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
+revision 2. On 2026-09-29 administration Part E.4c made both supervisors and their leaders end
+when a shutdown asks (§4). On 2026-09-28 administration Part E.1a moved the servers from `init`'s children to
 `service-mgr`'s (§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them
 in place of the servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service`
 the user database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and
@@ -298,6 +299,18 @@ hard constraint attached: the shared core must honour `session-mgr`'s dependency
 (`libkern` + `librsproto` + `libstream` + `libheap`, no `libos`), because `session-mgr` links it.
 The greeter — the part that draws — stays in each supervisor, which is exactly where the two
 diverge anyway.
+
+**A shutdown ends both** (administration Part E.4c). `service-mgr` sends each supervisor a terminate
+request, and where it finds one decides what happens:
+- **at its prompt or greeter**, the supervisor exits;
+- **during a session**, `libsession::spawn_leader` passes the request to the leader and gives it
+  5 s. The supervisor then closes the session at the view broker, as at any session's end, and
+  exits rather than presenting a login again.
+
+The leaders honour it. `nxsh` exits from its prompt, and while a command runs it asks the command's
+stages to stop, as an interrupt does, and exits once they have unwound. `desktop-shell` exits. The
+programs `desktop-shell` launched are not asked: they go when the compositor stops, and asking
+them, with unsaved work in mind, is Part F's session menu.
 
 **Step 1 is not a trivial difference.** `session-mgr` opens its prompt's `Tty` the way any
 program does, and closes it at session end as the revocation point. `desktop-session-mgr` must be

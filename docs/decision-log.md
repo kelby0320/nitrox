@@ -31144,3 +31144,52 @@ while the slot was about to be freed. The order is now **sessions, then endpoint
 - **The reboot byte:** a reset through the FADT's register.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4c: sessions end when a shutdown asks
+
+**Both login supervisors, and both session leaders, now honour a terminate request.** E.4b's
+shutdown sent one and waited out its 10 s bound, since nothing read it.
+
+- **`libsession::spawn_leader`** passes a terminate request on to the leader and gives it 5 s.
+  That is inside `service-mgr`'s 10 s for the supervisor, which must cover it. It records that a
+  stop was asked (`stop_asked`), and past the bound goes on without the leader, since there is no
+  forcible kill.
+- **`session-mgr`** watches its notification channel beside whatever it waits for. At the prompt,
+  a terminate request ends the process. After a session, a recorded stop means it exits instead of
+  prompting again, once the session is closed at the view broker as at any session's end.
+  `libsession::drain_for_stop` reads the channel. A supervisor has no child between sessions, so
+  what else it reads there can be dropped.
+- **`desktop-session-mgr`**, the same at its greeter and after a session.
+- **`nxsh`** exits from its prompt: the keystroke read watches the channel.
+  - While a command runs, the request is passed on to its stages once, as an interrupt is. The
+    evaluator's checkpoint then answers "interrupted" for as long as the stop stands, so no
+    `catch` recovers from it, and the REPL exits once the command has unwound.
+  - **One drain for both waits.** `reap` and the capture wait share `drain_notifications`. That
+    keeps a stage's `ChildExited`, read by the capture wait, for `reap` to count.
+- **`desktop-shell`** takes its notification channel into its main wait and exits on the request.
+  It drops the `ChildExited` of what it launched, which it never reaped. Those programs are not
+  asked, by the maintainer's scope for E.4. They go when the compositor stops.
+
+**Found by booting it, not by reading it.** A shutdown arriving while `nxsh` ran `sleep 60` was not
+honoured at first: `libsession: nxsh is still running after it was asked to stop`. `nxsh` sat in
+the capture wait, which watched the command's output, its diagnostics and the tty, and not the
+notification channel. `reap`'s own comment says that is where a long pipeline spends its time. The
+capture wait now reads the channel through the shared drain. The failing run is the control.
+
+**Booted by hand** with a temporary probe in `service-mgr` (reverted) that began a shutdown a fixed
+time after bring-up, under each gate that logs in, and read from the transcripts:
+- **A serial session** (`test-interactive --kvm`): `nxsh` exited from its prompt, `session-mgr`
+  after it, and `desktop-session-mgr` from its greeter. `service-mgr: the sessions have ended`
+  came at once, not after the bound.
+- **A graphical session** (`check-login --kvm`): `desktop-shell` exited when asked, then
+  `desktop-session-mgr`.
+- **Nobody logged in** (a release boot): both supervisors exited from their prompt and greeter.
+- **A command running** (the release image driven on serial through a FIFO: a login, then
+  `sleep 60`): `nxsh` asked `sleep` to stop, unwound and exited. The typed password is in no
+  transcript.
+
+In every run every service stopped, `init` left the root clean, and the machine halted. **The gate
+is E.4d's `check-shutdown`**, which runs `with power shutdown` from a serial session: the running
+command path again.
+
+No kernel change and no ABI hash impact.

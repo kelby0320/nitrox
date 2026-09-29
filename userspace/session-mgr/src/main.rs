@@ -45,8 +45,12 @@ use libsession::{NamespaceSpec, authenticate, ns_lookup, session_has_bin, sessio
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// Room for what a wait waits for and, beside it, the notification channel ([`wait_one`]).
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
+/// This supervisor's notification channel, where a shutdown's terminate request arrives: set once
+/// at startup, and watched beside whatever [`wait_one`] waits for (administration Part E.4c).
+static mut NOTIF_CH: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
@@ -74,7 +78,20 @@ fn kprint(msg: &[u8]) {
 fn idle(notif: u64) -> ! {
     loop {
         wait_one(notif);
+        if libsession::drain_for_stop(notif) {
+            stop();
+        }
     }
+}
+
+/// **A shutdown asked this supervisor to stop** (administration Part E.4c), and it has no session
+/// running: say so and exit. `service-mgr` sees the exit as its control channel closing. A session
+/// running when the request came is ended first, by `libsession::spawn_leader` passing it on.
+fn stop() -> ! {
+    kprint(b"session-mgr: asked to stop, exiting\n");
+    // SAFETY: terminating this process; the terminal it held closes with its handles.
+    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
+    park();
 }
 
 /// Park forever without a handle to wait on — the panic path, which has no notification
@@ -116,13 +133,41 @@ fn sleep_ms(ms: u64) {
 }
 
 /// Block on `handle`; returns `true` if it signalled (vs. a spurious wake).
+///
+/// **The notification channel is watched beside it** (administration Part E.4c), so a shutdown's
+/// terminate request reaches a supervisor waiting at the login prompt, where it has no session to
+/// end: it [`stop`]s. This supervisor has no child between sessions, so nothing it needs is among
+/// the notifications read here.
 fn wait_one(handle: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = handle;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    waited == 1
+    // SAFETY: single-threaded; set once at startup.
+    let notif = unsafe { NOTIF_CH };
+    loop {
+        let watch = notif != 0 && handle != notif;
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for two waiters.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = handle;
+            WAIT_HANDLES[1] = notif;
+            let n = if watch { 2 } else { 1 };
+            let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
+            syscall4(SYS_WAIT, handles, n, results, u64::MAX)
+        };
+        if waited < 1 {
+            return false;
+        }
+        if !watch {
+            return true;
+        }
+        // SAFETY: `waited` 24-byte results were written; the handle is the first word of each.
+        let fired = |h: u64| unsafe {
+            (0..waited as usize).any(|k| WAIT_RESULTS[24 * k..24 * k + 8] == h.to_le_bytes())
+        };
+        if fired(notif) && libsession::drain_for_stop(notif) {
+            stop();
+        }
+        if fired(handle) {
+            return true;
+        }
+    }
 }
 
 /// Receive the next control message on `ctrl` and return its transferred `handles[0]`
@@ -162,6 +207,8 @@ fn recv_handoff(ctrl: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
+    // SAFETY: single-threaded; written once, here, before any wait reads it.
+    unsafe { NOTIF_CH = notif };
     // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
     // server endpoint, (3) tty server endpoint. Positional — service-mgr sends an empty message
     // for an endpoint it does not have, so a missing one shortens no one's count. **All but the
@@ -355,6 +402,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 line.push_str(core::str::from_utf8(digits).unwrap_or("?"));
                 line.push_str(")\n");
                 kprint(line.as_bytes());
+            }
+            // **A shutdown ended this session** (administration Part E.4c): no prompt after it.
+            if libsession::stop_asked() {
+                stop();
             }
         }
         None => {

@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
@@ -70,12 +71,57 @@ static mut WAIT_HANDLES: [u64; 1] = [0; 1];
 /// buffers are: it owns a `.bss` handle array, and two callers sharing one would be two
 /// conversations sharing a slot.
 fn wait_one(handle: u64) -> bool {
+    wait_until(handle, u64::MAX)
+}
+
+/// [`wait_one`], giving up at `deadline` (absolute monotonic ns). `false` if it passed first.
+fn wait_until(handle: u64, deadline: u64) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = handle;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+        let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
+        syscall4(SYS_WAIT, handles, 1, results, deadline)
     };
     waited == 1
+}
+
+/// The monotonic clock, in nanoseconds.
+fn now_ns() -> u64 {
+    let mut now: u64 = 0;
+    // SAFETY: `&now` is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    now
+}
+
+/// Whether a terminate request has reached this process (administration Part E.4c): what a
+/// shutdown sends each login supervisor. Set by [`spawn_leader`] and [`drain_for_stop`].
+static STOP_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// How long a session's leader has, once asked to stop, before its supervisor goes on without it.
+/// Shorter than `service-mgr`'s bound on the supervisor itself, 10 s, which must cover it.
+const LEADER_STOP_NS: u64 = 5_000_000_000;
+
+/// **Whether this process has been asked to stop** (administration Part E.4c). A supervisor asks
+/// after a session ends, and exits rather than prompting again: a shutdown is under way.
+pub fn stop_asked() -> bool {
+    STOP_ASKED.load(Ordering::Relaxed)
+}
+
+/// Read every notification queued on `notif`, and say whether a terminate request was among them
+/// — for a supervisor between sessions, whose waits watch its notification channel beside what
+/// they wait for. It has no child then, so no `ChildExited` it needs can be among what this drops.
+pub fn drain_for_stop(notif: u64) -> bool {
+    loop {
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            return stop_asked();
+        }
+        // SAFETY: the kernel wrote a Notification into NOTIF.
+        if unsafe { (&raw const NOTIF.kind).read() } == KIND_TERMINATE_REQUESTED {
+            STOP_ASKED.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Write one line to the debug console.
@@ -1394,8 +1440,24 @@ pub fn spawn_leader(
         .s(b" spawned into the session namespace with its environment")
         .end();
     // Reap it: block on the notification channel for its ChildExited, then read the code.
+    //
+    // **A terminate request is passed on** (administration Part E.4c): a shutdown asks the
+    // supervisor, and the session is the leader's to end. It then has [`LEADER_STOP_NS`] to exit,
+    // and past that the supervisor goes on without it — a stop is a request, and there is no
+    // forcible kill.
+    let mut until = u64::MAX;
     loop {
-        if !wait_one(notif) {
+        if !wait_until(notif, until) {
+            if until != u64::MAX && now_ns() >= until {
+                Line::new()
+                    .s(b"libsession: ")
+                    .s(program.as_bytes())
+                    .s(b" is still running after it was asked to stop")
+                    .end();
+                // SAFETY: closing our reference to a process we no longer wait for.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+                return -1;
+            }
             continue;
         }
         // Drain queued notifications.
@@ -1412,6 +1474,14 @@ pub fn spawn_leader(
                 // SAFETY: closing our reference to the exited shell (reaping).
                 unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
                 return code;
+            }
+            if kind == KIND_TERMINATE_REQUESTED && until == u64::MAX {
+                STOP_ASKED.store(true, Ordering::Relaxed);
+                let mut l = Line::new();
+                l.s(b"libsession: asked to stop; passing it on to ").s(program.as_bytes()).end();
+                // SAFETY: a register-only syscall on the leader's process handle, which we hold.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, h as u64) };
+                until = now_ns().saturating_add(LEADER_STOP_NS);
             }
         }
     }

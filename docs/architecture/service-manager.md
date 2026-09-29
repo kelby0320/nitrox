@@ -283,7 +283,10 @@ the one loop:
 1. **Nothing more starts** — not bring-up, not a policy's restart — every service is marked asked
    to stop, and every waiting admin request is refused.
 2. **The sessions.** Both login supervisors are sent a terminate request, and have 10 s; their
-   control channels closing is how their exits are seen. Ending a session is theirs (Part E.4c).
+   control channels closing is how their exits are seen. Ending a session is theirs (Part E.4c,
+   [`graphical-session.md`](graphical-session.md) §4): each passes the request to its session's
+   leader, gives it 5 s, closes the session at the view broker and exits — or exits at once from
+   its prompt or greeter.
 3. **The services, last declared first**, each `CTRL_OP_SHUTDOWN` and 3 s to exit. The reverse of
    the start order lets each server outlive what was started after it, and may use it. One not
    honoured is logged "still running", and the shutdown goes on — a stop is a request, and there is

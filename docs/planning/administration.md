@@ -2121,6 +2121,10 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         (`0x1103`), and the sequence: sessions (10 s), services last declared first (3 s each),
         then `init`'s `Finish`. `boot-probe` gates every refusal; the shutdown itself was booted by
         hand from a trigger in `boot-probe`, and gated by E.4d's `check-shutdown`.)*
+      - *(E.4c landed 2026-09-29:* `libsession::spawn_leader` passes a terminate request to the
+        leader (5 s), and both supervisors exit after the session, or at once from their prompt or
+        greeter; `nxsh` exits from its prompt, or asks a running command's stages to stop and exits
+        once they unwind; `desktop-shell` exits. Booted by hand through each gate that logs in.)*
       - The `power` grant, and the seeded policy's `power` view for everyone.
       - `shutdown [--reboot]`.
       - **`cargo xtask check-shutdown`**, in CI's QEMU job. It boots a `--selftest` disk image, and
