@@ -117,11 +117,12 @@ pub use x86_64::timer::X86Timer as Timer;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::memory_types::X86MemoryTypes as MemoryTypes;
 // The machine's battery-backed wall clock, read **once** at boot to anchor
-// `crate::clock`. Neutral name because the concept is portable and the hardware is
-// not: x86 has the CMOS RTC behind ports 0x70/0x71, aarch64 boards a memory-mapped
-// `PL031`. See `arch/rtc.rs`.
+// `crate::clock`, and written when the clock is set (administration Part E.5).
+// Neutral names because the concept is portable and the hardware is not: x86 has the
+// CMOS RTC behind ports 0x70/0x71, aarch64 boards a memory-mapped `PL031`. See
+// `arch/rtc.rs`.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::rtc::wall_clock_seconds;
+pub use x86_64::rtc::{set_wall_clock_seconds, wall_clock_seconds};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::user_access::X86UserAccess as UserAccess;
 // Hardware-entropy source (the x86 impl uses RDSEED/RDRAND; aarch64 would use

@@ -1,7 +1,10 @@
 # Logging service
 
 **Status:** Implemented — the in-kernel log (`kernel/src/klog.rs`) and the userspace
-`logging-service`. Verified 2026-08-05.
+`logging-service`. Verified 2026-08-05. **Read-back built with administration Part E.6
+(2026-09-29)**: the ring answers `Log::Read` on a read session, the `logs` grant binds a read
+endpoint at `/dev/logs`, and `log` reads it; see [Reading it back](#reading-it-back). Last checked
+2026-09-29.
 
 The userspace **logging service** collects structured log records from any process
 that holds a logging capability, stamps each with trusted provenance, and fans them
@@ -153,11 +156,12 @@ out of ordinary namespace attenuation:
 
 > **Concurrent sources are bounded by the wait width.** Waiting across all the read ends
 > means one `sys_wait` slot per source, so the service reads from at most
-> `MAX_WAIT_HANDLES - 2` (30 since administration Part E.4a, when the control channel took a
-> slot for a shutdown's `CTRL_OP_SHUTDOWN`; 31 from 2026-07-29; 7 before) at once —
-> `MAX_SOURCES` is derived from the kernel constant rather than restated. `fs-server-ext4` has
-> the same ceiling for the same reason: 30 sessions while its control channel is open, which for
-> `init`'s mounts is the whole boot since Part E.4a. Removing it rather than raising it is
+> `MAX_WAIT_HANDLES - 6` (26 since administration Part E.6, when two read endpoints and two read
+> sessions took four slots; 30 from Part E.4a, when the control channel took one for a
+> shutdown's `CTRL_OP_SHUTDOWN`; 31 from 2026-07-29; 7 before) at once — `MAX_SOURCES` is derived
+> from the kernel constant rather than restated. A boot opens 10 to 16. `fs-server-ext4` has a
+> ceiling for the same reason: 30 sessions while its control channel is open, which for `init`'s
+> mounts is the whole boot since Part E.4a. Removing it rather than raising it is
 > `TODO(server-fanout)` in
 > [`docs/rationale/deferred-decisions.md`](../rationale/deferred-decisions.md).
 
@@ -202,12 +206,41 @@ Each stamped record routes to an ordered set of sinks behind one `Sink` trait
 
 - **Serial** — formats the record to a line and emits it (via `sys_kprint`), so logs are
   visible on the console as the stub did, now structured and stamped.
-- **In-memory ring** — a bounded keep-recent ring of recent records for later read-back
-  (`journalctl`-style). Slice 1 populates it; the read-back path is a later part.
+- **In-memory ring** — the most recent records, bounded by a megabyte of what they have allocated
+  rather than by a count (the heap's size classes can round that up to twice), which `Log::Read`
+  answers from (administration Part E.6; [Reading it back](#reading-it-back)). It keeps a message's
+  first kilobyte. It is not a `Sink`: the service holds it beside them, since `Read` must reach it.
 
 **Deferred — persistent DB on disk** (needs fs-server *write*, a later Phase-3 slice)
 and **network** (needs netstack). Both slot in behind the same `Sink` trait; sequencing
 Logging before fs-server RW is deliberate — serial + ring need no write capability.
+
+## Reading it back
+
+**Built with administration Part E.6 (2026-09-29).** The contract is
+[`rsproto-log-ops.md`](../spec/rsproto-log-ops.md); in outline:
+
+- **Resolving `read-endpoint` under `/log` mints a read endpoint**, a forwarding endpoint of the
+  service's own, and any resolve on that opens a **read session**. Two endpoints and two sessions
+  at most, which is what came out of the sources' ceiling above.
+- **`Read { after, max }` answers from the ring**: the records past a sequence number, oldest
+  first, as many as a reply holds. An empty reply is the end; the reply's `oldest` says what the
+  ring has dropped.
+- **Each record carries the wall clock at ingest** as well as the monotonic one, since a person
+  reading a log wants to know when. The wall clock can be set (Part E.5), so the sequence is
+  what orders records, and `log` shows both.
+- **Who reads it** is the `logs` grant's to decide: the view broker binds its read endpoint at
+  `/dev/logs` in a view with the grant, and the seeded policy gives it to `admin`. The ring holds
+  the view broker's audit, so reading it is not every session's. Only a holder of the root
+  namespace reaches `read-endpoint`, as with every server's admin endpoint
+  (`TODO(svc-auth-ungated)`).
+- **`log [PRINCIPAL]`** writes `Table<{sequence, time, principal, tier, level, message}>`, a
+  principal's own records and its named sources' when one is given.
+
+**Why the ring grew, and what the plan said about it.** It was 256 records; the plan said that was
+"smaller than one boot's log". It was not: a boot writes 50 to 100 records, a release boot fewer,
+since most of the system writes to the console rather than here. What outgrew 256 is a machine up
+for days, whose audit accumulates. A megabyte is several thousand records.
 
 ## Relationship to the kernel log
 
@@ -241,14 +274,15 @@ end.
 later spine slice — until then App-tier endpoints aren't resolved, only the
 self-open-under-System-principal demo runs); the disk-DB sink (fs-server RW) and network
 sink (netstack); structured `fields`/`Value` (typed-I/O / `TableWriter` — the wire reserves
-`field_count`); the ring read-back / `journalctl` path (its first *reply-bearing* op is
-where a real logging op namespace would be introduced); and any kernel-log unification.
+`field_count`); and any kernel-log unification. The ring read-back was deferred here too, and was
+built with administration Part E.6 ([Reading it back](#reading-it-back)).
 
 ## See also
 
 - `docs/architecture/service-manager.md` — the `log` handle seam this replaces
 - `docs/spec/service-toml-schema.md` — `[service.<name>.handles.log]`, stdio routing
 - `docs/spec/rsproto-wire-format.md` — the `LogRecord` body codec (append is a raw channel send, no op)
+- [`docs/spec/rsproto-log-ops.md`](../spec/rsproto-log-ops.md) — `Read`, and the read endpoint
 - `docs/archive/os-design-v5.1.md` § Logging — the original record sketch
 - `kernel/src/klog.rs`, `/dev/log` — the distinct kernel log
 - The audit subsystem (`SysCaps::AUDIT_CONTROL`) — the Security-tier analog, its own slice

@@ -31333,3 +31333,278 @@ declaration may lengthen a service's bound.
 
 **ABI:** no hash impact. `stop_timeout` is a declaration key; no syscall, layout or discriminant
 changes.
+
+## 2026-09-29 — Administration Part E.5: the clock
+
+A person with the `clock` grant can set the wall clock, and the machine's hardware clock keeps it
+across a reboot: `with admin date --set 2026-09-28T14:30:00Z`.
+
+**`sys_clock_set(clock, ns)`, syscall 41.**
+- **The arguments are checked first, then `SYSTEM_CLOCK`.**
+  - `clock` must be `Realtime`: `Monotonic` never steps, and the CPU clocks are counts.
+  - `ns` must fall in 2000–2099. Anything else is `InvalidArgument`.
+  - The capability comes after, so both refusals are reachable without it. `boot-probe` reaches
+    all three, and host tests reach the first two.
+- **Why 2000–2099:** it is what the RTC holds on every machine. Without a century register the
+  chip keeps two digits, which the boot reads as 20xx. A set to 2100 would come back as 2000, a
+  century wrong at the next boot, with nothing saying so. With a century register the chip could
+  hold more; one rule for every machine is simpler than a range that depends on the FADT.
+- **The offset is stored first**, from the counter as it reads then; then the RTC is written. One
+  lock covers both, so two sets cannot leave the running clock at one time and the chip at the
+  other, or interleave on the CMOS port pair.
+- **The RTC is written in the chip's own encoding.** That is BCD or binary, 12- or 24-hour, as
+  status B already says. The century register is written when the FADT names one, and the weekday
+  too, for firmware that shows it. `SET` holds the chip's updates for the write. Firmware reads the
+  chip in its own form, so a write that changed the form would break the firmware's clock.
+- **Then it is read back.** A result within two seconds of the write is `CLOCK_SET_KEPT`;
+  anything else is `CLOCK_SET_THIS_BOOT`.
+  - **Why a result and not an error:** the clock is set either way. A machine whose RTC does not
+    answer — it reads `0xFF`, and the read-back's update wait gives up — still has a running
+    clock, and on such a machine the clock may never have been set at boot.
+  - `date` says so on stderr, since the time then lasts until the next boot.
+  - The kernel logs every set with its second, and which of the two it was.
+- **`clock.rs` said the realtime clock "cannot jump backwards"**, which was true only because
+  nothing could set it. It now says a set steps it, and that intervals are measured on
+  `Monotonic`, as the plan asked.
+
+**`SYSTEM_CLOCK` travels one chain, and only the last link uses it.**
+- `init` gives it to `service-mgr` at spawn, and `service-mgr` to the view broker, whose
+  declaration asks for it. The broker adds it to a program's spawn for the `clock` grant, the one
+  grant that binds nothing.
+- None of the three sets the clock. A capability can be given at spawn only by a parent that holds
+  it, so each holds it for the next.
+- A session's programs are spawned without it, so `date --set` at a prompt is refused.
+- The seeded `admin` profile gains `clock`.
+
+**Beyond the plan: `nxsh` passes its stages what it holds.**
+- Found writing the grant's documentation. A view's bindings reach every stage of `with admin
+  nxsh` through the namespace, but `nxsh` spawned its stages with no capabilities, so `date --set`
+  in that shell was refused while its profile had the grant.
+- Its spawn now asks for every capability, which the kernel intersects with its own. That is
+  nothing in a session: the login supervisors and `nxterm` spawn it with nothing. It is
+  `SYSTEM_CLOCK` in a view with the grant, since the broker gives nothing else.
+- Recorded as a decision because it is one. **Whoever spawns `nxsh` now decides what its stages
+  hold**, and a future spawner that gives it `BIND_NAMESPACE` would give that to every stage.
+
+**`date --set TIME`** takes exactly `YYYY-MM-DDTHH:MM:SSZ`.
+- `libtime::parse_utc` refuses any other form: no offset, since there is no timezone database to
+  apply one with; no fraction; no leap second.
+- It also refuses a date that does not exist. It converts back through `civil_from_days`, so the
+  30th of February is refused rather than rolled into March.
+- `libtime` gains `days_from_civil`, the inverse the plan named.
+- `date` then reports the clock as read after the set.
+
+**Verified first, as the plan asked: QEMU keeps the RTC across a guest reset.**
+- `check-shutdown`'s reboot half now sets the clock to 2031-01-02T00:00:00Z before its
+  `--reboot`. The second boot anchored at 1925078413, 13 s after the time set.
+- With the RTC write claimed but not made, it anchored at 1790713148 — the host's own time, four
+  years short — and the gate failed on it. So the check can fail, and the write is what passes it.
+
+**Gates:**
+- **Host tests:**
+  - the RTC encoder, byte for byte in all four forms, with midnight and noon both ways, and the
+    weekday;
+  - every form round-tripped through `decode` across the day, the leap days and both ends of the
+    century;
+  - the years refused;
+  - `civil_from_days` inverting `days_from_civil`, in the kernel and in `libtime`;
+  - `settable` at both bounds' neighbours;
+  - the syscall's argument refusals, which come first: `require_syscap` panics on the host, so
+    reaching it would fail the test;
+  - `parse_utc`'s form, and eighteen refusals beside their accepted neighbours.
+- **`boot-probe`:**
+  - `Monotonic` and 1999 refused `InvalidArgument`;
+  - a set without `SYSTEM_CLOCK` refused `NoAccess`;
+  - the clock read on both sides of that refusal, and unmoved.
+- **`test-interactive` step 20g**, which makes 35:
+  - `date --set` refused without the grant;
+  - `with admin date --set …` set, with the kernel's "the RTC holds it";
+  - `date --unix` reads it from outside the view;
+  - `with admin nxsh` sets it from inside.
+- **`check-shutdown`:** the reboot's clock, above.
+
+**Controls, each failing where it should:**
+- `sys_clock_set` without its `SYSTEM_CLOCK` check fails `boot-probe`.
+- A `clock` grant that adds no capability fails `test-interactive` at the set.
+- `nxsh` passing nothing fails it at the inner shell's set.
+- The RTC write claimed but not made fails `check-shutdown`.
+- `parse_utc` without its round trip fails its host test, on 2026-09-31.
+- A mismatched `CLOCK_SET_THIS_BOOT` fails `abi-sync-check`'s new clock-set family.
+- **Midnight encoded as 0 in 12-hour mode fails only the byte-for-byte test**, not the round trip.
+  `decode` reads a stored 0 as midnight too, so a wrong encoder and the reader agree. That is why
+  the encoder's test pins bytes rather than trusting a round trip.
+
+**Docs corrected while here:**
+- `service-manager.md`'s *Capability posture* said `service-mgr` holds `LOAD_MODULE` to pass to
+  the device manager. `init` has only ever given it `BIND_NAMESPACE`, and now `SYSTEM_CLOCK`.
+- `syscall-abi.md` said `sys_clock_read` serves `Monotonic` only; `Realtime` has been served since
+  2026-07-24.
+- `deferred-decisions.md`'s resolved "Wall-clock time" row pointed at an open entry for setting
+  the clock that did not exist. A resolved row for setting the clock now follows it.
+
+**Docs:** `syscall-abi.md`, `syscaps.md`, `views-toml-schema.md`, `service-manager.md`,
+`power.md`, `shell-language.md`, `init/CLAUDE.md`, the root `CLAUDE.md`, and both plans.
+
+The full local gate set, 34, is green (fgb44).
+
+**ABI:** no hash impact. Syscall 41 and the `CLOCK_SET_*` values are not hash inputs, and no
+layout or discriminant changes.
+
+## 2026-09-29 — Administration Part E.6: the log, read back
+
+A person with the `logs` grant can read the service log: `with admin log view-broker` shows the
+broker's records, its audit among them, as a table. With it, Part E is complete.
+
+**The read path.** The contract is `rsproto-log-ops.md`.
+- **Minting a read endpoint.** Resolving `read-endpoint` under `/log` mints one: a forwarding
+  endpoint of the logging service's own. Any resolve on it opens a **read session**.
+- **`Read { after, max }`**, `0x0700`, is the first op in the `Log` category, which was reserved
+  for it in 2026-07. It answers the ring's records past a sequence, oldest first, as many as a
+  reply holds. An empty reply is the end.
+- **The reply's `oldest`** says what the ring has dropped.
+- **The broker holds one endpoint for the boot**, as it does `power`'s, and binds it at
+  `/dev/logs` for the `logs` grant. The seeded `admin` profile has the grant.
+- **Who reaches `read-endpoint`:** a holder of the root namespace, as with the storage and
+  services admin endpoints (`TODO(svc-auth-ungated)`). No session binds `/log`.
+
+**Two endpoints and two sessions, out of the sources' slots.**
+- The service waits on every channel it serves, so each came from `MAX_SOURCES`, 30 to 26. A boot
+  opens 10 to 16 sources.
+- Two endpoints: the broker's, and one more, `boot-probe`'s in a test image.
+- Two sessions: a `log` running, and one more. A reader closes its session when done, so this
+  bounds readers at one moment, not over a boot.
+- **Closes are answered before resolves in every wake**, E.4a's lesson from the view broker. A
+  reader that lets go of a session or an endpoint and asks at once for another must find the first
+  retired. The control that answers resolves first fails `boot-probe`.
+
+**The ring: a megabyte, not 256 records.**
+- **The plan's premise was wrong.** It said 256 records was "smaller than one boot's log". A boot
+  writes 50 to 100, counted in `test-qemu`, `test-interactive` and `check-shutdown` transcripts. A
+  release boot writes fewer, since most of the system writes to the console rather than here.
+- What outgrows 256 is a machine up for days, whose audit accumulates. So the ring grew for that,
+  and the plan's parenthesis is corrected where it is ticked.
+- **Bounded by bytes, not by a count**, because a message may be a kilobyte. A count would bound
+  the ring's memory only as tightly as the longest message allows.
+- **What it keeps:** a message's first 1024 bytes, cut on a character boundary and ending in `…`.
+  A principal or source is at most 64 bytes: longer is refused at the resolve, since a principal is
+  identity and cutting one could make two alike; a record's own source claim is cut. So every
+  record fits a reply with room to spare. The console still prints every message whole.
+- The ring moved into the library, `logging_service::ring`, so its arithmetic is host-tested.
+- It is no longer a `Sink`: `Read` must reach it, so the service holds it beside the sinks.
+
+**Each record carries the wall clock at ingest**, as well as the monotonic one.
+- A person reading a log wants to know when.
+- The wall clock can be set since Part E.5, so the sequence is the order.
+- **`log` shows `sequence` as well as the plan's `time`, `principal`, `tier`, `level` and
+  `message`.** `time` is Unix epoch seconds, as `list`'s `modified` is, and null for a record
+  taken while the clock was not set.
+- A named source is shown after its principal, `heartbeat.worker`, as the console shows it.
+  `log PRINCIPAL` keeps that principal's records and its sources'.
+
+**Tier and level names moved into `librsproto::log`**, since `log` now shows them too: a helper
+with two consumers belongs below both.
+
+**Gates:**
+- **Host tests:**
+  - `Read`'s request and reply round-trip, and a record that does not fit is left out whole;
+  - **a reader fed bytes no writer makes**, twelve ways: a short header, a count past or short of
+    the records, a byte after the last, a string cut short or past the body, an empty principal, a
+    reserved flag, a sequence that does not rise or is `0`, and a count of `u32::MAX`;
+  - the ring's byte accounting across eviction, `after` at each edge, and cutting on a character
+    boundary.
+- **`boot-probe`'s `logs_test`:**
+  - a record it writes on a source of its own is read back through a read endpoint bound as the
+    grant binds one, principal, source, level and message as written, with the wall clock;
+  - an eleven-byte `Read` is refused `InvalidArgument`, and another op `Unsupported`;
+  - two sessions are taken and a third refused, then one at once after one is let go;
+  - the same for endpoints: the broker's and the probe's, a third refused, then one at once.
+- **`test-interactive` step 20h**, which makes 36:
+  - `log` is refused naming the grant;
+  - `with admin log view-broker` shows the row for 20g's `date` view. That record reached the
+    console before the command was typed, so what matches can only be the row.
+
+**Controls, each failing where it should:**
+- A `Read` that answers nothing fails `test-interactive` at 20h.
+- Closed sessions never retired fails `boot-probe`.
+- Resolves answered before closes fails `boot-probe`.
+- The reader without its trailing check, or without its rising check, fails its host test.
+- The ring evicting without subtracting fails its host test.
+
+**Docs:**
+- New: `rsproto-log-ops.md`.
+- Updated: `logging.md` (*Reading it back*, the sinks, the sources' ceiling),
+  `rsproto-wire-format.md`, `views-toml-schema.md`, `shell-language.md`, and
+  `deferred-decisions.md`'s fan-out entry.
+- The root `CLAUDE.md`'s step count, and both plans.
+- **Part E's docs box**, ticked after a sweep for `init` named as a moving server's spawner or
+  supervisor. The sweep was checked first against the docs before E.1, where it found each such
+  claim. It found two that had outlived E.1: `storage.md`'s boot and supervision, and
+  `device-manager.md`'s supervision. Both now name `service-mgr`.
+
+The full local gate set, 34, is green (fgb45).
+
+**ABI:** no hash impact. A new rsproto op and its bodies are not hash inputs, and no kernel type
+changes.
+
+## 2026-09-29 — Parts E.5 and E.6, reviewed (PR #344): every record the ring keeps is one a reply can carry
+
+The review found one blocking problem, two worth fixing and two optional; all are taken. The
+clock half had nothing to fix: the reviewer read the `SYSTEM_CLOCK` chain end to end and broke the
+encoder five ways, each caught.
+
+**Blocking — a record with an empty source stopped every reader at it.**
+- **What happened:**
+  - `parse_append` reads a source flagged present with length `0` as `Some(&[])`, and the ring kept
+    it that way.
+  - The reply writer refuses a present, empty source, since an empty `source_len` on the wire
+    means none.
+  - `reply_records` took any refusal for a full reply. So every `Read` came back empty at that
+    record, and `log` called it the end of the ring.
+- **Reproduced by the reviewer:** one such record among fifty; a reader saw one and stopped.
+  Anything holding a log channel could send one, through `liblog::log_source` with `""` or a raw
+  append.
+- **Fixed for the class: everything the ring keeps is servable.**
+  - `Ring::push` keeps a present, empty source as none.
+  - At ingest, `claimed_source` reads an empty claim as no claim, so it falls back to the channel's
+    label as no claim does.
+  - **The reply's loop moved into the library**, as `Ring::fill_reply`, where the host tests reach
+    it. The reviewer had to copy it to test it.
+  - A record the writer refuses into an **empty** reply is passed over rather than stopping there.
+    `push` keeps nothing like that, but one kept around `push` would otherwise hide everything
+    after it.
+- **The test takes the service's path:** an append encoded, parsed, its source claimed, kept, and
+  read back as `log` reads, all fifty.
+- **Controls, each failing the test:** neither normalisation; `push`'s alone removed; the claim's
+  alone removed; and the pass-over removed, with an unservable record placed around `push`.
+
+**Worth fixing — the budget counted length, not allocation.**
+- A message cut from about 4 KB kept its 4 KB, and the ring counted 1 KB for it. A ring of long
+  lines could occupy four times its megabyte.
+- **Fixed:** `cut` calls `shrink_to_fit`, and `Ring::cost` counts capacity.
+- **Still not counted:** the heap's size classes round a string under 2 KiB up to the next power
+  of two, so what the ring occupies can reach twice its budget. `RING_BUDGET`'s doc now says so.
+- A test cuts a 3.9 KB message and asserts what it keeps; without `shrink_to_fit` it fails.
+
+**Worth fixing — the reader's empty-principal guard was untested.**
+- The test zeroed `principal_len` in place. That moved every string boundary after it, so the
+  whole-body check refused the reply before the guard was reached.
+- **Fixed:** the mutation now hands the principal's bytes to the message, so every length still
+  adds up and only the guard can refuse it. With the guard removed, the test now fails.
+- Its sibling mutations each break a check of their own. The reviewer broke those checks too, and
+  each was caught.
+
+**Optional, taken — `log` reported drops only at the start of a read.**
+- A ring busy enough can drop records while it is read.
+- `librsproto::log::dropped(after, oldest)` is the gap, host-tested at its edges. `log` checks it
+  on every reply, and says which kind of drop it was.
+
+**Optional, taken — the warning about `nxsh`'s pass-through now sits where spawners look:**
+`libsession::spawn_leader`'s doc and `graphical-session.md`'s leader table. Giving `nxsh` a
+capability gives it to every command typed at it.
+
+**Docs:** `rsproto-log-ops.md` (the empty source, and drops mid-read), `logging.md`'s ring,
+`shell-language.md`'s `log`, and the two above.
+
+The full local gate set, 34, is green (fgb46).
+
+**ABI:** no hash impact.

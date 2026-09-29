@@ -65,7 +65,9 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `BIND_NAMESPACE` — to register fs-server endpoints in the system namespace
 - `LOAD_MODULE` — to load Tier 2 LKMs (delegated to device manager later)
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
-- `SYSTEM_CLOCK` — delegated to time-sync service
+- `SYSTEM_CLOCK` — given to `service-mgr` at spawn, to pass to the view broker, whose `clock`
+  grant is that capability in a program's spawn (administration Part E.5). Init never sets the
+  clock itself.
 - **The system-control object** (administration Part E.3) — a handle in `rdx`, not a syscap:
   the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE` nor
   `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a

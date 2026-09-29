@@ -2143,7 +2143,12 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 
         A second boot runs `with power shutdown --reboot`, and QEMU is watched through a second
         boot.
-- [ ] **E.5 — the clock.**
+- [x] **E.5 — the clock.** *(Landed 2026-09-29, as drawn, and **QEMU does keep the RTC across a
+  guest reset**: the reboot half's second boot anchored 13 s after the time set, and an RTC write
+  claimed but not made fails it, anchored at the host's own time, four years short. Two things
+  beyond the plan: `nxsh` passes its stages what it holds, so `date --set` works in `with admin
+  nxsh` as the view's bindings do; and a set is refused outside 2000–2099, the years every machine's
+  RTC reads back. The write is read back, and `sys_clock_set` says when the chip did not take it.)*
       - `sys_clock_set` and the RTC's write-back.
       - `SYSTEM_CLOCK` from `init` to `service-mgr`, and to the broker.
       - The `clock` grant, and `date --set`.
@@ -2154,14 +2159,22 @@ A reboot is the same, with `reboot: true` and a reset at the end.
           **if QEMU keeps the RTC's registers across a guest reset**, which is unverified and is the
           first thing E.5 checks. If it does not, the write-back needs another witness, such as a
           host read of CMOS.
-- [ ] **E.6 — the log.**
+- [x] **E.6 — the log.** *(Landed 2026-09-29, as drawn, with the ring bounded by a megabyte
+      rather than a count, and each record stamped with the wall clock as well; `log` shows the
+      sequence too, since the clock can step. **The premise that 256 records was "smaller than
+      one boot's log" was wrong** — a boot writes 50 to 100 — and the ring grew for a machine up
+      for days. The read endpoints and sessions, two of each, came out of the sources' wait slots,
+      30 to 26.)*
       - The read endpoint and `Read`, and a larger ring.
       - The `logs` grant, `/dev/logs`, and `log`.
       - Gates:
         - host tests for `Read`'s encoding, including a reader fed bytes no writer makes;
         - `test-interactive`: `with admin log view-broker` shows an audit record an earlier step
           wrote, and `log` without the grant names it.
-- [ ] **Docs.**
+- [x] **Docs.** *(Done part by part, and swept at E.6, 2026-09-29, for `init` named as a moving
+      server's spawner or supervisor. The sweep was checked against the docs as they stood before
+      E.1, where it found each claim, and found two that had outlived E.1: `storage.md`'s boot and
+      supervision, and `device-manager.md`'s supervision.)*
       - `service-manager.md`: the boundary as built, the declaration keys, the registry, the
         endpoints and the shutdown; and its *Capability posture*, which gives `service-mgr` bind
         rights to the whole root now (the maintainer's call).

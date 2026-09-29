@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Calendar arithmetic and duration parsing — the pure half of `date` and `sleep`.
+//! Calendar arithmetic, and parsing a time or a duration — the pure half of `date` and `sleep`.
 //!
 //! Both utilities are mostly *not* about syscalls: `date` reads one clock and then does
 //! calendar arithmetic, and `sleep` arms one timer and then does string parsing. Those
@@ -55,6 +55,53 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let m = (mp + if mp < 10 { 3 } else { -9 }) as u32; // [1, 12]
     // March-based year → January-based.
     (y + i64::from(m <= 2), m, d)
+}
+
+/// The civil date → days since 1970-01-01, proleptic Gregorian: [`civil_from_days`]'s inverse
+/// (administration Part E.5, for `date --set`).
+///
+/// Hinnant's `days_from_civil`, over the same March-based era. `month` must be 1-12 and `day` a
+/// day of it; [`parse_utc`] checks that by converting back.
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    // January and February belong to the previous March-based year.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = i64::from((month + 9) % 12); // March = 0
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146_096]
+    era * 146_097 + doe - 719_468
+}
+
+/// **A time in UTC, as `date --set` takes it**: `YYYY-MM-DDTHH:MM:SSZ` exactly, as
+/// `2026-09-28T14:30:00Z` — seconds since the Unix epoch, or `None` (administration Part E.5).
+///
+/// **Only that form**, because it is the one a person can read without asking which field is
+/// which, and because anything looser invites a guess: no offset but `Z`, since there is no
+/// timezone database to apply one with; no fraction; no leap second. A date that does not exist —
+/// the 30th of February, the 29th in a common year — is refused rather than rolled into the next
+/// month, by converting the date back and comparing.
+pub fn parse_utc(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let punctuation = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')];
+    if b.len() != 20 || punctuation.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<u32> {
+        let digit = |n: u32, c: &u8| c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'));
+        b[from..to].iter().try_fold(0u32, digit)
+    };
+    let (year, month, day) = (i64::from(num(0, 4)?), num(5, 7)?, num(8, 10)?);
+    let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let in_range = (1..=12).contains(&month) && (1..=31).contains(&day);
+    if !in_range || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    Some(days * 86_400 + i64::from(hour * 3600 + minute * 60 + second))
 }
 
 /// Decompose nanoseconds since the Unix epoch into a UTC civil date and time.
@@ -198,6 +245,65 @@ mod tests {
         assert_eq!(civil_from_days(19782), (2024, 2, 29));
         // Before the epoch: the era arithmetic must floor, not truncate.
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// `days_from_civil` inverts `civil_from_days`, day by day across four centuries around the
+    /// epoch.
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for days in -200 * 365..300 * 365 {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "{y}-{m}-{d}");
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 2, 29), 11016);
+        assert_eq!(days_from_civil(2100, 3, 1), 47541);
+    }
+
+    /// **The one form `date --set` takes**, and the instants it names — cross-checked with
+    /// `date -u -d '…' +%s`.
+    #[test]
+    fn parse_utc_reads_the_documented_form() {
+        assert_eq!(parse_utc("2026-09-28T14:30:00Z"), Some(1_790_605_800));
+        assert_eq!(parse_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_utc("2000-02-29T23:59:59Z"), Some(951_868_799));
+        assert_eq!(parse_utc("2031-01-02T00:00:00Z"), Some(1_925_078_400));
+        assert_eq!(parse_utc("2099-12-31T23:59:59Z"), Some(4_102_444_799));
+        // And what it reads, `civil_from_unix` writes back.
+        let c = civil_from_unix(1_790_605_800 * 1_000_000_000);
+        assert_eq!(format_civil(&c), "2026-09-28 14:30:00");
+    }
+
+    /// **Anything else is refused**, including a date that does not exist — each field at the
+    /// value past its last.
+    #[test]
+    fn parse_utc_refuses_everything_else() {
+        for bad in [
+            "",
+            "2026-09-28",
+            "2026-09-28 14:30:00Z",   // a space for the `T`
+            "2026-09-28T14:30:00",    // no `Z`
+            "2026-09-28T14:30:00+00:00",
+            "2026-09-28t14:30:00z",
+            "2026-09-28T14:30:00.5Z", // a fraction
+            "2026-9-28T14:30:00Z",
+            "+026-09-28T14:30:00Z",
+            "2026-13-28T14:30:00Z",
+            "2026-00-28T14:30:00Z",
+            "2026-09-00T14:30:00Z",
+            "2026-09-31T14:30:00Z",   // September has 30
+            "2026-02-29T14:30:00Z",   // 2026 is common
+            "2100-02-29T14:30:00Z",   // and so is 2100
+            "2026-09-28T24:00:00Z",
+            "2026-09-28T14:60:00Z",
+            "2026-09-28T14:30:60Z",   // no leap second
+        ] {
+            assert_eq!(parse_utc(bad), None, "{bad:?}");
+        }
+        // Their neighbours are taken.
+        assert!(parse_utc("2026-09-30T23:59:59Z").is_some());
+        assert!(parse_utc("2024-02-29T00:00:00Z").is_some());
+        assert!(parse_utc("2000-02-29T00:00:00Z").is_some());
     }
 
     #[test]

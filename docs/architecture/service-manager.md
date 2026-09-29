@@ -316,8 +316,8 @@ amplify — a child can never gain a capability its parent lacks).
 | SysCap | service-mgr holds? | Why |
 |---|---|---|
 | `BIND_NAMESPACE` | **yes — own use** | It registers each service's endpoint into the system namespace (the RS protocol's bind step). This is the defining supervisor capability. It also *re-delegates* `BIND_NAMESPACE` to **both login supervisors** — `session-mgr` and, since M7 Part D, `desktop-session-mgr` — each of which needs it to construct a session namespace. |
-| `LOAD_MODULE` | **yes — pass-through** | Not used by service-mgr directly; held so it can *delegate* it to the `device-manager` service (delegation can only attenuate — to grant a cap, you must hold it). |
-| `SYSTEM_CLOCK` | **yes — pass-through** | Same: held to delegate to a `time-sync` service, not exercised by service-mgr itself. |
+| `SYSTEM_CLOCK` | **yes — pass-through** (since administration Part E.5) | Not used by service-mgr; held so it can *delegate* it to the view broker, whose declaration asks for it and whose `clock` grant passes it to a program at spawn (delegation can only attenuate — to grant a cap, you must hold it). `syscaps.md` follows the chain. |
+| `LOAD_MODULE` | **no**, until there is a module loader | This table said *yes — pass-through, for the device manager* until 2026-09-29, and `init` has never given it: its spawn of service-mgr asks for `BIND_NAMESPACE` alone, and now `SYSTEM_CLOCK`. Nothing loads a module, so nothing needs it passed on. |
 | `PHYSICAL_MEMORY` | **no** | Only `init` keeps this, for extreme recovery. A supervisor has no business with raw physical memory (called out explicitly in `userspace/init/CLAUDE.md`). |
 | `REAL_TIME` / `AUDIT_CONTROL` | **no** | No service-mgr need; a service wanting `REAL_TIME` acquires it another way, `AUDIT_CONTROL` belongs to the audit service's own grant path. |
 

@@ -3,8 +3,9 @@
 **Status:** Implemented (Phase 3 slice 6, 2026-07-14). Living document. The type,
 the `Process.syscaps` field, spawn inheritance, the init boot grant, and the two wired
 gates (`BIND_NAMESPACE` on `sys_ns_bind`, `REAL_TIME` on the RT scheduling class) are
-in; the other four caps are defined and inherited, their gates deferred to their
-operations' slices.
+in. **A third, `SYSTEM_CLOCK` on `sys_clock_set`, since administration Part E.5
+(2026-09-29).** The other three caps are defined and inherited, their gates deferred to
+their operations' slices. Last checked 2026-09-29.
 
 **SysCaps** are the kernel's second axis of authority: **ambient, per-process
 capabilities** for privileged *operations*, distinct from per-handle
@@ -41,7 +42,7 @@ Capability Bitmask"). Each is one bit of a `u64`:
 | `1<<1` | `BIND_NAMESPACE` | `sys_ns_bind` (`sys_ns_release_initramfs` does not exist) | **this slice** |
 | `1<<2` | `PHYSICAL_MEMORY` | mapping arbitrary physical memory | **defined only** (no phys-map syscall) |
 | `1<<3` | `REAL_TIME` | requesting the `RealTime` scheduling class | **this slice** |
-| `1<<4` | `SYSTEM_CLOCK` | setting the realtime-clock offset | **defined only** (clock is Monotonic-only) |
+| `1<<4` | `SYSTEM_CLOCK` | `sys_clock_set`: setting the wall clock and the RTC | **administration Part E.5** |
 | `1<<5` | `AUDIT_CONTROL` | audit-subsystem management | **defined only** (no audit subsystem) |
 
 **All six are *defined*** (the type + bitmask + the inheritance model need the full
@@ -183,10 +184,23 @@ fields; if `class == RealTime` and the caller lacks `REAL_TIME`, it is rejected
 your own thread is not privileged). Trusted kernel threads keep setting the class
 directly via `spawn_with_class` (they bypass the syscall).
 
-### The other four: defined, gate deferred to their slice
+**`SYSTEM_CLOCK` — on `sys_clock_set`** (administration Part E.5, 2026-09-29), the third
+wired, and the first whose holder is chosen by policy rather than by a declaration.
+`sys_clock_set` checks its arguments first — `Realtime` only, 2000–2099 only — and then
+the capability, so both refusals are reachable without it.
 
-`LOAD_MODULE`, `PHYSICAL_MEMORY`, `SYSTEM_CLOCK`, `AUDIT_CONTROL` have no operation to
-gate yet (no module loader, no phys-map syscall, Monotonic-only clock, no audit
+It travels down one chain, and **every link but the last only passes it on**: `init`
+gives it to `service-mgr` at spawn, `service-mgr` to the view broker, whose declaration
+asks for it, and the broker to a program it spawns in a view whose profile has the
+`clock` grant ([`views-toml-schema.md`](../spec/views-toml-schema.md)). None of the
+three sets the clock. A capability can be given at spawn only by a parent that holds
+it, so each is in the chain for the one after it. A session's programs are spawned
+without it, and `with admin date --set` is how a person sets the clock.
+
+### The other three: defined, gate deferred to their slice
+
+`LOAD_MODULE`, `PHYSICAL_MEMORY`, `AUDIT_CONTROL` have no operation to
+gate yet (no module loader, no phys-map syscall, no audit
 subsystem). They are defined and flow through inheritance; the slice that builds each
 operation adds the one-line `require_syscap(...)` at its entry. This doc is the
 registry of which bit that slice uses.
@@ -242,7 +256,8 @@ passing under the new gate (init/parent granted appropriately), *and* that a pro
   the `REAL_TIME` gate + the finalized `ThreadArgs` class/nice/affinity ABI; the
   `SpawnArgs.syscaps` field.
 - **Defined, not wired:** `LOAD_MODULE`, `PHYSICAL_MEMORY`, `SYSTEM_CLOCK`,
-  `AUDIT_CONTROL` (their gates land with their operations).
+  `AUDIT_CONTROL` (their gates land with their operations; `SYSTEM_CLOCK`'s did, in
+  administration Part E.5).
 - **Out:** libos wrappers for the new spawn/thread ABI (that's the slice-7
   authority-facing libos surface); any userspace privilege broker / policy.
 

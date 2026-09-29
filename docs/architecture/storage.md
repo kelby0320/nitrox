@@ -55,10 +55,11 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 
 ## 3. A boot, end to end
 
-1. **`init` mounts its critical path**, then spawns the device manager and, **straight after it**,
-   the storage service. A class's owner is whoever subscribes first, so the service must come
-   before anything declared (`TODO(svc-auth-ungated)` in
-   [`deferred-decisions.md`](../rationale/deferred-decisions.md)).
+1. **`init` mounts its critical path**, and `service-mgr` spawns the device manager and, **straight
+   after it**, the storage service, in the declarations' order (`init` spawned both until
+   administration Part E.1a; this step said so until 2026-09-29). A class's owner is whoever
+   subscribes first, so the service must come before anything else that could subscribe
+   (`TODO(svc-auth-ungated)` in [`deferred-decisions.md`](../rationale/deferred-decisions.md)).
 2. **The service takes `block`**: it resolves `/svc/devices/block`, and the manager has already
    queued an `Arrived` per disk, partition and RAM disk, each carrying the service's own duplicate
    of the device's node, then `Settled` ([`device-manager.md`](device-manager.md) §4). The
@@ -311,9 +312,11 @@ how, and what each suffix asks for where it arrives.
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.
 - **Arrivals after `Settled` are logged and ignored.** Nothing sends one until Phase 6's USB driver.
-- **Supervision.** `init` keeps the service's process handle, and nothing restarts it. If it
-  exited, its subscription would close and `block` would be free for anything in the root
-  namespace to take (`TODO(svc-auth-ungated)`).
+- **Supervision.** `service-mgr` keeps the service's process handle, and nothing restarts it: its
+  policy is `never`, and it is `essential`, so `service --stop` refuses it. If it exited, its
+  subscription would close and `block` would be free for anything in the root namespace to take
+  (`TODO(svc-auth-ungated)`). (`init` kept the handle until administration Part E.1a; this said so
+  until 2026-09-29.)
 
 ## Where to read more
 

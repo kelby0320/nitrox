@@ -147,7 +147,9 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// Spawn args for the service manager (the normal handoff). It inherits a LOOKUP-only
 /// handle to init's root namespace and holds `BIND_NAMESPACE` — its defining
 /// supervisor capability (registering service endpoints, re-delegating to
-/// session-mgr). See `docs/architecture/service-manager.md` § Capability posture. The
+/// session-mgr) — and `SYSTEM_CLOCK`, which it holds only to pass on to the view broker, whose
+/// `clock` grant is that capability at a program's spawn (administration Part E.5). See
+/// `docs/architecture/service-manager.md` § Capability posture. The
 /// bind-righted root it binds the servers with — the second gate — is sent down the
 /// handoff channel rather than inherited (administration Part E.1a).
 /// `handles[0]` is that **handoff channel** end, moved to service-mgr, over which init sends
@@ -168,7 +170,7 @@ static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
         0,
     ],
     namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE,
+    syscaps: SYSCAP_BIND_NAMESPACE | SYSCAP_SYSTEM_CLOCK,
 };
 
 /// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return

@@ -1217,7 +1217,8 @@ that holds a channel per client waits on its serving endpoint plus one slot per 
 one of them. (Since administration Part C.3 a filesystem server whose supervisor keeps its
 control channel, for `Meta::Unmount`, spends a slot on that too: 30 directory sessions while
 it is open. Since Part E.4a `init` keeps its mounts' too, for a shutdown's unmount, so every
-filesystem server has 30 for the whole boot.)
+filesystem server has 30 for the whole boot. And the logging service's sources, 26 since Part E.6,
+when two read endpoints and two read sessions took four slots.)
 Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
 (`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
 concurrent clients to 31, and made both derive their cap from the constant rather than
@@ -2157,7 +2158,8 @@ decision log entry for the date shown.
 | Forwarded-lookup concurrency (N = 1) | Phase 2/3 | `US_PENDING_MAX = 8` outstanding forwarded lookups, correlated by `request_id`. |
 | File truncate | 2026-07-24 | `sys_file_truncate` → `RESOLVE_TRUNCATE` → `ext4::truncate_file`, kernel-forwarded so the page cache stays coherent. |
 | Reclaiming a process's handles at exit | 2026-07-24 | Marked thread + a batched sweep in `reap_pending`; `next_owned` stays unbuilt (the sweep scans). |
-| Wall-clock time | 2026-07-24 | `CLOCK_REALTIME` anchored from the CMOS RTC at boot; the fs-server stamps inodes. Setting the clock stays unbuilt — see the open entry. |
+| Wall-clock time | 2026-07-24 | `CLOCK_REALTIME` anchored from the CMOS RTC at boot; the fs-server stamps inodes. Setting the clock stayed unbuilt; this row pointed at an open entry for it that did not exist, until the row below (2026-09-29). |
+| Setting the clock | 2026-09-29 | Administration Part E.5: `sys_clock_set` needs `SYSTEM_CLOCK`, steps the offset, and writes the RTC in the chip's own encoding, read back; the `clock` grant and `date --set`. `check-shutdown` proves the time survives a reboot. No time-sync service: nothing sets the clock but a person. |
 | Numeric `/proc/self/{pid,tid}` | Phase 3 | The capture → format → synthesize primitive landed with `/proc/sched/stats`; `/proc/self/status` was its second consumer. |
 | General deferred object reclamation from `SCHED`/IRQ context | 2026-07-21 | `SchedState::deferred_drops`, drained by `reap_pending` in thread context (review fix F2). |
 | `kmalloc` alignment > `SLAB_SIZE` | 2026-06-12 | Resolved by taking the other path: `mm::dma::DmaBuffer` allocates from the buddy. No remaining client wants it from `kmalloc`. |

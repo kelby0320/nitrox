@@ -835,6 +835,49 @@ fn power_refused_test(root_ns: u64) -> bool {
     true
 }
 
+// === setting the clock, without SYSTEM_CLOCK (administration Part E.5) ===========================
+
+/// **`sys_clock_set` is refused without `SYSTEM_CLOCK`**, which this process does not hold, and
+/// the clock does not move: a set to 2031 refused `NoAccess`, and the clock read either side of it
+/// within a minute of itself. Before the authority, the arguments: `Monotonic` never steps, and
+/// 1999 is before what the hardware clock holds — both `InvalidArgument`.
+fn clock_set_refused_test() -> bool {
+    use libkern::{CLOCK_MONOTONIC, CLOCK_REALTIME, KError, SYS_CLOCK_READ, SYS_CLOCK_SET};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: clock FAIL: ").s(why).end();
+        false
+    };
+    let read = || {
+        let mut ns = 0u64;
+        // SAFETY: a valid `u64` out-param on this stack.
+        let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut ns) as u64) };
+        (r == 0).then_some(ns)
+    };
+    let set = |clock: u64, secs: u64| {
+        // SAFETY: register-only syscall.
+        unsafe { syscall2(SYS_CLOCK_SET, clock, secs * 1_000_000_000) }
+    };
+    let in_2031 = 1_925_078_400; // 2031-01-02T00:00:00Z
+    if set(CLOCK_MONOTONIC, in_2031) != KError::InvalidArgument.as_i32() as i64 {
+        return fail(b"setting the monotonic clock was not refused InvalidArgument");
+    }
+    if set(CLOCK_REALTIME, 946_684_799) != KError::InvalidArgument.as_i32() as i64 {
+        return fail(b"a time in 1999 was not refused InvalidArgument");
+    }
+    let before = read();
+    if set(CLOCK_REALTIME, in_2031) != KError::NoAccess.as_i32() as i64 {
+        return fail(b"a set without SYSTEM_CLOCK was not refused NoAccess");
+    }
+    let (Some(before), Some(after)) = (before, read()) else {
+        return fail(b"the wall clock does not read");
+    };
+    if after < before || after - before > 60_000_000_000 {
+        return fail(b"the wall clock moved across a refused set");
+    }
+    kprint(b"boot-probe: sys_clock_set refused the monotonic clock, 1999 and no SYSTEM_CLOCK ok\n");
+    true
+}
+
 /// **A direct-handle bind needs `TRANSFER`** (PR #342 review), since every resolve of the binding
 /// mints a handle to the object for whoever asked. Without it, `init` could publish its
 /// system-control object, whose handle carries no `TRANSFER` so that it cannot leave `init`.
@@ -1450,6 +1493,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)
         & power_refused_test(root_ns)
+        & clock_set_refused_test()
         & bind_needs_transfer_test()
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
@@ -1467,7 +1511,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & accounts_test(root_ns)
         & restart_test(root_ns)
         & services_test(root_ns)
-        & power_endpoint_test(root_ns);
+        & power_endpoint_test(root_ns)
+        & logs_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -3483,6 +3528,133 @@ fn power_endpoint_test(root_ns: u64) -> bool {
         return fail(b"no power endpoint at once after the one was let go");
     }
     kprint(b"boot-probe: power endpoint refused a start, three malformed shutdowns and one on an admin session, and a third endpoint ok\n");
+    true
+}
+
+/// **Reading the log back** (administration Part E.6), through a read endpoint bound as the
+/// `logs` grant binds it:
+/// - a record this probe writes on a log source of its own is read back, principal, source, level
+///   and message as written, and stamped with the wall clock;
+/// - a `Read` whose body is not twelve bytes is refused `InvalidArgument`, and an op that is not
+///   `Read` `Unsupported`;
+/// - **two sessions at once, and a third refused** `WouldBlock`; one let go, and another opened
+///   at once — so a closed session is retired, not waited on;
+/// - **two endpoints at once**, the broker's and this probe's: a third refused, and one minted at
+///   once when this probe's is let go.
+///
+/// **After `power_endpoint_test`, and so after `storage_grant_test`**, whose admin views make the
+/// broker resolve its read endpoint for the `logs` grant and keep it for the boot.
+fn logs_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::log::{LEVEL_INFO, OP_LOG_READ, TIER_SYSTEM, parse_read_reply, read_request};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: logs: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
+    const MESSAGE: &str = "boot-probe: a record to read back";
+    liblog::open_source(root_ns, b"/log/system/boot-probe/logs-test").info(MESSAGE);
+
+    // A read endpoint, bound in a namespace of this probe's own at `/logs`, as the grant binds one.
+    let (st, endpoint) = ns_lookup(root_ns, b"/log/read-endpoint", chan);
+    if st != 0 || endpoint == 0 {
+        return fail(b"no read endpoint through /log/read-endpoint");
+    }
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if ns <= 0 {
+        close(endpoint);
+        return fail(b"no namespace to bind the read endpoint in");
+    }
+    let ns = ns as u64;
+    let at = b"/logs";
+    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+    let bound = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) };
+    close(endpoint);
+    if bound != 0 {
+        close(ns);
+        return fail(b"the read endpoint did not bind");
+    }
+    let (st, session) = ns_lookup(ns, at, chan);
+    if st != 0 || session == 0 {
+        close(ns);
+        return fail(b"no read session through the endpoint");
+    }
+    let ask = |id: u64, op: u16, body: &[u8]| -> Option<Received> {
+        if !rs_send(session, op, id, body, &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 5_000_000_000;
+        loop {
+            let m = receive(session, deadline)?;
+            m.handles.iter().for_each(|&h| close(h));
+            if m.request_id == id {
+                return Some(m);
+            }
+        }
+    };
+    // **The record, read back.** The append and the `Read` arrive on different channels, so the
+    // first reads may come before the record does: read on from where the last reply ended until
+    // it is there, for a few seconds.
+    let (mut after, mut id, mut found) = (0u64, 10u64, false);
+    let deadline = clock_ns() + 5_000_000_000;
+    while !found && clock_ns() < deadline {
+        id += 1;
+        let Some(m) = ask(id, OP_LOG_READ, &read_request(after, 0)) else {
+            close(session);
+            close(ns);
+            return fail(b"no answer to a Read");
+        };
+        let Some(reply) = (!m.error).then(|| parse_read_reply(&m.body)).flatten() else {
+            close(session);
+            close(ns);
+            return fail(b"a Read's answer did not read");
+        };
+        for rec in reply.records() {
+            after = rec.sequence;
+            found |= rec.principal == b"boot-probe"
+                && rec.source == Some(b"logs-test".as_slice())
+                && rec.message == MESSAGE.as_bytes()
+                && rec.level == LEVEL_INFO
+                && rec.tier == TIER_SYSTEM
+                && rec.time.is_some();
+        }
+    }
+    let invalid = ask(90, OP_LOG_READ, &read_request(0, 0)[..11]);
+    let unsupported = ask(91, OP_LOG_READ + 1, &read_request(0, 0));
+    let refused_as = |m: Option<Received>, e: KError| {
+        m.is_some_and(|m| m.error && librsproto::error::parse_error(&m.body).is_some_and(|b| b.kerror == e.as_i32()))
+    };
+    let (short_refused, op_refused) =
+        (refused_as(invalid, KError::InvalidArgument), refused_as(unsupported, KError::Unsupported));
+    // Two sessions, and a third refused; the second let go, and another taken at once.
+    let (st2, second) = ns_lookup(ns, at, chan);
+    let (st3, third) = ns_lookup(ns, at, chan);
+    close(third);
+    close(second);
+    let (st4, fourth) = ns_lookup(ns, at, chan);
+    close(fourth);
+    close(session);
+    // Two endpoints: the broker's and this probe's, by `ns`'s binding; a third refused. This
+    // probe's let go, and another minted at once.
+    let (e3, extra) = ns_lookup(root_ns, b"/log/read-endpoint", chan);
+    close(extra);
+    close(ns);
+    let (e4, again) = ns_lookup(root_ns, b"/log/read-endpoint", chan);
+    close(again);
+    if !found {
+        return fail(b"the record this probe wrote was not read back as written");
+    }
+    if !short_refused || !op_refused {
+        return fail(b"a Read of eleven bytes, or an op that is not Read, was not refused as it should be");
+    }
+    if st2 != 0 || st3 != KError::WouldBlock.as_i32() || st4 != 0 {
+        return fail(b"two read sessions, a third refused, and one at once after one was let go");
+    }
+    if e3 != KError::WouldBlock.as_i32() || e4 != 0 || again == 0 {
+        return fail(b"a third read endpoint refused, and one at once after this probe's was let go");
+    }
+    kprint(b"boot-probe: logs read a record back, refused two malformed requests, and held sessions and endpoints to two ok\n");
     true
 }
 

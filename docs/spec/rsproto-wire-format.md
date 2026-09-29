@@ -65,7 +65,7 @@ The 16-bit `op` field decomposes:
 | `Control` | `0x04xx` | Ioctl-style, opaque to the protocol |
 | `Power` | `0x05xx` | Suspend, resume, device power |
 | `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
-| `Log` | `0x07xx` | Reserved for *reply-bearing* logging ops (read-back/query). The hot append path uses **no** op — see [Log records](#log-records). |
+| `Log` | `0x07xx` | Reading the log back: `Read`, on a read session of the logging service's (`/log/read-endpoint`), since administration Part E.6. See [Log operations spec](rsproto-log-ops.md). The hot append path uses **no** op — see [Log records](#log-records). |
 | `Auth` | `0x08xx` | Credential validation (username/password → principal). See [Auth operations spec](rsproto-auth-ops.md). |
 | `Surface` | `0x09xx` | Windows, shared buffers, commit/release. See [Surface operations spec](rsproto-surface-ops.md). |
 | `Input` | `0x0Axx` | Merged input events from the `input-server`. See [Input operations spec](rsproto-input-ops.md). |
@@ -281,9 +281,9 @@ pub struct LogAppendHeader {
 ```
 
 Encoding follows the [body encoding rules](#body-encoding-rules) (little-endian,
-length-prefixed UTF-8). Reply-bearing logging operations (the `journalctl`-style read-back
-/ query path) are deferred; when introduced they take real `op`s in the `Log` (`0x07xx`)
-category and use the normal enveloped request/reply.
+length-prefixed UTF-8). Reply-bearing logging operations take real `op`s in the `Log`
+(`0x07xx`) category and use the normal enveloped request/reply: the first, `Read`, reads the
+service's ring back (administration Part E.6, [`rsproto-log-ops.md`](rsproto-log-ops.md)).
 
 ## Bulk data transfer
 

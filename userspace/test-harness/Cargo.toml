@@ -28,6 +28,9 @@ libterm = { path = "../libterm" }
 fs-server-ext4 = { path = "../fs-server-ext4" }
 # Whole-file reads, for `test-pattern --check`.
 libfs = { path = "../libfs" }
+# A log source of `boot-probe`'s own, whose record it reads back through `Log::Read`
+# (administration Part E.6).
+liblog = { path = "../liblog" }
 
 [[bin]]
 name = "test-harness"

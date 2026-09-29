@@ -98,7 +98,7 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
 `cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 34 steps,
+the real prompt over the serial console and matches on what comes back — 36 steps,
 expect-driven rather than sleep-driven.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
@@ -215,8 +215,10 @@ machine down. It asserts the sequence on COM1 (the sessions ended when asked rat
 bound, every service stopped but the test image's known clients, `init` left `/` clean) and **reads
 "It is now safe to turn off your computer." off the screen** with `check-fbcon`'s decoder, since
 the laptop has no serial port. With the machine stopped the host carves the root out: `e2fsck -fn`
-clean, `s_state` clean, and the file holding the pattern. Then a fresh copy runs `with power
-shutdown --reboot`, and the second boot must mount its root clean. It runs in CI's QEMU job.
+clean, `s_state` clean, and the file holding the pattern. Then a fresh copy sets the clock to 2031
+with `with admin date --set` and runs `with power shutdown --reboot`: the second boot must anchor
+its clock to the time set, read back from the RTC the set wrote (administration Part E.5), and
+mount its root clean. It runs in CI's QEMU job.
 **Waiting for `boot-probe` is load-bearing**: `boot-probe` takes and lets go of a power endpoint to
 test its refusals, and the broker holds another for the boot.
 

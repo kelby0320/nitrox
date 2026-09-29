@@ -2,7 +2,9 @@
 //! when `/system/views.toml` says the caller may (`docs/planning/administration.md` § Part A).
 //!
 //! **What it holds, and so what a bug here reaches.** It is spawned by `service-mgr` with
-//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and it inherits the
+//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and `SYSTEM_CLOCK`,
+//! which it never uses and passes to a program only for the `clock` grant (administration Part
+//! E.5) — a capability can be given at spawn only by a parent that holds it. It inherits the
 //! root namespace, which is where the grants come from: every block device, for `disks`. **And the
 //! root filesystem**, through which it reads `/system/views.toml`, replaces it since Part D.2, and
 //! makes and removes `/home/<name>` for the accounts it fronts since Part D.3. It never holds a
@@ -181,6 +183,9 @@ struct Broker {
     /// `service-mgr`'s power endpoint, resolved on first need and bound into every view with the
     /// `power` grant. There is one; the broker holds it for the boot.
     power: u64,
+    /// The logging service's read endpoint (administration Part E.6), resolved on first need and
+    /// bound into every view with the `logs` grant. The broker holds it for the boot, as `power`.
+    logs: u64,
     root_ns: u64,
     notif: u64,
     serve_end: u64,
@@ -323,6 +328,10 @@ const SERVICES_GRANT: &[u8] = b"/dev/services/admin";
 const POWER_ENDPOINT: &[u8] = b"/svc/services/power-endpoint";
 /// Where the `power` grant is bound in a view.
 const POWER_GRANT: &[u8] = b"/dev/power";
+/// Where the logging service mints a read endpoint (administration Part E.6).
+const LOG_READ_ENDPOINT: &[u8] = b"/log/read-endpoint";
+/// Where the `logs` grant is bound in a view.
+const LOGS_GRANT: &[u8] = b"/dev/logs";
 /// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
 /// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
@@ -383,6 +392,18 @@ impl Broker {
             );
         }
         self.power
+    }
+
+    /// The logging service's read endpoint, resolved on first need. `0` if it could not be.
+    fn logs_endpoint(&mut self) -> u64 {
+        if self.logs == 0 {
+            self.logs = ns_lookup(
+                self.root_ns,
+                LOG_READ_ENDPOINT,
+                RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_TRANSFER,
+            );
+        }
+        self.logs
     }
 
     /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
@@ -1226,6 +1247,7 @@ impl Broker {
             return fail(self, &mut p, "could not copy the caller's namespace");
         }
         let view_ns = view_ns as u64;
+        let mut syscaps = 0;
         for g in &p.grants {
             match g {
                 // **Every disk not in use** (administration Part C.6): a mounted filesystem's
@@ -1285,6 +1307,24 @@ impl Broker {
                         return fail(self, &mut p, "service-mgr's power endpoint is not there to grant");
                     }
                 }
+                // **Reading the log back** (administration Part E.6): the logging service's read
+                // endpoint at `/dev/logs`. Any resolve there opens a read session.
+                Grant::Logs => {
+                    let endpoint = self.logs_endpoint();
+                    // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
+                    let bound = endpoint != 0
+                        && unsafe {
+                            let (p, l) = (LOGS_GRANT.as_ptr() as u64, LOGS_GRANT.len() as u64);
+                            syscall4(SYS_NS_BIND, view_ns, p, l, endpoint)
+                        } == 0;
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "the logging service's read endpoint is not there to grant");
+                    }
+                }
+                // **Setting the clock** (administration Part E.5): `SYSTEM_CLOCK` in the spawn
+                // below, which the kernel intersects with the broker's own. Binds nothing.
+                Grant::Clock => syscaps |= SYSCAP_SYSTEM_CLOCK,
                 // **Changing the policy** (administration Part D.2): the broker's own forwarding
                 // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
@@ -1329,7 +1369,9 @@ impl Broker {
             // (`TODO(child-exit-attribution)`, as `service-mgr` does it).
             SPAWN.handles[1] = life_child;
             SPAWN.namespace = view_ns;
-            SPAWN.syscaps = 0;
+            // **No ambient authority but what a grant says**: `SYSTEM_CLOCK` for `clock`, and
+            // nothing otherwise.
+            SPAWN.syscaps = syscaps;
             SPAWN.arg0 = bootstrap_arg0(true);
             syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
         };
@@ -1558,6 +1600,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         storage: Storage::default(),
         services_admin: 0,
         power: 0,
+        logs: 0,
         root_ns,
         notif,
         serve_end,
