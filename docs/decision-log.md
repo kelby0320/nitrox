@@ -31648,13 +31648,47 @@ in the plan as F.1–F.4, with the Gates table's F row.
   both reach.
 - **A policy asking a password for `power` is refused from the desktop, saying why.** That is the
   graphical prompt's trigger firing, which the refusal names; F builds no prompt.
-- **A shutdown started elsewhere asks the windows too**, bounded by the leader's 5 s, with no
-  dialog: the machine is going down, and a question the shell could not wait for would be a lie.
+- **A shutdown started elsewhere asks the windows too**, bounded at 3 s of the shell's own, with
+  no dialog: the machine is going down, and a question the shell could not wait for would be a
+  lie. **Inside the leader's 5 s, with room**, since `spawn_leader`'s clock starts when it sends
+  the request and the shell hears of it later (PR #345 review).
 - **Restart and Shut down are absent from the menu until F.3 wires them**, by the desktop
   refresh's rule that a row that does nothing is worse than none.
-- **One new gate, `check-logout`, in CI**, on the release image and in one boot:
+- **One new gate, `check-logout`, in CI**, on the release image and in one QEMU run:
   - a logout waiting on the editor's question, cancelled;
   - one completed with Don't save;
   - one with nothing to ask;
   - a restart ending a window anyway;
   - a shutdown whose message is read off the screen.
+
+## 2026-09-29 — Part F's detail pass, reviewed (PR #345)
+
+No blocking findings. Four worth fixing and four optional, all taken; each is a correction to the
+plan, and one to the pass's own entry above, edited in place while it is unmerged.
+
+**Worth fixing:**
+- **F.1's gate could not see F.1's change.** `check-terminal`'s `nxterm` is a test-image service,
+  in `service-mgr`'s namespace and no session, so `whoami` fails there by design, before F.1 and
+  after. **Moved to `verify_app_namespace`**, which checks what an application's namespace
+  reaches before `desktop-shell` launches into it, and whose line `check-login` already asserts.
+  F.1 adds `/session/user` to the check and to the line.
+- **Applications get the session's disks today, and F.1 would have dropped them.** `launch`
+  rebinds them after `build_app_namespace`, outside the builder, so the spike missed it. It is
+  the path `nxinstall` from a desktop terminal takes on the laptop (PR #308 review). **F.1 keeps
+  it**, through the spec's existing `bind_blk`, rebinding from the session's namespace.
+- **The shell's wait at a shutdown started elsewhere matched the supervisor's, 5 s.** The
+  supervisor's clock starts first, so it always gave up first, and every window that declined
+  would make the leader one "still running after it was asked to stop". **3 s**, inside the 5,
+  as `LEADER_STOP_NS` sits inside `service-mgr`'s 10.
+- **Every managed window included dialogs.** `nxedit` reads a manager's close on its question as
+  Keep editing, so a second Log out, asking in creation order, would have taken the question away
+  and left the logout waiting on nothing anyone could answer. **Normal windows only**; End anyway's
+  `Manage::Close` takes a dialog with its parent.
+
+**Optional:**
+- The Docs box names three more docs F makes false.
+- `implementation-plan.md` records the pass, as C's, D's and E's were.
+- "In one boot" is "in one QEMU run": the gate restarts the machine half way.
+- **Restart and Shut down hand the broker an application's namespace**, not the session's. The
+  session's binds `/dev/draw` whole, reaching `manage`, and a view derived from it would give
+  `shutdown` that too.

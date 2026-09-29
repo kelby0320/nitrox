@@ -2296,7 +2296,10 @@ programs to close with unsaved work in mind (E.4a).
 - **Three builders, and two of them differ.** `libsession::build_namespace` builds a session from a
   `NamespaceSpec`. `desktop-shell` builds each application's namespace in its own
   `build_app_namespace`, binding mostly the same pieces by hand, plus `/dev/draw/new` and
-  `/dev/desktop`. The view broker derives, so it builds nothing from a recipe.
+  `/dev/desktop`. **Then `launch` passes on the session's disks**, outside the builder
+  (`rebind_block_devices(session_ns, app_ns)`): in an installer session every application gets
+  `/dev/blk/<n>`, which is how `nxinstall` typed in a desktop terminal finds a disk on the laptop
+  (PR #308 review). The view broker derives, so it builds nothing from a recipe.
   - **Where they have drifted: an application has no `/session/user`**, so by reading, `whoami` in
     a desktop terminal fails with "no session identity". F.1 confirms it booted before fixing it.
 - **The graphical prompt is designed only in this plan**, in *The prompt, and a terminal to prompt
@@ -2309,7 +2312,9 @@ programs to close with unsaved work in mind (E.4a).
   spec gains what an application has and a session does not: `/dev/draw/new`, narrowly, and
   `/dev/desktop`. What a session has and an application does not becomes optional. **An
   application gains `/session/user`**, the one piece it was missing, so `whoami` answers in a
-  desktop terminal. Otherwise an application sees what it saw.
+  desktop terminal. Otherwise an application sees what it saw — **the session's disks included**,
+  through the spec's existing `bind_blk` with the session's namespace as the one rebound from,
+  until Part G changes the installer's session (PR #345 review).
 - **The power menu**:
   - a button at the right end of the top bar, drawn as `IconKind::Power` — a ring open at the top
     with a bar through the gap — lit under the pointer and while open, as the other two are;
@@ -2318,7 +2323,11 @@ programs to close with unsaved work in mind (E.4a).
   - three rows: **Log out**, **Restart**, **Shut down**. The last two are `destructive` rows, since
     they end every session on the machine, not just this one.
 - **Ending a session closes its windows first.** Choosing any of the three:
-  1. `desktop-shell` sends `Manage::RequestClose` to **every** window it manages.
+  1. `desktop-shell` sends `Manage::RequestClose` to every **normal** window it manages — the
+     taskbar's entries — and **not to a dialog**. A client answers for its dialogs through their
+     parent, and `nxedit` reads a manager's close on its question as *Keep editing*: asking a
+     second Log out's windows in creation order would take the question away and leave the logout
+     waiting on an editor with nothing on screen to answer (PR #345 review).
   2. A window's client answers by closing, or by asking its own question — the editor's.
   3. Once every window is gone, the shell does what was chosen.
   4. **While any is left, after a moment**, a dialog names what is still open — each window's
@@ -2329,7 +2338,10 @@ programs to close with unsaved work in mind (E.4a).
 - **Log out** is the shell exiting once its windows are gone. `desktop-session-mgr` does the rest,
   as it does today at a shutdown.
 - **Restart and Shut down** go through the broker, as `with power shutdown` does:
-  - `desktop-shell` asks for `shutdown` — with `--reboot` for Restart — in the `power` view;
+  - `desktop-shell` asks for `shutdown` — with `--reboot` for Restart — in the `power` view,
+    handing the broker **an application's namespace**, built by F.1's builder, rather than its
+    own. The session's binds `/dev/draw` whole and so reaches `manage`; a view derived from it
+    would give `shutdown` that too (PR #345 review);
   - the policy decides, and the broker's audit records it, as it records `with`'s;
   - `service-mgr`'s sequence then asks this session to end too. The shell has closed its windows
     already, so it exits at once.
@@ -2341,7 +2353,11 @@ programs to close with unsaved work in mind (E.4a).
   consumers belongs below both.
 - **A shutdown started elsewhere** — `with power shutdown` in a terminal, or on the serial console
   — reaches `desktop-shell` as a terminate request. The shell asks every window to close as above,
-  and exits once they have or when `spawn_leader`'s bound for a leader runs out, 5 s. **No dialog
+  and exits once they have or after **3 s of its own**. **Inside `spawn_leader`'s 5 s for a leader,
+  with room**, since that clock starts when the request is sent and the shell learns of it later: a
+  wait as long as the supervisor's always ends after the supervisor has given up, and every
+  declining window would then be a leader "still running after it was asked to stop" (PR #345
+  review). `LEADER_STOP_NS` sits inside `service-mgr`'s 10 s the same way. **No dialog
   there**: the person started it from a terminal, the machine is going down, and a question the
   shell could not wait for would be a lie. A modified buffer in the editor is lost then, as it is
   today.
@@ -2373,26 +2389,31 @@ and the session would end with the editor's process left to notice (*Left alone*
 
 - [ ] **F.1 — one vocabulary for namespaces.**
       - `NamespaceSpec` gains `/dev/draw/new` and `/dev/desktop`, and makes optional what an
-        application does not get: `/applications`, the console and the disks.
+        application does not get: `/applications` and the console.
       - `desktop-shell` builds each application's namespace with `libsession::build_namespace`,
-        and `build_app_namespace` goes.
+        and `build_app_namespace` goes. **The session's disks still reach an application**:
+        `bind_blk`, rebinding from the session's namespace, in place of `launch`'s own rebind.
       - An application gains `/session/user`.
       - Gates:
         - **every existing gate**, since an application sees what it saw;
         - booted first: `whoami` in a desktop terminal, failing before and answering after;
-        - `check-terminal` types `whoami` into `nxterm`, and the name comes back.
+        - **`verify_app_namespace` checks `/session/user` too**, and its line — which
+          `check-login` already asserts, "grants new + /home + /dev/devices + /storage, withholds
+          manage" — names it. **Not `check-terminal`** (PR #345 review): its `nxterm` is a
+          test-image service in `service-mgr`'s namespace, in no session, and `whoami` there fails
+          by design.
 - [ ] **F.2 — the power menu, and Log out.**
       - `IconKind::Power`, host-tested by painting and counting ink, as a present-but-invisible
         widget would otherwise pass.
       - The top bar's right-hand button, and `menu_anchor` hanging a menu from either edge.
       - The menu: **Log out**, and Restart and Shut down **absent until F.3** — a row that does
         nothing is worse than none, the refresh's rule.
-      - **Closing a session's windows**: `RequestClose` to each; the waiting dialog after half a
-        second, naming what is left; Cancel and End anyway. The state is `desktop-shell`'s
-        library, host-tested: a window closing, one declining, the last one going, Cancel, End
-        anyway.
-      - **A terminate request asks every window too**, and exits once they are gone or at the
-        leader's bound.
+      - **Closing a session's windows**: `RequestClose` to each normal window, never a dialog; the
+        waiting dialog after half a second, naming what is left; Cancel and End anyway. The state is
+        `desktop-shell`'s library, host-tested: a window closing, one declining, the last one going,
+        Cancel, End anyway.
+      - **A terminate request asks the windows too**, and exits once they are gone or after 3 s,
+        inside the leader's 5 s.
       - `nxedit`'s stale comment on `CloseRequested`.
       - Gates: host tests, and **`cargo xtask check-logout`**, in CI's QEMU job, on the release
         image:
@@ -2408,7 +2429,7 @@ and the session would end with the editor's process left to notice (*Left alone*
       - The two rows, each through the broker's `power` view after the windows are closed; a
         refusal shown in a dialog, and a request for a password refused naming the graphical
         prompt.
-      - Gates: `check-logout` goes on, in the same boot:
+      - Gates: `check-logout` goes on, in the same QEMU run:
         7. log in, open the editor, type a line, **Restart**, and **End anyway**: a second boot, and
            its greeter;
         8. log in, **Shut down**: "It is now safe to turn off your computer." read off the screen
@@ -2430,6 +2451,11 @@ and the session would end with the editor's process left to notice (*Left alone*
       - `desktop-refresh.md`, which records `End session` as deferred for want of a logout path:
         built, as the power menu.
       - The root `CLAUDE.md`: `check-logout`.
+      - **Every current-behaviour doc F makes false** (PR #345 review):
+        `namespace-and-resource-servers.md` and `graphical-session.md` name
+        `build_app_namespace`, which F.1 deletes; `userspace/CLAUDE.md`'s layering names each
+        shared library, and F.3 moves the Views client into one; `qemu-integration-tests.md`
+        lists the screen gates, and `check-logout` joins them.
 
 **F.1 first**, since F.2 and F.3 are in `desktop-shell` too and the rebuild is easier on code that
 has not moved. **F.2 before F.3.** F.4 can go anywhere.
@@ -2470,7 +2496,7 @@ has not moved. **F.2 before F.3.** F.4 can go anywhere.
 | C | **`check-storage`**, in CI, on **`check-install`'s topology**: a test live image, whose root is a RAM disk, with a SATA disk attached — the second disk QEMU *can* supply. Auto-mounted (read-only, being a live boot), remounted writable, written through a mapping *without* a sync by a test program, unmounted — then `e2fsck`, the superblock's state and the file's **contents** checked on the host. A RAM disk cannot be checked there: the guest's writes never reach a host file. Plus `boot-probe`'s cache, flush and storage checks, and `/storage` in `test-interactive` and `check-login` |
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, `check-recovery`, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **every existing gate** unchanged, for `service-mgr` starting what `init` did; **`check-shutdown`**, in CI: write through a mapping without syncing, run `with power shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot, with the clock set before it read back after; `check-images` comparing the roots; `service`, `date --set` and `log` in `test-interactive` |
-| F | **every existing gate**, for `desktop-shell` building applications' namespaces through `libsession`; `whoami` answering in `check-terminal`; **`check-logout`**, in CI: from the desktop, a logout that waits for the editor's question, one cancelled, a restart that ends a window anyway, and a shutdown whose message is read off the screen |
+| F | **every existing gate**, for `desktop-shell` building applications' namespaces through `libsession`; `check-login` asserting an application's namespace grants `/session/user`; **`check-logout`**, in CI: from the desktop, a logout that waits for the editor's question, one cancelled, a restart that ends a window anyway, and a shutdown whose message is read off the screen |
 | G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |
 
 ## Deferred from this phase
