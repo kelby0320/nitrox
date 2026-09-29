@@ -1,17 +1,18 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-28,
-when `service-mgr` began starting and binding `auth-service` — administration Part E.1a; before that
-2026-09-25, when `account` arrived — administration Part D.4; earlier that day, when the view broker
-began fronting account operations — Part D.3; earlier that day, when it opened an admin session of
-its own to judge a policy — Part D.2; earlier that day, when `auth-service` became the user
-database's writer — administration Part D.1; earlier that day, when each session gained `/storage`
-and `/dev/storage`, the storage service's session endpoint at the bases `/fs` and `/info` —
-administration Part C.6; before that 2026-09-24, when each session gained `/dev/devices`, the device
-manager's tables at the base `/info` — Part B.4; before that 2026-09-23, when each session gained a
-view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** — the
-binding this document described before 2026-08-21, found then to have never existed and removed, now
-exists. The paragraph under "Credential validation" is the current shape; the history is kept
+when each session gained `/dev/services`, `service-mgr`'s table of services — administration Part
+E.2b; earlier that day, when `service-mgr` began starting and binding `auth-service` — Part E.1a;
+before that 2026-09-25, when `account` arrived — administration Part D.4; earlier that day, when the
+view broker began fronting account operations — Part D.3; earlier that day, when it opened an admin
+session of its own to judge a policy — Part D.2; earlier that day, when `auth-service` became the
+user database's writer — administration Part D.1; earlier that day, when each session gained
+`/storage` and `/dev/storage`, the storage service's session endpoint at the bases `/fs` and `/info`
+— administration Part C.6; before that 2026-09-24, when each session gained `/dev/devices`, the
+device manager's tables at the base `/info` — Part B.4; before that 2026-09-23, when each session
+gained a view-broker session and `/dev/views` — Part A.4). **`/svc/auth` is real as of M7 Part C** —
+the binding this document described before 2026-08-21, found then to have never existed and removed,
+now exists. The paragraph under "Credential validation" is the current shape; the history is kept
 because a doc that quietly starts being right again teaches nobody why it was wrong. The full path —
 login → authenticate → per-user namespace → sandboxed user shell → home write — runs end to end.
 Living document; describes the architecture, with the build sequence in the [implementation
@@ -214,6 +215,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/dev/devices` | an **info-only** endpoint of the device manager's, scoped to `/info` | the machine's devices as typed tables, and nothing to take one with — see below |
 | `/storage` | the storage service's **session** endpoint, scoped to `/fs` | every mounted filesystem, `/storage/<label>/…`, and nothing to mount with — see below |
 | `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds |
+| `/dev/services` | `service-mgr`'s **session** endpoint for its services | the table of services, `all.tsm`, and nothing to start or stop one with — [`rsproto-services-ops.md`](../spec/rsproto-services-ops.md) |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by

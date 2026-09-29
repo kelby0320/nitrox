@@ -198,9 +198,10 @@ sibling lives on the shell's backend, so the rules for a shared backend decide e
 - `Ctrl-C` reaches both, so the shell can stop the pipeline and a prompt the stage holds ends;
 - each terminal has its own echo setting.
 
-A sibling is freed when its stage exits, like any terminal, and `test-interactive` compares the
-open count across two identical commands to prove it. There are only fifteen, and a stage the
-server cannot give one runs without it.
+A sibling is freed when its stage exits, like any terminal, and `test-interactive` compares the open
+count across two identical commands to prove it. There are only fourteen (fifteen until
+administration Part E.2 gave the control channel a wait slot), and a stage the server cannot give
+one runs without it.
 
 **One consequence for the shell.** Asking for a sibling is a tty exchange, and a `Ctrl-C` that
 lands during it is taken by the exchange and recorded rather than left queued. So after spawning

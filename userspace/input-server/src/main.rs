@@ -38,7 +38,8 @@
 
 use input_server::devices::{Arrival, Notice, Table, notice};
 use input_server::{BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, merge};
-use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
+use libkern::abi::{CTRL_OP_SHUTDOWN, INPUT_EVENT_LEN, InputEvent};
+use libkern::control::Control;
 use libkern::debug::Line;
 use libkern::device::DeviceKind;
 use libkern::error::KError;
@@ -486,6 +487,9 @@ struct Server {
     channels: [u64; MAX_CONSUMERS],
     /// What each consumer is owed, parallel to `channels`.
     consumers: [Consumer; MAX_CONSUMERS],
+    /// The control channel, for `service --stop` (administration Part E.2); `0` once its
+    /// supervisor has gone, when it would stay signalled for good.
+    control: u64,
 }
 
 /// Mint a consumer channel and answer the resolve with it.
@@ -784,10 +788,14 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
         }
 
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // 1 + 1 + MAX_DEVICES + MAX_CONSUMERS, inside it.
+        // 1 + 1 + 1 + MAX_DEVICES + MAX_CONSUMERS, inside it.
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            if srv.control != 0 {
+                WAIT_HANDLES[n] = srv.control;
+                n += 1;
+            }
             if srv.subscription != 0 {
                 WAIT_HANDLES[n] = srv.subscription;
                 n += 1;
@@ -861,6 +869,15 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             };
             if h == serve_end {
                 forward_pending = true;
+            } else if srv.control != 0 && h == srv.control {
+                match libkern::control::recv(srv.control) {
+                    Control::Op(CTRL_OP_SHUTDOWN) => {
+                        kprint(b"input-server: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    Control::Closed => srv.control = 0,
+                    _ => {}
+                }
             } else if srv.subscription != 0 && h == srv.subscription {
                 notices_pending = true;
             } else if let Some(slot) = srv.devices.iter().position(|d| d.as_ref().is_some_and(|d| d.po == h)) {
@@ -951,6 +968,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         subscription: 0,
         channels: [0; MAX_CONSUMERS],
         consumers: [Consumer::new(); MAX_CONSUMERS],
+        control: ctrl,
     };
     // **Devices come from the manager, and there is no fallback to the raw paths**
     // (administration Part B): a second path that runs only when the first is broken is a path

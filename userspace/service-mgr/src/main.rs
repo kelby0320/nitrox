@@ -34,6 +34,7 @@ use libkern::debug::Line;
 use libkern::*;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::registry;
+use service_mgr::services;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 
 /// The freeing userspace heap (slice 4), backing `alloc` for the declaration parser.
@@ -242,14 +243,15 @@ fn now_ns() -> u64 {
 /// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
 fn create_control_channel() -> Option<(u64, u64)> {
     // **Depth 10, and the number bounds the send count rather than being a round one.** The
-    // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring
-    // shorter than the number of them does not block — it **drops the last handle silently**.
-    // This was 4 while the graphical column sent four; M12 Part E's clipboard made it five, and
-    // the symptom was a session whose namespace had no `/dev/clipboard` and a copy that failed
-    // two processes away, with the send reporting success. **Eight since administration Part
-    // E.1b** go to `desktop-session-mgr`, the storage service's route the eighth, so it is ten
-    // deep for two spare. `libsession::spawn_leader` carries the same warning from the same
-    // failure in M7 Part F — which is what named this one on sight.
+    // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring shorter
+    // than the number of them does not block — it **drops the last handle silently**. This was 4
+    // while the graphical column sent four; M12 Part E's clipboard made it five, and the symptom
+    // was a session whose namespace had no `/dev/clipboard` and a copy that failed two processes
+    // away, with the send reporting success. **Nine since administration Part E.2b** go to
+    // `desktop-session-mgr` — the storage service's route the eighth since E.1b, and
+    // `service-mgr`'s own services endpoint the ninth — so it is ten deep for one spare.
+    // `libsession::spawn_leader` carries the same warning from the same failure in M7 Part F —
+    // which is what named this one on sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0)
@@ -622,13 +624,26 @@ struct ChainEndpoints {
     views: u64,
     devices: u64,
     storage: u64,
+    /// `service-mgr`'s own session endpoint for `/svc/services` (administration Part E.2b): the
+    /// table of services, and nothing that starts or stops one.
+    services: u64,
 }
 
 impl ChainEndpoints {
     /// Every handle, in the order `desktop-session-mgr` receives them; `session-mgr` receives the
     /// same with no `draw`.
-    fn all(&self) -> [u64; 8] {
-        [self.fs, self.profile, self.tty, self.draw, self.clip, self.views, self.devices, self.storage]
+    fn all(&self) -> [u64; 9] {
+        [
+            self.fs,
+            self.profile,
+            self.tty,
+            self.draw,
+            self.clip,
+            self.views,
+            self.devices,
+            self.storage,
+            self.services,
+        ]
     }
 
     /// A second set of everything but `draw`, which only one column takes. `TRANSFER |
@@ -645,6 +660,7 @@ impl ChainEndpoints {
                 views: dup_endpoint(self.views),
                 devices: dup_endpoint(self.devices),
                 storage: dup_endpoint(self.storage),
+                services: dup_endpoint(self.services),
             }
         }
     }
@@ -692,9 +708,10 @@ fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
     // its home over IPC to the profile server. The fs server's, the profile server's, then the
     // routes to the terminal server, the clipboard (M12 Part E), the view broker (administration
     // Part A.4), the device manager's info-only endpoint (Part B.4) and the storage service's
-    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b).
+    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b), then this
+    // manager's own session endpoint for `/svc/services` (Part E.2b).
     let s = &serial;
-    for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage] {
+    for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage, s.services] {
         send_handle(sess_ctrl, h);
     }
     // **Kept, not closed** (administration Part E.1): shutdown asks the supervisors to end their
@@ -728,7 +745,7 @@ fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
         set.close();
         return false;
     }
-    // The serial column's order with the compositor's fourth — eight of the control channel's
+    // The serial column's order with the compositor's fourth — nine of the control channel's
     // ten, see `create_control_channel`.
     for h in set.all() {
         send_handle(ctrl, h);
@@ -801,6 +818,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
             endpoint: 0,
             root_bound: false,
             restart_at: None,
+            exited: None,
+            restarts: 0,
         })
         .collect();
     let mut m = Mgr {
@@ -809,6 +828,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         root_bind,
         registry,
         routes: alloc::vec::Vec::new(),
+        services: Services::default(),
+        held: alloc::vec::Vec::new(),
         terminal,
         fs_endpoint,
         profile_endpoint,
@@ -828,6 +849,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         Line::new().s(b"service-mgr: ").s(why.as_bytes()).s(b" -- starting nothing").end();
         m.ask_for_the_emergency_shell();
     }
+    m.open_services();
     m.run()
 }
 
@@ -920,6 +942,13 @@ fn reply_subnamespace(ch: u64, request_id: u64, ns: u64, consumed: usize, base: 
 /// One message on this manager's own endpoint: `(op, request_id, body)`. Handles that came with it
 /// are closed: a resolve carries none. `None` when nothing is queued.
 fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
+    recv_request(ch).ok().flatten()
+}
+
+/// [`recv_serve`], telling **a peer that has gone** apart: `Err(())`. A caller serving a channel
+/// someone else can close must act on it — a closed channel stays signalled, and waited on again it
+/// would spin the loop. A route's cannot close: this manager holds its other end.
+fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> {
     loop {
         // SAFETY: valid recv out-params.
         let rr = unsafe {
@@ -931,8 +960,11 @@ fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
                 (&raw mut SRV_COUNT) as u64,
             )
         };
+        if rr == KError::PeerClosed.as_i32() as i64 {
+            return Err(());
+        }
         if rr != 0 {
-            return None;
+            return Ok(None);
         }
         // SAFETY: the kernel wrote the count and the handles it installed.
         let count = unsafe { (&raw const SRV_COUNT).read() }.min(8);
@@ -946,8 +978,82 @@ fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
             core::slice::from_raw_parts(((&raw const SRV_MSG) as *const u8).add(24), len.min(4096 - 24))
         };
         if let Ok(m) = librsproto::decode(msg) {
-            return Some((m.op, m.request_id, m.body.to_vec()));
+            return Ok(Some((m.op, m.request_id, m.body.to_vec())));
         }
+    }
+}
+
+/// Refuse request `op` on `ch`, saying `why`. **`0` answers no one**: a held request whose session
+/// closed keeps going without one ([`Held::session`]).
+fn refuse(ch: u64, op: u16, request_id: u64, err: KError, why: &[u8]) {
+    if ch == 0 {
+        return;
+    }
+    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 160];
+    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
+    let flags = librsproto::RS_FLAG_REPLY | librsproto::RS_FLAG_ERROR;
+    let _ = send_rs(ch, op, request_id, flags, &body[..n], &[]);
+}
+
+/// Answer request `op` on `ch` with an empty body; `0` answers no one, as for [`refuse`].
+fn reply_ok(ch: u64, op: u16, request_id: u64) {
+    if ch == 0 {
+        return;
+    }
+    let _ = send_rs(ch, op, request_id, librsproto::RS_FLAG_REPLY, &[], &[]);
+}
+
+/// Answer a resolve with a channel, moving `client_end`; closed if it would not send.
+fn reply_channel(ch: u64, request_id: u64, client_end: u64) -> bool {
+    use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, resolve_reply};
+    let mut body = [0u8; RESOLVE_REPLY_LEN];
+    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
+    let (op, flags) = (librsproto::OP_NS_RESOLVE, librsproto::RS_FLAG_REPLY);
+    let sent = send_rs(ch, op, request_id, flags, &body, &[client_end]);
+    if !sent {
+        close(client_end);
+        reply_error(ch, librsproto::OP_NS_RESOLVE, request_id, KError::KernelError);
+    }
+    sent
+}
+
+/// Answer a resolve with `bytes`, as a fresh read-only memory object: a table.
+fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
+    use librsproto::namespace::{OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, resolve_reply};
+    let resolve = librsproto::OP_NS_RESOLVE;
+    // SAFETY: a plain anonymous object of `bytes.len()`.
+    let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
+    if obj <= 0 {
+        return reply_error(ch, resolve, request_id, KError::OutOfMemory);
+    }
+    let obj = obj as u64;
+    // SAFETY: mapping an object this process just created, to fill it.
+    let rw = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, bytes.len() as u64, rw) };
+    if addr <= 0 {
+        close(obj);
+        return reply_error(ch, resolve, request_id, KError::OutOfMemory);
+    }
+    // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    // Unmapped before the reply, as the device manager does: the mapping holds its own reference,
+    // so left behind it would pin every table ever served.
+    // SAFETY: unmapping a range this process mapped moments ago and never reads again.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
+    // SAFETY: narrowing a handle this process holds to what a reader needs — mapping it, and
+    // `INSPECT` for its size, which `libfs::read_file` asks for — and what moving it needs. A
+    // resolve asking for a right the answer lacks is refused, which is how `INSPECT` was found.
+    let rights = RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER;
+    let ro = unsafe { syscall2(SYS_HANDLE_DUPLICATE, obj, rights) };
+    close(obj);
+    if ro <= 0 {
+        return reply_error(ch, resolve, request_id, KError::KernelError);
+    }
+    let mut body = [0u8; RESOLVE_REPLY_LEN];
+    let _ = resolve_reply(&mut body, OBJECT_KIND_MEMOBJ, bytes.len() as u32);
+    if !send_rs(ch, resolve, request_id, librsproto::RS_FLAG_REPLY, &body, &[ro as u64]) {
+        close(ro as u64);
+        reply_error(ch, resolve, request_id, KError::KernelError);
     }
 }
 
@@ -1051,6 +1157,49 @@ struct Route {
     live: bool,
 }
 
+/// **An admin request waiting for what it asked** (administration Part E.2): a stop for the
+/// service's exit, a start for it to come up. Answered then — never by a wait here, since every
+/// resolve on a server's path waits on this process.
+struct Held {
+    /// The admin session to answer on, or `0` once it has closed: **what was asked goes on**, a
+    /// restart's start included, and only the answer is lost (PR #341 review, finding 1). The
+    /// handle is not kept, since it may be reused, and an answer must not reach whatever it names
+    /// next.
+    session: u64,
+    request_id: u64,
+    op: u16,
+    /// The service, as an index into `Mgr::svcs`.
+    svc: usize,
+    awaits: Awaits,
+}
+
+/// What a [`Held`] request waits for.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Awaits {
+    /// The service's exit, by `until`; then a start too, for a restart.
+    Exit { then_start: bool, until: u64 },
+    /// The service to come up: a server's `Meta::Ready`, bounded by its own deadline.
+    Up,
+}
+
+/// How long a stopped service has to exit before its stop is answered "asked, and still
+/// running". There is no forcible kill; a stop is a request.
+const STOP_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// **What serves `/svc/services`** (administration Part E.2): its own endpoint, bound there in the
+/// root; the admin endpoints minted from it, and the admin sessions opened on those.
+#[derive(Default)]
+struct Services {
+    /// The end this manager answers `/svc/services` on.
+    serve: u64,
+    /// **The session endpoint** (Part E.2b), and the end it is answered on: the table and nothing
+    /// else. Every login binds a duplicate at `/dev/services`.
+    session_client: u64,
+    session_serve: u64,
+    admin_ends: alloc::vec::Vec<u64>,
+    admin_sessions: alloc::vec::Vec<u64>,
+}
+
 /// One supervised service: its declaration, its child, and the state the restart
 /// policy needs across exits.
 struct Supervised {
@@ -1077,6 +1226,11 @@ struct Supervised {
     /// When a restart is due, its backoff over. **A deadline, never a sleep**: every resolve on a
     /// server's path waits on this process.
     restart_at: Option<u64>,
+    /// How it last exited: `None` if it never has, `Some(None)` if its code never came.
+    exited: Option<Option<i32>>,
+    /// Restarts over the boot, by its policy or asked for — the table's `restarts`, which a
+    /// start asked for does not reset as it resets `attempts`.
+    restarts: u32,
 }
 
 /// **The service manager's state, and its one loop** (administration Part E.1).
@@ -1102,6 +1256,10 @@ struct Mgr {
     /// This manager's own endpoints, one per server path and derived endpoint, made as each is
     /// first needed and kept for the boot.
     routes: alloc::vec::Vec<Route>,
+    /// `/svc/services`: the list, and starting and stopping on an admin session.
+    services: Services,
+    /// Admin requests waiting for what they asked.
+    held: alloc::vec::Vec<Held>,
     terminal: u64,
     /// The login chain's endpoints from `init`, until the chain takes them.
     fs_endpoint: u64,
@@ -1142,6 +1300,11 @@ impl Mgr {
                 for r in &self.routes {
                     push(r.serve);
                 }
+                push(self.services.serve);
+                push(self.services.session_serve);
+                for &h in self.services.admin_ends.iter().chain(&self.services.admin_sessions) {
+                    push(h);
+                }
                 for s in &self.svcs {
                     if s.running && matches!(s.phase, Phase::Starting { .. }) {
                         push(s.ctrl);
@@ -1161,6 +1324,7 @@ impl Mgr {
             };
             // **Level-triggered, so everything is looked at**, whichever handle woke the wait.
             self.serve_resolves();
+            self.serve_services();
             let mut codes = alloc::vec::Vec::new();
             drain_codes(self.notif, &mut codes);
             self.poll(&mut codes);
@@ -1178,6 +1342,11 @@ impl Mgr {
         // **Not an `after` once halted**: nothing more starts, so nothing clears it, and a deadline
         // left in the past would spin this loop (PR #340 review, finding 3).
         let mut d = if self.halted { u64::MAX } else { self.after_until.unwrap_or(u64::MAX) };
+        for h in &self.held {
+            if let Awaits::Exit { until, .. } = h.awaits {
+                d = d.min(until);
+            }
+        }
         for s in &self.svcs {
             if let Phase::Starting { deadline } = s.phase {
                 d = d.min(deadline);
@@ -1301,7 +1470,7 @@ impl Mgr {
     }
 
     /// Spawn declaration `i`. A server becomes `Starting`, and bring-up waits for its `Ready`.
-    fn start(&mut self, i: usize, bringup: bool) {
+    fn start(&mut self, i: usize, bringup: bool) -> bool {
         let server = self.svcs[i].decl.endpoint.is_some();
         let (h, ctrl) = spawn_service(self.root_ns, self.registry, &self.svcs[i].decl);
         let s = &mut self.svcs[i];
@@ -1326,20 +1495,15 @@ impl Mgr {
                     .s(b"' has no control channel -- its exit cannot be attributed")
                     .end();
             }
-        } else if bringup && server {
-            // The spawn already said why. A server that is not running did not come up.
-            self.awaiting = Some(i);
-            self.failed_to_start(i);
-        } else if !bringup {
-            // **A restart that could not spawn is a restart that failed**, and its policy decides
-            // what next — never the bring-up rule, which would ask for the emergency shell with
-            // the terminal server holding the console (PR #340 review, finding 3).
-            Line::new()
-                .s(b"service-mgr: '")
-                .s(self.svcs[i].decl.name.as_bytes())
-                .s(b"' could not be restarted")
-                .end();
-            self.apply_policy(i, Some(-1), Phase::Down);
+            true
+        } else {
+            if bringup && server {
+                // The spawn already said why. A server that is not running did not come up.
+                self.awaiting = Some(i);
+                self.failed_to_start(i);
+            }
+            // Otherwise the caller's: a restart's policy, or an administrator's answer.
+            false
         }
     }
 
@@ -1512,6 +1676,7 @@ impl Mgr {
         if self.awaiting == Some(i) {
             self.awaiting = None;
         }
+        self.settle_up(i, true);
     }
 
     /// Ask server `i` for the endpoint it mints for sessions by a resolve of `through`, and bind
@@ -1599,6 +1764,7 @@ impl Mgr {
     /// the emergency shell; any other is reported and passed.
     fn failed_to_start(&mut self, i: usize) {
         self.svcs[i].phase = Phase::Down;
+        self.settle_up(i, false);
         if self.awaiting != Some(i) {
             return;
         }
@@ -1637,6 +1803,7 @@ impl Mgr {
             s.ctrl = 0;
             s.running = false;
             s.phase = Phase::Down;
+            s.exited = Some(code);
             let mut l = Line::new();
             l.s(b"service-mgr: '").s(s.decl.name.as_bytes()).s(b"' exited");
             match code {
@@ -1661,6 +1828,7 @@ impl Mgr {
             }
         }
         self.apply_policy(i, code, was);
+        self.settle_exit(i);
     }
 
     /// Apply service `i`'s restart policy to an exit with `code` — or to a restart that could not
@@ -1721,6 +1889,24 @@ impl Mgr {
     /// Whatever is due: a restart whose backoff is over, and a server whose `Ready` is late.
     fn due(&mut self) {
         let now = now_ns();
+        // **A stop not honoured within its bound** is answered so, and stays asked: an exit after
+        // it is still a stop that was requested, and is not restarted.
+        let mut k = 0;
+        while k < self.held.len() {
+            match self.held[k].awaits {
+                Awaits::Exit { until, .. } if until <= now => {
+                    let h = self.held.remove(k);
+                    Line::new()
+                        .s(b"service-mgr: '")
+                        .s(self.svcs[h.svc].decl.name.as_bytes())
+                        .s(b"' was asked to stop, and is still running")
+                        .end();
+                    let why = b"it was asked to stop, and is still running";
+                    refuse(h.session, h.op, h.request_id, KError::TimedOut, why);
+                }
+                _ => k += 1,
+            }
+        }
         for i in 0..self.svcs.len() {
             if self.svcs[i].restart_at.is_some_and(|at| at <= now) {
                 self.svcs[i].restart_at = None;
@@ -1728,7 +1914,25 @@ impl Mgr {
                 // A restart is bring-up's only when it is of the server bring-up is waiting on —
                 // one that died starting, and replaces the attempt that did.
                 let bringup = self.awaiting == Some(i);
-                self.start(i, bringup);
+                self.svcs[i].restarts += 1;
+                if !self.start(i, bringup) && !bringup {
+                    // **A restart that could not spawn is a restart that failed**, and its policy
+                    // decides what next — never the bring-up rule, which would ask for the
+                    // emergency shell with the terminal server holding the console (PR #340
+                    // review, finding 3).
+                    Line::new()
+                        .s(b"service-mgr: '")
+                        .s(self.svcs[i].decl.name.as_bytes())
+                        .s(b"' could not be restarted")
+                        .end();
+                    self.apply_policy(i, Some(-1), Phase::Down);
+                    // **A start that waited for this one is answered** once its policy has
+                    // nothing more to try (PR #341 review, finding 5); otherwise it waits for the
+                    // next attempt.
+                    if self.svcs[i].restart_at.is_none() {
+                        self.settle_up(i, false);
+                    }
+                }
             }
             if let Phase::Starting { deadline } = self.svcs[i].phase
                 && deadline <= now
@@ -1745,6 +1949,273 @@ impl Mgr {
         }
     }
 
+    /// **Serve `/svc/services`** (administration Part E.2): an endpoint of this manager's own, bound
+    /// there in the root. It answers the table, and mints admin endpoints.
+    fn open_services(&mut self) {
+        let Some((client, serve)) = make_channel(SERVE_DEPTH) else {
+            kprint(b"service-mgr: /svc/services channel create FAIL\n");
+            return;
+        };
+        if self.root_bind == 0 || bind(self.root_bind, b"/svc/services", client, None) != 0 {
+            kprint(b"service-mgr: bind FAIL at /svc/services\n");
+            close(client);
+            close(serve);
+            return;
+        }
+        // The binding holds its own reference; this end is not needed again.
+        close(client);
+        self.services.serve = serve;
+        kprint(b"service-mgr: serving /svc/services\n");
+        // The session endpoint: made once, answered on its own end, so its holder is told apart —
+        // a session reaches the table and never an admin endpoint.
+        match make_channel(SERVE_DEPTH) {
+            Some((client, serve)) => {
+                self.services.session_client = client;
+                self.services.session_serve = serve;
+            }
+            None => {
+                kprint(b"service-mgr: services session endpoint create FAIL -- no /dev/services\n")
+            }
+        }
+    }
+
+    /// The table: a row per declaration, in file order.
+    fn table(&self) -> alloc::vec::Vec<u8> {
+        let rows: alloc::vec::Vec<(&str, services::State, u32)> = self
+            .svcs
+            .iter()
+            .map(|s| {
+                let starting = matches!(s.phase, Phase::Starting { .. });
+                let usable = s.phase == Phase::Up;
+                let state = services::state(s.running, starting, usable, s.requested_shutdown, s.exited);
+                (s.decl.name.as_str(), state, s.restarts)
+            })
+            .collect();
+        services::table(&rows)
+    }
+
+    /// Answer everything queued on `/svc/services`, its admin endpoints and their sessions.
+    fn serve_services(&mut self) {
+        let root = self.services.serve;
+        while root != 0 {
+            match recv_request(root) {
+                Ok(Some((op, request_id, body))) => {
+                    self.answer_resolve(root, op, request_id, &body, false)
+                }
+                Ok(None) => break,
+                Err(()) => {
+                    close(root);
+                    self.services.serve = 0;
+                    break;
+                }
+            }
+        }
+        // A session endpoint's holders are the logins and what they spawn; this manager holds its
+        // other end, so it cannot close.
+        let session = self.services.session_serve;
+        while session != 0 {
+            match recv_request(session) {
+                Ok(Some((op, request_id, body))) => {
+                    self.answer_resolve(session, op, request_id, &body, true)
+                }
+                _ => break,
+            }
+        }
+        let mut k = 0;
+        while k < self.services.admin_ends.len() {
+            let end = self.services.admin_ends[k];
+            match recv_request(end) {
+                Ok(Some((op, request_id, _))) => self.open_admin_session(end, op, request_id),
+                Ok(None) => k += 1,
+                // Its holder has gone: the broker, or a view with the grant, and every view made
+                // from it.
+                Err(()) => {
+                    close(end);
+                    self.services.admin_ends.remove(k);
+                }
+            }
+        }
+        let mut k = 0;
+        while k < self.services.admin_sessions.len() {
+            let session = self.services.admin_sessions[k];
+            match recv_request(session) {
+                Ok(Some((op, request_id, body))) => self.admin_request(session, op, request_id, &body),
+                Ok(None) => k += 1,
+                Err(()) => {
+                    close(session);
+                    self.services.admin_sessions.remove(k);
+                    // **What it asked goes on, unanswered.** Dropping the request instead would
+                    // drop a restart's start with its answer, and leave the service stopped.
+                    for h in self.held.iter_mut().filter(|h| h.session == session) {
+                        h.session = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A resolve on `/svc/services` (`session` = `false`) or a session endpoint: the table, or on
+    /// the first only, a new admin endpoint.
+    fn answer_resolve(&mut self, from: u64, op: u16, request_id: u64, body: &[u8], session: bool) {
+        let resolve = librsproto::OP_NS_RESOLVE;
+        if op != resolve {
+            return reply_error(from, op, request_id, KError::Unsupported);
+        }
+        let Some(r) = librsproto::namespace::parse_resolve_request(body) else {
+            return reply_error(from, resolve, request_id, KError::InvalidArgument);
+        };
+        match services::asked(r.suffix, session) {
+            services::Asked::Table => reply_table(from, request_id, &self.table()),
+            services::Asked::AdminEndpoint => {
+                if self.services.admin_ends.len() >= services::MAX_ADMIN_ENDPOINTS {
+                    return reply_error(from, resolve, request_id, KError::WouldBlock);
+                }
+                let Some((client, ours)) = make_channel(4) else {
+                    return reply_error(from, resolve, request_id, KError::KernelError);
+                };
+                if reply_channel(from, request_id, client) {
+                    self.services.admin_ends.push(ours);
+                    kprint(b"service-mgr: an admin endpoint minted\n");
+                } else {
+                    close(ours);
+                }
+            }
+            services::Asked::Unknown => reply_error(from, resolve, request_id, KError::NotFound),
+        }
+    }
+
+    /// A resolve on an admin endpoint: whatever its suffix, an admin session.
+    fn open_admin_session(&mut self, end: u64, op: u16, request_id: u64) {
+        let resolve = librsproto::OP_NS_RESOLVE;
+        if op != resolve {
+            return reply_error(end, op, request_id, KError::Unsupported);
+        }
+        if self.services.admin_sessions.len() >= services::MAX_ADMIN_SESSIONS {
+            return reply_error(end, resolve, request_id, KError::WouldBlock);
+        }
+        let Some((client, ours)) = make_channel(4) else {
+            return reply_error(end, resolve, request_id, KError::KernelError);
+        };
+        if reply_channel(end, request_id, client) {
+            self.services.admin_sessions.push(ours);
+        } else {
+            close(ours);
+        }
+    }
+
+    /// `Start`, `Stop` or `Restart`, on admin session `session`: refused now, or answered once it
+    /// has happened.
+    fn admin_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
+        let named = |n: &str| self.svcs.iter().position(|s| s.decl.name == n);
+        let found = core::str::from_utf8(body).ok().and_then(named);
+        let facts = found.map(|i| {
+            let s = &self.svcs[i];
+            let restart_due = s.restart_at.is_some();
+            services::Found { essential: s.decl.essential, running: s.running, restart_due }
+        });
+        let action = match services::decide(op, facts) {
+            Ok(a) => a,
+            Err((err, why)) => return refuse(session, op, request_id, err, why.as_bytes()),
+        };
+        // `decide` has refused a name no service has, so this only returns if that changes.
+        let Some(i) = found else { return };
+        if self.held.iter().any(|h| h.svc == i) {
+            let why = b"it is being started or stopped already";
+            return refuse(session, op, request_id, KError::WouldBlock, why);
+        }
+        let name = self.svcs[i].decl.name.clone();
+        match action {
+            services::Action::CancelRestart => {
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(name.as_bytes())
+                    .s(b"' will not be restarted, as asked")
+                    .end();
+                let s = &mut self.svcs[i];
+                s.restart_at = None;
+                s.requested_shutdown = true;
+                reply_ok(session, op, request_id);
+            }
+            services::Action::Start => {
+                Line::new().s(b"service-mgr: starting '").s(name.as_bytes()).s(b"', as asked").end();
+                self.start_asked(i, Held { session, request_id, op, svc: i, awaits: Awaits::Up });
+            }
+            services::Action::Stop | services::Action::StopThenStart => {
+                let then_start = action == services::Action::StopThenStart;
+                let ctrl = self.svcs[i].ctrl;
+                if ctrl == 0 {
+                    let why = b"it has no control channel to ask on";
+                    return refuse(session, op, request_id, KError::Unsupported, why);
+                }
+                Line::new()
+                    .s(b"service-mgr: asking '")
+                    .s(name.as_bytes())
+                    .s(if then_start { b"' to stop, to start it again" } else { b"' to stop" })
+                    .end();
+                send_control(ctrl, CTRL_OP_SHUTDOWN);
+                let s = &mut self.svcs[i];
+                s.requested_shutdown = true;
+                s.restart_at = None;
+                let until = now_ns().saturating_add(STOP_TIMEOUT_NS);
+                let awaits = Awaits::Exit { then_start, until };
+                self.held.push(Held { session, request_id, op, svc: i, awaits });
+            }
+        }
+    }
+
+    /// Start service `i` because it was asked, and answer `held` when it is up — at once, for one
+    /// that is not a server — or say why not. A start asked for starts afresh: no stop stands, and
+    /// its restart attempts begin again.
+    fn start_asked(&mut self, i: usize, held: Held) {
+        let s = &mut self.svcs[i];
+        s.requested_shutdown = false;
+        s.attempts = 0;
+        s.restart_at = None;
+        if !self.start(i, false) {
+            let why = b"it could not be spawned";
+            return refuse(held.session, held.op, held.request_id, KError::KernelError, why);
+        }
+        if matches!(self.svcs[i].phase, Phase::Starting { .. }) {
+            self.held.push(held);
+        } else {
+            reply_ok(held.session, held.op, held.request_id);
+        }
+    }
+
+    /// Service `i` has exited: answer a stop that waited for it, or start it again for a restart.
+    fn settle_exit(&mut self, i: usize) {
+        let waits_exit = |h: &Held| h.svc == i && matches!(h.awaits, Awaits::Exit { .. });
+        let Some(k) = self.held.iter().position(waits_exit) else {
+            return;
+        };
+        let h = self.held.remove(k);
+        match h.awaits {
+            Awaits::Exit { then_start: true, .. } => {
+                self.svcs[i].restarts += 1;
+                Line::new()
+                    .s(b"service-mgr: starting '")
+                    .s(self.svcs[i].decl.name.as_bytes())
+                    .s(b"' again, as asked")
+                    .end();
+                self.start_asked(i, Held { awaits: Awaits::Up, ..h });
+            }
+            _ => reply_ok(h.session, h.op, h.request_id),
+        }
+    }
+
+    /// Server `i` came up (`up`), or did not: answer a start that waited for it.
+    fn settle_up(&mut self, i: usize, up: bool) {
+        let Some(k) = self.held.iter().position(|h| h.svc == i && h.awaits == Awaits::Up) else {
+            return;
+        };
+        let h = self.held.remove(k);
+        if up {
+            reply_ok(h.session, h.op, h.request_id);
+        } else {
+            refuse(h.session, h.op, h.request_id, KError::TimedOut, b"it did not come up");
+        }
+    }
+
     /// Start the login chain with `init`'s two endpoints and a route to each server a session
     /// binds — never the server's own endpoint, so a session reaches a restarted server too.
     fn start_login_chain(&mut self) {
@@ -1757,6 +2228,8 @@ impl Mgr {
             views: self.route_copy("view-broker", None),
             devices: self.route_copy("device-mgr", Some("info-endpoint")),
             storage: self.route_copy("storage-service", Some("session-endpoint")),
+            // SAFETY: a channel end this process holds, or `0`.
+            services: unsafe { dup_endpoint(self.services.session_client) },
         };
         bring_up_login_chain(self.root_ns, chain);
     }

@@ -129,7 +129,10 @@ Every skipped declaration is logged by name and reason, critical or not.
 
 **Since administration Part E.1a**, and read by Part E.2's `service`: a service `service --stop`
 and `--restart` refuse, since its absence would lock the administrator out or lose state nothing
-rebuilds.
+rebuilds. **A server whose clients do not reconnect is essential too**, however it exits: stopping
+it strands them, and on a machine with no serial port leaves nothing to type at. That is why the
+terminal server, the input server and the compositor are, and the clipboard — whose clients open a
+session for each copy — is not (PR #341 review).
 
 ### `before` (optional, array of strings; default `[]`)
 

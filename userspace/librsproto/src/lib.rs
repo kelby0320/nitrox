@@ -34,6 +34,7 @@ pub mod surface;
 pub mod views;
 pub mod devices;
 pub mod storage;
+pub mod services;
 
 // --- Envelope (RsMsgHeader) -------------------------------------------------
 

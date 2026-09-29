@@ -33,6 +33,7 @@
 use clipboard_server::{Ring, RingError};
 use libkern::debug::Line;
 use libkern::*;
+use libkern::control::Control;
 use librsproto::clipboard::{
     CLIP_ENTRY_HEAD, CLIP_ERR_MALFORMED, CLIP_ERR_STALE, CLIP_INFO_LEN, CLIP_LIST_HEAD, CLIP_RING,
     ClipEntry, ClipInfo, ClipPaste, MAX_CLIP_BYTES, OP_CLIP_COPY, OP_CLIP_LIST, OP_CLIP_PASTE,
@@ -53,9 +54,10 @@ const MSG_LEN: usize = 4096;
 /// **Generous on purpose, and the bound is the wait set's rather than a guess.** Unlike
 /// `/svc/auth`, whose two callers are both supervisors, this endpoint is bound into *every*
 /// application namespace the shell constructs and into both session namespaces — so the editor,
-/// the browser, the terminal and every `clip` a pipeline runs each want one.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
-const _: () = assert!(1 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+/// the browser, the terminal and every `clip` a pipeline runs each want one. The wait set's other
+/// two are the endpoint and, since administration Part E.2, the control channel.
+const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
+const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// The ring, in `.bss`. See [`Ring`] for why it is fixed-size.
 static mut RING: Ring = Ring::new();
@@ -417,14 +419,20 @@ fn serve_list(ch: u64, request_id: u64) {
 }
 
 /// The serve loop: the forwarding endpoint plus every open session. Never returns.
-fn serve_loop(serve_end: u64) -> ! {
+fn serve_loop(serve_end: u64, mut control: u64) -> ! {
     kprint(b"clipboard-server: serving Clipboard ops over /dev/clipboard\n");
     loop {
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots and `n` is bounded by
-        // `1 + MAX_SESSIONS`, which is that limit by construction (asserted above).
+        // `2 + MAX_SESSIONS`, which is that limit by construction (asserted above).
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            // **The control channel, for `service --stop`** (administration Part E.2) — until
+            // its supervisor has gone, when it would stay signalled for good.
+            if control != 0 {
+                WAIT_HANDLES[n] = control;
+                n += 1;
+            }
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -459,6 +467,15 @@ fn serve_loop(serve_end: u64) -> ! {
             };
             if h == serve_end {
                 serve_resolve(serve_end);
+            } else if h == control {
+                match libkern::control::recv(control) {
+                    Control::Op(CTRL_OP_SHUTDOWN) => {
+                        kprint(b"clipboard-server: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    Control::Closed => control = 0,
+                    _ => {}
+                }
             } else {
                 serve_session(h);
             }
@@ -480,7 +497,7 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
         kprint(b"clipboard-server: Ready send FAIL\n");
         exit(1);
     }
-    serve_loop(serve_end);
+    serve_loop(serve_end, control);
 }
 
 #[panic_handler]

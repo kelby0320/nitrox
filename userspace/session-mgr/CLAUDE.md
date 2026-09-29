@@ -85,15 +85,17 @@ service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
 6. the route to an **info-only endpoint of the device manager's** (administration Part B.4) — not
    the one reached at `/svc/devices`, which could subscribe to a device class;
 7. the route to the **storage service's session endpoint** (administration Part C.6; resolved
-   here from `/svc/storage/session-endpoint` until Part E.1b).
+   here from `/svc/storage/session-endpoint` until Part E.1b);
+8. **`service-mgr`'s own session endpoint** for its services (administration Part E.2b), bound at
+   `/dev/services`: the table of services, and nothing that starts or stops one.
 
 **3–7 are `service-mgr`'s routes, not the servers' own endpoints** (administration Part E.1b): each
 is an endpoint of `service-mgr`'s that continues every resolve into whichever instance of that one
 server is running, so a session bound before a restart reaches the new server. `0` for a server
 that did not come up; the session then binds nothing there.
 
-session-mgr `recv`s all seven before doing anything. `desktop-session-mgr` gets the same with the
-compositor's route fourth, eight in all, and the control channels are 10 deep; `service-mgr`'s
+session-mgr `recv`s all eight before doing anything. `desktop-session-mgr` gets the same with the
+compositor's route fourth, nine in all, and the control channels are 10 deep; `service-mgr`'s
 `create_control_channel` says why the depth is a bound on the count rather than a round number.
 This list was three long until the PR #333 review, three parts after it had stopped being true,
 and six long until the PR #340 review, one part after.
@@ -124,6 +126,7 @@ the tty endpoint where the profile endpoint belongs.
 - `/dev/devices` — the device manager's tables, through an info-only endpoint at the base `/info`;
 - `/storage` and `/dev/storage` — the storage service's session endpoint, at the bases `/fs` (every
   mounted filesystem) and `/info` (the table), through the route `service-mgr` hands over;
+- `/dev/services` — `service-mgr`'s table of services (administration Part E.2b);
 - `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
 - **on an installer boot only**, the machine's block devices, each bound individually with its

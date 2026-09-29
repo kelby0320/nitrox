@@ -36,10 +36,11 @@ and the slice plan all live there.
 - **Stable Rust only.**
 - **Layering:** unlike `init`/`eshell`, service-mgr **is** allowed the stateful
   runtime — it runs after the ecosystem is coming up, not in the pre-allocator
-  critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` (+ later
-  `libstream`), eventual `std`. **Today it links `libkern`, `libheap`, `librsproto` and
-  `libfs`**: the last two since administration Part E.1a, for the `SUBNAMESPACE` replies its
-  endpoint answers and for reading its declarations.
+  critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` + `libstream`,
+  eventual `std`. **Today it links `libkern`, `libheap`, `librsproto`, `libfs` and
+  `libstream`**: `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE`
+  replies its endpoint answers and for reading its declarations, and `libstream` since Part E.2a,
+  for the table `/svc/services/all.tsm`.
 
 ## Discipline
 
@@ -52,9 +53,14 @@ and the slice plan all live there.
   (`wait_serving`, `lookup_serving`) answer them too. The lookups it waits on outright
   (`ns_lookup`: `/bin`, a server's log endpoint) reach the root filesystem, the profile server and
   servers already serving, none of which waits on it.
-- **The wait set is budgeted**: the notification channel, `registry::MAX_ROUTES` routes and
-  `registry::STARTING_ROOM` starting servers make the kernel's 32. A running service's channel is
-  not in it — a death queues `ChildExited`, which wakes the pass that finds it.
+- **The wait set is budgeted**: the notification channel, `registry::MAX_ROUTES` routes, the
+  handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` starting
+  servers make the kernel's 32. A running service's channel is not in it — a death queues
+  `ChildExited`, which wakes the pass that finds it.
+- **An admin request is answered once it has happened, never by a wait** (administration Part
+  E.2): a stop is `Held` until the exit, a start until the `Ready`. A reply sent before the thing is
+  done is a lie a gate cannot always catch; `boot-probe`'s services test reads the table straight
+  after each answer.
 - **Answer every resolve.** A forwarded resolve has no deadline: one dropped is a caller hung for
   good. A failed reply is answered with an error, and the endpoint's ring is `SERVE_DEPTH` (64)
   deep, because a full one answers the caller `WouldBlock` at once.

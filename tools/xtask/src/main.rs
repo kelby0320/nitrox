@@ -606,6 +606,9 @@ const COREUTILS: &[&str] = &[
     // The accounts (administration Part D.4): `--list` and your own `--password` from any session,
     // the rest from a view with the `accounts` grant, or on a users file for recovery.
     "account",
+    // The services (administration Part E.2): `--list` from any session, and `--start`, `--stop`
+    // and `--restart` from a view with the `services` grant.
+    "service",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -2257,6 +2260,39 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send(DEMO_USER)?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20f. **`service`, and a restart the session survives** (administration Part E.2b).
+    //      (a) `--list` is `service-mgr`'s table, from any session: the clipboard running.
+    s.send("service --list | filter name == \"clipboard-server\"")?;
+    s.expect("running")?;
+    s.expect("/home>")?;
+    //      (b) **A stop without the grant is refused before `service-mgr` is asked**: the
+    //          session's `/dev/services/admin` is its session endpoint, where nothing answers.
+    s.send("service --stop clipboard-server")?;
+    s.expect("need the services grant")?;
+    s.expect("/home>")?;
+    //      (c) **An essential service is refused by `service-mgr` itself**, grant or not.
+    s.send("with admin service --stop auth-service")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("it is essential")?;
+    s.expect("/home>")?;
+    //      (d) **The clipboard restarted, from this session**, answered once the new one is up.
+    s.send("with admin service --restart clipboard-server")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("service: restarted clipboard-server")?;
+    s.expect("/home>")?;
+    //      (e) **And the same session copies and pastes through it.** This session bound
+    //          `/dev/clipboard` at login, before the restart, and never again: what it reaches is
+    //          `service-mgr`'s route, which continues into whichever clipboard server is running
+    //          (Part E.1b). Bound to the server's own endpoint, `clip` would find it gone.
+    s.send("\"after-restart\" | clip --copy")?;
+    s.expect("/home>")?;
+    s.send("clip")?;
+    s.expect("after-restart")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -14660,6 +14696,11 @@ const SERVICES_TOML: &str = "\
 # **The servers first, in the order `init` started them** (administration Part E.1): each\n\
 # `endpoint` is waited on for its `Meta::Ready` before the next starts, which keeps the orders\n\
 # `init`'s comments called load-bearing. `never` restarts them, as `init` never did.\n\
+#\n\
+# **`essential` on every one but the clipboard** (PR #341 review): each of the others' absence\n\
+# locks the administrator out or loses state. The terminal server, the input server and the\n\
+# compositor are among them because their clients do not reconnect: on a machine with no serial\n\
+# port, stopping one leaves nothing to type at until power-off.\n\
 [service.auth-service]\n\
 executable = \"/bin/auth-service\"\n\
 description = \"The credential oracle, and the user database's writer\"\n\
@@ -14684,6 +14725,7 @@ policy = \"never\"\n\
 executable = \"/bin/tty-server\"\n\
 description = \"Terminals, over the console\"\n\
 endpoint = \"/dev/tty\"\n\
+essential = true\n\
 \n\
 [service.tty-server.restart]\n\
 policy = \"never\"\n\
@@ -14729,6 +14771,7 @@ policy = \"never\"\n\
 executable = \"/bin/input-server\"\n\
 description = \"Keyboards and pointers, merged\"\n\
 endpoint = \"/dev/input/new\"\n\
+essential = true\n\
 \n\
 [service.input-server.restart]\n\
 policy = \"never\"\n\
@@ -14737,6 +14780,7 @@ policy = \"never\"\n\
 executable = \"/bin/compositor\"\n\
 description = \"The display\"\n\
 endpoint = \"/dev/draw\"\n\
+essential = true\n\
 \n\
 [service.compositor.restart]\n\
 policy = \"never\"\n";
@@ -15094,7 +15138,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

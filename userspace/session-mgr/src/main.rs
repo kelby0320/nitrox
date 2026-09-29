@@ -186,6 +186,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // `service-mgr` asks for it each time the service comes up, and this is the route to whichever
     // is current.
     let storage_endpoint = recv_handoff(control);
+    // `service-mgr`'s own session endpoint for its services (administration Part E.2b), bound at
+    // `/dev/services` in every session: the table of services. `0` binds nothing.
+    let services_endpoint = recv_handoff(control);
     // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` starts
     // `auth-service` and binds `/svc/auth` (administration Part E.1a; `init` did until then), and
     // every supervisor asks the namespace for a session of its own — which is what lets
@@ -274,6 +277,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 views_base: &views_base[..views.map_or(0, |v| v.1)],
                 devices_endpoint,
                 storage_endpoint,
+                services_endpoint,
             });
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");

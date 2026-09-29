@@ -30685,3 +30685,167 @@ resolver, and creates and renames still work behind a route. All seven are addre
 **Also**: `init`'s emergency line says the reason is `service-mgr`'s, printed above it. It
 said "a critical server did not come up", which a lost file is not quite. And test images now
 fail on three new lines: `' skipped: `, `' could not be restarted`, `-- starting nothing`.
+
+## 2026-09-28 — Administration Part E.2a: `/svc/services`, and a stop answered once it has happened
+
+`service-mgr` serves **`/svc/services`** from an endpoint of its own, bound there in the root
+(`rsproto-services-ops.md`, new; `Services` is category `0x11xx`):
+- `all.tsm` is the list, a table of `name`, `state` and `restarts`;
+- `admin-endpoint` mints an admin endpoint, and any resolve on it opens an admin session;
+- on an admin session, `Start`, `Stop` and `Restart`.
+
+The session endpoint, the `services` grant, `service` itself and `test-interactive`'s `clip` gate
+are E.2b's.
+
+**The list is a table, not the `List` request the detail pass named.** The device manager's
+`/dev/devices/all.tsm` and the storage service's `/dev/storage/all.tsm` are tables answered on a
+resolve, and `disk --list` reads one. Following them costs `service-mgr` no channel per reader,
+and lets a pipeline `open` and `filter` the list like the others. `service --list` will read it
+the way `disk --list` does.
+
+**A request is answered once it has happened, and never by a wait.** Every resolve on a server's
+path waits on `service-mgr`, so it cannot sit in a wait for an exit.
+- A stop is **held** until the service's exit, and a start until its `Meta::Ready`. Each is a
+  deadline in the one loop, as a server's `Ready` was.
+- A stop is `CTRL_OP_SHUTDOWN` on the control channel: a request, with no forcible kill. One not
+  honoured in 5 s is answered `TimedOut`, "asked, and still running". It stays asked, and a later
+  exit is still a stop, so it is not restarted.
+- A restart is a held stop, then a held start.
+- **A second request for the same service is refused `WouldBlock`.** Two held requests for one
+  service would race to answer the same event.
+- `boot-probe` reads the table straight after each answer, so a reply sent early is caught.
+
+**Which services exit when asked**: `heartbeat`, and the four `essential` does not cover — the
+terminal server, the clipboard, the input server and the compositor.
+- Each waits on its control channel beside its work, through **`libkern::control`**. That module
+  is new; five programs read the control channel, and a helper with two consumers belongs below
+  both.
+- A closed control channel is `Control::Closed`, and each takes the channel out of its wait set.
+  **`heartbeat`'s own copy did not**: a closed channel stays signalled, so `heartbeat` would have
+  spun from the moment `service-mgr` died. Found moving it to the shared helper.
+- The terminal server's `MAX_TTYS` goes from 15 to 14, and the compositor's `MAX_SESSIONS` loses
+  one, to make room in their wait sets. The clipboard's loses one too.
+- A restarted compositor takes the screen again: the kernel hands `/dev/framebuffer` out on each
+  resolve.
+
+**The wait set pays for it.** `/svc/services`' endpoint, a session endpoint (E.2b's), two admin
+endpoints and four admin sessions take eight slots, so `MAX_ROUTES` goes from 16 to 14. Twelve are
+used in a test image.
+
+**`start` returns whether it spawned**, and each caller handles a failure:
+- bring-up, through the bring-up rule;
+- a restart by policy, through the policy (PR #340's fix, moved to `due`);
+- a start asked for, by refusing it.
+
+`reap` records how a service exited, for the table's `state`, and `restarts` counts restarts by
+policy and by request over the boot, which `attempts` does not.
+
+**Gate: `boot-probe`'s services test.** On an admin session, opened as the grant will open one:
+- the list;
+- `clipboard-server` stopped (then `stopped` in the table, and `/dev/clipboard` `NotFound`),
+  started (running, and it opens) and restarted (counted once);
+- `auth-service`'s stop and restart refused `NoAccess`, an unknown name `NotFound`, and a second
+  start `AlreadyExists`.
+
+**Controls, each a boot:**
+- the clipboard ignoring `CTRL_OP_SHUTDOWN`: the stop is answered `TimedOut` after 5 s, and the
+  test fails;
+- a restart not counted: the test fails on the count.
+
+Host tests cover the decisions (`services::decide`, `state`, `asked`) and the budget.
+
+**Only the clipboard's stop is booted.** Stopping the terminal, input or compositor server in the
+test image would break the gates that boot that image after `boot-probe`: `check-terminal` and
+`check-input` need all three. Their handling is the clipboard's, through the same helper, and is
+built but unexercised.
+
+## 2026-09-28 — Administration Part E.2b: `service`, the grant, and a session that survives a restart
+
+**Every session and application binds `/dev/services`**, `service-mgr`'s own session endpoint: the
+table of services and nothing else. `admin-endpoint` is `NotFound` there however it is bound, so no
+session starts or stops a service without the grant.
+- `service-mgr` makes the endpoint at startup and hands it down the login chain, the way E.1b hands
+  its routes down. That makes it the eighth handoff to `session-mgr` and the ninth to
+  `desktop-session-mgr`, whose control channel now holds nine of its ten slots.
+- `desktop-shell` receives it as its ninth extra and binds it into every application.
+- **Handed, not resolved.** `service-mgr` is the one that spawns the supervisors, so it has no
+  reason to make them ask for an endpoint it already holds. E.1b moved the storage service's session
+  endpoint the same way.
+
+**The `services` grant** binds `service-mgr`'s admin endpoint at `/dev/services/admin`. The broker
+resolves it lazily at `/svc/services/admin-endpoint`, as it does the storage service's. The seeded
+`admin` profile gains it. `service-mgr` still refuses an essential service's stop itself, whoever
+holds the grant.
+
+**`service`**, a coreutil modelled on `disk`:
+- `--list` reads `/dev/services/all.tsm`;
+- `--start`, `--stop` and `--restart NAME` ask on `/dev/services/admin`, and wait for the answer,
+  which comes once the thing is done;
+- without the grant, the admin path resolves through the session endpoint to `NotFound`, and
+  `service` names `with`.
+
+**`test-interactive` step 20f** (34 steps), from a serial session:
+- the list shows the clipboard running;
+- a stop without the grant is refused, naming the grant;
+- `with admin service --stop auth-service` is refused as essential;
+- `with admin service --restart clipboard-server` is answered once the new one is up;
+- **the same session then copies and pastes through `clip`.**
+
+**That last step is the first proof of E.1b's claim end to end**: a session bound before a restart
+reaches the new server. Until now only `boot-probe`'s copy of the root stood in for it.
+- The control hands the supervisors the clipboard server's own endpoint instead of the route,
+  which is what E.1a did. The restart succeeds, and `clip` then finds `no /dev/clipboard in this
+  namespace`, so the step fails.
+- E.1b's plan note named this gate as the one that would do it.
+
+**A doc comment went astray again** while adding the broker's `services_endpoint`: it was anchored
+on `fn storage_endpoint`, whose doc sat above it. Caught by reading before the sweep ran, and
+restored.
+
+**Two more lines E.1a's sweep missed**, in `graphical-session.md` §3, are fixed here: `init` asking
+the device manager for the info-only endpoint, and `desktop-session-mgr` resolving the storage
+session endpoint itself.
+
+## 2026-09-28 — Part E.2, reviewed (PR #341): a restart outlives its session, and three servers become essential
+
+The review found one blocking problem, three worth fixing and three optional. All are addressed.
+
+**Blocking — a restart whose admin session closed before its answer stopped the service and never
+started it again.**
+- When a session closed, `service-mgr` dropped the requests held for it. For a `Restart`, the held
+  entry was the only thing carrying "then start". So the service exited as asked, `settle_exit`
+  found nothing, and the requested shutdown kept the policy from restarting it.
+- The spec said what was asked goes on. The reviewer demonstrated it failing deterministically: the
+  kernel hands out what is queued before it reports the peer gone, so the request and the close are
+  handled in the same pass.
+- **Now the entry stays and loses only its session**: `session = 0` answers no one, and `refuse`
+  and `reply_ok` skip it. The handle is still not kept, since it may be reused.
+- `boot-probe` gained the reviewer's case: a second session sends `Restart` and closes at once, and
+  the clipboard must come back running and counted once. Control: dropping held requests again
+  fails it.
+
+**Worth fixing, 1 — three "stoppable" servers stranded their clients.**
+- `input-server`: the compositor connects to input once and never again.
+- The compositor: `desktop-session-mgr` exits when it loses the connection, and is nobody's
+  declaration to restart.
+- `tty-server`: `nxterm` needs `/dev/tty` for every shell.
+- On the laptop, which has no serial port, stopping any of the three left nothing to type at until
+  power-off. That is `essential`'s own definition, so **all three are `essential`**. The clipboard,
+  whose clients open a session per copy, is the one server `service` may stop.
+- The detail pass's "the rest may be stopped" held for the clipboard alone. The three keep their
+  `CTRL_OP_SHUTDOWN` handling, which a shutdown will use.
+- Making their clients reconnect would lift this. It is a feature of its own, and not this part's.
+
+**Worth fixing, 2 and 3 — two current-behaviour docs this PR made false:**
+- `console-and-tty.md` counted fifteen terminals, where `MAX_TTYS` is now fourteen;
+- `service-mgr/CLAUDE.md`'s dependency list lacked `libstream`.
+
+**Optional, all taken:**
+- **A start could wait forever.** A server started by request whose policy's respawn then failed to
+  spawn left its held start unanswered. It is now answered once the policy has nothing more to try.
+- **A stop during a backoff was refused "not running"**, and the scheduled restart ran anyway, so a
+  crash-looping service could not be stopped. `decide` now takes whether a restart is due, and such
+  a stop is `CancelRestart`, answered at once.
+- **A server past its `Ready` deadline showed `running`.** It is still a process, but it refused
+  or said nothing, and its path answers `NotFound`. `state` now takes whether a running service is
+  usable, and says `failed`.
