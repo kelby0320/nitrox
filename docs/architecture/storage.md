@@ -2,7 +2,7 @@
 
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
-since Part E.1b; last checked 2026-09-28.**
+since Part E.1b; its shutdown unmount built with Part E.4a; last checked 2026-09-29.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -301,10 +301,12 @@ how, and what each suffix asks for where it arrives.
   unmount starts. A lazy unmount, which would drain those, is not built.
 - **An open directory session is not a held file.** A client holding one when its filesystem is
   unmounted finds the channel closed.
-- **Nothing unmounts `init`'s mounts, or this service's own**, so nothing syncs them before the
-  machine stops. On a boot that is not a live one, every ext4 `init` did not mount is auto-mounted
-  writable. It is left not clean, with its dirty files unwritten, exactly as `/` and `/home` are.
-  Both are Part E's `shutdown`, which runs the unmount chain on everything mounted.
+- **A shutdown's unmount is built, and nothing asks for it yet** (administration Part E.4a). On
+  `CTRL_OP_SHUTDOWN` this service runs the chain on every mount it made, last first and without
+  the held check, then exits; `init` does the same for its own mounts on the terminal channel's
+  `Finish`. The sequence that sends both is Part E.4b's. Until it lands, every ext4 this service
+  auto-mounted writable is left not clean at power-off, with its dirty files unwritten, exactly as
+  `/` and `/home` are.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

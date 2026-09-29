@@ -791,8 +791,9 @@ pub mod slots {
     //! broker does not wait on is an exit it never sees, whose code is then paired with some other
     //! program's.
 
-    /// The forwarding endpoint and the notification channel.
-    pub const FIXED: usize = 2;
+    /// The forwarding endpoint, the notification channel and, since administration Part E.4, the
+    /// control channel.
+    pub const FIXED: usize = 3;
 
     /// What the wait set holds, by how many slots each may come to need.
     #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1262,16 +1263,16 @@ auth = "password"
         while load.admits_client(MAX) {
             load.clients += 1;
         }
-        assert_eq!(load.clients, 15, "(32 - 2) / 2");
+        assert_eq!(load.clients, 14, "(32 - 3) / 2");
         // Every one of them starts a program: channel and life channel each.
         let running = FIXED + 2 * load.clients;
         assert!(running <= MAX, "{running} handles in a {MAX}-slot wait set");
         // Exactly two slots free: one more client fits.
-        let two = Load { clients: 14, ..Load::default() };
+        let two = Load { clients: 13, singles: 1, ..Load::default() };
         assert_eq!(two.worst(), MAX - 2);
         assert!(two.admits_client(MAX));
         // One free: a supervisor fits, and half a client does not.
-        let one = Load { singles: 1, ..two };
+        let one = Load { singles: 2, ..two };
         assert_eq!(one.worst(), MAX - 1);
         assert!(!one.admits_client(MAX), "its program's life channel would have no slot");
         assert!(one.admits_supervisor(MAX));

@@ -30,6 +30,11 @@
 //! (`sys_ns_sync`), the unmount is refused if a file is still held (`sys_ns_held`), the server
 //! records the filesystem clean and exits (`Meta::Unmount`), the drive's cache is flushed, and
 //! the namespace is dropped.
+//!
+//! **A shutdown unmounts everything** (administration Part E.4). On `CTRL_OP_SHUTDOWN` — which
+//! only a shutdown sends, since this service is `essential` — it runs the chain on every mount,
+//! last mounted first, **without the held check**, by the maintainer's call: a write made after
+//! the sync is lost, as at a power cut, and every filesystem is left clean. Then it exits.
 
 #![no_std]
 #![no_main]
@@ -83,10 +88,10 @@ const MAX_MOUNTS: usize = 8;
 const MAX_ADMIN_ENDPOINTS: usize = 2;
 /// Admin sessions open at once: a `disk --mount` or `--unmount` is one, briefly.
 const MAX_ADMIN_SESSIONS: usize = 4;
-/// Directory sessions open at once: the wait set, less the endpoint, the subscription, and every
-/// other kind's bound.
+/// Directory sessions open at once: the wait set, less the endpoint, the subscription, the control
+/// channel, and every other kind's bound.
 const MAX_DIRS: usize =
-    MAX_WAIT_HANDLES - 2 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS - MAX_ADMIN_ENDPOINTS - MAX_ADMIN_SESSIONS;
+    MAX_WAIT_HANDLES - 3 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS - MAX_ADMIN_ENDPOINTS - MAX_ADMIN_SESSIONS;
 /// Where a filesystem server is spawned from: the store's copy, since the root is mounted by now.
 const FS_SERVER: &[u8] = b"/bin/fs-server-ext4";
 /// How long a filesystem server may take to answer `Meta::Ready`: `init`'s bound for its own.
@@ -869,7 +874,7 @@ impl Service {
                 let Ok(label) = core::str::from_utf8(&m.body) else {
                     return refuse(KError::InvalidArgument, b"a label that is not UTF-8");
                 };
-                match self.unmount(label) {
+                match self.unmount(label, true) {
                     Ok(()) => {
                         let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &[], &[]);
                     }
@@ -914,7 +919,10 @@ impl Service {
 
     /// **Unmount `label`: the chain**, each link only once the one before it held. An `Err` names
     /// the link that refused. A refusal before the server is told leaves the mount as it was.
-    fn unmount(&mut self, label: &str) -> Result<(), (KError, &'static [u8])> {
+    ///
+    /// `held_check` is `false` only for a shutdown's unmount ([`shut_down`](Self::shut_down)),
+    /// which goes on whatever still holds a file.
+    fn unmount(&mut self, label: &str, held_check: bool) -> Result<(), (KError, &'static [u8])> {
         let Some(i) = self.mounted.iter().position(|x| x.label == label) else {
             return Err((KError::NotFound, b"nothing is mounted with that label"));
         };
@@ -939,7 +947,7 @@ impl Service {
         //    (`sys_ns_held`, `syscall-abi.md`), so a count is asked again after a short park
         //    before it is believed. A real holder is still holding a few milliseconds later.
         let mut held = 0;
-        for attempt in 0..HELD_ASKS {
+        for attempt in 0..if held_check { HELD_ASKS } else { 0 } {
             if attempt > 0 {
                 park(HELD_PARK_NS);
             }
@@ -998,6 +1006,28 @@ impl Service {
         }
         l.end();
         Ok(())
+    }
+
+    /// **A shutdown's unmount**: every mount this service made, last mounted first, each by the
+    /// chain without its held check, and each outcome said — then exit. `init`'s own mounts are
+    /// `init`'s to unmount, after every service has stopped.
+    fn shut_down(&mut self) -> ! {
+        while let Some(x) = self.mounted.last() {
+            let label = x.label.clone();
+            if let Err((_, why)) = self.unmount(&label, false) {
+                // Out of the list whatever happened: the chain drops a mount once its server has
+                // been told, and one refused earlier is not asked again.
+                self.mounted.retain(|m| m.label != label);
+                Line::new()
+                    .s(b"storage-service: ")
+                    .untrusted(label.as_bytes())
+                    .s(b" was not unmounted cleanly at shutdown: ")
+                    .s(why)
+                    .end();
+            }
+        }
+        kprint(b"storage-service: asked to stop: everything it mounted is unmounted, exiting\n");
+        exit(0);
     }
 
     fn open_dir(&mut self, reply_to: u64, request_id: u64, listing: Listing) {
@@ -1289,9 +1319,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         exit(1);
     }
     s.serve_end = serve_end;
+    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
+    // `0` once `service-mgr` is gone.
+    let mut control = control;
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, and at
-        // most each kind's bound more — each refuses past it.
+        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, the
+        // control channel, and at most each kind's bound more — each refuses past it.
         let waited = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -1302,6 +1335,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             };
             push(s.serve_end);
             push(s.subscription);
+            if control != 0 {
+                push(control);
+            }
             for &e in &s.session_ends {
                 push(e);
             }
@@ -1335,6 +1371,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 }
             } else if h == s.subscription {
                 s.serve_subscription();
+            } else if h == control {
+                match libkern::control::recv(control) {
+                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => s.shut_down(),
+                    libkern::control::Control::Closed => control = 0,
+                    _ => {}
+                }
             } else if let Some(i) = s.session_ends.iter().position(|&e| e == h) {
                 // Every holder of this endpoint has let it go, its bindings included.
                 if !s.serve_resolve(h, true) {

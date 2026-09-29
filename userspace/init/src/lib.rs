@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod ready;
+pub mod unmount;
 /// The manifest parser, shared with the storage service since administration Part C.5 and
 /// kept at its old path here.
 pub use libinittoml::{manifest, toml_lite};

@@ -26,6 +26,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
@@ -79,6 +80,21 @@ static mut TERMINAL: u64 = 0;
 /// The system-control object (administration Part E.3), or 0 without one: the handle
 /// `sys_power` takes, which E.4's shutdown uses as its last step.
 static mut SYSTEM_CONTROL: u64 = 0;
+
+/// **`init`'s own mounts**, in the order they were made, each with its server's control channel:
+/// kept since administration Part E.4, for a shutdown's last filesystem step ([`finish`]). A
+/// server's control channel used to be closed as soon as its `Meta::Ready` came.
+static mut KEPT: Vec<Kept> = Vec::new();
+
+/// How long a filesystem server may take to answer `Meta::Unmount` at shutdown. Its write-back
+/// came first, in `sys_ns_sync`, so what is left is one superblock write.
+const UNMOUNT_TIMEOUT_NS: u64 = 10_000_000_000;
+
+/// A mount `init` made: where, and the control channel its server takes `Meta::Unmount` on.
+struct Kept {
+    mount_point: String,
+    control: u64,
+}
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -467,8 +483,8 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
             return None;
         }
     };
-    // The handshake is done; the control channel is no longer needed.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+    // The handshake is done. **The control channel is kept** (administration Part E.4), once the
+    // mount is made: a shutdown's `Meta::Unmount` goes down it, last mount first ([`finish`]).
 
     // 6. Bind the forwarding endpoint at the mount point. The kernel sees an
     //    IpcChannel and adopts it as a Userspace Server (slice-7 forwarding). The
@@ -486,10 +502,17 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     };
     if br != 0 {
         Line::new().s(b"init: bind FAIL at ").s(m.mount_point.as_bytes()).end();
-        // SAFETY: closing our own handle; nothing was bound with it.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+        // SAFETY: closing our own handles; nothing was bound with them.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, endpoint);
+            syscall1(SYS_HANDLE_CLOSE, ctrl_init);
+        }
         return None;
     }
+    // SAFETY: single-threaded init; `KEPT` is only ever reached through this raw pointer.
+    let kept = Kept { mount_point: m.mount_point.clone(), control: ctrl_init };
+    // SAFETY: as above.
+    unsafe { (*(&raw mut KEPT)).push(kept) };
 
     Line::new().s(b"init: mounted fs-server-ext4 at ").s(m.mount_point.as_bytes()).end();
     // init keeps `fs_h` (the long-lived server's process handle).
@@ -968,6 +991,8 @@ fn emergency(notif: u64, root_ns: u64) -> ! {
 fn reap_loop(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: entering reaping loop\n");
     let mut shell_started = false;
+    // A `Finish` that returned: the machine could not stop itself. A second changes nothing.
+    let mut finished = false;
     loop {
         // SAFETY: single-threaded init; the terminal channel is read only here.
         let terminal = unsafe { TERMINAL };
@@ -1041,11 +1066,13 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
             if rr != 0 {
                 break; // WouldBlock: nothing more
             }
-            // SAFETY: the kernel wrote the message; one payload byte at offset 24.
-            let (len, op, handles) = unsafe {
+            // SAFETY: the kernel wrote the message; its payload at offset 24, an op and, for
+            // `Finish`, whether to reboot.
+            let (len, op, reboot, handles) = unsafe {
                 (
                     u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]),
                     IPC_MSG[24],
+                    IPC_MSG[25] != 0,
                     (&raw const IPC_COUNT).read(),
                 )
             };
@@ -1063,7 +1090,151 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
                 spawn_eshell(root_ns);
                 shell_started = true;
             }
+            if len >= 2 && op == TERMINAL_OP_FINISH && !finished {
+                finished = true;
+                finish(root_ns, reboot);
+            }
         }
+    }
+}
+
+/// **Finish a shutdown** (administration Part E.4). `service-mgr` has asked every session and
+/// service to stop, and says so with `Finish`. What is left is `init`'s own: its mounts, last
+/// first — each written back with `sys_ns_sync`, then told `Meta::Unmount`, on which its server
+/// records the filesystem clean and exits — and then the machine, through `sys_power`.
+///
+/// **Whether or not a file is held**, by the maintainer's call: whatever still runs writes after
+/// the sync at its own risk, as at a power cut, and every filesystem is left clean. And whatever
+/// one mount answers, the next is still unmounted: a shutdown that stopped half way would leave
+/// every later filesystem not clean.
+///
+/// Returns only if the machine cannot be stopped — with no system-control object, or one
+/// `sys_power` refused — after saying so. The filesystems are unmounted by then, so the machine
+/// is as safe to turn off as a halt would have left it.
+fn finish(root_ns: u64, reboot: bool) {
+    kprint(if reboot {
+        b"init: finishing the shutdown, to reboot: its own filesystems, last mounted first\n"
+    } else {
+        b"init: finishing the shutdown: its own filesystems, last mounted first\n"
+    });
+    // SAFETY: single-threaded init; `KEPT` is only ever reached through this raw pointer, and is
+    // taken whole so that nothing unmounted is unmounted twice.
+    let kept = unsafe { core::mem::take(&mut *(&raw mut KEPT)) };
+    for m in kept.iter().rev() {
+        unmount_one(root_ns, m);
+    }
+    // SAFETY: single-threaded init; written once at startup.
+    let system_control = unsafe { SYSTEM_CONTROL };
+    if system_control == 0 {
+        Line::new()
+            .s(b"init: no system-control object, so the machine cannot stop itself; ")
+            .s(b"its filesystems are unmounted, and it is safe to turn off")
+            .end();
+        return;
+    }
+    let op = if reboot { POWER_REBOOT } else { POWER_HALT };
+    // SAFETY: a register-only syscall on a handle init holds; on success it does not return.
+    let r = unsafe { syscall2(SYS_POWER, system_control, op) };
+    Line::new()
+        .s(b"init: sys_power refused (")
+        .i(r)
+        .s(b"), so the machine cannot stop itself; ")
+        .s(b"its filesystems are unmounted, and it is safe to turn off")
+        .end();
+}
+
+/// Unmount one of `init`'s mounts at shutdown: every dirty file written back, then
+/// `Meta::Unmount` on its server's control channel, and the answer said. Each step is tried
+/// whatever the one before it did.
+fn unmount_one(root_ns: u64, m: &Kept) {
+    let at = m.mount_point.as_bytes();
+    // SAFETY: a namespace handle init holds, and a valid path.
+    let synced = unsafe { syscall3(SYS_NS_SYNC, root_ns, at.as_ptr() as u64, at.len() as u64) };
+    if synced < 0 {
+        let mut l = Line::new();
+        l.s(b"init: ").s(at).s(b": its files could not all be written back (").i(synced).s(b")");
+        l.end();
+    }
+    // SAFETY: IPC_MSG is init's own buffer, and nothing else uses it during a shutdown; the
+    // request is an envelope and no handles.
+    let sent = unsafe {
+        let msg: &mut [u8; IPC_MSG_LEN] = &mut *(&raw mut IPC_MSG);
+        let payload = &mut msg[24..];
+        match init::unmount::request(payload, 1) {
+            Some(n) => {
+                IPC_MSG[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+                IPC_MSG[8] = 0;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    m.control,
+                    (&raw const IPC_MSG) as u64,
+                    (&raw const IPC_HANDLES) as u64,
+                    0,
+                    SENDMODE_NOBLOCK,
+                ) == 0
+            }
+            None => false,
+        }
+    };
+    let answered = sent && wait_one_until(m.control, now_ns().saturating_add(UNMOUNT_TIMEOUT_NS));
+    // SAFETY: IPC_MSG/IPC_HANDLES/IPC_COUNT are valid writable out-params.
+    let received = answered
+        && unsafe {
+            syscall4(
+                SYS_CHANNEL_RECV,
+                m.control,
+                (&raw mut IPC_MSG) as u64,
+                (&raw mut IPC_HANDLES) as u64,
+                (&raw mut IPC_COUNT) as u64,
+            )
+        } == 0;
+    let mut line = Line::new();
+    line.s(b"init: ").s(at);
+    if received {
+        // SAFETY: the kernel wrote the message; its payload is bounded by the header's length.
+        let payload = unsafe {
+            let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
+            let msg: &[u8; IPC_MSG_LEN] = &*(&raw const IPC_MSG);
+            &msg[24..24 + len.min(IPC_MSG_LEN - 24)]
+        };
+        use init::unmount::Answer;
+        match init::unmount::answer(payload) {
+            Answer::Done => line.s(b" unmounted, and its server left the filesystem clean"),
+            Answer::Failed(why) => line.s(b" unmounted, but not left clean: ").untrusted(why),
+            Answer::Unexpected => line.s(b" answered its unmount with something else"),
+        };
+        // SAFETY: handles the kernel installed, which no answer carries.
+        unsafe {
+            for k in 0..(&raw const IPC_COUNT).read().min(init::ready::IPC_HANDLE_MAX) {
+                syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read());
+            }
+        }
+    } else if sent {
+        line.s(b" did not answer its unmount, and may not be left clean");
+    } else {
+        line.s(b": its server could not be told to unmount");
+    }
+    line.end();
+    // SAFETY: closing init's own control channel; its server has exited or been abandoned.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, m.control) };
+}
+
+/// The monotonic clock, in nanoseconds.
+fn now_ns() -> u64 {
+    let mut now: u64 = 0;
+    // SAFETY: `&now` is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    now
+}
+
+/// Wait for `h` to signal, until `deadline`. `true` if it did.
+fn wait_one_until(h: u64, deadline: u64) -> bool {
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with a deadline. The reaping
+    // loop that also uses them is this call's caller, and is not waiting.
+    unsafe {
+        WAIT_HANDLES[0] = h;
+        let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
+        syscall4(SYS_WAIT, handles, 1, results, deadline) == 1
     }
 }
 

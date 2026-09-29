@@ -31014,3 +31014,76 @@ administration Part A.1. It is back on `sys_ns_bind` and brought up to date.
 
 **ABI:** no hash impact. It is a new refusal on an existing syscall, and no layout or discriminant
 changes.
+
+## 2026-09-29 — Administration Part E.4a: every server exits when asked, and `init` can finish a shutdown
+
+**E.4 comes in four parts**, after the maintainer's call on what must exit when asked:
+- **E.4a**: the servers, and `init`'s end.
+- **E.4b**: `service-mgr`'s sequence.
+- **E.4c**: sessions.
+- **E.4d**: the grant, `shutdown` and `check-shutdown`.
+
+**The call** came from a survey of what honoured a stop. Only the terminal server, the clipboard,
+the input server, the compositor and `heartbeat` read `CTRL_OP_SHUTDOWN`. Nothing in a session
+read a terminate request: not the login supervisors (`spawn_leader` drained it unread), not
+`nxsh`, not `desktop-shell`, not the graphical programs. So the planned "ask, wait a bounded time,
+go on" would have waited out a bound for nearly everything.
+
+The maintainer chose **services and sessions**:
+- every server a release image runs, and the login supervisors, `nxsh` and `desktop-shell`,
+  exit when asked;
+- graphical programs are not asked in E.4. Their windows go with the compositor, and asking them,
+  with unsaved work in mind, belongs with Part F's session menu.
+
+**The five `essential` servers now exit on `CTRL_OP_SHUTDOWN`**: `auth-service`,
+`logging-service`, the view broker, `device-mgr` and the storage service.
+- Each adds its control channel to its wait set through `libkern::control`, as E.2a's four did,
+  and drops it if it closes. `service --stop` still refuses all five. Only a shutdown sends the op.
+- **What each gives up:** one wait slot, from what the wait set had spare. `auth-service` loses
+  one session slot (30), the log one source (30), `device-mgr` and the storage service one
+  directory session each, and the broker's fixed slots go from 2 to 3.
+- **The log** sinks every record already queued before it exits. **The storage service** first
+  runs its unmount chain on every mount it made, last mounted first. It skips the held check, by
+  the maintainer's call: a write made after the sync is lost, as at a power cut, and the
+  filesystem is left clean.
+
+**`init` keeps each mount's control channel.** It used to close it once `Meta::Ready` came.
+- `TERMINAL_OP_FINISH`, new in `libkern::abi`, carries a reboot byte. On it, `init` unmounts its
+  own mounts, last first: `sys_ns_sync`, then `Meta::Unmount`, with no held check. It then calls
+  `sys_power` to halt or reboot.
+- Every mount is unmounted whatever the one before answered. If `sys_power` refuses, `init` says
+  so and goes on reaping, with the filesystems clean.
+- **The request and answer are hand-built** in `init::unmount`, as `init::ready` hand-parses
+  `Ready`, since `librsproto` stays out of `init`'s build. Its host tests check the request with
+  `librsproto`'s decoder, and feed the parser `fs-server-ext4`'s own replies and malformed ones.
+
+**Nothing sends the op or `Finish` yet**: that is E.4b. So E.4a was booted by hand, with a
+temporary probe in `service-mgr` (reverted). The probe waited 25 s after bring-up, then asked each
+running service to stop, newest first, waiting up to 3 s each, then sent `init` `Finish`:
+- **The test image:** every server exited. The storage service unmounted its scratch disk left
+  clean, and `init` unmounted `/` left clean. `sys_power` flushed two disks and halted. `nxterm`,
+  `ui-testclient` and `restart-probe` were passed over as still running, as this scope expects.
+- **The disk, on the host:** `e2fsck -fn` clean, and the superblock's state `clean`. **Control:**
+  the same image quit mid-run without a shutdown reads `not clean`.
+- **The release image:** all nine servers exited, and the root was left clean again.
+- **`Finish` with the reboot byte:** `init` unmounted, then `sys_power` reset through the FADT's
+  register.
+
+**The first full gate run failed four gates, for two reasons:**
+- **The demo chain's session fan-out** opened the root server's whole session table and expected
+  31. The table is 30 while the server's control channel is open (`session_capacity`), and
+  `init` keeping it made that permanent. The demo now expects 30 and says why.
+- **The view broker refused a client with slots about to be freed.** It handled a wake's results
+  in wait-set order, and its forwarding endpoint is first. So a resolve that arrived in the same
+  wake as other clients' closes was answered `WouldBlock` before the closes were seen.
+  - `boot-probe`'s paced pair does exactly that: it closes every client it filled the broker
+    with, then opens two.
+  - The race predates E.4a. The demo chain failing changed the timing enough to hit it, and a
+    probe showed the refusal was `WouldBlock`.
+  - Fixed at the cause: **resolves are answered last in each wake**. Under the condition that
+    hit it (the fan-out left failing), the paced pair failed 1 run of 2 before the fix, and 0 of
+    6 after.
+- `check-terminal --kvm`'s failure was `boot-probe` exiting non-zero, from the same causes. It
+  passed twice after both fixes.
+
+No kernel change and no ABI hash impact.

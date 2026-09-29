@@ -277,7 +277,8 @@ object`, then:
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
 2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
    over the device handle (and, for a `"ro"` mount, the read-only flag), wait for its `Ready`
-   message carrying the server's endpoint, and bind that endpoint at the mount point. A
+   message carrying the server's endpoint, and bind that endpoint at the mount point, **keeping the
+   server's control channel** for the unmount a shutdown ends with (administration Part E.4). A
    writable server records the filesystem mounted before it answers, and reports one it finds
    was not cleanly unmounted (administration Part C.3). Any failure → the emergency path. The
    server reads the superblock and the root directory **before** it answers, and a device

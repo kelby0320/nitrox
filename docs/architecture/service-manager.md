@@ -6,7 +6,8 @@ checked 2026-09-28, when it took over starting and binding the servers `init` us
 boundary below, as built at last — through a registry of its own (administration Part E.1a),
 and began handing the sessions its own routes to them (Part E.1b), and reading its declarations
 from the root (Part E.1c), and serving `/svc/services` — the list, and starting and stopping on
-an admin session (Part E.2a);
+an admin session (Part E.2a); last checked 2026-09-29, when every server came to exit on
+`CTRL_OP_SHUTDOWN` and `init` to answer a shutdown's `Finish` (Part E.4a);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -227,6 +228,9 @@ chain with no `auth-service` behind it. Every skipped declaration is logged by n
 **The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
 handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
 then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
+**`TERMINAL_OP_FINISH`** (Part E.4a), with a byte saying whether to reboot, is a shutdown's last
+word to `init`, which unmounts its own filesystems and calls `sys_power`. `init` answers it;
+nothing sends it until Part E.4b's shutdown sequence.
 
 ### `/svc/services`: the list, and starting and stopping
 
@@ -247,8 +251,12 @@ A stop is `CTRL_OP_SHUTDOWN` on the service's control channel, **a request**: on
 s is answered "asked, and still running", stays asked, and is still a stop if it comes later. There
 is no forcible kill. An `essential` service's stop and restart are refused here, whoever asks.
 
-**Which services exit when asked**: `heartbeat`, and four servers — the terminal server, the
-clipboard, the input server and the compositor. **Only the clipboard may be stopped by request**:
+**Which services exit when asked**: `heartbeat`, and every server a release image runs — the
+terminal server, the clipboard, the input server and the compositor since Part E.2a, and
+`auth-service`, `logging-service`, the view broker, `device-mgr` and the storage service since
+Part E.4a. The storage service unmounts everything it mounted first, and the log sinks what is
+queued. The test image's graphical clients and `restart-probe` do not. **Only the clipboard may be
+stopped by request**:
 the other three are `essential`, since their clients do not reconnect, and on a machine with no
 serial port stopping one leaves nothing to type at (PR #341 review). Their exit is for a shutdown.
 Each waits on its control channel beside its work, through `libkern::control`, and **takes it out of

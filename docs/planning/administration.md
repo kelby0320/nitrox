@@ -2109,6 +2109,14 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 - [ ] **E.4 — `shutdown`.**
       - The sequence: sessions, services in reverse order, the storage service's unmount of
         everything, `init`'s mounts, the power op.
+      - *(In four parts, after the maintainer's call of 2026-09-29 that **every server and every
+        session's leader exits when asked**, and graphical programs are Part F's: E.4a the servers
+        and `init`'s end, E.4b `service-mgr`'s sequence, E.4c sessions, E.4d the grant, `shutdown`
+        and the gate.)*
+      - *(E.4a landed 2026-09-29:* the five `essential` servers exit on `CTRL_OP_SHUTDOWN`, the
+        storage service unmounting everything first; `init` keeps its mounts' control channels
+        and answers `TERMINAL_OP_FINISH` — its mounts, last first, then `sys_power`. Booted by hand
+        with a probe; the root left clean, checked on the host against a control.)*
       - The `power` grant, and the seeded policy's `power` view for everyone.
       - `shutdown [--reboot]`.
       - **`cargo xtask check-shutdown`**, in CI's QEMU job. It boots a `--selftest` disk image, and

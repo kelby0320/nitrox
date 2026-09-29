@@ -46,9 +46,9 @@ const SUBSCRIPTION_HEADROOM: usize = 32;
 /// Info-only endpoints at once. `service-mgr` asks for one at boot and couriers it for every
 /// session; the second is headroom, not a use.
 const MAX_INFO_ENDPOINTS: usize = 2;
-/// Directory sessions open at once: the wait set, less the endpoint, the info-only endpoints and
-/// an owner per class.
-const MAX_DIRS: usize = MAX_WAIT_HANDLES - 1 - MAX_INFO_ENDPOINTS - Class::ALL.len();
+/// Directory sessions open at once: the wait set, less the endpoint, the control channel, the
+/// info-only endpoints and an owner per class.
+const MAX_DIRS: usize = MAX_WAIT_HANDLES - 2 - MAX_INFO_ENDPOINTS - Class::ALL.len();
 /// What the manager takes each node with, and hands its owner: `/dev/blk`'s authority, which is
 /// the most any class needs — the storage service writes.
 const NODE_RIGHTS: u64 = RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
@@ -455,6 +455,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         .u(count(Class::Block))
         .s(b" block")
         .end();
+    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
+    // `service --stop` never sends it: the manager is `essential`. `0` once `service-mgr` is gone.
+    let mut control = control;
     let mut m = Manager {
         serve_end,
         records,
@@ -464,9 +467,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         info_ends: Vec::new(),
     };
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the info-only
-        // endpoints, an owner per class, and at most MAX_DIRS sessions — `mint_info_endpoint`
-        // and `open_dir` refuse past their bounds.
+        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the control channel,
+        // the info-only endpoints, an owner per class, and at most MAX_DIRS sessions —
+        // `mint_info_endpoint` and `open_dir` refuse past their bounds.
         let waited = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -476,6 +479,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 }
             };
             push(m.serve_end);
+            if control != 0 {
+                push(control);
+            }
             for &e in &m.info_ends {
                 push(e);
             }
@@ -503,6 +509,15 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 if !m.serve_resolve(h, false) {
                     kprint(b"device-mgr: forwarding endpoint closed\n");
                     exit(1);
+                }
+            } else if h == control {
+                match libkern::control::recv(control) {
+                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
+                        kprint(b"device-mgr: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    libkern::control::Control::Closed => control = 0,
+                    _ => {}
                 }
             } else if let Some(i) = m.info_ends.iter().position(|&e| e == h) {
                 // Every holder of this endpoint has let it go — its bindings included.

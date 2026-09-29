@@ -1517,6 +1517,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"view-broker: Ready send FAIL\n");
         exit(1);
     }
+    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
+    // `service --stop` never sends it: the broker is `essential`. `0` once `service-mgr` is gone.
+    let mut control = control;
     let mut b = Broker {
         storage: Storage::default(),
         services_admin: 0,
@@ -1548,6 +1551,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             };
             push(b.serve_end);
             push(b.notif);
+            if control != 0 {
+                push(control);
+            }
             for &s in &b.supervisors {
                 push(s);
             }
@@ -1578,6 +1584,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         };
         let _ = n;
         if waited > 0 {
+            // **Resolves last**: a new client is admitted by what the wait set holds, so every
+            // closed channel this wake reports is let go first. Answered in the wait set's order,
+            // the forwarding endpoint — its first slot — came before them, and a client arriving in
+            // the same wake as others' closes was refused `WouldBlock` with the slots it needed
+            // about to be freed (found by `boot-probe`'s paced pair, administration Part E.4a).
+            let mut resolves = false;
             for j in 0..waited as usize {
                 // SAFETY: `waited` records were written; the handle is the first word of each.
                 let h = unsafe {
@@ -1585,9 +1597,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
                 };
                 if h == b.serve_end {
-                    b.serve_resolve();
+                    resolves = true;
                 } else if h == b.notif {
                     b.drain_notifications();
+                } else if h == control {
+                    // Nothing to save on the way out: every write to the policy file is made whole
+                    // before it is answered, as `auth-service`'s to the users file are.
+                    match libkern::control::recv(control) {
+                        libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
+                            kprint(b"view-broker: asked to stop, exiting\n");
+                            exit(0);
+                        }
+                        libkern::control::Control::Closed => control = 0,
+                        _ => {}
+                    }
                 } else if let Some(i) = b.supervisors.iter().position(|&s| s == h) {
                     b.serve_supervisor(i);
                 } else if let Some(i) = b.endpoints.iter().position(|&(ch, _, _)| ch == h) {
@@ -1607,6 +1630,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                         Ok(None) => {}
                     }
                 }
+            }
+            if resolves {
+                b.serve_resolve();
             }
         }
         b.run_due();

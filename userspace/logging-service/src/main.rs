@@ -39,13 +39,14 @@ const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 /// The most per-principal log channels the server reads from at once.
 ///
-/// **Derived, not chosen**: the server waits on one set holding the serving endpoint plus
-/// every source, so the ceiling is the kernel's fan-out limit less that one slot. Written
+/// **Derived, not chosen**: the server waits on one set holding the serving endpoint, the control
+/// channel (administration Part E.4) and every source, so the ceiling is the kernel's fan-out
+/// limit less those two slots. Written
 /// this way rather than restating the number so that raising [`MAX_WAIT_HANDLES`] moves it
 /// — this and `fs-server-ext4`'s session cap were separately-written `7`s until Slice C3.
 /// Escaping the limit rather than raising it is `TODO(server-fanout)`; see
 /// `docs/architecture/logging.md`.
-const MAX_SOURCES: usize = MAX_WAIT_HANDLES - 1;
+const MAX_SOURCES: usize = MAX_WAIT_HANDLES - 2;
 /// `KError::PeerClosed` — the writer of a source channel is gone. Distinguished from
 /// `WouldBlock` because the two demand opposite responses: wait again, or stop waiting
 /// **forever**. See [`drain_source`].
@@ -548,23 +549,30 @@ fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &m
 
 /// The serve loop: multi-wait on the serving endpoint + every per-principal channel;
 /// forwarded resolves mint channels, log appends are stamped and sunk. Never returns.
-fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
+///
+/// **It exits on `CTRL_OP_SHUTDOWN`** (administration Part E.4), after sinking every record
+/// already queued: a shutdown asks the services in the reverse of their start order, so by then
+/// everything started after the log has said its last. `service --stop` never sends it, since
+/// the log is `essential`.
+fn serve_loop(serve_end: u64, mut control: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
     kprint(b"logging-service: serving\n");
     let mut sources: Vec<Source> = Vec::new();
     let mut dead: Vec<u64> = Vec::new();
     let mut seq: u64 = 0;
     loop {
-        // Build the wait set: [serve_end] + each source read end.
+        // Build the wait set: [serve_end, control] + each source read end.
         let n_src = sources.len();
+        let first = if control != 0 { 2 } else { 1 };
         // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots, and `n_src` is capped at
-        // MAX_SOURCES, so `1 + n_src <= MAX_WAIT_HANDLES` by construction.
+        // MAX_SOURCES, so `2 + n_src <= MAX_WAIT_HANDLES` by construction.
         unsafe {
             WAIT_HANDLES[0] = serve_end;
+            WAIT_HANDLES[1] = control;
             for i in 0..n_src {
-                WAIT_HANDLES[1 + i] = sources[i].handle;
+                WAIT_HANDLES[first + i] = sources[i].handle;
             }
         }
-        let count = 1 + n_src;
+        let count = first + n_src;
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count`.
         let waited = unsafe {
             syscall4(
@@ -593,6 +601,18 @@ fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
                 // Drain every queued forwarded resolve.
                 while recv(serve_end) == 0 {
                     process_resolve(serve_end, &mut sources);
+                }
+            } else if h == control {
+                match libkern::control::recv(control) {
+                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
+                        for s in &sources {
+                            drain_source(s.handle, &sources, sinks, &mut seq);
+                        }
+                        kprint(b"logging-service: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    libkern::control::Control::Closed => control = 0,
+                    _ => {}
                 }
             } else if drain_source(h, &sources, sinks, &mut seq) {
                 dead.push(h);
@@ -630,7 +650,7 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     sinks.push(Box::new(SerialSink));
     sinks.push(Box::new(RingSink { buf: VecDeque::new() }));
-    serve_loop(serve_end, &mut sinks);
+    serve_loop(serve_end, control, &mut sinks);
 }
 
 #[panic_handler]
