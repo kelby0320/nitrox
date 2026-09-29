@@ -20,7 +20,8 @@
 //! - `tier`, `level`, and `message` — the last two the emitter's claim.
 //!
 //! **What the ring no longer holds is said**, on stderr: it keeps the most recent records, so a
-//! machine up long enough has dropped its first.
+//! machine up long enough has dropped its first — and a ring busy enough can drop some while `log`
+//! reads it, which is said too (PR #344 review).
 
 #![no_std]
 #![no_main]
@@ -36,7 +37,7 @@ use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
 use libkern::error::KError;
 use libkern::{exit, kprint};
-use librsproto::log::{OP_LOG_READ, ReadRecord, level_name, parse_read_reply, read_request, tier_name};
+use librsproto::log::{OP_LOG_READ, ReadRecord, dropped, level_name, parse_read_reply, read_request, tier_name};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -123,9 +124,14 @@ fn read(stage: &Stage, session: u64, principal: Option<&str>, out: &mut Out) -> 
             stage.diag(b"log: the logging service's answer did not read\n");
             return EXIT_FAILURE;
         };
-        if after == 0 && reply.oldest > 1 {
-            let dropped = format!("log: the {} oldest records are no longer kept\n", reply.oldest - 1);
-            stage.diag(dropped.as_bytes());
+        let lost = dropped(after, reply.oldest);
+        if lost != 0 {
+            let said = if after == 0 {
+                format!("log: the {lost} oldest records are no longer kept\n")
+            } else {
+                format!("log: {lost} records were dropped from the ring while it was read\n")
+            };
+            stage.diag(said.as_bytes());
         }
         if reply.count == 0 {
             return EXIT_OK;

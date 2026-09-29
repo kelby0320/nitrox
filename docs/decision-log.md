@@ -31545,3 +31545,66 @@ The full local gate set, 34, is green (fgb45).
 
 **ABI:** no hash impact. A new rsproto op and its bodies are not hash inputs, and no kernel type
 changes.
+
+## 2026-09-29 — Parts E.5 and E.6, reviewed (PR #344): every record the ring keeps is one a reply can carry
+
+The review found one blocking problem, two worth fixing and two optional; all are taken. The
+clock half had nothing to fix: the reviewer read the `SYSTEM_CLOCK` chain end to end and broke the
+encoder five ways, each caught.
+
+**Blocking — a record with an empty source stopped every reader at it.**
+- **What happened:**
+  - `parse_append` reads a source flagged present with length `0` as `Some(&[])`, and the ring kept
+    it that way.
+  - The reply writer refuses a present, empty source, since an empty `source_len` on the wire
+    means none.
+  - `reply_records` took any refusal for a full reply. So every `Read` came back empty at that
+    record, and `log` called it the end of the ring.
+- **Reproduced by the reviewer:** one such record among fifty; a reader saw one and stopped.
+  Anything holding a log channel could send one, through `liblog::log_source` with `""` or a raw
+  append.
+- **Fixed for the class: everything the ring keeps is servable.**
+  - `Ring::push` keeps a present, empty source as none.
+  - At ingest, `claimed_source` reads an empty claim as no claim, so it falls back to the channel's
+    label as no claim does.
+  - **The reply's loop moved into the library**, as `Ring::fill_reply`, where the host tests reach
+    it. The reviewer had to copy it to test it.
+  - A record the writer refuses into an **empty** reply is passed over rather than stopping there.
+    `push` keeps nothing like that, but one kept around `push` would otherwise hide everything
+    after it.
+- **The test takes the service's path:** an append encoded, parsed, its source claimed, kept, and
+  read back as `log` reads, all fifty.
+- **Controls, each failing the test:** neither normalisation; `push`'s alone removed; the claim's
+  alone removed; and the pass-over removed, with an unservable record placed around `push`.
+
+**Worth fixing — the budget counted length, not allocation.**
+- A message cut from about 4 KB kept its 4 KB, and the ring counted 1 KB for it. A ring of long
+  lines could occupy four times its megabyte.
+- **Fixed:** `cut` calls `shrink_to_fit`, and `Ring::cost` counts capacity.
+- **Still not counted:** the heap's size classes round a string under 2 KiB up to the next power
+  of two, so what the ring occupies can reach twice its budget. `RING_BUDGET`'s doc now says so.
+- A test cuts a 3.9 KB message and asserts what it keeps; without `shrink_to_fit` it fails.
+
+**Worth fixing — the reader's empty-principal guard was untested.**
+- The test zeroed `principal_len` in place. That moved every string boundary after it, so the
+  whole-body check refused the reply before the guard was reached.
+- **Fixed:** the mutation now hands the principal's bytes to the message, so every length still
+  adds up and only the guard can refuse it. With the guard removed, the test now fails.
+- Its sibling mutations each break a check of their own. The reviewer broke those checks too, and
+  each was caught.
+
+**Optional, taken — `log` reported drops only at the start of a read.**
+- A ring busy enough can drop records while it is read.
+- `librsproto::log::dropped(after, oldest)` is the gap, host-tested at its edges. `log` checks it
+  on every reply, and says which kind of drop it was.
+
+**Optional, taken — the warning about `nxsh`'s pass-through now sits where spawners look:**
+`libsession::spawn_leader`'s doc and `graphical-session.md`'s leader table. Giving `nxsh` a
+capability gives it to every command typed at it.
+
+**Docs:** `rsproto-log-ops.md` (the empty source, and drops mid-read), `logging.md`'s ring,
+`shell-language.md`'s `log`, and the two above.
+
+The full local gate set, 34, is green (fgb46).
+
+**ABI:** no hash impact.

@@ -206,10 +206,10 @@ Each stamped record routes to an ordered set of sinks behind one `Sink` trait
 
 - **Serial** — formats the record to a line and emits it (via `sys_kprint`), so logs are
   visible on the console as the stub did, now structured and stamped.
-- **In-memory ring** — the most recent records, bounded by a megabyte rather than a count, which
-  `Log::Read` answers from (administration Part E.6; [Reading it back](#reading-it-back)). It
-  keeps a message's first kilobyte. It is not a `Sink`: the service holds it beside them, since
-  `Read` must reach it.
+- **In-memory ring** — the most recent records, bounded by a megabyte of what they have allocated
+  rather than by a count (the heap's size classes can round that up to twice), which `Log::Read`
+  answers from (administration Part E.6; [Reading it back](#reading-it-back)). It keeps a message's
+  first kilobyte. It is not a `Sink`: the service holds it beside them, since `Read` must reach it.
 
 **Deferred — persistent DB on disk** (needs fs-server *write*, a later Phase-3 slice)
 and **network** (needs netstack). Both slot in behind the same `Sink` trait; sequencing

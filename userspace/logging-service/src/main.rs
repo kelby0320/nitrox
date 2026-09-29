@@ -29,13 +29,11 @@ use alloc::vec::Vec;
 
 use libkern::*;
 use librsproto::error::error_body;
-use librsproto::log::{
-    LEVEL_INFO, OP_LOG_READ, ReadRecord, ReadReplyWriter, level_name, parse_append, parse_read_request,
-};
+use librsproto::log::{LEVEL_INFO, OP_LOG_READ, level_name, parse_append, parse_read_request};
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, RS_HEADER_LEN, decode, encode};
 use logging_service::path::{self, tier_name};
-use logging_service::ring::{NAME_MAX, Record, Ring};
+use logging_service::ring::{NAME_MAX, Record, Ring, claimed_source};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -517,35 +515,15 @@ fn serve_read_session(h: u64, ring: &Ring) -> bool {
     }
 }
 
-/// Answer a `Read`: the records after `after`, oldest first, as many as one reply holds and no more
-/// than `max` (`0` for no limit). None left is an empty reply, which is how a reader knows it has
-/// read to the end. Every record fits an empty reply ([`logging_service::ring::MESSAGE_KEPT`]), so
-/// a reply that has any to give gives at least one.
+/// Answer a `Read`: the records after `after`, oldest first, as many as one reply holds and no
+/// more than `max` (`0` for no limit) — [`Ring::fill_reply`]. None left is an empty reply, which is
+/// how a reader knows it has read to the end.
 fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
     // SAFETY: READ_BODY is this single-threaded service's scratch, used by no one else.
     let body = unsafe { &mut *(&raw mut READ_BODY) };
-    let Some(mut w) = ReadReplyWriter::new(body, ring.oldest()) else {
+    let Some(len) = ring.fill_reply(after, max, body) else {
         return reply_error(to, request_id, OP_LOG_READ, KError::KernelError.as_i32());
     };
-    for r in ring.after(after) {
-        if max != 0 && w.count() >= max {
-            break;
-        }
-        let rec = ReadRecord {
-            sequence: r.sequence,
-            time: r.time,
-            timestamp: r.timestamp,
-            tier: r.tier,
-            level: r.level,
-            principal: r.principal.as_bytes(),
-            source: r.source.as_deref().map(str::as_bytes),
-            message: r.message.as_bytes(),
-        };
-        if !w.push(&rec) {
-            break;
-        }
-    }
-    let len = w.finish();
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24, and READ_BODY is
     // not REPLY_MSG.
     let rs_len = unsafe {
@@ -702,12 +680,7 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
             None => continue, // malformed record: drop
         };
         let message = String::from(core::str::from_utf8(la.message).unwrap_or("<non-utf8>"));
-        // A record's own `source` wins; otherwise the channel's named-source label.
-        let source = la
-            .source
-            .map(|s| String::from(core::str::from_utf8(s).unwrap_or("?")))
-            .or_else(|| chan_label.clone());
-        log.record(principal.clone(), tier, la.level, message, source);
+        log.record(principal.clone(), tier, la.level, message, claimed_source(la.source, &chan_label));
     }
     false // drained, still live
 }

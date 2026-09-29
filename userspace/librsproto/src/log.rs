@@ -351,6 +351,16 @@ pub fn parse_read_reply(body: &[u8]) -> Option<ReadReply<'_>> {
     (off == records.len()).then_some(ReadReply { oldest, count, records })
 }
 
+/// **How many records a reader lost** between the last sequence it read, `after`, and a reply
+/// whose ring now starts at `oldest` — `0` when none were (PR #344 review). A ring drops only its
+/// oldest and numbers every record, so what lies between is exactly what was dropped: from the
+/// start of a read (`after` `0`) the records before the oldest, and in the middle of one those the
+/// ring dropped while it was being read. An empty ring (`oldest` `0`) has lost nothing a reader
+/// could have been given.
+pub fn dropped(after: u64, oldest: u64) -> u64 {
+    oldest.saturating_sub(after.saturating_add(1))
+}
+
 impl<'a> ReadReply<'a> {
     /// The records, oldest first.
     pub fn records(&self) -> ReadRecords<'a> {
@@ -485,6 +495,19 @@ mod tests {
         assert_eq!(w.count(), 0);
     }
 
+    /// **What a reader lost**, at the start of a read and in the middle of one, and at the edges:
+    /// the next record exactly, and an empty ring.
+    #[test]
+    fn dropped_is_the_gap_before_the_oldest() {
+        assert_eq!(dropped(0, 1), 0); // from the start, nothing dropped yet
+        assert_eq!(dropped(0, 41), 40); // from the start, the first 40 gone
+        assert_eq!(dropped(7, 8), 0); // mid-read, the next one is the oldest: none lost
+        assert_eq!(dropped(7, 12), 4); // mid-read, 8 to 11 dropped while reading
+        assert_eq!(dropped(7, 3), 0); // the oldest is behind where the reader is
+        assert_eq!(dropped(0, 0), 0); // an empty ring
+        assert_eq!(dropped(u64::MAX, u64::MAX), 0);
+    }
+
     /// **The request is exactly twelve bytes.**
     #[test]
     fn a_read_request_of_any_other_length_is_refused() {
@@ -516,7 +539,19 @@ mod tests {
         refused(&|b| super::put_u32(b, 4, 1), "a reserved flag set");
         refused(&|b| super::put_u16(b, first + 26, 0xFFFF), "a principal length past the body");
         refused(&|b| super::put_u16(b, first + 30, 0xFFFF), "a message length past the body");
-        refused(&|b| super::put_u16(b, first + 26, 0), "an empty principal");
+        // **An empty principal, in a record otherwise well formed** (PR #344 review): the
+        // principal's bytes are handed to the message, so every length still adds up and only the
+        // principal guard can refuse it. Zeroing the length alone moved every boundary after it,
+        // and the whole-body check refused that before the guard was asked.
+        refused(
+            &|b| {
+                let plen = super::get_u16(b, first + 26);
+                let mlen = super::get_u16(b, first + 30);
+                super::put_u16(b, first + 26, 0);
+                super::put_u16(b, first + 30, mlen + plen);
+            },
+            "an empty principal",
+        );
         refused(&|b| super::put_u64(b, first, 9), "a sequence that does not rise");
         refused(&|b| super::put_u64(b, first, 0), "a sequence of 0");
         // A count of u32::MAX over a short body must stop at the body, not loop four billion

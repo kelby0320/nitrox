@@ -292,6 +292,11 @@ Both supervisors run the same five steps. Only the first and last differ.
 | 4. spawn the leader | `/bin/nxsh`, `syscaps: 0` | `/bin/desktop-shell`, `BIND_NAMESPACE` |
 | 5. reap, tear down, re-present | close ns, close tty, re-prompt | close ns, destroy windows, re-present greeter |
 
+**`nxsh`'s `syscaps: 0` is load-bearing for every command in the session**: since administration
+Part E.5, `nxsh` passes each stage it spawns whatever capabilities it holds, so giving it one gives
+that one to everything typed at it. That is how `with admin nxsh` is a shell whose `date --set`
+works; for a leader it would put the capability in every command a person runs.
+
 Steps 2–4 are the same logic against different arguments, which is what
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 7 factors into a shared crate.
 **The split follows Linux's PAM precedent** — shared library, separate supervisors — and it has a

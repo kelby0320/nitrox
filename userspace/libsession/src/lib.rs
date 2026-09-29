@@ -1246,7 +1246,10 @@ pub fn session_env() -> libstream::wire::Record {
 /// shell could not be spawned. This is the login's payoff: an unprivileged process in a
 /// per-user namespace, reaped by session-mgr.
 /// **`syscaps` is the caller's to choose, and the two columns choose differently.** The serial
-/// leader gets `0` — `nxsh` is a sandboxed user shell and holds nothing. The graphical leader
+/// leader gets `0` — `nxsh` is a sandboxed user shell and holds nothing. **And `0` is what every
+/// command in the session gets** (PR #344 review): since administration Part E.5 `nxsh` passes
+/// each stage it spawns whatever it holds, so a capability given to it here is given to all of
+/// them. The graphical leader
 /// gets `SYSCAP_BIND_NAMESPACE`, because `desktop-shell` constructs a namespace per application
 /// it launches: `ui-composition-model.md` §5a rests the guarantee that "an application cannot
 /// compose other applications" on the shell being the process that built them.

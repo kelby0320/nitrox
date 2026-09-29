@@ -78,11 +78,16 @@ Each record:
 - **None left is an empty reply**, `count` `0`. That is how a reader knows it has read to the end,
   so a reader asks again after the last sequence it was given until one comes back empty.
 - **`oldest` says what was dropped.** The ring keeps the most recent records, bounded at a
-  megabyte; a reader asking from `0` whose first reply says `oldest` is past `1` has lost
-  `oldest - 1` records to it.
+  megabyte, and numbers every record, so a reader that last read `after` and is answered with
+  `oldest` past `after + 1` lost what lies between: from the start of a read, the records before
+  the oldest; in the middle of one, those the ring dropped while it was read.
+  `librsproto::log::dropped` is that arithmetic, and `log` says either on stderr.
 - **Every kept record fits an empty reply**: the ring keeps a message's first 1024 bytes, cut on
-  a character boundary and ending in `…`, and a principal and a source are at most 64. So a reply
-  with anything to give holds at least one record. The serial console has every message whole.
+  a character boundary and ending in `…`, a principal and a source are at most 64, and a source
+  claimed empty is kept as none, since an empty `source_len` means no source. So a reply with
+  anything to give holds at least one record. Until the PR #344 review an empty source claim was
+  kept as it came, which no reply could carry, and every `Read` stopped at it. The serial console
+  has every message whole.
 - **`time` can step** — the clock can be set (administration Part E.5) — so `sequence` is the
   order. A record is dropped from the ring only as the oldest, so sequences are never reused.
 
