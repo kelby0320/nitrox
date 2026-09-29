@@ -310,6 +310,29 @@ fn send_control(ctrl: u64, op: u8) {
     }
 }
 
+/// Tell `init` to finish a shutdown, on the terminal channel (administration Part E.4):
+/// `TERMINAL_OP_FINISH`, then whether to reboot.
+fn send_finish(terminal: u64, reboot: bool) {
+    if terminal == 0 {
+        kprint(b"service-mgr: no terminal channel, so init cannot be told to finish\n");
+        return;
+    }
+    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; a two-byte payload and no handles.
+    unsafe {
+        (&raw mut SEND_MSG.header.payload_len).write(2);
+        (&raw mut SEND_MSG.payload[0]).write(TERMINAL_OP_FINISH);
+        (&raw mut SEND_MSG.payload[1]).write(reboot as u8);
+        syscall5(
+            SYS_CHANNEL_SEND,
+            terminal,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        );
+    }
+}
+
 /// Read + parse the service declarations, **from the root filesystem** at
 /// `/system/services.toml` (administration Part E.1c; the initramfs's `etc/services.toml` until
 /// then). `init` has mounted the root before it spawns this process, and there the file can be
@@ -841,6 +864,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         after_until: None,
         halted: false,
         reported: false,
+        shutdown: None,
     };
     // **A file that has lost its critical servers starts nothing** (PR #340 review, finding 2):
     // with no declarations, or none critical, bring-up would go straight to a login chain with no
@@ -1183,8 +1207,38 @@ enum Awaits {
 }
 
 /// How long a stopped service has to exit before its stop is answered "asked, and still
-/// running". There is no forcible kill; a stop is a request.
+/// running", unless its declaration says (`stop_timeout`). There is no forcible kill; a stop is a
+/// request.
 const STOP_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// How long the login supervisors have, at shutdown, to end their sessions and exit. Each gives its
+/// session's leader a bound of its own first, so this is the longer.
+const SESSIONS_TIMEOUT_NS: u64 = 10_000_000_000;
+
+/// How long each service has, at shutdown, to exit once asked, **unless its declaration says**
+/// (`stop_timeout`). Shorter than a `service --stop`'s: no person waits on the answer, and a
+/// service that does not honour it holds up only the stop. A service whose stop is real work —
+/// the storage service, writing back every filesystem it mounted — declares its own (PR #343
+/// review): past this bound `init` would stop the machine mid-write.
+const SHUTDOWN_STOP_NS: u64 = 3_000_000_000;
+
+/// **A shutdown under way** (administration Part E.4b): whether it ends in a reboot, and what it
+/// waits for now. Its order is [`service_mgr::shutdown`]'s.
+struct Shutdown {
+    reboot: bool,
+    stage: Stage,
+}
+
+/// Where a shutdown has got to. Each wait is a deadline in the one loop, as every wait here is.
+#[derive(Copy, Clone)]
+enum Stage {
+    /// The login supervisors have been asked to end their sessions, and have until `until`.
+    Sessions { until: u64 },
+    /// Service `i` has been asked to stop, and has until `until`.
+    Service { i: usize, until: u64 },
+    /// `init` has been told to finish: its own filesystems, then the machine.
+    Finished,
+}
 
 /// **What serves `/svc/services`** (administration Part E.2): its own endpoint, bound there in the
 /// root; the admin endpoints minted from it, and the admin sessions opened on those.
@@ -1198,6 +1252,10 @@ struct Services {
     session_serve: u64,
     admin_ends: alloc::vec::Vec<u64>,
     admin_sessions: alloc::vec::Vec<u64>,
+    /// **The power endpoints and sessions** (Part E.4b): a session opened on one takes `Shutdown`
+    /// and nothing else.
+    power_ends: alloc::vec::Vec<u64>,
+    power_sessions: alloc::vec::Vec<u64>,
 }
 
 /// One supervised service: its declaration, its child, and the state the restart
@@ -1277,6 +1335,8 @@ struct Mgr {
     halted: bool,
     /// Whether the supervised list has been reported.
     reported: bool,
+    /// A shutdown under way, once one is asked for.
+    shutdown: Option<Shutdown>,
 }
 
 impl Mgr {
@@ -1305,6 +1365,9 @@ impl Mgr {
                 for &h in self.services.admin_ends.iter().chain(&self.services.admin_sessions) {
                     push(h);
                 }
+                for &h in self.services.power_ends.iter().chain(&self.services.power_sessions) {
+                    push(h);
+                }
                 for s in &self.svcs {
                     if s.running && matches!(s.phase, Phase::Starting { .. }) {
                         push(s.ctrl);
@@ -1329,6 +1392,7 @@ impl Mgr {
             drain_codes(self.notif, &mut codes);
             self.poll(&mut codes);
             self.due();
+            self.shutdown_step();
             // Anything left belongs to a child this manager does not supervise — the login
             // supervisors, whose exits reach this same channel. Reported rather than dropped.
             for code in codes {
@@ -1346,6 +1410,10 @@ impl Mgr {
             if let Awaits::Exit { until, .. } = h.awaits {
                 d = d.min(until);
             }
+        }
+        match self.shutdown.as_ref().map(|s| s.stage) {
+            Some(Stage::Sessions { until } | Stage::Service { until, .. }) => d = d.min(until),
+            _ => {}
         }
         for s in &self.svcs {
             if let Phase::Starting { deadline } = s.phase {
@@ -1994,8 +2062,72 @@ impl Mgr {
         services::table(&rows)
     }
 
-    /// Answer everything queued on `/svc/services`, its admin endpoints and their sessions.
+    /// Answer everything queued on `/svc/services`, its admin and power endpoints and their
+    /// sessions.
+    ///
+    /// **Sessions, then endpoints, then resolves**, so that a slot a closed channel frees is free
+    /// before a new one is asked for in the same wake: a session before an endpoint opens another,
+    /// and an endpoint before `/svc/services` mints another. Answered the other way round, a
+    /// `power-endpoint` resolve arriving with its last holder's close was refused `WouldBlock` with
+    /// the one slot about to be freed — the view broker's own race, found by `boot-probe` in
+    /// administration Part E.4a.
     fn serve_services(&mut self) {
+        let mut k = 0;
+        while k < self.services.admin_sessions.len() {
+            let session = self.services.admin_sessions[k];
+            match recv_request(session) {
+                Ok(Some((op, request_id, body))) => self.admin_request(session, op, request_id, &body),
+                Ok(None) => k += 1,
+                Err(()) => {
+                    close(session);
+                    self.services.admin_sessions.remove(k);
+                    // **What it asked goes on, unanswered.** Dropping the request instead would
+                    // drop a restart's start with its answer, and leave the service stopped.
+                    for h in self.held.iter_mut().filter(|h| h.session == session) {
+                        h.session = 0;
+                    }
+                }
+            }
+        }
+        let mut k = 0;
+        while k < self.services.power_sessions.len() {
+            let session = self.services.power_sessions[k];
+            match recv_request(session) {
+                Ok(Some((op, request_id, body))) => self.power_request(session, op, request_id, &body),
+                Ok(None) => k += 1,
+                // A shutdown already asked goes on: it was answered when it began.
+                Err(()) => {
+                    close(session);
+                    self.services.power_sessions.remove(k);
+                }
+            }
+        }
+        let mut k = 0;
+        while k < self.services.admin_ends.len() {
+            let end = self.services.admin_ends[k];
+            match recv_request(end) {
+                Ok(Some((op, request_id, _))) => self.open_admin_session(end, op, request_id),
+                Ok(None) => k += 1,
+                // Its holder has gone: the broker, or a view with the grant, and every view made
+                // from it.
+                Err(()) => {
+                    close(end);
+                    self.services.admin_ends.remove(k);
+                }
+            }
+        }
+        let mut k = 0;
+        while k < self.services.power_ends.len() {
+            let end = self.services.power_ends[k];
+            match recv_request(end) {
+                Ok(Some((op, request_id, _))) => self.open_power_session(end, op, request_id),
+                Ok(None) => k += 1,
+                Err(()) => {
+                    close(end);
+                    self.services.power_ends.remove(k);
+                }
+            }
+        }
         let root = self.services.serve;
         while root != 0 {
             match recv_request(root) {
@@ -2019,37 +2151,6 @@ impl Mgr {
                     self.answer_resolve(session, op, request_id, &body, true)
                 }
                 _ => break,
-            }
-        }
-        let mut k = 0;
-        while k < self.services.admin_ends.len() {
-            let end = self.services.admin_ends[k];
-            match recv_request(end) {
-                Ok(Some((op, request_id, _))) => self.open_admin_session(end, op, request_id),
-                Ok(None) => k += 1,
-                // Its holder has gone: the broker, or a view with the grant, and every view made
-                // from it.
-                Err(()) => {
-                    close(end);
-                    self.services.admin_ends.remove(k);
-                }
-            }
-        }
-        let mut k = 0;
-        while k < self.services.admin_sessions.len() {
-            let session = self.services.admin_sessions[k];
-            match recv_request(session) {
-                Ok(Some((op, request_id, body))) => self.admin_request(session, op, request_id, &body),
-                Ok(None) => k += 1,
-                Err(()) => {
-                    close(session);
-                    self.services.admin_sessions.remove(k);
-                    // **What it asked goes on, unanswered.** Dropping the request instead would
-                    // drop a restart's start with its answer, and leave the service stopped.
-                    for h in self.held.iter_mut().filter(|h| h.session == session) {
-                        h.session = 0;
-                    }
-                }
             }
         }
     }
@@ -2080,6 +2181,20 @@ impl Mgr {
                     close(ours);
                 }
             }
+            services::Asked::PowerEndpoint => {
+                if self.services.power_ends.len() >= services::MAX_POWER_ENDPOINTS {
+                    return reply_error(from, resolve, request_id, KError::WouldBlock);
+                }
+                let Some((client, ours)) = make_channel(4) else {
+                    return reply_error(from, resolve, request_id, KError::KernelError);
+                };
+                if reply_channel(from, request_id, client) {
+                    self.services.power_ends.push(ours);
+                    kprint(b"service-mgr: a power endpoint minted\n");
+                } else {
+                    close(ours);
+                }
+            }
             services::Asked::Unknown => reply_error(from, resolve, request_id, KError::NotFound),
         }
     }
@@ -2103,9 +2218,177 @@ impl Mgr {
         }
     }
 
+    /// A resolve on a power endpoint: whatever its suffix, a power session.
+    fn open_power_session(&mut self, end: u64, op: u16, request_id: u64) {
+        let resolve = librsproto::OP_NS_RESOLVE;
+        if op != resolve {
+            return reply_error(end, op, request_id, KError::Unsupported);
+        }
+        if self.services.power_sessions.len() >= services::MAX_POWER_SESSIONS {
+            return reply_error(end, resolve, request_id, KError::WouldBlock);
+        }
+        let Some((client, ours)) = make_channel(4) else {
+            return reply_error(end, resolve, request_id, KError::KernelError);
+        };
+        if reply_channel(end, request_id, client) {
+            self.services.power_sessions.push(ours);
+        } else {
+            close(ours);
+        }
+    }
+
+    /// `Shutdown`, on power session `session`: answered as soon as it has begun, since nothing
+    /// comes back after it, and refused while one is under way. A power session asks for nothing
+    /// else.
+    fn power_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
+        use librsproto::services::{OP_SERVICES_SHUTDOWN, parse_shutdown};
+        if op != OP_SERVICES_SHUTDOWN {
+            let why = b"a power session asks for a shutdown and nothing else";
+            return refuse(session, op, request_id, KError::NoAccess, why);
+        }
+        let Some(reboot) = parse_shutdown(body) else {
+            let why = b"a shutdown's body is one byte, to halt or to reboot";
+            return refuse(session, op, request_id, KError::InvalidArgument, why);
+        };
+        if self.shutdown.is_some() {
+            return refuse(session, op, request_id, KError::WouldBlock, b"a shutdown is under way");
+        }
+        reply_ok(session, op, request_id);
+        self.begin_shutdown(reboot);
+    }
+
+    /// **Begin a shutdown**: nothing more starts, every waiting request is refused, and the login
+    /// supervisors are asked to end their sessions — the first of [`service_mgr::shutdown`]'s
+    /// steps. [`shutdown_step`](Self::shutdown_step) takes the rest as each is done.
+    fn begin_shutdown(&mut self, reboot: bool) {
+        kprint(if reboot {
+            b"service-mgr: shutting down, to reboot, as asked\n"
+        } else {
+            b"service-mgr: shutting down, as asked\n"
+        });
+        // Nothing more starts — not bring-up, not a policy's restart — and whatever exits from here
+        // was asked to.
+        self.halted = true;
+        for s in &mut self.svcs {
+            s.restart_at = None;
+            s.requested_shutdown = true;
+        }
+        // **Every request waiting is refused**: a restart's start in particular must not run.
+        for h in core::mem::take(&mut self.held) {
+            refuse(h.session, h.op, h.request_id, KError::WouldBlock, b"the machine is shutting down");
+        }
+        // The sessions first. Each supervisor passes the request on to its session's leader, closes
+        // the session at the broker, and exits; its control channel closing is how that is seen.
+        kprint(b"service-mgr: asking the login supervisors to end their sessions\n");
+        for k in [0, 2] {
+            // SAFETY: single-threaded; the supervisors' slots.
+            let h = unsafe { SUPERVISORS[k] };
+            if h != 0 {
+                // SAFETY: a register-only syscall on a process handle this manager holds.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, h) };
+            }
+        }
+        let until = now_ns().saturating_add(SESSIONS_TIMEOUT_NS);
+        self.shutdown = Some(Shutdown { reboot, stage: Stage::Sessions { until } });
+    }
+
+    /// **Take a shutdown as far as it can go now**: past the sessions once both supervisors have
+    /// exited, past a service once it has exited, each at the latest when its bound runs out —
+    /// a stop is a request, and one not honoured holds up only the machine's stop. Then `init` is
+    /// told to finish.
+    fn shutdown_step(&mut self) {
+        let Some((reboot, stage)) = self.shutdown.as_ref().map(|s| (s.reboot, s.stage)) else {
+            return;
+        };
+        let now = now_ns();
+        let below = match stage {
+            Stage::Sessions { until } => {
+                // SAFETY: single-threaded; the supervisors' slots.
+                let gone = |k: usize| {
+                    let c = unsafe { SUPERVISORS[k] };
+                    c == 0 || channel_peer_closed(c)
+                };
+                let (text, desktop) = (gone(1), gone(3));
+                if !(text && desktop) && now < until {
+                    return;
+                }
+                if text && desktop {
+                    kprint(b"service-mgr: the sessions have ended\n");
+                } else {
+                    let mut l = Line::new();
+                    l.s(b"service-mgr: still running after the sessions' bound:");
+                    if !text {
+                        l.s(b" session-mgr");
+                    }
+                    if !desktop {
+                        l.s(b" desktop-session-mgr");
+                    }
+                    l.s(b" -- the shutdown goes on").end();
+                }
+                self.svcs.len()
+            }
+            Stage::Service { i, until } => {
+                if self.svcs[i].running && now < until {
+                    return;
+                }
+                if self.svcs[i].running {
+                    Line::new()
+                        .s(b"service-mgr: '")
+                        .s(self.svcs[i].decl.name.as_bytes())
+                        .s(b"' is still running after it was asked to stop -- the shutdown goes on")
+                        .end();
+                }
+                i
+            }
+            Stage::Finished => return,
+        };
+        let running: alloc::vec::Vec<bool> = self.svcs.iter().map(|s| s.running).collect();
+        let mut below = below;
+        let next = loop {
+            match service_mgr::shutdown::next_to_stop(&running, below) {
+                Some(i) if self.svcs[i].ctrl == 0 => {
+                    Line::new()
+                        .s(b"service-mgr: '")
+                        .s(self.svcs[i].decl.name.as_bytes())
+                        .s(b"' has no control channel to ask on -- passed over")
+                        .end();
+                    below = i;
+                }
+                other => break other,
+            }
+        };
+        let stage = match next {
+            Some(i) => {
+                Line::new()
+                    .s(b"service-mgr: asking '")
+                    .s(self.svcs[i].decl.name.as_bytes())
+                    .s(b"' to stop, for the shutdown")
+                    .end();
+                send_control(self.svcs[i].ctrl, CTRL_OP_SHUTDOWN);
+                let bound = self.svcs[i].decl.stop_timeout.unwrap_or(SHUTDOWN_STOP_NS);
+                Stage::Service { i, until: now.saturating_add(bound) }
+            }
+            None => {
+                kprint(b"service-mgr: every service has been asked to stop; telling init to finish\n");
+                send_finish(self.terminal, reboot);
+                Stage::Finished
+            }
+        };
+        if let Some(s) = self.shutdown.as_mut() {
+            s.stage = stage;
+        }
+    }
+
     /// `Start`, `Stop` or `Restart`, on admin session `session`: refused now, or answered once it
     /// has happened.
     fn admin_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
+        if op == librsproto::services::OP_SERVICES_SHUTDOWN {
+            let why = b"a shutdown is asked on a power session, which the `power` grant opens";
+            return refuse(session, op, request_id, KError::NoAccess, why);
+        }
+        if self.shutdown.is_some() {
+            return refuse(session, op, request_id, KError::WouldBlock, b"the machine is shutting down");
+        }
         let named = |n: &str| self.svcs.iter().position(|s| s.decl.name == n);
         let found = core::str::from_utf8(body).ok().and_then(named);
         let facts = found.map(|i| {
@@ -2156,7 +2439,8 @@ impl Mgr {
                 let s = &mut self.svcs[i];
                 s.requested_shutdown = true;
                 s.restart_at = None;
-                let until = now_ns().saturating_add(STOP_TIMEOUT_NS);
+                let bound = self.svcs[i].decl.stop_timeout.unwrap_or(STOP_TIMEOUT_NS);
+                let until = now_ns().saturating_add(bound);
                 let awaits = Awaits::Exit { then_start, until };
                 self.held.push(Held { session, request_id, op, svc: i, awaits });
             }

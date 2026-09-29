@@ -193,7 +193,11 @@ nothing still holding a file of it (`sys_ns_held`). After the reply it flushes t
 `test-qemu` run, against the test image's scratch filesystem.
 
 **A filesystem server keeps its control channel after `Ready` for this**, and treats the peer
-closing it as ordinary. `init` closes its end as soon as a mount is bound, and never unmounts.
+closing it as ordinary. **`init` keeps its end too**, since administration Part E.4, and is the
+second sender: when a shutdown finishes, it runs `sys_ns_sync` and then `Meta::Unmount` on each of
+its own mounts, last mounted first, **without** the held check, and says what each answered. It
+builds the request and reads the answer by hand (`userspace/init/src/unmount.rs`), as it reads
+`Ready`, since `librsproto` is kept out of `init`'s build. The drive's flush is `sys_power`'s.
 
 ### A filesystem server's setup message
 

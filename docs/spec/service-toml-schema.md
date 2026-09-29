@@ -134,6 +134,18 @@ it strands them, and on a machine with no serial port leaves nothing to type at.
 terminal server, the input server and the compositor are, and the clipboard — whose clients open a
 session for each copy — is not (PR #341 review).
 
+### `stop_timeout` (optional, duration string; default: the service manager's)
+
+**Since administration Part E.4** (PR #343 review): how long the service may take to exit once asked
+to stop, at a shutdown or on `service --stop`. Absent, it is the service manager's own bound: 3 s at
+a shutdown and 5 s on `service --stop`. Past it the service manager goes on without it: a shutdown
+asks the next service, and `service --stop` says the service is still running.
+
+It is for a service whose stop does work that grows with its state. The storage service declares
+`"60s"`, because its stop writes back and unmounts every filesystem it mounted. A duration that
+does not read is the default, like `backoff_initial`'s; the first `stop_timeout` in a declaration
+is the one read.
+
 ### `before` (optional, array of strings; default `[]`)
 
 Inverse of `after`. Naming services that should be started after this one. Equivalent to those services declaring `after = [<this service>]`. Provided for ergonomic flexibility.

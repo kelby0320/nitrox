@@ -31014,3 +31014,322 @@ administration Part A.1. It is back on `sys_ns_bind` and brought up to date.
 
 **ABI:** no hash impact. It is a new refusal on an existing syscall, and no layout or discriminant
 changes.
+
+## 2026-09-29 — Administration Part E.4a: every server exits when asked, and `init` can finish a shutdown
+
+**E.4 comes in four parts**, after the maintainer's call on what must exit when asked:
+- **E.4a**: the servers, and `init`'s end.
+- **E.4b**: `service-mgr`'s sequence.
+- **E.4c**: sessions.
+- **E.4d**: the grant, `shutdown` and `check-shutdown`.
+
+**The call** came from a survey of what honoured a stop. Only the terminal server, the clipboard,
+the input server, the compositor and `heartbeat` read `CTRL_OP_SHUTDOWN`. Nothing in a session
+read a terminate request: not the login supervisors (`spawn_leader` drained it unread), not
+`nxsh`, not `desktop-shell`, not the graphical programs. So the planned "ask, wait a bounded time,
+go on" would have waited out a bound for nearly everything.
+
+The maintainer chose **services and sessions**:
+- every server a release image runs, and the login supervisors, `nxsh` and `desktop-shell`,
+  exit when asked;
+- graphical programs are not asked in E.4. Their windows go with the compositor, and asking them,
+  with unsaved work in mind, belongs with Part F's session menu.
+
+**The five `essential` servers now exit on `CTRL_OP_SHUTDOWN`**: `auth-service`,
+`logging-service`, the view broker, `device-mgr` and the storage service.
+- Each adds its control channel to its wait set through `libkern::control`, as E.2a's four did,
+  and drops it if it closes. `service --stop` still refuses all five. Only a shutdown sends the op.
+- **What each gives up:** one wait slot, from what the wait set had spare. `auth-service` loses
+  one session slot (30), the log one source (30), `device-mgr` and the storage service one
+  directory session each, and the broker's fixed slots go from 2 to 3.
+- **The log** sinks every record already queued before it exits. **The storage service** first
+  runs its unmount chain on every mount it made, last mounted first. It skips the held check, by
+  the maintainer's call: a write made after the sync is lost, as at a power cut, and the
+  filesystem is left clean.
+
+**`init` keeps each mount's control channel.** It used to close it once `Meta::Ready` came.
+- `TERMINAL_OP_FINISH`, new in `libkern::abi`, carries a reboot byte. On it, `init` unmounts its
+  own mounts, last first: `sys_ns_sync`, then `Meta::Unmount`, with no held check. It then calls
+  `sys_power` to halt or reboot.
+- Every mount is unmounted whatever the one before answered. If `sys_power` refuses, `init` says
+  so and goes on reaping, with the filesystems clean.
+- **The request and answer are hand-built** in `init::unmount`, as `init::ready` hand-parses
+  `Ready`, since `librsproto` stays out of `init`'s build. Its host tests check the request with
+  `librsproto`'s decoder, and feed the parser `fs-server-ext4`'s own replies and malformed ones.
+
+**Nothing sends the op or `Finish` yet**: that is E.4b. So E.4a was booted by hand, with a
+temporary probe in `service-mgr` (reverted). The probe waited 25 s after bring-up, then asked each
+running service to stop, newest first, waiting up to 3 s each, then sent `init` `Finish`:
+- **The test image:** every server exited. The storage service unmounted its scratch disk left
+  clean, and `init` unmounted `/` left clean. `sys_power` flushed two disks and halted. `nxterm`,
+  `ui-testclient` and `restart-probe` were passed over as still running, as this scope expects.
+- **The disk, on the host:** `e2fsck -fn` clean, and the superblock's state `clean`. **Control:**
+  the same image quit mid-run without a shutdown reads `not clean`.
+- **The release image:** all nine servers exited, and the root was left clean again.
+- **`Finish` with the reboot byte:** `init` unmounted, then `sys_power` reset through the FADT's
+  register.
+
+**The first full gate run failed four gates, for two reasons:**
+- **The demo chain's session fan-out** opened the root server's whole session table and expected
+  31. The table is 30 while the server's control channel is open (`session_capacity`), and
+  `init` keeping it made that permanent. The demo now expects 30 and says why.
+- **The view broker refused a client with slots about to be freed.** It handled a wake's results
+  in wait-set order, and its forwarding endpoint is first. So a resolve that arrived in the same
+  wake as other clients' closes was answered `WouldBlock` before the closes were seen.
+  - `boot-probe`'s paced pair does exactly that: it closes every client it filled the broker
+    with, then opens two.
+  - The race predates E.4a. The demo chain failing changed the timing enough to hit it, and a
+    probe showed the refusal was `WouldBlock`.
+  - Fixed at the cause: **resolves are answered last in each wake**. Under the condition that
+    hit it (the fan-out left failing), the paced pair failed 1 run of 2 before the fix, and 0 of
+    6 after.
+- `check-terminal --kvm`'s failure was `boot-probe` exiting non-zero, from the same causes. It
+  passed twice after both fixes.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4b: `service-mgr` runs a shutdown
+
+**A power endpoint and power sessions.**
+- `/svc/services/power-endpoint`, from the root namespace only, mints an endpoint on which any
+  resolve opens a power session. A session endpoint answers the suffix `NotFound`, as it answers
+  `admin-endpoint`.
+- A power session takes **`Shutdown`** (`0x1103`), with a one-byte body: halt or reboot. It takes
+  nothing else, and an admin session does not take `Shutdown`. So stopping the machine and
+  administering services stay two grants, `power` and `services`, as the plan drew them.
+- `Shutdown` is answered as soon as it begins, since nothing comes back after it. A second one is
+  refused `WouldBlock`.
+
+**The sequence** is a state machine in the one loop, each wait a deadline, in
+`service_mgr::shutdown`'s order:
+1. Nothing more starts. Every service is marked asked to stop, and every waiting admin request is
+   refused, a restart's pending start among them.
+2. **The sessions**: both login supervisors get a terminate request, and 10 s. Their control
+   channels closing is how their exits are seen, since a process handle cannot be waited on and
+   neither supervisor closes its control channel.
+3. **The services, last declared first**: each gets `CTRL_OP_SHUTDOWN` and 3 s. That is shorter
+   than `service --stop`'s 5 s, since no person waits on this answer. A service not honouring it is
+   logged and passed over.
+4. `TERMINAL_OP_FINISH` to `init`.
+
+**Room for it**: one power endpoint (the broker binds one into every view) and two power sessions.
+They take the starting servers' room from nine to six, and bring-up starts one server at a time.
+
+**The broker's race, a second time.** `serve_services` answered new resolves on `/svc/services`
+before it looked at closed endpoints, and endpoints' session opens before closed sessions. With one
+power endpoint, a holder that let it go and asked again at once would be refused `WouldBlock`
+while the slot was about to be freed. The order is now **sessions, then endpoints, then resolves**.
+
+**Gates:**
+- **Host tests:** the suffix routing, including a session reaching no power endpoint; `Shutdown`'s
+  body, including what no correct client sends; and the stop order.
+- **`boot-probe`'s `power_endpoint_test`**, on a session opened as the grant will open one:
+  - `Start` on a power session is refused `NoAccess`;
+  - three malformed `Shutdown`s are refused `InvalidArgument`;
+  - a `Shutdown` on an admin session is refused `NoAccess`;
+  - a second power endpoint is refused while one is held, and one is taken at once after it is let
+    go.
+- **Controls:**
+  - a power session that skips its op check fails the case;
+  - a cap of two power endpoints fails it too.
+
+**A well-formed `Shutdown` stops the machine, so no `test-qemu` sends one**; that is E.4d's
+`check-shutdown`. It was booted by hand in the test image, from a temporary trigger at the end of
+`boot-probe` (reverted):
+- **The sessions:** the supervisors ran out their 10 s. They do not honour the request until E.4c.
+- **The services:** `ui-testclient`, `nxterm` and `restart-probe` were passed over after 3 s each,
+  and every server exited, the storage service unmounting its scratch disk first.
+- **The end:** `init` unmounted `/`, left clean, and `sys_power` halted.
+- **The disk**, on the host: `e2fsck -fn` clean, and the state `clean`.
+- **The reboot byte:** a reset through the FADT's register.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4c: sessions end when a shutdown asks
+
+**Both login supervisors, and both session leaders, now honour a terminate request.** E.4b's
+shutdown sent one and waited out its 10 s bound, since nothing read it.
+
+- **`libsession::spawn_leader`** passes a terminate request on to the leader and gives it 5 s.
+  That is inside `service-mgr`'s 10 s for the supervisor, which must cover it. It records that a
+  stop was asked (`stop_asked`), and past the bound goes on without the leader, since there is no
+  forcible kill.
+- **`session-mgr`** watches its notification channel beside whatever it waits for. At the prompt,
+  a terminate request ends the process. After a session, a recorded stop means it exits instead of
+  prompting again, once the session is closed at the view broker as at any session's end.
+  `libsession::drain_for_stop` reads the channel. A supervisor has no child between sessions, so
+  what else it reads there can be dropped.
+- **`desktop-session-mgr`**, the same at its greeter and after a session.
+- **`nxsh`** exits from its prompt: the keystroke read watches the channel.
+  - While a command runs, the request is passed on to its stages once, as an interrupt is. The
+    evaluator's checkpoint then answers "interrupted" for as long as the stop stands, so no
+    `catch` recovers from it, and the REPL exits once the command has unwound.
+  - **One drain for both waits.** `reap` and the capture wait share `drain_notifications`. That
+    keeps a stage's `ChildExited`, read by the capture wait, for `reap` to count.
+- **`desktop-shell`** takes its notification channel into its main wait and exits on the request.
+  It drops the `ChildExited` of what it launched, which it never reaped. Those programs are not
+  asked, by the maintainer's scope for E.4. They go when the compositor stops.
+
+**Found by booting it, not by reading it.** A shutdown arriving while `nxsh` ran `sleep 60` was not
+honoured at first: `libsession: nxsh is still running after it was asked to stop`. `nxsh` sat in
+the capture wait, which watched the command's output, its diagnostics and the tty, and not the
+notification channel. `reap`'s own comment says that is where a long pipeline spends its time. The
+capture wait now reads the channel through the shared drain. The failing run is the control.
+
+**Booted by hand** with a temporary probe in `service-mgr` (reverted) that began a shutdown a fixed
+time after bring-up, under each gate that logs in, and read from the transcripts:
+- **A serial session** (`test-interactive --kvm`): `nxsh` exited from its prompt, `session-mgr`
+  after it, and `desktop-session-mgr` from its greeter. `service-mgr: the sessions have ended`
+  came at once, not after the bound.
+- **A graphical session** (`check-login --kvm`): `desktop-shell` exited when asked, then
+  `desktop-session-mgr`.
+- **Nobody logged in** (a release boot): both supervisors exited from their prompt and greeter.
+- **A command running** (the release image driven on serial through a FIFO: a login, then
+  `sleep 60`): `nxsh` asked `sleep` to stop, unwound and exited. The typed password is in no
+  transcript.
+
+In every run every service stopped, `init` left the root clean, and the machine halted. **The gate
+is E.4d's `check-shutdown`**, which runs `with power shutdown` from a serial session: the running
+command path again.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4d: `shutdown`, the `power` grant, and `check-shutdown`
+
+**E.4 is complete**: a person can stop the machine, and a gate proves what that leaves on the disk.
+
+**The `power` grant** binds `service-mgr`'s power endpoint at `/dev/power`. The broker resolves it
+on first need and holds it for the boot, as it holds the admin endpoint for `services`.
+
+**The seeded policy** gains a `power` profile and a rule letting anyone (`who = ["*"]`) run
+`shutdown` in it with `auth = "none"`. That is the maintainer's call from the detail pass: the
+person at the machine may power it off, as with a desktop's power button. `admin` gains `power` too.
+
+**`shutdown [--reboot]`** is a coreutil. It opens a power session at `/dev/power` and sends one
+`Shutdown`, which is answered as soon as the shutdown begins. It then says `shutdown: shutting down`
+(or `restarting`) on its terminal and the console, and exits. The broker's audit records the view
+it ran in. Without the grant, `/dev/power` is not there, and `shutdown` names `with power shutdown`.
+
+**Two power endpoints, not one.** E.4b allowed one, bound into every view. But `admin` grants
+`power`, so the first `admin` view the broker builds takes that endpoint for the rest of the boot.
+In a test image `boot-probe`'s view broker test builds `admin` views before its power test. So the
+test's own direct resolve was refused, found by the first `check-shutdown` run. The cap is two:
+- one for the broker to hold for the boot;
+- one for a client that resolves one directly.
+
+`boot-probe` now asserts that **a third** is refused while the broker's and its own are held, and
+that one is taken at once after it lets its own go. The E.4b control, a cap of two, becomes a cap of
+three, and fails the case. The starting servers' room goes from six to five.
+
+**`cargo xtask check-shutdown`**, in CI's QEMU job, is the second gate whose verdict is a disk. It
+boots two copies of a `--selftest` disk image, on serial.
+- **The halt:**
+  - Once `boot-probe`'s verdict is in, it logs in and has `test-pattern` write a pattern under
+    `/home` through a mapping, with no sync. The host reads the disk mid-run: the file is there
+    without the pattern, and the superblock says mounted.
+  - It runs `with power shutdown`, and asserts the sequence on COM1: the sessions ended when asked,
+    not after their bound; every service stopped but the test image's known clients (`nxterm`,
+    `ui-testclient`, `input-testclient`, `restart-probe`); and `init` unmounted `/` clean.
+  - It reads the message off COM1, and off **the screen**, as its last line, with `check-fbcon`'s
+    decoder.
+  - With the machine stopped, the host finds: `e2fsck -fn` clean, `s_state` clean, and the file
+    holding the pattern, read with `debugfs`.
+- **The reboot, on a fresh copy:**
+  - A fresh copy is needed because `boot-probe` does not run twice on one filesystem: its rename
+    test finds the first run's files, as the first attempt at this half found.
+  - It runs `with power shutdown --reboot`, and sees a reset through the FADT's register.
+  - The second boot's `init` must mount the root **without** `the filesystem was not cleanly
+    unmounted last time`. That is the reboot's own shutdown leaving it clean.
+
+**Waiting for `boot-probe` is load-bearing**, and the gate says why: a shutdown asked while
+`boot-probe` held its power endpoint would find the broker's one or none.
+
+**Controls**, each a KVM run of the gate against a deliberately broken build:
+- **A:** `init` skipping its unmounts on a reboot only. The halt half passes, and the second boot
+  finds the root not cleanly unmounted.
+- **B:** a halt writing no line to the screen. The screen's last line is `power: stopping every
+  processor, to halt`, and the gate fails there.
+- **C:** `nxsh` ignoring a terminate request while it runs `with`. `nxsh: asked to stop, exiting`
+  is missing.
+- **D:** `init` skipping `sys_ns_sync` before `Meta::Unmount`. **`e2fsck` and `s_state` both pass**,
+  since the filesystem is marked clean with the data never written, and the pattern check alone
+  fails. That is what the pattern check is for.
+
+**By hand, before the gate:** on the release image, driven on serial through a FIFO, `shutdown`
+without the grant was refused naming `with`, and `with power shutdown` stopped the machine through
+the whole sequence.
+
+Local timing: 80 s under TCG. The local gate set grows from 32 to 34 with `check-shutdown` and its
+`--kvm` run.
+
+No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Part E.4, reviewed (PR #343): a declaration says how long its stop takes
+
+The review found one blocking problem, one worth fixing and three optional. All are addressed; one
+by a documented deferral rather than code.
+
+**Blocking — two architecture docs said the opposite of what E.4a built.**
+- `ext4-fs-server-rw.md` said `init`'s mounts are never unmounted, and that `init` closes their
+  control channel at once, so they keep every session slot. Since E.4a `init` keeps the channel
+  (`KEPT`) and unmounts at `Finish`, so the root server's session capacity is 30 for the whole boot.
+- `logging.md` gave the log's source ceiling as `MAX_WAIT_HANDLES - 1` (31), and said
+  `fs-server-ext4` had the identical ceiling. Both are 30.
+- **Swept for the class**, which found five more: `deferred-decisions.md` in three places (the
+  auth service's `MAX_SESSIONS`, `TODO(server-fanout)`'s "`init`'s mounts keep 31", and a
+  still-owed item, "`init`'s mounts are never unmounted", whose trigger was this part);
+  `storage.md`'s "never unmounted", true only of the storage service; and `fs-server-ext4`'s
+  `serve_control` doc comment. `rsproto-storage-ops.md`'s "never unmounted here" is about the
+  storage service and stays.
+
+**Worth fixing — 3 s per service was too short for the storage service.** Its stop writes back and
+unmounts every filesystem it mounted, and that takes as long as what is dirty. Past 3 s the
+shutdown went on, and `init`'s `sys_power` would stop every processor mid-write.
+- **Fixed with a per-declaration `stop_timeout`**, a duration, which bounds both a shutdown's stop
+  and `service --stop`. The storage service declares `"60s"`. Like its neighbours the first value
+  in a declaration wins, and a value that does not read is the default.
+- **Why not a longer bound for everyone:** a service that does not honour a stop — four in a test
+  image — would hold every shutdown up for as long. The service that needs the time says so.
+- **Why not bounding the storage service from inside:** its stop can wait on a sync, which no
+  deadline reaches (below). A bound it set itself would be one more guess at the same number.
+- **Verified, with a control.** A probe made the storage service's stop sleep 6 s first.
+  `check-shutdown --kvm` passed. With the probe kept and the `stop_timeout` line removed, it failed:
+  the storage service's "everything it mounted is unmounted, exiting" was not in the transcript,
+  because the machine had halted first. The gate already asserts that line, so it caught this.
+- **Not measured:** how long a real stop takes with a lot dirty. The control is a delay injected
+  into the stop, not a large file under `/storage`. 60 s is a margin, not a measurement.
+- A host test covers the parse: first value wins, the value does not leak into the next
+  declaration, and `"soon"` reads as the default.
+
+**Optional, taken — `nxsh`'s evaluator checkpoint never read the notification channel.** A long
+loop that runs no stage never saw a terminate request.
+- **Reproduced first.** At a serial prompt, `for i in 1..30000 { for j in 1..30000 { } }`, then a
+  shutdown from a `service-mgr` probe: `libsession: nxsh is still running after it was asked to
+  stop`, and the session ended with the shell's exit `-1`.
+- **Fixed:** the checkpoint drains the notification channel, with or without a terminal, before it
+  polls the tty. The same run then printed `nxsh: asked to stop, exiting`, exit 0.
+- **What the drain drops:** a child's exit. No stage runs at a checkpoint, since `reap` has counted
+  every exit before a pipeline returns. The prompt's own read already drops them the same way.
+- **What did not work as a reproduction, for the record:** `for i in 1..100000000` makes the range
+  whole first, and the shell exits; `;` does not separate statements; and `while true { }` stops at
+  the evaluator's 10 million iteration backstop before a probe fires.
+
+**Optional, documented rather than fixed — `init`'s `Finish` can block without a bound.**
+`sys_ns_sync` returns when its write IRPs complete, and an interrupt-driven IRP has no
+force-complete timeout. A disk that stops completing writes holds PID 1 there, and `sys_power` is
+never reached.
+- **Why not bounded in `init`:** `init` cannot bound a syscall that blocks. The sync would have to
+  move to a thread, or the kernel would have to give up on the IRP. Either is the missing IRP
+  timeout, which is deferred with its own trigger. That deferral (§ *IRP cancellation and the
+  completion timeout*) now names a shutdown as exposed to it.
+- `init`'s `finish` doc comment and `init/CLAUDE.md` say so, beside the bounded wait for each
+  `Meta::Unmount` answer. The kernel's own flush in `sys_power` is bounded already.
+
+**Optional, taken:** `service-manager.md` omitted `input-testclient` from the test image's services
+that do not honour a stop.
+
+**Docs:** `service-toml-schema.md` gains `stop_timeout`; `service-manager.md` § *Shutdown* says a
+declaration may lengthen a service's bound.
+
+**ABI:** no hash impact. `stop_timeout` is a declaration key; no syscall, layout or discriminant
+changes.

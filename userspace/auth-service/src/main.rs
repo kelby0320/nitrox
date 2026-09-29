@@ -58,11 +58,12 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// How many clients may hold an auth session at once.
 ///
-/// One slot goes to the forwarding endpoint itself; the rest are sessions. Two supervisors
-/// is what M7 needs — `session-mgr` and `desktop-session-mgr` — and the limit is the wait
-/// set's rather than a guess, so it costs nothing to be generous.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
-const _: () = assert!(1 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+/// Two slots go to the forwarding endpoint and, since administration Part E.4, the control
+/// channel; the rest are sessions. Two supervisors is what M7 needs — `session-mgr` and
+/// `desktop-session-mgr` — and the limit is the wait set's rather than a guess, so it costs
+/// nothing to be generous.
+const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
+const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// Open auth sessions, one per client that resolved `/svc/auth`. `0` marks a free slot.
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
@@ -251,17 +252,26 @@ fn send_reply(serve_end: u64, op: u16, request_id: u64, body: &[u8], error: bool
 
 /// The serve loop: block for an `Authenticate` request, validate it against the DB,
 /// and reply. Never returns.
-fn serve_loop(serve_end: u64) -> ! {
+///
+/// **It exits on `CTRL_OP_SHUTDOWN`** (administration Part E.4), which a shutdown sends every
+/// service. `service --stop` never does: `auth-service` is `essential`. Nothing needs saving on
+/// the way out, since every write to the users file is made whole — a new file, synced, then
+/// renamed over the old — before its answer is sent.
+fn serve_loop(serve_end: u64, mut control: u64) -> ! {
     kprint(b"auth-service: serving Auth::Authenticate over /svc/auth, and administration at /svc/auth/admin\n");
     loop {
         // Wait on the forwarding endpoint plus every open auth session — the same shape
         // `profile-server` and the compositor use, and the reason this server can now answer
         // more than one supervisor.
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots and `n` is bounded by
-        // `1 + MAX_SESSIONS`, which is that limit by construction (asserted above).
+        // `2 + MAX_SESSIONS`, which is that limit by construction (asserted above).
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            if control != 0 {
+                WAIT_HANDLES[n] = control;
+                n += 1;
+            }
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -291,6 +301,15 @@ fn serve_loop(serve_end: u64) -> ! {
             };
             if h == serve_end {
                 serve_resolve(serve_end);
+            } else if h == control {
+                match libkern::control::recv(control) {
+                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
+                        kprint(b"auth-service: asked to stop, exiting\n");
+                        exit(0);
+                    }
+                    libkern::control::Control::Closed => control = 0,
+                    _ => {}
+                }
             } else {
                 serve_session(h);
             }
@@ -751,7 +770,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         kprint(b"auth-service: Ready send FAIL\n");
         exit(1);
     }
-    serve_loop(serve_end);
+    serve_loop(serve_end, control);
 }
 
 #[panic_handler]

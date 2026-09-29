@@ -54,6 +54,19 @@ fn kprint(msg: &[u8]) {
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
+/// **A shutdown asked this supervisor to stop** (administration Part E.4c), and it has no session
+/// running: say so and exit, which `service-mgr` sees as its control channel closing. The greeter's
+/// window goes with the process. A session running when the request came is ended first, by
+/// `libsession::spawn_leader` passing it on.
+fn stop() -> ! {
+    kprint(b"desktop-session-mgr: asked to stop, exiting\n");
+    // SAFETY: terminating this process.
+    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Report and exit. A greeter that cannot draw is not a degraded greeter.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
@@ -437,17 +450,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // the same thing.
     let ev = session.wait_handle();
     loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+        // **The notification channel beside the compositor's** (administration Part E.4c): a
+        // shutdown's terminate request, at the greeter, ends this supervisor. It has no child
+        // between sessions, so nothing it needs is among the notifications read here.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for two waiters.
         unsafe {
             WAIT_HANDLES[0] = ev;
+            WAIT_HANDLES[1] = notif;
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                2,
                 (&raw mut WAIT_RESULTS) as u64,
                 u64::MAX,
             )
         };
+        if libsession::drain_for_stop(notif) {
+            stop();
+        }
         if session.pump().is_err() {
             fail(b"desktop-session-mgr: compositor connection lost\n");
         }
@@ -505,6 +525,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.
             unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
+            // **A shutdown ended this session** (administration Part E.4c): no greeter after it.
+            if libsession::stop_asked() {
+                stop();
+            }
             // **Set before the window is drawn, not after.** `open_greeter` presents, and
             // `view()` reads `denied` — so setting it afterwards drew a blank greeter and the
             // refusal never appeared. The next keystroke clears `denied` before its own
@@ -618,10 +642,10 @@ fn present(
     ok
 }
 
-/// Wait set for the greeter's event channel.
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-/// One 24-byte `IoResult`.
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// Wait set for the greeter's event channel and, beside it, the notification channel.
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+/// A 24-byte `IoResult` per waiter.
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

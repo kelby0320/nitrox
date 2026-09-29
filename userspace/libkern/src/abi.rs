@@ -221,6 +221,11 @@ pub const CTRL_OP_SHUTDOWN: u8 = 1;
 /// start before the terminal server. One byte of payload, as the control ops.
 pub const TERMINAL_OP_EMERGENCY: u8 = 1;
 
+/// `service-mgr` → `init`, on the terminal channel (administration Part E.4): every session and
+/// service has been asked to stop, so finish the shutdown — `init`'s own mounts, last first, then
+/// `sys_power`. Two bytes of payload: this op, then `1` to reboot or `0` to halt.
+pub const TERMINAL_OP_FINISH: u8 = 2;
+
 /// The fixed 24-byte IPC message header. `sender_pid`/`timestamp` are stamped by
 /// the kernel at send and cannot be forged.
 #[repr(C)]

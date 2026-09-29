@@ -6,7 +6,9 @@ checked 2026-09-28, when it took over starting and binding the servers `init` us
 boundary below, as built at last — through a registry of its own (administration Part E.1a),
 and began handing the sessions its own routes to them (Part E.1b), and reading its declarations
 from the root (Part E.1c), and serving `/svc/services` — the list, and starting and stopping on
-an admin session (Part E.2a);
+an admin session (Part E.2a); last checked 2026-09-29, when every server came to exit on
+`CTRL_OP_SHUTDOWN` and `init` to answer a shutdown's `Finish` (Part E.4a), and it came to run the
+shutdown itself (Part E.4b);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -198,7 +200,8 @@ the orders `init` relied on: the broker after the log it audits to, the device m
 two that take its devices, and the input server before the compositor. **The login chain starts
 after the last server and before the rest** (`service_mgr::bringup`): its supervisors need the
 servers, and a test image's clients must start after the greeter. `service-mgr` keeps the
-supervisors' process handles and control channels, which shutdown will use.
+supervisors' process handles and control channels: a shutdown asks them on the first to end their
+sessions, and learns of their exits from the second closing (§ *Shutdown*).
 
 **`service-mgr` never blocks on anything that can wait on it.** Every resolve on a server's path
 waits on it, so a blocking wait for a server that is itself resolving one — the broker opens its
@@ -227,6 +230,9 @@ chain with no `auth-service` behind it. Every skipped declaration is logged by n
 **The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
 handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
 then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
+**`TERMINAL_OP_FINISH`** (Part E.4a), with a byte saying whether to reboot, is a shutdown's last
+word to `init`, which unmounts its own filesystems and calls `sys_power`, sent as a shutdown's
+last step (§ *Shutdown*, Part E.4b).
 
 ### `/svc/services`: the list, and starting and stopping
 
@@ -247,8 +253,12 @@ A stop is `CTRL_OP_SHUTDOWN` on the service's control channel, **a request**: on
 s is answered "asked, and still running", stays asked, and is still a stop if it comes later. There
 is no forcible kill. An `essential` service's stop and restart are refused here, whoever asks.
 
-**Which services exit when asked**: `heartbeat`, and four servers — the terminal server, the
-clipboard, the input server and the compositor. **Only the clipboard may be stopped by request**:
+**Which services exit when asked**: `heartbeat`, and every server a release image runs — the
+terminal server, the clipboard, the input server and the compositor since Part E.2a, and
+`auth-service`, `logging-service`, the view broker, `device-mgr` and the storage service since
+Part E.4a. The storage service unmounts everything it mounted first, and the log sinks what is
+queued. The test image's graphical clients and `restart-probe` do not. **Only the clipboard may be
+stopped by request**:
 the other three are `essential`, since their clients do not reconnect, and on a machine with no
 serial port stopping one leaves nothing to type at (PR #341 review). Their exit is for a shutdown.
 Each waits on its control channel beside its work, through `libkern::control`, and **takes it out of
@@ -257,7 +267,44 @@ registry entry goes with it, so its path answers `NotFound` until it is started 
 binding reaches the new one then.
 
 **The wait set pays for it**: `/svc/services`' endpoint, a session endpoint, two admin endpoints
-and four admin sessions (`services::SLOTS`), which is what took `MAX_ROUTES` from 16 to 14.
+and four admin sessions (`services::SLOTS`), which is what took `MAX_ROUTES` from 16 to 14 — and
+since Part E.4b two power endpoints and two power sessions, which took the starting servers' room
+(`registry::STARTING_ROOM`) from nine to five. Bring-up starts one server at a time. (One power
+endpoint until Part E.4d, when every `admin` view's `power` grant was found to make the view broker
+hold it for the boot.)
+
+### Shutdown
+
+*(Administration Part E.4b, 2026-09-29.)* `/svc/services/power-endpoint` mints a **power endpoint**,
+on which any resolve opens a **power session** taking `Shutdown` alone
+([`rsproto-services-ops.md`](../spec/rsproto-services-ops.md)); the view broker's `power` grant
+binds one at `/dev/power`, and `with power shutdown [--reboot]` asks there — anyone at the machine,
+with no password, in the seeded policy (Part E.4d). A `Shutdown` is answered as soon as it begins, and then
+`service-mgr` takes the machine down in `service_mgr::shutdown`'s order, each wait a deadline in
+the one loop:
+
+1. **Nothing more starts** — not bring-up, not a policy's restart — every service is marked asked
+   to stop, and every waiting admin request is refused.
+2. **The sessions.** Both login supervisors are sent a terminate request, and have 10 s; their
+   control channels closing is how their exits are seen. Ending a session is theirs (Part E.4c,
+   [`graphical-session.md`](graphical-session.md) §4): each passes the request to its session's
+   leader, gives it 5 s, closes the session at the view broker and exits — or exits at once from
+   its prompt or greeter.
+3. **The services, last declared first**, each `CTRL_OP_SHUTDOWN` and 3 s to exit, or what its
+   declaration's `stop_timeout` gives it. The reverse of
+   the start order lets each server outlive what was started after it, and may use it. One not
+   honoured is logged "still running", and the shutdown goes on — a stop is a request, and there is
+   no forcible kill. The storage service unmounts everything it mounted on the way out.
+4. **`init` is told to finish** on the terminal channel: its own filesystems, then `sys_power`.
+
+What honours a stop is § *Servers, and the registry* above: every server a release image runs. In a
+test image `nxterm`, `ui-testclient`, `input-testclient` and `restart-probe` do not, and each is
+passed over after its bound.
+
+**A declaration may say how long its stop takes** (`stop_timeout`, PR #343 review): the storage
+service declares 60 s, since its stop is the write-back and unmount of every filesystem it mounted,
+and grows with what is dirty. The same bound answers a `service --stop`. Past it the shutdown goes
+on, and a filesystem still being written would be left not clean.
 
 ## Capability posture
 

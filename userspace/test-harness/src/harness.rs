@@ -3665,8 +3665,12 @@ fn session_fanout_demo(root_ns: u64) {
     use librsproto::session::DIR_SESSION_RIGHTS;
     kprint(b"test-harness: session fan-out demo (past the old 7-session cap)\n");
 
-    /// The server's ceiling: its wait set is `serve_end` + one slot per session.
-    const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
+    /// The server's ceiling: its wait set is `serve_end`, its control channel, and one slot per
+    /// session (`fs-server-ext4`'s `session_capacity`). The control channel is open for the life
+    /// of the root's server since administration Part E.4, when `init` came to keep it for a
+    /// shutdown's `Meta::Unmount`; before that it was closed after `Ready`, and the table was one
+    /// larger.
+    const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 2;
     /// The limit this replaced — the point of the check is to work well beyond it.
     const OLD_CAP: usize = 7;
 

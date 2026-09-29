@@ -63,6 +63,11 @@ pub mod policy {
         /// `/dev/services/admin` (administration Part E.2b). `service-mgr` refuses an essential
         /// service's stop itself, whoever holds this.
         Services,
+        /// **Shutting the machine down, or restarting it**: `service-mgr`'s power endpoint, bound
+        /// at `/dev/power` (administration Part E.4d). A session opened there takes `Shutdown` and
+        /// nothing else. The seeded policy gives it to everyone, for `shutdown` only, as a
+        /// desktop's power button would.
+        Power,
     }
 
     impl Grant {
@@ -74,6 +79,7 @@ pub mod policy {
                 "views" => Some(Grant::Views),
                 "accounts" => Some(Grant::Accounts),
                 "services" => Some(Grant::Services),
+                "power" => Some(Grant::Power),
                 _ => None,
             }
         }
@@ -86,13 +92,14 @@ pub mod policy {
                 Grant::Views => "views",
                 Grant::Accounts => "accounts",
                 Grant::Services => "services",
+                Grant::Power => "power",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
     pub const KNOWN_GRANTS: &[Grant] =
-        &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts, Grant::Services];
+        &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts, Grant::Services, Grant::Power];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -791,8 +798,9 @@ pub mod slots {
     //! broker does not wait on is an exit it never sees, whose code is then paired with some other
     //! program's.
 
-    /// The forwarding endpoint and the notification channel.
-    pub const FIXED: usize = 2;
+    /// The forwarding endpoint, the notification channel and, since administration Part E.4, the
+    /// control channel.
+    pub const FIXED: usize = 3;
 
     /// What the wait set holds, by how many slots each may come to need.
     #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1037,7 +1045,10 @@ auth = "password"
         assert_eq!(Grant::from_name("services"), Some(Grant::Services));
         assert_eq!(Grant::Services.name(), "services");
         assert!(KNOWN_GRANTS.contains(&Grant::Services));
-        let e = parse("[profile.admin]\ngrants = [\"power\"]\n").unwrap_err();
+        assert_eq!(Grant::from_name("power"), Some(Grant::Power));
+        assert_eq!(Grant::Power.name(), "power");
+        assert!(KNOWN_GRANTS.contains(&Grant::Power));
+        let e = parse("[profile.admin]\ngrants = [\"teleport\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
         // And `views` (administration Part D.2).
         assert_eq!(Grant::from_name("views"), Some(Grant::Views));
@@ -1056,7 +1067,7 @@ auth = "password"
             assert_eq!(e.line, line, "{e}");
             assert!(e.message.contains(needle), "`{e}` should mention `{needle}`");
         };
-        bad("[profile.admin]\ngrants = [\"power\"]\n", 2, "not a grant this system has");
+        bad("[profile.admin]\ngrants = [\"teleport\"]\n", 2, "not a grant this system has");
         let undefined = "[profile.admin]\ngrants = [\"disks\"]\n[[rule]]\nwho = [\"a\"]\n\
                          use = [\"x\"]\nrun = [\"*\"]\nauth = \"none\"\n";
         bad(undefined, 3, "no profile defines");
@@ -1262,16 +1273,16 @@ auth = "password"
         while load.admits_client(MAX) {
             load.clients += 1;
         }
-        assert_eq!(load.clients, 15, "(32 - 2) / 2");
+        assert_eq!(load.clients, 14, "(32 - 3) / 2");
         // Every one of them starts a program: channel and life channel each.
         let running = FIXED + 2 * load.clients;
         assert!(running <= MAX, "{running} handles in a {MAX}-slot wait set");
         // Exactly two slots free: one more client fits.
-        let two = Load { clients: 14, ..Load::default() };
+        let two = Load { clients: 13, singles: 1, ..Load::default() };
         assert_eq!(two.worst(), MAX - 2);
         assert!(two.admits_client(MAX));
         // One free: a supervisor fits, and half a client does not.
-        let one = Load { singles: 1, ..two };
+        let one = Load { singles: 2, ..two };
         assert_eq!(one.worst(), MAX - 1);
         assert!(!one.admits_client(MAX), "its program's life channel would have no slot");
         assert!(one.admits_supervisor(MAX));

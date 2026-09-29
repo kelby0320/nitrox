@@ -13,7 +13,8 @@ PID 1. The first userspace process. Spawned directly by the kernel with the full
 5. Spawn the service manager, handing it a root handle with init's own rights and the root
    filesystem's and profile server's endpoints, and keep the channel they went down as the
    **terminal channel**
-6. Enter main loop: reap orphaned processes, and answer the terminal channel
+6. Enter main loop: reap orphaned processes, and answer the terminal channel — including a
+   shutdown's `Finish`, which unmounts init's own filesystems and stops the machine
 
 **It starts no other server** (administration Part E.1a, 2026-09-28). The nine system servers —
 `auth-service`, `logging-service`, `tty-server`, `clipboard-server`, the view broker,
@@ -124,6 +125,16 @@ beside its notification channel:
 - **`TERMINAL_OP_EMERGENCY`** (`libkern::abi`): a `critical` server did not come up at boot, and
   `service-mgr` has started nothing more. Init fires the failing verdict and spawns `eshell` —
   the backstop init itself gave `auth-service` and `logging-service` when it started them.
+- **`TERMINAL_OP_FINISH`** (administration Part E.4): a shutdown has asked every session and
+  service to stop. Init unmounts its own mounts, last first — `sys_ns_sync`, then `Meta::Unmount`
+  on the control channel it **keeps** for each since then, with no held check — and calls
+  `sys_power` with the system-control object, to halt or to reboot as the second byte says. Every
+  mount is unmounted whatever the one before answered, and if `sys_power` refuses, init says so
+  and goes on reaping: the filesystems are clean by then. **One wait here is not bounded by
+  init**: `sys_ns_sync` blocks until its write IRPs complete, and interrupt-driven IRPs have no
+  force-complete timeout yet, so a disk that stops completing writes holds the shutdown there
+  (`deferred-decisions.md` § *IRP cancellation and the completion timeout*). The answer to
+  `Meta::Unmount` is bounded, at 10 s.
 - **Its closing** means `service-mgr` has died. Init reports it and **does not restart it**: a
   fresh `service-mgr` could not re-adopt the running servers or the registry that reached them.
   The machine needs a restart.

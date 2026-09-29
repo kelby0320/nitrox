@@ -166,6 +166,20 @@ pub mod registry {
     }
 }
 
+pub mod shutdown {
+    //! **A shutdown's order** (administration Part E.4b): the sessions first, then the services
+    //! **last declared first** — the reverse of the order bring-up starts them in, so each server
+    //! outlives the ones started after it, which may use it: the compositor stops before the input
+    //! server, and the storage service unmounts while the log it reports to is still there — and
+    //! then `init`, which unmounts its own filesystems and stops the machine.
+
+    /// The next service to ask, below `below` in declaration order: the last one there that is
+    /// `running`, or `None` once none is.
+    pub fn next_to_stop(running: &[bool], below: usize) -> Option<usize> {
+        running[..below.min(running.len())].iter().rposition(|&r| r)
+    }
+}
+
 pub mod services {
     //! **`/svc/services`** (administration Part E.2): the list of services, for anyone, and
     //! starting, stopping and restarting them, on an admin session.
@@ -178,6 +192,9 @@ pub mod services {
     //!   `/dev/services/admin`.
     //! - On an admin session, `Start`, `Stop` and `Restart` (`librsproto::services`), each answered
     //!   once it has happened.
+    //! - `power-endpoint`, resolved from `/svc/services` only, mints one on which any resolve
+    //!   opens a **power session**, which takes `Shutdown` and nothing else (administration Part
+    //!   E.4b). The view broker's `power` grant binds one at `/dev/power`.
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -189,9 +206,19 @@ pub mod services {
     pub const MAX_ADMIN_ENDPOINTS: usize = 2;
     /// Admin sessions open at once: a `service --stop` or `--restart` is one, briefly.
     pub const MAX_ADMIN_SESSIONS: usize = 4;
+    /// Power endpoints at once: **one the view broker holds for the boot**, asked for the first
+    /// time a view needs it — and every `admin` view does, since `admin` grants `power` — and bound
+    /// into every view with the grant; and a second for a client that resolves one directly, as
+    /// `boot-probe` does to test the refusals (administration Part E.4d, when one was found to be
+    /// the broker's before the probe ever asked).
+    pub const MAX_POWER_ENDPOINTS: usize = 2;
+    /// Power sessions open at once: a `shutdown` is one, and a second can only be refused, since
+    /// one shutdown is already enough.
+    pub const MAX_POWER_SESSIONS: usize = 2;
     /// Wait-set slots the services take: `/svc/services`' own endpoint, the session endpoint, and
-    /// the admin endpoints and sessions.
-    pub const SLOTS: usize = 2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS;
+    /// the admin and power endpoints and sessions.
+    pub const SLOTS: usize =
+        2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS + MAX_POWER_ENDPOINTS + MAX_POWER_SESSIONS;
 
     /// Where a service is, as the table says it.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -277,6 +304,9 @@ pub mod services {
         /// `admin-endpoint`: an admin endpoint. **Only on `/svc/services`**: a session endpoint
         /// answers it `NotFound`, so a session cannot reach starting and stopping at all.
         AdminEndpoint,
+        /// `power-endpoint`: a power endpoint, and **only on `/svc/services`** for the same reason:
+        /// a session reaches a shutdown through the `power` grant or not at all.
+        PowerEndpoint,
         /// Anything else.
         Unknown,
     }
@@ -286,6 +316,7 @@ pub mod services {
         match suffix {
             b"all.tsm" => Asked::Table,
             b"admin-endpoint" if !session => Asked::AdminEndpoint,
+            b"power-endpoint" if !session => Asked::PowerEndpoint,
             _ => Asked::Unknown,
         }
     }
@@ -443,7 +474,27 @@ mod tests {
         assert_eq!(asked(b"all.tsm", true), Asked::Table);
         assert_eq!(asked(b"admin-endpoint", false), Asked::AdminEndpoint);
         assert_eq!(asked(b"admin-endpoint", true), Asked::Unknown);
+        assert_eq!(asked(b"power-endpoint", false), Asked::PowerEndpoint);
+        assert_eq!(asked(b"power-endpoint", true), Asked::Unknown, "a session reaches no shutdown");
         assert_eq!(asked(b"", false), Asked::Unknown);
+    }
+
+    /// **A shutdown asks the services last first**, passing over what is not running, and ends
+    /// once none is left below where it has got to.
+    #[test]
+    fn a_shutdown_stops_the_services_last_first() {
+        use super::shutdown::next_to_stop;
+        let running = [true, false, true, true, false];
+        let mut order = std::vec::Vec::new();
+        let mut below = running.len();
+        while let Some(i) = next_to_stop(&running, below) {
+            order.push(i);
+            below = i;
+        }
+        assert_eq!(order, [3, 2, 0]);
+        assert_eq!(next_to_stop(&[false, false], 2), None, "nothing running");
+        assert_eq!(next_to_stop(&[], 0), None, "nothing declared");
+        assert_eq!(next_to_stop(&[true], 0), None, "none below the first");
     }
 
     /// **A file that has lost its critical servers is an emergency**, however it lost them.

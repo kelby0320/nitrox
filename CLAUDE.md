@@ -69,6 +69,7 @@ cargo xtask check-install  # install to a blank disk from the live menu, then bo
 cargo xtask check-recovery # reset a password on an installed disk from the live image, then boot it
 cargo xtask image --live --selftest # the test live image: the live stick with the test packages
 cargo xtask check-storage  # that stick beside a copy of the release disk; the host checks the disk
+cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
 ```
 
@@ -204,6 +205,20 @@ without the pattern, so what it finds after `with admin disk --unmount`, the unm
 With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock's
 `s_state` clean, and the file holding the pattern, read with `debugfs` rather than the library
 that wrote it. It runs in CI's QEMU job.
+
+`cargo xtask check-shutdown` is the **shutdown gate** (administration Part E.4d), and the second
+whose verdict is a disk. It boots a copy of a `--selftest` disk image and, on serial once
+`boot-probe`'s verdict is in, logs in as `alice`: `test-pattern` writes a pattern under `/home`
+through a mapping and exits without a sync, the host finds the file mid-run without it, and
+`with power shutdown` — no password, the seeded policy's `power` view for everyone — takes the
+machine down. It asserts the sequence on COM1 (the sessions ended when asked rather than after their
+bound, every service stopped but the test image's known clients, `init` left `/` clean) and **reads
+"It is now safe to turn off your computer." off the screen** with `check-fbcon`'s decoder, since
+the laptop has no serial port. With the machine stopped the host carves the root out: `e2fsck -fn`
+clean, `s_state` clean, and the file holding the pattern. Then a fresh copy runs `with power
+shutdown --reboot`, and the second boot must mount its root clean. It runs in CI's QEMU job.
+**Waiting for `boot-probe` is load-bearing**: `boot-probe` takes and lets go of a power endpoint to
+test its refusals, and the broker holds another for the boot.
 
 `cargo xtask check-report` is the **hardware report gate** (Phase 5 Part D). Every boot logs what it
 found — the bootloader handoff, the CPU, every ACPI table and MADT entry, each PCI function's

@@ -163,6 +163,34 @@ fn kprint(msg: &[u8]) {
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
+/// **A shutdown asked this shell to stop** (administration Part E.4c): its session's supervisor
+/// passed the request on. The shell exits; what it launched is not asked in this part, and goes
+/// when the compositor it draws through is stopped (Part F's session menu is where asking them,
+/// with unsaved work in mind, belongs).
+fn stop() -> ! {
+    kprint(b"desktop-shell: asked to stop, exiting\n");
+    // SAFETY: terminating this process.
+    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Read every notification queued on `notif`, and say whether a terminate request was among them.
+/// The rest are dropped: this shell reaps nothing, so the `ChildExited` of what it launched is of
+/// no use to it.
+fn stop_asked(notif: u64) -> bool {
+    let mut asked = false;
+    loop {
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
+            return asked;
+        }
+        // SAFETY: the kernel wrote a Notification into NOTIF.
+        asked |= unsafe { (&raw const NOTIF.kind).read() } == libkern::abi::KIND_TERMINATE_REQUESTED;
+    }
+}
+
 /// Report and exit.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
@@ -1661,8 +1689,13 @@ const MAX_LOGGED_THEME_ISSUES: usize = 8;
 const CASCADE_STEP: i32 = 24;
 
 /// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
-/// sessions.
-static mut WAIT_HANDLES: [u64; 2 + 1 + MAX_DESKTOP_SESSIONS] = [0; 3 + MAX_DESKTOP_SESSIONS];
+/// sessions, and the notification channel, where a shutdown's terminate request arrives
+/// (administration Part E.4c).
+static mut WAIT_HANDLES: [u64; 4 + MAX_DESKTOP_SESSIONS] = [0; 4 + MAX_DESKTOP_SESSIONS];
+/// The shell's notification channel: set once at startup, and waited on with the rest.
+static mut SHELL_NOTIF: u64 = 0;
+/// Where [`stop_asked`] reads a notification.
+static mut NOTIF: Notification = Notification::zeroed();
 /// One 24-byte `IoResult` **per handle in the set**, because that is what the kernel writes.
 ///
 /// `sys_wait` takes no length for this buffer: it writes one record for *every signalled*
@@ -1675,8 +1708,8 @@ static mut WAIT_HANDLES: [u64; 2 + 1 + MAX_DESKTOP_SESSIONS] = [0; 3 + MAX_DESKT
 /// Every other server in this tree already sizes it this way (`compositor`,
 /// `logging-service`, `fs-server-ext4`); `session-mgr` waits on exactly one handle, where one
 /// record is right. Found by the PR #257 reviewer while reading something else.
-static mut WAIT_RESULTS: [u8; 24 * (3 + MAX_DESKTOP_SESSIONS)] =
-    [0; 24 * (3 + MAX_DESKTOP_SESSIONS)];
+static mut WAIT_RESULTS: [u8; 24 * (4 + MAX_DESKTOP_SESSIONS)] =
+    [0; 24 * (4 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
@@ -1684,6 +1717,8 @@ static mut WAIT_RESULTS: [u8; 24 * (3 + MAX_DESKTOP_SESSIONS)] =
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> ! {
     kprint(b"desktop-shell: up (graphical session leader)\n");
+    // SAFETY: single-threaded; written once, here, before the loop waits on it.
+    unsafe { SHELL_NOTIF = notif };
 
     // Two messages arrive on the setup channel, in order: the Tier-1 `argv` + environment,
     // then the compositor's forwarding endpoint. The second is what lets this process build
@@ -2243,6 +2278,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     n += 1;
                 }
             }
+            if SHELL_NOTIF != 0 {
+                WAIT_HANDLES[n as usize] = SHELL_NOTIF;
+                n += 1;
+            }
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
@@ -2251,6 +2290,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 deadline,
             )
         };
+        // SAFETY: single-threaded; set once at startup.
+        let notif = unsafe { SHELL_NOTIF };
+        if notif != 0 && stop_asked(notif) {
+            stop();
+        }
         // **Drained before the compositor's events**, so a `Switch` that changes what the bar
         // shows is reflected by the same iteration's redraw rather than the next one's.
         // SAFETY: reading our own endpoint and session table.

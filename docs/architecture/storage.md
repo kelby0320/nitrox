@@ -2,7 +2,7 @@
 
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
-since Part E.1b; last checked 2026-09-28.**
+since Part E.1b; its shutdown unmount built with Part E.4a; last checked 2026-09-29.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -110,7 +110,8 @@ source names a partition by one of the two schemes `init` accepts
   confirm the match, and a position they contradict is no match. The UUID is compared in the form
   the kernel names the path with, exactly, as `init`'s lookup is.
 
-**`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted.
+**`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted by this service.
+`init` unmounts them itself at a shutdown (Part E.4a).
 
 **If they cannot all be placed, this service mounts nothing.** Sometimes `init.toml` does not read,
 names no mount, or names one that matches no device. Then a device this service takes for free
@@ -301,10 +302,11 @@ how, and what each suffix asks for where it arrives.
   unmount starts. A lazy unmount, which would drain those, is not built.
 - **An open directory session is not a held file.** A client holding one when its filesystem is
   unmounted finds the channel closed.
-- **Nothing unmounts `init`'s mounts, or this service's own**, so nothing syncs them before the
-  machine stops. On a boot that is not a live one, every ext4 `init` did not mount is auto-mounted
-  writable. It is left not clean, with its dirty files unwritten, exactly as `/` and `/home` are.
-  Both are Part E's `shutdown`, which runs the unmount chain on everything mounted.
+- **A shutdown unmounts everything** (administration Part E.4). On `CTRL_OP_SHUTDOWN` this service
+  runs the chain on every mount it made, last first and without the held check, then exits; `init`
+  does the same for its own mounts on the terminal channel's `Finish`. `service-mgr`'s shutdown
+  sends both (Part E.4b), when a person runs `with power shutdown` (Part E.4d). `check-shutdown`
+  gates it for `init`'s root. A machine turned off without one is still left not clean.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

@@ -153,9 +153,11 @@ out of ordinary namespace attenuation:
 
 > **Concurrent sources are bounded by the wait width.** Waiting across all the read ends
 > means one `sys_wait` slot per source, so the service reads from at most
-> `MAX_WAIT_HANDLES - 1` (31, since 2026-07-29; 7 before) at once — `MAX_SOURCES` is
-> derived from the kernel constant rather than restated. `fs-server-ext4` has the identical
-> ceiling for the identical reason. Removing it rather than raising it is
+> `MAX_WAIT_HANDLES - 2` (30 since administration Part E.4a, when the control channel took a
+> slot for a shutdown's `CTRL_OP_SHUTDOWN`; 31 from 2026-07-29; 7 before) at once —
+> `MAX_SOURCES` is derived from the kernel constant rather than restated. `fs-server-ext4` has
+> the same ceiling for the same reason: 30 sessions while its control channel is open, which for
+> `init`'s mounts is the whole boot since Part E.4a. Removing it rather than raising it is
 > `TODO(server-fanout)` in
 > [`docs/rationale/deferred-decisions.md`](../rationale/deferred-decisions.md).
 

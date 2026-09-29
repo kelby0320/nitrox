@@ -77,6 +77,9 @@ const MAX_CAPTURE: usize = 1 << 20;
 
 /// `ChildExited` notification kind (`docs/spec/notification-format.md`).
 const KIND_CHILD_EXITED: u32 = 0x0200;
+/// `TerminateRequested`: someone holding this shell's process handle asks it to exit — its session's
+/// supervisor, at a shutdown (administration Part E.4c).
+const KIND_TERMINATE_REQUESTED: u32 = libkern::abi::KIND_TERMINATE_REQUESTED;
 /// `ExitStatus.kind` for a normal exit; anything else means the process died.
 const EXIT_KIND_NORMAL: u32 = 0;
 
@@ -85,12 +88,13 @@ const EXIT_KIND_NORMAL: u32 = 0;
 // *kind* and reported every non-zero exit as a crash.
 static mut NOTIF: libkern::abi::Notification =
     libkern::abi::Notification { kind: 0, body: [0; 60] };
-/// Three waiters: what the pipeline is producing, the terminal — so `Ctrl-C` is noticed
-/// while a *stage* is what is taking the time (§11h) — and the pipeline's shared `stderr`,
+/// Four waiters: what the pipeline is producing, the terminal — so `Ctrl-C` is noticed
+/// while a *stage* is what is taking the time (§11h) — the pipeline's shared `stderr`,
 /// so a stage's diagnostics reach the screen **while** it is still working rather than
-/// after it finishes (Phase 5 Part H.1).
-static mut WAIT_HANDLES: [u64; 3] = [0; 3];
-static mut WAIT_RESULTS: [u8; 72] = [0; 72];
+/// after it finishes (Phase 5 Part H.1), and the notification channel, so a shutdown's
+/// terminate request does too (administration Part E.4c).
+static mut WAIT_HANDLES: [u64; 4] = [0; 4];
+static mut WAIT_RESULTS: [u8; 96] = [0; 96];
 
 /// Was `handle` among the `n` results `sys_wait` just wrote?
 ///
@@ -434,6 +438,10 @@ impl Host for NitroxHost {
         // for this reader, so reaping first would deadlock any producer larger than one
         // pipe's worth.
         let mut output: Option<Vec<u8>> = None;
+        // What the capture wait reads off the notification channel for `reap`: stages' exits, and
+        // whether a terminate request has been passed on (administration Part E.4c).
+        let mut early: Vec<(i32, bool)> = Vec::new();
+        let mut stop_sent = false;
         if let Some(rx) = capture {
             // **The terminal is watched here, not only in `reap`** (§11h). This is where
             // the shell actually spends a long pipeline: the tail's output does not close
@@ -457,6 +465,10 @@ impl Host for NitroxHost {
             let mut complete = false;
             let mut overflowed = false;
             loop {
+                // **The notification channel is read here too** (administration Part E.4c): a
+                // terminate request from the session's supervisor must reach the stages while the
+                // shell sits in this wait, and a stage's exit read here is kept for `reap`.
+                drain_notifications(self.notif, &children, &mut stop_sent, &mut early);
                 // **Poll before blocking.** A channel signals its waiters at the moment
                 // a message is enqueued, so a waiter that arrives *afterwards* never
                 // sees that edge — and the interrupt is enqueued before this wait
@@ -471,15 +483,16 @@ impl Host for NitroxHost {
                     }
                     continue;
                 }
-                // SAFETY: valid waiter buffers; two or three handles.
+                // SAFETY: valid waiter buffers; three or four handles.
                 let waited = unsafe {
                     WAIT_HANDLES[0] = rx;
                     WAIT_HANDLES[1] = err_rx;
+                    WAIT_HANDLES[2] = self.notif;
                     let n = if self.tty != 0 {
-                        WAIT_HANDLES[2] = self.tty;
-                        3
+                        WAIT_HANDLES[3] = self.tty;
+                        4
                     } else {
-                        2
+                        3
                     };
                     syscall4(
                         SYS_WAIT,
@@ -528,7 +541,8 @@ impl Host for NitroxHost {
             unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };
         }
 
-        let reaped = reap(self.notif, self.tty, err_rx, &children, stages, spawned, strict);
+        let reaped =
+            reap(self.notif, self.tty, err_rx, &children, stages, spawned, strict, early, stop_sent);
         // **One last drain, after every stage is gone.** A program's final word is often its
         // most important — a refusal, or what it wrote — and it can be sent microseconds
         // before `exit`, which is to say after the wait that noticed the exit had already
@@ -708,6 +722,20 @@ impl Host for NitroxHost {
     /// sequential and each tty exchange completes before the next statement — so anything
     /// waiting here is the unsolicited interrupt.
     fn interrupted(&mut self) -> bool {
+        // **A terminate request, between statements** (PR #343 review): read off the notification
+        // channel here too, so a loop that runs no stage — `for i in 1..30000 { for j in 1..30000
+        // { } }` at a prompt — still sees it, and with or without a terminal. No stage runs at a
+        // checkpoint: `reap` has counted every exit before a pipeline returns, so nothing the
+        // drain drops here is one anyone is waiting for.
+        // SAFETY: single-threaded shell; set once at startup.
+        let notif = unsafe { NOTIF_CH };
+        if notif != 0 {
+            drain_notifications(notif, &[], &mut false, &mut Vec::new());
+        }
+        // SAFETY: single-threaded shell.
+        if unsafe { (&raw const STOP_ASKED).read() } {
+            return true;
+        }
         if self.tty == 0 {
             return false;
         }
@@ -741,7 +769,7 @@ impl Host for NitroxHost {
             // interrupt the recovery as fast as it started.
             let hit = (&raw const INTERRUPTED).read();
             (&raw mut INTERRUPTED).write(false);
-            hit
+            hit || (&raw const STOP_ASKED).read()
         }
     }
 
@@ -774,6 +802,7 @@ impl Host for NitroxHost {
 /// which — a report that is incomplete beats one that is confidently wrong. Filed as
 /// `TODO(pipeline-stage-attribution)`; the fix is a pid on `HandleInfo` for a process
 /// handle, or a handle in the notification, and it is an ABI change.
+#[allow(clippy::too_many_arguments)]
 fn reap(
     notif: u64,
     tty: u64,
@@ -782,9 +811,13 @@ fn reap(
     stages: &[StageSpec],
     spawned: usize,
     strict: bool,
+    // Exits the capture wait read before this ran, in arrival order, and whether it has already
+    // passed a terminate request on (administration Part E.4c).
+    early: Vec<(i32, bool)>,
+    stop_sent: bool,
 ) -> Vec<StageStatus> {
-    let mut seen: Vec<(i32, bool)> = Vec::with_capacity(spawned);
-    let mut asked = false;
+    let mut seen: Vec<(i32, bool)> = early;
+    let mut asked = stop_sent;
     while seen.len() < spawned {
         // **Wait on the terminal as well as the children.** The shell is blocked here for
         // as long as the pipeline runs, so this is the only place `Ctrl-C` can be noticed
@@ -835,21 +868,7 @@ fn reap(
                 unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
             }
         }
-        // SAFETY: `NOTIF` is a valid 64-byte out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            continue; // WouldBlock — re-block
-        }
-        // SAFETY: the kernel wrote a Notification into `NOTIF`.
-        let (kind, body) = unsafe {
-            ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read())
-        };
-        if kind != KIND_CHILD_EXITED {
-            continue;
-        }
-        let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-        let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-        seen.push((code, exit_kind != EXIT_KIND_NORMAL));
+        drain_notifications(notif, children, &mut asked, &mut seen);
     }
 
     let mut out = Vec::with_capacity(stages.len());
@@ -1132,6 +1151,10 @@ fn repl(
 
     let mut chunk = [0u8; 64];
     loop {
+        // SAFETY: single-threaded shell.
+        if unsafe { (&raw const STOP_ASKED).read() } {
+            stop();
+        }
         let n = match tty_read(tty, &mut chunk) {
             Some(n) => n,
             // The terminal is gone (the session ended under us). Leaving is the only
@@ -1452,6 +1475,12 @@ fn search_key(st: &mut Search, b: u8, history: &nxsh::history::History) -> Searc
 /// Send one tty request and wait for its reply; returns `(is_error, body_len)` with the
 /// body copied into `out`, or `None` if the exchange failed outright.
 fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, usize)> {
+    tty_exchange(ch, op, body, out, false)
+}
+
+/// [`tty_request`], and when `watch`, the notification channel watched for a terminate request
+/// while the reply is awaited ([`tty_await_reply`]).
+fn tty_exchange(ch: u64, op: u16, body: &[u8], out: &mut [u8], watch: bool) -> Option<(bool, usize)> {
     // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at the payload offset.
     let sent = unsafe {
         let rs_len = librsproto::encode(&mut TTY_MSG[24..], op, 1, 0, body, 0)?;
@@ -1469,27 +1498,52 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, u
     if !sent {
         return None;
     }
-    tty_await_reply(ch, out)
+    tty_await_reply(ch, out, watch)
 }
 
 /// Wait for the reply to the request just sent, stepping over any interrupt event.
 ///
 /// Split out so it can be re-entered: the interrupt is the one unsolicited message on this
 /// channel (§11h), and the reply this exchange is owed is still coming behind it.
-fn tty_await_reply(ch: u64, out: &mut [u8]) -> Option<(bool, usize)> {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = ch;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
-    };
-    if waited < 1 {
-        return None;
+///
+/// **When `watch`, the notification channel is watched too** (administration Part E.4c): the
+/// prompt's read is where an interactive shell spends its time, so it is where a terminate request
+/// finds it. Only the prompt watches, since only there is no stage running whose `ChildExited`
+/// reading the channel could take from [`reap`]; what else is read here is dropped.
+fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize)> {
+    // SAFETY: single-threaded shell; set once at startup.
+    let notif = unsafe { NOTIF_CH };
+    let watch = watch && notif != 0;
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one or two waiters.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = ch;
+            WAIT_HANDLES[1] = notif;
+            let n = if watch { 2 } else { 1 };
+            let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
+            syscall4(SYS_WAIT, handles, n, results, u64::MAX)
+        };
+        if waited < 1 {
+            return None;
+        }
+        if !watch {
+            break;
+        }
+        if signalled(waited, notif) {
+            loop {
+                // SAFETY: `NOTIF` is a valid 64-byte out-param.
+                if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
+                    break;
+                }
+                // SAFETY: the kernel wrote a Notification into `NOTIF`.
+                if unsafe { (&raw const NOTIF.kind).read() } == KIND_TERMINATE_REQUESTED {
+                    stop();
+                }
+            }
+        }
+        if signalled(waited, ch) {
+            break;
+        }
     }
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -1518,7 +1572,7 @@ fn tty_await_reply(ch: u64, out: &mut [u8]) -> Option<(bool, usize)> {
         // here would leave the real reply queued for whoever asked next.
         if m.op == librsproto::OP_TTY_INTERRUPT {
             INTERRUPTED = true;
-            return tty_await_reply(ch, out);
+            return tty_await_reply(ch, out, watch);
         }
         let n = m.body.len().min(out.len());
         out[..n].copy_from_slice(&m.body[..n]);
@@ -1528,7 +1582,7 @@ fn tty_await_reply(ch: u64, out: &mut [u8]) -> Option<(bool, usize)> {
 
 /// Take whatever keystrokes are available. `None` if the terminal is unusable.
 fn tty_read(ch: u64, out: &mut [u8]) -> Option<usize> {
-    match tty_request(ch, librsproto::OP_TTY_READ, &[], out) {
+    match tty_exchange(ch, librsproto::OP_TTY_READ, &[], out, true) {
         Some((false, n)) => Some(n),
         _ => None,
     }
@@ -1583,6 +1637,54 @@ fn tty_write_crlf(ch: u64, text: &str) {
 /// shell is doing — clear the line at a prompt, unwind an evaluation in progress — and only
 /// the caller knows which.
 static mut INTERRUPTED: bool = false;
+
+/// **This shell has been asked to exit** (administration Part E.4c): a `TerminateRequested` from
+/// its session's supervisor, at a shutdown. Unlike [`INTERRUPTED`] it is sticky — the evaluator's
+/// checkpoint answers "interrupted" for as long as it is set, so no `catch` recovers from it — and
+/// the REPL exits once what was running has unwound.
+static mut STOP_ASKED: bool = false;
+
+/// The shell's notification channel, where that request arrives: set once at startup. The prompt's
+/// read watches it ([`tty_read`]), and so does [`reap`] while a pipeline runs.
+static mut NOTIF_CH: u64 = 0;
+
+/// **Read every notification queued on `notif`** while a pipeline runs: a `ChildExited` is kept in
+/// `exits`, as `(code, crashed)` in arrival order, and a `TerminateRequested` from the session's
+/// supervisor (administration Part E.4c) asks every stage to stop — once, as an interrupt does,
+/// with `asked` saying whether that has happened — and marks the shell to exit once the pipeline
+/// has unwound. Shared by the capture wait and [`reap`], so an exit read by the first is still
+/// counted by the second.
+fn drain_notifications(notif: u64, children: &[u64], asked: &mut bool, exits: &mut Vec<(i32, bool)>) {
+    loop {
+        // SAFETY: `NOTIF` is a valid 64-byte out-param.
+        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
+            return; // WouldBlock: drained
+        }
+        // SAFETY: the kernel wrote a Notification into `NOTIF`.
+        let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        if kind == KIND_TERMINATE_REQUESTED {
+            // SAFETY: single-threaded shell.
+            unsafe { (&raw mut STOP_ASKED).write(true) };
+            if !*asked {
+                *asked = true;
+                for &c in children {
+                    // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                    unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+                }
+            }
+        } else if kind == KIND_CHILD_EXITED {
+            let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            exits.push((code, exit_kind != EXIT_KIND_NORMAL));
+        }
+    }
+}
+
+/// Say this shell was asked to stop, and exit.
+fn stop() -> ! {
+    kprint(b"nxsh: asked to stop, exiting\n");
+    exit(EXIT_OK)
+}
 
 static mut TTY_MSG: [u8; 4096] = [0; 4096];
 static mut TTY_HANDLES: [u64; 8] = [0; 8];
@@ -1650,6 +1752,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         .u(env.values.len() as u64)
         .s(b" fields)")
         .end();
+    // SAFETY: single-threaded shell; written once, here, before any wait reads it.
+    unsafe { NOTIF_CH = notif };
     exit(run(notif, ns, &argv, env, terminal))
 }
 
