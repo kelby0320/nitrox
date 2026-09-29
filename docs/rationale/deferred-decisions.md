@@ -114,7 +114,10 @@ request cancellation or the 30-second force-complete timeout. Phase 2 stacks are
 shallow and the boot-path block driver completes promptly. `sys_io_cancel` is
 defined (number reserved) but returns `Unsupported` until this lands. Trigger:
 long-running or cancellable I/O (network, user-abortable operations) and Tier 2
-module unload (which drains in-flight IRPs).
+module unload (which drains in-flight IRPs). **A shutdown is exposed to it too** (PR #343 review):
+`init`'s `Finish` calls `sys_ns_sync`, which blocks until its write IRPs complete, so a disk that
+stops completing writes holds PID 1 there and `sys_power` is never reached. The kernel's own flush
+in `sys_power` is bounded; the write-back before it is only as bounded as the IRPs it waits on.
 
 **Async-I/O surface subset.** The [`IoOp`](../spec/io-operation.md) descriptor
 ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,
@@ -527,12 +530,13 @@ is still open.) The precedent is now concrete: a
 
 **Availability is the other half, and it is the nearer one.** `open_auth_session` applies no
 per-caller cap and frees a slot only when the peer closes, so any holder of the inherited root
-namespace can resolve `/svc/auth` up to `MAX_SESSIONS` (31) times and keep them; every later
-resolve then gets `WouldBlock`, and the caller's symptom is `session-mgr: /svc/auth resolve
-FAIL; no session can authenticate`. Not exploitable today — nothing hostile runs, and
-`session-mgr` resolves at boot before `service-mgr` starts anything — but
-`desktop-session-mgr` resolves *later*, in Part D, so the window widens exactly when a second
-supervisor arrives. Same fix as the rest of this entry (PR #235 review, finding 8).
+namespace can resolve `/svc/auth` up to `MAX_SESSIONS` (30 since administration Part E.4a, when the
+control channel took a slot; 31 before) times and keep them; every later resolve then gets
+`WouldBlock`, and the caller's symptom is `session-mgr: /svc/auth resolve FAIL; no session can
+authenticate`. Not exploitable today — nothing hostile runs, and `session-mgr` resolves at boot
+before `service-mgr` starts anything — but `desktop-session-mgr` resolves *later*, in Part D, so the
+window widens exactly when a second supervisor arrives. Same fix as the rest of this entry (PR #235
+review, finding 8).
 
 **`/svc/views` sits on the same boundary, and costs more there** (administration Part A,
 2026-09-23). `init` binds the view broker at `/svc/views` in the root namespace for `auth-service`'s
@@ -1212,7 +1216,9 @@ that holds a channel per client waits on its serving endpoint plus one slot per 
 `MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not
 one of them. (Since administration Part C.3 a filesystem server whose supervisor keeps its
 control channel, for `Meta::Unmount`, spends a slot on that too: 30 directory sessions while
-it is open. `init`'s mounts keep 31, since `init` closes its end at once.) Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
+it is open. Since Part E.4a `init` keeps its mounts' too, for a shutdown's unmount, so every
+filesystem server has 30 for the whole boot.)
+Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
 (`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
 concurrent clients to 31, and made both derive their cap from the constant rather than
 restate it. That is a bigger number, not a different shape, and three things are unchanged:
@@ -1596,11 +1602,13 @@ device after the unmount. **C.8's `check-storage` proves it where the host can r
 real SATA disk, unmounted in the guest and then checked on the host. The file holds its pattern,
 `e2fsck -fn` finds the filesystem clean, and the superblock says so.
 
+**`init`'s mounts are unmounted by a shutdown** (administration Part E.4a, paid 2026-09-29): on
+the terminal channel's `Finish`, `init` runs the same sync and `Meta::Unmount` on them, last
+mounted first, before it asks the kernel to stop the machine. `check-shutdown` proves it on the
+host the way `check-storage` does. A machine turned off without a shutdown is still left not
+clean.
+
 **What is still owed:**
-- **`init`'s mounts are never unmounted, so nothing syncs them before the machine stops.**
-  **Trigger, and it is scheduled**: Part E's `shutdown` (`docs/planning/administration.md`),
-  which runs the same chain on them. Until then a file on `/` or `/home` that its writer left
-  unsynced is written only by a later sync of it.
 - **A file its server gives id `0` is uncached.** It has no self-pin and no sync can find it, so
   its unsynced mapped writes are still lost when its writer lets go. No in-tree server sends a
   zero id: `fs-server-ext4` sends the inode number. **Trigger**: the first server that serves a

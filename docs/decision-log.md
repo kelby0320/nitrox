@@ -31263,3 +31263,73 @@ Local timing: 80 s under TCG. The local gate set grows from 32 to 34 with `check
 `--kvm` run.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Part E.4, reviewed (PR #343): a declaration says how long its stop takes
+
+The review found one blocking problem, one worth fixing and three optional. All are addressed; one
+by a documented deferral rather than code.
+
+**Blocking — two architecture docs said the opposite of what E.4a built.**
+- `ext4-fs-server-rw.md` said `init`'s mounts are never unmounted, and that `init` closes their
+  control channel at once, so they keep every session slot. Since E.4a `init` keeps the channel
+  (`KEPT`) and unmounts at `Finish`, so the root server's session capacity is 30 for the whole boot.
+- `logging.md` gave the log's source ceiling as `MAX_WAIT_HANDLES - 1` (31), and said
+  `fs-server-ext4` had the identical ceiling. Both are 30.
+- **Swept for the class**, which found five more: `deferred-decisions.md` in three places (the
+  auth service's `MAX_SESSIONS`, `TODO(server-fanout)`'s "`init`'s mounts keep 31", and a
+  still-owed item, "`init`'s mounts are never unmounted", whose trigger was this part);
+  `storage.md`'s "never unmounted", true only of the storage service; and `fs-server-ext4`'s
+  `serve_control` doc comment. `rsproto-storage-ops.md`'s "never unmounted here" is about the
+  storage service and stays.
+
+**Worth fixing — 3 s per service was too short for the storage service.** Its stop writes back and
+unmounts every filesystem it mounted, and that takes as long as what is dirty. Past 3 s the
+shutdown went on, and `init`'s `sys_power` would stop every processor mid-write.
+- **Fixed with a per-declaration `stop_timeout`**, a duration, which bounds both a shutdown's stop
+  and `service --stop`. The storage service declares `"60s"`. Like its neighbours the first value
+  in a declaration wins, and a value that does not read is the default.
+- **Why not a longer bound for everyone:** a service that does not honour a stop — four in a test
+  image — would hold every shutdown up for as long. The service that needs the time says so.
+- **Why not bounding the storage service from inside:** its stop can wait on a sync, which no
+  deadline reaches (below). A bound it set itself would be one more guess at the same number.
+- **Verified, with a control.** A probe made the storage service's stop sleep 6 s first.
+  `check-shutdown --kvm` passed. With the probe kept and the `stop_timeout` line removed, it failed:
+  the storage service's "everything it mounted is unmounted, exiting" was not in the transcript,
+  because the machine had halted first. The gate already asserts that line, so it caught this.
+- **Not measured:** how long a real stop takes with a lot dirty. The control is a delay injected
+  into the stop, not a large file under `/storage`. 60 s is a margin, not a measurement.
+- A host test covers the parse: first value wins, the value does not leak into the next
+  declaration, and `"soon"` reads as the default.
+
+**Optional, taken — `nxsh`'s evaluator checkpoint never read the notification channel.** A long
+loop that runs no stage never saw a terminate request.
+- **Reproduced first.** At a serial prompt, `for i in 1..30000 { for j in 1..30000 { } }`, then a
+  shutdown from a `service-mgr` probe: `libsession: nxsh is still running after it was asked to
+  stop`, and the session ended with the shell's exit `-1`.
+- **Fixed:** the checkpoint drains the notification channel, with or without a terminal, before it
+  polls the tty. The same run then printed `nxsh: asked to stop, exiting`, exit 0.
+- **What the drain drops:** a child's exit. No stage runs at a checkpoint, since `reap` has counted
+  every exit before a pipeline returns. The prompt's own read already drops them the same way.
+- **What did not work as a reproduction, for the record:** `for i in 1..100000000` makes the range
+  whole first, and the shell exits; `;` does not separate statements; and `while true { }` stops at
+  the evaluator's 10 million iteration backstop before a probe fires.
+
+**Optional, documented rather than fixed — `init`'s `Finish` can block without a bound.**
+`sys_ns_sync` returns when its write IRPs complete, and an interrupt-driven IRP has no
+force-complete timeout. A disk that stops completing writes holds PID 1 there, and `sys_power` is
+never reached.
+- **Why not bounded in `init`:** `init` cannot bound a syscall that blocks. The sync would have to
+  move to a thread, or the kernel would have to give up on the IRP. Either is the missing IRP
+  timeout, which is deferred with its own trigger. That deferral (§ *IRP cancellation and the
+  completion timeout*) now names a shutdown as exposed to it.
+- `init`'s `finish` doc comment and `init/CLAUDE.md` say so, beside the bounded wait for each
+  `Meta::Unmount` answer. The kernel's own flush in `sys_power` is bounded already.
+
+**Optional, taken:** `service-manager.md` omitted `input-testclient` from the test image's services
+that do not honour a stop.
+
+**Docs:** `service-toml-schema.md` gains `stop_timeout`; `service-manager.md` § *Shutdown* says a
+declaration may lengthen a service's bound.
+
+**ABI:** no hash impact. `stop_timeout` is a declaration key; no syscall, layout or discriminant
+changes.

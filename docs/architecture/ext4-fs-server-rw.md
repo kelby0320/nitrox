@@ -99,12 +99,15 @@ unmount sets the bit again as its last write (`mark_clean`), on `Meta::Unmount` 
 supervisor on the control channel. The server then replies and exits
 ([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
 not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
-a repair tool is `TODO(fs-repair)`. `init`'s mounts are never unmounted, so until Part E's
-shutdown every boot of an installed machine reports it.
+a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
+Part E.4): `sys_ns_sync`, then `Meta::Unmount`, last mounted first. A machine turned off without
+one is still reported on its next boot.
 
 **The control channel stays open after `Ready`**, and takes a wait slot while it is. A directory
-session may use the last slot only once it has closed. `init` closes its end as soon as a mount
-is bound, so its mounts keep every session slot, and a closed control channel is ordinary.
+session may use the last slot only once it has closed. **`init` keeps its end** for the shutdown's
+unmount, since Part E.4a, so the root server's session capacity is `MAX_SESSIONS - 1`, 30, for the
+whole boot, as the storage service's mounts' has always been. A closed control channel is still
+ordinary.
 
 ## Journaling (jbd2) — deferred
 

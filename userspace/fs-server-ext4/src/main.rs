@@ -1233,12 +1233,12 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
     }
 }
 
-/// Serve the control channel after `Ready` (administration Part C.3). `init` closes its end as
-/// soon as the mount is bound, so a closed peer is ordinary: the channel leaves the wait set
-/// and serving goes on. **The one request is `Meta::Unmount`**: record the filesystem cleanly
-/// unmounted, answer, and exit. By then the supervisor has written back everything the kernel
-/// held of it, and nothing more can reach it. A read-only mount writes nothing, since it never
-/// marked the filesystem mounted.
+/// Serve the control channel after `Ready` (administration Part C.3). Both supervisors keep their
+/// end — `init` since Part E.4a, for a shutdown's unmount — but a closed peer is still ordinary:
+/// the channel leaves the wait set and serving goes on. **The one request is `Meta::Unmount`**:
+/// record the filesystem cleanly unmounted, answer, and exit. By then the supervisor has written
+/// back everything the kernel held of it, and nothing more can reach it. A read-only mount writes
+/// nothing, since it never marked the filesystem mounted.
 fn serve_control<R: BlockReader + BlockWriter>(reader: &R) {
     // SAFETY: a single-threaded read.
     let control = unsafe { CONTROL };

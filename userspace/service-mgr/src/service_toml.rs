@@ -121,6 +121,11 @@ pub struct ServiceDecl {
     /// **A service `service --stop` and `--restart` refuse** (Part E.2): one whose absence would
     /// lock the administrator out, or lose state nothing rebuilds.
     pub essential: bool,
+    /// **How long it may take to exit once asked to stop**, in nanoseconds — at a shutdown, or
+    /// on `service --stop` — or `None` for `service-mgr`'s own bound (administration Part E.4, PR
+    /// #343 review). For a service whose stop is work that grows with what it holds: the storage
+    /// service writes back and unmounts every filesystem it mounted before it exits.
+    pub stop_timeout: Option<u64>,
 }
 
 /// Whether `path` may be a server's root path: absolute, not the root itself, and made of
@@ -191,6 +196,8 @@ struct RestartSeen {
     endpoint: bool,
     critical: bool,
     essential: bool,
+    /// `stop_timeout`, same reason.
+    stop_timeout: bool,
     policy: bool,
     max_attempts: bool,
     backoff: bool,
@@ -338,6 +345,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
     let mut endpoint: Option<Option<String>> = None;
     let mut critical = false;
     let mut essential = false;
+    let mut stop_timeout: Option<u64> = None;
     let mut restart = RestartConfig::default();
     let mut seen = RestartSeen::default();
     let mut section = Section::None;
@@ -372,6 +380,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
                     endpoint: endpoint.clone().flatten(),
                     critical,
                     essential,
+                    stop_timeout,
                 });
             }
             // **This is the only thing that resets them**, and it has to cover both paths:
@@ -410,6 +419,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
                         endpoint = None;
                         critical = false;
                         essential = false;
+                        stop_timeout = None;
                         name = Some(String::from(svc));
                     }
                     section = Section::Root;
@@ -459,6 +469,11 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
             Section::Root if key == "essential" && !seen.essential => {
                 seen.essential = true;
                 essential = value == "true";
+            }
+            // A duration that does not read is `service-mgr`'s own bound, as a backoff's is.
+            Section::Root if key == "stop_timeout" && !seen.stop_timeout => {
+                seen.stop_timeout = true;
+                stop_timeout = unquote(value).and_then(parse_duration_ns);
             }
             // Every arm is guarded on **not yet seen** — see [`RestartSeen`].
             Section::Restart => match key {
@@ -876,6 +891,15 @@ backoff_max = \"2s\"\n";
         );
         assert_eq!(first[0].endpoint.as_deref(), Some("/x"), "first value wins");
         assert!(first[0].critical, "first value wins");
+        // **How long its stop may take** (PR #343 review): read, per declaration, first value wins.
+        let slow = parse_all(
+            "[service.a]\nexecutable=\"/a\"\nstop_timeout=\"60s\"\nstop_timeout=\"1s\"\n\
+             [service.b]\nexecutable=\"/b\"\n\
+             [service.c]\nexecutable=\"/c\"\nstop_timeout=\"soon\"\n",
+        );
+        assert_eq!(slow[0].stop_timeout, Some(60_000_000_000), "first value wins");
+        assert_eq!(slow[1].stop_timeout, None, "a bound does not leak to the next service");
+        assert_eq!(slow[2].stop_timeout, None, "one that does not read is service-mgr's own");
         let yes = parse_all("[service.a]\nexecutable=\"/a\"\ncritical=yes\n");
         assert!(!yes[0].critical, "only `true` is true");
     }

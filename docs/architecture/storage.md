@@ -110,7 +110,8 @@ source names a partition by one of the two schemes `init` accepts
   confirm the match, and a position they contradict is no match. The UUID is compared in the form
   the kernel names the path with, exactly, as `init`'s lookup is.
 
-**`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted.
+**`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted by this service.
+`init` unmounts them itself at a shutdown (Part E.4a).
 
 **If they cannot all be placed, this service mounts nothing.** Sometimes `init.toml` does not read,
 names no mount, or names one that matches no device. Then a device this service takes for free

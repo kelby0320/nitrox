@@ -290,15 +290,21 @@ the one loop:
    [`graphical-session.md`](graphical-session.md) §4): each passes the request to its session's
    leader, gives it 5 s, closes the session at the view broker and exits — or exits at once from
    its prompt or greeter.
-3. **The services, last declared first**, each `CTRL_OP_SHUTDOWN` and 3 s to exit. The reverse of
+3. **The services, last declared first**, each `CTRL_OP_SHUTDOWN` and 3 s to exit, or what its
+   declaration's `stop_timeout` gives it. The reverse of
    the start order lets each server outlive what was started after it, and may use it. One not
    honoured is logged "still running", and the shutdown goes on — a stop is a request, and there is
    no forcible kill. The storage service unmounts everything it mounted on the way out.
 4. **`init` is told to finish** on the terminal channel: its own filesystems, then `sys_power`.
 
 What honours a stop is § *Servers, and the registry* above: every server a release image runs. In a
-test image `nxterm`, `ui-testclient` and `restart-probe` do not, and each is passed over after its
-bound.
+test image `nxterm`, `ui-testclient`, `input-testclient` and `restart-probe` do not, and each is
+passed over after its bound.
+
+**A declaration may say how long its stop takes** (`stop_timeout`, PR #343 review): the storage
+service declares 60 s, since its stop is the write-back and unmount of every filesystem it mounted,
+and grows with what is dirty. The same bound answers a `service --stop`. Past it the shutdown goes
+on, and a filesystem still being written would be left not clean.
 
 ## Capability posture
 

@@ -1108,6 +1108,12 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
 /// one mount answers, the next is still unmounted: a shutdown that stopped half way would leave
 /// every later filesystem not clean.
 ///
+/// **The sync is the one wait `init` does not bound** (PR #343 review). `sys_ns_sync` returns when
+/// its write IRPs complete, and an interrupt-driven IRP has no force-complete timeout yet, so a
+/// disk that stops completing writes holds the shutdown here and `sys_power` is never reached.
+/// That is `deferred-decisions.md` § *IRP cancellation and the completion timeout*, whose trigger
+/// this is; each `Meta::Unmount` answer is bounded, by `UNMOUNT_TIMEOUT_NS`.
+///
 /// Returns only if the machine cannot be stopped — with no system-control object, or one
 /// `sys_power` refused — after saying so. The filesystems are unmounted by then, so the machine
 /// is as safe to turn off as a halt would have left it.

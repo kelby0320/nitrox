@@ -1207,15 +1207,19 @@ enum Awaits {
 }
 
 /// How long a stopped service has to exit before its stop is answered "asked, and still
-/// running". There is no forcible kill; a stop is a request.
+/// running", unless its declaration says (`stop_timeout`). There is no forcible kill; a stop is a
+/// request.
 const STOP_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// How long the login supervisors have, at shutdown, to end their sessions and exit. Each gives its
 /// session's leader a bound of its own first, so this is the longer.
 const SESSIONS_TIMEOUT_NS: u64 = 10_000_000_000;
 
-/// How long each service has, at shutdown, to exit once asked. Shorter than a `service --stop`'s:
-/// no person waits on the answer, and a service that does not honour it holds up only the stop.
+/// How long each service has, at shutdown, to exit once asked, **unless its declaration says**
+/// (`stop_timeout`). Shorter than a `service --stop`'s: no person waits on the answer, and a
+/// service that does not honour it holds up only the stop. A service whose stop is real work —
+/// the storage service, writing back every filesystem it mounted — declares its own (PR #343
+/// review): past this bound `init` would stop the machine mid-write.
 const SHUTDOWN_STOP_NS: u64 = 3_000_000_000;
 
 /// **A shutdown under way** (administration Part E.4b): whether it ends in a reboot, and what it
@@ -2361,7 +2365,8 @@ impl Mgr {
                     .s(b"' to stop, for the shutdown")
                     .end();
                 send_control(self.svcs[i].ctrl, CTRL_OP_SHUTDOWN);
-                Stage::Service { i, until: now.saturating_add(SHUTDOWN_STOP_NS) }
+                let bound = self.svcs[i].decl.stop_timeout.unwrap_or(SHUTDOWN_STOP_NS);
+                Stage::Service { i, until: now.saturating_add(bound) }
             }
             None => {
                 kprint(b"service-mgr: every service has been asked to stop; telling init to finish\n");
@@ -2434,7 +2439,8 @@ impl Mgr {
                 let s = &mut self.svcs[i];
                 s.requested_shutdown = true;
                 s.restart_at = None;
-                let until = now_ns().saturating_add(STOP_TIMEOUT_NS);
+                let bound = self.svcs[i].decl.stop_timeout.unwrap_or(STOP_TIMEOUT_NS);
+                let until = now_ns().saturating_add(bound);
                 let awaits = Awaits::Exit { then_start, until };
                 self.held.push(Held { session, request_id, op, svc: i, awaits });
             }

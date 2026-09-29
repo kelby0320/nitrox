@@ -722,6 +722,20 @@ impl Host for NitroxHost {
     /// sequential and each tty exchange completes before the next statement — so anything
     /// waiting here is the unsolicited interrupt.
     fn interrupted(&mut self) -> bool {
+        // **A terminate request, between statements** (PR #343 review): read off the notification
+        // channel here too, so a loop that runs no stage — `for i in 1..30000 { for j in 1..30000
+        // { } }` at a prompt — still sees it, and with or without a terminal. No stage runs at a
+        // checkpoint: `reap` has counted every exit before a pipeline returns, so nothing the
+        // drain drops here is one anyone is waiting for.
+        // SAFETY: single-threaded shell; set once at startup.
+        let notif = unsafe { NOTIF_CH };
+        if notif != 0 {
+            drain_notifications(notif, &[], &mut false, &mut Vec::new());
+        }
+        // SAFETY: single-threaded shell.
+        if unsafe { (&raw const STOP_ASKED).read() } {
+            return true;
+        }
         if self.tty == 0 {
             return false;
         }
