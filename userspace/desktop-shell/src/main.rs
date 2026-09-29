@@ -646,7 +646,10 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
-/// Construct the namespace one application runs in, and return its handle.
+/// Construct the namespace one application runs in: [`libsession::build`], from the same
+/// [`libsession::NamespaceSpec`] the login supervisors build sessions from (administration Part
+/// F.1). This shell had a builder of its own until F.1, and it had drifted: it never bound
+/// `/session/user`, so `whoami` in a desktop terminal said "no session identity".
 ///
 /// **The load-bearing part of the shell**, and the reason it holds `BIND_NAMESPACE` at all.
 /// `ui-composition-model.md` §5a rests the guarantee that *an application cannot compose other
@@ -677,289 +680,70 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
-#[allow(clippy::too_many_arguments)]
-fn build_app_namespace(
-    draw: u64,
-    fs: u64,
-    tty: u64,
-    profile: u64,
-    home: &str,
-    desktop: u64,
-    clipboard: u64,
-    views: u64,
-    views_base: &str,
-    devices: u64,
-    storage: u64,
-    services: u64,
-) -> u64 {
-    let ns = unsafe { syscall0(SYS_NS_CREATE) };
-    if ns < 0 {
-        kprint(b"desktop-shell: application ns_create FAIL\n");
-        return 0;
+/// **What an application gets, and why each** — the reasons this shell's builder carried, kept
+/// with the choice now that `libsession` does the binding:
+/// - **`/dev/draw/new`, narrowly**, above.
+/// - **`/home`, the user's subtree**, because the environment names it: `session_env` sets `HOME`
+///   and `PWD` to `/home`, and a namespace where that resolves to nothing gives a shell whose every
+///   relative path fails (PR #238 review, finding 3). Required when there is a home.
+/// - **`/bin`, scoped**, because a terminal has to host a shell; scoped, so `/bin/applications`
+///   does not reach the applications projection (PR #279 review, blocking 1).
+/// - **No `/applications`**: nothing in an application reads it, and an application holds no
+///   authority to spawn from a menu — `Desktop::Open` exists because of that.
+/// - **`/dev/tty`**, the tty server, where each resolve mints a fresh terminal — so two emulators
+///   share nothing, and the binding need not be per window.
+/// - **`/system/fonts`**, read-only, so it can render text.
+/// - **`/dev/desktop` and `/dev/clipboard` are capability decisions**, granted deliberately for v1:
+///   every application in the session can create, switch and name desktops, and read what anything
+///   else copied (M12 decision 1). Bound here rather than into the session, whose namespace is this
+///   shell's own and has nothing else running in it (PR #239 review, finding 1).
+/// - **`/dev/views` at the session's base**, so `with` in a terminal launched here reaches the view
+///   broker as this session; an application cannot choose another base.
+/// - **`/dev/devices`, `/storage`, `/dev/storage` and `/dev/services`**, the session's own binds of
+///   info-only endpoints: none reaches a class, a mount or a start.
+/// - **`/session/user`**, since F.1: who the session is for, as the session has it.
+/// - **The session's disks, in an installer session alone** (PR #308 review, blocking 1): rebound
+///   from the session's namespace, which is why that is the spec's `root_ns`. Without it an
+///   installer typed at a desktop terminal finds no disk, and on the laptop there is no other way
+///   in.
+///
+/// `None` if the namespace could not be built with what it cannot do without.
+fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
+    let built = libsession::build(&libsession::NamespaceSpec {
+        root_ns: l.session_ns,
+        fs_endpoint: l.fs,
+        profile_endpoint: l.profile,
+        tty_endpoint: l.tty,
+        clipboard_endpoint: l.clipboard,
+        home: l.home.as_bytes(),
+        user: l.user.as_bytes(),
+        bind_fonts: true,
+        bind_console: false,
+        bind_blk: l.disks,
+        views_endpoint: l.views,
+        views_base: l.views_base.as_bytes(),
+        devices_endpoint: l.devices,
+        storage_endpoint: l.storage,
+        services_endpoint: l.services,
+        bind_applications: false,
+        draw_endpoint: l.draw,
+        desktop_endpoint: l.desktop,
+    })?;
+    if built.desktop {
+        kprint(b"desktop-shell: application /dev/desktop bound\n");
     }
-    let ns = ns as u64;
+    Some(built)
+}
 
-    // `/dev/draw/new`, narrow. See this function's doc for why the base is `/new`.
-    let path = b"/dev/draw/new";
-    let base = b"/new";
-    // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-    let dr = unsafe {
-        syscall6(
-            SYS_NS_BIND,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            draw,
-            base.as_ptr() as u64,
-            base.len() as u64,
-        )
+/// **The session's user**, read from its `/session/user` as `whoami` reads it: the name up to the
+/// first NUL or newline. Empty if the session has none, which binds none into an application.
+fn session_user(session_ns: u64) -> alloc::string::String {
+    let Ok(bytes) = libfs::read_file(session_ns, b"/session/user") else {
+        kprint(b"desktop-shell: the session has no /session/user\n");
+        return alloc::string::String::new();
     };
-    if dr != 0 {
-        kprint(b"desktop-shell: application /dev/draw/new bind FAIL\n");
-        // SAFETY: closing the namespace we just created.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
-        return 0;
-    }
-
-    // **No `/applications`, deliberately.** The *session* namespace has it and this one does not,
-    // so `nxsh` on the serial console can list the installed applications and the same `nxsh`
-    // inside `nxterm` cannot. Nothing in an application reads it, and an application holds no
-    // authority to spawn in the first place — `Desktop::Open` exists because of that — so the
-    // binding would be a hole in a sandbox with nothing on the other side of it. (This was filed
-    // as a symptom of there being no account that sees more of the system; administration Part A
-    // answered that with views, reached by `with`, and the asymmetry stands on its own.)
-    //
-    // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
-    // session itself gets — an application that could not draw text would be a window of
-    // rectangles.
-    if fs != 0 {
-        let fpath = b"/system/fonts";
-        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-        let fr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                fpath.as_ptr() as u64,
-                fpath.len() as u64,
-                fs,
-                fpath.as_ptr() as u64,
-                fpath.len() as u64,
-            )
-        };
-        if fr != 0 {
-            kprint(b"desktop-shell: application /system/fonts bind FAIL\n");
-        }
-    }
-
-    // **`/dev/tty`, which is `graphical-session.md` §6.1's first shape and Part F's answer.**
-    //
-    // The path names the tty *server*, not a device: each resolve mints a **fresh terminal**
-    // (`tty-server`'s `open_tty`), exactly as `/dev/draw/new` mints a compositor session per
-    // caller. So two terminal emulators in two namespaces each get their own, attach their own
-    // backend, and share nothing — the binding does not need to be per-window because the
-    // minting already is.
-    //
-    // §6.1's *second* shape — absent from application namespaces, the terminal handed down —
-    // stays true one level in: `nxterm` resolves this to obtain a terminal, then hands **that
-    // handle** to the `nxsh` it hosts, because a binding cannot name a particular window. The
-    // emulator does not need to name one; it makes one.
-    if tty != 0 {
-        let tpath = b"/dev/tty";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let tr = unsafe {
-            syscall4(SYS_NS_BIND, ns, tpath.as_ptr() as u64, tpath.len() as u64, tty)
-        };
-        if tr != 0 {
-            kprint(b"desktop-shell: application /dev/tty bind FAIL\n");
-        }
-    }
-
-    // **`/bin`, because a terminal has to be able to host a shell.** `nxterm` spawns `nxsh`,
-    // and without this it launches, finds a font and a terminal, and then reports
-    // `/bin/nxsh not found` — a window that opens and immediately has nothing in it.
-    //
-    // **What an application namespace holds is `/dev/draw/new`, `/system/fonts`, `/dev/tty`,
-    // `/bin` and the user's `/home`** — the session's members less the manager channel and
-    // less `/session/user`, and with `/dev/draw` narrowed to `/new` rather than the session's
-    // whole subtree. That narrowing is what M7 is about. *Which* applications get which of
-    // these is a per-application policy and a later question: there is no manifest to read it
-    // from, and inventing one here would be guessing at what `ui-composition-model.md` wants
-    // before anything asks.
-    if profile != 0 {
-        let bpath = b"/bin";
-        // **Scoped**, which is what keeps this bind from also handing over `/applications`
-        // (PR #279 review, blocking 1). Unscoped, `/bin/applications` forwarded as a bare
-        // `applications` and reached the applications projection's root — so the omission
-        // documented four lines up was not an omission at all.
-        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-        let br = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                bpath.as_ptr() as u64,
-                bpath.len() as u64,
-                profile,
-                bpath.as_ptr() as u64,
-                bpath.len() as u64,
-            )
-        };
-        if br != 0 {
-            kprint(b"desktop-shell: application /bin bind FAIL\n");
-        }
-    }
-
-    // **`/dev/desktop`, and binding it is a capability decision** — every application in this
-    // session can then create, switch and name desktops, which is strictly more than one has
-    // otherwise, since it cannot even raise its own window. Granted deliberately for v1: the
-    // narrow-bind that withholds `/dev/draw/manage` while granting `new` is available here too,
-    // but withholding mutation would leave `desktop switch` with no way to work, and a binding
-    // whose only consumer is disarmed is the shape the `desktop-endpoint` deferral existed to refuse.
-    //
-    // **Bound here rather than into the session namespace.** The session namespace is the
-    // shell's own and nothing else runs in it, so a binding there would have no consumer at
-    // all — while a `/bin` command runs under the `nxsh` a terminal spawned, whose namespace is
-    // this one (PR #239 review, finding 1).
-    if desktop != 0 {
-        let dpath = b"/dev/desktop";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let dr = unsafe {
-            syscall4(SYS_NS_BIND, ns, dpath.as_ptr() as u64, dpath.len() as u64, desktop)
-        };
-        if dr != 0 {
-            kprint(b"desktop-shell: application /dev/desktop bind FAIL\n");
-        } else {
-            kprint(b"desktop-shell: application /dev/desktop bound\n");
-        }
-    }
-
-    // **`/dev/clipboard`, so applications can copy and paste** (M12 Part E). It is bound here
-    // for `/dev/desktop`'s reason: the session namespace is the shell's own and nothing else
-    // runs in it, so a binding there alone would have no consumer — while the editor, the
-    // browser, the terminal and any `clip` a pipeline runs all live in namespaces this
-    // function builds.
-    //
-    // **And granting it is a capability decision, exactly as `/dev/desktop` is.** Everything
-    // in this session can then read what anything else copied. That is M12 decision 1's
-    // accepted position — the binding is the authority, and the trigger for narrowing it is an
-    // application inside a session that the person does not trust, which is the day profiles
-    // stop being a build-time idea. The mechanism for narrowing needs no protocol change: an
-    // endpoint attenuated to `RIGHT_SEND` before it reaches here is an application that can
-    // copy and not read.
-    if clipboard != 0 {
-        let cpath = b"/dev/clipboard";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let cr = unsafe {
-            syscall4(SYS_NS_BIND, ns, cpath.as_ptr() as u64, cpath.len() as u64, clipboard)
-        };
-        if cr != 0 {
-            kprint(b"desktop-shell: application /dev/clipboard bind FAIL\n");
-        }
-    }
-
-    // **`/home`, scoped to the user's subtree — because otherwise the environment lies.**
-    // `session_env()` sets `HOME` and `PWD` to `/home`, and `launch` forwards that record
-    // unchanged, so a terminal opened here started its `nxsh` with `PWD=/home` in a namespace
-    // where `/home` resolved to nothing. `nxsh` resolves every relative path against `PWD`, so
-    // `list .`, `cd`, and `open ./x` all failed in the graphical column while passing in the
-    // serial one — and no gate saw it, because the grid renders only under `test-harness`
-    // (PR #238 review, finding 3).
-    //
-    // The six-argument bind, with `home` as the subtree base: the same shape
-    // `libsession::build_namespace` uses, so an application sees exactly the user's home and
-    // not the `/home` above it. Binding the fs endpoint whole-tree here would hand every
-    // application every user's files, which is the opposite of what this function is for.
-    if fs != 0 && !home.is_empty() {
-        let hpath = b"/home";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let hr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                hpath.as_ptr() as u64,
-                hpath.len() as u64,
-                fs,
-                home.as_ptr() as u64,
-                home.len() as u64,
-            )
-        };
-        if hr != 0 {
-            kprint(b"desktop-shell: application /home subtree bind FAIL\n");
-        }
-    }
-
-    // **`/dev/views`, at the session's base** (administration Part A.4), so `with` typed in a
-    // terminal launched here reaches the view broker as *this* session: the base is the identity,
-    // and an application cannot choose another. The same bind the session itself got.
-    if views != 0 && !views_base.is_empty() {
-        let vpath = b"/dev/views";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let vr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                vpath.as_ptr() as u64,
-                vpath.len() as u64,
-                views,
-                views_base.as_ptr() as u64,
-                views_base.len() as u64,
-            )
-        };
-        if vr != 0 {
-            kprint(b"desktop-shell: application /dev/views bind FAIL\n");
-        }
-    }
-
-    // **`/dev/devices`, at the base `/info`** (administration Part B.4) — the same bind the session
-    // got, so `list /dev/devices` in a terminal launched here lists the machine's devices. The
-    // endpoint is info-only, so no path under it reaches a class to subscribe to.
-    if devices != 0 {
-        let dpath = b"/dev/devices";
-        let base = b"/info";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let dr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                dpath.as_ptr() as u64,
-                dpath.len() as u64,
-                devices,
-                base.as_ptr() as u64,
-                base.len() as u64,
-            )
-        };
-        if dr != 0 {
-            kprint(b"desktop-shell: application /dev/devices bind FAIL\n");
-        }
-    }
-
-    // **`/storage` at the base `/fs`, and `/dev/storage` at `/info`** (administration Part C.6) —
-    // the session's two binds of the storage service's session endpoint, so a program launched
-    // here reaches every mounted filesystem and the table of what each disk holds. The endpoint
-    // answers nothing else, so however this shell binds it, no path under it mounts anything.
-    if storage != 0 {
-        for (at, base) in [(&b"/storage"[..], &b"/fs"[..]), (b"/dev/storage", b"/info")] {
-            // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-            let sr = unsafe {
-                syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, storage, base.as_ptr() as u64, base.len() as u64)
-            };
-            if sr != 0 {
-                kprint(b"desktop-shell: application /storage bind FAIL\n");
-            }
-        }
-    }
-
-    // **`/dev/services`** (administration Part E.2b) — `service-mgr`'s session endpoint, so a
-    // program launched here lists the services. It answers the table and nothing else, so however
-    // this shell binds it, no path under it starts or stops one.
-    if services != 0 {
-        let at = b"/dev/services";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let r = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, services, 0, 0) };
-        if r != 0 {
-            kprint(b"desktop-shell: application /dev/services bind FAIL\n");
-        }
-    }
-    ns
+    let end = bytes.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(bytes.len());
+    alloc::string::String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Check the application namespace grants `new` and withholds `manage`, before anything runs
@@ -979,6 +763,7 @@ fn verify_app_namespace(
     expect_desktop: bool,
     expect_devices: bool,
     expect_storage: bool,
+    expect_user: bool,
 ) -> bool {
     let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if new_h != 0 {
@@ -1094,8 +879,27 @@ fn verify_app_namespace(
             }
             st == 0 && dir != 0
         });
+    // **`/session/user` is reported, not required** (administration Part F.1), for `/dev/devices`'
+    // reason: an application that cannot say whose session it is in still runs. Resolved: it is a
+    // snapshot bound directly, so nothing is forwarded and nothing can deadlock.
+    let user = expect_user && {
+        let (st, h) = ns_lookup(ns, b"/session/user", RIGHT_MAP_READ);
+        if h != 0 {
+            // SAFETY: closing a handle this check obtained.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        }
+        if st != 0 || h == 0 {
+            Line::new()
+                .s(b"desktop-shell: application namespace cannot reach /session/user (status ")
+                .i(st as i64)
+                .s(b")")
+                .end();
+        }
+        st == 0 && h != 0
+    };
     Line::new()
         .s(b"desktop-shell: application namespace grants new + /home")
+        .s(if user { b" + /session/user" } else { b"" })
         .s(if devices { b" + /dev/devices" } else { b"" })
         .s(if storage { b" + /storage" } else { b"" })
         .s(b", withholds manage")
@@ -1268,6 +1072,11 @@ struct Launcher<'a> {
     services: u64,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
+    /// The session's user, bound as `/session/user` in an application's namespace (administration
+    /// Part F.1). Empty binds nothing.
+    user: &'a str,
+    /// Whether the session has disks — an installer session — so an application gets them too.
+    disks: bool,
     /// The environment record an application reads its `HOME` from.
     env: &'a libstream::wire::Record,
     /// Whether a namespace this shell builds actually gates. False disables launching outright.
@@ -1293,42 +1102,29 @@ impl Launcher<'_> {
 /// The body of [`Launcher::launch`], kept a free function so the long sequence of handle
 /// bookkeeping reads as it did before the context was gathered.
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
-    let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
-        (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
-    let (views, views_base, devices, storage, services) = (l.views, l.views_base, l.devices, l.storage, l.services);
+    let (session_ns, draw, desktop, home, env) = (l.session_ns, l.draw, l.desktop, l.home, l.env);
+    let (devices, storage) = (l.devices, l.storage);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(
-        draw, fs, tty, profile, home, desktop, clipboard, views, views_base, devices, storage, services,
-    );
-    if app_ns == 0 {
+    let Some(built) = build_app_namespace(l) else {
         return false;
-    }
-    // **The disks, if this session has any** (Phase 5 Part H.1). It has them only on an installer
-    // boot, where a supervisor handed them over deliberately; on every other session this finds
-    // nothing and binds nothing.
-    //
-    // **Without this the disks stop at the shell.** The session namespace is the shell's own, and
-    // every program it launches gets the namespace built above — so an installer typed at a
-    // terminal would resolve nothing, and on the laptop the graphical session is the *only* way
-    // to log in, there being no serial port (PR #308 review, blocking 1). The shell passes the
-    // devices on exactly as it passes its endpoints.
-    //
-    // Ambient within an installer session, and deliberately so: that session exists to write a
-    // disk. Per-program grants are what `docs/planning/administration.md`'s broker is for.
-    let disks = libsession::rebind_block_devices(session_ns, app_ns);
-    if disks > 0 {
+    };
+    let app_ns = built.ns;
+    // **The disks, if this session has any** (Phase 5 Part H.1), which the builder rebinds from the
+    // session's namespace: an installer boot's, handed over deliberately. See
+    // [`build_app_namespace`] for why an application gets them.
+    if built.disks > 0 {
         Line::new()
             .s(b"desktop-shell: ")
-            .u(disks as u64)
+            .u(built.disks as u64)
             .s(b" block device(s) into ")
             .untrusted(program.as_bytes())
             .s(b"'s namespace (installer session)")
             .end();
     }
-    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0) {
+    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0, !l.user.is_empty()) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
@@ -1898,39 +1694,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
     };
 
-    let mut may_launch = false;
-    if draw_endpoint != 0 {
-        let app_ns =
-            build_app_namespace(
-                draw_endpoint,
-                fs_endpoint,
-                tty_endpoint,
-                profile_endpoint,
-                home,
-                desktop_endpoint,
-                clipboard_endpoint,
-                views_endpoint,
-                views_base,
-                devices_endpoint,
-                storage_endpoint,
-                services_endpoint,
-            );
-        if app_ns != 0 {
-            may_launch = verify_app_namespace(
-                app_ns,
-                !home.is_empty(),
-                desktop_endpoint != 0,
-                devices_endpoint != 0,
-                storage_endpoint != 0,
-            );
-            // SAFETY: closing the namespace; nothing has been launched into it yet.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
-        }
-    }
-    if !may_launch {
-        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
-    }
-    let launcher = Launcher {
+    // **Who the session is for, and whether it has disks**, read once from the session's own
+    // namespace (administration Part F.1): an application gets the one as `/session/user`, and the
+    // other only on an installer boot. Neither changes while the session lasts.
+    let user = session_user(session_ns);
+    let disks = libsession::block_device_count(session_ns) > 0;
+    let mut launcher = Launcher {
         session_ns,
         draw: draw_endpoint,
         fs: fs_endpoint,
@@ -1944,9 +1713,32 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         storage: storage_endpoint,
         services: services_endpoint,
         home,
+        user: &user,
+        disks,
         env: &env,
-        enabled: may_launch,
+        enabled: false,
     };
+    // **An application's namespace, built and checked before any is launched**, by the builder a
+    // launch uses: a shell that cannot build a gated one launches nothing.
+    let mut may_launch = false;
+    if draw_endpoint != 0
+        && let Some(built) = build_app_namespace(&launcher)
+    {
+        may_launch = verify_app_namespace(
+            built.ns,
+            !home.is_empty(),
+            desktop_endpoint != 0,
+            devices_endpoint != 0,
+            storage_endpoint != 0,
+            !user.is_empty(),
+        );
+        // SAFETY: closing the namespace; nothing has been launched into it yet.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, built.ns) };
+    }
+    if !may_launch {
+        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
+    }
+    launcher.enabled = may_launch;
 
     Line::new()
         .s(b"desktop-shell: top bar presented, window ")

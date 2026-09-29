@@ -31692,3 +31692,56 @@ plan, and one to the pass's own entry above, edited in place while it is unmerge
 - **Restart and Shut down hand the broker an application's namespace**, not the session's. The
   session's binds `/dev/draw` whole, reaching `manage`, and a view derived from it would give
   `shutdown` that too.
+
+## 2026-09-29 — Administration Part F.1: one builder for sessions and applications
+
+`desktop-shell` builds each application's namespace with `libsession::build`, from the
+`NamespaceSpec` the login supervisors build sessions from. Its own `build_app_namespace` is gone.
+Nothing an application sees changes, but one thing: **it has `/session/user`**, so `whoami` in a
+desktop terminal answers.
+
+**Booted first, as the plan asked.** A probe in `verify_app_namespace` resolved `/session/user` in
+an application's namespace during `check-login`: `NotFound`. So `whoami` there said "no session
+identity". The two builders had drifted at exactly the member the plan's spike named.
+
+**What moved into the spec:**
+- `draw_endpoint`, bound at `/dev/draw/new` alone with the base `/new`, **required when asked
+  for**, as it was in `desktop-shell`'s builder;
+- `desktop_endpoint`, at `/dev/desktop`;
+- `bind_applications`, true for a session and false for an application.
+
+**What changed shape, deliberately:**
+- **`/home` is required when there is a home**, for an application too. It had been reported and
+  skipped there. `verify_app_namespace` refused to launch without it anyway, so no application
+  starts differently.
+- **`/session/user` is bound only when there is a name.** `desktop-shell` reads its session's at
+  startup, with `libfs::read_file`, up to the first NUL. A probe confirmed it reads `alice`, five
+  bytes.
+- **The disks.** `desktop-shell` passes them to an application through the spec's `bind_blk`,
+  rebinding from the session's namespace, which is the spec's `root_ns` for an application. The
+  PR #345 review found the plan had dropped them. `libsession::block_device_count` tells the shell
+  once whether its session has any, which only an installer session does. So an ordinary session
+  never logs "asked for disks and found none". The installer's line keeps its count, which
+  `check-install` asserts.
+- **`libsession::build` returns what bound**, a `Built`, in place of the process-wide
+  `SESSION_HAS_*` statics. `desktop-shell` builds many namespaces, and writing a global per build
+  there would describe the last one. `build_namespace` stays the supervisors' wrapper and records
+  the statics their `session_has_*` read.
+- **The old builder's reasons** — why each member, and why `/dev/desktop` and `/dev/clipboard`
+  are capability decisions — moved into the new function's doc, one line each, rather than going
+  with its body.
+
+**Gate:**
+- `verify_app_namespace` now resolves `/session/user` and names it in its line. It is reported,
+  not required, as `/dev/devices` is. `check-login` asserts the line in both places it did.
+- **Control:** an application built with no user fails `check-login` at that line.
+- `check-terminal` is not the gate, as the PR #345 review found: its `nxterm` is a test-image
+  service in no session.
+
+**Docs:** `graphical-session.md` (Status, and §6's application namespace),
+`namespace-and-resource-servers.md`, `session-mgr/CLAUDE.md`, and the plan.
+
+The full local gate set, 34, is green (fgb47), `check-install` among them: it asserts the
+installer session's disks reaching the terminal it opens.
+
+No kernel change; no ABI hash impact.

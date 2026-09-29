@@ -325,6 +325,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 devices_endpoint,
                 storage_endpoint,
                 services_endpoint,
+                // A session lists its desktop entries; the window pieces are an application's.
+                bind_applications: true,
+                draw_endpoint: 0,
+                desktop_endpoint: 0,
             });
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");

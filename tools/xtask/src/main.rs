@@ -5760,9 +5760,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // draws anything, and an expectation placed beside its topic rather than its position in the
     // stream scans past output that was there.
     session.expect("desktop-shell: clock ")?;
+    // **And `/session/user`, since administration Part F.1**: `desktop-shell` builds an
+    // application's namespace with `libsession`, as the supervisors build a session's, and the
+    // one piece its own builder had never bound was who the session is for. `whoami` in a desktop
+    // terminal said "no session identity" until then. The shell resolves it in the namespace it
+    // built, and names it here only if it answered.
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /session/user + /dev/devices + /storage, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -5884,7 +5889,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new + /home + /dev/devices + /storage, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home + /session/user + /dev/devices + /storage, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the menu, so an `expect` between the two is a race between processes —

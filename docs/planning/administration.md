@@ -2387,7 +2387,11 @@ and the session would end with the editor's process left to notice (*Left alone*
 
 ### The pieces, in dependency order
 
-- [ ] **F.1 — one vocabulary for namespaces.**
+- [x] **F.1 — one vocabulary for namespaces.** *(Landed 2026-09-29, as drawn. Booted first: an
+      application's `/session/user` resolved `NotFound`. `libsession::build` returns what it bound,
+      a `Built`, so `desktop-shell` can report it, and `build_namespace` wraps it for the
+      supervisors, recording their `session_has_*`; `block_device_count` tells `desktop-shell` once
+      whether its session has disks.)*
       - `NamespaceSpec` gains `/dev/draw/new` and `/dev/desktop`, and makes optional what an
         application does not get: `/applications` and the console.
       - `desktop-shell` builds each application's namespace with `libsession::build_namespace`,

@@ -198,6 +198,11 @@ fn run_session(
         devices_endpoint: devices,
         storage_endpoint: storage,
         services_endpoint: services,
+        // A session lists its desktop entries. `/dev/draw` is bound whole below, for
+        // `desktop-shell` itself; `new` alone is an application's.
+        bind_applications: true,
+        draw_endpoint: 0,
+        desktop_endpoint: 0,
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
