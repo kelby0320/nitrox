@@ -14,13 +14,10 @@
 //! binding permits, so reaching `system/*` at all already implies the right to. This is
 //! pure syntax.
 
-/// Kernel tier — the kernel `klog`/audit rings. Never produced by [`classify`] (kernel
-/// rings are not resolved); defined for the record's `tier` field.
-pub const TIER_KERNEL: u8 = 0;
-/// System tier — supervised services (service-mgr / init mint these).
-pub const TIER_SYSTEM: u8 = 1;
-/// Application tier — user apps (session-mgr, later).
-pub const TIER_APP: u8 = 2;
+/// The tiers, and their names: `librsproto`'s since administration Part E.6, when `log` came to
+/// read records back and show them. `TIER_KERNEL` is never produced by [`classify`] — kernel
+/// rings are not resolved.
+pub use librsproto::log::{TIER_APP, TIER_KERNEL, TIER_SYSTEM, tier_name};
 
 /// A classified log path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -29,16 +26,6 @@ pub struct Classified<'a> {
     pub principal: &'a str,
     /// Optional self-declared sub-label under `principal`.
     pub source: Option<&'a str>,
-}
-
-/// Human-readable tier name (for the serial sink / logging).
-pub fn tier_name(tier: u8) -> &'static str {
-    match tier {
-        TIER_KERNEL => "kernel",
-        TIER_SYSTEM => "system",
-        TIER_APP => "app",
-        _ => "?",
-    }
 }
 
 /// Parse a resolve suffix into `(tier, principal, source)`, or `None` if the tier is

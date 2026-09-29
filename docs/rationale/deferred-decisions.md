@@ -1217,7 +1217,8 @@ that holds a channel per client waits on its serving endpoint plus one slot per 
 one of them. (Since administration Part C.3 a filesystem server whose supervisor keeps its
 control channel, for `Meta::Unmount`, spends a slot on that too: 30 directory sessions while
 it is open. Since Part E.4a `init` keeps its mounts' too, for a shutdown's unmount, so every
-filesystem server has 30 for the whole boot.)
+filesystem server has 30 for the whole boot. And the logging service's sources, 26 since Part E.6,
+when two read endpoints and two read sessions took four slots.)
 Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
 (`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
 concurrent clients to 31, and made both derive their cap from the constant rather than

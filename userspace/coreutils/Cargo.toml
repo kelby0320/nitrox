@@ -90,3 +90,8 @@ path = "src/bin/service.rs"
 [[bin]]
 name = "shutdown"
 path = "src/bin/shutdown.rs"
+
+# Reading the service log back (administration Part E.6), through the `logs` grant.
+[[bin]]
+name = "log"
+path = "src/bin/log.rs"

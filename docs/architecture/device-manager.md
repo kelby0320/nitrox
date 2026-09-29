@@ -185,9 +185,11 @@ one-off boot of a release disk whose root would not mount.
 - **An event source.** The kernel registers every node before userspace, and nothing registers one
   later. `Arrived` after `Settled` and `Departed` are specified and handled, `input-server`'s side
   in host tests, and sent by nothing until Phase 6.
-- **Supervision.** `init` keeps the manager's process handle, and nothing restarts it. If it
-  exited, an owner would keep the devices it holds (`input-server` logs that the manager has gone
-  and keeps reading), and every `/dev/devices` resolve would fail.
+- **Supervision.** `service-mgr` keeps the manager's process handle, and nothing restarts it: its
+  policy is `never`, and it is `essential`, so `service --stop` refuses it. If it exited, an owner
+  would keep the devices it holds (`input-server` logs that the manager has gone and keeps
+  reading), and every `/dev/devices` resolve would fail. (`init` kept the handle until
+  administration Part E.1a; this said so until 2026-09-29.)
 
 ## Where to read more
 

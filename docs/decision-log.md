@@ -31449,3 +31449,99 @@ The full local gate set, 34, is green (fgb44).
 
 **ABI:** no hash impact. Syscall 41 and the `CLOCK_SET_*` values are not hash inputs, and no
 layout or discriminant changes.
+
+## 2026-09-29 — Administration Part E.6: the log, read back
+
+A person with the `logs` grant can read the service log: `with admin log view-broker` shows the
+broker's records, its audit among them, as a table. With it, Part E is complete.
+
+**The read path.** The contract is `rsproto-log-ops.md`.
+- **Minting a read endpoint.** Resolving `read-endpoint` under `/log` mints one: a forwarding
+  endpoint of the logging service's own. Any resolve on it opens a **read session**.
+- **`Read { after, max }`**, `0x0700`, is the first op in the `Log` category, which was reserved
+  for it in 2026-07. It answers the ring's records past a sequence, oldest first, as many as a
+  reply holds. An empty reply is the end.
+- **The reply's `oldest`** says what the ring has dropped.
+- **The broker holds one endpoint for the boot**, as it does `power`'s, and binds it at
+  `/dev/logs` for the `logs` grant. The seeded `admin` profile has the grant.
+- **Who reaches `read-endpoint`:** a holder of the root namespace, as with the storage and
+  services admin endpoints (`TODO(svc-auth-ungated)`). No session binds `/log`.
+
+**Two endpoints and two sessions, out of the sources' slots.**
+- The service waits on every channel it serves, so each came from `MAX_SOURCES`, 30 to 26. A boot
+  opens 10 to 16 sources.
+- Two endpoints: the broker's, and one more, `boot-probe`'s in a test image.
+- Two sessions: a `log` running, and one more. A reader closes its session when done, so this
+  bounds readers at one moment, not over a boot.
+- **Closes are answered before resolves in every wake**, E.4a's lesson from the view broker. A
+  reader that lets go of a session or an endpoint and asks at once for another must find the first
+  retired. The control that answers resolves first fails `boot-probe`.
+
+**The ring: a megabyte, not 256 records.**
+- **The plan's premise was wrong.** It said 256 records was "smaller than one boot's log". A boot
+  writes 50 to 100, counted in `test-qemu`, `test-interactive` and `check-shutdown` transcripts. A
+  release boot writes fewer, since most of the system writes to the console rather than here.
+- What outgrows 256 is a machine up for days, whose audit accumulates. So the ring grew for that,
+  and the plan's parenthesis is corrected where it is ticked.
+- **Bounded by bytes, not by a count**, because a message may be a kilobyte. A count would bound
+  the ring's memory only as tightly as the longest message allows.
+- **What it keeps:** a message's first 1024 bytes, cut on a character boundary and ending in `…`.
+  A principal or source is at most 64 bytes: longer is refused at the resolve, since a principal is
+  identity and cutting one could make two alike; a record's own source claim is cut. So every
+  record fits a reply with room to spare. The console still prints every message whole.
+- The ring moved into the library, `logging_service::ring`, so its arithmetic is host-tested.
+- It is no longer a `Sink`: `Read` must reach it, so the service holds it beside the sinks.
+
+**Each record carries the wall clock at ingest**, as well as the monotonic one.
+- A person reading a log wants to know when.
+- The wall clock can be set since Part E.5, so the sequence is the order.
+- **`log` shows `sequence` as well as the plan's `time`, `principal`, `tier`, `level` and
+  `message`.** `time` is Unix epoch seconds, as `list`'s `modified` is, and null for a record
+  taken while the clock was not set.
+- A named source is shown after its principal, `heartbeat.worker`, as the console shows it.
+  `log PRINCIPAL` keeps that principal's records and its sources'.
+
+**Tier and level names moved into `librsproto::log`**, since `log` now shows them too: a helper
+with two consumers belongs below both.
+
+**Gates:**
+- **Host tests:**
+  - `Read`'s request and reply round-trip, and a record that does not fit is left out whole;
+  - **a reader fed bytes no writer makes**, twelve ways: a short header, a count past or short of
+    the records, a byte after the last, a string cut short or past the body, an empty principal, a
+    reserved flag, a sequence that does not rise or is `0`, and a count of `u32::MAX`;
+  - the ring's byte accounting across eviction, `after` at each edge, and cutting on a character
+    boundary.
+- **`boot-probe`'s `logs_test`:**
+  - a record it writes on a source of its own is read back through a read endpoint bound as the
+    grant binds one, principal, source, level and message as written, with the wall clock;
+  - an eleven-byte `Read` is refused `InvalidArgument`, and another op `Unsupported`;
+  - two sessions are taken and a third refused, then one at once after one is let go;
+  - the same for endpoints: the broker's and the probe's, a third refused, then one at once.
+- **`test-interactive` step 20h**, which makes 36:
+  - `log` is refused naming the grant;
+  - `with admin log view-broker` shows the row for 20g's `date` view. That record reached the
+    console before the command was typed, so what matches can only be the row.
+
+**Controls, each failing where it should:**
+- A `Read` that answers nothing fails `test-interactive` at 20h.
+- Closed sessions never retired fails `boot-probe`.
+- Resolves answered before closes fails `boot-probe`.
+- The reader without its trailing check, or without its rising check, fails its host test.
+- The ring evicting without subtracting fails its host test.
+
+**Docs:**
+- New: `rsproto-log-ops.md`.
+- Updated: `logging.md` (*Reading it back*, the sinks, the sources' ceiling),
+  `rsproto-wire-format.md`, `views-toml-schema.md`, `shell-language.md`, and
+  `deferred-decisions.md`'s fan-out entry.
+- The root `CLAUDE.md`'s step count, and both plans.
+- **Part E's docs box**, ticked after a sweep for `init` named as a moving server's spawner or
+  supervisor. The sweep was checked first against the docs before E.1, where it found each such
+  claim. It found two that had outlived E.1: `storage.md`'s boot and supervision, and
+  `device-manager.md`'s supervision. Both now name `service-mgr`.
+
+The full local gate set, 34, is green (fgb45).
+
+**ABI:** no hash impact. A new rsproto op and its bodies are not hash inputs, and no kernel type
+changes.

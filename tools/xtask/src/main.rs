@@ -614,6 +614,8 @@ const COREUTILS: &[&str] = &[
     // Stopping or restarting the machine (administration Part E.4d), through the `power` grant the
     // seeded policy gives everyone for it.
     "shutdown",
+    // Reading the service log back (administration Part E.6), through the `logs` grant.
+    "log",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -2332,6 +2334,23 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("wall clock: set to 1925164800 (Unix epoch seconds, UTC); the RTC holds it")?;
     s.expect("/home>")?;
     s.send("exit")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 20h. **`log`, and the audit an earlier step wrote** (administration Part E.6).
+    //      (a) **Refused without the grant**: a session has no `/dev/logs`, and `log` says which
+    //          grant it needs.
+    s.send("log")?;
+    s.expect("needs the logs grant")?;
+    s.expect("/home>")?;
+    //      (b) **Read back through the `logs` grant**: the view broker's records, 20g's view among
+    //          them, as a table. The row is the logging service's ring answering `Read`; the same
+    //          record went to the console when it was written, before this was typed, so what is
+    //          matched here can only be the row.
+    s.send("with admin log view-broker")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("view: alice admin date — started")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -15538,7 +15557,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

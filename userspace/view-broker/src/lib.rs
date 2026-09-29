@@ -73,6 +73,10 @@ pub mod policy {
         /// checks a process-wide capability here, not a handle — so the program's children get it
         /// only if it passes it on.
         Clock,
+        /// **Reading the log back**: the logging service's read endpoint, bound at `/dev/logs`
+        /// (administration Part E.6), where a resolve opens a session that answers `Log::Read` —
+        /// every service's records, and this broker's audit among them.
+        Logs,
     }
 
     impl Grant {
@@ -86,6 +90,7 @@ pub mod policy {
                 "services" => Some(Grant::Services),
                 "power" => Some(Grant::Power),
                 "clock" => Some(Grant::Clock),
+                "logs" => Some(Grant::Logs),
                 _ => None,
             }
         }
@@ -100,6 +105,7 @@ pub mod policy {
                 Grant::Services => "services",
                 Grant::Power => "power",
                 Grant::Clock => "clock",
+                Grant::Logs => "logs",
             }
         }
     }
@@ -113,6 +119,7 @@ pub mod policy {
         Grant::Services,
         Grant::Power,
         Grant::Clock,
+        Grant::Logs,
     ];
 
     /// A profile: a named set of grants. A request names one as its view.
@@ -1065,6 +1072,9 @@ auth = "password"
         assert_eq!(Grant::from_name("clock"), Some(Grant::Clock));
         assert_eq!(Grant::Clock.name(), "clock");
         assert!(KNOWN_GRANTS.contains(&Grant::Clock));
+        assert_eq!(Grant::from_name("logs"), Some(Grant::Logs));
+        assert_eq!(Grant::Logs.name(), "logs");
+        assert!(KNOWN_GRANTS.contains(&Grant::Logs));
         let e = parse("[profile.admin]\ngrants = [\"teleport\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
         // And `views` (administration Part D.2).
