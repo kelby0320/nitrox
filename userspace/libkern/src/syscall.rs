@@ -106,6 +106,14 @@ pub const SYS_NS_SYNC: u64 = 38;
 /// to handed out are still held by something: a handle, a mapping, an IRP, or a dirty pin. Asked
 /// after `sys_ns_sync`, a non-zero answer means the mount is in use (administration Part C.5c).
 pub const SYS_NS_HELD: u64 = 39;
+/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt
+/// ([`POWER_HALT`]) or reset ([`POWER_REBOOT`]). Needs `WRITE` on the system-control object,
+/// which only `init` holds, and **returns only to refuse** (administration Part E.3).
+pub const SYS_POWER: u64 = 40;
+/// `sys_power`'s halt: the machine stays on, saying it is safe to turn it off.
+pub const POWER_HALT: u64 = 0;
+/// `sys_power`'s reboot: the FADT's reset register, then the 8042, then a triple fault.
+pub const POWER_REBOOT: u64 = 1;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to

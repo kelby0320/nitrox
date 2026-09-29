@@ -219,7 +219,8 @@ The kernel rejects allocations of handles with rights that are not meaningful fo
 | `PendingOperation` | `WAIT` |
 | `IoRing` | `READ`, `WRITE` (for SQE/CQE access) |
 | `EntropyObject` | `READ` |
-| `DeviceNode` | `READ`, `INSPECT` |
+| `DeviceNode` | `READ`, `WRITE` (a block device is written through `sys_io_submit`; `INSPECT` is a generic right, not a principal one — this row said `READ`, `INSPECT` until 2026-09-28) |
+| `SystemControl` | `WRITE` — the one object, `init`'s, whose handle carries `WRITE` and `INSPECT` and cannot be duplicated or transferred ([`power.md`](../architecture/power.md)) |
 | `UserspaceServerReg` | (internal; not user-accessible) |
 
 Resource handles (returned by namespace lookups) receive principal rights (`READ`/`WRITE`/`EXECUTE`) per the resource server's metadata and the rights requested by the caller.

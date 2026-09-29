@@ -238,6 +238,9 @@ pub const SYS_NS_SYNC: u64 = 38;
 /// `sys_ns_held(ns, path, path_len)` — how many of a mount's files something still holds
 /// (administration Part C.5c).
 pub const SYS_NS_HELD: u64 = 39;
+/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
+/// (administration Part E.3). Returns only to refuse.
+pub const SYS_POWER: u64 = 40;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -290,6 +293,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
         SYS_NS_SYNC => encode(sys_ns_sync(a0, a1, a2 as usize)),
         SYS_NS_HELD => encode(sys_ns_held(a0, a1, a2 as usize)),
+        SYS_POWER => encode(sys_power(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
@@ -2931,6 +2935,24 @@ fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     Ok(held)
 }
 
+/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
+/// the machine (administration Part E.3; [`crate::power`]). Needs `WRITE` on a
+/// [`SystemControl`](crate::object::SystemControl), which only `init` holds; `op` is
+/// `POWER_HALT` or `POWER_REBOOT`, and anything else is `InvalidArgument`.
+///
+/// **It returns only to refuse.** The handle is checked before the op, so a process without the
+/// object learns nothing from either. Its flush waits in the kernel, bounded — the one blocking
+/// syscall with nothing to hand a `PendingOperation` to, since nothing comes back.
+fn sys_power(sc_h: u64, op: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let _system_control = lookup_typed(sc_h, pid, Rights::WRITE, KObjectType::SystemControl)?;
+    use crate::libkern::power::PowerOp;
+    let op = PowerOp::from_u64(op).ok_or(KError::InvalidArgument)?;
+    let what = if op == PowerOp::Halt { "halt" } else { "reboot" };
+    crate::kprintln!("power: pid {pid} asks to {what}");
+    crate::power::power(op)
+}
+
 /// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.
 ///
 /// Stamps on **sync**, not on the individual write, because the kernel has no per-page
@@ -3625,6 +3647,27 @@ mod tests {
             .allocate(1, ptr, KObjectType::EntropyObject, entropy_rights())
             .expect("entropy_rights must be valid for an EntropyObject");
         let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    /// **`init`'s system-control handle can be used and not given away** (administration Part
+    /// E.3): its rights are allocatable on the object, and a duplicate — the first step of
+    /// handing a handle to anyone — is refused for want of `DUPLICATE`.
+    #[test]
+    fn the_system_control_handle_cannot_be_duplicated() {
+        use crate::object::SystemControl;
+        use crate::object::system_control::INIT_RIGHTS;
+        init_global_heap();
+        let t = HandleTable::try_new(0x1357_9BDF_2468_ACE0).unwrap();
+        let ptr = KBox::into_raw(SystemControl::try_new().unwrap()).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::SystemControl, INIT_RIGHTS)
+            .expect("INIT_RIGHTS must be valid for a SystemControl");
+        assert!(t.lookup(h, 1, Rights::WRITE).is_ok());
+        assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
+        assert!(!INIT_RIGHTS.contains(Rights::TRANSFER), "and so is a transfer");
+        let co = t.close(h, 1).unwrap();
+        // SAFETY: `co` carries the handle's one reference, released here once.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 

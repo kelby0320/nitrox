@@ -722,6 +722,15 @@ impl ArchPlatform for X86Platform {
         // read-only thereafter; `n` entries are initialised.
         unsafe { core::slice::from_raw_parts((&raw const ECAM) as *const EcamRegion, n) }
     }
+
+    fn prepare_reset() {
+        super::reset::prepare();
+    }
+
+    unsafe fn reset() -> ! {
+        // SAFETY: forwarded from the trait's contract.
+        unsafe { super::reset::reset() }
+    }
 }
 
 // The arch-internal MADT accessors below are the seam the `phase-2/ioapic`

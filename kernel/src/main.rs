@@ -1013,8 +1013,9 @@ unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
 // the Process and its address space. This is the substrate-works milestone.
 
 /// Arm the syscall fast path, then load + launch **init** as pid 1 with a handle
-/// to its own notification channel (`rdi`) and a full-rights root-namespace handle
-/// (`rsi`) carrying the boot kernel-server bindings. init reads its manifest from
+/// to its own notification channel (`rdi`), a full-rights root-namespace handle
+/// (`rsi`) carrying the boot kernel-server bindings, and the system-control handle
+/// (`rdx`, administration Part E.3). init reads its manifest from
 /// the initramfs, spawns the demo chain (`parent` → `child`), and runs the reaping
 /// loop. This boot thread hands off (via `sched::exit` in `kernel_main`) into init
 /// and then idles; init is the supervisor now (not the kernel). The init ELF is
@@ -1363,19 +1364,43 @@ fn run_first_userspace() {
         }
     };
 
+    // **The system-control object** (administration Part E.3): the capability to stop the machine,
+    // made once and handed to init in `rdx`. Its handle carries `WRITE` and `INSPECT` and neither
+    // `DUPLICATE` nor `TRANSFER`, so init cannot give it away. A boot without it still runs, but
+    // nothing on it can stop the machine; init says which it has.
+    let system_control_h = match nitrox_kernel::object::SystemControl::try_new() {
+        Ok(sc) => {
+            let sp = KBox::into_raw(sc).as_ptr() as *mut ();
+            let rights = nitrox_kernel::object::system_control::INIT_RIGHTS;
+            match global::get().allocate(1, sp, KObjectType::SystemControl, rights) {
+                Ok(h) => h.bits(),
+                Err(_) => {
+                    // SAFETY: `allocate` did not adopt the creation reference; reclaim and drop it.
+                    drop(unsafe { ObjectRef::from_raw(sp, KObjectType::SystemControl) });
+                    kprintln!("init: system-control handle alloc failed");
+                    0
+                }
+            }
+        }
+        Err(_) => {
+            kprintln!("init: system-control object alloc failed");
+            0
+        }
+    };
+
     let proc_ref = {
         let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
     };
 
-    // Spawn the parent's main thread, seeding `rdi` = its notification handle and
-    // `rsi` = its root-namespace handle.
+    // Spawn the parent's main thread, seeding `rdi` = its notification handle, `rsi` = its
+    // root-namespace handle and `rdx` = the system-control handle.
     if sched::spawn_user(
         proc_ref,
         info.entry_point.as_u64(),
         info.stack_top.as_u64(),
-        [notif_h.bits(), ns_h.bits(), 0, 0],
+        [notif_h.bits(), ns_h.bits(), system_control_h, 0],
     )
     .is_err()
     {

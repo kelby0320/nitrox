@@ -91,7 +91,7 @@ the child's `_start`. This is the uniform bootstrap convention across pid 1,
 |---|---|
 | `rdi` | the child's notification-channel handle |
 | `rsi` | the child's **root-namespace** handle (`LOOKUP`-only), or `0` if none |
-| `rdx` | the child's first installed handle (`handles[0]`), or `0` if none |
+| `rdx` | the child's first installed handle (`handles[0]`), or `0` if none — for pid 1, the system-control object (administration Part E.3) |
 | `rcx` | `args.arg0` — an opaque word, or a **bootstrap descriptor** (below) |
 
 This register bootstrap is the universal, zero-syscall floor and it **stays** — the

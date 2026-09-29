@@ -61,6 +61,16 @@ pub trait ArchCpu {
     /// cores that may not yet have an IDT. A core still in bring-up is instead responsible for
     /// checking that a stop began before it makes itself schedulable; see `ap_entry`.
     fn stop_the_machine() -> !;
+    /// Stop every **online** CPU but this one, and mask interrupts on this one; then return, so
+    /// that it can finish the machine's last work alone — a power operation's message or reset
+    /// (administration Part E.3). [`stop_the_machine`](Self::stop_the_machine) is this, then
+    /// the screen, then [`halt_loop`](Self::halt_loop).
+    ///
+    /// **After it, the caller must not take a lock another CPU could hold, nor allocate**: a CPU
+    /// this stopped may have been holding either. So what it says goes through the emergency
+    /// serial writer and [`crate::fbcon::reclaim_for_stop_with`], and nothing restores the
+    /// interrupt flag — the caller halts or resets.
+    fn stop_other_cpus();
 
     /// `true` if this CPU has an on-chip local interrupt controller (the one
     /// [`crate::arch::Irq`] brings up). On x86_64 this is the on-chip APIC

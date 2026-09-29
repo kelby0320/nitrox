@@ -327,6 +327,18 @@ impl Console {
         }
     }
 
+    /// Write `last` on a row of its own: after a newline if the cursor is partway along a row, and
+    /// with none after it, so that it is the last line written. Nothing for an empty `last`.
+    pub fn write_last(&mut self, last: &[u8]) {
+        if last.is_empty() {
+            return;
+        }
+        if self.grid.cursor().1 != 0 {
+            self.write(b"\n");
+        }
+        self.write(last);
+    }
+
     /// Paint again. Taken back from userspace, that is every cell and the margins beyond them,
     /// since nothing about what is on the screen is known any more.
     pub fn reclaim(&mut self) {
@@ -522,10 +534,24 @@ pub fn hold_for_gate() {
 /// Take the screen back for a machine that is stopping, repainted with the last rows written.
 /// Once per boot; called by `stop_the_machine` after every other CPU has been told to halt.
 pub fn reclaim_for_stop() {
+    reclaim_for_stop_with(b"");
+}
+
+/// [`reclaim_for_stop`], with `last` written as the screen's last line first: a power operation's
+/// *"It is now safe to turn off your computer."* (administration Part E.3). Called in the same
+/// place, once every other CPU has been told to halt, so nothing can print after it.
+///
+/// **Written here, not through `kprint`**, because [`push`] refuses once the machine is stopping —
+/// which is right for a fault, whose diagnosis nothing should scroll away, and is why the line
+/// can be the last one. It starts a row of its own if the cursor is partway along one.
+pub fn reclaim_for_stop_with(last: &[u8]) {
     if RECLAIMED.swap(true, Ordering::AcqRel) {
         return;
     }
-    with_console(|c| c.reclaim());
+    with_console(|c| {
+        c.write_last(last);
+        c.reclaim();
+    });
 }
 
 /// Run `f` on the console, unless this CPU is inside it already or the lock does not come free
@@ -771,5 +797,30 @@ mod tests {
         assert_eq!(console.owner(), Owner::Kernel);
         assert_eq!(fake.read(g), ["booting", "panic: here", ""]);
         assert!(fake.pixels.iter().all(|&p| p == pack(INK) || p == pack(PAPER)), "no userspace pixel survives");
+    }
+
+    /// **A power operation's last line is the bottom row, on a row of its own** (administration
+    /// Part E.3), whether or not something left the cursor partway along one.
+    #[test]
+    fn the_last_line_is_a_row_of_its_own() {
+        const SAFE: &[u8] = b"It is now safe to turn off your computer.";
+        let mut fake = Fake::new(400, 50, 0);
+        let mut console = Box::new(Console::new());
+        let g = console.attach(fake.screen()).unwrap();
+        console.write(b"booting\n");
+        assert!(console.yield_screen());
+        console.write(b"a partial line");
+        console.write_last(SAFE);
+        console.reclaim();
+        let safe = "It is now safe to turn off your computer.";
+        assert_eq!(fake.read(g), ["booting", "a partial line", safe]);
+
+        let mut console = Box::new(Console::new());
+        let g = console.attach(fake.screen()).unwrap();
+        console.write(b"booting\n");
+        console.write_last(SAFE);
+        console.write_last(b"");
+        console.reclaim();
+        assert_eq!(fake.read(g), ["booting", safe, ""]);
     }
 }

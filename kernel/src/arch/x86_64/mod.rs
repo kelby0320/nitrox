@@ -18,6 +18,7 @@ pub mod paging;
 pub mod qemu;
 pub mod registers;
 pub mod regs;
+pub mod reset;
 pub mod ps2;
 pub mod rtc;
 pub mod serial;

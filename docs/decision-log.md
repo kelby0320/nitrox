@@ -30891,3 +30891,74 @@ whose FADT names no register.
 Gates run: `test-qemu --kvm`, `check-report --kvm`, `check-fbcon --kvm`, the host suite,
 `check-arch`, `abi-sync-check` and `check-docs`. The full set follows E.3b, which changes the ABI.
 No kernel ABI change here.
+
+## 2026-09-28 — Administration Part E.3b: the system-control object and `sys_power`
+
+**The system-control object** is kernel object type 15, and there is one. `run_first_userspace`
+makes it and hands it to `init` in `rdx`. Its handle has `WRITE` and `INSPECT`, and neither
+`DUPLICATE` nor `TRANSFER`, so `init` cannot give it away.
+- **A handle, not a syscap.** A syscap is ambient: everything `init` spawned with it could stop the
+  machine. A held object lets exactly one process do so.
+- The plan's early *Power* section had it delegated to `service-mgr`. The detail pass kept it with
+  `init`, whose mounts are a shutdown's last step, and this follows the detail pass.
+- `init` checks what `rdx` holds with `sys_handle_stat`, keeps it for E.4, and says `init: holds
+  the system-control object`. `test-qemu` requires that line.
+
+**`sys_power(system_control, op)`**, syscall 40, is `kernel/src/power.rs`:
+1. **Flush** every block device except partitions, whose flush is their disk's. All flushes go out
+   at once, with 10 s for all of them together. A disk that fails or does not finish is logged,
+   and the stop goes on.
+2. **Stop** the other processors.
+3. **Halt** with *"It is now safe to turn off your computer."*, or **reset**.
+
+It returns only to refuse. The handle is checked before the op.
+
+**Three arch pieces make that possible:**
+- **`ArchCpu::stop_other_cpus`**, split out of `stop_the_machine`, which is now it, then the screen,
+  then `halt_loop`. A power operation has its own last work to do on the one processor left.
+- **`ArchPlatform::prepare_reset` and `reset`**, split in two because nothing may allocate once the
+  others are stopped, and a reset register in memory space needs a mapping. `prepare_reset` maps
+  it while the machine still runs.
+- **`fbcon::reclaim_for_stop_with`**. `push` refuses once the machine is stopping, which keeps a
+  panic's diagnosis last. So the power operation's line is written into the grid by the reclaim
+  itself, on a row of its own, and is the last line on the screen.
+
+**The reset chain:**
+- The FADT's reset register comes first when it is in a space this kernel writes:
+  - an I/O port;
+  - memory, mapped beforehand;
+  - a bus-0 PCI configuration register, through the legacy `0xCF8`/`0xCFC` mechanism.
+- Then the 8042's pulse, whatever `IAPC_BOOT_ARCH` says, as E.3a's entry promised.
+- Then a triple fault. It is not one of the steps but what `reset` ends in, so no `unreachable!`
+  follows a list that "always" ends in one. Each step gets half a second.
+
+**Booted by hand, since no gate halts or resets a machine yet** (E.4's `check-shutdown` will). A
+probe in `init` called `sys_power` 20 s after its reaping loop began, with the greeter up:
+- **Halt:** COM1 showed the flush (`flushed 1 of 1 disks`), the stop and the message. A screendump
+  showed the screen taken back from the compositor, with the message as its last line.
+- **Reboot:** QEMU under `-no-reboot -no-shutdown` went to status `shutdown`, which is a guest
+  reset, with no 8042 line: the register at `0xcf9` did it.
+- **Each later step alone**, with the steps before it removed: the 8042 reset q35, and so did the
+  triple fault.
+- **An inert register write** (value 0) was followed, half a second later, by the 8042 line. That
+  shows the settle's clock runs with interrupts masked.
+
+**Gates:**
+- Host tests: the object's rights, which a duplicate refuses; the op's decoding; which devices are
+  flushed; the reset order and which reset registers are written; the PCI configuration address;
+  and the last line's row.
+- `test-qemu`: `init`'s line, and `boot-probe` calling `sys_power` three ways, each refused:
+  - with no handle, `InvalidHandle`;
+  - with its lookup-only root, `NoAccess`;
+  - with a writable disk, `InvalidArgument` — a `WRITE` handle, so the type is what refuses it.
+- **Controls:**
+  - A kernel that hands `init` 0 in `rdx` fails `test-qemu`'s check.
+  - A `sys_power` that checks the right and not the type halts the machine inside `boot-probe`, and
+    the run times out.
+  - A mismatched `POWER_REBOOT` fails `abi-sync-check`'s new *power operations* family.
+
+**A doc bug fixed on the way:** `handle-encoding.md` gave `DeviceNode`'s principal rights as
+`READ`, `INSPECT`. The code has `READ`, `WRITE`, and `INSPECT` is a generic right.
+
+**ABI:** a new `KObjectType` discriminant (15), which is a version-hash input. Also a new syscall
+number (40) and the `POWER_*` values, which are not hash inputs.

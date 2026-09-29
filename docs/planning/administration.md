@@ -2085,7 +2085,8 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - `test-interactive`: `service --list`, then `with admin service --restart
           clipboard-server`, after which `clip` still copies and pastes **in the same session**,
           through the registry.
-- [ ] **E.3 — the kernel: the system-control object, FADT, and the power op.**
+- [x] **E.3 — the kernel: the system-control object, FADT, and the power op.** *(Complete
+      2026-09-28, in two parts.)*
       - The object in `init`'s boot grant.
       - `sys_power`: flush, stop, then the message or the reset chain.
       - FADT's flags, reset register and century register, in the hardware report.
@@ -2097,6 +2098,12 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         `IAPC_BOOT_ARCH` — whether an 8042 is present, which the reboot chain's second step is
         about — in the report, each read only as far as the table's length goes. The RTC takes its
         century from the register. The object and `sys_power` are E.3b's.)*
+      - *(E.3b landed 2026-09-28, and with it E.3:* the object is type 15, handed to `init` in
+        `rdx` without `DUPLICATE` or `TRANSFER`; `sys_power` is syscall 40. A reboot's register,
+        8042 and triple fault each reset q35 alone, checked by hand with a probe in `init`, since
+        no gate halts a machine before E.4's `check-shutdown`. `test-qemu` also requires `init`'s
+        `holds the system-control object` and `boot-probe`'s three refused calls.
+        [`power.md`](../architecture/power.md) is new.)*
 - [ ] **E.4 — `shutdown`.**
       - The sequence: sessions, services in reverse order, the storage service's unmount of
         everything, `init`'s mounts, the power op.

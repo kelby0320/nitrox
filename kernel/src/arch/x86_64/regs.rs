@@ -29,6 +29,20 @@ pub unsafe fn outb(port: u16, val: u8) {
     }
 }
 
+/// Write a doubleword to I/O port `port`.
+///
+/// # Safety
+/// See [`outb`] — the caller must own `port`.
+#[inline]
+pub unsafe fn outl(port: u16, val: u32) {
+    // SAFETY: `out dx, eax` writes `eax` to the I/O port named by `dx`. The caller upholds the
+    // device-level contract; the instruction touches no memory and no flags.
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") val,
+             options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Read a byte from I/O port `port`.
 ///
 /// # Safety

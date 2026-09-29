@@ -281,6 +281,9 @@ pub enum KObjectType {
     DeviceNode = 12,
     UserspaceServerReg = 13,
     FileObject = 14,
+    /// The capability to stop the machine: one, made at boot and handed to `init` (administration
+    /// Part E.3).
+    SystemControl = 15,
 }
 
 impl KObjectType {
@@ -305,6 +308,7 @@ impl KObjectType {
             12 => Some(Self::DeviceNode),
             13 => Some(Self::UserspaceServerReg),
             14 => Some(Self::FileObject),
+            15 => Some(Self::SystemControl),
             _ => None,
         }
     }
@@ -545,9 +549,11 @@ mod tests {
         assert_eq!(KObjectType::IoRing as u32, 10);
         assert_eq!(KObjectType::UserspaceServerReg as u32, 13);
         assert_eq!(KObjectType::FileObject as u32, 14);
+        assert_eq!(KObjectType::SystemControl as u32, 15);
         // Round-trip the newest discriminant; one past it is unknown.
         assert_eq!(KObjectType::from_u32(14), Some(KObjectType::FileObject));
-        assert_eq!(KObjectType::from_u32(15), None);
+        assert_eq!(KObjectType::from_u32(15), Some(KObjectType::SystemControl));
+        assert_eq!(KObjectType::from_u32(16), None);
     }
 
     #[test]

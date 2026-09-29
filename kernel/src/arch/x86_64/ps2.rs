@@ -56,6 +56,8 @@ const CMD_DISABLE_AUX: u8 = 0xA7;
 const CMD_ENABLE_AUX: u8 = 0xA8;
 /// Controller command: the **next** data-port write goes to the aux device.
 const CMD_WRITE_AUX: u8 = 0xD4;
+/// Controller command: pulse the output port's reset line — the processor's reset, on a PC.
+const CMD_PULSE_RESET: u8 = 0xFE;
 
 /// Config bit: raise IRQ 1 when the keyboard has a byte.
 const CONFIG_KBD_IRQ: u8 = 0x01;
@@ -204,6 +206,28 @@ pub fn read_byte() -> Option<(Port, u8)> {
     let port = if status & STATUS_FROM_AUX != 0 { Port::Aux } else { Port::Keyboard };
     // SAFETY: ring-0 read of the i8042 data port; a byte is present per the status read.
     Some((port, unsafe { inb(DATA) }))
+}
+
+/// **Pulse the reset line** (administration Part E.3): the second way a reboot tries, after the
+/// FADT's reset register.
+///
+/// Waits a bounded time for the controller to take a command, then writes it. A machine with no
+/// 8042 reads `0xFF` from the status port, input-full set for ever, so the wait gives up and the
+/// write goes nowhere — which is why this runs whatever `IAPC_BOOT_ARCH` says: firmware gets that
+/// bit wrong both ways, and a pulse sent to nothing costs nothing.
+///
+/// # Safety
+/// Ring 0, with every other processor stopped: when it works, it resets the machine.
+pub unsafe fn pulse_reset() {
+    for _ in 0..100_000 {
+        // SAFETY: ring-0 read of the i8042 status port; reading it has no side effects.
+        if unsafe { inb(CMD) } & STATUS_INPUT_FULL == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: ring 0, and the caller has stopped the machine for exactly this.
+    unsafe { outb(CMD, CMD_PULSE_RESET) };
 }
 
 /// Whether the controller has a byte nobody has collected.

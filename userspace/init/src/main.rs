@@ -75,6 +75,10 @@ static mut PROFILE_ENDPOINT: u64 = 0;
 /// when a critical server does not come up at boot, and its closing is how `init` learns that
 /// `service-mgr` has gone. `0` while there is none.
 static mut TERMINAL: u64 = 0;
+
+/// The system-control object (administration Part E.3), or 0 without one: the handle
+/// `sys_power` takes, which E.4's shutdown uses as its last step.
+static mut SYSTEM_CONTROL: u64 = 0;
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
@@ -1063,13 +1067,36 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
     }
 }
 
+/// **Keep the system-control object**, the capability to stop the machine (administration Part
+/// E.3), if `rdx` holds it: a handle to a `SystemControl` with `WRITE`. The kernel makes one and
+/// hands it to init alone, without the rights to give it away, so the process that stops the
+/// machine is this one: a shutdown (administration Part E.4) ends with `sys_power` on it, once
+/// everything else has stopped.
+///
+/// A boot without it goes on, and says so: nothing before the stop needs it, and a shutdown
+/// would reach every step but the last.
+fn keep_system_control(h: u64) {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let stat = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
+    let kind = stat == 0 && info.object_type == KOBJ_SYSTEM_CONTROL;
+    if h != 0 && kind && info.rights & RIGHT_WRITE != 0 {
+        // SAFETY: single-threaded init; written once, here, before anything reads it.
+        unsafe { SYSTEM_CONTROL = h };
+        kprint(b"init: holds the system-control object\n");
+    } else {
+        kprint(b"init: no system-control object -- a shutdown cannot stop the machine\n");
+    }
+}
+
 /// Bootstrap registers: `rdi` = notification channel, `rsi` = root namespace
-/// (full-rights, kernel-bound servers), `rdx`/`rcx` unused (init takes no
-/// installed handles or arg0 from the kernel).
+/// (full-rights, kernel-bound servers), `rdx` = the system-control object
+/// (administration Part E.3), `rcx` unused (init takes no arg0 from the kernel).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, _arg0: u64) -> ! {
     kprint(b"init: up (pid 1)\n");
-    let count = (notif != 0) as u64 + (root_ns != 0) as u64;
+    keep_system_control(system_control);
+    let count = (notif != 0) as u64 + (root_ns != 0) as u64 + (system_control != 0) as u64;
     Line::new()
         .s(b"init: received ")
         .u(count)
@@ -1077,6 +1104,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
         .u(notif)
         .s(b", ns=")
         .u(root_ns)
+        .s(b", system-control=")
+        .u(system_control)
         .s(b")")
         .end();
 

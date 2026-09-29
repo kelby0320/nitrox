@@ -11611,6 +11611,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             check_servers_are_service_mgrs(&transcript)?;
+            check_system_control(&transcript)?;
             check_hardware_facts(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
@@ -11975,6 +11976,20 @@ const SERVICE_MGR_SERVERS: &[(&str, &str)] = &[
     ("input-server", "/dev/input/new"),
     ("compositor", "/dev/draw"),
 ];
+
+/// **`init` holds the system-control object** (administration Part E.3): the kernel made it and
+/// handed it over in `rdx`, and `init` found a `SystemControl` with `WRITE` there. The other half,
+/// that nothing else can use `sys_power`, is `boot-probe`'s, which gates the verdict itself.
+fn check_system_control(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if !text.contains("init: holds the system-control object") {
+        return Err("`init: holds the system-control object` is not in the transcript: the kernel's \
+                    handoff in `rdx` did not reach init as a SystemControl with WRITE"
+            .into());
+    }
+    println!("xtask: init holds the system-control object ✓");
+    Ok(())
+}
 
 /// **`service-mgr` bound every server, and `init` bound none of them** (administration Part E.1).
 /// `init` starts only its mounts, the profile server at `/bin`, and `service-mgr`; a line of
@@ -12731,6 +12746,15 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/libkern/io_op.rs",
         user_file: "userspace/libkern/src/abi.rs",
         shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
+    // `sys_power`'s operations (administration Part E.3). The kernel states them in a file of their
+    // own, so the sweep there finds nothing else; `libkern` keeps them beside `SYS_POWER`.
+    AbiFamily {
+        what: "power operations",
+        kernel_file: "kernel/src/libkern/power.rs",
+        user_file: "userspace/libkern/src/syscall.rs",
+        shape: AbiShape::U64Const,
         one_sided: &[],
     },
 ];

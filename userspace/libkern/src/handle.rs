@@ -167,6 +167,8 @@ pub enum KObjectType {
     DeviceNode = 12,
     UserspaceServerReg = 13,
     FileObject = 14,
+    /// The capability to stop the machine, which only `init` holds (administration Part E.3).
+    SystemControl = 15,
 }
 
 // --- `u32` object-type aliases (for raw `sys_handle_stat` decoding) ---------
@@ -180,6 +182,7 @@ pub const KOBJ_TIMER: u32 = KObjectType::Timer as u32;
 pub const KOBJ_PENDING_OPERATION: u32 = KObjectType::PendingOperation as u32;
 pub const KOBJ_ENTROPY_OBJECT: u32 = KObjectType::EntropyObject as u32;
 pub const KOBJ_FILE_OBJECT: u32 = KObjectType::FileObject as u32;
+pub const KOBJ_SYSTEM_CONTROL: u32 = KObjectType::SystemControl as u32;
 
 #[cfg(test)]
 mod tests {
@@ -197,6 +200,7 @@ mod tests {
         assert_eq!(KOBJ_PROCESS, 1);
         assert_eq!(KOBJ_THREAD, 2);
         assert_eq!(KOBJ_NAMESPACE, 3);
+        assert_eq!(KOBJ_SYSTEM_CONTROL, 15);
     }
 
     #[test]
