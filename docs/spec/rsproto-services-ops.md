@@ -31,7 +31,7 @@ order:
 | Column | Type | |
 |---|---|---|
 | `name` | `String` | the declaration's name |
-| `state` | `String` | `starting` (a server whose `Meta::Ready` has not come), `running`, `stopped` (asked to stop, finished with `0`, or never started) or `failed` (any other exit, or one whose code never came) |
+| `state` | `String` | `starting` (a server whose `Meta::Ready` has not come), `running`, `stopped` (asked to stop, finished with `0`, or never started) or `failed` (any other exit, one whose code never came, or a server still running that refused or sent no `Ready` in time) |
 | `restarts` | `Int` | restarts over the boot, by the service's policy or asked for |
 
 A table is minted fresh per resolve, as the device manager's and the storage service's are.
@@ -48,8 +48,9 @@ is the standard `ErrorBody`, whose reason says why.
 
 **Each is answered once it has happened**, never by a wait inside `service-mgr` — every resolve on
 a server's path waits on that process. A request waits for the service, and is answered then; one
-request per service at a time, and a second is refused `WouldBlock`. An admin session that closes
-before its answer loses it, and what it asked goes on.
+request per service at a time, and a second is refused `WouldBlock`. **An admin session that closes
+before its answer loses the answer, and what it asked goes on** — a restart's start included (PR
+#341 review).
 
 ### `Start` (`0x1100`)
 
@@ -71,6 +72,9 @@ Stop a running service, by `CTRL_OP_SHUTDOWN` on its control channel. **A stop i
 there is no forcible kill. A service that exits is not restarted, whatever its policy. Answered once
 it has exited.
 
+**A service in its restart backoff is not running, and a stop cancels the restart**, answered at
+once (PR #341 review). Refusing it "not running" would let a crash-looping service start again.
+
 | Refusal | Why |
 |---|---|
 | `NotFound` | no service is declared by that name |
@@ -80,9 +84,12 @@ it has exited.
 | `TimedOut` | it was asked, and is still running 5 s later; it stays asked, and its exit is still a stop |
 | `WouldBlock` | it is being started or stopped already |
 
-**Which services exit when asked**: `heartbeat`, and the four servers that may be stopped — the
-terminal server, the clipboard, the input server and the compositor. A server's registry entry goes
-with it, so its path answers `NotFound` until it is started again.
+**Which services may be stopped**: of the servers, **the clipboard alone**; every other is
+`essential`. The terminal server, the input server and the compositor exit when asked too — a
+shutdown will ask them — but their clients do not reconnect, so on a machine with no serial port
+stopping one leaves nothing to type at (PR #341 review). Of the other services, `heartbeat` exits
+when asked. A server's registry entry goes with it, so its path answers `NotFound` until it is
+started again.
 
 ### `Restart` (`0x1102`)
 

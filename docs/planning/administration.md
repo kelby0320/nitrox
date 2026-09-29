@@ -1877,6 +1877,9 @@ from "lost at exit" to "lost at power-off unless something syncs it".
   - `device-mgr` and `storage-service`, whose subscriptions and mounts would be lost.
 
   The rest — `tty-server`, `clipboard-server`, `input-server`, the compositor — may be stopped.
+  *(The clipboard alone, since the PR #341 review: the other three's clients do not reconnect, so
+  on a machine with no serial port stopping one leaves nothing to type at. They are `essential`
+  until their clients reconnect.)*
 - **The declarations and the profile manifest move onto root**: `/system/services.toml` and
   `/system/profiles/system.toml`, read after `init` has mounted it. The initramfs then holds
   `init.toml` and its four programs, and the live image's marker, as the 2026-09-22 decision says

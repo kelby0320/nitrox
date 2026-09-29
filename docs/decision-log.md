@@ -30805,3 +30805,47 @@ restored.
 **Two more lines E.1a's sweep missed**, in `graphical-session.md` §3, are fixed here: `init` asking
 the device manager for the info-only endpoint, and `desktop-session-mgr` resolving the storage
 session endpoint itself.
+
+## 2026-09-28 — Part E.2, reviewed (PR #341): a restart outlives its session, and three servers become essential
+
+The review found one blocking problem, three worth fixing and three optional. All are addressed.
+
+**Blocking — a restart whose admin session closed before its answer stopped the service and never
+started it again.**
+- When a session closed, `service-mgr` dropped the requests held for it. For a `Restart`, the held
+  entry was the only thing carrying "then start". So the service exited as asked, `settle_exit`
+  found nothing, and the requested shutdown kept the policy from restarting it.
+- The spec said what was asked goes on. The reviewer demonstrated it failing deterministically: the
+  kernel hands out what is queued before it reports the peer gone, so the request and the close are
+  handled in the same pass.
+- **Now the entry stays and loses only its session**: `session = 0` answers no one, and `refuse`
+  and `reply_ok` skip it. The handle is still not kept, since it may be reused.
+- `boot-probe` gained the reviewer's case: a second session sends `Restart` and closes at once, and
+  the clipboard must come back running and counted once. Control: dropping held requests again
+  fails it.
+
+**Worth fixing, 1 — three "stoppable" servers stranded their clients.**
+- `input-server`: the compositor connects to input once and never again.
+- The compositor: `desktop-session-mgr` exits when it loses the connection, and is nobody's
+  declaration to restart.
+- `tty-server`: `nxterm` needs `/dev/tty` for every shell.
+- On the laptop, which has no serial port, stopping any of the three left nothing to type at until
+  power-off. That is `essential`'s own definition, so **all three are `essential`**. The clipboard,
+  whose clients open a session per copy, is the one server `service` may stop.
+- The detail pass's "the rest may be stopped" held for the clipboard alone. The three keep their
+  `CTRL_OP_SHUTDOWN` handling, which a shutdown will use.
+- Making their clients reconnect would lift this. It is a feature of its own, and not this part's.
+
+**Worth fixing, 2 and 3 — two current-behaviour docs this PR made false:**
+- `console-and-tty.md` counted fifteen terminals, where `MAX_TTYS` is now fourteen;
+- `service-mgr/CLAUDE.md`'s dependency list lacked `libstream`.
+
+**Optional, all taken:**
+- **A start could wait forever.** A server started by request whose policy's respawn then failed to
+  spawn left its held start unanswered. It is now answered once the policy has nothing more to try.
+- **A stop during a backoff was refused "not running"**, and the scheduled restart ran anyway, so a
+  crash-looping service could not be stopped. `decide` now takes whether a restart is due, and such
+  a stop is `CancelRestart`, answered at once.
+- **A server past its `Ready` deadline showed `running`.** It is still a process, but it refused
+  or said nothing, and its path answers `NotFound`. `state` now takes whether a running service is
+  usable, and says `failed`.

@@ -983,16 +983,23 @@ fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> 
     }
 }
 
-/// Refuse request `op` on `ch`, saying `why`.
+/// Refuse request `op` on `ch`, saying `why`. **`0` answers no one**: a held request whose session
+/// closed keeps going without one ([`Held::session`]).
 fn refuse(ch: u64, op: u16, request_id: u64, err: KError, why: &[u8]) {
+    if ch == 0 {
+        return;
+    }
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 160];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
     let flags = librsproto::RS_FLAG_REPLY | librsproto::RS_FLAG_ERROR;
     let _ = send_rs(ch, op, request_id, flags, &body[..n], &[]);
 }
 
-/// Answer request `op` on `ch` with an empty body.
+/// Answer request `op` on `ch` with an empty body; `0` answers no one, as for [`refuse`].
 fn reply_ok(ch: u64, op: u16, request_id: u64) {
+    if ch == 0 {
+        return;
+    }
     let _ = send_rs(ch, op, request_id, librsproto::RS_FLAG_REPLY, &[], &[]);
 }
 
@@ -1154,7 +1161,10 @@ struct Route {
 /// service's exit, a start for it to come up. Answered then — never by a wait here, since every
 /// resolve on a server's path waits on this process.
 struct Held {
-    /// The admin session to answer on.
+    /// The admin session to answer on, or `0` once it has closed: **what was asked goes on**, a
+    /// restart's start included, and only the answer is lost (PR #341 review, finding 1). The
+    /// handle is not kept, since it may be reused, and an answer must not reach whatever it names
+    /// next.
     session: u64,
     request_id: u64,
     op: u16,
@@ -1916,6 +1926,12 @@ impl Mgr {
                         .s(b"' could not be restarted")
                         .end();
                     self.apply_policy(i, Some(-1), Phase::Down);
+                    // **A start that waited for this one is answered** once its policy has
+                    // nothing more to try (PR #341 review, finding 5); otherwise it waits for the
+                    // next attempt.
+                    if self.svcs[i].restart_at.is_none() {
+                        self.settle_up(i, false);
+                    }
                 }
             }
             if let Phase::Starting { deadline } = self.svcs[i].phase
@@ -1970,7 +1986,8 @@ impl Mgr {
             .iter()
             .map(|s| {
                 let starting = matches!(s.phase, Phase::Starting { .. });
-                let state = services::state(s.running, starting, s.requested_shutdown, s.exited);
+                let usable = s.phase == Phase::Up;
+                let state = services::state(s.running, starting, usable, s.requested_shutdown, s.exited);
                 (s.decl.name.as_str(), state, s.restarts)
             })
             .collect();
@@ -2027,9 +2044,11 @@ impl Mgr {
                 Err(()) => {
                     close(session);
                     self.services.admin_sessions.remove(k);
-                    // What it asked goes on, unanswered: the handle may be reused, and an answer
-                    // must not reach whatever it names next.
-                    self.held.retain(|h| h.session != session);
+                    // **What it asked goes on, unanswered.** Dropping the request instead would
+                    // drop a restart's start with its answer, and leave the service stopped.
+                    for h in self.held.iter_mut().filter(|h| h.session == session) {
+                        h.session = 0;
+                    }
                 }
             }
         }
@@ -2089,7 +2108,11 @@ impl Mgr {
     fn admin_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
         let named = |n: &str| self.svcs.iter().position(|s| s.decl.name == n);
         let found = core::str::from_utf8(body).ok().and_then(named);
-        let facts = found.map(|i| (self.svcs[i].decl.essential, self.svcs[i].running));
+        let facts = found.map(|i| {
+            let s = &self.svcs[i];
+            let restart_due = s.restart_at.is_some();
+            services::Found { essential: s.decl.essential, running: s.running, restart_due }
+        });
         let action = match services::decide(op, facts) {
             Ok(a) => a,
             Err((err, why)) => return refuse(session, op, request_id, err, why.as_bytes()),
@@ -2102,6 +2125,17 @@ impl Mgr {
         }
         let name = self.svcs[i].decl.name.clone();
         match action {
+            services::Action::CancelRestart => {
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(name.as_bytes())
+                    .s(b"' will not be restarted, as asked")
+                    .end();
+                let s = &mut self.svcs[i];
+                s.restart_at = None;
+                s.requested_shutdown = true;
+                reply_ok(session, op, request_id);
+            }
             services::Action::Start => {
                 Line::new().s(b"service-mgr: starting '").s(name.as_bytes()).s(b"', as asked").end();
                 self.start_asked(i, Held { session, request_id, op, svc: i, awaits: Awaits::Up });

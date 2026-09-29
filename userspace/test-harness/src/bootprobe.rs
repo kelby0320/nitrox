@@ -3134,6 +3134,8 @@ fn restart_test(root_ns: u64) -> bool {
 /// 4. A restart is answered once the new instance is up, and the table counts it.
 /// 5. The refusals: an essential service's stop and restart, a name nothing declares, a start of a
 ///    running service.
+/// 6. **A restart whose session closes at once still starts the service again** (PR #341 review,
+///    finding 1): only the answer is lost with the session.
 fn services_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
@@ -3186,8 +3188,8 @@ fn services_test(root_ns: u64) -> bool {
     let bound = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) };
     close(endpoint);
     let (st, admin) = if bound == 0 { ns_lookup(ns, at, chan) } else { (-1, 0) };
-    close(ns);
     if st != 0 || admin == 0 {
+        close(ns);
         return fail(b"/dev/services/admin opened no admin session");
     }
     let mut next = 0u64;
@@ -3211,6 +3213,7 @@ fn services_test(root_ns: u64) -> bool {
     let answered = |m: &Option<Received>| m.as_ref().is_some_and(|m| !m.error);
     let finish = |ok: bool| {
         close(admin);
+        close(ns);
         ok
     };
 
@@ -3255,8 +3258,43 @@ fn services_test(root_ns: u64) -> bool {
     if state("auth-service").as_deref() != Some("running") {
         return finish(fail(b"auth-service is not running after its refused stop"));
     }
+    // 6. A restart asked on a session that closes before its answer. The request and the close are
+    //    handled in one pass: the kernel hands out what is queued before it reports the peer gone.
+    let before = row("clipboard-server").map_or(-1, |r| r.1);
+    let (st, second) = ns_lookup(ns, at, chan);
+    if st != 0 || second == 0 || !rs_send(second, OP_SERVICES_RESTART, 1, b"clipboard-server", &[]) {
+        close(second);
+        return finish(fail(b"a second admin session would not take a restart"));
+    }
+    close(second);
+    // Twenty milliseconds between reads, on a timer: a wait on no handles is refused at once.
+    // SAFETY: register-only syscall; a one-shot timer this process owns.
+    let timer = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
+    let deadline = clock_ns() + 15_000_000_000;
+    let restarted = loop {
+        match row("clipboard-server") {
+            Some((s, n)) if s == "running" && n == before + 1 => break true,
+            _ if clock_ns() > deadline => break false,
+            _ if timer > 0 => {
+                let at = clock_ns() + 20_000_000;
+                let handles = [timer as u64];
+                let mut results = [0u8; 24];
+                // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
+                unsafe {
+                    syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
+                    syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, at + 1_000_000_000);
+                }
+            }
+            _ => {}
+        }
+    };
+    close(if timer > 0 { timer as u64 } else { 0 });
+    if !restarted {
+        return finish(fail(b"a restart whose session closed at once did not start clipboard-server again"));
+    }
     kprint(b"boot-probe: services: listed, clipboard-server stopped, started and restarted, each answered once done ok\n");
     kprint(b"boot-probe: services: an essential stop, an unknown name and a second start refused ok\n");
+    kprint(b"boot-probe: services: a restart whose session closed at once still started it again ok\n");
     finish(true)
 }
 

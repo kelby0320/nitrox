@@ -14696,6 +14696,11 @@ const SERVICES_TOML: &str = "\
 # **The servers first, in the order `init` started them** (administration Part E.1): each\n\
 # `endpoint` is waited on for its `Meta::Ready` before the next starts, which keeps the orders\n\
 # `init`'s comments called load-bearing. `never` restarts them, as `init` never did.\n\
+#\n\
+# **`essential` on every one but the clipboard** (PR #341 review): each of the others' absence\n\
+# locks the administrator out or loses state. The terminal server, the input server and the\n\
+# compositor are among them because their clients do not reconnect: on a machine with no serial\n\
+# port, stopping one leaves nothing to type at until power-off.\n\
 [service.auth-service]\n\
 executable = \"/bin/auth-service\"\n\
 description = \"The credential oracle, and the user database's writer\"\n\
@@ -14720,6 +14725,7 @@ policy = \"never\"\n\
 executable = \"/bin/tty-server\"\n\
 description = \"Terminals, over the console\"\n\
 endpoint = \"/dev/tty\"\n\
+essential = true\n\
 \n\
 [service.tty-server.restart]\n\
 policy = \"never\"\n\
@@ -14765,6 +14771,7 @@ policy = \"never\"\n\
 executable = \"/bin/input-server\"\n\
 description = \"Keyboards and pointers, merged\"\n\
 endpoint = \"/dev/input/new\"\n\
+essential = true\n\
 \n\
 [service.input-server.restart]\n\
 policy = \"never\"\n\
@@ -14773,6 +14780,7 @@ policy = \"never\"\n\
 executable = \"/bin/compositor\"\n\
 description = \"The display\"\n\
 endpoint = \"/dev/draw\"\n\
+essential = true\n\
 \n\
 [service.compositor.restart]\n\
 policy = \"never\"\n";

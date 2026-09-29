@@ -247,12 +247,14 @@ A stop is `CTRL_OP_SHUTDOWN` on the service's control channel, **a request**: on
 s is answered "asked, and still running", stays asked, and is still a stop if it comes later. There
 is no forcible kill. An `essential` service's stop and restart are refused here, whoever asks.
 
-**Which services exit when asked**: `heartbeat`, and the four servers `essential` does not cover —
-the terminal server, the clipboard, the input server and the compositor. Each waits on its control
-channel beside its work, through `libkern::control`, and **takes it out of its wait set if it
-closes**, since a closed channel stays signalled for good. A stopped server's registry entry goes
-with it, so its path answers `NotFound` until it is started again, and every binding reaches the
-new one then.
+**Which services exit when asked**: `heartbeat`, and four servers — the terminal server, the
+clipboard, the input server and the compositor. **Only the clipboard may be stopped by request**:
+the other three are `essential`, since their clients do not reconnect, and on a machine with no
+serial port stopping one leaves nothing to type at (PR #341 review). Their exit is for a shutdown.
+Each waits on its control channel beside its work, through `libkern::control`, and **takes it out of
+its wait set if it closes**, since a closed channel stays signalled for good. A stopped server's
+registry entry goes with it, so its path answers `NotFound` until it is started again, and every
+binding reaches the new one then.
 
 **The wait set pays for it**: `/svc/services`' endpoint, a session endpoint, two admin endpoints
 and four admin sessions (`services::SLOTS`), which is what took `MAX_ROUTES` from 16 to 14.

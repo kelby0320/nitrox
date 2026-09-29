@@ -218,13 +218,23 @@ pub mod services {
         }
     }
 
-    /// A service's state: whether it is `running` and still `starting`, whether its stop was
-    /// `requested`, and how it last `exited` — `None` if it never has, `Some(None)` if its code
-    /// never came.
-    pub fn state(running: bool, starting: bool, requested: bool, exited: Option<Option<i32>>) -> State {
-        match (running, starting) {
-            (true, true) => State::Starting,
-            (true, false) => State::Running,
+    /// A service's state: whether it is `running` and still `starting`, or `usable` — a server
+    /// bound, or any other service — whether its stop was `requested`, and how it last `exited`:
+    /// `None` if it never has, `Some(None)` if its code never came.
+    ///
+    /// **Running and not usable is `failed`** (PR #341 review, finding 7): a server that refused,
+    /// or sent no `Meta::Ready` in time, is still a process, and its path answers `NotFound`.
+    pub fn state(
+        running: bool,
+        starting: bool,
+        usable: bool,
+        requested: bool,
+        exited: Option<Option<i32>>,
+    ) -> State {
+        match (running, starting, usable) {
+            (true, true, _) => State::Starting,
+            (true, false, true) => State::Running,
+            (true, false, false) => State::Failed,
             _ if requested => State::Stopped,
             _ => match exited {
                 None | Some(Some(0)) => State::Stopped,
@@ -289,13 +299,26 @@ pub mod services {
         Stop,
         /// Ask it to stop, then start it; answer once the new one is up.
         StopThenStart,
+        /// **Cancel the restart its policy has scheduled**, and answer at once: a service in its
+        /// backoff is not running, and a stop is what keeps it from running again (PR #341 review,
+        /// finding 6). Without this a crash-looping service could not be stopped.
+        CancelRestart,
     }
 
-    /// The request `op` (`librsproto::services`) for a service found as `(essential, running)`,
-    /// or not found: what to do, or why not.
-    pub fn decide(op: u16, found: Option<(bool, bool)>) -> Result<Action, (KError, &'static str)> {
+    /// What `decide` needs of the service a request names.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Found {
+        pub essential: bool,
+        pub running: bool,
+        /// Whether its policy has a restart scheduled: it exited, and its backoff is not over.
+        pub restart_due: bool,
+    }
+
+    /// The request `op` (`librsproto::services`) for the service `found`, or none: what to do, or
+    /// why not.
+    pub fn decide(op: u16, found: Option<Found>) -> Result<Action, (KError, &'static str)> {
         use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
-        let Some((essential, running)) = found else {
+        let Some(Found { essential, running, restart_due }) = found else {
             return Err((KError::NotFound, "no service is declared by that name"));
         };
         match op {
@@ -305,6 +328,7 @@ pub mod services {
                 KError::NoAccess,
                 "it is essential: without it the system cannot be administered, or loses what it holds",
             )),
+            OP_SERVICES_STOP if !running && restart_due => Ok(Action::CancelRestart),
             OP_SERVICES_STOP if !running => Err((KError::InvalidArgument, "it is not running")),
             OP_SERVICES_STOP => Ok(Action::Stop),
             OP_SERVICES_RESTART if running => Ok(Action::StopThenStart),
@@ -360,13 +384,14 @@ mod tests {
     /// **What each admin request does, and what refuses it** (administration Part E.2).
     #[test]
     fn an_admin_request_is_decided_by_the_service_it_names() {
-        use super::services::{Action, decide};
+        use super::services::{Action, Found, decide};
         use librsproto::services::{
             OP_SERVICES_RESTART as RESTART, OP_SERVICES_START as START, OP_SERVICES_STOP as STOP,
         };
         use libkern::error::KError;
-        let (plain_up, plain_down) = (Some((false, true)), Some((false, false)));
-        let essential_up = Some((true, true));
+        let found = |essential, running, restart_due| Some(Found { essential, running, restart_due });
+        let (plain_up, plain_down) = (found(false, true, false), found(false, false, false));
+        let essential_up = found(true, true, false);
         assert_eq!(decide(START, plain_down), Ok(Action::Start));
         assert_eq!(decide(START, plain_up).map_err(|e| e.0), Err(KError::AlreadyExists));
         assert_eq!(decide(STOP, plain_up), Ok(Action::Stop));
@@ -376,9 +401,15 @@ mod tests {
         // An essential service is refused a stop and a restart, running or not, and not a start.
         for op in [STOP, RESTART] {
             assert_eq!(decide(op, essential_up).map_err(|e| e.0), Err(KError::NoAccess));
-            assert_eq!(decide(op, Some((true, false))).map_err(|e| e.0), Err(KError::NoAccess));
+            assert_eq!(decide(op, found(true, false, false)).map_err(|e| e.0), Err(KError::NoAccess));
         }
-        assert_eq!(decide(START, Some((true, false))), Ok(Action::Start));
+        assert_eq!(decide(START, found(true, false, false)), Ok(Action::Start));
+        // **A stop during a backoff cancels the restart**, where "not running" would let it run.
+        let backing_off = found(false, false, true);
+        assert_eq!(decide(STOP, backing_off), Ok(Action::CancelRestart));
+        assert_eq!(decide(START, backing_off), Ok(Action::Start));
+        assert_eq!(decide(RESTART, backing_off), Ok(Action::Start));
+        assert_eq!(decide(STOP, found(true, false, true)).map_err(|e| e.0), Err(KError::NoAccess));
         assert_eq!(decide(STOP, None).map_err(|e| e.0), Err(KError::NotFound));
         assert_eq!(decide(0x1103, plain_up).map_err(|e| e.0), Err(KError::Unsupported));
     }
@@ -387,13 +418,15 @@ mod tests {
     #[test]
     fn a_state_is_told_from_how_a_service_last_ended() {
         use super::services::{State, state};
-        assert_eq!(state(true, true, false, None), State::Starting);
-        assert_eq!(state(true, false, false, Some(Some(1))), State::Running, "running is running");
-        assert_eq!(state(false, false, true, Some(Some(1))), State::Stopped, "asked to stop");
-        assert_eq!(state(false, false, false, None), State::Stopped, "never started");
-        assert_eq!(state(false, false, false, Some(Some(0))), State::Stopped, "finished cleanly");
-        assert_eq!(state(false, false, false, Some(Some(-1))), State::Failed);
-        assert_eq!(state(false, false, false, Some(None)), State::Failed, "a code that never came");
+        assert_eq!(state(true, true, false, false, None), State::Starting);
+        assert_eq!(state(true, false, true, false, Some(Some(1))), State::Running, "running is running");
+        assert_eq!(state(true, false, false, false, None), State::Failed, "no Ready in time");
+        assert_eq!(state(false, false, false, true, Some(Some(1))), State::Stopped, "asked to stop");
+        assert_eq!(state(false, false, false, false, None), State::Stopped, "never started");
+        assert_eq!(state(false, false, false, false, Some(Some(0))), State::Stopped, "finished cleanly");
+        assert_eq!(state(false, false, false, false, Some(Some(-1))), State::Failed);
+        let never_came = state(false, false, false, false, Some(None));
+        assert_eq!(never_came, State::Failed, "a code that never came");
     }
 
     /// **The table is a TSM1 table** a reader decodes, a row per service, and a session endpoint

@@ -36,10 +36,11 @@ and the slice plan all live there.
 - **Stable Rust only.**
 - **Layering:** unlike `init`/`eshell`, service-mgr **is** allowed the stateful
   runtime — it runs after the ecosystem is coming up, not in the pre-allocator
-  critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` (+ later
-  `libstream`), eventual `std`. **Today it links `libkern`, `libheap`, `librsproto` and
-  `libfs`**: the last two since administration Part E.1a, for the `SUBNAMESPACE` replies its
-  endpoint answers and for reading its declarations.
+  critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` + `libstream`,
+  eventual `std`. **Today it links `libkern`, `libheap`, `librsproto`, `libfs` and
+  `libstream`**: `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE`
+  replies its endpoint answers and for reading its declarations, and `libstream` since Part E.2a,
+  for the table `/svc/services/all.tsm`.
 
 ## Discipline
 
