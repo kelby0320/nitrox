@@ -203,9 +203,11 @@ each step's rationale is in the source comments:
    features the kernel requires, uses when present, and warns about, each `+` or `-`. Both only
    read, and both run before the step that panics on a missing required feature
    (`init_protections`), so the line naming what is missing is on the screen first. Later steps
-   add their own facts the same way — every ACPI table and MADT entry, each PCI function's
-   capabilities and what its driver did with it, the framebuffer's row padding, whether a UART
-   answers at COM1 — so every boot's log is a hardware report of the machine it ran on.
+   add their own facts the same way — every ACPI table and MADT entry, the FADT's flags, reset
+   register, century register and 8042 (administration Part E.3), each PCI function's capabilities
+   and what its driver did with it, the framebuffer's row padding, whether a UART answers at COM1 —
+   so every boot's log is a hardware report of the machine it ran on. The RTC reads its century
+   from the FADT's century register when there is one, and guesses 20 when there is not.
 4. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
    it. This is the first code to walk firmware structures and the first place a fault can
    happen, which is why the IDT is already live.

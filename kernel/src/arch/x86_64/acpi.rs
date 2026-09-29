@@ -1,9 +1,12 @@
 //! x86_64 ACPI static-table parser ([`ArchPlatform`] impl).
 //!
-//! Pure-Rust, **no AML**: walk the RSDP → RSDT/XSDT → the two tables Phase 2
-//! needs — the **MADT** (interrupt routing: IOAPIC bases, GSI bases, ISA-IRQ
-//! source overrides) and the **MCFG** (PCIe ECAM windows). ACPICA/AML is a
-//! separate, deferred concern (see `docs/rationale/why-phased-acpi.md`).
+//! Pure-Rust, **no AML**: walk the RSDP → RSDT/XSDT → the tables the kernel
+//! reads — the **MADT** (interrupt routing: IOAPIC bases, GSI bases, ISA-IRQ
+//! source overrides), the **MCFG** (PCIe ECAM windows) and, since
+//! administration Part E.3, the **FADT** (its flags, the reset register a
+//! reboot writes, the RTC's century register, and whether an 8042 is present).
+//! ACPICA/AML is a separate, deferred concern (see
+//! `docs/rationale/why-phased-acpi.md`).
 //!
 //! ## Arch boundary
 //!
@@ -18,12 +21,13 @@
 //! ## Structure
 //!
 //! The byte-level parsers ([`parse_rsdp`], [`parse_madt`], [`parse_mcfg`],
-//! [`sdt_pointers`]) are pure functions over `&[u8]`, host-tested against
-//! synthetic table blobs. The only non-pure part is the boot glue in
-//! [`X86Platform::init`]: read the RSDP from Limine, translate physical table
-//! addresses through the HHDM, and feed the bytes to the parsers.
+//! [`parse_fadt`], [`sdt_pointers`]) are pure functions over `&[u8]`,
+//! host-tested against synthetic table blobs. The only non-pure part is the
+//! boot glue in [`X86Platform::init`]: read the RSDP from Limine, translate
+//! physical table addresses through the HHDM, and feed the bytes to the
+//! parsers.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::platform::{ArchPlatform, EcamRegion};
 use crate::libkern::AllocError;
@@ -92,6 +96,9 @@ static mut IOAPICS: [IoApic; MAX_IOAPIC] = [IoApic::ZERO; MAX_IOAPIC];
 static OVERRIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut OVERRIDES: [SourceOverride; MAX_OVERRIDE] = [SourceOverride::ZERO; MAX_OVERRIDE];
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// The FADT's parse, and whether there was one (administration Part E.3).
+static FADT_READ: AtomicBool = AtomicBool::new(false);
+static mut FADT: Fadt = Fadt { flags: None, reset: None, century: None, boot_arch: None };
 static mut CPU_APIC_IDS: [u32; MAX_CPU] = [0; MAX_CPU];
 
 // --- Little-endian field readers (callers guarantee `off + width <= b.len()`) ---
@@ -417,6 +424,129 @@ fn parse_mcfg(mcfg: &[u8], out: &mut [EcamRegion]) -> usize {
     n
 }
 
+/// **A register's location**, as ACPI names one: a Generic Address Structure (12 bytes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Gas {
+    /// Which address space `address` is in: [`GAS_SYSTEM_MEMORY`], [`GAS_SYSTEM_IO`] or
+    /// [`GAS_PCI_CONFIG`], or another this kernel does not write.
+    pub space: u8,
+    pub bit_width: u8,
+    pub bit_offset: u8,
+    pub access_size: u8,
+    pub address: u64,
+}
+
+/// A [`Gas`] in physical memory.
+pub(crate) const GAS_SYSTEM_MEMORY: u8 = 0;
+/// A [`Gas`] in the I/O port space.
+pub(crate) const GAS_SYSTEM_IO: u8 = 1;
+/// A [`Gas`] in PCI configuration space: bus 0, device, function and offset packed in `address`.
+pub(crate) const GAS_PCI_CONFIG: u8 = 2;
+
+impl Gas {
+    fn read(b: &[u8]) -> Gas {
+        let (space, bit_width, bit_offset, access_size) = (b[0], b[1], b[2], b[3]);
+        Gas { space, bit_width, bit_offset, access_size, address: rd_u64(b, 4) }
+    }
+
+    /// The address space's name, for the report.
+    fn space_name(&self) -> &'static str {
+        match self.space {
+            GAS_SYSTEM_MEMORY => "memory",
+            GAS_SYSTEM_IO => "I/O",
+            GAS_PCI_CONFIG => "PCI config",
+            _ => "another space",
+        }
+    }
+}
+
+/// **What this kernel reads of the FADT** (administration Part E.3): its flags, the reset register
+/// and the value that resets, the RTC's century register, and whether there is an 8042. Each is
+/// `None` when the table is too short to hold it — a revision-1 FADT ends at byte 116, before the
+/// reset register — or does not name it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct Fadt {
+    pub flags: Option<u32>,
+    /// The reset register and the byte to write to it — only when the flags advertise it
+    /// (`RESET_REG_SUP`) and it names an address.
+    pub reset: Option<(Gas, u8)>,
+    /// The CMOS index of the RTC's century register; `None` when the FADT names none.
+    pub century: Option<u8>,
+    /// `IAPC_BOOT_ARCH`: bit 1 says the machine has an 8042.
+    pub boot_arch: Option<u16>,
+}
+
+/// FADT flag: the reset register is valid.
+pub(crate) const FADT_RESET_REG_SUP: u32 = 1 << 10;
+/// `IAPC_BOOT_ARCH` bit: the machine has an 8042 keyboard controller.
+pub(crate) const BOOT_ARCH_8042: u16 = 1 << 1;
+
+/// Byte offsets into the FADT (ACPI 6.5 §5.2.9).
+const FADT_CENTURY: usize = 108;
+const FADT_BOOT_ARCH: usize = 109;
+const FADT_FLAGS: usize = 112;
+const FADT_RESET_REG: usize = 116;
+const FADT_RESET_VALUE: usize = 128;
+
+/// Parse the parts of a FADT this kernel uses, reading only what the table's length holds.
+fn parse_fadt(t: &[u8]) -> Fadt {
+    let has = |off: usize, len: usize| t.len() >= off + len;
+    let flags = has(FADT_FLAGS, 4).then(|| rd_u32(t, FADT_FLAGS));
+    let reset = if has(FADT_RESET_VALUE, 1) && flags.is_some_and(|f| f & FADT_RESET_REG_SUP != 0) {
+        let gas = Gas::read(&t[FADT_RESET_REG..FADT_RESET_REG + 12]);
+        (gas.address != 0).then_some((gas, t[FADT_RESET_VALUE]))
+    } else {
+        None
+    };
+    Fadt {
+        flags,
+        reset,
+        century: has(FADT_CENTURY, 1).then(|| t[FADT_CENTURY]).filter(|&c| c != 0),
+        boot_arch: has(FADT_BOOT_ARCH, 2).then(|| rd_u16(t, FADT_BOOT_ARCH)),
+    }
+}
+
+/// Log what the FADT says, a line the hardware report carries: the facts a reset and the clock
+/// depend on, so a machine's report says whether it can reset by register.
+fn log_fadt(f: &Fadt) {
+    match f.flags {
+        Some(flags) => crate::kprintln!("fadt: flags {:#x}", flags),
+        None => crate::kprintln!("fadt: too short to hold flags"),
+    }
+    match f.reset {
+        Some((gas, value)) => crate::kprintln!(
+            "fadt: reset register {} {:#x} width {}, value {:#x}",
+            gas.space_name(),
+            gas.address,
+            gas.bit_width,
+            value
+        ),
+        None => crate::kprintln!("fadt: no reset register"),
+    }
+    match f.century {
+        Some(index) => crate::kprintln!("fadt: century register CMOS {:#x}", index),
+        None => crate::kprintln!("fadt: no century register"),
+    }
+    match f.boot_arch {
+        Some(arch) => crate::kprintln!(
+            "fadt: boot arch {:#x}; 8042 {}",
+            arch,
+            if arch & BOOT_ARCH_8042 != 0 { "present" } else { "absent" }
+        ),
+        None => crate::kprintln!("fadt: no boot arch flags"),
+    }
+}
+
+/// The FADT, once `init` has read it; `None` before, or on a machine with none.
+pub(crate) fn fadt() -> Option<Fadt> {
+    if FADT_READ.load(Ordering::Acquire) {
+        // SAFETY: written once by `init` before `FADT_READ` is set, read-only after.
+        Some(unsafe { (&raw const FADT).read() })
+    } else {
+        None
+    }
+}
+
 /// Map a firmware physical address into a readable byte slice through the HHDM.
 ///
 /// # Safety
@@ -489,6 +619,7 @@ impl ArchPlatform for X86Platform {
         let (mut ni, mut no, mut nc, mut ne) = (0usize, 0usize, 0usize, 0usize);
         let mut madt: Option<&[u8]> = None;
         let mut have_mcfg = false;
+        let mut fadt: Option<Fadt> = None;
 
         for tphys in sdt_pointers(sdt, info.use_xsdt) {
             // SAFETY: each pointer is from the validated root table; read 36
@@ -527,6 +658,7 @@ impl ArchPlatform for X86Platform {
                     ne = parse_mcfg(table, &mut ecam);
                     have_mcfg = true;
                 }
+                b"FACP" if fadt.is_none() => fadt = Some(parse_fadt(table)),
                 _ => {}
             }
         }
@@ -539,6 +671,11 @@ impl ArchPlatform for X86Platform {
             (&raw mut OVERRIDES).write(overrides);
             (&raw mut CPU_APIC_IDS).write(cpus);
             (&raw mut ECAM).write(ecam);
+        }
+        if let Some(f) = fadt {
+            // SAFETY: as above — the sole write, before `FADT_READ` publishes it.
+            unsafe { (&raw mut FADT).write(f) };
+            FADT_READ.store(true, Ordering::Release);
         }
         IOAPIC_COUNT.store(ni, Ordering::Release);
         OVERRIDE_COUNT.store(no, Ordering::Release);
@@ -571,6 +708,10 @@ impl ArchPlatform for X86Platform {
                 e.bus_start,
                 e.bus_end
             );
+        }
+        match &fadt {
+            Some(f) => log_fadt(f),
+            None => crate::kprintln!("fadt: none -- no reset register, no century register"),
         }
         Ok(())
     }
@@ -942,5 +1083,63 @@ mod tests {
         let mut cp = [0u32; 2];
         assert_eq!(parse_madt(&[0u8; 10], &mut io, &mut ov, &mut cp), (0, 0, 0));
         assert_eq!(parse_mcfg(&[0u8; 10], &mut [EcamRegion::ZERO; 2]), 0);
+    }
+
+    /// A FADT of `len` bytes with the fields this kernel reads set as q35's are: flags with
+    /// `RESET_REG_SUP`, the reset register at I/O port 0xcf9 taking 0x0f, century at CMOS 0x32,
+    /// and an 8042.
+    fn fadt(len: usize) -> Vec<u8> {
+        let mut t = sdt_header(b"FACP", len);
+        t.resize(len, 0);
+        let mut put = |off: usize, bytes: &[u8]| {
+            if off + bytes.len() <= t.len() {
+                t[off..off + bytes.len()].copy_from_slice(bytes);
+            }
+        };
+        put(FADT_CENTURY, &[0x32]);
+        put(FADT_BOOT_ARCH, &BOOT_ARCH_8042.to_le_bytes());
+        put(FADT_FLAGS, &(FADT_RESET_REG_SUP | 0x1).to_le_bytes());
+        put(FADT_RESET_REG, &[GAS_SYSTEM_IO, 8, 0, 1]);
+        put(FADT_RESET_REG + 4, &0xcf9u64.to_le_bytes());
+        put(FADT_RESET_VALUE, &[0x0f]);
+        t
+    }
+
+    /// **Each field is read only when the table holds it** — a revision-1 FADT ends at 116, before
+    /// the reset register — and a reset register counts only when the flags advertise it and it
+    /// names an address.
+    #[test]
+    fn a_fadt_is_read_as_far_as_its_length_goes() {
+        let (space, bit_width, bit_offset, access_size) = (GAS_SYSTEM_IO, 8, 0, 1);
+        let io = Gas { space, bit_width, bit_offset, access_size, address: 0xcf9 };
+        let full = parse_fadt(&fadt(244));
+        assert_eq!(full.flags, Some(FADT_RESET_REG_SUP | 1));
+        assert_eq!(full.reset, Some((io, 0x0f)));
+        assert_eq!(full.century, Some(0x32));
+        assert_eq!(full.boot_arch, Some(BOOT_ARCH_8042));
+        // Exactly long enough for the reset value, and one byte short of it.
+        assert_eq!(parse_fadt(&fadt(129)).reset, Some((io, 0x0f)));
+        let short = parse_fadt(&fadt(128));
+        let sup = Some(FADT_RESET_REG_SUP | 1);
+        assert_eq!((short.reset, short.flags), (None, sup), "too short for the reset register");
+        // Revision 1's length: flags, century and boot arch, no reset register.
+        let v1 = parse_fadt(&fadt(116));
+        assert_eq!((v1.flags.is_some(), v1.reset, v1.century), (true, None, Some(0x32)));
+        // Too short for any of it.
+        assert_eq!(parse_fadt(&fadt(100)), Fadt::default());
+        assert_eq!(parse_fadt(&[0u8; 10]), Fadt::default());
+    }
+
+    #[test]
+    fn a_reset_register_needs_the_flag_and_an_address_and_a_century_needs_an_index() {
+        let mut t = fadt(244);
+        t[FADT_FLAGS..FADT_FLAGS + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_fadt(&t).reset, None, "not advertised");
+        let mut t = fadt(244);
+        t[FADT_RESET_REG + 4..FADT_RESET_REG + 12].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(parse_fadt(&t).reset, None, "advertised, at no address");
+        let mut t = fadt(244);
+        t[FADT_CENTURY] = 0;
+        assert_eq!(parse_fadt(&t).century, None, "index 0 is none");
     }
 }

@@ -11639,6 +11639,13 @@ const EMULATED_MACHINE_FACTS: &[&[&str]] = &[
     &["madt: lapic uid 3 apic 3 enabled"],
     &["madt: ioapic 0 @0xfec00000 gsi 0"],
     &["acpi: 1 IOAPIC, 5 src-override, 4 CPU; 1 ECAM region"],
+    // **q35's FADT** (administration Part E.3): the reset register a reboot writes first — the
+    // chipset's reset control at I/O 0xcf9, `RESET_REG_SUP` set in the flags — the RTC's century
+    // register, and an 8042.
+    &["fadt: flags 0x84a5"],
+    &["fadt: reset register I/O 0xcf9 width 8, value 0xf"],
+    &["fadt: century register CMOS 0x32"],
+    &["fadt: boot arch 0x2; 8042 present"],
 ];
 
 /// The facts `test-qemu`'s boot adds to [`EMULATED_MACHINE_FACTS`]: its disk is on AHCI, so the

@@ -30849,3 +30849,45 @@ started it again.**
 - **A server past its `Ready` deadline showed `running`.** It is still a process, but it refused
   or said nothing, and its path answers `NotFound`. `state` now takes whether a running service is
   usable, and says `failed`.
+
+## 2026-09-28 — Administration Part E.3a: the FADT, read for a reset and a century
+
+E.3 comes in two parts. **E.3a reads the FADT**, the table E.3b's reboot needs and the RTC's
+century was waiting on. E.3b is the system-control object and `sys_power`.
+
+**Four things are read from it**, each only when the table's length holds it:
+- the **flags**, at 112;
+- the **reset register and value**, at 116 and 128, counted only when the flags advertise
+  `RESET_REG_SUP` and the register names an address;
+- the **century register's** CMOS index, at 108, where 0 means none;
+- **`IAPC_BOOT_ARCH`**, at 109, for whether an 8042 is present.
+
+The last is the one the plan did not name. The reboot chain's second step is the 8042's reset
+pulse, so the laptop's report should say whether its firmware claims to have one. E.3b does not
+skip the pulse on the flag's word: firmware gets the bit wrong both ways, and a pulse sent where
+there is no 8042 does nothing.
+
+**A short table is an ordinary case, not a bad one.** A revision-1 FADT ends at byte 116, before
+the reset register, which ACPI 2.0 added. So a table can advertise `RESET_REG_SUP` and not hold
+the register; it then has none. The host tests cover lengths from the full 244 down to 10,
+including 128, which holds the register's address and not its value.
+
+**The hardware report prints four lines**: `fadt: flags`, `fadt: reset register`, `fadt: century
+register` and `fadt: boot arch`, each with a line for its absence, and one line when there is no
+FADT at all. q35's are:
+- flags `0x84a5`, `RESET_REG_SUP` among them;
+- a reset register at I/O `0xcf9`, 8 bits wide, value `0xf` — the chipset's reset control;
+- a century register at CMOS `0x32`;
+- boot arch `0x2`, an 8042 present.
+
+These join `EMULATED_MACHINE_FACTS`, so `test-qemu` asserts them off COM1 and `check-report` off
+the live image's report pages. The laptop's report will say whether it can reset by register.
+
+**The RTC reads its century from the register** when the FADT names one, in the chip's own BCD or
+binary form. A reading outside 19–21 is not believed, and the year falls back to 2000–2099, which
+is what every boot did before. The module's "the century is a guess" is now true only of a machine
+whose FADT names no register.
+
+Gates run: `test-qemu --kvm`, `check-report --kvm`, `check-fbcon --kvm`, the host suite,
+`check-arch`, `abi-sync-check` and `check-docs`. The full set follows E.3b, which changes the ABI.
+No kernel ABI change here.

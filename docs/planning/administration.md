@@ -2093,6 +2093,10 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         - host tests for the FADT parser, including a table too short to hold a reset register;
         - `test-qemu`: the FADT facts q35 has;
         - `check-report`: the same lines, read off the live image's report.
+      - *(E.3a landed 2026-09-28:* the FADT's flags, reset register, century register and
+        `IAPC_BOOT_ARCH` — whether an 8042 is present, which the reboot chain's second step is
+        about — in the report, each read only as far as the table's length goes. The RTC takes its
+        century from the register. The object and `sys_power` are E.3b's.)*
 - [ ] **E.4 — `shutdown`.**
       - The sequence: sessions, services in reverse order, the storage service's unmount of
         everything, `init`'s mounts, the power op.
