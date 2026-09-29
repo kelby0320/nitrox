@@ -31087,3 +31087,60 @@ running service to stop, newest first, waiting up to 3 s each, then sent `init` 
   passed twice after both fixes.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4b: `service-mgr` runs a shutdown
+
+**A power endpoint and power sessions.**
+- `/svc/services/power-endpoint`, from the root namespace only, mints an endpoint on which any
+  resolve opens a power session. A session endpoint answers the suffix `NotFound`, as it answers
+  `admin-endpoint`.
+- A power session takes **`Shutdown`** (`0x1103`), with a one-byte body: halt or reboot. It takes
+  nothing else, and an admin session does not take `Shutdown`. So stopping the machine and
+  administering services stay two grants, `power` and `services`, as the plan drew them.
+- `Shutdown` is answered as soon as it begins, since nothing comes back after it. A second one is
+  refused `WouldBlock`.
+
+**The sequence** is a state machine in the one loop, each wait a deadline, in
+`service_mgr::shutdown`'s order:
+1. Nothing more starts. Every service is marked asked to stop, and every waiting admin request is
+   refused, a restart's pending start among them.
+2. **The sessions**: both login supervisors get a terminate request, and 10 s. Their control
+   channels closing is how their exits are seen, since a process handle cannot be waited on and
+   neither supervisor closes its control channel.
+3. **The services, last declared first**: each gets `CTRL_OP_SHUTDOWN` and 3 s. That is shorter
+   than `service --stop`'s 5 s, since no person waits on this answer. A service not honouring it is
+   logged and passed over.
+4. `TERMINAL_OP_FINISH` to `init`.
+
+**Room for it**: one power endpoint (the broker binds one into every view) and two power sessions.
+They take the starting servers' room from nine to six, and bring-up starts one server at a time.
+
+**The broker's race, a second time.** `serve_services` answered new resolves on `/svc/services`
+before it looked at closed endpoints, and endpoints' session opens before closed sessions. With one
+power endpoint, a holder that let it go and asked again at once would be refused `WouldBlock`
+while the slot was about to be freed. The order is now **sessions, then endpoints, then resolves**.
+
+**Gates:**
+- **Host tests:** the suffix routing, including a session reaching no power endpoint; `Shutdown`'s
+  body, including what no correct client sends; and the stop order.
+- **`boot-probe`'s `power_endpoint_test`**, on a session opened as the grant will open one:
+  - `Start` on a power session is refused `NoAccess`;
+  - three malformed `Shutdown`s are refused `InvalidArgument`;
+  - a `Shutdown` on an admin session is refused `NoAccess`;
+  - a second power endpoint is refused while one is held, and one is taken at once after it is let
+    go.
+- **Controls:**
+  - a power session that skips its op check fails the case;
+  - a cap of two power endpoints fails it too.
+
+**A well-formed `Shutdown` stops the machine, so no `test-qemu` sends one**; that is E.4d's
+`check-shutdown`. It was booted by hand in the test image, from a temporary trigger at the end of
+`boot-probe` (reverted):
+- **The sessions:** the supervisors ran out their 10 s. They do not honour the request until E.4c.
+- **The services:** `ui-testclient`, `nxterm` and `restart-probe` were passed over after 3 s each,
+  and every server exited, the storage service unmounting its scratch disk first.
+- **The end:** `init` unmounted `/`, left clean, and `sys_power` halted.
+- **The disk**, on the host: `e2fsck -fn` clean, and the state `clean`.
+- **The reboot byte:** a reset through the FADT's register.
+
+No kernel change and no ABI hash impact.

@@ -301,12 +301,11 @@ how, and what each suffix asks for where it arrives.
   unmount starts. A lazy unmount, which would drain those, is not built.
 - **An open directory session is not a held file.** A client holding one when its filesystem is
   unmounted finds the channel closed.
-- **A shutdown's unmount is built, and nothing asks for it yet** (administration Part E.4a). On
-  `CTRL_OP_SHUTDOWN` this service runs the chain on every mount it made, last first and without
-  the held check, then exits; `init` does the same for its own mounts on the terminal channel's
-  `Finish`. The sequence that sends both is Part E.4b's. Until it lands, every ext4 this service
-  auto-mounted writable is left not clean at power-off, with its dirty files unwritten, exactly as
-  `/` and `/home` are.
+- **A shutdown unmounts everything** (administration Part E.4). On `CTRL_OP_SHUTDOWN` this service
+  runs the chain on every mount it made, last first and without the held check, then exits; `init`
+  does the same for its own mounts on the terminal channel's `Finish`. `service-mgr`'s shutdown
+  sends both (Part E.4b). **Nothing a person can reach asks for one yet**: the `power` grant and
+  `shutdown` are Part E.4d's. Until then a machine turned off is left not clean, as before.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

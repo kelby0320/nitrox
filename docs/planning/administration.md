@@ -2117,6 +2117,10 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         storage service unmounting everything first; `init` keeps its mounts' control channels
         and answers `TERMINAL_OP_FINISH` — its mounts, last first, then `sys_power`. Booted by hand
         with a probe; the root left clean, checked on the host against a control.)*
+      - *(E.4b landed 2026-09-29:* `/svc/services/power-endpoint` and power sessions, `Shutdown`
+        (`0x1103`), and the sequence: sessions (10 s), services last declared first (3 s each),
+        then `init`'s `Finish`. `boot-probe` gates every refusal; the shutdown itself was booted by
+        hand from a trigger in `boot-probe`, and gated by E.4d's `check-shutdown`.)*
       - The `power` grant, and the seeded policy's `power` view for everyone.
       - `shutdown [--reboot]`.
       - **`cargo xtask check-shutdown`**, in CI's QEMU job. It boots a `--selftest` disk image, and

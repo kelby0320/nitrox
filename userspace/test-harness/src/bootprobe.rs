@@ -1466,7 +1466,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & policy_test(root_ns)
         & accounts_test(root_ns)
         & restart_test(root_ns)
-        & services_test(root_ns);
+        & services_test(root_ns)
+        & power_endpoint_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
@@ -3384,6 +3385,103 @@ fn services_test(root_ns: u64) -> bool {
     kprint(b"boot-probe: services: an essential stop, an unknown name and a second start refused ok\n");
     kprint(b"boot-probe: services: a restart whose session closed at once still started it again ok\n");
     finish(true)
+}
+
+/// **The power endpoint answers nothing but a well-formed shutdown** (administration Part E.4b),
+/// on a session opened as the view broker's `power` grant will open one — and an admin session
+/// answers no shutdown at all. A well-formed one on a power session would stop this machine, so
+/// sending it is `check-shutdown`'s:
+/// - `Start` on a power session, refused `NoAccess`;
+/// - `Shutdown` with no body, two bytes, or a byte that names neither halt nor reboot, refused
+///   `InvalidArgument`;
+/// - `Shutdown` on an admin session, refused `NoAccess`;
+/// - a second power endpoint while the one is held, refused `WouldBlock`, and another taken at once
+///   once it is let go — which is `serve_services` answering closes before resolves.
+fn power_endpoint_test(root_ns: u64) -> bool {
+    use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
+    use librsproto::services::{OP_SERVICES_SHUTDOWN, OP_SERVICES_START, SHUTDOWN_HALT, SHUTDOWN_REBOOT};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: power: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
+    // A session on the endpoint `path` mints, as a grant's binding reaches it: bound in a namespace
+    // of this probe's own, and resolved there. The namespace holds the endpoint until it is closed.
+    let open = |path: &[u8]| -> Option<(u64, u64)> {
+        let (st, endpoint) = ns_lookup(root_ns, path, chan);
+        if st != 0 || endpoint == 0 {
+            return None;
+        }
+        // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+        let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+        if ns <= 0 {
+            close(endpoint);
+            return None;
+        }
+        let ns = ns as u64;
+        let at = b"/grant";
+        // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
+        let bound = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, 0, 0) };
+        close(endpoint);
+        let (st, session) = if bound == 0 { ns_lookup(ns, at, chan) } else { (-1, 0) };
+        if st != 0 || session == 0 {
+            close(ns);
+            return None;
+        }
+        Some((ns, session))
+    };
+    // Ask `op` on `session` and say how it was answered: `0`, or the refusal's `KError`.
+    let ask = |session: u64, id: u64, op: u16, body: &[u8]| -> Option<i32> {
+        if !rs_send(session, op, id, body, &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 10_000_000_000;
+        loop {
+            let m = receive(session, deadline)?;
+            m.handles.iter().for_each(|&h| close(h));
+            if m.request_id == id {
+                return Some(if m.error { librsproto::error::parse_error(&m.body).map_or(-1, |e| e.kerror) } else { 0 });
+            }
+        }
+    };
+    let Some((power_ns, power)) = open(b"/svc/services/power-endpoint") else {
+        return fail(b"no power session through /svc/services/power-endpoint");
+    };
+    let Some((admin_ns, admin)) = open(b"/svc/services/admin-endpoint") else {
+        close(power);
+        close(power_ns);
+        return fail(b"no admin session through /svc/services/admin-endpoint");
+    };
+    let (no_access, invalid) = (Some(KError::NoAccess.as_i32()), Some(KError::InvalidArgument.as_i32()));
+    let refusals: [(Option<i32>, Option<i32>, &[u8]); 5] = [
+        (ask(power, 1, OP_SERVICES_START, b"clipboard-server"), no_access, b"a start on a power session"),
+        (ask(power, 2, OP_SERVICES_SHUTDOWN, &[]), invalid, b"a shutdown with no body"),
+        (ask(power, 3, OP_SERVICES_SHUTDOWN, &[SHUTDOWN_HALT, SHUTDOWN_REBOOT]), invalid, b"a shutdown with two bytes"),
+        (ask(power, 4, OP_SERVICES_SHUTDOWN, &[2]), invalid, b"a shutdown naming neither halt nor reboot"),
+        (ask(admin, 5, OP_SERVICES_SHUTDOWN, &[SHUTDOWN_HALT]), no_access, b"a shutdown on an admin session"),
+    ];
+    // The one power endpoint is held by `power_ns`'s binding.
+    let (second, extra) = ns_lookup(root_ns, b"/svc/services/power-endpoint", chan);
+    close(extra);
+    for h in [power, power_ns, admin, admin_ns] {
+        close(h);
+    }
+    let (again, taken) = ns_lookup(root_ns, b"/svc/services/power-endpoint", chan);
+    close(taken);
+    for (answer, expected, what) in refusals {
+        if answer != expected {
+            Line::new().s(b"boot-probe: power: ").s(what).s(b" was answered ").i(answer.unwrap_or(1) as i64).end();
+            return fail(b"a request was not refused as it should be");
+        }
+    }
+    if second != KError::WouldBlock.as_i32() {
+        return fail(b"a second power endpoint was not refused while the one was held");
+    }
+    if again != 0 || taken == 0 {
+        return fail(b"no power endpoint at once after the one was let go");
+    }
+    kprint(b"boot-probe: power endpoint refused a start, three malformed shutdowns and one on an admin session, and one endpoint at a time ok\n");
+    true
 }
 
 /// **Accounts, fronted by the broker** (administration Part D.3).

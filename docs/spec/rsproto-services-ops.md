@@ -4,7 +4,8 @@
 `all.tsm`, are implemented in `userspace/service-mgr/` and encoded by
 `userspace/librsproto/src/services.rs` (administration Part E.2a); the session endpoint every login
 binds at `/dev/services`, the view broker's `services` grant and `service` itself are Part E.2b's.
-The decisions — what each request does, and what refuses it — are `service_mgr::services`,
+The power endpoint and `Shutdown` are Part E.4b's (2026-09-29); the `power` grant that binds one
+into a view is E.4d's. The decisions — what each request does, and what refuses it — are `service_mgr::services`,
 host-tested. See [`service-manager.md`](../architecture/service-manager.md) for the manager, and
 [`administration.md`](../planning/administration.md) § *Part E in detail* for the design and its
 reasons.
@@ -22,6 +23,8 @@ to it can read.
 | admin endpoint | `/svc/services/admin-endpoint`, from the root namespace | `admin-endpoint` | a forwarding endpoint of `service-mgr`'s own |
 | session endpoint | handed to both login supervisors at spawn, bound at `/dev/services` in every session and application | `all.tsm` | the table; any other suffix, `admin-endpoint` among them, is `NotFound` |
 | admin session | any resolve on an admin endpoint | any | a channel carrying the requests below |
+| power endpoint | `/svc/services/power-endpoint`, from the root namespace | `power-endpoint` | a forwarding endpoint of `service-mgr`'s own; a session endpoint answers the suffix `NotFound` |
+| power session | any resolve on a power endpoint | any | a channel carrying [`Shutdown`](#shutdown-0x1103), and nothing else |
 
 Any other suffix is `NotFound`.
 
@@ -39,7 +42,9 @@ A table is minted fresh per resolve, as the device manager's and the storage ser
 **Who holds an admin endpoint decides who starts and stops.** `service-mgr` answers every request
 on an admin session. It gates one thing itself: an `essential` service's stop and restart
 ([`service-toml-schema.md`](service-toml-schema.md)). At most two admin endpoints and four admin
-sessions exist at once; one more is refused `WouldBlock`, and a closed one frees its slot.
+sessions exist at once, and one power endpoint and two power sessions; one more is refused
+`WouldBlock`, and a closed one frees its slot — before a new one is answered in the same wake, so a
+holder that lets one go and asks again at once is not refused (administration Part E.4b).
 
 ## Requests
 
@@ -98,3 +103,23 @@ running. Refused as those are, and `NoAccess` for an `essential` service whether
 not. Every binding of a restarted server's path reaches the new instance
 ([`service-manager.md`](../architecture/service-manager.md) § *Servers, and the registry*); a client
 holding a channel to the old one sees it close.
+
+### `Shutdown` (`0x1103`)
+
+*(Administration Part E.4b.)* **On a power session only**: shut the machine down, or reboot it. The
+body is one byte: `0` to halt, `1` to reboot (`SHUTDOWN_HALT`, `SHUTDOWN_REBOOT`). **Answered as
+soon as the shutdown has begun**, since nothing comes back after it; what follows is
+[`service-manager.md`](../architecture/service-manager.md) § *Shutdown*.
+
+A power session takes nothing else, and an admin session does not take this: who may shut the
+machine down is the `power` grant's to decide, and who may start and stop services is the
+`services` grant's.
+
+| Refusal | Why |
+|---|---|
+| `NoAccess` | on a power session, any other request; on an admin session, this one |
+| `InvalidArgument` | a body that is not one byte naming a halt or a reboot |
+| `WouldBlock` | a shutdown is already under way |
+
+**While a shutdown is under way** an admin session's every request is refused `WouldBlock`, and the
+requests already waiting are refused so: a restart's start in particular must not run.
