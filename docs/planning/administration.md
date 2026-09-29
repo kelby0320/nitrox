@@ -2106,7 +2106,7 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         [`power.md`](../architecture/power.md) is new. **The PR #342 review found `init` could
         still bind the object**, since a direct-handle bind asked for no right on the handle; a
         direct-handle bind needs `TRANSFER` since, for every object.)*
-- [ ] **E.4 — `shutdown`.**
+- [x] **E.4 — `shutdown`.** *(Complete 2026-09-29, in four parts.)*
       - The sequence: sessions, services in reverse order, the storage service's unmount of
         everything, `init`'s mounts, the power op.
       - *(In four parts, after the maintainer's call of 2026-09-29 that **every server and every
@@ -2125,6 +2125,12 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         leader (5 s), and both supervisors exit after the session, or at once from their prompt or
         greeter; `nxsh` exits from its prompt, or asks a running command's stages to stop and exits
         once they unwind; `desktop-shell` exits. Booted by hand through each gate that logs in.)*
+      - *(E.4d landed 2026-09-29, and with it E.4:* the `power` grant at `/dev/power`, the seeded
+        `power` view for everyone, `shutdown [--reboot]`, and `check-shutdown` in CI as drawn —
+        but its reboot half boots **a fresh copy**, since `boot-probe` does not run twice on one
+        filesystem, and asserts the second boot mounts its root clean. **Two power endpoints**:
+        every `admin` view makes the broker hold one for the boot. The clock half of the reboot is
+        E.5's.)*
       - The `power` grant, and the seeded policy's `power` view for everyone.
       - `shutdown [--reboot]`.
       - **`cargo xtask check-shutdown`**, in CI's QEMU job. It boots a `--selftest` disk image, and

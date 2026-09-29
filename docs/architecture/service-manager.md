@@ -268,15 +268,18 @@ binding reaches the new one then.
 
 **The wait set pays for it**: `/svc/services`' endpoint, a session endpoint, two admin endpoints
 and four admin sessions (`services::SLOTS`), which is what took `MAX_ROUTES` from 16 to 14 — and
-since Part E.4b a power endpoint and two power sessions, which took the starting servers' room
-(`registry::STARTING_ROOM`) from nine to six. Bring-up starts one server at a time.
+since Part E.4b two power endpoints and two power sessions, which took the starting servers' room
+(`registry::STARTING_ROOM`) from nine to five. Bring-up starts one server at a time. (One power
+endpoint until Part E.4d, when every `admin` view's `power` grant was found to make the view broker
+hold it for the boot.)
 
 ### Shutdown
 
 *(Administration Part E.4b, 2026-09-29.)* `/svc/services/power-endpoint` mints a **power endpoint**,
 on which any resolve opens a **power session** taking `Shutdown` alone
-([`rsproto-services-ops.md`](../spec/rsproto-services-ops.md)); the view broker's `power` grant is
-what binds one into a view (Part E.4d). A `Shutdown` is answered as soon as it begins, and then
+([`rsproto-services-ops.md`](../spec/rsproto-services-ops.md)); the view broker's `power` grant
+binds one at `/dev/power`, and `with power shutdown [--reboot]` asks there — anyone at the machine,
+with no password, in the seeded policy (Part E.4d). A `Shutdown` is answered as soon as it begins, and then
 `service-mgr` takes the machine down in `service_mgr::shutdown`'s order, each wait a deadline in
 the one loop:
 

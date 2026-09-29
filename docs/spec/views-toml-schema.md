@@ -12,10 +12,13 @@ syntax. A view is a profile's grants added to the caller's own namespace; see
 
 ```toml
 [profile.admin]
-grants = ["disks", "storage", "views", "accounts", "services"]
+grants = ["disks", "storage", "views", "accounts", "services", "power"]
 
 [profile.install]
 grants = ["disks"]
+
+[profile.power]
+grants = ["power"]
 
 [[rule]]
 who  = ["alice"]      # accounts that may ask, or ["*"] for any
@@ -28,6 +31,13 @@ who  = ["alice"]
 use  = ["install"]
 run  = ["nxinstall"]
 auth = "password"
+
+# The person at the machine may power it off, as with a desktop's power button.
+[[rule]]
+who  = ["*"]
+use  = ["power"]
+run  = ["shutdown"]
+auth = "none"
 ```
 
 ## Grammar
@@ -58,6 +68,7 @@ names its line.
 | `views` | the broker's policy endpoint at `/dev/policy`: reading this file and installing a new one, which `with --show` and `with --install` use ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `Show`, `Install`). **Not** `/system/views.toml` writable: an install is judged first, so a policy that leaves no administrator never reaches the disk | Part D.2 |
 | `accounts` | the broker's accounts endpoint at `/dev/accounts`: adding and removing accounts and setting their passwords ([`rsproto-views-ops.md`](rsproto-views-ops.md) § `AddAccount`, `RemoveAccount`, `SetPassword`). **Not** `/system/users` or `/home` writable: the broker checks the guards — a removal waits for logout and must leave an administrator — makes and removes homes, and asks `auth-service`, the file's only writer. Listing accounts and changing one's own password need no grant | Part D.3 |
 | `services` | `service-mgr`'s admin endpoint at `/dev/services/admin`: starting, stopping and restarting services ([`rsproto-services-ops.md`](rsproto-services-ops.md)). `service-mgr` refuses an `essential` service's stop and restart itself, whoever holds this. Listing the services needs no grant: every session's `/dev/services` is the table | Part E.2b |
+| `power` | `service-mgr`'s power endpoint at `/dev/power`: a session there takes `Shutdown`, to halt or reboot the machine, and nothing else ([`rsproto-services-ops.md`](rsproto-services-ops.md) § `Shutdown`). **The seeded policy gives it to everyone**, for `shutdown` alone and with no password, as a desktop's power button would; `admin` has it too | Part E.4d |
 
 Each later part of the administration phase adds its grant to this table.
 

@@ -3395,8 +3395,10 @@ fn services_test(root_ns: u64) -> bool {
 /// - `Shutdown` with no body, two bytes, or a byte that names neither halt nor reboot, refused
 ///   `InvalidArgument`;
 /// - `Shutdown` on an admin session, refused `NoAccess`;
-/// - a second power endpoint while the one is held, refused `WouldBlock`, and another taken at once
-///   once it is let go — which is `serve_services` answering closes before resolves.
+/// - a third power endpoint while two are held, refused `WouldBlock`, and another taken at once
+///   once one is let go — which is `serve_services` answering closes before resolves. **The view
+///   broker holds the first** by then: `view_broker_test` has had it build `admin` views, whose
+///   `power` grant takes one for the boot (administration Part E.4d).
 fn power_endpoint_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::services::{OP_SERVICES_SHUTDOWN, OP_SERVICES_START, SHUTDOWN_HALT, SHUTDOWN_REBOOT};
@@ -3460,7 +3462,7 @@ fn power_endpoint_test(root_ns: u64) -> bool {
         (ask(power, 4, OP_SERVICES_SHUTDOWN, &[2]), invalid, b"a shutdown naming neither halt nor reboot"),
         (ask(admin, 5, OP_SERVICES_SHUTDOWN, &[SHUTDOWN_HALT]), no_access, b"a shutdown on an admin session"),
     ];
-    // The one power endpoint is held by `power_ns`'s binding.
+    // Two power endpoints are held now: the broker's, and this probe's, by `power_ns`'s binding.
     let (second, extra) = ns_lookup(root_ns, b"/svc/services/power-endpoint", chan);
     close(extra);
     for h in [power, power_ns, admin, admin_ns] {
@@ -3475,12 +3477,12 @@ fn power_endpoint_test(root_ns: u64) -> bool {
         }
     }
     if second != KError::WouldBlock.as_i32() {
-        return fail(b"a second power endpoint was not refused while the one was held");
+        return fail(b"a third power endpoint was not refused while the broker's and this probe's were held");
     }
     if again != 0 || taken == 0 {
         return fail(b"no power endpoint at once after the one was let go");
     }
-    kprint(b"boot-probe: power endpoint refused a start, three malformed shutdowns and one on an admin session, and one endpoint at a time ok\n");
+    kprint(b"boot-probe: power endpoint refused a start, three malformed shutdowns and one on an admin session, and a third endpoint ok\n");
     true
 }
 

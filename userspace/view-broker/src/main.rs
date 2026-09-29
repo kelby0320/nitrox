@@ -178,6 +178,9 @@ struct Broker {
     /// `service-mgr`'s admin endpoint, which the `services` grant binds into a view (administration
     /// Part E.2b). **Resolved when first needed**, as the storage service's is; `0` until then.
     services_admin: u64,
+    /// `service-mgr`'s power endpoint, resolved on first need and bound into every view with the
+    /// `power` grant. There is one; the broker holds it for the boot.
+    power: u64,
     root_ns: u64,
     notif: u64,
     serve_end: u64,
@@ -316,6 +319,10 @@ const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
 const SERVICES_ADMIN: &[u8] = b"/svc/services/admin-endpoint";
 /// Where the `services` grant is bound in a view.
 const SERVICES_GRANT: &[u8] = b"/dev/services/admin";
+/// Where `service-mgr` mints a power endpoint (administration Part E.4d).
+const POWER_ENDPOINT: &[u8] = b"/svc/services/power-endpoint";
+/// Where the `power` grant is bound in a view.
+const POWER_GRANT: &[u8] = b"/dev/power";
 /// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
 /// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
@@ -364,6 +371,18 @@ impl Broker {
             );
         }
         self.services_admin
+    }
+
+    /// `service-mgr`'s power endpoint, resolved on first need. `0` if it could not be.
+    fn power_endpoint(&mut self) -> u64 {
+        if self.power == 0 {
+            self.power = ns_lookup(
+                self.root_ns,
+                POWER_ENDPOINT,
+                RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_TRANSFER,
+            );
+        }
+        self.power
     }
 
     /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
@@ -1251,6 +1270,21 @@ impl Broker {
                         return fail(self, &mut p, "service-mgr's admin endpoint is not there to grant");
                     }
                 }
+                // **Shutting down** (administration Part E.4d): `service-mgr`'s power endpoint at
+                // `/dev/power`. A session opened there takes `Shutdown` and nothing else.
+                Grant::Power => {
+                    let endpoint = self.power_endpoint();
+                    // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
+                    let bound = endpoint != 0
+                        && unsafe {
+                            let (p, l) = (POWER_GRANT.as_ptr() as u64, POWER_GRANT.len() as u64);
+                            syscall4(SYS_NS_BIND, view_ns, p, l, endpoint)
+                        } == 0;
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "service-mgr's power endpoint is not there to grant");
+                    }
+                }
                 // **Changing the policy** (administration Part D.2): the broker's own forwarding
                 // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
@@ -1523,6 +1557,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let mut b = Broker {
         storage: Storage::default(),
         services_admin: 0,
+        power: 0,
         root_ns,
         notif,
         serve_end,

@@ -284,6 +284,16 @@ jobs:
       - name: cargo xtask check-storage --kvm
         run: cargo xtask check-storage --kvm
 
+      # **A shutdown, with the host holding the result** (administration Part E.4d): a copy of the
+      # test disk, logged in on serial. A test program writes a pattern through a mapping and exits
+      # without a sync, and the host sees the file there without it; `with power shutdown`, with no
+      # password; the sessions and services stop when asked, `init` unmounts the root, and "It is
+      # now safe to turn off your computer." is read off COM1 and off the screen. With the machine
+      # stopped: `e2fsck -fn` clean, the superblock clean, and the file holding the pattern. Then a
+      # fresh copy runs `with power shutdown --reboot`, and the second boot mounts its root clean.
+      - name: cargo xtask check-shutdown --kvm
+        run: cargo xtask check-shutdown --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

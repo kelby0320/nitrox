@@ -31193,3 +31193,73 @@ is E.4d's `check-shutdown`**, which runs `with power shutdown` from a serial ses
 command path again.
 
 No kernel change and no ABI hash impact.
+
+## 2026-09-29 — Administration Part E.4d: `shutdown`, the `power` grant, and `check-shutdown`
+
+**E.4 is complete**: a person can stop the machine, and a gate proves what that leaves on the disk.
+
+**The `power` grant** binds `service-mgr`'s power endpoint at `/dev/power`. The broker resolves it
+on first need and holds it for the boot, as it holds the admin endpoint for `services`.
+
+**The seeded policy** gains a `power` profile and a rule letting anyone (`who = ["*"]`) run
+`shutdown` in it with `auth = "none"`. That is the maintainer's call from the detail pass: the
+person at the machine may power it off, as with a desktop's power button. `admin` gains `power` too.
+
+**`shutdown [--reboot]`** is a coreutil. It opens a power session at `/dev/power` and sends one
+`Shutdown`, which is answered as soon as the shutdown begins. It then says `shutdown: shutting down`
+(or `restarting`) on its terminal and the console, and exits. The broker's audit records the view
+it ran in. Without the grant, `/dev/power` is not there, and `shutdown` names `with power shutdown`.
+
+**Two power endpoints, not one.** E.4b allowed one, bound into every view. But `admin` grants
+`power`, so the first `admin` view the broker builds takes that endpoint for the rest of the boot.
+In a test image `boot-probe`'s view broker test builds `admin` views before its power test. So the
+test's own direct resolve was refused, found by the first `check-shutdown` run. The cap is two:
+- one for the broker to hold for the boot;
+- one for a client that resolves one directly.
+
+`boot-probe` now asserts that **a third** is refused while the broker's and its own are held, and
+that one is taken at once after it lets its own go. The E.4b control, a cap of two, becomes a cap of
+three, and fails the case. The starting servers' room goes from six to five.
+
+**`cargo xtask check-shutdown`**, in CI's QEMU job, is the second gate whose verdict is a disk. It
+boots two copies of a `--selftest` disk image, on serial.
+- **The halt:**
+  - Once `boot-probe`'s verdict is in, it logs in and has `test-pattern` write a pattern under
+    `/home` through a mapping, with no sync. The host reads the disk mid-run: the file is there
+    without the pattern, and the superblock says mounted.
+  - It runs `with power shutdown`, and asserts the sequence on COM1: the sessions ended when asked,
+    not after their bound; every service stopped but the test image's known clients (`nxterm`,
+    `ui-testclient`, `input-testclient`, `restart-probe`); and `init` unmounted `/` clean.
+  - It reads the message off COM1, and off **the screen**, as its last line, with `check-fbcon`'s
+    decoder.
+  - With the machine stopped, the host finds: `e2fsck -fn` clean, `s_state` clean, and the file
+    holding the pattern, read with `debugfs`.
+- **The reboot, on a fresh copy:**
+  - A fresh copy is needed because `boot-probe` does not run twice on one filesystem: its rename
+    test finds the first run's files, as the first attempt at this half found.
+  - It runs `with power shutdown --reboot`, and sees a reset through the FADT's register.
+  - The second boot's `init` must mount the root **without** `the filesystem was not cleanly
+    unmounted last time`. That is the reboot's own shutdown leaving it clean.
+
+**Waiting for `boot-probe` is load-bearing**, and the gate says why: a shutdown asked while
+`boot-probe` held its power endpoint would find the broker's one or none.
+
+**Controls**, each a KVM run of the gate against a deliberately broken build:
+- **A:** `init` skipping its unmounts on a reboot only. The halt half passes, and the second boot
+  finds the root not cleanly unmounted.
+- **B:** a halt writing no line to the screen. The screen's last line is `power: stopping every
+  processor, to halt`, and the gate fails there.
+- **C:** `nxsh` ignoring a terminate request while it runs `with`. `nxsh: asked to stop, exiting`
+  is missing.
+- **D:** `init` skipping `sys_ns_sync` before `Meta::Unmount`. **`e2fsck` and `s_state` both pass**,
+  since the filesystem is marked clean with the data never written, and the pattern check alone
+  fails. That is what the pattern check is for.
+
+**By hand, before the gate:** on the release image, driven on serial through a FIFO, `shutdown`
+without the grant was refused naming `with`, and `with power shutdown` stopped the machine through
+the whole sequence.
+
+Local timing: 80 s under TCG. The local gate set grows from 32 to 34 with `check-shutdown` and its
+`--kvm` run.
+
+No kernel change and no ABI hash impact.

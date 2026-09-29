@@ -206,9 +206,12 @@ pub mod services {
     pub const MAX_ADMIN_ENDPOINTS: usize = 2;
     /// Admin sessions open at once: a `service --stop` or `--restart` is one, briefly.
     pub const MAX_ADMIN_SESSIONS: usize = 4;
-    /// Power endpoints at once. The view broker asks for one the first time a view needs it, and
-    /// binds that one into every view with the grant.
-    pub const MAX_POWER_ENDPOINTS: usize = 1;
+    /// Power endpoints at once: **one the view broker holds for the boot**, asked for the first
+    /// time a view needs it — and every `admin` view does, since `admin` grants `power` — and bound
+    /// into every view with the grant; and a second for a client that resolves one directly, as
+    /// `boot-probe` does to test the refusals (administration Part E.4d, when one was found to be
+    /// the broker's before the probe ever asked).
+    pub const MAX_POWER_ENDPOINTS: usize = 2;
     /// Power sessions open at once: a `shutdown` is one, and a second can only be refused, since
     /// one shutdown is already enough.
     pub const MAX_POWER_SESSIONS: usize = 2;

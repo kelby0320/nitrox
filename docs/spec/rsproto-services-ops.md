@@ -4,8 +4,8 @@
 `all.tsm`, are implemented in `userspace/service-mgr/` and encoded by
 `userspace/librsproto/src/services.rs` (administration Part E.2a); the session endpoint every login
 binds at `/dev/services`, the view broker's `services` grant and `service` itself are Part E.2b's.
-The power endpoint and `Shutdown` are Part E.4b's (2026-09-29); the `power` grant that binds one
-into a view is E.4d's. The decisions — what each request does, and what refuses it — are `service_mgr::services`,
+The power endpoint and `Shutdown` are Part E.4b's (2026-09-29), and the `power` grant that binds
+one into a view, and `shutdown`, are E.4d's. The decisions — what each request does, and what refuses it — are `service_mgr::services`,
 host-tested. See [`service-manager.md`](../architecture/service-manager.md) for the manager, and
 [`administration.md`](../planning/administration.md) § *Part E in detail* for the design and its
 reasons.
@@ -42,7 +42,9 @@ A table is minted fresh per resolve, as the device manager's and the storage ser
 **Who holds an admin endpoint decides who starts and stops.** `service-mgr` answers every request
 on an admin session. It gates one thing itself: an `essential` service's stop and restart
 ([`service-toml-schema.md`](service-toml-schema.md)). At most two admin endpoints and four admin
-sessions exist at once, and one power endpoint and two power sessions; one more is refused
+sessions exist at once, and two power endpoints and two power sessions — the view broker holds one
+power endpoint for the boot, so a second is for a client that resolves one directly; one more is
+refused
 `WouldBlock`, and a closed one frees its slot — before a new one is answered in the same wake, so a
 holder that lets one go and asks again at once is not refused (administration Part E.4b).
 

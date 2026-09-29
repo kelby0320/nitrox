@@ -304,8 +304,8 @@ how, and what each suffix asks for where it arrives.
 - **A shutdown unmounts everything** (administration Part E.4). On `CTRL_OP_SHUTDOWN` this service
   runs the chain on every mount it made, last first and without the held check, then exits; `init`
   does the same for its own mounts on the terminal channel's `Finish`. `service-mgr`'s shutdown
-  sends both (Part E.4b). **Nothing a person can reach asks for one yet**: the `power` grant and
-  `shutdown` are Part E.4d's. Until then a machine turned off is left not clean, as before.
+  sends both (Part E.4b), when a person runs `with power shutdown` (Part E.4d). `check-shutdown`
+  gates it for `init`'s root. A machine turned off without one is still left not clean.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.

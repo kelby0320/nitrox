@@ -1,12 +1,12 @@
 # Power
 
-**Status: the kernel half built with administration Part E.3; last checked 2026-09-29, when a
-direct-handle bind came to need `TRANSFER` (PR #342 review).** The
+**Status: the kernel half built with administration Part E.3, and `shutdown` above it with Part
+E.4; last checked 2026-09-29, when `check-shutdown` came to gate a halt and a reboot.** The
 system-control object, `sys_power`'s halt and reboot, and the FADT facts a reset and the clock
-use. Not built: `shutdown`, and the sequence that stops the sessions, the services and the
-filesystems before `init` calls `sys_power` — administration Part E.4,
-[`administration.md`](../planning/administration.md). Nothing calls `sys_power` yet. Not built at
-all: power-off, which needs AML.
+use. A person asks with `with power shutdown [--reboot]`; `service-mgr` stops the sessions and the
+services, and `init` unmounts its filesystems and calls `sys_power`
+([`service-manager.md`](service-manager.md) § *Shutdown*). Not built at all: power-off, which needs
+AML.
 
 ## The system-control object
 
@@ -118,5 +118,8 @@ BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as 
     the run times out;
   - `boot-probe` binding a handle without `TRANSFER`, refused `NoAccess`, and one with it, taken.
 - **`cargo xtask check-report`**: the same `fadt:` lines, read off the live image's report.
-- **Not yet by a gate: a halt or a reset itself.** Administration Part E.4's `check-shutdown` will
-  boot one of each. E.3's were booted by hand, with a probe in `init`.
+- **`cargo xtask check-shutdown`** (administration Part E.4d), in CI: `with power shutdown` from a
+  serial session, the message read off COM1 and **off the screen**, and the disk checked on the
+  host after it; then `--reboot`, a reset through the FADT's register, and a second boot that
+  mounts its root clean. The 8042 and the triple fault, which q35 never reaches, were booted by
+  hand in E.3, each alone.

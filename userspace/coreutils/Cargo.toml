@@ -85,3 +85,8 @@ path = "src/bin/account.rs"
 [[bin]]
 name = "service"
 path = "src/bin/service.rs"
+
+# Stopping or restarting the machine (administration Part E.4d), through the `power` grant.
+[[bin]]
+name = "shutdown"
+path = "src/bin/shutdown.rs"
