@@ -4,40 +4,56 @@
 //! boot to establish an offset, and every later reading is
 //! `monotonic + offset`. That shape is deliberate.
 //!
-//! - **It cannot jump backwards.** The monotonic counter is the only thing
-//!   advancing, so timestamps taken in order are ordered, and code that
-//!   subtracts two realtime readings never sees a negative interval — the
-//!   classic hazard of sampling a RTC that a user or NTP can step.
+//! - **It moves only with the monotonic counter, until someone sets it.**
+//!   Between sets, timestamps taken in order are ordered. **A set steps it**,
+//!   backwards as readily as forwards (administration Part E.5): code that must
+//!   never see a negative interval subtracts `CLOCK_MONOTONIC` readings, which
+//!   nothing can step. Until E.5 this said the realtime clock "cannot jump
+//!   backwards", which was true only because nothing could set it.
 //! - **The RTC is slow and racy to read** (port I/O plus an update-in-progress
 //!   window; see `arch/rtc.rs`). Paying that once at boot rather than per
 //!   timestamp matters: the filesystem server stamps an inode on every create,
 //!   mkdir, and rename.
-//! - **Setting the clock becomes a single atomic store** to the offset, which
-//!   is what an NTP client or `date --set` will need. That path is deliberately
-//!   *not* built here: adjusting time-of-day is real authority (it moves every
-//!   future timestamp and, eventually, certificate validity), so it belongs
-//!   behind a syscap rather than being ambient. Reading is ambient — it is
+//! - **Setting the clock is a single atomic store** to the offset ([`set`],
+//!   `sys_clock_set`), then a write of the RTC, so the next boot anchors to
+//!   what was set. Adjusting time-of-day is real authority (it moves every
+//!   future timestamp and, eventually, certificate validity), so it needs
+//!   `SYSTEM_CLOCK` rather than being ambient. Reading is ambient — it is
 //!   information you cannot act on, and `CLOCK_MONOTONIC` already is.
 //!   See the decision log, 2026-07-24.
 //!
 //! If the RTC cannot be read (no such device, or it reports an implausible
-//! date), the clock stays **unset** and `CLOCK_REALTIME` keeps returning
-//! `Unsupported` rather than inventing an epoch — a filesystem stamping 1970 on
-//! every file is at least honestly wrong, where a fabricated "plausible" time
-//! is silently wrong.
+//! date), the clock stays **unset** until something sets it, and
+//! `CLOCK_REALTIME` keeps returning `Unsupported` rather than inventing an
+//! epoch — a filesystem stamping 1970 on every file is at least honestly
+//! wrong, where a fabricated "plausible" time is silently wrong.
 
 use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crate::arch::Timer;
 use crate::arch::timer::ArchTimer;
+use crate::libkern::SpinLock;
+use crate::libkern::lockrank::LockRank;
 
 /// `realtime_ns = monotonic_ns + OFFSET_NS`. Meaningful only while [`IS_SET`].
 static OFFSET_NS: AtomicI64 = AtomicI64::new(0);
-/// Whether [`init`] found a usable wall clock.
+/// Whether the wall clock is anchored: by [`init`], from the RTC, or by [`set`].
 static IS_SET: AtomicBool = AtomicBool::new(false);
 
 /// Nanoseconds per second.
 const NS_PER_SEC: i64 = 1_000_000_000;
+
+/// The first second the clock may be set to: 2000-01-01T00:00:00Z.
+const SETTABLE_FROM_SECS: i64 = 946_684_800;
+/// The first second it may not: 2100-01-01T00:00:00Z. The RTC holds a two-digit year, read as
+/// 2000–2099 on a machine whose FADT names no century register, so a later time would read back
+/// as another century at the next boot.
+const SETTABLE_UNTIL_SECS: i64 = 4_102_444_800;
+
+/// Serializes [`set`]: the offset and the RTC must be written by one caller at a time, or two sets
+/// could leave the running clock at one and the chip at the other — and the RTC's index/data port
+/// pair interleaved.
+static SETTING: SpinLock<()> = SpinLock::new(LockRank::Leaf, ());
 
 /// Anchor the wall clock from the hardware RTC. Called once during boot, after
 /// the monotonic timer is up. Returns the epoch seconds it anchored to, or
@@ -50,6 +66,30 @@ pub fn init() -> Option<i64> {
     // the clock as set also sees the offset it was set with.
     IS_SET.store(true, Ordering::Release);
     Some(epoch_secs)
+}
+
+/// **Whether `ns` is a time the clock may be set to**, as whole seconds since the epoch: from
+/// 2000-01-01 to the end of 2099, which is what the RTC holds on every machine (administration Part
+/// E.5). A pure function, so `sys_clock_set`'s refusal is host-tested.
+pub fn settable(ns: u64) -> Option<i64> {
+    let secs = i64::try_from(ns / NS_PER_SEC as u64).ok()?;
+    (SETTABLE_FROM_SECS..SETTABLE_UNTIL_SECS).contains(&secs).then_some(secs)
+}
+
+/// **Set the wall clock** to `ns` since the epoch, and write it to the RTC (administration Part
+/// E.5). Returns whether the RTC holds it: `false` means the clock is set until the next boot,
+/// which anchors to whatever the chip still says. The caller has checked [`settable`] and
+/// `SYSTEM_CLOCK`.
+///
+/// **It steps the clock**, backwards as readily as forwards (see the module docs), and anchors
+/// one that never was: a machine whose RTC could not be read at boot has a wall clock from here.
+pub fn set(ns: u64) -> bool {
+    let _setting = SETTING.lock();
+    // The offset first, from the counter as it reads now: the RTC's write and read-back take a
+    // millisecond or more, and should not be charged to the time that was asked for.
+    OFFSET_NS.store(ns as i64 - Timer::read_ns() as i64, Ordering::Relaxed);
+    IS_SET.store(true, Ordering::Release);
+    crate::arch::set_wall_clock_seconds((ns / NS_PER_SEC as u64) as i64)
 }
 
 /// Current wall-clock time in nanoseconds since the Unix epoch, or `None` if
@@ -105,6 +145,21 @@ mod tests {
         assert_eq!((-1i64).div_euclid(NS_PER_SEC), -1);
         assert_eq!((NS_PER_SEC - 1).div_euclid(NS_PER_SEC), 0);
         assert_eq!((-NS_PER_SEC).div_euclid(NS_PER_SEC), -1);
+    }
+
+    /// **The times a set may ask for**: 2000-01-01T00:00:00Z to 2099-12-31T23:59:59Z, and a
+    /// fraction of a second inside either end — each bound tested at its neighbour.
+    #[test]
+    fn settable_is_the_rtcs_century() {
+        let ns = |secs: i64| secs as u64 * NS_PER_SEC as u64;
+        assert_eq!(settable(ns(SETTABLE_FROM_SECS)), Some(946_684_800));
+        assert_eq!(settable(ns(SETTABLE_FROM_SECS) - 1), None);
+        assert_eq!(settable(ns(SETTABLE_UNTIL_SECS) - 1), Some(4_102_444_799));
+        assert_eq!(settable(ns(SETTABLE_UNTIL_SECS)), None);
+        // 2026-09-28T14:30:00.5Z is its whole second.
+        assert_eq!(settable(ns(1_790_605_800) + 500_000_000), Some(1_790_605_800));
+        assert_eq!(settable(0), None);
+        assert_eq!(settable(u64::MAX), None);
     }
 
     #[test]

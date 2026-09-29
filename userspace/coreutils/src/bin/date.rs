@@ -1,12 +1,13 @@
-//! `date` — report the wall-clock time.
+//! `date` — report the wall-clock time, or set it.
 //!
-//! Milestone 2 Part D. Almost all of this utility is calendar arithmetic, which lives in
-//! [`coreutils::time`] and is tested on the host; what remains here is one syscall and
-//! the choice of what to publish.
+//! Milestone 2 Part D, and `--set` administration Part E.5. Almost all of this utility is
+//! calendar arithmetic, which lives in [`coreutils::time`] and is tested on the host; what
+//! remains here is a syscall or two and the choice of what to publish.
 //!
 //! ```text
-//! date            # the current time
-//! date --unix     # …as a bare epoch value, for arithmetic
+//! date                                       # the current time
+//! date --unix                                # …as a bare epoch value, for arithmetic
+//! with admin date --set 2026-09-28T14:30:00Z # set it, and the machine's hardware clock
 //! ```
 //!
 //! ## Deliberate behaviours
@@ -21,6 +22,11 @@
 //! - **An unset clock is an error, not a zero.** `CLOCK_REALTIME` reports `Unsupported`
 //!   on a machine whose RTC could not be read rather than inventing an epoch, and this
 //!   passes that through instead of printing 1970 as though it were true.
+//! - **`--set` takes one form, in UTC**: `YYYY-MM-DDTHH:MM:SSZ` ([`coreutils::time::parse_utc`]),
+//!   from 2000 to 2099, which is what the hardware clock holds. It needs the `clock` grant — the
+//!   kernel's `SYSTEM_CLOCK`, given at spawn — and then reports the time as `date` does, so what
+//!   it prints is the clock read after the set. A hardware clock that did not take the time is
+//!   said, since the time then lasts until the next boot.
 
 #![no_std]
 #![no_main]
@@ -29,9 +35,10 @@ extern crate alloc;
 
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use coreutils::time::{civil_from_unix, format_civil};
-use libkern::abi::{CLOCK_REALTIME, IPC_PAYLOAD_SIZE};
-use libkern::syscall::{SYS_CLOCK_READ, syscall2};
+use coreutils::time::{civil_from_unix, format_civil, parse_utc};
+use libkern::abi::{CLOCK_REALTIME, CLOCK_SET_THIS_BOOT, IPC_PAYLOAD_SIZE};
+use libkern::error::KError;
+use libkern::syscall::{SYS_CLOCK_READ, SYS_CLOCK_SET, syscall2};
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
@@ -45,14 +52,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 static mut CLOCK_BUF: u64 = 0;
 
 const UNIX: Flag = Flag::new("unix", 'u', "report the bare epoch value only");
+const SET: Flag = Flag::long_only("set", "set the clock to TIME, in UTC (needs the clock grant)");
 
 const HELP: &[u8] = b"usage: date [--unix]\n\
+    \x20      date --set TIME [--unix]\n\
     \n\
     Report the current wall-clock time (UTC).\n\
     Emits Table<{unix: Int, year: Int, month: Int, day: Int,\n\
                  hour: Int, minute: Int, second: Int}> on stdout.\n\
     \n\
+    With --set, first set the clock, and the machine's hardware clock, to TIME: UTC, as\n\
+    2026-09-28T14:30:00Z, from 2000 to 2099. That needs the clock grant:\n\
+    `with admin date --set TIME`.\n\
+    \n\
       -u, --unix    report the bare epoch value only\n\
+          --set     set the clock to TIME first (needs the clock grant)\n\
           --help    show this help and exit\n\
           --version show version information and exit\n";
 
@@ -62,7 +76,7 @@ const VERSION: &[u8] = b"date (nitrox coreutils) 0.1.0\n";
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let stage = Stage::enter(notif, ns, endpoint, arg0);
 
-    let args = match parse(&stage.argv, &[UNIX]) {
+    let args = match parse(&stage.argv, &[UNIX, SET]) {
         Ok(a) => a,
         Err(_) => stage.die(b"date: unrecognized option (try --help)\n", EXIT_USAGE),
     };
@@ -74,7 +88,13 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.diag(VERSION);
         exit(EXIT_OK);
     }
-    if !args.operands.is_empty() {
+    if args.has("set") {
+        let [time] = args.operands.as_slice() else {
+            let why = b"date: --set takes one TIME, as 2026-09-28T14:30:00Z (try --help)\n";
+            stage.die(why, EXIT_USAGE);
+        };
+        set(&stage, time);
+    } else if !args.operands.is_empty() {
         stage.die(b"date: takes no operands (try --help)\n", EXIT_USAGE);
     }
 
@@ -106,6 +126,37 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         }
     }
     exit(EXIT_OK)
+}
+
+/// **Set the clock to `time`** (administration Part E.5), or die saying why not. Returns once the
+/// clock is set, whether or not the hardware clock took it — which is said when it did not.
+fn set(stage: &Stage, time: &str) {
+    let Some(secs) = parse_utc(time) else {
+        stage.die(b"date: TIME is UTC, as 2026-09-28T14:30:00Z\n", EXIT_USAGE);
+    };
+    // `parse_utc` reads four digits of year, so a time before 1970 is the only negative, and the
+    // kernel refuses it with everything else outside 2000-2099.
+    let ns = u64::try_from(secs).unwrap_or(0).saturating_mul(1_000_000_000);
+    // SAFETY: no pointers; the kernel checks the clock, the time and `SYSTEM_CLOCK`.
+    let r = unsafe { syscall2(SYS_CLOCK_SET, CLOCK_REALTIME, ns) };
+    if r == KError::NoAccess.as_i32() as i64 {
+        stage.die(
+            b"date: cannot set the clock here -- that needs the clock grant: `with admin date --set ...`\n",
+            EXIT_FAILURE,
+        );
+    }
+    if r == KError::InvalidArgument.as_i32() as i64 {
+        stage.die(b"date: the clock can be set to a time from 2000 to 2099\n", EXIT_FAILURE);
+    }
+    if r < 0 {
+        stage.die(b"date: the clock was not set\n", EXIT_FAILURE);
+    }
+    if r as u64 == CLOCK_SET_THIS_BOOT {
+        stage.diag(
+            b"date: the clock is set, but the hardware clock would not take it: it lasts until the \
+              next boot\n",
+        );
+    }
 }
 
 /// Write the single row as a TSM1 table on the `stdout` stream.

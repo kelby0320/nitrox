@@ -43,7 +43,7 @@ pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;
 pub use syscall::*;
-pub use syscaps::{SYSCAP_BIND_NAMESPACE, SYSCAP_REAL_TIME, SysCaps};
+pub use syscaps::{SYSCAP_BIND_NAMESPACE, SYSCAP_REAL_TIME, SYSCAP_SYSTEM_CLOCK, SysCaps};
 
 /// Zero `bytes` where they lie — a password, once it has been used.
 ///

@@ -91,14 +91,16 @@ it. A revision-1 FADT ends at byte 116, before the reset register:
 
 | Offset | Field | Used for |
 |---|---|---|
-| 108 | `CENTURY` — the RTC's century register, 0 for none | the wall clock's century |
+| 108 | `CENTURY` — the RTC's century register, 0 for none | the wall clock's century, read at boot and written by a set (Part E.5) |
 | 109 | `IAPC_BOOT_ARCH` — bit 1, an 8042 | the report |
 | 112 | `Flags` — bit 10, `RESET_REG_SUP` | whether the reset register counts |
 | 116, 128 | `RESET_REG` (a Generic Address Structure) and `RESET_VALUE` | the first way to reset |
 
 The hardware report prints them as four `fadt:` lines, so the laptop's report says whether it can
 reset by register. The RTC reads the century register when the FADT names one, in the chip's own
-BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as before.
+BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as before. **A set writes
+it** (`sys_clock_set`, Part E.5), in the same encoding — which is why a set is refused outside
+2000–2099: a machine with no century register would read a later year back as another century.
 
 ## What gates it
 
@@ -120,6 +122,7 @@ BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as 
 - **`cargo xtask check-report`**: the same `fadt:` lines, read off the live image's report.
 - **`cargo xtask check-shutdown`** (administration Part E.4d), in CI: `with power shutdown` from a
   serial session, the message read off COM1 and **off the screen**, and the disk checked on the
-  host after it; then `--reboot`, a reset through the FADT's register, and a second boot that
-  mounts its root clean. The 8042 and the triple fault, which q35 never reaches, were booted by
-  hand in E.3, each alone.
+  host after it; then the clock set to 2031, `--reboot`, a reset through the FADT's register, and
+  a second boot that anchors its clock to the time set (Part E.5: QEMU keeps the RTC across a
+  guest reset) and mounts its root clean. The 8042 and the triple fault, which q35 never reaches,
+  were booted by hand in E.3, each alone.

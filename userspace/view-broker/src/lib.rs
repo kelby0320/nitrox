@@ -68,6 +68,11 @@ pub mod policy {
         /// nothing else. The seeded policy gives it to everyone, for `shutdown` only, as a
         /// desktop's power button would.
         Power,
+        /// **Setting the clock**: `SYSTEM_CLOCK` in the program's spawn, which `sys_clock_set`
+        /// asks for (administration Part E.5). The one grant that binds nothing — the kernel
+        /// checks a process-wide capability here, not a handle — so the program's children get it
+        /// only if it passes it on.
+        Clock,
     }
 
     impl Grant {
@@ -80,6 +85,7 @@ pub mod policy {
                 "accounts" => Some(Grant::Accounts),
                 "services" => Some(Grant::Services),
                 "power" => Some(Grant::Power),
+                "clock" => Some(Grant::Clock),
                 _ => None,
             }
         }
@@ -93,13 +99,21 @@ pub mod policy {
                 Grant::Accounts => "accounts",
                 Grant::Services => "services",
                 Grant::Power => "power",
+                Grant::Clock => "clock",
             }
         }
     }
 
     /// Every grant this broker knows, for the message that refuses one it does not.
-    pub const KNOWN_GRANTS: &[Grant] =
-        &[Grant::Disks, Grant::Storage, Grant::Views, Grant::Accounts, Grant::Services, Grant::Power];
+    pub const KNOWN_GRANTS: &[Grant] = &[
+        Grant::Disks,
+        Grant::Storage,
+        Grant::Views,
+        Grant::Accounts,
+        Grant::Services,
+        Grant::Power,
+        Grant::Clock,
+    ];
 
     /// A profile: a named set of grants. A request names one as its view.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1048,6 +1062,9 @@ auth = "password"
         assert_eq!(Grant::from_name("power"), Some(Grant::Power));
         assert_eq!(Grant::Power.name(), "power");
         assert!(KNOWN_GRANTS.contains(&Grant::Power));
+        assert_eq!(Grant::from_name("clock"), Some(Grant::Clock));
+        assert_eq!(Grant::Clock.name(), "clock");
+        assert!(KNOWN_GRANTS.contains(&Grant::Clock));
         let e = parse("[profile.admin]\ngrants = [\"teleport\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
         // And `views` (administration Part D.2).

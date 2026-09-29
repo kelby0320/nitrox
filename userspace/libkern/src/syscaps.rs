@@ -64,6 +64,8 @@ impl SysCaps {
 pub const SYSCAP_BIND_NAMESPACE: u64 = SysCaps::BIND_NAMESPACE.bits();
 /// `u64` alias for `REAL_TIME`.
 pub const SYSCAP_REAL_TIME: u64 = SysCaps::REAL_TIME.bits();
+/// `u64` alias for `SYSTEM_CLOCK`: `sys_clock_set`'s authority (administration Part E.5).
+pub const SYSCAP_SYSTEM_CLOCK: u64 = SysCaps::SYSTEM_CLOCK.bits();
 
 impl BitOr for SysCaps {
     type Output = SysCaps;

@@ -1292,7 +1292,7 @@ it applies rather than either camp uninspected:**
 | `mkdir` | path | Creates a directory. `--parents` creates intermediate directories. |
 | `touch` | path | Creates an empty file if absent; updates modified-time if present (§10c). |
 | `rename` | path, bare new name | Renames within the source's existing directory only; a path separator in the target argument is a fail-loud error (§10c). |
-| `date` | — (optional format spec) | Emits current date/time as a structured value. |
+| `date` | the wall clock | Emits `Table<{unix, year, month, day, hour, minute, second}>`, one row, in UTC; `--unix` narrows it to `unix`. No format spec: there is no timezone database or locale behind one. `--set TIME` first sets the clock and the machine's hardware clock to `TIME` — UTC, exactly as `2026-09-28T14:30:00Z`, from 2000 to 2099 — which needs the `clock` grant (`with admin date --set …`), and then emits the time as read after the set; a hardware clock that did not take the time is said on stderr, since it then lasts until the next boot (administration Part E.5). |
 | `sleep` | duration | Suspends the calling pipeline stage for the given duration; not schema-producing. |
 | `whoami` | — | Emits current user identity as a value. |
 | `disk` | block devices and mounted filesystems | `--list` emits the storage service's `Table<{name, kind, size, filesystem, label, mounted, by, mode, clean}>`, from any session. `--mount DEVICE [LABEL]` and `--unmount LABEL` each emit a one-row table, and need the view broker's `storage` grant: without it they fail naming `with` (administration Part C.7, [`storage.md`](../architecture/storage.md)). |

@@ -202,7 +202,12 @@ static mut SPAWN: SpawnArgs = SpawnArgs {
     handles: [0; SPAWN_MAX_HANDLES],
     rights: [u64::MAX; SPAWN_MAX_HANDLES],
     namespace: 0,
-    syscaps: 0,
+    // **Whatever this shell holds, passed on**, which the kernel intersects with its own (child =
+    // parent & asked): nothing in a session, and `SYSTEM_CLOCK` in a view with the `clock` grant
+    // (administration Part E.5). A view's bindings reach every stage through the namespace, and
+    // this is how its one capability does too, so `with admin nxsh` is a shell whose `date --set`
+    // works. Everything that spawns `nxsh` gives it nothing else.
+    syscaps: u64::MAX,
 };
 
 /// The real host: syscalls, pipes, spawns.

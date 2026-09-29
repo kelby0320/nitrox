@@ -835,6 +835,49 @@ fn power_refused_test(root_ns: u64) -> bool {
     true
 }
 
+// === setting the clock, without SYSTEM_CLOCK (administration Part E.5) ===========================
+
+/// **`sys_clock_set` is refused without `SYSTEM_CLOCK`**, which this process does not hold, and
+/// the clock does not move: a set to 2031 refused `NoAccess`, and the clock read either side of it
+/// within a minute of itself. Before the authority, the arguments: `Monotonic` never steps, and
+/// 1999 is before what the hardware clock holds — both `InvalidArgument`.
+fn clock_set_refused_test() -> bool {
+    use libkern::{CLOCK_MONOTONIC, CLOCK_REALTIME, KError, SYS_CLOCK_READ, SYS_CLOCK_SET};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: clock FAIL: ").s(why).end();
+        false
+    };
+    let read = || {
+        let mut ns = 0u64;
+        // SAFETY: a valid `u64` out-param on this stack.
+        let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut ns) as u64) };
+        (r == 0).then_some(ns)
+    };
+    let set = |clock: u64, secs: u64| {
+        // SAFETY: register-only syscall.
+        unsafe { syscall2(SYS_CLOCK_SET, clock, secs * 1_000_000_000) }
+    };
+    let in_2031 = 1_925_078_400; // 2031-01-02T00:00:00Z
+    if set(CLOCK_MONOTONIC, in_2031) != KError::InvalidArgument.as_i32() as i64 {
+        return fail(b"setting the monotonic clock was not refused InvalidArgument");
+    }
+    if set(CLOCK_REALTIME, 946_684_799) != KError::InvalidArgument.as_i32() as i64 {
+        return fail(b"a time in 1999 was not refused InvalidArgument");
+    }
+    let before = read();
+    if set(CLOCK_REALTIME, in_2031) != KError::NoAccess.as_i32() as i64 {
+        return fail(b"a set without SYSTEM_CLOCK was not refused NoAccess");
+    }
+    let (Some(before), Some(after)) = (before, read()) else {
+        return fail(b"the wall clock does not read");
+    };
+    if after < before || after - before > 60_000_000_000 {
+        return fail(b"the wall clock moved across a refused set");
+    }
+    kprint(b"boot-probe: sys_clock_set refused the monotonic clock, 1999 and no SYSTEM_CLOCK ok\n");
+    true
+}
+
 /// **A direct-handle bind needs `TRANSFER`** (PR #342 review), since every resolve of the binding
 /// mints a handle to the object for whoever asked. Without it, `init` could publish its
 /// system-control object, whose handle carries no `TRANSFER` so that it cannot leave `init`.
@@ -1450,6 +1493,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)
         & power_refused_test(root_ns)
+        & clock_set_refused_test()
         & bind_needs_transfer_test()
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)

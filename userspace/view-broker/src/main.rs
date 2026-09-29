@@ -2,7 +2,9 @@
 //! when `/system/views.toml` says the caller may (`docs/planning/administration.md` § Part A).
 //!
 //! **What it holds, and so what a bug here reaches.** It is spawned by `service-mgr` with
-//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and it inherits the
+//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and `SYSTEM_CLOCK`,
+//! which it never uses and passes to a program only for the `clock` grant (administration Part
+//! E.5) — a capability can be given at spawn only by a parent that holds it. It inherits the
 //! root namespace, which is where the grants come from: every block device, for `disks`. **And the
 //! root filesystem**, through which it reads `/system/views.toml`, replaces it since Part D.2, and
 //! makes and removes `/home/<name>` for the accounts it fronts since Part D.3. It never holds a
@@ -1226,6 +1228,7 @@ impl Broker {
             return fail(self, &mut p, "could not copy the caller's namespace");
         }
         let view_ns = view_ns as u64;
+        let mut syscaps = 0;
         for g in &p.grants {
             match g {
                 // **Every disk not in use** (administration Part C.6): a mounted filesystem's
@@ -1285,6 +1288,9 @@ impl Broker {
                         return fail(self, &mut p, "service-mgr's power endpoint is not there to grant");
                     }
                 }
+                // **Setting the clock** (administration Part E.5): `SYSTEM_CLOCK` in the spawn
+                // below, which the kernel intersects with the broker's own. Binds nothing.
+                Grant::Clock => syscaps |= SYSCAP_SYSTEM_CLOCK,
                 // **Changing the policy** (administration Part D.2): the broker's own forwarding
                 // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
@@ -1329,7 +1335,9 @@ impl Broker {
             // (`TODO(child-exit-attribution)`, as `service-mgr` does it).
             SPAWN.handles[1] = life_child;
             SPAWN.namespace = view_ns;
-            SPAWN.syscaps = 0;
+            // **No ambient authority but what a grant says**: `SYSTEM_CLOCK` for `clock`, and
+            // nothing otherwise.
+            SPAWN.syscaps = syscaps;
             SPAWN.arg0 = bootstrap_arg0(true);
             syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
         };

@@ -294,17 +294,26 @@ const _: () = assert!(align_of::<IpcMsg>() == 4096);
 const _: () = assert!(offset_of!(IpcMsg, payload) == 24);
 const _: () = assert!(offset_of!(IpcMsg, handles) == 4032);
 
-// --- sys_clock_read --------------------------------------------------------
+// --- sys_clock_read and sys_clock_set ---------------------------------------
 
-/// `ClockId::Monotonic` — nanoseconds since boot, never decreasing.
+/// `ClockId::Monotonic` — nanoseconds since boot, never decreasing, and never set.
 pub const CLOCK_MONOTONIC: u64 = 0;
 
 /// `ClockId::Realtime` — nanoseconds since the Unix epoch (UTC).
 ///
-/// Derived as monotonic + a boot-time offset anchored from the hardware RTC, so it
-/// advances smoothly and never steps backwards. Returns `Unsupported` on a machine
-/// whose RTC could not be read rather than reporting a fabricated epoch.
+/// Derived as monotonic + an offset anchored from the hardware RTC at boot, so it advances
+/// smoothly — **until someone sets it**: `sys_clock_set` steps it, backwards as readily as
+/// forwards (administration Part E.5), so an interval is measured on [`CLOCK_MONOTONIC`]. Returns
+/// `Unsupported` on a machine whose RTC could not be read, until it is set, rather than reporting
+/// a fabricated epoch.
 pub const CLOCK_REALTIME: u64 = 1;
+
+/// `sys_clock_set` set the clock, and the machine's hardware clock holds it: the next boot anchors
+/// to it.
+pub const CLOCK_SET_KEPT: u64 = 0;
+/// `sys_clock_set` set the clock, but the hardware clock did not take the time — there is none,
+/// or it did not read back — so it lasts until the next boot.
+pub const CLOCK_SET_THIS_BOOT: u64 = 1;
 
 // --- sys_wait completion record --------------------------------------------
 

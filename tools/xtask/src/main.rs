@@ -2301,6 +2301,40 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 20g. **`date --set`, and the clock it leaves** (administration Part E.5).
+    //      (a) **Refused without the grant**, by the kernel: `SYSTEM_CLOCK` is a capability given
+    //          at spawn, and a session's programs are spawned without it.
+    s.send("date --set 2031-01-02T00:00:00Z")?;
+    s.expect("needs the clock grant")?;
+    s.expect("/home>")?;
+    //      (b) **Set through the `clock` grant**: the kernel says the RTC took it, and `date`
+    //          reports the clock as it reads after. The epoch value is matched, since the typed
+    //          command holds the date and would satisfy a match on it.
+    s.send("with admin date --set 2031-01-02T00:00:00Z --unix")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("wall clock: set to 1925078400 (Unix epoch seconds, UTC); the RTC holds it")?;
+    s.expect("1925078")?;
+    s.expect("/home>")?;
+    //      (c) **And another program reads it**, outside the view: the kernel's clock, not the
+    //          view's.
+    s.send("date --unix")?;
+    s.expect("1925078")?;
+    s.expect("/home>")?;
+    //      (d) **A shell in the view passes it on**: `nxsh` spawns its stages with what it holds,
+    //          so `date --set` works in `with admin nxsh` as the view's bindings do. A day later,
+    //          so the kernel's line is this set's and not (b)'s.
+    s.send("with admin nxsh")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("date --set 2031-01-03T00:00:00Z --unix")?;
+    s.expect("wall clock: set to 1925164800 (Unix epoch seconds, UTC); the RTC holds it")?;
+    s.expect("/home>")?;
+    s.send("exit")?;
+    s.expect("/home>")?;
+    steps += 1;
+
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     //
@@ -4306,9 +4340,11 @@ const SHUTDOWN_UNHONOURED: &[&str] = &["nxterm", "ui-testclient", "input-testcli
 /// recording a clean unmount, and the file holding the pattern, read with `debugfs`.
 ///
 /// **The reboot.** A fresh copy of the disk, since `boot-probe` is not one to run twice on the same
-/// filesystem; `with power shutdown --reboot`, a reset through the FADT's register, and QEMU is
-/// watched through a second boot — whose `init` must mount the root **without** finding it not
-/// cleanly unmounted, which is the reboot's own shutdown leaving it clean.
+/// filesystem; `with admin date --set` to 2031, then `with power shutdown --reboot`, a reset
+/// through the FADT's register, and QEMU is watched through a second boot — which must **anchor its
+/// clock to the time set**, read back from the RTC the set wrote (administration Part E.5), and
+/// whose `init` must mount the root **without** finding it not cleanly unmounted, which is the
+/// reboot's own shutdown leaving it clean.
 ///
 /// **Only after `boot-probe`'s verdict.** The power endpoint is one, and `boot-probe` takes and
 /// lets go of it to test its refusals; a shutdown asked in the meantime would find the broker
@@ -4530,15 +4566,48 @@ fn check_shutdown_sequence(transcript: &str) -> R<()> {
     Ok(())
 }
 
-/// The reboot: `with power shutdown --reboot` resets through the FADT's register, and the second
-/// boot's `init` mounts the root without finding it not cleanly unmounted.
+/// The time the reboot half sets before it restarts: 2031-01-02T00:00:00Z, years from any host's
+/// clock, so a second boot that anchored to the host's time rather than the one written is plain.
+const SHUTDOWN_SET_CLOCK: (&str, i64) = ("2031-01-02T00:00:00Z", 1_925_078_400);
+
+/// How far past [`SHUTDOWN_SET_CLOCK`] the second boot may anchor: the seconds the reboot took,
+/// since QEMU's RTC goes on counting, with room for a slow TCG host. A clock that did not survive
+/// is five years out.
+const SHUTDOWN_CLOCK_SLACK_SECS: i64 = 600;
+
+/// The reboot: the clock set with `with admin date --set`, then `with power shutdown --reboot`
+/// resets through the FADT's register. The second boot anchors its clock to the time that was set
+/// — the RTC's write-back, across a reset (administration Part E.5) — and its `init` mounts the
+/// root without finding it not cleanly unmounted.
 fn run_shutdown_reboot(s: &mut Session) -> R<()> {
     s.expect("init: up (pid 1)")?;
     shutdown_login(s)?;
+    let (time, epoch) = SHUTDOWN_SET_CLOCK;
+    s.send(&format!("with admin date --set {time} --unix"))?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect(&format!("wall clock: set to {epoch} (Unix epoch seconds, UTC); the RTC holds it"))?;
+    s.expect("/home>")?;
     s.send("with power shutdown --reboot")?;
     s.expect("shutdown: restarting")?;
     s.expect("power: resetting through the FADT's reset register")?;
     let reset_at = s.transcript().len();
+    s.expect("wall clock: anchored at ")?;
+    let anchored = s.rest_of_line()?;
+    let secs: i64 = anchored
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("the second boot's clock line did not read: `{anchored}`"))?;
+    if !(epoch..=epoch + SHUTDOWN_CLOCK_SLACK_SECS).contains(&secs) {
+        let slack = SHUTDOWN_CLOCK_SLACK_SECS;
+        return Err(format!(
+            "the second boot anchored its clock at {secs}, not within {slack} s after the {epoch} \
+             set before the reboot: the RTC did not keep the time written to it"
+        )
+        .into());
+    }
+    println!("  ok: the clock set before the reboot is the one the second boot anchored to: {secs}");
     s.expect("init: up (pid 1)")?;
     s.expect("init: mounted fs-server-ext4 at /")?;
     let after = s.transcript()[reset_at..].to_string();
@@ -13042,6 +13111,16 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
+    // What `sys_clock_set` says (administration Part E.5): the clock set and kept by the RTC, or
+    // set for this boot only. The kernel's `u64` consts in `clock.rs` are these alone; `libkern`
+    // keeps them beside `CLOCK_REALTIME`.
+    AbiFamily {
+        what: "clock-set results",
+        kernel_file: "kernel/src/libkern/clock.rs",
+        user_file: "userspace/libkern/src/abi.rs",
+        shape: AbiShape::U64Const,
+        one_sided: &[],
+    },
 ];
 
 /// Individually-named constants that mirror across the boundary under *different* names or
@@ -15059,7 +15138,9 @@ executable = \"/bin/view-broker\"\n\
 description = \"Views, and the policy and accounts it fronts\"\n\
 endpoint = \"/svc/views\"\n\
 essential = true\n\
-syscaps = [\"BIND_NAMESPACE\"]\n\
+# `SYSTEM_CLOCK` only to give it: the `clock` grant is that capability at a program's spawn, and\n\
+# a parent passes on only what it holds (administration Part E.5).\n\
+syscaps = [\"BIND_NAMESPACE\", \"SYSTEM_CLOCK\"]\n\
 \n\
 [service.view-broker.restart]\n\
 policy = \"never\"\n\
@@ -15457,7 +15538,7 @@ fn seeded_views_toml() -> String {
          # Seeded by the build; an installed system's comes from the installer.\n\
          \n\
          [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\"]\n\
+         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\"]\n\
          \n\
          [profile.install]\n\
          grants = [\"disks\"]\n\

@@ -2143,7 +2143,12 @@ A reboot is the same, with `reboot: true` and a reset at the end.
 
         A second boot runs `with power shutdown --reboot`, and QEMU is watched through a second
         boot.
-- [ ] **E.5 — the clock.**
+- [x] **E.5 — the clock.** *(Landed 2026-09-29, as drawn, and **QEMU does keep the RTC across a
+  guest reset**: the reboot half's second boot anchored 13 s after the time set, and an RTC write
+  claimed but not made fails it, anchored at the host's own time, four years short. Two things
+  beyond the plan: `nxsh` passes its stages what it holds, so `date --set` works in `with admin
+  nxsh` as the view's bindings do; and a set is refused outside 2000–2099, the years every machine's
+  RTC reads back. The write is read back, and `sys_clock_set` says when the chip did not take it.)*
       - `sys_clock_set` and the RTC's write-back.
       - `SYSTEM_CLOCK` from `init` to `service-mgr`, and to the broker.
       - The `clock` grant, and `date --set`.
