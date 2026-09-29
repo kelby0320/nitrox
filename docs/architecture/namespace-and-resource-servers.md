@@ -5,7 +5,8 @@
 Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
 to "enforced" 2026-09-23; a server minting a narrower endpoint on request (the device manager's
 info-only one) described 2026-09-24; a resolve continued in a namespace a server hands back
-(`OBJECT_KIND_SUBNAMESPACE`) built with administration Part C.4, 2026-09-24.
+(`OBJECT_KIND_SUBNAMESPACE`) built with administration Part C.4, 2026-09-24; a direct-handle bind
+needing `TRANSFER`, 2026-09-29.
 
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
@@ -660,7 +661,9 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `ns`'s bindings, with the same full rights. Needs `LOOKUP` on `ns`.
 - **`sys_ns_bind(ns, path, path_len, resource) -> 0`** — bind `resource` (a direct
   handle in slice 1; a userspace-server endpoint in slice 7) at `path`. Needs `BIND`
-  on `ns` and the `BIND_NAMESPACE` syscap. In-kernel `KernelServer`
+  on `ns` and the `BIND_NAMESPACE` syscap, and **a direct handle needs `TRANSFER`**:
+  every resolve of the binding mints a handle to the object, so a bind gives it away as a
+  send does (PR #342 review, 2026-09-29). In-kernel `KernelServer`
   bindings are made by the kernel at boot, not through this syscall.
 - **`sys_ns_unbind(ns, path, path_len) -> 0`** — remove the binding at `path`. Needs
   `UNBIND`.

@@ -67,7 +67,8 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `SYSTEM_CLOCK` — delegated to time-sync service
 - **The system-control object** (administration Part E.3) — a handle in `rdx`, not a syscap:
   the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE` nor
-  `TRANSFER`, so init cannot delegate it even by mistake. Init keeps it for the last step of a
+  `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a
+  namespace bind, which all need `TRANSFER`. Init keeps it for the last step of a
   shutdown (E.4), after every service and mount has stopped. See
   `docs/architecture/power.md`.
 

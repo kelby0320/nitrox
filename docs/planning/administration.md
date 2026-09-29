@@ -2103,7 +2103,9 @@ A reboot is the same, with `reboot: true` and a reset at the end.
         8042 and triple fault each reset q35 alone, checked by hand with a probe in `init`, since
         no gate halts a machine before E.4's `check-shutdown`. `test-qemu` also requires `init`'s
         `holds the system-control object` and `boot-probe`'s three refused calls.
-        [`power.md`](../architecture/power.md) is new.)*
+        [`power.md`](../architecture/power.md) is new. **The PR #342 review found `init` could
+        still bind the object**, since a direct-handle bind asked for no right on the handle; a
+        direct-handle bind needs `TRANSFER` since, for every object.)*
 - [ ] **E.4 — `shutdown`.**
       - The sequence: sessions, services in reverse order, the storage service's unmount of
         everything, `init`'s mounts, the power op.

@@ -1465,11 +1465,6 @@ pub fn sys_ns_derive(ns_h: u64) -> SysResult {
     }
 }
 
-/// `sys_ns_bind(ns, path, path_len, resource)` — bind `resource` (a direct
-/// kernel-object handle in slice 1) at `path` in namespace `ns`. Requires the
-/// `BIND` right on `ns`. The binding takes a **clone** of the resource's
-/// reference (the caller's handle stays valid) and records the resource handle's
-/// current rights as the binding's rights cap. Returns 0.
 /// Require the calling process to hold system capability `cap`, else [`KError::NoAccess`].
 /// The process-level authority gate (`docs/architecture/syscaps.md`) — checked after the
 /// caller's `Process` is resolved, alongside (not instead of) any per-handle `Rights`.
@@ -1484,6 +1479,25 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     }
 }
 
+/// Whether a handle carrying `rights` may be bound as a **direct handle**: only one that may leave
+/// its process, so `NoAccess` without `TRANSFER`.
+///
+/// A direct-handle bind gives the object away — every resolve of the binding mints a handle to
+/// it, for whoever asked — just as an IPC send and a spawn grant do, and those two need
+/// `TRANSFER`. Without this, a handle issued to stay in one process could be published instead:
+/// `init`'s system-control object, which carries no `TRANSFER` so that it cannot leave `init`, was
+/// bindable until the PR #342 review found it. A **userspace-server** bind needs no right on its
+/// endpoint: the kernel keeps the endpoint, and no resolve hands it out.
+fn direct_bindable(rights: Rights) -> Result<(), KError> {
+    if rights.contains(Rights::TRANSFER) { Ok(()) } else { Err(KError::NoAccess) }
+}
+
+/// `sys_ns_bind(ns, path, path_len, resource, base, base_len)` — bind `resource` at `path` in
+/// namespace `ns`: an `IpcChannel` as a userspace server, anything else as a direct handle.
+/// Requires the `BIND` right on `ns` and the `BIND_NAMESPACE` syscap, and a direct handle needs
+/// `TRANSFER` ([`direct_bindable`]). The binding takes a **clone** of the resource's reference
+/// (the caller's handle stays valid) and records the resource handle's current rights as the
+/// binding's rights cap. Returns 0.
 pub fn sys_ns_bind(
     ns_h: u64,
     path_ptr: u64,
@@ -1514,7 +1528,8 @@ pub fn sys_ns_bind(
         SubtreeBase::empty()
     };
 
-    // Resolve the resource handle (any type; ownership is the authority).
+    // Resolve the resource handle (any type; ownership is the authority, and a direct handle's
+    // `TRANSFER` is checked below).
     let res_ok = global::get()
         .lookup(RawHandle(resource_h), pid, Rights::empty())
         .map_err(map_handle_err)?;
@@ -1578,6 +1593,7 @@ pub fn sys_ns_bind(
     if !base.is_empty() {
         return Err(KError::InvalidArgument);
     }
+    direct_bindable(rights)?;
     // Clone the resource for the binding; the binding's rights are the handle's rights.
     let target = res_ok.object.clone();
     match ns.bind(path, target, rights) {
@@ -3651,10 +3667,11 @@ mod tests {
     }
 
     /// **`init`'s system-control handle can be used and not given away** (administration Part
-    /// E.3): its rights are allocatable on the object, and a duplicate — the first step of
-    /// handing a handle to anyone — is refused for want of `DUPLICATE`.
+    /// E.3): its rights are allocatable on the object, a duplicate is refused for want of
+    /// `DUPLICATE`, and a direct-handle bind — which the PR #342 review found needed no right at
+    /// all — for want of `TRANSFER`. A send and a spawn grant need `TRANSFER` too.
     #[test]
-    fn the_system_control_handle_cannot_be_duplicated() {
+    fn the_system_control_handle_cannot_be_given_away() {
         use crate::object::SystemControl;
         use crate::object::system_control::INIT_RIGHTS;
         init_global_heap();
@@ -3665,7 +3682,9 @@ mod tests {
             .expect("INIT_RIGHTS must be valid for a SystemControl");
         assert!(t.lookup(h, 1, Rights::WRITE).is_ok());
         assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
-        assert!(!INIT_RIGHTS.contains(Rights::TRANSFER), "and so is a transfer");
+        let held = t.lookup(h, 1, Rights::empty()).unwrap().rights;
+        assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
+        assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
         let co = t.close(h, 1).unwrap();
         // SAFETY: `co` carries the handle's one reference, released here once.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });

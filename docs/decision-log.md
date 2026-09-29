@@ -30962,3 +30962,55 @@ probe in `init` called `sys_power` 20 s after its reaping loop began, with the g
 
 **ABI:** a new `KObjectType` discriminant (15), which is a version-hash input. Also a new syscall
 number (40) and the `POWER_*` values, which are not hash inputs.
+
+## 2026-09-29 — Part E.3, reviewed (PR #342): a direct-handle bind needs `TRANSFER`
+
+The review found one blocking problem and two optional ones. All are addressed.
+
+**Blocking — `init` could give the system-control object away, by binding it.**
+- `sys_ns_bind` looked the resource handle up with no required right ("any type; ownership is the
+  authority"). It then bound the object with the handle's own rights, and every later resolve
+  minted a handle from those.
+- So leaving `DUPLICATE` and `TRANSFER` off `init`'s handle closed duplicate, IPC send and spawn,
+  and not bind. `init`, which holds `BIND_NAMESPACE`, could publish the object. Anything resolving
+  the path — `service-mgr` on the same root, or a child given a namespace with the binding — would
+  get a `SystemControl` with `WRITE`, which `sys_power` accepts.
+- The reviewer ran the exact steps against one handle table in a scratch host test, and it passed.
+  The docs had stated the opposite as a guarantee in six places.
+
+**Fixed for the class, not the object: a direct-handle bind needs `TRANSFER`** (`NoAccess`
+without it).
+- **Why:** a bind gives the object to whoever resolves the path, as a send and a spawn grant do,
+  and those two already needed `TRANSFER`, the right that says a handle may leave its process.
+- **What else it closes:** any other handle issued without `TRANSFER` was bindable the same way.
+  `init`'s notification channel, whose handle carries `WAIT`, `DUPLICATE` and `INSPECT`, is one.
+- **What it leaves alone:** an IPC endpoint bound as a userspace server needs no right, since the
+  kernel keeps it and no resolve hands it out.
+- **Breakage checked by measuring first.** A temporary kernel probe logged every direct-handle bind
+  whose handle lacked `TRANSFER`. It found none across `test-qemu`, `test-interactive`,
+  `check-live` and `check-terminal`, all `--kvm`. A positive control, logging every direct-handle
+  bind, fired: `libsession`'s `/dev/blk` rebinds and their `info` leaves, and the demo harness's
+  memory objects. Every one carried `TRANSFER`, so no caller changes.
+
+**Gates:**
+- The host test becomes `the_system_control_handle_cannot_be_given_away`. It asserts that `init`'s
+  rights are refused a direct bind, where it had asserted a constant.
+- `boot-probe` gains `bind_needs_transfer_test`: a memory object's handle duplicated without
+  `TRANSFER` is refused `NoAccess`, and the original, with it, is bound in the same namespace.
+- **Controls:**
+  - dropping the check from `sys_ns_bind` fails `boot-probe`;
+  - a rule that allows everything fails the host test.
+
+**Also, while here:** `sys_ns_bind`'s doc comment had been orphaned onto `require_syscap` since
+administration Part A.1. It is back on `sys_ns_bind` and brought up to date.
+
+**Optional, both taken:**
+- `qemu-integration-tests.md` counted eight `test-qemu` transcript checks; there are ten.
+- `why-phased-acpi.md` named an `ArchPower` seam that does not exist. A note now names the one
+  built — `ArchPlatform::prepare_reset`/`reset`, and `sys_power`'s halt — and links `power.md`.
+
+**Docs** for the new rule: `syscall-abi.md` § Namespace, `handle-encoding.md` on `TRANSFER`,
+`namespace-and-resource-servers.md`, `power.md`, and `init/CLAUDE.md`.
+
+**ABI:** no hash impact. It is a new refusal on an existing syscall, and no layout or discriminant
+changes.

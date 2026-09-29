@@ -1,6 +1,7 @@
 # Power
 
-**Status: the kernel half built with administration Part E.3; last checked 2026-09-28.** The
+**Status: the kernel half built with administration Part E.3; last checked 2026-09-29, when a
+direct-handle bind came to need `TRANSFER` (PR #342 review).** The
 system-control object, `sys_power`'s halt and reboot, and the FADT facts a reset and the clock
 use. Not built: `shutdown`, and the sequence that stops the sessions, the services and the
 filesystems before `init` calls `sys_power` — administration Part E.4,
@@ -14,9 +15,15 @@ notification channel and the root namespace ([`boot-flow.md`](boot-flow.md) §4)
 carries `WRITE`, which `sys_power` requires, and `INSPECT`, and neither `DUPLICATE` nor
 `TRANSFER`:
 
-- `init` cannot give it away, even by mistake — a duplicate is refused, and nothing without
-  `TRANSFER` can be sent or granted at spawn;
-- nothing binds it in a namespace, so no lookup yields it.
+- `init` cannot give it away, even by mistake: a duplicate needs `DUPLICATE`, and an IPC send, a
+  spawn grant and a direct-handle bind each need `TRANSFER`;
+- so it is bound in no namespace, and no lookup yields it.
+
+The bind was the gap the PR #342 review found: `sys_ns_bind` asked for no right on a direct
+handle, so `init` could have published the object at a path anyone resolving it would get a
+`WRITE` handle from. A direct-handle bind needs `TRANSFER` since then, for every object — a bind
+gives the object away as a send does ([`syscall-abi.md`](../spec/syscall-abi.md) §
+Namespace).
 
 So the process that stops the machine is the one the kernel started first. That is deliberate:
 `init` mounted the root, and a shutdown's last steps are its own — its mounts written back and
@@ -101,14 +108,15 @@ BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as 
   - the PCI configuration address;
   - the RTC's century;
   - the last line's row;
-  - the object's rights, which a duplicate is refused;
+  - the object's rights: a duplicate and a direct-handle bind are refused;
   - the op's decoding, and which block devices are flushed.
 - **`cargo xtask test-qemu`:**
   - q35's four `fadt:` lines;
   - `init: holds the system-control object`;
   - `boot-probe` calling `sys_power` with no handle, a lookup-only namespace and a writable disk,
     each refused. A kernel that checked the right and not the type halts the machine there, and
-    the run times out.
+    the run times out;
+  - `boot-probe` binding a handle without `TRANSFER`, refused `NoAccess`, and one with it, taken.
 - **`cargo xtask check-report`**: the same `fadt:` lines, read off the live image's report.
 - **Not yet by a gate: a halt or a reset itself.** Administration Part E.4's `check-shutdown` will
   boot one of each. E.3's were booted by hand, with a probe in `init`.

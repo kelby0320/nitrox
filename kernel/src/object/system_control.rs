@@ -2,8 +2,9 @@
 //! Part E.3).
 //!
 //! **One exists**, made at boot and handed to `init` in `rdx`, with `WRITE` and `INSPECT` and
-//! neither `DUPLICATE` nor `TRANSFER`: `init` cannot give it away, so the process that stops the
-//! machine is the one the kernel started first. Like an [`EntropyObject`](super::EntropyObject)
+//! neither `DUPLICATE` nor `TRANSFER`: `init` cannot duplicate it, send it, grant it at spawn or
+//! bind it in a namespace, so the process that stops the machine is the one the kernel started
+//! first. Like an [`EntropyObject`](super::EntropyObject)
 //! it is a **token** and carries no state — the machine it controls is the one there is.
 //! `sys_power` looks it up, requiring `WRITE`, and flushes, stops and halts or resets through
 //! [`crate::power`]. See `docs/architecture/power.md`.

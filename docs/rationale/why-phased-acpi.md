@@ -121,9 +121,11 @@ The most user-visible Phase 1 limitation is shutdown. The kernel can boot, run, 
 
 Both paths are wrapped behind `ArchPower::shutdown()` and `ArchPower::reboot()`, so Phase 2 can swap in ACPICA-backed implementations without touching callers.
 
+> **As built (administration Part E.3, 2026-09-28), the seam is named differently and there is no shutdown.** A reset is `ArchPlatform::prepare_reset` and `reset` — the FADT's reset register, then the 8042, then a triple fault — and a halt is `sys_power`'s own, which stops every processor and says it is safe to turn the machine off. The QEMU-only port `0x604` write is not used, so the emulator does not power off either. See [`power.md`](../architecture/power.md).
+
 ## Where to read more
 
-- Power management architecture — **not written.** ACPI is Phase 2 and not yet active
+- Power management architecture — [`power.md`](../architecture/power.md) for what is built: the reset and halt, with no AML. ACPI Phase 2 is not yet active
   (see the root `CLAUDE.md`, "Forbidden patterns", on the planned ACPICA exception).
 - [Boot flow architecture](../architecture/boot-flow.md) — where ACPI initialization happens during boot
 - [ACPICA project documentation](https://www.intel.com/content/www/us/en/developer/articles/tool/acpi-component-architecture-downloads.html) — for when Phase 2 happens
