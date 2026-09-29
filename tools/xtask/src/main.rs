@@ -11611,6 +11611,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             check_servers_are_service_mgrs(&transcript)?;
+            check_system_control(&transcript)?;
             check_hardware_facts(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
@@ -11639,6 +11640,13 @@ const EMULATED_MACHINE_FACTS: &[&[&str]] = &[
     &["madt: lapic uid 3 apic 3 enabled"],
     &["madt: ioapic 0 @0xfec00000 gsi 0"],
     &["acpi: 1 IOAPIC, 5 src-override, 4 CPU; 1 ECAM region"],
+    // **q35's FADT** (administration Part E.3): the reset register a reboot writes first — the
+    // chipset's reset control at I/O 0xcf9, `RESET_REG_SUP` set in the flags — the RTC's century
+    // register, and an 8042.
+    &["fadt: flags 0x84a5"],
+    &["fadt: reset register I/O 0xcf9 width 8, value 0xf"],
+    &["fadt: century register CMOS 0x32"],
+    &["fadt: boot arch 0x2; 8042 present"],
 ];
 
 /// The facts `test-qemu`'s boot adds to [`EMULATED_MACHINE_FACTS`]: its disk is on AHCI, so the
@@ -11968,6 +11976,20 @@ const SERVICE_MGR_SERVERS: &[(&str, &str)] = &[
     ("input-server", "/dev/input/new"),
     ("compositor", "/dev/draw"),
 ];
+
+/// **`init` holds the system-control object** (administration Part E.3): the kernel made it and
+/// handed it over in `rdx`, and `init` found a `SystemControl` with `WRITE` there. The other half,
+/// that nothing else can use `sys_power`, is `boot-probe`'s, which gates the verdict itself.
+fn check_system_control(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if !text.contains("init: holds the system-control object") {
+        return Err("`init: holds the system-control object` is not in the transcript: the kernel's \
+                    handoff in `rdx` did not reach init as a SystemControl with WRITE"
+            .into());
+    }
+    println!("xtask: init holds the system-control object ✓");
+    Ok(())
+}
 
 /// **`service-mgr` bound every server, and `init` bound none of them** (administration Part E.1).
 /// `init` starts only its mounts, the profile server at `/bin`, and `service-mgr`; a line of
@@ -12724,6 +12746,15 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/libkern/io_op.rs",
         user_file: "userspace/libkern/src/abi.rs",
         shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
+    // `sys_power`'s operations (administration Part E.3). The kernel states them in a file of their
+    // own, so the sweep there finds nothing else; `libkern` keeps them beside `SYS_POWER`.
+    AbiFamily {
+        what: "power operations",
+        kernel_file: "kernel/src/libkern/power.rs",
+        user_file: "userspace/libkern/src/syscall.rs",
+        shape: AbiShape::U64Const,
         one_sided: &[],
     },
 ];

@@ -219,12 +219,13 @@ The kernel rejects allocations of handles with rights that are not meaningful fo
 | `PendingOperation` | `WAIT` |
 | `IoRing` | `READ`, `WRITE` (for SQE/CQE access) |
 | `EntropyObject` | `READ` |
-| `DeviceNode` | `READ`, `INSPECT` |
+| `DeviceNode` | `READ`, `WRITE` (a block device is written through `sys_io_submit`; `INSPECT` is a generic right, not a principal one — this row said `READ`, `INSPECT` until 2026-09-28) |
+| `SystemControl` | `WRITE` — the one object, `init`'s, whose handle carries `WRITE` and `INSPECT` and cannot be duplicated or transferred ([`power.md`](../architecture/power.md)) |
 | `UserspaceServerReg` | (internal; not user-accessible) |
 
 Resource handles (returned by namespace lookups) receive principal rights (`READ`/`WRITE`/`EXECUTE`) per the resource server's metadata and the rights requested by the caller.
 
-Generic rights (`DUPLICATE`, `TRANSFER`, `INSPECT`, `WAIT`) are valid on any handle type but may be stripped at issuance for handles intended to remain process-local or non-transferable.
+Generic rights (`DUPLICATE`, `TRANSFER`, `INSPECT`, `WAIT`) are valid on any handle type but may be stripped at issuance for handles intended to remain process-local or non-transferable. **`TRANSFER` is what lets a handle's object leave its process**, and every way out asks for it: an IPC send, a spawn grant, and a direct-handle `sys_ns_bind` (since 2026-09-28; before, a bind asked for no right on the handle).
 
 ## Endianness
 

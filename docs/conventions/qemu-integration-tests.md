@@ -81,7 +81,7 @@ A verdict is one bit, and some defects do not reach it. `test-qemu` therefore al
 against the **captured serial transcript** after a PASS, and a transcript check failing fails
 the run.
 
-`test-qemu` has eight (the list is `cmd_test_qemu`'s PASS arm); the ones with a story worth
+`test-qemu` has ten (the list is `cmd_test_qemu`'s PASS arm, and it wins over this count); the ones with a story worth
 keeping are below, and `check_ahci_msi_path`, `check_block_read_selftest` and
 `check_oversize_refused` each carry theirs in a doc comment. **`check_login_chain`** requires
 `session-mgr: received fs + profile endpoints; auth resolved from /svc/auth` (the wording changed

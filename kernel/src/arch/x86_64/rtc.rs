@@ -35,11 +35,11 @@
 //! timezone database to correct it with, and a timezone is a *display* concern
 //! for the shell, not a kernel one.
 //!
-//! The **century** is a guess. The century register's location is only
-//! discoverable from ACPI's FADT, which this kernel does not parse yet
-//! (`docs/rationale/why-phased-acpi.md`), so a two-digit year is mapped into
-//! 2000–2099 and the result sanity-clamped. Wrong by a century is caught by the
-//! clamp; wrong within this century is not possible from a two-digit year.
+//! The **century** comes from the century register when ACPI's FADT names one
+//! (administration Part E.3), in the chip's own BCD or binary. Without one — no
+//! FADT, or one that names none, or a register that reads outside 19–21 — a
+//! two-digit year is mapped into 2000–2099, which is what it was before the FADT
+//! was parsed.
 
 use super::regs::{inb, outb};
 
@@ -78,6 +78,8 @@ struct Raw {
     day: u8,
     month: u8,
     year: u8,
+    /// The century register, when the FADT names one.
+    century: Option<u8>,
 }
 
 /// Read one CMOS register.
@@ -99,8 +101,8 @@ unsafe fn read_reg(reg: u8) -> u8 {
 ///
 /// # Safety
 /// As [`read_reg`].
-unsafe fn read_raw() -> Raw {
-    // SAFETY: all six are plain time registers.
+unsafe fn read_raw(century: Option<u8>) -> Raw {
+    // SAFETY: all six are plain time registers, and the century register's index is the FADT's.
     unsafe {
         Raw {
             second: read_reg(REG_SECONDS),
@@ -109,6 +111,7 @@ unsafe fn read_raw() -> Raw {
             day: read_reg(REG_DAY),
             month: read_reg(REG_MONTH),
             year: read_reg(REG_YEAR),
+            century: century.map(|index| read_reg(index)),
         }
     }
 }
@@ -118,6 +121,7 @@ unsafe fn read_raw() -> Raw {
 ///
 /// Called **once**, during boot, from [`crate::clock::init`].
 pub fn wall_clock_seconds() -> Option<i64> {
+    let century = super::acpi::fadt().and_then(|f| f.century);
     // Wait out any in-progress update, then double-read: the update can start
     // between the `UIP` check and the last register read, so two identical
     // readings are what actually proves the value is stable.
@@ -130,7 +134,7 @@ pub fn wall_clock_seconds() -> Option<i64> {
                 return None; // no RTC, or one stuck mid-update
             }
         }
-        read_raw()
+        read_raw(century)
     };
     let mut tries = 0u32;
     loop {
@@ -142,7 +146,7 @@ pub fn wall_clock_seconds() -> Option<i64> {
                     return None;
                 }
             }
-            read_raw()
+            read_raw(century)
         };
         if next == prev {
             break;
@@ -189,8 +193,10 @@ fn decode(raw: Raw, status_b: u8) -> Option<i64> {
     let month = conv(raw.month)?;
     let year2 = conv(raw.year)?;
 
-    // No ACPI ⇒ no century register; a two-digit year maps into 2000–2099.
-    let year = 2000i64 + year2 as i64;
+    // The century register when the FADT names one and it reads as one; otherwise a two-digit
+    // year maps into 2000–2099.
+    let century = raw.century.and_then(conv).filter(|c| (19..=21).contains(c)).unwrap_or(20);
+    let year = century as i64 * 100 + year2 as i64;
 
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
@@ -235,7 +241,7 @@ mod tests {
     use super::*;
 
     fn raw(second: u8, minute: u8, hour: u8, day: u8, month: u8, year: u8) -> Raw {
-        Raw { second, minute, hour, day, month, year }
+        Raw { second, minute, hour, day, month, year, century: None }
     }
 
     #[test]
@@ -311,5 +317,24 @@ mod tests {
         // Year `00` is 2000, not 1900 — and certainly not 0.
         let r = raw(0, 0, 0, 1, 1, 0);
         assert_eq!(decode(r, STATUS_B_BINARY), Some(946_684_800));
+    }
+
+    /// **The century register, when the FADT names one** (administration Part E.3), in the chip's
+    /// own encoding — and a reading outside 19–21 is not believed.
+    #[test]
+    fn a_century_register_sets_the_century() {
+        // 1999-12-31 00:00 UTC is 946_598_400; with a century of 19, year 99 is 1999.
+        let bcd = Raw { century: Some(0x19), ..raw(0, 0, 0, 0x31, 0x12, 0x99) };
+        assert_eq!(decode(bcd, STATUS_B_24_HOUR), Some(946_598_400));
+        let binary = Raw { century: Some(19), ..raw(0, 0, 0, 31, 12, 99) };
+        assert_eq!(decode(binary, STATUS_B_BINARY | STATUS_B_24_HOUR), Some(946_598_400));
+        // 20 reads as the guess did; 0x20 BCD is 20.
+        let twenty = Raw { century: Some(0x20), ..raw(0, 0, 0, 1, 1, 0) };
+        assert_eq!(decode(twenty, STATUS_B_24_HOUR), Some(946_684_800));
+        // Nonsense falls back to 20, and a non-BCD byte in BCD mode does too.
+        let wild = Raw { century: Some(55), ..raw(0, 0, 0, 1, 1, 0) };
+        assert_eq!(decode(wild, STATUS_B_BINARY | STATUS_B_24_HOUR), Some(946_684_800));
+        let not_bcd = Raw { century: Some(0x2a), ..raw(0, 0, 0, 1, 1, 0) };
+        assert_eq!(decode(not_bcd, STATUS_B_24_HOUR), Some(946_684_800));
     }
 }

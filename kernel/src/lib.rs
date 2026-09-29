@@ -31,6 +31,7 @@ pub mod limine;
 pub mod mm;
 pub mod object;
 pub mod pci;
+pub mod power;
 pub mod report;
 pub mod rsproto;
 pub mod sched;

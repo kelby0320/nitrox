@@ -55,6 +55,17 @@ impl ArchCpu for X86Cpu {
     }
 
     fn stop_the_machine() -> ! {
+        <Self as ArchCpu>::stop_other_cpus();
+        // **The screen comes back last**, on both of `stop_other_cpus`' branches: after every
+        // other CPU has been told to halt, so a compositor stops drawing over it, and after the
+        // diagnosis was printed — its lines are the grid's last rows. Early in boot the kernel
+        // never gave the screen up and this only finishes a paint; the fallback branch there is
+        // precisely where a panic before `init` lands, which is the case the console exists for.
+        crate::fbcon::reclaim_for_stop();
+        <Self as ArchCpu>::halt_loop()
+    }
+
+    fn stop_other_cpus() {
         // **Mask first, and run to completion on one CPU.** This inherits the caller's IF:
         // from `dump_and_halt` that is already 0 (the IDT gate clears it), but from `panic!`
         // it is whatever the panicking context held, and IF=1 in ring 0 is reachable —
@@ -66,7 +77,7 @@ impl ArchCpu for X86Cpu {
         // so the loop would NMI the core it is now running on and take itself out partway
         // through the scan. Masking makes the whole sequence uninterruptible.
         //
-        // SAFETY: ring 0. This diverges into `halt_loop`, so nothing later depends on IF
+        // SAFETY: ring 0. The caller goes on to halt or reset, so nothing later depends on IF
         // being restored.
         unsafe {
             <Self as ArchCpu>::interrupts_disable();
@@ -103,13 +114,6 @@ impl ArchCpu for X86Cpu {
                 unsafe { super::apic::send_nmi(apic) };
             }
         }
-        // **The screen comes back last**, on both branches: after every other CPU has been told
-        // to halt, so a compositor stops drawing over it, and after the diagnosis was printed —
-        // its lines are the grid's last rows. Early in boot the kernel never gave the screen up
-        // and this only finishes a paint; the fallback branch above is precisely where a panic
-        // before `init` lands, which is the case the console exists for.
-        crate::fbcon::reclaim_for_stop();
-        <Self as ArchCpu>::halt_loop()
     }
 
     fn halt_loop() -> ! {

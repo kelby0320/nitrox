@@ -238,6 +238,9 @@ pub const SYS_NS_SYNC: u64 = 38;
 /// `sys_ns_held(ns, path, path_len)` — how many of a mount's files something still holds
 /// (administration Part C.5c).
 pub const SYS_NS_HELD: u64 = 39;
+/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
+/// (administration Part E.3). Returns only to refuse.
+pub const SYS_POWER: u64 = 40;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -290,6 +293,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
         SYS_NS_SYNC => encode(sys_ns_sync(a0, a1, a2 as usize)),
         SYS_NS_HELD => encode(sys_ns_held(a0, a1, a2 as usize)),
+        SYS_POWER => encode(sys_power(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
@@ -1461,11 +1465,6 @@ pub fn sys_ns_derive(ns_h: u64) -> SysResult {
     }
 }
 
-/// `sys_ns_bind(ns, path, path_len, resource)` — bind `resource` (a direct
-/// kernel-object handle in slice 1) at `path` in namespace `ns`. Requires the
-/// `BIND` right on `ns`. The binding takes a **clone** of the resource's
-/// reference (the caller's handle stays valid) and records the resource handle's
-/// current rights as the binding's rights cap. Returns 0.
 /// Require the calling process to hold system capability `cap`, else [`KError::NoAccess`].
 /// The process-level authority gate (`docs/architecture/syscaps.md`) — checked after the
 /// caller's `Process` is resolved, alongside (not instead of) any per-handle `Rights`.
@@ -1480,6 +1479,25 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     }
 }
 
+/// Whether a handle carrying `rights` may be bound as a **direct handle**: only one that may leave
+/// its process, so `NoAccess` without `TRANSFER`.
+///
+/// A direct-handle bind gives the object away — every resolve of the binding mints a handle to
+/// it, for whoever asked — just as an IPC send and a spawn grant do, and those two need
+/// `TRANSFER`. Without this, a handle issued to stay in one process could be published instead:
+/// `init`'s system-control object, which carries no `TRANSFER` so that it cannot leave `init`, was
+/// bindable until the PR #342 review found it. A **userspace-server** bind needs no right on its
+/// endpoint: the kernel keeps the endpoint, and no resolve hands it out.
+fn direct_bindable(rights: Rights) -> Result<(), KError> {
+    if rights.contains(Rights::TRANSFER) { Ok(()) } else { Err(KError::NoAccess) }
+}
+
+/// `sys_ns_bind(ns, path, path_len, resource, base, base_len)` — bind `resource` at `path` in
+/// namespace `ns`: an `IpcChannel` as a userspace server, anything else as a direct handle.
+/// Requires the `BIND` right on `ns` and the `BIND_NAMESPACE` syscap, and a direct handle needs
+/// `TRANSFER` ([`direct_bindable`]). The binding takes a **clone** of the resource's reference
+/// (the caller's handle stays valid) and records the resource handle's current rights as the
+/// binding's rights cap. Returns 0.
 pub fn sys_ns_bind(
     ns_h: u64,
     path_ptr: u64,
@@ -1510,7 +1528,8 @@ pub fn sys_ns_bind(
         SubtreeBase::empty()
     };
 
-    // Resolve the resource handle (any type; ownership is the authority).
+    // Resolve the resource handle (any type; ownership is the authority, and a direct handle's
+    // `TRANSFER` is checked below).
     let res_ok = global::get()
         .lookup(RawHandle(resource_h), pid, Rights::empty())
         .map_err(map_handle_err)?;
@@ -1574,6 +1593,7 @@ pub fn sys_ns_bind(
     if !base.is_empty() {
         return Err(KError::InvalidArgument);
     }
+    direct_bindable(rights)?;
     // Clone the resource for the binding; the binding's rights are the handle's rights.
     let target = res_ok.object.clone();
     match ns.bind(path, target, rights) {
@@ -2931,6 +2951,24 @@ fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     Ok(held)
 }
 
+/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
+/// the machine (administration Part E.3; [`crate::power`]). Needs `WRITE` on a
+/// [`SystemControl`](crate::object::SystemControl), which only `init` holds; `op` is
+/// `POWER_HALT` or `POWER_REBOOT`, and anything else is `InvalidArgument`.
+///
+/// **It returns only to refuse.** The handle is checked before the op, so a process without the
+/// object learns nothing from either. Its flush waits in the kernel, bounded — the one blocking
+/// syscall with nothing to hand a `PendingOperation` to, since nothing comes back.
+fn sys_power(sc_h: u64, op: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let _system_control = lookup_typed(sc_h, pid, Rights::WRITE, KObjectType::SystemControl)?;
+    use crate::libkern::power::PowerOp;
+    let op = PowerOp::from_u64(op).ok_or(KError::InvalidArgument)?;
+    let what = if op == PowerOp::Halt { "halt" } else { "reboot" };
+    crate::kprintln!("power: pid {pid} asks to {what}");
+    crate::power::power(op)
+}
+
 /// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.
 ///
 /// Stamps on **sync**, not on the individual write, because the kernel has no per-page
@@ -3625,6 +3663,30 @@ mod tests {
             .allocate(1, ptr, KObjectType::EntropyObject, entropy_rights())
             .expect("entropy_rights must be valid for an EntropyObject");
         let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    /// **`init`'s system-control handle can be used and not given away** (administration Part
+    /// E.3): its rights are allocatable on the object, a duplicate is refused for want of
+    /// `DUPLICATE`, and a direct-handle bind — which the PR #342 review found needed no right at
+    /// all — for want of `TRANSFER`. A send and a spawn grant need `TRANSFER` too.
+    #[test]
+    fn the_system_control_handle_cannot_be_given_away() {
+        use crate::object::SystemControl;
+        use crate::object::system_control::INIT_RIGHTS;
+        init_global_heap();
+        let t = HandleTable::try_new(0x1357_9BDF_2468_ACE0).unwrap();
+        let ptr = KBox::into_raw(SystemControl::try_new().unwrap()).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::SystemControl, INIT_RIGHTS)
+            .expect("INIT_RIGHTS must be valid for a SystemControl");
+        assert!(t.lookup(h, 1, Rights::WRITE).is_ok());
+        assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
+        let held = t.lookup(h, 1, Rights::empty()).unwrap().rights;
+        assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
+        assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
+        let co = t.close(h, 1).unwrap();
+        // SAFETY: `co` carries the handle's one reference, released here once.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 

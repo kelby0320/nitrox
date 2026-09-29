@@ -112,6 +112,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `37` | `sys_ns_derive` |
 | `38` | `sys_ns_sync` |
 | `39` | `sys_ns_held` |
+| `40` | `sys_power` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -290,6 +291,8 @@ fn sys_ns_bind(
 ) -> isize
 ```
 Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate) **and** the `BIND_NAMESPACE` system capability (an additional gate; see [syscaps](../architecture/syscaps.md)). Returns `0` on success.
+
+**A direct handle needs `TRANSFER`** (`NoAccess` without it). Every resolve of the binding mints a handle to the object for whoever asked, so a bind gives the object away as an IPC send and a spawn grant do, and like them it needs the right that says a handle may leave its process. Until the PR #342 review it needed none, so a handle issued not to leave — `init`'s system-control object — could have been published. An IPC endpoint bound as a userspace server needs no right: the kernel keeps it, and no resolve hands it out.
 
 **Subtree scoping** (`base_len > 0`): for an IPC resource-server (userspace-server) bind, `base` is an absolute namespace path the kernel prepends to every forwarded lookup's suffix, so the binding exposes only that sub-tree of the server — e.g. `sys_ns_bind(ns, "/home", …, fs_endpoint, "/home/alice", 11)` makes a lookup of `/home/notes` reach the server as `home/alice/notes`, and nothing above `/home/alice` nameable. `base` is validated like any binding path (no `.`/`..`, so it cannot escape the subtree; root `/` and paths over 128 bytes are rejected → `InvalidArgument`). `base_len == 0` = an unscoped whole-tree mount (the original behaviour; existing callers via `syscall4` pass 0 automatically). A non-zero `base` on a **direct-handle** bind is rejected (`InvalidArgument`) — scoping applies only to servers. See [session-and-auth](../architecture/session-and-auth.md) § Session construction.
 
@@ -589,6 +592,33 @@ Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in t
 fn sys_release_initramfs() -> isize
 ```
 Unbinds `/initramfs` from the root namespace and frees the initramfs physical pages. One-shot — succeeds once, returns `AlreadyReleased` thereafter. Requires `BIND_NAMESPACE`. **Deferred** — not implemented, and neither is the `AlreadyReleased` error it names. The initramfs must currently stay resident because the root fs-server's restart image can only come from it (`deferred-decisions.md`, "Filesystem server restart"). Marked 2026-08-18: this signature carried no deferred marker for as long as it has existed, three lines below one that does, and `check-docs`' syscall cross-check reads *numbered* table rows and prose bullets, so an unnumbered code block is invisible to it (audit D.5f).
+
+### Power
+
+```rust
+fn sys_power(system_control: RawHandle, op: u64) -> isize
+```
+**Flush every disk, stop every processor, then halt or reset the machine** (administration Part
+E.3; [`power.md`](../architecture/power.md)). `op` is `POWER_HALT` (`0`) or `POWER_REBOOT` (`1`).
+
+- **The flush**: `IoOpcode::Flush` to every block device but a partition, whose flush is its
+  disk's, waited for in the kernel for at most 10 seconds for all of them together. A disk that
+  fails or does not finish is named on the log, and the stop goes on.
+- **The stop**: every other processor, by the path a panic takes.
+- **A halt** writes *"It is now safe to turn off your computer."* on COM1 and as the screen's last
+  line, taking the screen back from whoever held it, and halts. There is no power-off: S5 needs
+  AML.
+- **A reboot** writes *"Restarting."* the same way, then tries the FADT's reset register when the
+  FADT advertises one, the 8042's reset line, and a triple fault, giving each half a second.
+
+Requires `WRITE` on a `SystemControl`. There is one, made at boot and handed to `init` in `rdx`
+without `DUPLICATE` or `TRANSFER`, so no other process can hold it. The handle is checked before
+`op`: `InvalidHandle`, `NoAccess` or `InvalidArgument` for a handle that is not the object, then
+`InvalidArgument` for an `op` that names nothing.
+
+**It returns only to refuse.** It is outside the async-first rule for that reason: a blocking
+operation hands back a `PendingOperation`, and this has nothing to hand one to. (Syscall number
+`40`.)
 
 ### High-Throughput Ring (additive optimization)
 

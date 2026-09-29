@@ -65,6 +65,12 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `LOAD_MODULE` — to load Tier 2 LKMs (delegated to device manager later)
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
 - `SYSTEM_CLOCK` — delegated to time-sync service
+- **The system-control object** (administration Part E.3) — a handle in `rdx`, not a syscap:
+  the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE` nor
+  `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a
+  namespace bind, which all need `TRANSFER`. Init keeps it for the last step of a
+  shutdown (E.4), after every service and mount has stopped. See
+  `docs/architecture/power.md`.
 
 **`service-mgr` sits in init's trust tier** (administration Part E, the maintainer's call,
 2026-09-28). The root handle init hands it carries init's own rights, `BIND` and `UNBIND` among

@@ -74,4 +74,19 @@ pub trait ArchPlatform {
     /// The slice is stable for the lifetime of the kernel (written once at
     /// boot, read-only thereafter).
     fn pcie_ecam_regions() -> &'static [EcamRegion];
+    /// Get ready to [`reset`](Self::reset), doing now whatever it will need that allocates or
+    /// takes a lock — on x86_64, a mapping for a reset register in memory space. Called while
+    /// every processor still runs, since `reset`'s caller stops the others first and one of
+    /// them may stop holding the allocator's lock (administration Part E.3).
+    fn prepare_reset();
+    /// Reset the machine, trying each way the platform offers until one works (administration
+    /// Part E.3). Never returns.
+    ///
+    /// # Safety
+    /// Ring 0, after [`prepare_reset`](Self::prepare_reset), with interrupts masked and every
+    /// other processor stopped ([`ArchCpu::stop_other_cpus`]). It allocates nothing and takes no
+    /// lock.
+    ///
+    /// [`ArchCpu::stop_other_cpus`]: crate::arch::cpu::ArchCpu::stop_other_cpus
+    unsafe fn reset() -> !;
 }

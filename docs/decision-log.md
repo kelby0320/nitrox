@@ -30849,3 +30849,168 @@ started it again.**
 - **A server past its `Ready` deadline showed `running`.** It is still a process, but it refused
   or said nothing, and its path answers `NotFound`. `state` now takes whether a running service is
   usable, and says `failed`.
+
+## 2026-09-28 — Administration Part E.3a: the FADT, read for a reset and a century
+
+E.3 comes in two parts. **E.3a reads the FADT**, the table E.3b's reboot needs and the RTC's
+century was waiting on. E.3b is the system-control object and `sys_power`.
+
+**Four things are read from it**, each only when the table's length holds it:
+- the **flags**, at 112;
+- the **reset register and value**, at 116 and 128, counted only when the flags advertise
+  `RESET_REG_SUP` and the register names an address;
+- the **century register's** CMOS index, at 108, where 0 means none;
+- **`IAPC_BOOT_ARCH`**, at 109, for whether an 8042 is present.
+
+The last is the one the plan did not name. The reboot chain's second step is the 8042's reset
+pulse, so the laptop's report should say whether its firmware claims to have one. E.3b does not
+skip the pulse on the flag's word: firmware gets the bit wrong both ways, and a pulse sent where
+there is no 8042 does nothing.
+
+**A short table is an ordinary case, not a bad one.** A revision-1 FADT ends at byte 116, before
+the reset register, which ACPI 2.0 added. So a table can advertise `RESET_REG_SUP` and not hold
+the register; it then has none. The host tests cover lengths from the full 244 down to 10,
+including 128, which holds the register's address and not its value.
+
+**The hardware report prints four lines**: `fadt: flags`, `fadt: reset register`, `fadt: century
+register` and `fadt: boot arch`, each with a line for its absence, and one line when there is no
+FADT at all. q35's are:
+- flags `0x84a5`, `RESET_REG_SUP` among them;
+- a reset register at I/O `0xcf9`, 8 bits wide, value `0xf` — the chipset's reset control;
+- a century register at CMOS `0x32`;
+- boot arch `0x2`, an 8042 present.
+
+These join `EMULATED_MACHINE_FACTS`, so `test-qemu` asserts them off COM1 and `check-report` off
+the live image's report pages. The laptop's report will say whether it can reset by register.
+
+**The RTC reads its century from the register** when the FADT names one, in the chip's own BCD or
+binary form. A reading outside 19–21 is not believed, and the year falls back to 2000–2099, which
+is what every boot did before. The module's "the century is a guess" is now true only of a machine
+whose FADT names no register.
+
+Gates run: `test-qemu --kvm`, `check-report --kvm`, `check-fbcon --kvm`, the host suite,
+`check-arch`, `abi-sync-check` and `check-docs`. The full set follows E.3b, which changes the ABI.
+No kernel ABI change here.
+
+## 2026-09-28 — Administration Part E.3b: the system-control object and `sys_power`
+
+**The system-control object** is kernel object type 15, and there is one. `run_first_userspace`
+makes it and hands it to `init` in `rdx`. Its handle has `WRITE` and `INSPECT`, and neither
+`DUPLICATE` nor `TRANSFER`, so `init` cannot give it away.
+- **A handle, not a syscap.** A syscap is ambient: everything `init` spawned with it could stop the
+  machine. A held object lets exactly one process do so.
+- The plan's early *Power* section had it delegated to `service-mgr`. The detail pass kept it with
+  `init`, whose mounts are a shutdown's last step, and this follows the detail pass.
+- `init` checks what `rdx` holds with `sys_handle_stat`, keeps it for E.4, and says `init: holds
+  the system-control object`. `test-qemu` requires that line.
+
+**`sys_power(system_control, op)`**, syscall 40, is `kernel/src/power.rs`:
+1. **Flush** every block device except partitions, whose flush is their disk's. All flushes go out
+   at once, with 10 s for all of them together. A disk that fails or does not finish is logged,
+   and the stop goes on.
+2. **Stop** the other processors.
+3. **Halt** with *"It is now safe to turn off your computer."*, or **reset**.
+
+It returns only to refuse. The handle is checked before the op.
+
+**Three arch pieces make that possible:**
+- **`ArchCpu::stop_other_cpus`**, split out of `stop_the_machine`, which is now it, then the screen,
+  then `halt_loop`. A power operation has its own last work to do on the one processor left.
+- **`ArchPlatform::prepare_reset` and `reset`**, split in two because nothing may allocate once the
+  others are stopped, and a reset register in memory space needs a mapping. `prepare_reset` maps
+  it while the machine still runs.
+- **`fbcon::reclaim_for_stop_with`**. `push` refuses once the machine is stopping, which keeps a
+  panic's diagnosis last. So the power operation's line is written into the grid by the reclaim
+  itself, on a row of its own, and is the last line on the screen.
+
+**The reset chain:**
+- The FADT's reset register comes first when it is in a space this kernel writes:
+  - an I/O port;
+  - memory, mapped beforehand;
+  - a bus-0 PCI configuration register, through the legacy `0xCF8`/`0xCFC` mechanism.
+- Then the 8042's pulse, whatever `IAPC_BOOT_ARCH` says, as E.3a's entry promised.
+- Then a triple fault. It is not one of the steps but what `reset` ends in, so no `unreachable!`
+  follows a list that "always" ends in one. Each step gets half a second.
+
+**Booted by hand, since no gate halts or resets a machine yet** (E.4's `check-shutdown` will). A
+probe in `init` called `sys_power` 20 s after its reaping loop began, with the greeter up:
+- **Halt:** COM1 showed the flush (`flushed 1 of 1 disks`), the stop and the message. A screendump
+  showed the screen taken back from the compositor, with the message as its last line.
+- **Reboot:** QEMU under `-no-reboot -no-shutdown` went to status `shutdown`, which is a guest
+  reset, with no 8042 line: the register at `0xcf9` did it.
+- **Each later step alone**, with the steps before it removed: the 8042 reset q35, and so did the
+  triple fault.
+- **An inert register write** (value 0) was followed, half a second later, by the 8042 line. That
+  shows the settle's clock runs with interrupts masked.
+
+**Gates:**
+- Host tests: the object's rights, which a duplicate refuses; the op's decoding; which devices are
+  flushed; the reset order and which reset registers are written; the PCI configuration address;
+  and the last line's row.
+- `test-qemu`: `init`'s line, and `boot-probe` calling `sys_power` three ways, each refused:
+  - with no handle, `InvalidHandle`;
+  - with its lookup-only root, `NoAccess`;
+  - with a writable disk, `InvalidArgument` — a `WRITE` handle, so the type is what refuses it.
+- **Controls:**
+  - A kernel that hands `init` 0 in `rdx` fails `test-qemu`'s check.
+  - A `sys_power` that checks the right and not the type halts the machine inside `boot-probe`, and
+    the run times out.
+  - A mismatched `POWER_REBOOT` fails `abi-sync-check`'s new *power operations* family.
+
+**A doc bug fixed on the way:** `handle-encoding.md` gave `DeviceNode`'s principal rights as
+`READ`, `INSPECT`. The code has `READ`, `WRITE`, and `INSPECT` is a generic right.
+
+**ABI:** a new `KObjectType` discriminant (15), which is a version-hash input. Also a new syscall
+number (40) and the `POWER_*` values, which are not hash inputs.
+
+## 2026-09-29 — Part E.3, reviewed (PR #342): a direct-handle bind needs `TRANSFER`
+
+The review found one blocking problem and two optional ones. All are addressed.
+
+**Blocking — `init` could give the system-control object away, by binding it.**
+- `sys_ns_bind` looked the resource handle up with no required right ("any type; ownership is the
+  authority"). It then bound the object with the handle's own rights, and every later resolve
+  minted a handle from those.
+- So leaving `DUPLICATE` and `TRANSFER` off `init`'s handle closed duplicate, IPC send and spawn,
+  and not bind. `init`, which holds `BIND_NAMESPACE`, could publish the object. Anything resolving
+  the path — `service-mgr` on the same root, or a child given a namespace with the binding — would
+  get a `SystemControl` with `WRITE`, which `sys_power` accepts.
+- The reviewer ran the exact steps against one handle table in a scratch host test, and it passed.
+  The docs had stated the opposite as a guarantee in six places.
+
+**Fixed for the class, not the object: a direct-handle bind needs `TRANSFER`** (`NoAccess`
+without it).
+- **Why:** a bind gives the object to whoever resolves the path, as a send and a spawn grant do,
+  and those two already needed `TRANSFER`, the right that says a handle may leave its process.
+- **What else it closes:** any other handle issued without `TRANSFER` was bindable the same way.
+  `init`'s notification channel, whose handle carries `WAIT`, `DUPLICATE` and `INSPECT`, is one.
+- **What it leaves alone:** an IPC endpoint bound as a userspace server needs no right, since the
+  kernel keeps it and no resolve hands it out.
+- **Breakage checked by measuring first.** A temporary kernel probe logged every direct-handle bind
+  whose handle lacked `TRANSFER`. It found none across `test-qemu`, `test-interactive`,
+  `check-live` and `check-terminal`, all `--kvm`. A positive control, logging every direct-handle
+  bind, fired: `libsession`'s `/dev/blk` rebinds and their `info` leaves, and the demo harness's
+  memory objects. Every one carried `TRANSFER`, so no caller changes.
+
+**Gates:**
+- The host test becomes `the_system_control_handle_cannot_be_given_away`. It asserts that `init`'s
+  rights are refused a direct bind, where it had asserted a constant.
+- `boot-probe` gains `bind_needs_transfer_test`: a memory object's handle duplicated without
+  `TRANSFER` is refused `NoAccess`, and the original, with it, is bound in the same namespace.
+- **Controls:**
+  - dropping the check from `sys_ns_bind` fails `boot-probe`;
+  - a rule that allows everything fails the host test.
+
+**Also, while here:** `sys_ns_bind`'s doc comment had been orphaned onto `require_syscap` since
+administration Part A.1. It is back on `sys_ns_bind` and brought up to date.
+
+**Optional, both taken:**
+- `qemu-integration-tests.md` counted eight `test-qemu` transcript checks; there are ten.
+- `why-phased-acpi.md` named an `ArchPower` seam that does not exist. A note now names the one
+  built — `ArchPlatform::prepare_reset`/`reset`, and `sys_power`'s halt — and links `power.md`.
+
+**Docs** for the new rule: `syscall-abi.md` § Namespace, `handle-encoding.md` on `TRANSFER`,
+`namespace-and-resource-servers.md`, `power.md`, and `init/CLAUDE.md`.
+
+**ABI:** no hash impact. It is a new refusal on an existing syscall, and no layout or discriminant
+changes.

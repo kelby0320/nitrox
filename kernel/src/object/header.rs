@@ -37,7 +37,8 @@ use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
     DeviceNode, EntropyObject, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
-    NotificationChannel, PendingOperation, Process, Thread, Timer, UserspaceServerReg,
+    NotificationChannel, PendingOperation, Process, SystemControl, Thread, Timer,
+    UserspaceServerReg,
 };
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
@@ -372,6 +373,15 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::FileObject);
         }
+        KObjectType::SystemControl => {
+            // SAFETY: last ref to a `SystemControl` produced by KBox::into_raw.
+            // The object owns nothing; the box drop frees its allocation.
+            drop(unsafe {
+                KBox::<SystemControl>::from_raw(NonNull::new_unchecked(ptr as *mut SystemControl))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::SystemControl);
+        }
         // No other kernel object types are implemented yet; they land behind
         // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -404,6 +414,7 @@ pub(crate) mod test_probe {
         static INTERRUPT_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static USERSPACE_SERVER_REG_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static FILE_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static SYSTEM_CONTROL_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -429,6 +440,7 @@ pub(crate) mod test_probe {
                 USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1))
             }
             KObjectType::FileObject => FILE_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::SystemControl => SYSTEM_CONTROL_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}
         }
     }
@@ -467,6 +479,10 @@ pub(crate) mod test_probe {
 
     pub(crate) fn entropy_object_destroys() -> usize {
         ENTROPY_OBJECT_DESTROYS.with(Cell::get)
+    }
+
+    pub(crate) fn system_control_destroys() -> usize {
+        SYSTEM_CONTROL_DESTROYS.with(Cell::get)
     }
 
     pub(crate) fn device_node_destroys() -> usize {

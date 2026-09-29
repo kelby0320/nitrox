@@ -203,9 +203,11 @@ each step's rationale is in the source comments:
    features the kernel requires, uses when present, and warns about, each `+` or `-`. Both only
    read, and both run before the step that panics on a missing required feature
    (`init_protections`), so the line naming what is missing is on the screen first. Later steps
-   add their own facts the same way — every ACPI table and MADT entry, each PCI function's
-   capabilities and what its driver did with it, the framebuffer's row padding, whether a UART
-   answers at COM1 — so every boot's log is a hardware report of the machine it ran on.
+   add their own facts the same way — every ACPI table and MADT entry, the FADT's flags, reset
+   register, century register and 8042 (administration Part E.3), each PCI function's capabilities
+   and what its driver did with it, the framebuffer's row padding, whether a UART answers at COM1 —
+   so every boot's log is a hardware report of the machine it ran on. The RTC reads its century
+   from the FADT's century register when there is one, and guesses 20 when there is not.
 4. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
    it. This is the first code to walk firmware structures and the first place a fault can
    happen, which is why the IDT is already live.
@@ -254,15 +256,22 @@ one process nothing else can construct:
   `docs/spec/device-node.md`), each partition's `/dev/disk/by-partuuid/*` and `by-partlabel/*`
   name, and `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12
   of § 3).
-- Spawn with exactly two handles — the notification channel and the namespace root.
+- Make the **system-control object** — the capability to stop the machine — and a handle to it
+  with `WRITE` and `INSPECT` and neither `DUPLICATE` nor `TRANSFER` (administration Part E.3,
+  [`power.md`](power.md)).
+- Spawn with exactly three handles — the notification channel in `rdi`, the namespace root in
+  `rsi`, and the system-control object in `rdx`.
 
-**init receives two handles and no more.** Everything else it obtains, it obtains by
+**init receives three handles and no more.** Everything else it obtains, it obtains by
 lookup in the namespace it was given, which is the capability model's opening move rather
-than an implementation detail.
+than an implementation detail. The third is the one thing a lookup must never yield: nothing
+binds it anywhere, and `init` cannot give it away.
 
 ## 5. init (pid 1)
 
-`_start(notif, root_ns, …)` in `userspace/init/src/main.rs`:
+`_start(notif, root_ns, system_control, …)` in `userspace/init/src/main.rs`, which first checks
+that `rdx` holds a system-control object and keeps it, saying `init: holds the system-control
+object`, then:
 
 1. **Read the manifest** — `/initramfs/etc/init.toml`, parsed into an ordered list of
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.

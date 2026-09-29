@@ -791,6 +791,92 @@ fn flush_test(root_ns: u64) -> bool {
     true
 }
 
+// === the power op, from a process without the object (administration Part E.3) ===================
+
+/// **`sys_power` from anything but `init` is refused**, and the machine goes on: with no handle,
+/// with a namespace this process may only look up in, and with a disk it may write — a `WRITE`
+/// handle, so it is the object's type that refuses it, not a missing right.
+///
+/// The halt it would otherwise be is what makes a wrong answer loud: the boot stops before the
+/// verdict, and `test-qemu` times out.
+fn power_refused_test(root_ns: u64) -> bool {
+    use libkern::{KError, POWER_HALT, RIGHT_WRITE, SYS_POWER};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: power FAIL: ").s(why).end();
+        false
+    };
+    // SAFETY: register-only syscall; refused before anything happens, which is the point.
+    let power = |h: u64| unsafe { syscall2(SYS_POWER, h, POWER_HALT) };
+    if power(0) != KError::InvalidHandle.as_i32() as i64 {
+        return fail(b"no handle was not refused InvalidHandle");
+    }
+    if power(root_ns) != KError::NoAccess.as_i32() as i64 {
+        return fail(b"a lookup-only namespace was not refused NoAccess");
+    }
+    // The root partition, as `flush_test` finds it: the installed disk's, or the live stick's.
+    let labels: [&[u8]; 2] = [b"nitrox-root", b"nitrox-live"];
+    let root = |records: alloc::vec::Vec<libkern::device::DeviceRecord>| {
+        records.iter().find(|r| labels.contains(&r.name())).and_then(|r| r.block_index())
+    };
+    let Some(index) = registry_records(root_ns).and_then(root) else {
+        return fail(b"no root partition in the registry");
+    };
+    let path = alloc::format!("/dev/blk/{index}");
+    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_WRITE);
+    if st != 0 || dev == 0 {
+        return fail(b"the root partition does not open read-write");
+    }
+    let refused = power(dev);
+    close(dev);
+    if refused != KError::InvalidArgument.as_i32() as i64 {
+        return fail(b"a writable disk was not refused InvalidArgument");
+    }
+    kprint(b"boot-probe: sys_power refused no handle, a namespace and a writable disk ok\n");
+    true
+}
+
+/// **A direct-handle bind needs `TRANSFER`** (PR #342 review), since every resolve of the binding
+/// mints a handle to the object for whoever asked. Without it, `init` could publish its
+/// system-control object, whose handle carries no `TRANSFER` so that it cannot leave `init`.
+///
+/// This process holds no such object, so it makes one of its own shape: a memory object's handle,
+/// duplicated without `TRANSFER`, is refused `NoAccess`, and the original, with it, is taken — in
+/// the same namespace, so the refusal is the right's and not the bind's.
+fn bind_needs_transfer_test() -> bool {
+    use libkern::{KError, RIGHT_INSPECT, RIGHT_MAP_READ, SYS_NS_BIND, SYS_NS_CREATE};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: bind FAIL: ").s(why).end();
+        false
+    };
+    // SAFETY: register-only syscall; it creates an object and touches no memory of ours.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    // SAFETY: as above.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if ns <= 0 || mem <= 0 {
+        return fail(b"no namespace or memory object to bind");
+    }
+    let (ns, mem) = (ns as u64, mem as u64);
+    // SAFETY: register-only syscall on a handle this process holds.
+    let kept = unsafe { syscall2(SYS_HANDLE_DUPLICATE, mem, RIGHT_MAP_READ | RIGHT_INSPECT) };
+    let bind = |at: &[u8], h: u64| {
+        // SAFETY: `at` is a valid path buffer; `ns` and `h` are handles this process holds.
+        unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, h, 0, 0) }
+    };
+    let refused = kept > 0 && bind(b"/kept", kept as u64) == KError::NoAccess.as_i32() as i64;
+    let taken = bind(b"/given", mem) == 0;
+    for h in [ns, mem, kept.max(0) as u64] {
+        close(h);
+    }
+    if !refused {
+        return fail(b"a handle without TRANSFER was not refused NoAccess");
+    }
+    if !taken {
+        return fail(b"a handle with TRANSFER was not bound");
+    }
+    kprint(b"boot-probe: a direct bind needs TRANSFER: refused without it, taken with it ok\n");
+    true
+}
+
 // === a resolve continued in another namespace (administration Part C.4) ===========================
 
 /// Reply `SUBNAMESPACE` to `request_id` on `ch`: the first `consumed` bytes of the suffix stand for
@@ -1363,6 +1449,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)
+        & power_refused_test(root_ns)
+        & bind_needs_transfer_test()
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
