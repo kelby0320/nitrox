@@ -2406,7 +2406,12 @@ and the session would end with the editor's process left to notice (*Left alone*
           manage" — names it. **Not `check-terminal`** (PR #345 review): its `nxterm` is a
           test-image service in `service-mgr`'s namespace, in no session, and `whoami` there fails
           by design.
-- [ ] **F.2 — the power menu, and Log out.**
+- [x] **F.2 — the power menu, and Log out.** *(Landed 2026-09-29. Three things differ from the
+      text below: **the waiting dialog is a popup hung under the power button**, as the menu is —
+      a `dialog` is held for the manager to place, and the manager is the shell — so it never
+      covers the editor's question, centred on the editor; **`check-logout` has a seventh step**, a
+      shutdown typed at a terminal, the one gate on the stop path's 3 s; and the editor's answer is
+      *discard*, not "Don't save". `desktop-session-mgr` now says "greeter presented again".)*
       - `IconKind::Power`, host-tested by painting and counting ink, as a present-but-invisible
         widget would otherwise pass.
       - The top bar's right-hand button, and `menu_anchor` hanging a menu from either edge.

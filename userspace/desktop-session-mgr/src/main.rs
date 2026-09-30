@@ -545,7 +545,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // Back to a login window. A fresh one rather than a retained one, for the reason
             // above — and its buffers with it, since the old window's are gone.
             match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
-                Some(id) => window = id,
+                Some(id) => {
+                    window = id;
+                    // **Said, as the first one is** (administration Part F.2): a logout from the
+                    // desktop's power menu is the first thing to end a graphical session and
+                    // leave the machine running, and `check-logout` waits for this.
+                    Line::new().s(b"desktop-session-mgr: greeter presented again, window ").u(id as u64).end();
+                }
                 None => fail(b"desktop-session-mgr: could not draw the greeter again\n"),
             }
             dirty = false;

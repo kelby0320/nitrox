@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod ending;
 pub mod panel;
 
 /// One graphical application, from a desktop entry under `/applications`.

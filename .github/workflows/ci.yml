@@ -247,6 +247,16 @@ jobs:
       - name: cargo xtask check-login --kvm
         run: cargo xtask check-login --kvm
 
+      # **Ending a session from the desktop** (administration Part F.2), on the release image as
+      # `check-login` is: the power menu's Log out asks every window to close, waits on the
+      # editor's question with the shell's dialog naming it, is cancelled, and then ends when the
+      # editor closes and the greeter comes back; one with nothing to ask ends at once; and a
+      # shutdown typed at a terminal asks the windows too and goes inside its supervisor's bound.
+      # Unconditional, for `check-login`'s reason: a session a person cannot leave is not a
+      # partial failure.
+      - name: cargo xtask check-logout --kvm
+        run: cargo xtask check-logout --kvm
+
       # **No serial port**, which is what the laptop Phase 5 targets has: the boot is read back
       # off the screen with the kernel console's own glyphs (from frames the gate-only
       # `fbcon-gate` kernel feature holds still, so sampling speed does not matter), the console

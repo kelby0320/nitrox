@@ -61,6 +61,7 @@ cargo xtask check-terminal # click into nxterm, type, and check the shell's answ
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
 cargo xtask check-images   # test vs release initramfs and root: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
+cargo xtask check-logout   # log out from the power menu: the editor's question, Cancel, the greeter
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
@@ -142,6 +143,15 @@ display arm exists for a person rather than for a test: everything else display-
 bottom-most — `service-mgr` brings the login chain up after the servers and before every other
 declared service, which is what keeps `check-display`'s reference windows undisturbed — so it holds
 no keyboard and nothing typed reaches it.
+
+`cargo xtask check-logout` is the **ending a session gate** (administration Part F.2), on the
+release image for `check-login`'s reason, and in CI's QEMU job. From the desktop's power menu, in
+one QEMU run: a **Log out** that asks every window to close and waits on the editor's "discard?"
+question, with the shell's waiting dialog naming it; **Cancel**, and the session goes on; Log out
+again and discard, and **the greeter comes back**; a logout with nothing to ask, which ends at
+once; and a **shutdown typed at a terminal**, which asks the windows too and has the shell gone
+inside its supervisor's bound. It aims at the power button and the dialogs' buttons from `chrome`,
+and chooses the menu's row by the keyboard.
 
 `cargo xtask check-fbcon` is the **no-serial-port gate** (Phase 5 Part B): the laptop Phase 5
 targets has no COM1, so the kernel draws everything COM1 receives on the screen until a client is

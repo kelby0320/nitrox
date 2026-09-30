@@ -90,7 +90,8 @@ use desktop_shell::{
     Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop,
     parse_entry,
 };
-use desktop_shell::panel::{self, BottomMsg, MenuMsg, TopMsg};
+use desktop_shell::ending::{Asked, Closing, Ending, Next};
+use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
 use libui::window::Child;
 use libui::paint::{FontMetrics, Theme, paint_over};
@@ -164,9 +165,9 @@ fn kprint(msg: &[u8]) {
 }
 
 /// **A shutdown asked this shell to stop** (administration Part E.4c): its session's supervisor
-/// passed the request on. The shell exits; what it launched is not asked in this part, and goes
-/// when the compositor it draws through is stopped (Part F's session menu is where asking them,
-/// with unsaved work in mind, belongs).
+/// passed the request on. Since Part F.2 the windows are asked to close first — the loop's
+/// `Asked::Stop`, bounded at `ending::STOP_WAIT_NS` with no dialog — and this is the exit once
+/// they have, or the bound has run out, or there was nothing to ask.
 fn stop() -> ! {
     kprint(b"desktop-shell: asked to stop, exiting\n");
     // SAFETY: terminating this process.
@@ -1980,7 +1981,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // arrows, Enter, Escape and Left/Right between the two menus behave as they do everywhere
     // else — and Left/Right is the only way to reach `Places` without a pointer.
     let mut bar = BarMenus {
-        state: MenuState::new(2),
+        // Three: Applications, Places, and the power menu (administration Part F.2), which Left
+        // and Right move between as a menu bar's do.
+        state: MenuState::new(3),
         win: None,
         query: TextFieldState::new(),
         programs: &programs,
@@ -1991,6 +1994,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // **The desktop-name prompt, a popup of its own** since the menu stopped being a modal it
     // could borrow.
     let mut prompt: Option<Child> = None;
+    // **A session end under way** (administration Part F.2): the windows asked to close, and the
+    // dialog naming what is left. `Closing` decides what happens; this loop asks and draws.
+    let mut closing: Option<Closing> = None;
+    let mut ending_win: Option<Child> = None;
+    // Where that dialog hangs: right-aligned under the power button, as the power menu does, so it
+    // never covers a question an application centred on its own window.
+    let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
     let mut name = TextFieldState::new();
     // The overview: its window, the thumbnails it is showing, and which one is being dragged.
     let mut overview: Option<u32> = None;
@@ -2045,7 +2055,34 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
         }
-        let deadline = if sent_request || session.events_pending() > 0 { 0 } else { next_tick };
+        // **Drive a session end** (administration Part F.2) before choosing how long to sleep: ask any
+        // window not asked yet — every one the first time, and one opened while the end waits — and
+        // do what `Closing` says, which may be a deadline of its own.
+        let mut ending_deadline = u64::MAX;
+        if let Some(c) = closing.as_mut() {
+            if let Some(m) = manager.as_mut() {
+                let windows: alloc::vec::Vec<(u32, alloc::string::String)> =
+                    entries.iter().map(|e| (e.id, entry_title(e))).collect();
+                for id in c.sync(&windows) {
+                    request_close(m, id);
+                    sent_request = true;
+                }
+            }
+            match c.next(now_ns().unwrap_or(u64::MAX)) {
+                Next::Wait { until } => ending_deadline = until,
+                Next::Dialog => {
+                    show_ending_dialog(&mut session, &mut ending_win, c, window, ending_anchor, &theme, &font)
+                }
+                Next::End(asked) => {
+                    if let Some(d) = ending_win.take() {
+                        d.close(&mut session);
+                    }
+                    end_session(asked);
+                }
+            }
+        }
+        let deadline =
+            if sent_request || session.events_pending() > 0 { 0 } else { next_tick.min(ending_deadline) };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
@@ -2084,8 +2121,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         };
         // SAFETY: single-threaded; set once at startup.
         let notif = unsafe { SHELL_NOTIF };
+        // **A stop asks the windows too** (administration Part F.2): every one is asked to close, and
+        // the shell goes once they have or after `STOP_WAIT_NS`, inside the leader's bound — with no
+        // dialog, since the machine is going down. It overrides a person's end already under way.
+        // With nothing to ask, or no clock to bound the wait with, it goes at once, as it did.
         if notif != 0 && stop_asked(notif) {
-            stop();
+            let Some(now) = now_ns().filter(|_| manager.is_some()) else { stop() };
+            if !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop)) {
+                if let Some(d) = ending_win.take() {
+                    d.close(&mut session);
+                }
+                kprint(b"desktop-shell: asked to stop; asking every window to close first\n");
+                closing = Some(Closing::begin(Asked::Stop, now));
+            }
         }
         // **Drained before the compositor's events**, so a `Switch` that changes what the bar
         // shows is reflected by the same iteration's redraw rather than the next one's.
@@ -2126,6 +2174,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 bar.id().unwrap_or(0),
                 prompt.as_ref().map_or(0, |c| c.id()),
                 wallpaper_window,
+                ending_win.as_ref().map_or(0, |c| c.id()),
             ];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
@@ -2575,6 +2624,18 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             launcher.launch(FOLDER_OPENER, &[p.path.as_str()]);
                         }
                     }
+                    // **The power menu** (administration Part F.2): begin ending the session. The
+                    // loop's top asks the windows and waits; a second choice while one is under
+                    // way changes nothing.
+                    Some(MenuMsg::End(ending)) => {
+                        if closing.is_none() {
+                            Line::new()
+                                .s(b"desktop-shell: ending the session: ")
+                                .s(panel::ending_title(ending).as_bytes())
+                                .end();
+                            closing = Some(Closing::begin(Asked::Person(ending), now_ns().unwrap_or(0)));
+                        }
+                    }
                     Some(MenuMsg::Nothing) | None => {}
                 }
                 // **Launched, then closed** — the modal's order, and the one a reader of the log
@@ -2582,6 +2643,54 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // consequence. `check-login` and `shot` read the two lines in this order.
                 if finished {
                     bar.close(&mut session);
+                }
+                continue;
+            }
+            // **The waiting dialog's own input** (administration Part F.2): End anyway, Cancel — its
+            // buttons, its close button, or Escape. **It is not dismissed by a press elsewhere**, as
+            // a menu is: the person is expected to press elsewhere, to answer an application's own
+            // question, and the dialog stays until it is answered or has nothing left to name.
+            if ending_win.as_ref().map(|c| c.id()) == Some(w) {
+                let mut chose = None;
+                match &event {
+                    libsurface::WindowEvent::Key(k) if k.pressed != 0 && k.keycode == KEY_ESC => {
+                        chose = Some(EndingMsg::Cancel);
+                    }
+                    libsurface::WindowEvent::Pointer(_) => {
+                        if let (Some(d), Some(c)) = (ending_win.as_mut(), closing.as_ref()) {
+                            let view = ending_view(c, d.hovered_key(), &theme);
+                            chose = d.route(&view, &font, &theme, &event).first().copied();
+                            if chose.is_none() {
+                                let view = ending_view(c, d.hovered_key(), &theme);
+                                d.present(&mut session, &view, &font, &theme);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                match chose {
+                    Some(EndingMsg::Cancel) => {
+                        if let Some(d) = ending_win.take() {
+                            d.close(&mut session);
+                        }
+                        closing = None;
+                        kprint(b"desktop-shell: ending the session cancelled; it goes on\n");
+                    }
+                    Some(EndingMsg::EndAnyway) => {
+                        if let (Some(c), Some(m)) = (closing.as_mut(), manager.as_mut()) {
+                            let left = c.end_anyway();
+                            Line::new()
+                                .s(b"desktop-shell: ending anyway, closing ")
+                                .u(left.len() as u64)
+                                .s(b" window(s)")
+                                .end();
+                            for id in left {
+                                insist_on_close(m, id);
+                            }
+                            sent_request = true;
+                        }
+                    }
+                    Some(EndingMsg::Nothing) | None => {}
                 }
                 continue;
             }
@@ -3148,7 +3257,6 @@ fn ask_to_close(
     window: u32,
     asked: &mut alloc::vec::Vec<(u32, u64)>,
 ) {
-    use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
     let now = now_ns();
     let armed = asked
         .iter()
@@ -3159,22 +3267,33 @@ fn ask_to_close(
         }
         return;
     }
-    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
-    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+    if !request_close(mgr, window) {
         return;
     }
-    let mut reply = [0u8; 64];
-    if mgr.request(OP_MGR_REQUEST_CLOSE, &body, None, &mut reply).is_err() {
-        Line::new().s(b"desktop-shell: RequestClose refused for window ").u(window as u64).end();
-        return;
-    }
-    Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
     // An expired entry for this window is replaced rather than joined: one window is being
     // asked about once, however many times the question has been put.
     asked.retain(|&(id, _)| id != window);
     if let Some(n) = now {
         asked.push((window, n.saturating_add(INSIST_WINDOW_NS)));
     }
+}
+
+/// **Ask a window's client to close it** — `Manage::RequestClose`, the polite half. `true` if the
+/// compositor forwarded it. The taskbar's ask ([`ask_to_close`]) and a session end
+/// (administration Part F.2) both come here.
+fn request_close(mgr: &mut ChannelTransport, window: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_REQUEST_CLOSE, &body, None, &mut reply).is_err() {
+        Line::new().s(b"desktop-shell: RequestClose refused for window ").u(window as u64).end();
+        return false;
+    }
+    Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
+    true
 }
 
 /// Destroy a window whose client did not answer — `Manage::Close`.
@@ -4867,7 +4986,7 @@ struct BarMenus<'a> {
     /// The home an application sees, which the places are written from.
     home: &'a str,
     /// Where each menu hangs, by index — see [`menu_anchors`].
-    anchors: [(i32, i32); 2],
+    anchors: [(i32, i32); 3],
 }
 
 impl BarMenus<'_> {
@@ -4883,8 +5002,11 @@ impl BarMenus<'_> {
 
     /// What the log calls the menu that is open — or was, for a line about closing it.
     fn what(&self) -> &'static str {
-        let which = self.win.as_ref().map(|(w, _)| *w).or(self.state.open());
-        if which == Some(panel::PLACES) { "places menu" } else { "applications menu" }
+        match self.win.as_ref().map(|(w, _)| *w).or(self.state.open()) {
+            Some(panel::PLACES) => "places menu",
+            Some(panel::POWER) => "power menu",
+            _ => "applications menu",
+        }
     }
 
     /// Close whatever is open, choosing nothing.
@@ -4950,7 +5072,9 @@ impl BarMenus<'_> {
         if which == panel::APPS {
             l.s(b"applications menu open, window ").u(id as u64).s(b" listing ").u(self.programs.len() as u64);
         } else {
-            l.s(b"places menu open, window ").u(id as u64);
+            // **Named by `what`**, which knows all three: a two-way branch here called the power
+            // menu the places menu (administration Part F.2).
+            l.s(self.what().as_bytes()).s(b" open, window ").u(id as u64);
         }
         l.end();
         self.win = Some((which, c));
@@ -4988,19 +5112,109 @@ impl BarMenus<'_> {
     }
 }
 
-/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`] and
-/// [`panel::PLACES`].
+/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`], [`panel::PLACES`]
+/// and [`panel::POWER`] — the last **right-aligned** under the power button, so it stays on the
+/// screen (administration Part F.2).
 ///
 /// **Read off a layout of the bar**, not written down: a word's position is a fact about the bar,
 /// and the menu hanging from it is the one thing that has to agree.
-fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 2] {
+fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 3] {
+    let view = panel::top_bar(clock, None, None, theme);
+    let metrics = FontMetrics::new(font, theme.font_px);
+    let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &metrics);
+    let fallback = (panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP);
+    let at = |key| libui::layout::locate(&view, &l, key).map_or(fallback, panel::menu_anchor);
+    let power = libui::layout::locate(&view, &l, panel::POWER_KEY).map_or(fallback, |word| {
+        panel::menu_anchor_right(word, popup_width(&panel::power_menu(), theme, &metrics))
+    });
+    [at(panel::APPS_KEY), at(panel::PLACES_KEY), power]
+}
+
+/// How wide `menu` draws as a popup — what a right-hung menu's anchor needs.
+fn popup_width(menu: &libui::menu::Menu<MenuMsg>, theme: &Theme, metrics: &FontMetrics<'_>) -> u32 {
+    let view = libui::menu::popup(menu, &MenuState::new(1), panel::ROW_KEY_BASE, None, theme);
+    libui::layout::measure(
+        &view,
+        libui::layout::Constraints::loose(libdraw::geom::Size::new(u32::MAX / 4, u32::MAX / 4)),
+        metrics,
+    )
+    .w
+}
+
+/// Where the waiting dialog hangs (administration Part F.2): right-aligned under the power button,
+/// as the power menu is, [`libui::widget::DIALOG_W`] wide.
+fn ending_anchor(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> (i32, i32) {
     let view = panel::top_bar(clock, None, None, theme);
     let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &FontMetrics::new(font, theme.font_px));
-    let at = |key| {
-        libui::layout::locate(&view, &l, key)
-            .map_or((panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP), panel::menu_anchor)
+    libui::layout::locate(&view, &l, panel::POWER_KEY).map_or(
+        (screen.width as i32 - libui::widget::DIALOG_W as i32 - panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP),
+        |word| panel::menu_anchor_right(word, libui::widget::DIALOG_W),
+    )
+}
+
+/// The waiting dialog as `c` has it now. A stop has no dialog, so only a person's end is drawn.
+fn ending_view(c: &Closing, hovered: Option<u64>, theme: &Theme) -> Element<EndingMsg> {
+    let ending = match c.asked() {
+        Asked::Person(e) => e,
+        Asked::Stop => Ending::LogOut,
     };
-    [at(panel::APPS_KEY), at(panel::PLACES_KEY)]
+    panel::ending_dialog(ending, &c.question(), hovered, theme)
+}
+
+/// **Bring the waiting dialog up, or draw it again** with what it names now (administration Part
+/// F.2). A popup of the top bar's, as the menus are, rather than a `dialog`: a dialog is held for
+/// the manager to place, and the manager is this shell, which would be waiting on itself. Its
+/// origin is logged, since `check-logout` aims at its buttons from it.
+fn show_ending_dialog(
+    session: &mut Session<ChannelTransport>,
+    win: &mut Option<Child>,
+    c: &Closing,
+    parent: u32,
+    at: (i32, i32),
+    theme: &Theme,
+    font: &Font,
+) {
+    if let Some(d) = win.as_mut() {
+        let view = ending_view(c, d.hovered_key(), theme);
+        d.present(session, &view, font, theme);
+        Line::new().s(b"desktop-shell: ").s(c.question().0.as_bytes()).end();
+        return;
+    }
+    let view = ending_view(c, None, theme);
+    let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
+        kprint(b"desktop-shell: waiting dialog CreateWindow FAILED\n");
+        return;
+    };
+    if !d.present(session, &view, font, theme) {
+        d.close(session);
+        return;
+    }
+    Line::new()
+        .s(b"desktop-shell: waiting dialog open, window ")
+        .u(d.id() as u64)
+        .s(b" at ")
+        .i(at.0 as i64)
+        .s(b",")
+        .i(at.1 as i64)
+        .s(b": ")
+        .s(c.question().0.as_bytes())
+        .end();
+    *win = Some(d);
+}
+
+/// **The session ends** (administration Part F.2), every window closed or ended anyway: the shell
+/// exits, and `desktop-session-mgr` does the rest — tells the broker, closes the namespace, and
+/// presents the greeter. A stop exits as it always has (E.4c).
+fn end_session(asked: Asked) -> ! {
+    if asked == Asked::Stop {
+        stop();
+    }
+    kprint(b"desktop-shell: logging out, exiting\n");
+    // SAFETY: terminating this process.
+    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Open the desktop-name prompt: above the bottom bar's right-hand end, where the desktop's name

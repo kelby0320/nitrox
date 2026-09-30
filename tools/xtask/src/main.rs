@@ -14,6 +14,7 @@
 //!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
 //!   check-login     boot the release image + drive the graphical greeter to a session
+//!   check-logout    log out from the desktop's power menu, waiting on the editor's question
 //!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
 //!   check-live      boot the live image as a USB stick with no disk; mount, greeter, and a write
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
@@ -120,6 +121,23 @@ mod chrome {
     pub const TAB_SIDE: i32 = 6;
     /// From one tab's left edge to the next's (`TAB_PITCH`): a tab and the pixel between them.
     pub const TAB_PITCH: i32 = 121;
+    /// **A `libui` dialog's size and its two buttons' centres** (`DIALOG_W`, `DIALOG_H`,
+    /// `DIALOG_LEFT_CX`, `DIALOG_RIGHT_CX`, `DIALOG_BUTTON_CY`): the editor's confirmation, which
+    /// `check-login` answers, and the shell's waiting dialog, which `check-logout` does
+    /// (administration Part F.2). Here since F.2, when a second gate aimed at them; they were
+    /// `check-login`'s locals.
+    pub const DIALOG_W: i32 = 340;
+    /// See [`DIALOG_W`].
+    pub const DIALOG_H: i32 = 132;
+    /// See [`DIALOG_W`]: the left button's centre — discard, End anyway.
+    pub const DIALOG_LEFT_CX: i32 = 89;
+    /// See [`DIALOG_W`]: the right button's centre — keep editing, Cancel.
+    pub const DIALOG_RIGHT_CX: i32 = 250;
+    /// See [`DIALOG_W`]: both buttons' vertical centre.
+    pub const DIALOG_BUTTON_CY: i32 = 106;
+    /// **How far in from the screen's right edge the power button is aimed at**: half its width,
+    /// `desktop_shell::panel::POWER_W` (administration Part F.2), whose own test presses here.
+    pub const POWER_FROM_RIGHT: i32 = 17;
 }
 
 /// **The file browser's own chrome, as the gates aim at it** — `nxfiles`'s metrics, copied on
@@ -377,6 +395,7 @@ fn main() -> ExitCode {
         "check-input",
         "check-terminal",
         "check-login",
+        "check-logout",
         "check-fbcon",
         "check-live",
         "check-storage",
@@ -463,6 +482,7 @@ fn main() -> ExitCode {
         Some("check-display") => cmd_check_display(accel, gate_size),
         Some("check-terminal") => cmd_check_terminal(accel, gate_size),
         Some("check-login") => cmd_check_login(accel, gate_size),
+        Some("check-logout") => cmd_check_logout(accel, gate_size),
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
         Some("check-storage") => cmd_check_storage(accel, gate_size),
@@ -509,6 +529,7 @@ fn print_help() {
            test-interactive  boot the release image and drive a real login + shell\n  \
            check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
            check-login       type a wrong then a right password at the graphical greeter\n  \
+           check-logout      log out from the power menu: an editor's question, Cancel, the greeter\n  \
            check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
@@ -5303,6 +5324,181 @@ fn limine_menu(w: u32, h: u32, rgb: &[u8]) -> Option<usize> {
 /// of the same fact, which is what an assertion is for.
 const STAGED_APPLICATIONS: usize = 3;
 
+/// `cargo xtask check-logout` — **ending a session from the desktop** (administration Part F.2),
+/// in CI's QEMU job.
+///
+/// On the **release image**, as `check-login` is: only there does the greeter hold the keyboard,
+/// and only after a real login does `desktop-shell` build a session a person can end. In one QEMU
+/// run:
+/// 1. log in at the greeter;
+/// 2. open the editor from the Applications menu, and type a key, so it has something to lose;
+/// 3. the power menu's **Log out**: the shell asks the editor's window to close, the editor asks
+///    whether to discard, and half a second later **the shell's waiting dialog names it**;
+/// 4. **Cancel**, and the session goes on — the Applications menu still opens;
+/// 5. Log out again, and **discard** in the editor's question, still up from step 3: the editor
+///    closes, the shell exits, and **the greeter comes back**;
+/// 6. log in again, open a terminal, and Log out: **nothing to ask**, so no waiting dialog, and the
+///    greeter comes back;
+/// 7. log in again, open the editor with a key typed into it and a terminal, and type
+///    `with power shutdown` there: **a shutdown started elsewhere asks the windows too** — the
+///    editor asks, no dialog comes, and the shell goes after its own 3 s, **inside its supervisor's
+///    5 s**, so no leader is left "still running after it was asked to stop"; then the machine
+///    halts. No other gate reaches this path: `check-shutdown` has no graphical session.
+///
+/// **Aimed, not measured**: the power button at `chrome::POWER_FROM_RIGHT` in from the right edge,
+/// the menu's row by the keyboard, and the dialogs' buttons at `chrome`'s published centres from
+/// the origins the shell logs — the rule every screen gate here keeps (M11 decision 2).
+fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Normal)?;
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp-logout.sock");
+    println!("xtask: logout gate — booting the release image…\n");
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-logout", &qmp_sock, size)?;
+    const APPS_CLICK: (i32, i32) = (60, 12);
+    let power_click = (size.w as i32 - chrome::POWER_FROM_RIGHT, 12);
+
+    // 1. Log in.
+    session.expect("desktop-session-mgr: greeter presented")?;
+    logout_gate_login(&mut qmp, &mut session, size)?;
+    println!("  ok: logged in at the greeter");
+
+    // 2. The editor, with a key typed into it.
+    let editor = logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
+    press(&mut qmp, "z")?;
+    session.expect("nxedit: buffer rev 1")?;
+    println!("  ok: the editor is open (window {editor}) with something to lose");
+
+    // 3. Log out: the editor asks, and the shell names it.
+    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    session.expect("desktop-shell: placed dialog ")?;
+    let placed = session.rest_of_line()?;
+    let (_, parent, qx, qy, _, _) = parse_dialog_placement(&placed)
+        .ok_or_else(|| format!("could not read the editor's question's placement from {placed:?}"))?;
+    if parent != editor {
+        return Err(format!("the question placed is on window {parent}, not the editor's {editor}").into());
+    }
+    let (wx, wy) = logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
+    println!("  ok: Log out asked the editor, which asked about its buffer, and the shell named it");
+
+    // 4. Cancel, and the session goes on.
+    click_at(&mut qmp, &mut session, wx + chrome::DIALOG_RIGHT_CX, wy + chrome::DIALOG_BUTTON_CY)?;
+    session.expect("desktop-shell: ending the session cancelled; it goes on")?;
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications menu open")?;
+    press(&mut qmp, "esc")?;
+    session.expect("desktop-shell: applications menu closed")?;
+    println!("  ok: Cancel kept the session");
+
+    // 5. Log out again, and discard: the greeter comes back.
+    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
+    click_at(&mut qmp, &mut session, qx + chrome::DIALOG_LEFT_CX, qy + chrome::DIALOG_BUTTON_CY)?;
+    session.expect("nxedit: discarding the unsaved buffer")?;
+    session.expect("desktop-shell: logging out, exiting")?;
+    session.expect("desktop-session-mgr: session ended (leader exit 0)")?;
+    session.expect("desktop-session-mgr: greeter presented again")?;
+    println!("  ok: once the editor closed, the session ended and the greeter came back");
+
+    // 6. Log in again; a terminal; Log out — nothing to ask.
+    logout_gate_login(&mut qmp, &mut session, size)?;
+    logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxterm")?;
+    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    let from = session.transcript().len();
+    session.expect("desktop-shell: logging out, exiting")?;
+    if session.transcript()[from..].contains("desktop-shell: waiting dialog open") {
+        return Err("a terminal, which closes when asked, still brought up the waiting dialog".into());
+    }
+    session.expect("desktop-session-mgr: greeter presented again")?;
+    println!("  ok: with nothing to ask, the session ended at once and the greeter came back");
+
+    // 7. A shutdown typed at a terminal, with the editor holding something to lose.
+    logout_gate_login(&mut qmp, &mut session, size)?;
+    logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
+    press(&mut qmp, "z")?;
+    session.expect("nxedit: buffer rev 1")?;
+    logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxterm")?;
+    type_at_terminal(&mut qmp, "with power shutdown")?;
+    session.expect("desktop-shell: asked to stop; asking every window to close first")?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    // **To the halt, then read back**: a shell that outlived its supervisor's bound never says it is
+    // exiting before the machine stops, so waiting for that line would time out rather than say why.
+    let from = session.transcript().len();
+    session.expect("It is now safe to turn off your computer.")?;
+    let after = &session.transcript()[from..];
+    if after.contains("desktop-shell: waiting dialog open") {
+        return Err("a shutdown started at a terminal brought up the waiting dialog".into());
+    }
+    if after.contains("desktop-shell is still running after it was asked to stop")
+        || !after.contains("desktop-shell: asked to stop, exiting")
+    {
+        return Err(
+            "the shell outlived its supervisor's bound: its own wait for the windows must end first".into(),
+        );
+    }
+    println!("  ok: a shutdown from a terminal asked the windows, waited without a dialog, and halted");
+    println!("\nxtask: logout gate PASSED — a logout waited for the editor's question, was cancelled, \
+              then ended; one with nothing to ask ended at once; and a shutdown asked the windows ✓");
+    Ok(())
+}
+
+/// Log in at the greeter as the demo account, and wait for the shell's bars.
+fn logout_gate_login(qmp: &mut Qmp, session: &mut Session, size: DisplaySize) -> R<()> {
+    type_at_greeter(qmp, session, DEMO_USER)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, DEMO_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect("desktop-session-mgr: login ok -> home=/home/alice")?;
+    session.expect("desktop-shell: up (graphical session leader)")?;
+    session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
+    Ok(())
+}
+
+/// Launch `program` from the Applications menu, and return its window's id once the shell has
+/// placed it and the screen has settled — so what is typed next reaches it.
+fn logout_gate_launch(qmp: &mut Qmp, session: &mut Session, apps: (i32, i32), program: &str) -> R<u32> {
+    click_at(qmp, session, apps.0, apps.1)?;
+    session.expect("desktop-shell: applications menu open")?;
+    type_into_menu(qmp, session, program)?;
+    press(qmp, "ret")?;
+    session.expect(&format!("desktop-shell: launched {program} into its own namespace"))?;
+    session.expect("desktop-shell: placed window ")?;
+    let placed = session.rest_of_line()?;
+    let (id, _, _) =
+        parse_placement(&placed).ok_or_else(|| format!("could not read {program}'s placement from {placed:?}"))?;
+    let _ = settle_and_capture(qmp, &build_cache().join("check-logout.ppm"))?;
+    Ok(id)
+}
+
+/// Open the power menu at `power` and choose its first row, Log out, by the keyboard.
+fn logout_gate_choose(qmp: &mut Qmp, session: &mut Session, power: (i32, i32)) -> R<()> {
+    click_at(qmp, session, power.0, power.1)?;
+    session.expect("desktop-shell: power menu open")?;
+    press(qmp, "down")?;
+    press(qmp, "ret")?;
+    session.expect("desktop-shell: ending the session: Log out")?;
+    Ok(())
+}
+
+/// Wait for the shell's waiting dialog, check what it says, and return its origin.
+fn logout_gate_waiting(session: &mut Session, says: &str) -> R<(i32, i32)> {
+    session.expect("desktop-shell: waiting dialog open, window ")?;
+    let line = session.rest_of_line()?;
+    // `<id> at <x>,<y>: <what it says>`
+    let (head, said) = line.split_once(": ").ok_or_else(|| format!("no text in {line:?}"))?;
+    if said.trim() != says {
+        return Err(format!("the waiting dialog says {:?}, not {says:?}", said.trim()).into());
+    }
+    let at = head.split_once(" at ").map(|(_, a)| a).ok_or_else(|| format!("no origin in {line:?}"))?;
+    let (x, y) = at
+        .split_once(',')
+        .and_then(|(x, y)| Some((x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?)))
+        .ok_or_else(|| format!("could not read the dialog's origin from {line:?}"))?;
+    Ok((x, y))
+}
+
 /// `cargo xtask check-fbcon` — **the boot is legible with no serial port at all** (Phase 5
 /// Part B).
 ///
@@ -8049,14 +8245,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     (This paragraph named two symbols that same part deleted — PR #268 review, worth
     //     fixing 2 — which is the drift the move was made to prevent, in the one place a
     //     compiler cannot see.)
-    const CONFIRM_W: i32 = 340;
-    const CONFIRM_H: i32 = 132;
+    const CONFIRM_W: i32 = chrome::DIALOG_W;
+    const CONFIRM_H: i32 = chrome::DIALOG_H;
     // **Moved by the desktop refresh's Part B** from (91, 249, 103): the dialog's content runs
     // flush to its border now, three pixels wider each side and three lower. `libui`'s pin moved
     // with them, in the same change.
-    const CONFIRM_DISCARD_CX: i32 = 89;
-    const CONFIRM_KEEP_CX: i32 = 250;
-    const CONFIRM_BUTTON_CY: i32 = 106;
+    const CONFIRM_DISCARD_CX: i32 = chrome::DIALOG_LEFT_CX;
+    const CONFIRM_KEEP_CX: i32 = chrome::DIALOG_RIGHT_CX;
+    const CONFIRM_BUTTON_CY: i32 = chrome::DIALOG_BUTTON_CY;
     // **And the editor's own size, `nxedit::START_SIZE`, because the geometry line cannot be
     // read this late.** The shell logs at most `MAX_LOGGED_GEOMETRY` of them per session and
     // this run passed that long ago — a bound that exists because the event is client-driven,
@@ -16677,6 +16873,11 @@ mod tests {
             ("TAB_W", chrome::TAB_W, w::TAB_W as i32),
             ("TAB_SIDE", chrome::TAB_SIDE, w::TAB_SIDE as i32),
             ("TAB_PITCH", chrome::TAB_PITCH, w::TAB_PITCH as i32),
+            ("DIALOG_W", chrome::DIALOG_W, w::DIALOG_W as i32),
+            ("DIALOG_H", chrome::DIALOG_H, w::DIALOG_H as i32),
+            ("DIALOG_LEFT_CX", chrome::DIALOG_LEFT_CX, w::DIALOG_LEFT_CX),
+            ("DIALOG_RIGHT_CX", chrome::DIALOG_RIGHT_CX, w::DIALOG_RIGHT_CX),
+            ("DIALOG_BUTTON_CY", chrome::DIALOG_BUTTON_CY, w::DIALOG_BUTTON_CY),
         ] {
             assert_eq!(gate, toolkit, "`chrome::{what}` is {gate}, the toolkit's is {toolkit}");
         }

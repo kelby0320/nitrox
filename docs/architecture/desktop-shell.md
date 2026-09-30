@@ -2,7 +2,9 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-22**, when the desktop refresh's Part E replaced the
+**Partly built, and checked 2026-09-29**, when administration Part F.2 gave the top bar a **power
+menu** at its right-hand end and taught the shell to **end its session**, closing its windows
+first (§4b). Before that, checked 2026-09-22, when the desktop refresh's Part E replaced the
 overview's thumbnail grid and desktop sidebar with the design's **cards per desktop**, and a
 click on a window in another desktop's card learned to switch there before raising it — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
@@ -224,12 +226,13 @@ compositor. That is the cheap option kept open rather than exercised.
 
 ## 4. The Applications and Places menus
 
-**Two words on the top bar, each opening a menu that hangs from it** (desktop refresh, Part C,
-which took the design's panels). `Applications` carries the design's accent dot; the clock is
-centred on the screen, not on what the words leave; the right-hand end the design gives quick
-settings and notifications is empty, because neither exists (§9). The bar is a `libui` `Child`
-like every application's window, so its words are routed and light under the pointer, and the
-menus hang from where a layout of the bar says the words are.
+**Two words on the top bar, each opening a menu that hangs from it** (desktop refresh, Part C, which
+took the design's panels), **and since administration Part F.2 a power button at its right-hand
+end** (§4b). `Applications` carries the design's accent dot; the clock is centred on the screen, not
+on what the words leave; the design gives the right-hand end quick settings and notifications, which
+do not exist (§9), and the power button is there instead. The bar is a `libui` `Child` like every
+application's window, so its words are routed and light under the pointer, and the menus hang from
+where a layout of the bar says the words are.
 
 It replaced the **applications modal**: a 320×240 popup at the bar's corner, a search field over a
 scrolling list. The design's menu is a menu, and following it literally would have lost the one
@@ -317,6 +320,44 @@ part that matters; which program it picks is data.
 answer would be about the *shell's* namespace rather than the caller's or the opener's — three
 namespaces that agree today only because one process builds all three. What the path turns out to
 be is reported by whatever opens it, in the window the person who asked is looking at.
+
+### 4b. The power menu, and ending the session
+
+**Built with administration Part F.2.** The top bar's right-hand end is a **power button** — the
+power symbol, `libui`'s `IconKind::Power`, lit as the words are — opening the **power menu**, hung
+right-aligned under it so it stays on the screen. It holds **Log out**; Restart and Shut down join
+it in F.3. The maintainer placed it there, departing from the design's `End session` row in the
+Applications menu. `Left` and `Right` move between it and the other two, as a menu bar's do.
+
+**Ending a session closes its windows first.** The decisions are `desktop_shell::ending`, which
+is host-tested; the loop asks and draws:
+1. The shell sends `Manage::RequestClose` to every **normal** window it manages — every desktop's,
+   whoever opened it — and to any opened while it waits. **Never to a dialog**: a dialog is its
+   parent's to answer for, and `nxedit` reads a manager's close on its question as *keep editing*.
+2. Each client closes, or asks its own question: the editor's *discard unsaved changes?*.
+3. **Half a second in**, with any still open, the **waiting dialog** comes up: a popup hung under
+   the power button as the menu is — a `dialog` would be held for the manager to place, and the
+   manager is this shell — naming how many are left and the first two by title, with **End
+   anyway** and **Cancel**. It stays until answered; a press elsewhere, to answer the editor,
+   does not dismiss it.
+4. **Cancel** keeps the session: nothing more is asked, and what was asked stays asked. **End
+   anyway** sends `Manage::Close` to every window still open.
+5. With none left, **Log out** is the shell exiting. `desktop-session-mgr` reaps it, tells the
+   view broker the session ended, closes the namespace, and presents the greeter again — the
+   first thing to end a graphical session and leave the machine running.
+
+**A shutdown started elsewhere** — `with power shutdown` in a terminal, or on the serial console —
+reaches the shell as a terminate request (administration Part E.4c). It asks every window the same
+way and exits once they have or after **3 s of its own, with no dialog**: inside the 5 s
+`libsession::spawn_leader` gives a leader, whose clock starts before the shell hears of the stop,
+so the supervisor never gives up on the shell first. A question an application raised then goes
+unanswered, and the machine stops.
+
+**What it does not do**: kill a process. End anyway destroys a window, and a program that goes on
+without its window runs until the machine stops, as one that ignores its session's end does.
+
+`check-logout` gates all of it, in CI: a logout that waits on the editor's question, one cancelled,
+one completed, one with nothing to ask, and a shutdown typed at a terminal.
 
 ## 5. What the shell settled about the toolkit
 

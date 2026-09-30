@@ -1262,13 +1262,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 // A dismissal is a popup's event; this window is not one.
                 WindowEvent::Dismissed => {}
-                // **Answered by exiting, and the unsaved buffer goes with it.** An editor with
-                // somewhere to put a question would ask it — that is what a `CloseRequested`
-                // rather than a destruction is *for* — and this one has no dialog to ask in.
-                // Naming the gap is the honest half; the confirmation belongs with the rest of
-                // the editor's second pass, which M12 owns.
+                // **Answered as the close button is**: `Msg::Close`, which closes a window with no
+                // unsaved buffer and **asks** about one that has — the confirmation dialog, M12
+                // Part A — rather than letting the buffer go. That is what a `CloseRequested`
+                // rather than a destruction is *for*, and it is what a logout from the desktop's
+                // power menu waits on (administration Part F.2). This comment said the editor
+                // "has no dialog to ask in" from M12 until F.2; its library had one all along.
                 WindowEvent::CloseRequested => {
-                    kprint(b"nxedit: asked to close, exiting\n");
+                    kprint(b"nxedit: asked to close\n");
                     app.update(Msg::Close);
                 }
                 // **Somebody dragged a file onto this window** (M10 Part E). Routed by position

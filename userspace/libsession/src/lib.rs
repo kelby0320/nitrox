@@ -99,7 +99,9 @@ static STOP_ASKED: AtomicBool = AtomicBool::new(false);
 
 /// How long a session's leader has, once asked to stop, before its supervisor goes on without it.
 /// Shorter than `service-mgr`'s bound on the supervisor itself, 10 s, which must cover it.
-const LEADER_STOP_NS: u64 = 5_000_000_000;
+/// **Public, because a leader's own wait must fit inside it** — `desktop-shell`'s for its windows
+/// (administration Part F.2), whose host test compares the two.
+pub const LEADER_STOP_NS: u64 = 5_000_000_000;
 
 /// **Whether this process has been asked to stop** (administration Part E.4c). A supervisor asks
 /// after a session ends, and exits rather than prompting again: a shutdown is under way.

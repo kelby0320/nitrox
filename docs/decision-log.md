@@ -31745,3 +31745,90 @@ The full local gate set, 34, is green (fgb47), `check-install` among them: it as
 installer session's disks reaching the terminal it opens.
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.2: the power menu, and Log out
+
+The top bar's right-hand end is a **power button**, opening a **power menu** with **Log out**.
+Ending a session asks every window to close first, waits on any question one asks, and names
+what is left in a dialog with End anyway and Cancel. It is the first way to end a graphical
+session and leave the machine running.
+
+**The pieces:**
+- **`IconKind::Power`** in `libui`: a ring open at the top with a bar down to its centre, drawn a
+  pixel at a time in doubled coordinates, like the window controls beside it.
+  - Its box rounds to even so the two-pixel bar has a centre. **Only this glyph rounds**, so the
+    title-bar controls keep the box they had.
+  - Its test reads the shape back from a painted framebuffer, in terms the other glyphs fail.
+  - **The first version of the test passed a closed ring.** A closed ring's top row is inked only
+    where the bar is, so "nothing in the top row's outer thirds" held either way. The gap shows a
+    row down, two pixels either side of the bar, and the test reads it there. The control that
+    drew no gap passed the first version and fails this one.
+- **The power menu**: the bar's third menu, hung right-aligned (`menu_anchor_right`) so it stays
+  on the screen.
+  - Log out alone until F.3, by the refresh's rule that a row doing nothing is worse than none.
+  - The bar's open line had two branches and called it "places menu open". It is named by
+    `BarMenus::what` now, which knows all three.
+- **`desktop_shell::ending`**, pure and host-tested: which windows are still open, when the dialog
+  comes up, what it says, and when the session may end.
+  - **Every normal window is asked** — every desktop's, and any opened while the end waits — and
+    **never a dialog**, the PR #345 review's finding.
+  - **The dialog comes up at half a second**, and is drawn again only when what it names changes.
+  - **A stop waits 3 s with no dialog.** Its test compares that against `libsession`'s
+    `LEADER_STOP_NS`, made public for it, rather than a literal 5.
+- **The waiting dialog is a popup under the power button**, not a `dialog` and not centred:
+  - **A `dialog` is held for the manager to place.** The manager is this shell, which would be
+    placing a window it is waiting on.
+  - Under the power button, where the menu was, it never covers the question an application
+    centres on its own window.
+  - It is `libui`'s fixed question, two lines and two buttons, so its buttons land at the
+    published centres.
+  - **It is not dismissed by a press elsewhere**, as a menu is, because answering the editor is
+    exactly a press elsewhere.
+- **Log out is the shell exiting.** `desktop-session-mgr` already handled a leader that exits. It
+  now says **"greeter presented again"**, since only the first greeter was announced.
+- **A stop asks the windows too.** The terminate path that exited at once (E.4c) now asks and
+  goes after 3 s, or at once with nothing to ask.
+- **`nxedit`'s comment on `CloseRequested`** said it had "no dialog to ask in" from M12 on, and
+  its library had one. Its log line said "asked to close, exiting" and then asked about the
+  buffer. Both are corrected.
+
+**`check-logout`**, new in CI, on the release image, in one QEMU run:
+1. log in;
+2. open the editor and type into it;
+3. Log out: the editor asks, and the shell's dialog names it;
+4. Cancel, and the session goes on;
+5. Log out again, discard in the editor, and the greeter comes back;
+6. log in, open a terminal, and Log out: no dialog, and the greeter comes back;
+7. log in, open the editor with a key typed and a terminal, and type `with power shutdown`: the
+   editor asks, no dialog comes, and the machine halts without the supervisor finding the shell
+   "still running". **Beyond the plan**, and the one gate on the stop path: `check-shutdown` has
+   no graphical session.
+
+Its aims — the power button, and a `libui` dialog's size and button centres — moved into
+`chrome`, where `the_gates_chrome_table_is_the_toolkits` pins them. They had been `check-login`'s
+locals, and `check-login` now reads them from `chrome` too.
+
+**Controls, each failing:**
+- **A dialog at once fails at step 3**, not at step 6's check: the dialog comes up before the
+  editor's question, and the ordered expectations time out.
+- **A terminal a second slow to close fails step 6's own check**: "a terminal, which closes when
+  asked, still brought up the waiting dialog".
+- **A stop wait of 6 s fails step 7's own check.** Step 7 first timed out waiting for the shell's
+  exit line, which never comes when the machine halts first. It now waits for the halt and reads
+  back.
+- **A Cancel that does nothing fails step 4.**
+- In the host tests: the ending's timings, End anyway, the named-and-counted question, and the
+  panel's button, menu, anchor and dialog aims.
+
+**Under TCG** the gate passes too, twice. Step 6 depends on a terminal closing inside half a
+second, and it did.
+
+**Docs:**
+- `desktop-shell.md` §4 and a new §4b, and its Status;
+- `graphical-session.md` §4, and its Status;
+- `qemu-integration-tests.md`'s screen gates, and `desktop-refresh.md`'s `End session`;
+- the root `CLAUDE.md` and the plan.
+
+The local gate set grows to 36 with `check-logout` and its `--kvm` run, and is green (fgb48).
+
+No kernel change; no ABI hash impact.

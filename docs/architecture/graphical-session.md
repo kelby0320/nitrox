@@ -5,19 +5,19 @@
 **Built, and checked 2026-09-29** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
 revision 2. On 2026-09-29 administration Part E.4c made both supervisors and their leaders end when
 a shutdown asks (§4), and Part F.1 had `desktop-shell` build applications' namespaces with
-`libsession`, which gave them `/session/user` (§6). On 2026-09-28 administration Part E.1a moved the
-servers from `init`'s children to `service-mgr`'s (§3's diagram), and Part E.1b handed the
-supervisors `service-mgr`'s routes to them in place of the servers' own endpoints. On 2026-09-25
-administration Part D.1 made `auth-service` the user database's writer as well as its verifier (§1,
-§2), and Part C.6 gave sessions and applications `/storage` and `/dev/storage`, through a session
-endpoint of the storage service's that each supervisor resolves itself and the shell receives as its
-eighth extra. On 2026-09-24 Part B.4 gave them `/dev/devices` through an info-only endpoint, and
-§3's diagram was brought up to what each supervisor is now handed. Two things changed under it
-before that: the session namespace also binds `/applications`, which is where the Applications
-menu's entries come from (M14 Part H), and §3 records why an *application's* namespace deliberately
-does not; and the desktop refresh's Part D restyled the greeter's card and moved its pure half — the
-state, the keys it acts on itself and the view — into a library beside the binary, so the host tests
-it.
+`libsession`, which gave them `/session/user` (§6), and Part F.2 a way to log out (§4). On
+2026-09-28 administration Part E.1a moved the servers from `init`'s children to `service-mgr`'s
+(§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them in place of the
+servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service` the user
+database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and applications
+`/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
+supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
+them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+supervisor is now handed. Two things changed under it before that: the session namespace also binds
+`/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
+records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
+restyled the greeter's card and moved its pure half — the state, the keys it acts on itself and the
+view — into a library beside the binary, so the host tests it.
 
 What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
 `/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,
@@ -315,9 +315,17 @@ request, and where it finds one decides what happens:
   exits rather than presenting a login again.
 
 The leaders honour it. `nxsh` exits from its prompt, and while a command runs it asks the command's
-stages to stop, as an interrupt does, and exits once they have unwound. `desktop-shell` exits. The
-programs `desktop-shell` launched are not asked: they go when the compositor stops, and asking
-them, with unsaved work in mind, is Part F's session menu.
+stages to stop, as an interrupt does, and exits once they have unwound. **`desktop-shell` asks its
+windows to close first** (administration Part F.2): every normal window, then out after 3 s of its
+own with no dialog, inside the 5 s above. Until F.2 it exited at once and left them to go with the
+compositor.
+
+**A person ends a graphical session from the power menu** (administration Part F.2): **Log out**,
+at the top bar's right-hand end. `desktop-shell` asks every window to close, waits on any question
+one asks — naming what is left in a dialog with End anyway and Cancel — and exits once none is
+left. The supervisor then does what it does at any session's end, and presents the greeter again:
+the first way to end a graphical session and leave the machine running. See
+[`desktop-shell.md`](desktop-shell.md) §4b.
 
 **Step 1 is not a trivial difference.** `session-mgr` opens its prompt's `Tty` the way any
 program does, and closes it at session end as the revocation point. `desktop-session-mgr` must be
