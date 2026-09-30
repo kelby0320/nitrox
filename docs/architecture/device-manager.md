@@ -2,7 +2,8 @@
 
 **Status: built — administration Part B, B.1–B.5, 2026-09-24; `block` owned by the storage service
 since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a, the info-only
-endpoint reached through its route since E.1b; last checked 2026-09-28.** What exists:
+endpoint reached through its route since E.1b; the installer session's rebinding gone since Part
+G.3; last checked 2026-09-30.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -156,10 +157,11 @@ the same fix to come. The manager holds no syscaps and binds nothing; `service-m
 
 - **`eshell`'s `lsblk`** reads `/dev/registry`, since the recovery shell runs in the root
   namespace. It prints each block device's path, kind, size and name.
-- **`libsession::rebind_block_devices`** hands disks to an installer session or a view. It reads
-  the registry when its source has one, which is the root namespace, where `/dev/blk` is one
-  kernel-server binding whose children no enumeration can see. Otherwise it reads the source's own
-  `/dev/blk/<n>` bindings, which is `desktop-shell` rebinding an installer session's disks.
+- **`libsession::rebind_block_devices_except`** hands disks to a view: the broker's `disks` grant,
+  and since administration Part G.3 the only way a disk reaches a program. It reads the registry of
+  its source, the root namespace, where `/dev/blk` is one kernel-server binding whose children no
+  enumeration can see. Until G.3 it also read a session's own `/dev/blk/<n>` bindings, for
+  `desktop-shell` to pass an installer session's disks on; no session holds one now.
 - **`nxinstall`** lists its own namespace, in which what it may write is exactly what is bound.
   Since administration Part G.2 it also reads `/dev/devices/all.tsm` beside the storage service's
   table, to say why a disk the machine has is not in its view: which partitions are the disk's, and
@@ -177,7 +179,7 @@ counter. `libfs::ns_children` still reports a kernel server's subtree as one bin
 | `test-interactive` | The manager mints the info-only endpoint before the first login. In a serial session, `list /dev/devices` names the disk and both input devices, a `filter kind == "disk"` prints the disk's model, and `/dev/devices/block` and `/dev/registry` open nothing |
 | `check-login` | The graphical session has `/dev/devices`, and each application namespace the shell builds reaches it |
 | `check-live` | `/dev/devices` lists the live image's module as a `ramdisk`, the one RAM disk any gate has |
-| `check-install` | `desktop-shell` rebinds an installer session's disks from the session's own bindings, and `nxinstall` finds them by listing its namespace |
+| `check-install` | The view broker's `disks` grant hands `with admin nxinstall` the devices not in use — the pristine root and the ESP module, and the target once it is unmounted — and `nxinstall` finds them by listing its namespace. The session itself holds none (administration Part G.3) |
 | `check-input`, with and without `--no-ps2-irq` | Unchanged — and every key and click in them is now read from a node the manager handed over; the events themselves never pass through it |
 
 `eshell` is reached only when the critical path fails, so no gate runs `lsblk`. It was checked on a

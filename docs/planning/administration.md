@@ -1,17 +1,19 @@
 # Administration: views, devices, and the tools an installed system needs
 
-**Status: in progress — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C complete
-(2026-09-25), Part D complete (2026-09-25), Part E detailed (2026-09-28) and in progress — E.1a
-built the same day; scoped 2026-09-22 and revised after the PR #326 review.** Scheduled after [the
-desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope and the
-architecture below were agreed with the maintainer on 2026-09-22. The review then found that several
-mechanisms depend on things the code does not have, and **the maintainer took the four resolutions
-that needed a decision the same day** (the last item under *Decisions*). **Part A has had its detail
-pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B** (*Part B in
-detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D** (*Part D in
-detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*, 2026-09-28) and is
-being built, E.1a first; the other parts are sketched. The plan began as a stub on 2026-09-16, written while
-building the installer — the first program that needed authority an ordinary session cannot have.
+**Status: complete (2026-09-30) — Part A complete (2026-09-23), Part B complete (2026-09-24), Part C
+complete (2026-09-25), Part D complete (2026-09-25), Part E complete (2026-09-29), Part F complete
+(2026-09-29), Part G complete (2026-09-30); scoped 2026-09-22 and revised after the PR #326
+review.** The paragraph below is the plan's history as it was written, not its state. Scheduled
+after [the desktop refresh](desktop-refresh.md), which is complete, and before Phase 6. The scope
+and the architecture below were agreed with the maintainer on 2026-09-22. The review then found that
+several mechanisms depend on things the code does not have, and **the maintainer took the four
+resolutions that needed a decision the same day** (the last item under *Decisions*). **Part A has
+had its detail pass** (*Part A in detail*, below) **and is built (2026-09-23)**, as is **Part B**
+(*Part B in detail*, 2026-09-24), as are **Part C** (*Part C in detail*, 2026-09-25) and **Part D**
+(*Part D in detail*, 2026-09-25). **Part E has had its detail pass** (*Part E in detail*,
+2026-09-28) and is being built, E.1a first; the other parts are sketched. The plan began as a stub
+on 2026-09-16, written while building the installer — the first program that needed authority an
+ordinary session cannot have.
 
 ## Scope
 
@@ -508,7 +510,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       building application namespaces in the same vocabulary; the graphical prompt's design
       written down, with its trigger; and, handed on by Part E, **a power menu** — Log out,
       Restart, Shut down — that **closes a session's windows first**.
-- [ ] **G — the installer, the broker's first client** — *detailed below, G.1–G.3 (2026-09-30).*
+- [x] **G — the installer, the broker's first client** — *detailed below, G.1–G.3 (2026-09-30);
+      complete 2026-09-30, and with it the phase.*
       (Decided 2026-09-17.) **The installer's boot
       entry stays** — it is still the one that loads the 33 MiB installable ESP, which is H.1's
       reasoning and still sound — **but its session stops being special**. It becomes an ordinary
@@ -2743,7 +2746,17 @@ Each keeps `check-install` passing: it is on demand, but in the local gate set.
         administrator, and `/home/<name>` has its folders, with no `/home/alice`;
       - the second boot's greeter refuses `alice`, and logs the new account in;
       - neither password in the transcript.
-- [ ] **G.3 — every session ordinary, and a reinstall.**
+- [x] **G.3 — every session ordinary, and a reinstall.** *(Landed 2026-09-30, as drawn. Three
+      things beyond it:
+      - **`check-live` asserts the absence positively**: `nxinstall` in its serial session says "no
+        block devices in this view", and nothing on the boot was handed a disk. Its old check
+        matched the words "installer session", which nothing prints any more, so it would have
+        passed on anything;
+      - **`libsession::block_indices` hands on nothing from a source with no registry.** Reading
+        a namespace's own bindings was for `desktop-shell` to pass a session's disks on;
+      - **`check-install` reads the pristine root's `/dev/blk` index off the storage service's
+        report**, since the target's partitions number the devices, and its step 7 checks that
+        the grant, not the session, filled the view.)*
   - Removed: `installer_boot`, the marker, `cmdline: install`, the supervisors' `bind_blk`,
     `desktop-shell`'s pass-through, `block_device_count` and `NamespaceSpec::bind_blk`.
   - **`check-install` reinstalls**: its target is a copy of the release disk, holding an install,
@@ -2762,7 +2775,7 @@ Each keeps `check-install` passing: it is on demand, but in the local gate set.
     - `check-images`: the live initramfs differs from the release one in `etc/init.toml` alone;
     - **every gate**, since no session hands out a disk now;
     - **`check-install`**, the reinstall.
-- [ ] **Docs.**
+- [x] **Docs.**
   - `session-and-auth.md`, `device-manager.md` and `boot-flow.md` describe the installer session.
   - `storage.md`: a `nitrox-source` partition is not auto-mounted. Its gate rows for `nxinstall`'s
     refusals change too: `check-login` 9a2's `/dev/blk/0` is now refused as the running system,

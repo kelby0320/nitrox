@@ -176,20 +176,24 @@ second Limine module, which the kernel publishes as a RAM disk — attached as a
 the AHCI controller empty, so no storage driver is involved: the laptop's first boot, before there
 is a USB driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
-timer tick instead of its own interrupt takes 3 s or more), and that a serial login writes under
-`/home`. It runs in CI's QEMU job.
+timer tick instead of its own interrupt takes 3 s or more), that a serial login writes under
+`/home`, and that the session reaches no disk — none does on any entry since administration Part
+G.3. It runs in CI's QEMU job.
 
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
-`check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
-menu entry with a blank disk attached, and drives the path a person takes on the laptop — Limine's
-menu, the **graphical** greeter, a terminal from the Applications menu, and `with admin nxinstall`
-typed at the shell in it, answering the installer's questions for the new machine's first account
-(administration Part G.2). Nothing reads the terminal's grid (a release image deliberately does not
-narrate it), so what it asserts on **in the guest** is the kernel log: the ESP module that entry
-alone loads with the pristine root beside it, which the storage service leaves unmounted and the
-installer copies from, the six devices the session and then the shell hand on, and the milestones a
-destructive operation records. It also aims the installer at the RAM disk holding the running root,
-named correctly, and asserts nothing was installed to it.
+`check-resolutions`: two boots, and a 512 MiB disk image. **It is a reinstall** (administration Part
+G.3): the disk is a copy of the release disk, grown to 512 MiB, so it holds an install. The first
+boot boots the live image's third menu entry with that disk attached, and drives the path a person
+takes on the laptop — Limine's menu, the **graphical** greeter, a terminal from the Applications
+menu, and `with admin nxinstall` typed at the shell in it. Nothing reads the terminal's grid (a
+release image deliberately does not narrate it), so what it asserts on **in the guest** is the
+kernel log: the ESP module that entry alone loads with the pristine root beside it, which the
+storage service leaves unmounted and the installer copies from; the disk's older install
+auto-mounted read-only; a session that holds no disk, and a view the `disks` grant filled; the
+target refused as in use, `with admin disk --unmount nitrox-root` freeing it, and the install
+proceeding; the installer's questions for the new machine's first account answered (Part G.2); and
+the milestones a destructive operation records. It also aims the installer at the pristine root, a
+RAM disk, named correctly, and asserts nothing was installed to it.
 
 **Then it carves the root partition off the written disk and checks it on the host**, which is where
 H.2's claims live — a boot proves the filesystem works and says nothing about its size, and H.1's
@@ -440,6 +444,7 @@ Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem
 (`docs/planning/desktop-refresh.md`), adopting a polished design, and then **administration**
 (`docs/planning/administration.md`) — elevation and the tools an installed system needs. The
 refresh is first because the admin tools are UI surfaces. **The refresh is complete as of
-2026-09-22** — all eleven parts, A–K — so administration is the current work. Phases are **not renumbered**: the
-numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
+2026-09-22** — all eleven parts, A–K — and **administration as of 2026-09-30**, all seven parts,
+A–G, the last being an installer that runs in an ordinary session as the view broker's client.
+Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
 portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

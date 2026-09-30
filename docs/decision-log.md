@@ -32254,3 +32254,75 @@ echoed into a desktop terminal's grid, and nothing reads the grid.
 - the root `CLAUDE.md`, `deferred-decisions.md`, the plan and `implementation-plan.md`.
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Administration Part G.3: every session ordinary, and the phase complete
+
+No session holds a disk now, on any boot entry. The installer runs as `with admin nxinstall` and
+reaches its disks through the view broker's `disks` grant. `check-install` reinstalls onto a disk
+that holds an install. With it **Part G is complete, and so is administration**, all seven parts.
+
+**Removed:**
+- The live stick's `cmdline: install`, and the `etc/install-allowed` marker that made the word mean
+  something. `check-images` now holds the live initramfs to the release one but for `etc/init.toml`
+  alone.
+- From `libsession`:
+  - `installer_boot` and its two readers;
+  - `NamespaceSpec::bind_blk` and `Built::disks`;
+  - `block_device_count`, the plain `rebind_block_devices`, and `session_has_blk`.
+
+  `rebind_block_devices_except`, the broker's grant, stays. Its doc now says it is the one way a
+  disk reaches a program.
+- The two supervisors' `bind_blk`, and `desktop-shell`'s pass-through of a session's disks into
+  every application.
+- **`block_indices`' second source.** It read a namespace's own bindings when there was no
+  registry, which was for `desktop-shell` to pass a session's disks on. A source with no registry
+  now hands on nothing.
+
+**`check-install` is a reinstall.**
+- **The target** is a copy of the release disk, grown to 512 MiB. At 128 MiB the installed root is
+  one block group (PR #347 review). The old install's primary GPT still finds `nitrox-root`, and
+  the storage service auto-mounts it read-only.
+- **The gate asserts, in order:**
+  - the auto-mount;
+  - a session holding no disk;
+  - the target refused as in use, with the grant's line proving the view was filled by the grant;
+  - the pristine root refused as a RAM disk. Its index is read off the storage service's report,
+    since the target's partitions now number the devices;
+  - `with admin disk --unmount nitrox-root`, and the storage service's `unmounted nitrox-root`;
+  - then G.2's install and account, the host checks, and the second boot.
+- **`install_gate_with_admin` takes the program**, since `disk` goes through it too.
+- **One mistake before the first run.** An `expect` for the grant's line, placed after
+  `started`, would have waited for the *next* grant: the broker logs the grant before `started`,
+  and `expect` consumes what it scans. The gate reads the transcript for that line instead.
+
+**`check-live` asserts the absence positively.** Its check matched the words "installer session",
+which nothing prints now, so it would have passed on any boot. It now runs `nxinstall` in its
+serial session and expects "no block devices in this view", and finds no namespace on the boot
+handed a disk.
+
+**Controls:**
+- **A `disks` grant that withheld nothing** fails `check-install` at step 7. The installer never
+  refused the target, since the target was in its view.
+- The two G.2 controls, and the ones on the source and the storage service from G.1, stand as
+  they were.
+
+**Docs:**
+- `session-and-auth.md`: no exception now;
+- `boot-flow.md`: the install entry carries modules, not authority;
+- `device-manager.md`, and `session-mgr/CLAUDE.md`;
+- the root `CLAUDE.md`: `check-install`, `check-live`, and the Status — administration complete;
+- the plan: G.3, the Docs box, Part G and its Status line;
+- `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.
+
+**What the phase built**, for whoever reads this next:
+- views, and a broker that grants them;
+- a device manager with coldplug;
+- storage: write-back, and mounts;
+- accounts;
+- services, power, the clock and the log;
+- the desktop's power menu;
+- an installer that is the broker's client and makes a machine its own administrator.
+
+Phase 6, USB, is next. Its plan already carries what this phase deferred to it.

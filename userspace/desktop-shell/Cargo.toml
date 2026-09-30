@@ -26,10 +26,10 @@ libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
 # **The namespace builder** (administration Part F.1): an application's namespace is built from
 # the same `NamespaceSpec` the login supervisors build a session's from, so the two cannot drift
-# apart again — `/session/user` had. With it `block_device_count`, which says once whether this is
-# an installer session whose disks an application gets, and `LEADER_STOP_NS`, which the ending's
-# test holds the shell's own stop wait inside. The shell takes nothing else from this crate: it is
-# not a supervisor of sessions. (Until F.1, `rebind_block_devices` was all it took.)
+# apart again — `/session/user` had. With it `LEADER_STOP_NS`, which the ending's test holds the
+# shell's own stop wait inside. The shell takes nothing else from this crate: it is not a supervisor
+# of sessions. (Until F.1, `rebind_block_devices` was all it took; until G.3, `block_device_count`
+# too, to pass an installer session's disks on.)
 libsession = { path = "../libsession" }
 # `io` for `session::Dir`: the Applications menu reads /applications as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }

@@ -132,14 +132,13 @@ from the same `NamespaceSpec`, with `/applications` and the console off and `/de
 - `/dev/services` — `service-mgr`'s table of services (administration Part E.2b);
 - `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
-- **on an installer boot only**, the machine's block devices, each bound individually with its
-  `info` snapshot (Phase 5 Part H.1).
+- **never the machine's block devices.** From Phase 5 Part H.1 until administration Part G.3 an
+  installer boot's session held every one; now a program reaches a disk only through the view
+  broker's `disks` grant, as `with admin nxinstall` does.
 
-The last is the conditional member that matters most, and it is a design decision like every
-other: it is selected by the live image's own boot-menu entry, never by an installed system's
-ordinary login, and it is what the view broker's `disks` grant gives instead. Both server bindings **share** init's
-registration rather than minting a rival — the kernel's bind-mount semantics, one server
-connection under many names.
+The absence is the member that matters most, and it is a design decision like every other. Both
+server bindings **share** init's registration rather than minting a rival — the kernel's bind-mount
+semantics, one server connection under many names.
 
 That list is the sandbox. Nothing else is reachable: not `/system`, not `/store`, not
 `/initramfs`. Adding a member is granting every session that authority, so it is a design

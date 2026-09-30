@@ -1,7 +1,8 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-30,
-when the installer began writing an installed machine's user database — administration Part G.2;
+when the installer session went and every session became ordinary — administration Part G.3 —
+and the installer began writing an installed machine's user database — Part G.2;
 before that 2026-09-28, when each session gained `/dev/services`, `service-mgr`'s table of services — administration Part
 E.2b; earlier that day, when `service-mgr` began starting and binding `auth-service` — Part E.1a;
 before that 2026-09-25, when `account` arrived — administration Part D.4; earlier that day, when the
@@ -76,8 +77,8 @@ Every arrow only ever *attenuates* authority. `BIND_NAMESPACE` is concentrated i
 three supervisors (init, service-mgr, session-mgr — the v5.1 concentration) and
 reaches no leaf. The user shell holds **empty** syscaps and a namespace that names
 only its session's resources, so it cannot *name* another user's home — there is nothing to deny.
-`/dev/blk` is in that set only for an installer session, which the live image's own boot entry
-selects; see § the session namespace below.
+`/dev/blk` is in no session's set: a program reaches a disk only through the view broker's
+`disks` grant (administration Part G.3); see § the session namespace below.
 
 This is the same supervisor-mediated shape used everywhere else in the system
 ([why-supervisor-registration](../rationale/why-supervisor-registration.md)): a leaf
@@ -224,17 +225,15 @@ Deliberately **absent**: other users' homes, admin resources, the raw filesystem
 `/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
 namespace construction, not permission denial."
 
-**The one exception, since Phase 5 Part H.1: an installer session.** The live image's third
-boot-menu entry passes `install` on the kernel command line; a session built on *that* boot is
-handed the machine's block devices (each device and its `info` snapshot, bound individually — a
-supervisor cannot re-bind the `/dev/blk` kernel server), and `desktop-shell` passes them on to the
-programs it launches, because on a machine with no serial port the graphical session is the only
-way to log in. Nothing else grants them: an ordinary live boot and an installed system build the
-namespace above, and `check-live` asserts that an ordinary boot's transcript never mentions an
-installer session. The view broker (administration Part A) does not construct this namespace: it
-copies the caller's own and adds a profile's grants, and the `disks` grant *is* this binding, per
-device — which is what lets the installer run from an ordinary session under `with admin` (Part G). The user shell is then spawned with this
-namespace (`SpawnArgs.namespace`; the child receives a LOOKUP-only handle to it) and
+**No exception.** From Phase 5 Part H.1 until administration Part G.3 there was one: the live
+image's third boot-menu entry passed `install` on the kernel command line, and a session built on
+that boot was handed the machine's block devices, which `desktop-shell` passed on to the programs it
+launched. **Now every session is built as above, on every entry**, and the installer runs as `with
+admin nxinstall` (Part G): the view broker copies the caller's namespace and adds a profile's
+grants, and the `disks` grant binds each device not in use, with its `info` snapshot, one at a time
+— a supervisor cannot re-bind the `/dev/blk` kernel server. `check-live` asserts a live boot's
+session finds no disk, and that nothing on the boot was handed one. The user shell is then spawned
+with this namespace (`SpawnArgs.namespace`; the child receives a LOOKUP-only handle to it) and
 **empty `SysCaps`** — a fully unprivileged leaf.
 
 ### Subtree scoping

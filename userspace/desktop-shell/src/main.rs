@@ -703,10 +703,9 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// - **`/dev/devices`, `/storage`, `/dev/storage` and `/dev/services`**, the session's own binds of
 ///   info-only endpoints: none reaches a class, a mount or a start.
 /// - **`/session/user`**, since F.1: who the session is for, as the session has it.
-/// - **The session's disks, in an installer session alone** (PR #308 review, blocking 1): rebound
-///   from the session's namespace, which is why that is the spec's `root_ns`. Without it an
-///   installer typed at a desktop terminal finds no disk, and on the laptop there is no other way
-///   in.
+/// - **No disks.** A program reaches one only through the view broker's `disks` grant, as `with
+///   admin nxinstall` does (administration Part G.3). Until then an installer session's disks were
+///   rebound into every application from here.
 ///
 /// `None` if the namespace could not be built with what it cannot do without.
 fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
@@ -720,7 +719,6 @@ fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
         user: l.user.as_bytes(),
         bind_fonts: true,
         bind_console: false,
-        bind_blk: l.disks,
         views_endpoint: l.views,
         views_base: l.views_base.as_bytes(),
         devices_endpoint: l.devices,
@@ -1076,8 +1074,6 @@ struct Launcher<'a> {
     /// The session's user, bound as `/session/user` in an application's namespace (administration
     /// Part F.1). Empty binds nothing.
     user: &'a str,
-    /// Whether the session has disks — an installer session — so an application gets them too.
-    disks: bool,
     /// The environment record an application reads its `HOME` from.
     env: &'a libstream::wire::Record,
     /// Whether a namespace this shell builds actually gates. False disables launching outright.
@@ -1113,18 +1109,6 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
         return false;
     };
     let app_ns = built.ns;
-    // **The disks, if this session has any** (Phase 5 Part H.1), which the builder rebinds from the
-    // session's namespace: an installer boot's, handed over deliberately. See
-    // [`build_app_namespace`] for why an application gets them.
-    if built.disks > 0 {
-        Line::new()
-            .s(b"desktop-shell: ")
-            .u(built.disks as u64)
-            .s(b" block device(s) into ")
-            .untrusted(program.as_bytes())
-            .s(b"'s namespace (installer session)")
-            .end();
-    }
     if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0, !l.user.is_empty()) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
@@ -1696,11 +1680,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
     };
 
-    // **Who the session is for, and whether it has disks**, read once from the session's own
-    // namespace (administration Part F.1): an application gets the one as `/session/user`, and the
-    // other only on an installer boot. Neither changes while the session lasts.
+    // **Who the session is for**, read once from the session's own namespace (administration Part
+    // F.1): an application gets it as `/session/user`. It does not change while the session lasts.
     let user = session_user(session_ns);
-    let disks = libsession::block_device_count(session_ns) > 0;
     let mut launcher = Launcher {
         session_ns,
         draw: draw_endpoint,
@@ -1716,7 +1698,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         services: services_endpoint,
         home,
         user: &user,
-        disks,
         env: &env,
         enabled: false,
     };

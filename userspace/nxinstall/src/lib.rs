@@ -45,9 +45,9 @@ pub const LOGICAL_BLOCK: u32 = 512;
 /// leading zero but `0` itself, so one device has one spelling (administration Part B.5).
 ///
 /// **The installer lists what its namespace holds** rather than probing `/dev/blk/0`, `1`, … for
-/// the first miss. It runs in a view (`with admin nxinstall`) or an installer session's
-/// application namespace, and in both, what it may write is exactly what is bound — so the
-/// listing is the whole answer, and a view granted one disk has a gap the probe stopped at.
+/// the first miss. It runs in a view (`with admin nxinstall`), where what it may write is exactly
+/// what the `disks` grant bound — so the listing is the whole answer, and a view granted one disk
+/// has a gap the probe stopped at.
 pub fn block_index(name: &str) -> Option<usize> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) || (bytes.len() > 1 && bytes[0] == b'0') {

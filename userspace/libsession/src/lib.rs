@@ -144,9 +144,8 @@ fn kprint(msg: &[u8]) {
 /// identity". The view broker derives a view from its caller's namespace and builds nothing from
 /// a recipe.
 pub struct NamespaceSpec<'a> {
-    /// The namespace direct handles and disks are resolved from: the supervisor's own — the root
-    /// namespace — for a session, and **the session's** for an application, whose disks are the
-    /// session's to pass on.
+    /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
+    /// for a session, and **the session's** for an application.
     pub root_ns: u64,
     /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
     pub fs_endpoint: u64,
@@ -200,19 +199,6 @@ pub struct NamespaceSpec<'a> {
     /// into a windowed session costs. The serial column binds it because the console *is* its
     /// terminal.
     pub bind_console: bool,
-    /// Bind `/dev/blk` into the session, so it can read and write **whole disks** (Phase 5
-    /// Part H.1).
-    ///
-    /// **False for every ordinary session, and that is the sandbox.** A session with this can
-    /// overwrite any disk in the machine, including the one it booted from; the omission of
-    /// `/dev/blk` is what makes a login safe rather than any check inside a program.
-    ///
-    /// `true` only for an **installer session**, which the live image starts from its own
-    /// boot-menu entry and which exists to write a disk. When elevation arrives
-    /// (`docs/planning/administration.md`) a broker will construct exactly this namespace after
-    /// authenticating, and nothing here changes: the authority is a binding a supervisor made,
-    /// which is what that phase is for.
-    pub bind_blk: bool,
     /// The view broker's, bound at `/dev/views` with
     /// [`views_base`](Self::views_base) as its subtree base. `0` binds nothing — a boot where
     /// the broker did not start, whose sessions simply have no `with`.
@@ -296,9 +282,6 @@ pub struct Built {
     pub devices: bool,
     /// `/storage` and `/dev/storage` both bound.
     pub storage: bool,
-    /// How many block devices were rebound from `root_ns`: `0` unless [`NamespaceSpec::bind_blk`]
-    /// asked, and the source had some.
-    pub disks: usize,
     /// `/dev/desktop` bound.
     pub desktop: bool,
 }
@@ -464,8 +447,8 @@ pub fn views_close_session(sup: u64, id: u64) {
 /// e.g. `/home/alice`): a fresh namespace binding the user's home subtree of the
 /// fs-server at `/home` (RW) and the console at `/dev/console` (so the shell has I/O).
 /// Deliberately **omits** everything else (other homes, the raw fs root) — absence is the
-/// sandbox. `/dev/blk` is omitted too unless [`NamespaceSpec::bind_blk`] asks for it, which only
-/// an installer session does. Proves `BIND_NAMESPACE` + subtree scoping + shared-
+/// sandbox. `/dev/blk` is omitted too, for every session: a program reaches a disk only through the
+/// view broker's `disks` grant (administration Part G.3). Proves `BIND_NAMESPACE` + subtree scoping + shared-
 /// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
 /// `root_ns` is session-mgr's inherited namespace (to resolve the console).
 ///
@@ -475,7 +458,6 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     let Some(b) = build(spec) else { return 0 };
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe {
-        SESSION_HAS_BLK = b.disks > 0;
         SESSION_HAS_BIN = b.bin;
         SESSION_HAS_TTY = b.tty;
         SESSION_HAS_CONSOLE = b.console;
@@ -502,7 +484,6 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         user,
         bind_fonts,
         bind_console,
-        bind_blk,
         views_endpoint,
         views_base,
         devices_endpoint,
@@ -849,23 +830,6 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
             has_console = true;
         }
     }
-    // **The disks, one at a time** (Phase 5 Part H.1), for an installer session only.
-    //
-    // `/dev/blk` is a *kernel-server* binding and `sys_ns_bind` binds endpoints and direct
-    // handles — a supervisor cannot re-bind a kernel server, and the first draft of this tried
-    // to, which a boot answered with "not in this supervisor's namespace". So the supervisor
-    // resolves each device and binds **it**, which is finer-grained than the registry anyway:
-    // what a session gets is the devices this code decided to hand it, which is the shape the
-    // elevation broker will want when it grants one disk rather than all of them
-    // (`docs/planning/administration.md`).
-    //
-    // Each device's `info` leaf is a snapshot object, so it is resolved once here and bound
-    // beside its device. Device facts do not change while a machine runs — a disk does not
-    // become a partition — and nothing here supports hot-plug.
-    let disks = if bind_blk { rebind_block_devices(root_ns, ns) } else { 0 };
-    if bind_blk && disks == 0 {
-        kprint(b"libsession: installer session asked for disks and found none\n");
-    }
     // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application (M8 Part F): the
     // desktops, named. No base. Non-fatal: an application without it still draws.
     let mut has_desktop = false;
@@ -887,51 +851,30 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         views: has_views,
         devices: has_devices,
         storage: has_storage,
-        disks,
         desktop: has_desktop,
     })
 }
 
-/// **How many block devices `ns` holds**, read as [`rebind_block_devices`] reads them.
-/// `desktop-shell` asks this of its session once, since only an installer session has any, and
-/// passes them on to what it launches only then (administration Part F.1).
-pub fn block_device_count(ns: u64) -> usize {
-    block_indices(ns, &[]).len()
-}
-
-/// Hand every block device reachable from `from_ns` to `to_ns`, with its `info` snapshot, and
-/// return how many were bound.
+/// **Hand every block device `from_ns`'s registry lists to `to_ns`, leaving out the devices whose
+/// registry ids are in `withheld`**, each with its `info` snapshot, and return how many were bound
+/// — the view broker's `disks` grant (administration Part C.6), and since Part G.3 the only way a
+/// disk reaches a program. The broker asks the storage service what is in use — a mounted
+/// filesystem's device, `init`'s included, and the disk that holds it — and hands on the rest: a
+/// raw write to a mounted filesystem's device, or to the disk under it, would land underneath a
+/// live server.
 ///
 /// **A supervisor cannot re-bind `/dev/blk` itself**: it is a *kernel-server* binding and
 /// `sys_ns_bind` takes endpoints and direct handles, which a boot answered with "not in this
-/// supervisor's namespace" the first time this was tried. So each device is resolved and bound
-/// individually — finer-grained than the registry, and the shape an elevation broker will want
-/// when it grants one disk rather than all of them (`docs/planning/administration.md`).
+/// supervisor's namespace" the first time this was tried (Phase 5 Part H.1). So each device is
+/// resolved and bound individually, which is also what lets one be withheld.
 ///
-/// **Three callers, two kinds of source** (`userspace/CLAUDE.md` on where a helper lives once it
-/// has two): a session manager hands the devices to an installer session and the view broker to a
-/// view, both from the root namespace; and `desktop-shell` hands an installer session's on to the
-/// applications it launches — from the session's namespace, where each device is a binding of its
-/// own and there is no registry. [`block_indices`] reads whichever the source has. Without the
-/// shell's step the disks reach the shell and nothing a person can type into — and on the laptop,
-/// where there is no serial port, the graphical session is the only way to log in at all (PR #308
-/// review, blocking 1).
+/// **Only a source with a registry can withhold**, since the ids are the registry's, and only one
+/// with a registry hands anything on. The broker's source is the root namespace, which has one.
+/// Until Part G.3 a session manager handed an installer session every disk, and `desktop-shell`
+/// passed a session's on from its own bindings; no session holds a disk now.
 ///
 /// Each device's `info` is a snapshot object, resolved once and bound beside its device: device
 /// facts do not change while a machine runs.
-pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
-    rebind_block_devices_except(from_ns, to_ns, &[])
-}
-
-/// [`rebind_block_devices`], **leaving out the devices whose registry ids are in `withheld`**
-/// (administration Part C.6): the view broker's `disks` grant, which asks the storage service what
-/// is in use — a mounted filesystem's device, `init`'s included, and the disk that holds it — and
-/// hands on the rest. A raw write to a mounted filesystem's device, or to the disk under it, would
-/// land underneath a live server.
-///
-/// **Only a source with a registry can withhold**, since the ids are the registry's: a namespace
-/// holding its devices as bindings has no way to say which is which. The broker's source is the
-/// root namespace, which has one. `withheld` empty is `rebind_block_devices`.
 pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -> usize {
     let mut bound = 0;
     for n in block_indices(from_ns, withheld) {
@@ -982,7 +925,7 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
     bound
 }
 
-/// Take back what [`rebind_block_devices`] bound into `ns`: each `/dev/blk/<n>` and its `info`.
+/// Take back what [`rebind_block_devices_except`] bound into `ns`: each `/dev/blk/<n>` and its `info`.
 /// Returns how many devices were unbound.
 ///
 /// **The view broker's, for a session that ended** (`docs/planning/administration.md` § Part A).
@@ -1012,22 +955,17 @@ pub fn unbind_block_devices(ns: u64) -> usize {
 /// The `/dev/blk/<n>` indices `ns` can reach, ascending (administration Part B.5), less the
 /// devices whose registry ids are in `withheld` (Part C.6).
 ///
-/// **From the registry where `ns` has one** — the root namespace, where `/dev/blk` is one
-/// kernel-server binding whose children no enumeration can see — **and otherwise from `ns`'s own
-/// bindings**: a session, a view and an application namespace are each handed their devices one
-/// binding at a time, and deliberately have no registry. Only the first can withhold, since the
-/// ids are the registry's.
+/// **From the registry** — the root namespace's, where `/dev/blk` is one kernel-server binding
+/// whose children no enumeration can see. A source with no registry yields nothing: since
+/// administration Part G.3 nothing hands on a namespace's own bindings, which is what reading
+/// them was for.
 fn block_indices(ns: u64, withheld: &[u32]) -> alloc::vec::Vec<u32> {
-    match registry_blocks(ns) {
-        Some(blocks) => {
-            let mut out: alloc::vec::Vec<u32> =
-                blocks.iter().filter(|(id, _)| !withheld.contains(id)).map(|&(_, n)| n).collect();
-            out.sort_unstable();
-            out.dedup();
-            out
-        }
-        None => bound_block_indices(ns),
-    }
+    let Some(blocks) = registry_blocks(ns) else { return alloc::vec::Vec::new() };
+    let mut out: alloc::vec::Vec<u32> =
+        blocks.iter().filter(|(id, _)| !withheld.contains(id)).map(|&(_, n)| n).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The block devices `/dev/registry` lists, as `(registry id, /dev/blk index)`. `None` if `ns` has
@@ -1095,77 +1033,6 @@ fn blk_path(n: u32, info: bool) -> alloc::string::String {
     if info { alloc::format!("/dev/blk/{n}/info") } else { alloc::format!("/dev/blk/{n}") }
 }
 
-/// Whether this boot asked for an **installer session**: the word `install` on the kernel's
-/// command line, read from `/proc/cmdline`.
-///
-/// **One reader for both columns.** The serial and graphical session managers each build
-/// namespaces and each must make the same decision; two copies of "does the line contain
-/// `install`" is two places for it to drift. The kernel does not interpret the word — it serves
-/// the line and this looks for it (Phase 5 Part H.1).
-///
-/// A word, not a substring: `installer-notes` on the line is not a request to install.
-///
-/// **And the word alone is not enough.** The kernel serves the command line to every image alike,
-/// so an installed machine whose firmware menu lets somebody type one would otherwise hand them a
-/// session holding every disk. The live image carries `/initramfs/etc/install-allowed` and a
-/// release image does not — `check-images` holds both to that — so the word is the request and the
-/// file is the permission (PR #308 review, optional 7). The detail pass said this should be data;
-/// this is the data.
-pub fn installer_boot(root_ns: u64) -> bool {
-    if !image_allows_install(root_ns) {
-        return false;
-    }
-    cmdline_says_install(root_ns)
-}
-
-/// Whether this image permits an installer session at all: the live image's marker file.
-fn image_allows_install(root_ns: u64) -> bool {
-    let (st, obj) = ns_lookup(root_ns, b"/initramfs/etc/install-allowed", RIGHT_MAP_READ);
-    if st != 0 || obj == 0 {
-        return false;
-    }
-    // SAFETY: closing our own handle; the file's contents are not read — its existence is the
-    // answer, and the initramfs is the image's own data.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, obj) };
-    true
-}
-
-/// Whether the kernel's command line carries the word `install`.
-fn cmdline_says_install(root_ns: u64) -> bool {
-    let (st, mem) = ns_lookup(root_ns, b"/proc/cmdline", RIGHT_MAP_READ);
-    if st != 0 || mem == 0 {
-        return false;
-    }
-    // One page is more than any bootloader's line; a longer one is cut, and a word cut in half
-    // does not match.
-    const MAX: usize = 4096;
-    // SAFETY: the leaf answers with a read-only object of the line's length.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, MAX as u64, RIGHT_MAP_READ) };
-    if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        return false;
-    }
-    // SAFETY: `addr` maps `MAX` readable bytes; the tail past the line is zero.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, MAX) };
-    let found = bytes
-        .split(|b| b.is_ascii_whitespace() || *b == 0)
-        .any(|word| word == b"install");
-    // SAFETY: our own mapping and handle.
-    unsafe {
-        syscall3(SYS_MEMORY_UNMAP, addr as u64, MAX as u64, 0);
-        syscall1(SYS_HANDLE_CLOSE, mem);
-    }
-    found
-}
-
-/// Whether the last-built session namespace got `/dev/blk` — an installer session, and nothing
-/// else. Read for the log line and by the gate that asserts an ordinary session does *not*.
-pub fn session_has_blk() -> bool {
-    // SAFETY: single-threaded session-mgr.
-    unsafe { SESSION_HAS_BLK }
-}
-
 /// Whether the last-built session namespace got its `/bin`. Read only for the log line —
 /// nothing branches on it.
 pub fn session_has_bin() -> bool {
@@ -1173,8 +1040,6 @@ pub fn session_has_bin() -> bool {
     unsafe { SESSION_HAS_BIN }
 }
 
-/// Set by [`build_session_namespace`]; see [`session_has_blk`].
-static mut SESSION_HAS_BLK: bool = false;
 /// Set by [`build_session_namespace`]; see [`session_has_bin`].
 static mut SESSION_HAS_BIN: bool = false;
 
