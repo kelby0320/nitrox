@@ -1127,8 +1127,8 @@ impl Broker {
                 let _ = libfs::remove_tree(root_ns, home.as_bytes(), &mut |_, _| {});
             }
         };
-        // **The folders a person's files go in** (`TODO(home-folders)`, resolved here for every
-        // home an administrator adds): the same three `nxfiles`' sidebar offers.
+        // **The folders a person's files go in**, for every home an administrator adds: the same
+        // three `nxfiles`' sidebar offers. The installer makes them for the first account.
         for folder in libfs::HOME_FOLDERS {
             let dir = libfs::join(home.as_bytes(), folder.as_bytes());
             if libfs::mkdir(root_ns, dir.as_bytes()).is_err() && !libfs::is_dir(root_ns, dir.as_bytes()) {

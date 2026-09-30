@@ -2200,7 +2200,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if let Some((ch, e)) = powering
             && !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop))
         {
-            let heard = match libviews::ipc::recv(ch) {
+            let heard = match libprompt::ipc::recv(ch) {
                 Ok(Some((librsproto::views::OP_VIEWS_EXITED, _, _, body))) => {
                     let (code, crashed) = librsproto::views::parse_exited(&body).unwrap_or((1, true));
                     Some((code == 0 && !crashed).then_some(()).ok_or_else(|| Refusal::exited(code, crashed)))
@@ -2211,7 +2211,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             match heard {
                 None => {}
                 Some(Ok(())) => {
-                    libviews::ipc::close(ch);
+                    libprompt::ipc::close(ch);
                     powering = None;
                     Line::new()
                         .s(b"desktop-shell: ")
@@ -2220,7 +2220,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         .end();
                 }
                 Some(Err(r)) => {
-                    libviews::ipc::close(ch);
+                    libprompt::ipc::close(ch);
                     powering = None;
                     show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font);
                 }
@@ -5385,7 +5385,7 @@ fn power_refusal(session_ns: u64) -> Option<Refusal> {
         return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
     }
     let answer = libviews::decide(ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
-    libviews::ipc::close(ch);
+    libprompt::ipc::close(ch);
     match answer {
         Ok((outcome, why)) => Refusal::from_answer(outcome, why),
         Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
@@ -5410,7 +5410,7 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
         return Err(failure(failed::NO_BROKER));
     }
     let Some(built) = build_app_namespace(l) else {
-        libviews::ipc::close(ch);
+        libprompt::ipc::close(ch);
         return Err(failure(failed::NO_NAMESPACE));
     };
     // **Verified as a launch's is**, by the process that built it: that `shutdown`'s view cannot
@@ -5418,8 +5418,8 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
     let (home, desktop, devices, storage, user) =
         (!l.home.is_empty(), l.desktop != 0, l.devices != 0, l.storage != 0, !l.user.is_empty());
     if !verify_app_namespace(built.ns, home, desktop, devices, storage, user) {
-        libviews::ipc::close(built.ns);
-        libviews::ipc::close(ch);
+        libprompt::ipc::close(built.ns);
+        libprompt::ipc::close(ch);
         kprint(b"desktop-shell: application namespace is not gated; not asking the broker\n");
         return Err(failure(failed::NO_NAMESPACE));
     }
@@ -5442,7 +5442,7 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
         Ok((Outcome::Denied { .. }, why)) => Refusal::Refused(why),
         Err(f) => failure(f.why()),
     };
-    libviews::ipc::close(ch);
+    libprompt::ipc::close(ch);
     Err(refusal)
 }
 

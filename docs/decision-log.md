@@ -32183,3 +32183,74 @@ would grant it, and that ends in G.3.
 - the plan and `implementation-plan.md`.
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Administration Part G.2: the installer in a view, and the first account
+
+`with admin nxinstall` names every disk it cannot have and says why. After the confirmation it
+asks for the new machine's first account on its terminal. The installed root then holds that
+account alone, the seeded policy making it the administrator, and its home.
+
+**The pieces:**
+- **`libprompt`**, a crate of its own.
+  - It holds `coreutils::prompt`, now with a line prompt, and the scrubbing plumbing that was
+    `libviews::ipc`. `with`, `account` and `nxinstall` prompt with it. `libviews` and
+    `desktop-shell` speak through its `ipc`.
+  - `outcome()`, which parses a Views answer, stayed with the broker's client as
+    `libviews::outcome`.
+  - **The password prompts log a receipt once echo is off** (`ask_password_then`,
+    `ask_new_password_then`), one per read. Echo goes back on between the two reads, so a gate
+    that typed both copies after one receipt could echo the second into the grid.
+- **`view_broker::policy::seed(name)`**, the build's policy as a function. The build calls it
+  naming the demo account, and the installer naming the first account. A host test holds it to
+  making its one account the one administrator.
+- **`nxinstall`**:
+  - **`nxinstall::withheld`**, host-tested: from `/dev/devices` and `/dev/storage`'s tables, the
+    disks the machine has and the view does not, and why. One the storage service mounted comes
+    with `with admin disk --unmount <label>`; one `init` mounted holds the running system. The
+    lines go to `stderr`, and naming such a disk as the target is refused with the same reason.
+  - **The account, after the confirmation.** It asks a name, which must pass `libusers`' rule,
+    then a password twice. It logs a receipt for each question, and a cancelled or wrong answer
+    writes nothing. A program with no terminal is refused before anything is written.
+  - **`copy_tree` passes over `/home`'s contents, `/system/users` and `/system/views.toml`.**
+    `put_file` and `put_dir` then write the one record under a fresh salt, the seeded policy, and
+    `/home/<name>` with `libfs::HOME_FOLDERS`. **`TODO(home-folders)` is resolved.**
+  - It logs `the first account is <name>, its administrator`, and never the password.
+- **`check-install`**:
+  - runs `with admin nxinstall` for its refusal and its install, typing the live account's password
+    after the broker's audit receipt;
+  - answers the account's questions after each receipt;
+  - on the host, finds `/system/users` holding the one account, the policy making it the one
+    administrator, and `/home` holding its home alone with the three folders;
+  - on the second boot, which now has a QMP socket, sees `alice` refused and the new account let
+    in;
+  - finds neither password in either transcript.
+- **The listing's new messages, in three other gates:**
+  - `check-login` 9a2 expects `/dev/blk/0` to be refused as the running system;
+  - `test-interactive` 20b(a) expects "no block devices in this view";
+  - `test-interactive` 20b(d) reads the serial terminal, where `stderr` shows beside the table. So
+    "the table is unchanged" did not keep it passing. It now requires every line naming a withheld
+    device to be that device's message, and `/dev/blk/0`'s message to be present.
+
+**Controls, each failing its gate:**
+- **The copy entering `/home`**: `check-install` says "/home holds [alice, dana]".
+- **The seed naming `alice`**: "the installed policy makes [alice] administrators".
+- **No messages for withheld disks**: `test-interactive` says "did not say /dev/blk/0 holds the
+  running system". The first run of this control failed earlier, on the reworded no-disks line,
+  which proved nothing. The step was fixed and the control run again.
+
+**One visible consequence.** The first account's home has the three folders and no theme or
+wallpaper, as Part D decided for every new home. So an installed machine's first desktop is the
+built-in theme on its ground colour, where the build's demo home carries the photograph.
+
+**Not observable by a gate:** a receipt logged before echo was off. What it risks is a password
+echoed into a desktop terminal's grid, and nothing reads the grid.
+
+**Docs:**
+- `nxinstall`'s module doc, and `libviews`' and `coreutils`' crate docs;
+- `userspace/CLAUDE.md`'s layering;
+- `views-toml-schema.md`: a machine's first policy is the seed;
+- `session-and-auth.md`: an installed machine's user database;
+- `storage.md`'s gate rows, `boot-flow.md`, `device-manager.md` and `graphical-prompt.md`;
+- the root `CLAUDE.md`, `deferred-decisions.md`, the plan and `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.

@@ -182,22 +182,25 @@ timer tick instead of its own interrupt takes 3 s or more), and that a serial lo
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
 `check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
 menu entry with a blank disk attached, and drives the path a person takes on the laptop — Limine's
-menu, the **graphical** greeter, a terminal from the Applications menu, and `nxinstall` typed at the
-shell in it. Nothing reads the terminal's grid (a release image deliberately does not narrate it),
-so what it asserts on **in the guest** is the kernel log: the ESP module that entry alone loads with
-the pristine root beside it, which the storage service leaves unmounted and the installer copies
-from, the six devices the session and then the shell hand on, and the milestones a destructive
-operation records. It also aims the installer at the RAM disk holding the running root, named
-correctly, and asserts nothing was installed to it.
+menu, the **graphical** greeter, a terminal from the Applications menu, and `with admin nxinstall`
+typed at the shell in it, answering the installer's questions for the new machine's first account
+(administration Part G.2). Nothing reads the terminal's grid (a release image deliberately does not
+narrate it), so what it asserts on **in the guest** is the kernel log: the ESP module that entry
+alone loads with the pristine root beside it, which the storage service leaves unmounted and the
+installer copies from, the six devices the session and then the shell hand on, and the milestones a
+destructive operation records. It also aims the installer at the RAM disk holding the running root,
+named correctly, and asserts nothing was installed to it.
 
-**Then it carves the root partition off the written disk and checks it on the host**, which is
-where H.2's claims live — a boot proves the filesystem works and says nothing about its size, and
-H.1's install booted perfectly with 24 MiB on a 477 MiB partition. Three claims: `e2fsck -fn`
-finds it clean, its superblock's block count is the *partition's*, and **a write lands past block
-group 0**, done with the allocator the guest runs because a size assertion passes just as well
-with allocation confined to the first group. The file goes to a copy, so the disk that boots is
-the one the installer made. The second boot is that disk alone, with no stick, and a greeter on
-it.
+**Then it carves the root partition off the written disk and checks it on the host**, which is where
+H.2's claims live — a boot proves the filesystem works and says nothing about its size, and H.1's
+install booted perfectly with 24 MiB on a 477 MiB partition. Three claims: `e2fsck -fn` finds it
+clean, its superblock's block count is the *partition's*, and **a write lands past block group 0**,
+done with the allocator the guest runs because a size assertion passes just as well with allocation
+confined to the first group. The file goes to a copy, so the disk that boots is the one the
+installer made. **And the account** (Part G.2): `/system/users` holds the new account alone, the
+policy makes it the one administrator, and `/home` holds its home alone, with its three folders. The
+second boot is that disk alone, with no stick: its greeter refuses the live stick's `alice` and logs
+the new account in, and neither boot's transcript holds either password.
 
 `cargo xtask check-recovery` is the **recovery gate** (administration Part D.5), on demand like
 `check-install`: two boots and a copy of the release disk. It is the one account path nobody

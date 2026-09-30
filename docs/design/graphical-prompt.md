@@ -25,7 +25,7 @@ It is not a dialog service for applications, and it stores nothing.
 ## Where things stand today
 
 - **The terminal prompt** (administration Part A):
-  - `with` turns echo off and reads the password on its terminal with `coreutils::prompt`, then
+  - `with` turns echo off and reads the password on its terminal with `libprompt`, then
     sends it to the broker as `Password`.
   - The broker paces each check: the session's delay after a failure, and three failures per
     request (`view_broker::pacing::Held`).

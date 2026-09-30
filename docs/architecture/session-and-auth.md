@@ -1,7 +1,8 @@
 # Sessions and authentication
 
-**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-28,
-when each session gained `/dev/services`, `service-mgr`'s table of services — administration Part
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-30,
+when the installer began writing an installed machine's user database — administration Part G.2;
+before that 2026-09-28, when each session gained `/dev/services`, `service-mgr`'s table of services — administration Part
 E.2b; earlier that day, when `service-mgr` began starting and binding `auth-service` — Part E.1a;
 before that 2026-09-25, when `account` arrived — administration Part D.4; earlier that day, when the
 view broker began fronting account operations — Part D.3; earlier that day, when it opened an admin
@@ -175,7 +176,9 @@ A credential store — one record per principal: a salt, an iteration count, the
 verifier, and the principal's home path. It is not user-facing configuration (so it is not
 TOML), and it contains **no plaintext secret**: the stored verifier is one-way. The build seeds
 the demo account from a build input, never committed to the source tree (the "no embedded
-secrets" rule, `userspace/CLAUDE.md`).
+secrets" rule, `userspace/CLAUDE.md`). **An installed machine's comes from its installer**
+(administration Part G.2): `nxinstall` asks for the first account on its terminal and writes the
+file holding that one record, so the build's demo account stays on the live stick.
 
 **`auth-service` writes it, and is its only writer on a running system** (administration Part
 D.1). An admin session, opened by resolving `/svc/auth/admin`, answers `List`, `Add`, `Remove` and

@@ -13,6 +13,9 @@ libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
 # `lookup_wait`, for `/dev/views`.
 libfs = { path = "../libfs" }
+# The channel plumbing a password crosses: send, receive and wait, each buffer scrubbed. It moved
+# into `libprompt` with the prompts (administration Part G.2), and this crate speaks through it.
+libprompt = { path = "../libprompt" }
 
 [lib]
 name = "libviews"

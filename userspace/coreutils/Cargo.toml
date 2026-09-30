@@ -24,10 +24,12 @@ libstream = { path = "../libstream", features = ["io"] }
 # The user database's rules and its edits: `account` checks a name and a password against them
 # before sending either, and its offline mode edits a users file with them (administration D.4).
 libusers = { path = "../libusers" }
-# The view broker's client, and the channel plumbing a password crosses: `with` and `account` ask
-# the broker with it, and `prompt` asks a terminal. It was `coreutils::ipc` and `with`'s own until
+# The view broker's client: `with` and `account` ask the broker with it. It was `with`'s own until
 # the desktop's power menu became a third consumer (administration Part F.3).
 libviews = { path = "../libviews" }
+# Asking a person on a terminal, and the plumbing a password crosses: `with` and `account` prompt
+# with it. It was this crate's `prompt` until `nxinstall` became a third consumer (Part G.2).
+libprompt = { path = "../libprompt" }
 
 [lib]
 name = "coreutils"

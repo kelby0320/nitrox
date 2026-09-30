@@ -1989,7 +1989,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          The baseline the grant is measured against: the same program, a moment later, sees
     //          them only because the broker bound them.
     s.send("nxinstall")?;
-    s.expect("no block devices in this session")?;
+    // "in this view" since administration Part G.2, which also says how to get the disks: the
+    // grant, through `with admin`.
+    s.expect("no block devices in this view")?;
     s.expect("/home>")?;
     //      (b) **Refused by the policy, and nothing asked.** `install` lets alice run `nxinstall`
     //          and nothing else; a request for `nxsh` there is refused before any password, and
@@ -2030,14 +2032,25 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     }
     s.expect("/home>")?;
     let listing = s.transcript()[listing_from..].to_string();
+    // **Never a row, and the disk named as what it is** (administration Part G.2). Since G.2 the
+    // installer says, on `stderr`, why a disk it cannot have is missing — and the serial terminal
+    // shows `stderr` beside the table. So the claim is now per line: a line naming a withheld
+    // device must be that message, and `/dev/blk/0`'s must be there, saying it holds the running
+    // system. The root partition, `/dev/blk/2`, is never named at all: the message is per disk.
     for withheld in ["/dev/blk/0", "/dev/blk/2"] {
-        if listing.contains(withheld) {
+        if let Some(row) = listing.lines().find(|l| l.contains(withheld) && !l.contains("holds the running system")) {
             return Err(format!(
                 "`with admin nxinstall` listed {withheld}, which is in use (init's root, or the disk \
-                 holding it): {listing:?}"
+                 holding it): {row:?}"
             )
             .into());
         }
+    }
+    if !listing.lines().any(|l| l.contains("/dev/blk/0 (") && l.contains("holds the running system")) {
+        return Err(format!(
+            "`with admin nxinstall` did not say /dev/blk/0 holds the running system: {listing:?}"
+        )
+        .into());
     }
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
@@ -3370,6 +3383,12 @@ const SESSION_DEVICES: usize = 6;
 /// What the kernel calls the RAM disk `root.img` becomes — the running system's own root, and
 /// the device this gate points the installer at to prove it refuses one.
 const RAMDISK_IDENTITY: &str = "module 1 (/boot/root.img)";
+/// **The account `check-install` makes the new machine's first** (administration Part G.2): a
+/// fixture, as `DEMO_USER` is, and one the build does not make, so a login as it can only have
+/// come from what the installer wrote.
+const INSTALL_ACCOUNT: &str = "dana";
+/// Its password: letters and spaces, since it is typed on PS/2 at a terminal and at a greeter.
+const INSTALL_PASSWORD: &str = "a quiet morning by the lake";
 
 /// How big the gate's blank disk is. Small enough to write quickly under TCG, large enough for a
 /// 33 MiB boot partition and a root partition with room left over.
@@ -3460,18 +3479,25 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     println!("  ok: and it refused the RAM disk it was pointed at, named correctly");
+    install_gate_no_passwords(&transcript, "the first boot")?;
 
     // Before booting it: what the boot cannot tell us about the filesystem.
     check_installed_root(&target, &work)?;
+    check_installed_account(&target, &work)?;
 
     // The second boot: what was written, on its own.
     println!("\nxtask: booting the installed disk with no stick…\n");
+    let boot_qmp = work.join("qmp-install-boot.sock");
+    let _ = fs::remove_file(&boot_qmp);
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", target.display()))
         .arg("-display")
         .arg("none")
+        // **A login this time** (administration Part G.2), so the greeter needs keys.
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", boot_qmp.display()))
         .arg("-chardev")
         .arg("stdio,id=hostserial,signal=off")
         .arg("-serial")
@@ -3483,11 +3509,15 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut session = Session::spawn(cmd, "check-install-boot")?;
-    let result = run_installed_boot_steps(&mut session);
+    let mut qmp = Qmp::connect(&boot_qmp)?;
+    let result = run_installed_boot_steps(&mut session, &mut qmp);
     let transcript = session.finish();
-    match result {
+    match result.and_then(|()| install_gate_no_passwords(&transcript, "the installed disk's boot")) {
         Ok(()) => {
-            println!("\nxtask: installed to a blank disk, and that disk boots to a greeter ✓");
+            println!(
+                "\nxtask: installed to a blank disk, and that disk boots to a greeter that knows only \
+                 {INSTALL_ACCOUNT} ✓"
+            );
             Ok(())
         }
         Err(e) => {
@@ -3495,6 +3525,72 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
             Err(e)
         }
     }
+}
+
+/// **Neither password this gate typed is in what the guest printed** (administration Part G.2):
+/// the live account's, at `with`'s prompts and a greeter, and the new account's, at the installer's
+/// prompts and a greeter. Each was typed with echo off or into a masked field.
+fn install_gate_no_passwords(transcript: &str, which: &str) -> R<()> {
+    for (whose, pw) in [(DEMO_USER, DEMO_PASSWORD), (INSTALL_ACCOUNT, INSTALL_PASSWORD)] {
+        if transcript.contains(pw) {
+            return Err(format!("{whose}'s password is in {which}'s transcript").into());
+        }
+    }
+    println!("  ok: neither password typed is in {which}'s transcript");
+    Ok(())
+}
+
+/// **The installed root holds the new machine's account and no other** (administration Part G.2),
+/// read on the host out of the partition the installer wrote, with the code the guest serves it
+/// with:
+/// - `/system/users` has one record, `INSTALL_ACCOUNT`'s, at `/home/<name>`;
+/// - `/system/views.toml` reads, and makes it the one administrator — `alice` is not one;
+/// - `/home` holds its home alone, with the three folders a home has, and no `alice`.
+fn check_installed_account(disk: &Path, work: &Path) -> R<()> {
+    use fs_server_ext4::ext4;
+    let fs_img = work.join("installed-account.ext4");
+    carve_partition(disk, 2, &fs_img)?;
+    let img = MemFs(std::cell::RefCell::new(fs::read(&fs_img)?));
+    let read = |path: &str| -> R<Vec<u8>> {
+        let mut out = vec![0u8; 64 * 1024];
+        let n = ext4::read_file(&img, path.as_bytes(), &mut out).map_err(|e| format!("read {path}: {e:?}"))?;
+        out.truncate(n);
+        Ok(out)
+    };
+    let users = read("/system/users")?;
+    let records: Vec<(String, String)> = libusers::records(&users)
+        .map(|r| (String::from_utf8_lossy(r.name).into_owned(), String::from_utf8_lossy(r.home).into_owned()))
+        .collect();
+    let home = format!("/home/{INSTALL_ACCOUNT}");
+    if records != [(INSTALL_ACCOUNT.to_string(), home.clone())] {
+        return Err(format!("/system/users holds {records:?}, not {INSTALL_ACCOUNT} alone").into());
+    }
+    println!("  ok: /system/users holds {INSTALL_ACCOUNT} alone, at {home}");
+    let policy_text = String::from_utf8(read("/system/views.toml")?)?;
+    let policy = view_broker::policy::parse(&policy_text).map_err(|e| format!("/system/views.toml does not read: {e}"))?;
+    let admins = policy.administrators(&[INSTALL_ACCOUNT, DEMO_USER]);
+    if admins != [INSTALL_ACCOUNT] {
+        return Err(format!("the installed policy makes {admins:?} administrators, not {INSTALL_ACCOUNT} alone").into());
+    }
+    println!("  ok: the installed policy makes {INSTALL_ACCOUNT} the one administrator");
+    let mut homes = Vec::new();
+    let home_ino = ext4::resolve_dir(&img, b"/home").map_err(|e| format!("/home: {e:?}"))?;
+    ext4::read_dir(&img, home_ino, 0, |_, _, name| {
+        if name != b"." && name != b".." {
+            homes.push(String::from_utf8_lossy(name).into_owned());
+        }
+        true
+    })
+    .map_err(|e| format!("list /home: {e:?}"))?;
+    if homes != [INSTALL_ACCOUNT] {
+        return Err(format!("/home holds {homes:?}, not {INSTALL_ACCOUNT}'s home alone").into());
+    }
+    for folder in ["Documents", "Downloads", "Pictures"] {
+        let path = format!("{home}/{folder}");
+        ext4::resolve_dir(&img, path.as_bytes()).map_err(|e| format!("{path}: {e:?}"))?;
+    }
+    println!("  ok: /home holds {home} alone, with Documents, Downloads and Pictures");
+    Ok(())
 }
 
 /// An in-memory filesystem image, for holding an installed root to the code that will serve it.
@@ -3804,12 +3900,13 @@ fn run_install_steps(
     //    proof is available: nothing may say it installed to `/dev/blk/1`, and the transcript is
     //    checked for that after the install that follows has succeeded, which is what stops the
     //    absence from being satisfied by an installer that never ran at all.
-    type_at_terminal(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
+    install_gate_with_admin(qmp, session, &format!(" /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
     // **The positive half, and it is what makes the absence below mean anything.** An
     // absence alone is satisfied by a command that never ran, by a character going astray so
     // the operand named nothing, and by a refusal for the wrong *reason* — the name check
     // rather than the kind check. This line says which check fired (PR #309 review, 7).
     session.expect("nxinstall: refused /dev/blk/1: it is a ram disk, not a disk")?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: the RAM disk was refused for being one, named correctly");
 
     // 8. The installer, typed at the shell in it.
@@ -3817,7 +3914,18 @@ fn run_install_steps(
     //    **`/dev/blk/0` is the disk**, and this gate asserts that rather than assuming it: the
     //    AHCI disk is registered before the two modules, so a change in that order should fail
     //    here rather than silently install to something else. The line above named it.
-    type_at_terminal(qmp, &format!("nxinstall /dev/blk/0 \"{identity}\""))?;
+    install_gate_with_admin(qmp, session, &format!(" /dev/blk/0 \"{identity}\""))?;
+
+    // **The first account, asked after the confirmation** (administration Part G.2). Each answer
+    // is typed after the installer's receipt for it: the name's before it is asked, each
+    // password's once echo is off, so nothing typed is echoed or early.
+    session.expect("nxinstall: asking for the first account")?;
+    type_answer(qmp, INSTALL_ACCOUNT)?;
+    session.expect("nxinstall: asking for its password")?;
+    type_answer(qmp, INSTALL_PASSWORD)?;
+    session.expect("nxinstall: asking for the password again")?;
+    type_answer(qmp, INSTALL_PASSWORD)?;
+    println!("  ok: the installer asked for the first account, and was answered");
 
     // What a destructive operation leaves in the system log, which is also the only thing this
     // gate can read: a release terminal does not narrate its grid.
@@ -3830,6 +3938,8 @@ fn run_install_steps(
         return Err(format!("the installer copied its root from {from:?}, not the pristine root").into());
     }
     println!("  ok: the root came from the pristine copy —{}", from.trim_end());
+    session.expect(&format!("nxinstall: the first account is {INSTALL_ACCOUNT}, its administrator"))?;
+    println!("  ok: it made {INSTALL_ACCOUNT} the new machine's first account and its administrator");
     // **A filesystem it made, not one it copied** (Phase 5 Part H.2). The size in this line is
     // the *partition's*, which is the whole point: H.1 put a 24 MiB filesystem on it.
     session.expect("nxinstall: wrote the partition table, the boot partition, and a ")?;
@@ -3847,11 +3957,23 @@ fn run_install_steps(
     // off next, and a drive may still hold the last sectors in its cache.
     session.expect("nxinstall: flushed the disk's write cache")?;
     println!("  ok: the installer flushed the disk before saying done");
+    session.expect("view: alice admin nxinstall — exited, code 0")?;
+    Ok(())
+}
+
+/// **`with admin nxinstall<args>`, at the terminal** (administration Part G.2): the command, then
+/// the live stick account's password once the broker's audit says it is asking — the receipt
+/// `check-login` types after too — and its start.
+fn install_gate_with_admin(qmp: &mut Qmp, session: &mut Session, args: &str) -> R<()> {
+    type_at_terminal(qmp, &format!("with admin nxinstall{args}"))?;
+    session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
+    type_answer(qmp, DEMO_PASSWORD)?;
+    session.expect("view: alice admin nxinstall — started")?;
     Ok(())
 }
 
 /// The second boot: the installed disk, alone.
-fn run_installed_boot_steps(session: &mut Session) -> R<()> {
+fn run_installed_boot_steps(session: &mut Session, qmp: &mut Qmp) -> R<()> {
     // **It found its root by the label this installer wrote**, not by the one the live image
     // used: the bytes copied in are the live root's, and what makes them `nitrox-root` is the
     // partition table `nxinstall` built.
@@ -3861,6 +3983,22 @@ fn run_installed_boot_steps(session: &mut Session) -> R<()> {
     // And no module disk: nothing is riding along this time.
     session.expect("desktop-session-mgr: greeter presented")?;
     println!("  ok: the greeter came up on the installed system");
+    // **The live stick's account is not this machine's** (administration Part G.2): refused, with
+    // the password that worked on the stick — tested before the new account, so a greeter that
+    // let anyone in could not pass on the right one.
+    type_at_greeter(qmp, session, DEMO_USER)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, DEMO_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect("desktop-session-mgr: login denied")?;
+    println!("  ok: the live stick's {DEMO_USER} is refused");
+    type_at_greeter(qmp, session, INSTALL_ACCOUNT)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, INSTALL_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect(&format!("desktop-session-mgr: login ok -> home=/home/{INSTALL_ACCOUNT}"))?;
+    session.expect("desktop-shell: up (graphical session leader)")?;
+    println!("  ok: {INSTALL_ACCOUNT}, the account the installer made, logs in to a desktop");
     Ok(())
 }
 
@@ -8132,20 +8270,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "with admin nxinstall")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
     // No leading Enter here, unlike `type_at_terminal`: at a password prompt one would be an empty
-    // password. Paced like it, before every key.
-    for c in DEMO_PASSWORD.chars() {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        press(&mut qmp, &qcode)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    press(&mut qmp, "ret")?;
+    // password.
+    type_answer(&mut qmp, DEMO_PASSWORD)?;
     session.expect("view: alice admin nxinstall — started")?;
     session.expect("view: alice admin nxinstall — exited, code 0")?;
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
@@ -8156,20 +8282,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      all. Until C.6 this step passed on that disk too, which was the weaker claim.
     type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0 x")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
-    for c in DEMO_PASSWORD.chars() {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        press(&mut qmp, &qcode)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    press(&mut qmp, "ret")?;
-    session.expect("nxinstall: refused /dev/blk/0: not a block device in this session")?;
+    type_answer(&mut qmp, DEMO_PASSWORD)?;
+    // **Refused as the running system** (administration Part G.2), which the installer now knows:
+    // the tables say `init` mounted its root partition.
+    session.expect("nxinstall: refused /dev/blk/0: it holds the running system")?;
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: and it did not see /dev/blk/0, the disk holding init's root");
 
@@ -9179,6 +9295,27 @@ fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
         // back — uppercase, quotes, brackets — and a second map would be a second thing to
         // keep correct. A character neither knows is an error there rather than a silent
         // skip, because a dropped character makes a *different command line*.
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+    }
+    std::thread::sleep(PER_KEY);
+    press(qmp, "ret")?;
+    Ok(())
+}
+
+/// **Type an answer at a prompt a program is waiting at, then Enter** — a password at `with`'s, a
+/// name or a password at `nxinstall`'s. Paced like [`type_at_terminal`], before every key, but with
+/// **no leading Enter**: at a prompt it would be an empty answer.
+fn type_answer(qmp: &mut Qmp, text: &str) -> R<()> {
+    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
+    for c in text.chars() {
+        std::thread::sleep(PER_KEY);
         let (qcode, shift) = qcode_for(c)?;
         if shift {
             qmp.send_key("shift", true)?;
@@ -13154,6 +13291,17 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libprompt` — asking a person on a terminal (administration Part G.2): the new password typed
+    // twice, held to `libusers`' rules. It was `coreutils::prompt`, whose tests ran under
+    // `-p coreutils`; moved, they would stop running unless named here.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libprompt")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libviews` — the view broker's client (administration Part F.3): a request's handles in the
     // order the broker takes them, and reading a listing for the answer a request would get. The
     // agreement of that reading with the broker's own rule is `view-broker`'s test, above.
@@ -15945,41 +16093,12 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
 
 /// The policy the build seeds at `/system/views.toml` — see where it is staged.
 ///
-/// **A function rather than a literal**, because the account name is `DEMO_USER` and a policy that
-/// named someone the build did not make would deny everything while reading perfectly well.
+/// **`view_broker::policy::seed`, naming `DEMO_USER`** (administration Part G.2): the installer
+/// writes the same policy onto an installed machine, naming its first account, so the two cannot
+/// drift. A policy that named someone the build did not make would deny everything while reading
+/// perfectly well.
 fn seeded_views_toml() -> String {
-    format!(
-        "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
-         # Seeded by the build; an installed system's comes from the installer.\n\
-         \n\
-         [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\"]\n\
-         \n\
-         [profile.install]\n\
-         grants = [\"disks\"]\n\
-         \n\
-         [profile.power]\n\
-         grants = [\"power\"]\n\
-         \n\
-         [[rule]]\n\
-         who  = [\"{DEMO_USER}\"]\n\
-         use  = [\"admin\"]\n\
-         run  = [\"*\"]\n\
-         auth = \"password\"\n\
-         \n\
-         [[rule]]\n\
-         who  = [\"{DEMO_USER}\"]\n\
-         use  = [\"install\"]\n\
-         run  = [\"nxinstall\"]\n\
-         auth = \"password\"\n\
-         \n\
-         # The person at the machine may power it off, as with a desktop's power button.\n\
-         [[rule]]\n\
-         who  = [\"*\"]\n\
-         use  = [\"power\"]\n\
-         run  = [\"shutdown\"]\n\
-         auth = \"none\"\n"
-    )
+    view_broker::policy::seed(DEMO_USER)
 }
 
 /// The programs a session gets through its profile: the coreutils, plus `nxsh`.
@@ -16694,8 +16813,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     }
     // **The folders the browser's sidebar offers** (M14 Part D). Staged here for the demo home.
     // Whoever makes a home makes them: the view broker for every account an administrator adds
-    // (administration Part D.3), and Part G's installer for the first, which is what
-    // `TODO(home-folders)` still waits on.
+    // (administration Part D.3), and the installer for an installed machine's first (Part G.2).
     //
     // **Spelled twice, and checked by a boot rather than by the compiler.** `libfs` names the
     // same three in `HOME_FOLDERS` and this crate does not link it — that is the same reason the

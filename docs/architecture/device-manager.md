@@ -161,6 +161,9 @@ the same fix to come. The manager holds no syscaps and binds nothing; `service-m
   kernel-server binding whose children no enumeration can see. Otherwise it reads the source's own
   `/dev/blk/<n>` bindings, which is `desktop-shell` rebinding an installer session's disks.
 - **`nxinstall`** lists its own namespace, in which what it may write is exactly what is bound.
+  Since administration Part G.2 it also reads `/dev/devices/all.tsm` beside the storage service's
+  table, to say why a disk the machine has is not in its view: which partitions are the disk's, and
+  where one is mounted, by whom.
 
 None of them stops at a gap, and each takes its indices from what exists rather than from a
 counter. `libfs::ns_children` still reports a kernel server's subtree as one binding, and says that

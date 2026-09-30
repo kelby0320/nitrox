@@ -29,6 +29,12 @@ libheap = { path = "../libheap" }
 # (administration Part B.5).
 libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
+# The first account (administration Part G.2): asked on the terminal with `libprompt`, checked and
+# written with `libusers`, and made the administrator by the seeded policy, which the build writes
+# with the same `view_broker::policy::seed`.
+libprompt = { path = "../libprompt" }
+libusers = { path = "../libusers" }
+view-broker = { path = "../view-broker" }
 
 [lib]
 name = "nxinstall"

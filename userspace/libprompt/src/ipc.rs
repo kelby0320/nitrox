@@ -2,19 +2,17 @@
 //! message, wait, and take the answer to it.
 //!
 //! Moved out of `with` when `account` became its second user (administration Part D.4), into
-//! `coreutils::ipc`, and out of `coreutils` into this crate when the desktop became a third (Part
-//! F.3). Every user speaks to the view broker, and `coreutils::prompt` borrows it to ask a terminal
-//! for a password. A password passes through these buffers on the way to either, so **every buffer
+//! `coreutils::ipc`; out of `coreutils` into `libviews` when the desktop became a third (Part F.3);
+//! and into `libprompt` with the prompts that use it (Part G.2), since `nxinstall` asks a terminal
+//! and never the broker. `libviews` speaks to the broker with it. A password passes through these buffers on the way to either, so **every buffer
 //! here is zeroed once the kernel has the message** — a copy left in a stack frame is a copy nothing
 //! else will overwrite.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
 use libkern::scrub;
 use libkern::syscall::{SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall5};
 use libkern::{KError, SENDMODE_NOBLOCK};
-use librsproto::views::{Outcome, parse_outcome};
 
 /// A received message: `(op, request_id, is_error, body)`.
 pub type Msg = (u16, u64, bool, Vec<u8>);
@@ -144,13 +142,4 @@ pub fn answer(ch: u64, request_id: u64, deadline: u64) -> Option<(bool, Vec<u8>)
 pub fn lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     let (st, h) = libfs::lookup_wait(ns, path, rights);
     if st == 0 { h } else { 0 }
-}
-
-/// The view broker's answer, as the outcome and its reason. An answer that does not read is a
-/// denial saying so.
-pub fn outcome(body: &[u8]) -> (Outcome, String) {
-    match parse_outcome(body) {
-        Some((o, why)) => (o, String::from_utf8_lossy(why).into_owned()),
-        None => (Outcome::Denied { retry: false }, String::from("the broker's answer did not read")),
-    }
 }

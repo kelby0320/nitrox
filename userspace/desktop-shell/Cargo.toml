@@ -47,6 +47,9 @@ libfs = { path = "../libfs" }
 # `shutdown` in the `power` view, with the same request `with` makes, and read the person's
 # listing first so a refusal comes before any window is asked to close.
 libviews = { path = "../libviews" }
+# The plumbing the broker's channel is spoken through: its `recv` and `close` (Part G.2 moved it
+# out of `libviews`).
+libprompt = { path = "../libprompt" }
 
 # The pure half — the desktop-entry parser, the Applications menu's filter, and the top bar and
 # its menus as element trees (`panel`) — so it can be host-tested.

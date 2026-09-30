@@ -2710,7 +2710,18 @@ Each keeps `check-install` passing: it is on demand, but in the local gate set.
     - `check-images`: the new module's filesystem is the release root's, file for file;
     - `check-install`: the module is loaded, and the install copies from it;
     - `check-live`, `check-storage` and `check-recovery`, unchanged.
-- [ ] **G.2 — the installer in a view, and the first account.**
+- [x] **G.2 — the installer in a view, and the first account.** *(Landed 2026-09-30. Four
+      things the text below did not say:
+      - **the password prompts log their receipts once echo is off**
+        (`libprompt::ask_password_then`), since echo goes back on between the two reads and a gate
+        typing both after one receipt could put the second on the screen;
+      - **`outcome()` stayed with the broker's client**: it parses the Views protocol, so it moved
+        to `libviews` rather than into `libprompt` with the rest of `ipc`;
+      - **`test-interactive` 20b(d) reads both streams** on the serial terminal, so "stdout
+        unchanged" did not keep it passing. It now requires every line naming a withheld device to
+        be that device's message, and `/dev/blk/0`'s to be there;
+      - **the first account's home has no theme or wallpaper**, as Part D decided for every new
+        home, so an installed machine's first desktop is the built-in theme on its ground colour.)*
   - `nxinstall` names a disk it lacks from `/dev/devices` and `/dev/storage`, with the command that
     frees it.
   - `libprompt`, with `coreutils::prompt` and `libviews::ipc` moved into it, and a line prompt.
