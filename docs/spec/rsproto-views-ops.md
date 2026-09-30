@@ -1,7 +1,9 @@
 # rsproto — Views operations (`0x0Exx`)
 
-**Status: normative for what is built (2026-09-25).** Every op below is implemented in
-`userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`. Written with
+**Status: normative for what is built (2026-09-29).** Every op below is implemented in
+`userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`; the client half —
+`Request`, `Password`, `List` and `Decide` — is `userspace/libviews/`, which `with`, `account` and
+`desktop-shell` share (Part F.3). Written with
 administration Part A.3; the policy endpoint, `Show` and `Install` since Part D.2; the accounts
 endpoint, its three ops, `Accounts` and `ChangePassword` since Part D.3. See
 [`administration.md`](../planning/administration.md) § *Part A in detail* for the design and why
@@ -21,7 +23,7 @@ principal.
 |---|---|---|---|
 | forwarding endpoint | `/svc/views`, bound by `service-mgr`; by a login supervisor at `/dev/views` in each session, with the subtree base `/s/<session>` | — | `Namespace::Resolve` |
 | supervisor channel | `/svc/views/session`, from the root namespace | `session` | `OpenSession`, `CloseSession` |
-| client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Check`, `Accounts`, `ChangePassword`; receives `Exited` |
+| client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Decide`, `Check`, `Accounts`, `ChangePassword`; receives `Exited` |
 | policy channel | `/dev/policy`, from inside a view with the `views` grant, which the broker binds there with the base `/policy/<session>` | `policy/<session>` | `Show`, `Install` |
 | accounts channel | `/dev/accounts`, from inside a view with the `accounts` grant, bound the same way with the base `/accounts/<session>` | `accounts/<session>` | `AddAccount`, `RemoveAccount`, `SetPassword` |
 
@@ -85,9 +87,12 @@ Run a program in a view. Request body:
 | each argument | u16 length + bytes |
 | env | u32 length + a TSM1 `Record` ([typed-stream-format](typed-stream-format.md)), opaque to the codec |
 
-Transferred handles, in order: **a namespace** (always — a copy of the caller's own, from
-`sys_ns_derive`, since the one a process is spawned with cannot be transferred), then each stream
-whose bit is set, then the terminal. A count that disagrees with the bits is refused.
+Transferred handles, in order: **a namespace** (always), then each stream whose bit is set, then
+the terminal. A count that disagrees with the bits is refused. **The namespace is the one the view
+is built from**, and its sender chooses it: `with` sends a copy of its own, from `sys_ns_derive`,
+since the one a process is spawned with cannot be transferred; `desktop-shell`'s Restart and Shut
+down send an application's, which it built, so the view does not reach the window manager the
+session's does (Part F.3).
 
 Reply: an outcome — `NeedPassword` when the rule asks for one, `Started`, or `Denied` with the
 policy's reason. On `Started`:
@@ -138,6 +143,21 @@ Request: empty. Reply: a u16 row count, then per row: view (u16 length + bytes),
 (u16 length + bytes — `*`, or names separated by spaces), and a password flag (1 byte). What the
 session's principal may use, one row per view a rule lets them use, in the policy's order. A policy
 that does not read is an error reply (`InvalidArgument`).
+
+**The reply is cut at 2 KiB**, at the first row that does not fit, and says nothing of it. A
+client must not read a decision off it — the PR #346 review found that a `power` row past the cut
+read as "no rule". `Decide` is the question to ask.
+
+### `Decide` (`0x0E0F`) — client
+
+**What a `Request` for a program in a view would be answered, running nothing** (Part F.3, PR
+#346 review). Request body: the view (u16 length + bytes), then the program (u16 length + bytes),
+with nothing after. Reply: an outcome — `Started` if it would start with no password,
+`NeedPassword`, or `Denied` with the reason a `Request` would give; a body that does not read is
+`Denied`, "the question does not read". It takes no handle, starts nothing, and is not audited:
+it tells the session what its `List` already does. `desktop-shell` asks it before closing a window
+for a Restart or a Shut down. The `Request` that follows still decides: the policy can change in
+between.
 
 ### `Check` (`0x0E07`) — client
 

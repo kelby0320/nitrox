@@ -11,7 +11,9 @@
 //! **What the design asks for and what is here.** The top panel is the design's: 30 pixels on the
 //! panel ground with a rule beneath, an `Applications` button with its accent dot, a `Places`
 //! button, and the clock centred on the screen. Its right-hand end — quick settings and a
-//! notifications tray — is not built, because neither exists (`desktop-shell.md` §9). The
+//! notifications tray — is not built, because neither exists (`desktop-shell.md` §9); **a power
+//! button is there instead** since administration Part F.2, opening the menu that ends the
+//! session (`desktop-shell.md` §4b). The
 //! Applications menu is the design's menu with no categories and a filter field above the rows,
 //! because typing to narrow it is the fastest way to a program and the only one without a pointer
 //! (`docs/planning/desktop-refresh.md`, Part C).
@@ -22,19 +24,25 @@ use alloc::vec::Vec;
 use libdraw::format::Rgb;
 use libdraw::geom::Size;
 use libui::element::{
-    Element, Insets, TextSize, center, center_v, column, fill, ink, padding, rounded_fill, row,
-    scaled, sized, stack, text, wash, with_spacing,
+    Element, IconKind, Insets, TextSize, center, center_v, column, fill, icon, ink, padding,
+    rounded_fill, row, scaled, sized, stack, text, wash, with_spacing,
 };
 use libui::layout::{Constraints, Metrics, measure};
 use libui::menu::{Item, Menu, MenuState, popup, popup_headed};
-use libui::widget::{CONTROL_RADIUS, TextFieldState, Theme, WidgetState, popup_frame, text_field};
+use libui::widget::{
+    CONTROL_RADIUS, DIALOG_GAP, DIALOG_PAD, TextFieldState, Theme, TitleButtons, WidgetState, button,
+    dialog_frame, popup_frame, text_field, title_bar,
+};
 
+use crate::ending::{Ending, Refusal};
 use crate::{Application, BAR_H, matches_app};
 
 /// The Applications menu's index in the bar's table — see [`menus`].
 pub const APPS: usize = 0;
 /// The Places menu's.
 pub const PLACES: usize = 1;
+/// The power menu's (administration Part F.2).
+pub const POWER: usize = 2;
 
 /// What a press on the top bar asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +61,8 @@ pub enum MenuMsg {
     Launch(usize),
     /// Open the place at this index into [`libfs::places`].
     Place(usize),
+    /// **End the session** (administration Part F.2): the power menu's rows.
+    End(Ending),
     /// What a row that cannot be chosen carries. A disabled row never produces its message; it
     /// has to have one all the same.
     Nothing,
@@ -64,6 +74,11 @@ pub const APPS_KEY: u64 = 1;
 pub const PLACES_KEY: u64 = 2;
 /// The empty stretch after them, keyed because its siblings are.
 const REST_KEY: u64 = 3;
+/// The power button's, at the bar's right-hand end (administration Part F.2).
+pub const POWER_KEY: u64 = 4;
+/// The power button's width: a square a little wider than the bar is tall, so the glyph has the
+/// same room as a window control and the press a target the size of a word's.
+pub const POWER_W: u32 = BAR_H + 4;
 /// The filter field's key, above the rows.
 pub const FILTER_KEY: u64 = 10;
 /// Where a menu's rows are keyed from.
@@ -147,9 +162,16 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     // **Above the rule, not over it**: a lit word's wash would otherwise run across the rule's
     // pixel and break the line under it.
     let above_rule = Insets { top: 0, right: 0, bottom: 1, left: 0 };
+    // **The power button, at the right-hand end** (administration Part F.2, the maintainer's call):
+    // the power symbol, lit as the words are, opening the menu that ends the session. The
+    // design's right-hand end is quick settings and notifications, which do not exist; this is
+    // where a person looks for the way out.
+    let power = face(lit(POWER_KEY, POWER), sized(Size::new(POWER_W, BAR_H - 1), icon(IconKind::Power)))
+        .on_press(TopMsg::Menu(POWER))
+        .key(POWER_KEY);
     let words = padding(
         above_rule,
-        row(alloc::vec![apps, places, sized(Size::new(0, 0), text("")).flex(1).key(REST_KEY)]),
+        row(alloc::vec![apps, places, sized(Size::new(0, 0), text("")).flex(1).key(REST_KEY), power]),
     );
     let rule = column(alloc::vec![
         sized(Size::new(0, 0), text("")).flex(1),
@@ -163,9 +185,10 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     stack(alloc::vec![rule, clock, words])
 }
 
-/// The two menus the bar opens: the applications `query` matches, and the places.
+/// The three menus the bar opens: the applications `query` matches, the places, and the power
+/// menu (administration Part F.2).
 ///
-/// **One table, indexed by [`APPS`] and [`PLACES`]**, because `MenuState` moves between them
+/// **One table, indexed by [`APPS`], [`PLACES`] and [`POWER`]**, because `MenuState` moves between them
 /// with Left and Right the way a window's menu bar does — the only way to reach `Places` on a
 /// machine with no pointer.
 pub fn menus(
@@ -175,7 +198,23 @@ pub fn menus(
     home: &str,
     theme: &Theme,
 ) -> Vec<Menu<MenuMsg>> {
-    alloc::vec![apps_menu(apps, query), places_menu(places, home, theme)]
+    alloc::vec![apps_menu(apps, query), places_menu(places, home, theme), power_menu()]
+}
+
+/// **The power menu** (administration Parts F.2 and F.3): ending the session, or the machine.
+/// **Restart and Shut down are destructive rows**, drawn in `deny`: they end every session on the
+/// machine, not just this one. Neither asks here — the windows are asked to close first, and the
+/// policy decides.
+pub fn power_menu() -> Menu<MenuMsg> {
+    let row = |e: Ending| Item::plain(e.title(), MenuMsg::End(e));
+    Menu {
+        title: "Power",
+        items: alloc::vec![
+            row(Ending::LogOut),
+            row(Ending::Restart).destructive(true),
+            row(Ending::ShutDown).destructive(true),
+        ],
+    }
 }
 
 /// The applications `query` matches, **keyed by index into the unfiltered list**.
@@ -279,6 +318,117 @@ pub fn name_prompt(name: &TextFieldState, theme: &Theme) -> Element<()> {
 /// `word` is the rectangle of the word that opens it, from a layout of [`top_bar`].
 pub fn menu_anchor(word: libdraw::geom::Rect) -> (i32, i32) {
     (word.origin.x + MENU_INSET_X, BAR_H as i32 + MENU_DROP)
+}
+
+/// Where a menu `width` wide hangs from a word at the **right-hand end** of the bar: its right
+/// edge [`MENU_INSET_X`] in from the word's, as a left-hung menu's left edge is from its word's —
+/// so the power menu stays on the screen (administration Part F.2).
+pub fn menu_anchor_right(word: libdraw::geom::Rect, width: u32) -> (i32, i32) {
+    (word.origin.x + word.size.w as i32 - MENU_INSET_X - width as i32, BAR_H as i32 + MENU_DROP)
+}
+
+// ---- the waiting dialog ---------------------------------------------------------------------
+
+/// What the waiting dialog's controls ask for (administration Part F.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EndingMsg {
+    /// Destroy what is still open, and end the session.
+    EndAnyway,
+    /// Keep the session: nothing more is asked.
+    Cancel,
+    /// What the title bar's drag carries: the dialog stays where the shell put it.
+    Nothing,
+}
+
+/// The waiting dialog's title bar's key.
+pub const ENDING_TITLE_KEY: u64 = 200;
+/// Its question's.
+pub const ENDING_TEXT_KEY: u64 = 201;
+/// Its End anyway button's.
+pub const ENDING_END_KEY: u64 = 202;
+/// Its Cancel button's.
+pub const ENDING_CANCEL_KEY: u64 = 203;
+
+/// **The waiting dialog** (administration Part F.2): what a session end is still waiting for —
+/// [`Closing::question`](crate::ending::Closing::question)'s two lines — with **End anyway** and
+/// **Cancel**. `libui`'s fixed question, two lines over two buttons, so its buttons land where
+/// `DIALOG_LEFT_CX` and `DIALOG_RIGHT_CX` say, which `check-logout` aims at. Closing it is Cancel:
+/// the frame must not be a way to end a session.
+pub fn ending_dialog(
+    ending: Ending,
+    question: &(String, String),
+    hovered: Option<u64>,
+    theme: &Theme,
+) -> Element<EndingMsg> {
+    let buttons = TitleButtons { minimise: None, maximise: None, close: Some(EndingMsg::Cancel) };
+    let bar = title_bar(ending.title(), None, true, EndingMsg::Nothing, buttons, hovered, theme)
+        .key(ENDING_TITLE_KEY);
+    let lines = padding(
+        Insets::all(DIALOG_PAD),
+        column(alloc::vec![text(question.0.clone()), text(question.1.clone())]),
+    )
+    .key(ENDING_TEXT_KEY);
+    let answer = |label: &'static str, msg: EndingMsg, key: u64| {
+        button(label, msg, WidgetState { hovered: hovered == Some(key), ..Default::default() }, theme)
+            .key(key)
+            .flex(1)
+    };
+    let answers = with_spacing(
+        row(alloc::vec![
+            answer("End anyway", EndingMsg::EndAnyway, ENDING_END_KEY),
+            answer("Cancel", EndingMsg::Cancel, ENDING_CANCEL_KEY),
+        ]),
+        DIALOG_GAP,
+    );
+    dialog_frame(bar, lines, answers, true, theme)
+}
+
+// ---- the refusal ----------------------------------------------------------------------------
+
+/// What the refusal dialog's controls ask for (administration Part F.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefusalMsg {
+    /// Put it away.
+    Close,
+    /// What the title bar's drag carries: the dialog stays where the shell put it.
+    Nothing,
+}
+
+/// The refusal dialog's title bar's key.
+pub const REFUSAL_TITLE_KEY: u64 = 210;
+/// Its two lines'.
+pub const REFUSAL_TEXT_KEY: u64 = 211;
+/// The empty half where a question's first answer would be.
+pub const REFUSAL_GAP_KEY: u64 = 212;
+/// Its Close button's.
+pub const REFUSAL_CLOSE_KEY: u64 = 213;
+
+/// **Why a Restart or a Shut down did not happen** (administration Part F.3): the [`Refusal`]'s two
+/// lines, and **Close**. A report, not a question, so it has one answer, in the right-hand half
+/// where the waiting dialog's Cancel is — `DIALOG_RIGHT_CX` names it — and closing the frame means
+/// the same. Hung where the waiting dialog is, under the power button.
+pub fn refusal_dialog(
+    ending: Ending,
+    refusal: &Refusal,
+    hovered: Option<u64>,
+    theme: &Theme,
+) -> Element<RefusalMsg> {
+    let buttons = TitleButtons { minimise: None, maximise: None, close: Some(RefusalMsg::Close) };
+    let bar = title_bar(ending.title(), None, true, RefusalMsg::Nothing, buttons, hovered, theme)
+        .key(REFUSAL_TITLE_KEY);
+    let (first, second) = refusal.lines(ending);
+    let lines =
+        padding(Insets::all(DIALOG_PAD), column(alloc::vec![text(first), text(second)])).key(REFUSAL_TEXT_KEY);
+    let close = button(
+        "Close",
+        RefusalMsg::Close,
+        WidgetState { hovered: hovered == Some(REFUSAL_CLOSE_KEY), ..Default::default() },
+        theme,
+    )
+    .key(REFUSAL_CLOSE_KEY)
+    .flex(1);
+    let answers = with_spacing(row(alloc::vec![text("").key(REFUSAL_GAP_KEY).flex(1), close]), DIALOG_GAP);
+    dialog_frame(bar, lines, answers, true, theme)
 }
 
 // ---- the bottom bar -------------------------------------------------------------------------
@@ -751,6 +901,169 @@ mod tests {
         }
     }
 
+    /// **The power button is the bar's right-hand end**, at every screen width, and a press on it
+    /// opens the power menu (administration Part F.2). `check-logout` aims `POWER_W / 2` in from
+    /// the screen's right edge, so that is where this presses.
+    #[test]
+    fn the_power_button_is_the_bars_right_hand_end() {
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for width in [1024u32, 1280, 1360, 1920, 2560] {
+                let bar = top_bar("12:34", None, None, &theme);
+                let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
+                let power = locate(&bar, &l, POWER_KEY).expect("the power button");
+                assert_eq!(power.right() as u32, width, "flush with the right edge at {width}");
+                assert_eq!(power.size.w, POWER_W);
+                // `xtask`'s `chrome::POWER_FROM_RIGHT`, as a literal on purpose (M11 decision 2).
+                let at = width as i32 - 17;
+                assert_eq!(POWER_W as i32 / 2, 17, "the gate aims at the button's middle");
+                assert_eq!(click(&bar, Rect::new(0, 0, width, BAR_H), &m, at, 12), [TopMsg::Menu(POWER)], "at {width}");
+            }
+        }
+    }
+
+    /// **The power menu is Log out, Restart and Shut down**, in that order — `check-logout` reaches
+    /// each by pressing Down that many times — the last two destructive, and it is the table's
+    /// third menu (administration Parts F.2 and F.3).
+    #[test]
+    fn the_power_menu_logs_out_restarts_and_shuts_down() {
+        let table = menus(&staged(), "", &libfs::places("/home"), "/home", &Theme::light());
+        assert_eq!(table.len(), 3);
+        assert_eq!(table[POWER].title, "Power");
+        let rows: Vec<(&str, MenuMsg, bool)> = table[POWER]
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Action { label, msg, enabled: true, destructive, .. } => {
+                    Some((label.as_ref(), *msg, *destructive))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Log out", MenuMsg::End(Ending::LogOut), false),
+                ("Restart", MenuMsg::End(Ending::Restart), true),
+                ("Shut down", MenuMsg::End(Ending::ShutDown), true),
+            ]
+        );
+        // Every row is a choice: nothing the keyboard's Down would stop on and choose nothing with.
+        assert_eq!(table[POWER].items.len(), rows.len());
+    }
+
+    /// **The power menu hangs right-aligned and stays on the screen**: its right edge
+    /// `MENU_INSET_X` in from the screen's, at every width and both text sizes — where hung from
+    /// the left of its button, as the other two are, it would run off the edge.
+    #[test]
+    fn the_power_menu_hangs_right_aligned_on_the_screen() {
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for width in [1024u32, 1360, 2560] {
+                let bar = top_bar("", None, None, &theme);
+                let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
+                let word = locate(&bar, &l, POWER_KEY).expect("the power button");
+                let table = menus(&staged(), "", &libfs::places("/home"), "/home", &theme);
+                let view = menu_view(POWER, &table, &MenuState::new(3), None, &TextFieldState::new(), &theme);
+                let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
+                let (x, y) = menu_anchor_right(word, size.w);
+                assert!(x >= 0, "off the left at {width}");
+                assert_eq!(x + size.w as i32, width as i32 - MENU_INSET_X, "right edge at {width}");
+                assert_eq!(y, BAR_H as i32 + MENU_DROP);
+                // And hung from the left, it would not have fitted.
+                assert!(menu_anchor(word).0 + size.w as i32 > width as i32, "the left anchor fits after all");
+            }
+        }
+    }
+
+    /// **The waiting dialog's buttons land where `libui` publishes** — End anyway on the left,
+    /// Cancel on the right — and its close button is Cancel: `check-logout` aims at those
+    /// constants, so a dialog that moved them fails here, not after a boot.
+    #[test]
+    fn the_waiting_dialogs_buttons_land_where_libui_says() {
+        use libui::widget::{DIALOG_BUTTON_CY, DIALOG_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_W};
+        let f = font();
+        let theme = Theme::light();
+        let m = FontMetrics::new(&f, theme.font_px);
+        let q = (String::from("Waiting for 1 window to close:"), String::from("notes.txt"));
+        let view = ending_dialog(Ending::LogOut, &q, None, &theme);
+        let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
+        assert_eq!((size.w, size.h), (DIALOG_W, DIALOG_H));
+        let bounds = Rect::new(0, 0, size.w, size.h);
+        assert_eq!(click(&view, bounds, &m, DIALOG_LEFT_CX, DIALOG_BUTTON_CY), [EndingMsg::EndAnyway]);
+        assert_eq!(click(&view, bounds, &m, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), [EndingMsg::Cancel]);
+        let l = layout(&view, bounds, &m);
+        let text_rect = locate(&view, &l, ENDING_TEXT_KEY).expect("the question");
+        assert!(text_rect.size.h > 0 && text_rect.size.w > 0);
+        // The title bar's close button, pressed at its centre.
+        let close = locate(&view, &l, libui::widget::TITLE_CLOSE_KEY).expect("the close button");
+        let (cx, cy) = (close.origin.x + close.size.w as i32 / 2, close.origin.y + close.size.h as i32 / 2);
+        assert_eq!(click(&view, bounds, &m, cx, cy), [EndingMsg::Cancel], "closing the dialog is Cancel");
+    }
+
+    /// **The refusal dialog's Close lands where the waiting dialog's Cancel does**, the left half
+    /// answers nothing, and closing the frame is Close — the fixed frame, so `DIALOG_RIGHT_CX` names
+    /// its button as it does the other's.
+    #[test]
+    fn the_refusal_dialogs_close_lands_where_libui_says() {
+        use libui::widget::{DIALOG_BUTTON_CY, DIALOG_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_W};
+        let f = font();
+        let theme = Theme::light();
+        let m = FontMetrics::new(&f, theme.font_px);
+        let view = refusal_dialog(Ending::ShutDown, &Refusal::Password, None, &theme);
+        let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
+        assert_eq!((size.w, size.h), (DIALOG_W, DIALOG_H));
+        let bounds = Rect::new(0, 0, size.w, size.h);
+        assert_eq!(click(&view, bounds, &m, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), [RefusalMsg::Close]);
+        assert!(click(&view, bounds, &m, DIALOG_LEFT_CX, DIALOG_BUTTON_CY).is_empty(), "the empty half");
+        let l = layout(&view, bounds, &m);
+        let close = locate(&view, &l, libui::widget::TITLE_CLOSE_KEY).expect("the close button");
+        let (cx, cy) = (close.origin.x + close.size.w as i32 / 2, close.origin.y + close.size.h as i32 / 2);
+        assert_eq!(click(&view, bounds, &m, cx, cy), [RefusalMsg::Close]);
+    }
+
+    /// **Every refusal the shell can say fits the dialog's width**, at both text sizes — two lines
+    /// in `libui`'s fixed question, where a line that runs past the frame is cut off mid-reason.
+    /// The broker's own reasons can name a person, which no test can bound; these are the rest.
+    #[test]
+    fn every_refusal_the_shell_says_fits_the_dialog() {
+        use crate::ending::failed;
+        let f = font();
+        let refusals = [
+            Refusal::Password,
+            // The broker's own words, from `view_broker::policy::Policy::would`, for a short name.
+            Refusal::Refused(String::from("no rule lets alice use `power`")),
+            Refusal::Refused(String::from("`power` does not let alice run `shutdown`")),
+            Refusal::Failed(String::from(failed::NO_BROKER)),
+            Refusal::Failed(String::from(failed::NO_NAMESPACE)),
+            Refusal::Failed(String::from(failed::BROKER_GONE)),
+            Refusal::Failed(String::from(libviews::Failed::NoAnswer.why())),
+            Refusal::Failed(String::from(libviews::Failed::Refused.why())),
+            Refusal::Failed(String::from(libviews::Failed::Garbled.why())),
+            Refusal::exited(-2147483648, false),
+            Refusal::exited(1, true),
+        ];
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for ending in [Ending::Restart, Ending::ShutDown] {
+                for r in &refusals {
+                    let view = refusal_dialog(ending, r, None, &theme);
+                    let bounds = Rect::new(0, 0, libui::widget::DIALOG_W, libui::widget::DIALOG_H);
+                    let l = layout(&view, bounds, &m);
+                    let room = locate(&view, &l, REFUSAL_TEXT_KEY).expect("the lines").size.w - 2 * DIALOG_PAD;
+                    let (a, b) = r.lines(ending);
+                    for line in [a, b] {
+                        let e: Element<RefusalMsg> = text(line.clone());
+                        let w = libui::layout::measure(&e, Constraints::loose(Size::new(4000, 4000)), &m).w;
+                        assert!(w <= room, "{line:?} is {w} wide in {room} at {} px", theme.font_px);
+                    }
+                }
+            }
+        }
+    }
+
     /// The bar keeps diffing as a word lights and its menu opens — a shape `diff` refuses is a bar
     /// that stops drawing, the failure `menu::popup`'s note describes.
     #[test]
@@ -796,7 +1109,7 @@ mod tests {
         let empty = apps_menu(&[], "");
         assert!(matches!(&empty.items[..], [Item::Action { label, enabled: false, .. }] if label == "No applications"));
         // Enter has nothing to choose: the cursor lands nowhere.
-        let mut s = MenuState::new(2);
+        let mut s = MenuState::new(3);
         s.toggle(APPS);
         s.select_first(&[none, apps_menu(&apps, "")]);
         assert_eq!(s.cursor(), None);
@@ -865,7 +1178,7 @@ mod tests {
                 for c in query.chars() {
                     q.insert(c);
                 }
-                let view = menu_view(which, &table, &MenuState::new(2), None, &q, &theme);
+                let view = menu_view(which, &table, &MenuState::new(3), None, &q, &theme);
                 let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
                 let msgs = click(&view, Rect::new(0, 0, size.w, size.h), &m, sx - ax, sy - ay);
                 let want = table[which].items.iter().enumerate().find_map(|(i, it)| {

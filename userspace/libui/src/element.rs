@@ -97,7 +97,7 @@ pub struct Docked<Msg> {
     pub element: Element<Msg>,
 }
 
-/// Which window control an [`Icon`](Node::Icon) draws.
+/// Which glyph an [`Icon`](Node::Icon) draws: a window control, or the power symbol.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IconKind {
     /// A bar along the bottom of the glyph box.
@@ -106,6 +106,9 @@ pub enum IconKind {
     Maximise,
     /// Two crossed strokes.
     Close,
+    /// **The power symbol**: a ring open at the top, with a bar down through the gap to the
+    /// centre — the top bar's power menu (administration Part F.2).
+    Power,
 }
 
 /// A step on the text-size scale, relative to the theme's one `font_px` (desktop refresh,
@@ -681,7 +684,7 @@ pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
     Element::new(Node::Bevel(colour))
 }
 
-/// A window-control glyph — see [`Node::Icon`].
+/// A glyph — a window control, or the power symbol — see [`Node::Icon`].
 ///
 /// It measures to nothing, like a fill: the button around it decides its size, and the glyph is
 /// drawn centred in whatever box it lands in.

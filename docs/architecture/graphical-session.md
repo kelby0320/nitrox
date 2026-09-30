@@ -3,14 +3,17 @@
 ## Status
 
 **Built, and checked 2026-09-29** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
-revision 2. On 2026-09-29 administration Part E.4c made both supervisors and their leaders end
-when a shutdown asks (§4). On 2026-09-28 administration Part E.1a moved the servers from `init`'s children to
-`service-mgr`'s (§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them
-in place of the servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service`
-the user database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and
-applications `/storage` and `/dev/storage`, through a session endpoint of the storage service's that
-each supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4
-gave them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
+revision 2. On 2026-09-29 administration Part E.4c made both supervisors and their leaders end when
+a shutdown asks (§4), and Part F.1 had `desktop-shell` build applications' namespaces with
+`libsession`, which gave them `/session/user` (§6), Part F.2 a way to log out (§4), and Part F.3
+a way to restart or shut the machine down from the desktop, through the view broker (§4). On
+2026-09-28 administration Part E.1a moved the servers from `init`'s children to `service-mgr`'s
+(§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them in place of the
+servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service` the user
+database's writer as well as its verifier (§1, §2), and Part C.6 gave sessions and applications
+`/storage` and `/dev/storage`, through a session endpoint of the storage service's that each
+supervisor resolves itself and the shell receives as its eighth extra. On 2026-09-24 Part B.4 gave
+them `/dev/devices` through an info-only endpoint, and §3's diagram was brought up to what each
 supervisor is now handed. Two things changed under it before that: the session namespace also binds
 `/applications`, which is where the Applications menu's entries come from (M14 Part H), and §3
 records why an *application's* namespace deliberately does not; and the desktop refresh's Part D
@@ -313,9 +316,23 @@ request, and where it finds one decides what happens:
   exits rather than presenting a login again.
 
 The leaders honour it. `nxsh` exits from its prompt, and while a command runs it asks the command's
-stages to stop, as an interrupt does, and exits once they have unwound. `desktop-shell` exits. The
-programs `desktop-shell` launched are not asked: they go when the compositor stops, and asking
-them, with unsaved work in mind, is Part F's session menu.
+stages to stop, as an interrupt does, and exits once they have unwound. **`desktop-shell` asks its
+windows to close first** (administration Part F.2): every normal window, then out after 3 s of its
+own with no dialog, inside the 5 s above. Until F.2 it exited at once and left them to go with the
+compositor.
+
+**A person ends a graphical session from the power menu** (administration Part F.2): **Log out**,
+at the top bar's right-hand end. `desktop-shell` asks every window to close, waits on any question
+one asks — naming what is left in a dialog with End anyway and Cancel — and exits once none is
+left. The supervisor then does what it does at any session's end, and presents the greeter again:
+the first way to end a graphical session and leave the machine running. See
+[`desktop-shell.md`](desktop-shell.md) §4b.
+
+**Restart and Shut down end the machine from the same menu** (administration Part F.3). The windows
+close as for Log out; then `desktop-shell` asks the view broker for `shutdown` in the `power` view,
+as `with power shutdown` does, handing it an application's namespace rather than the session's.
+The shutdown that follows is the one above, arriving at a leader with nothing left open, which
+exits at once — so the session's end, seen from the supervisor, is a shutdown's, not a logout's.
 
 **Step 1 is not a trivial difference.** `session-mgr` opens its prompt's `Tty` the way any
 program does, and closes it at session end as the revocation point. `desktop-session-mgr` must be
@@ -353,7 +370,8 @@ resolves to the tty server's endpoint, which **mints** terminals. The per-applic
 from minting and from `Tty::AttachBackend`, not from the binding.
 
 So an application namespace binds `/dev/tty` the same way for every application
-(`desktop-shell`'s `build_app_namespace`), and `nxterm` opens a terminal, attaches its own
+(`desktop-shell` builds it with `libsession::build`, as a session is built, since administration
+Part F.1), and `nxterm` opens a terminal, attaches its own
 window as that terminal's backend, and hands the terminal to `nxsh` **as a handle** — which is
 why two terminals do not contend: each mints its own, on its own backend. `nxsh` takes a
 handed-down terminal when its parent gives one and resolves `/dev/tty` otherwise, which is the
@@ -367,6 +385,14 @@ inside `nxterm` cannot. That asymmetry is the design rather than an oversight: n
 application reads it, and an application holds no authority to spawn in the first place, which is
 why `Desktop::Open` exists. A binding whose only justification is that it would be harmless is a
 hole in a sandbox with nothing on the other side of it.
+
+**What it has that it lacked until administration Part F.1: `/session/user`.** `desktop-shell`
+built an application's namespace with a builder of its own, which had drifted from the sessions'
+and never bound who the session is for, so `whoami` in a desktop terminal said "no session
+identity". It builds with `libsession::build` now, from the same `NamespaceSpec` the supervisors
+use — **one vocabulary, three builders**, the view broker's deriving — and reads the name from its
+own session's `/session/user`. What an application gets beyond a session is `/dev/draw/new`,
+narrowly, and `/dev/desktop`; what it lacks is `/applications` and the console.
 
 **It stands on its own, and is not a symptom of anything.** It was filed as one until 2026-09-23 —
 "there is one kind of account … and no session that sees the system" (`TODO(admin-visibility)`).

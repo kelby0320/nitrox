@@ -46,7 +46,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::ipc::{call, lookup, outcome};
+use libviews::ipc::{call, lookup, outcome};
 use coreutils::prompt::{ask_new_password, ask_password};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;

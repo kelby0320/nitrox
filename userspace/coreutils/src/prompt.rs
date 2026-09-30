@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use libkern::scrub;
 use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, TTY_MODE_ECHO};
 
-use crate::ipc::{recv, send, wait};
+use libviews::ipc::{recv, send, wait};
 
 /// One exchange with the terminal, stepping over an `Interrupt` — which it records in
 /// `interrupted`, since `Ctrl-C` at a password prompt means "never mind".

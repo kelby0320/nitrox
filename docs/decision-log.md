@@ -31692,3 +31692,353 @@ plan, and one to the pass's own entry above, edited in place while it is unmerge
 - **Restart and Shut down hand the broker an application's namespace**, not the session's. The
   session's binds `/dev/draw` whole, reaching `manage`, and a view derived from it would give
   `shutdown` that too.
+
+## 2026-09-29 — Administration Part F.1: one builder for sessions and applications
+
+`desktop-shell` builds each application's namespace with `libsession::build`, from the
+`NamespaceSpec` the login supervisors build sessions from. Its own `build_app_namespace` is gone.
+Nothing an application sees changes, but one thing: **it has `/session/user`**, so `whoami` in a
+desktop terminal answers.
+
+**Booted first, as the plan asked.** A probe in `verify_app_namespace` resolved `/session/user` in
+an application's namespace during `check-login`: `NotFound`. So `whoami` there said "no session
+identity". The two builders had drifted at exactly the member the plan's spike named.
+
+**What moved into the spec:**
+- `draw_endpoint`, bound at `/dev/draw/new` alone with the base `/new`, **required when asked
+  for**, as it was in `desktop-shell`'s builder;
+- `desktop_endpoint`, at `/dev/desktop`;
+- `bind_applications`, true for a session and false for an application.
+
+**What changed shape, deliberately:**
+- **`/home` is required when there is a home**, for an application too. It had been reported and
+  skipped there. `verify_app_namespace` refused to launch without it anyway, so no application
+  starts differently.
+- **`/session/user` is bound only when there is a name.** `desktop-shell` reads its session's at
+  startup, with `libfs::read_file`, up to the first NUL. A probe confirmed it reads `alice`, five
+  bytes.
+- **The disks.** `desktop-shell` passes them to an application through the spec's `bind_blk`,
+  rebinding from the session's namespace, which is the spec's `root_ns` for an application. The
+  PR #345 review found the plan had dropped them. `libsession::block_device_count` tells the shell
+  once whether its session has any, which only an installer session does. So an ordinary session
+  never logs "asked for disks and found none". The installer's line keeps its count, which
+  `check-install` asserts.
+- **`libsession::build` returns what bound**, a `Built`, in place of the process-wide
+  `SESSION_HAS_*` statics. `desktop-shell` builds many namespaces, and writing a global per build
+  there would describe the last one. `build_namespace` stays the supervisors' wrapper and records
+  the statics their `session_has_*` read.
+- **The old builder's reasons** — why each member, and why `/dev/desktop` and `/dev/clipboard`
+  are capability decisions — moved into the new function's doc, one line each, rather than going
+  with its body.
+
+**Gate:**
+- `verify_app_namespace` now resolves `/session/user` and names it in its line. It is reported,
+  not required, as `/dev/devices` is. `check-login` asserts the line in both places it did.
+- **Control:** an application built with no user fails `check-login` at that line.
+- `check-terminal` is not the gate, as the PR #345 review found: its `nxterm` is a test-image
+  service in no session.
+
+**Docs:** `graphical-session.md` (Status, and §6's application namespace),
+`namespace-and-resource-servers.md`, `session-mgr/CLAUDE.md`, and the plan.
+
+The full local gate set, 34, is green (fgb47), `check-install` among them: it asserts the
+installer session's disks reaching the terminal it opens.
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.2: the power menu, and Log out
+
+The top bar's right-hand end is a **power button**, opening a **power menu** with **Log out**.
+Ending a session asks every window to close first, waits on any question one asks, and names
+what is left in a dialog with End anyway and Cancel. It is the first way to end a graphical
+session and leave the machine running.
+
+**The pieces:**
+- **`IconKind::Power`** in `libui`: a ring open at the top with a bar down to its centre, drawn a
+  pixel at a time in doubled coordinates, like the window controls beside it.
+  - Its box rounds to even so the two-pixel bar has a centre. **Only this glyph rounds**, so the
+    title-bar controls keep the box they had.
+  - Its test reads the shape back from a painted framebuffer, in terms the other glyphs fail.
+  - **The first version of the test passed a closed ring.** A closed ring's top row is inked only
+    where the bar is, so "nothing in the top row's outer thirds" held either way. The gap shows a
+    row down, two pixels either side of the bar, and the test reads it there. The control that
+    drew no gap passed the first version and fails this one.
+- **The power menu**: the bar's third menu, hung right-aligned (`menu_anchor_right`) so it stays
+  on the screen.
+  - Log out alone until F.3, by the refresh's rule that a row doing nothing is worse than none.
+  - The bar's open line had two branches and called it "places menu open". It is named by
+    `BarMenus::what` now, which knows all three.
+- **`desktop_shell::ending`**, pure and host-tested: which windows are still open, when the dialog
+  comes up, what it says, and when the session may end.
+  - **Every normal window is asked** — every desktop's, and any opened while the end waits — and
+    **never a dialog**, the PR #345 review's finding.
+  - **The dialog comes up at half a second**, and is drawn again only when what it names changes.
+  - **A stop waits 3 s with no dialog.** Its test compares that against `libsession`'s
+    `LEADER_STOP_NS`, made public for it, rather than a literal 5.
+- **The waiting dialog is a popup under the power button**, not a `dialog` and not centred:
+  - **A `dialog` is held for the manager to place.** The manager is this shell, which would be
+    placing a window it is waiting on.
+  - Under the power button, where the menu was, it never covers the question an application
+    centres on its own window.
+  - It is `libui`'s fixed question, two lines and two buttons, so its buttons land at the
+    published centres.
+  - **It is not dismissed by a press elsewhere**, as a menu is, because answering the editor is
+    exactly a press elsewhere.
+- **Log out is the shell exiting.** `desktop-session-mgr` already handled a leader that exits. It
+  now says **"greeter presented again"**, since only the first greeter was announced.
+- **A stop asks the windows too.** The terminate path that exited at once (E.4c) now asks and
+  goes after 3 s, or at once with nothing to ask.
+- **`nxedit`'s comment on `CloseRequested`** said it had "no dialog to ask in" from M12 on, and
+  its library had one. Its log line said "asked to close, exiting" and then asked about the
+  buffer. Both are corrected.
+
+**`check-logout`**, new in CI, on the release image, in one QEMU run:
+1. log in;
+2. open the editor and type into it;
+3. Log out: the editor asks, and the shell's dialog names it;
+4. Cancel, and the session goes on;
+5. Log out again, discard in the editor, and the greeter comes back;
+6. log in, open a terminal, and Log out: no dialog, and the greeter comes back;
+7. log in, open the editor with a key typed and a terminal, and type `with power shutdown`: the
+   editor asks, no dialog comes, and the machine halts without the supervisor finding the shell
+   "still running". **Beyond the plan**, and the one gate on the stop path: `check-shutdown` has
+   no graphical session.
+
+Its aims — the power button, and a `libui` dialog's size and button centres — moved into
+`chrome`, where `the_gates_chrome_table_is_the_toolkits` pins them. They had been `check-login`'s
+locals, and `check-login` now reads them from `chrome` too.
+
+**Controls, each failing:**
+- **A dialog at once fails at step 3**, not at step 6's check: the dialog comes up before the
+  editor's question, and the ordered expectations time out.
+- **A terminal a second slow to close fails step 6's own check**: "a terminal, which closes when
+  asked, still brought up the waiting dialog".
+- **A stop wait of 6 s fails step 7's own check.** Step 7 first timed out waiting for the shell's
+  exit line, which never comes when the machine halts first. It now waits for the halt and reads
+  back.
+- **A Cancel that does nothing fails step 4.**
+- In the host tests: the ending's timings, End anyway, the named-and-counted question, and the
+  panel's button, menu, anchor and dialog aims.
+
+**Under TCG** the gate passes too, twice. Step 6 depends on a terminal closing inside half a
+second, and it did.
+
+**Docs:**
+- `desktop-shell.md` §4 and a new §4b, and its Status;
+- `graphical-session.md` §4, and its Status;
+- `qemu-integration-tests.md`'s screen gates, and `desktop-refresh.md`'s `End session`;
+- the root `CLAUDE.md` and the plan.
+
+The local gate set grows to 36 with `check-logout` and its `--kvm` run, and is green (fgb48).
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.3: Restart and Shut down
+
+The power menu gains **Restart** and **Shut down**, as destructive rows. Each ends the session the
+way Log out does — every window asked to close, the waiting dialog, End anyway and Cancel — and
+then asks the view broker for `shutdown`, `--reboot` for Restart, in the `power` view, with the
+request `with power shutdown` makes.
+
+**The pieces:**
+- **`libviews`, a new crate: the view broker's client.** The request was `with`'s own, in a
+  coreutil the desktop cannot reach; `userspace/CLAUDE.md`'s rule puts a helper with a second
+  consumer below both.
+  - It holds the request — its handles in the order the broker takes them, its body, the round
+    trip — with the password step and the listing. `coreutils::ipc`, the plumbing that scrubs
+    what a password passes through, moved in with it.
+  - **Waits can end.** `with` has nothing else to do while the broker thinks; the desktop has a
+    screen to keep answering, so it bounds a broker that has stopped at 5 s.
+  - **Every handle a request carries is gone when it returns**: sent, the broker's; not sent,
+    closed. `with` exits on a failure, so it never needed this; the shell lives on.
+- **A refusal before any window is asked**, which the plan did not have. Found after the windows
+  closed, a policy that refuses, or one that wants a password, would have cost the person their
+  windows — the editor's question included — for nothing.
+  - The shell reads the person's `List` first. Its rows are what `decide` reads, one per view per
+    rule in the policy's order, so the first row naming the view and the program is the rule that
+    decides. `libviews::access` is that reading.
+  - **The broker's tests hold it to `decide`**, over the seed and a policy whose rules overlap,
+    for every principal, view and program. A reading that took any passwordless row rather than
+    the first fails that test.
+  - The request after the windows close still decides, and a refusal then is shown too.
+- **The request hands the broker an application's namespace**, built with F.1's builder and
+  verified as a launch's is, rather than the session's, which reaches `manage`.
+  - On `Started` **the channel stays open**. A client channel that closes while its program runs
+    is a Stop, so closing it would stop `shutdown`.
+  - The shell then waits for its terminate request. An `Exited` of 0 means the shutdown has
+    begun; anything else is a refusal.
+  - A password is never answered: the channel closes, which drops the request.
+- **The refusal is a dialog**, a popup under the power button as the waiting dialog is.
+  - It uses `libui`'s fixed frame: two lines, and **Close** in the right half, where Cancel is.
+  - A password's reads "The policy asks for your password, which / only a terminal can ask for
+    yet." Its console line names the graphical prompt's trigger.
+  - A host test checks that every refusal the shell can say fits the frame, at both text sizes. A
+    longer line fails it.
+- **End anyway asked its window again**, which F.2 shipped and this part's gate found.
+  - A destroyed window is still listed until the compositor has got to it. The next `sync` took it
+    for a new one: it asked it to close again, was refused, and redrew the dialog naming it.
+  - `Closing` now remembers what it ended. F.2's host test ended a window and stopped there, and
+    F.2's gate never pressed End anyway.
+- **`desktop-shell`'s manifest said it took only `rebind_block_devices` from `libsession`**, which
+  F.1 made false. It is corrected.
+
+**`check-logout`**, now nine steps in three boots in one QEMU run:
+7. **F.2's typed shutdown is `with power shutdown --reboot` now**, because the halt must come
+   last. Its assertions are the same, and a second boot's greeter follows.
+8. **Restart**, with the editor holding something to lose: the waiting dialog names it, End
+   anyway, the broker starts `shutdown --reboot`, and a third boot's greeter.
+9. **Shut down**: the message on COM1, and read off the screen with `check-fbcon`'s decoder.
+   `check-shutdown`'s reader is shared now, as `expect_safe_on_screen`.
+
+`spawn_release_guest` takes `reboot`, which only this gate passes. **The first run read back from
+the shell's "started" line and missed `shutdown: restarting`.** `shutdown` can print that before
+the shell hears it was started, so the read-back now starts at the click. A restart also logs
+"shutting down, to reboot, as asked", not the halt's line.
+
+**Controls, each failing:**
+- **A Restart that asks for `shutdown` without `--reboot`** halts the machine, and step 8 times
+  out waiting for the reset.
+- **`access` reading any passwordless row**: the broker's agreement test.
+- **`Closing` without the memory of what it ended**: the End anyway test.
+- **A refusal line longer than the frame**: the fit test.
+
+**Not gated: a refusal.** The seeded policy never refuses, and a gate that installed another would
+be changing the release image it boots in place. The refusal is host-tested only.
+
+**Under TCG** the gate passes in 1m28s.
+
+**Docs:**
+- `desktop-shell.md` §4b, and its Status;
+- `graphical-session.md` §4, and its Status;
+- `views-toml-schema.md`: the desktop asks as `with` does;
+- `rsproto-views-ops.md`:
+  - the namespace a request sends is its sender's choice;
+  - a listing can be read for a decision;
+  - `libviews`;
+- `userspace/CLAUDE.md`'s layering;
+- the root `CLAUDE.md`'s `check-logout`, and `desktop-refresh.md`;
+- the plan, and `implementation-plan.md`, where F.1 and F.2 had not been recorded either.
+
+The local gate set stays at 36 and is green (fgb49).
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.4: the graphical prompt, written down
+
+[`docs/design/graphical-prompt.md`](design/graphical-prompt.md): designed, not built. With it
+**Part F is complete**.
+
+**The plan's premise was not true of today's compositor.** Its bullet said the compositor draws
+the prompt with the desktop dimmed behind it, "which no client surface can do".
+- **An application's popup is never held for the manager.** It is placed where its creator asks,
+  negative offsets included, at any size, and pushed on top of the stack. The topmost window that
+  takes focus has the keyboard.
+- **A host probe proved it**, and was not kept. It created a bar, an application's window, and a
+  popup of that window the size of the screen. The popup landed at (0,0), above the bar, and was
+  the focus candidate.
+- **Nothing refuses a `panel` on an application's connection either.**
+
+So **keeping applications off the panels is the prompt's first piece**:
+- the manager's connection is opened through `manage`, so the compositor knows it;
+- an application's popup is kept in the work area;
+- a panel is refused on any other connection.
+
+It is recorded as `TODO(app-covers-panels)`, marked where a popup is placed, and triggered by
+building the prompt.
+
+**What the document settles:**
+- **Only the broker opens it.** The prompt is a `prompt` suffix of `/dev/draw`, answered only on a
+  resolve with no base, which is one through the root namespace's binding. Sessions bind
+  `/dev/draw` at a base, as they bind `/dev/views`.
+  - Today the shell's whole `/dev/draw` would reach it, and the shell would be in the password's
+    path.
+  - The root namespace's other holders are every system service. `TODO(svc-auth-ungated)` already
+    names that trusted set.
+- **A helper draws it**: `view-prompt`, spawned by the broker for each prompt, holding the prompt
+  endpoint and the fonts. The broker stays small, and the compositor grows no toolkit.
+- **It is a layer above the stack.** The manager is not told of it and can neither capture nor close
+  it.
+  - The dim covers the bars, and a strip over the top bar is the tell: a password prompt that
+    leaves the top bar undimmed is not the system's.
+  - The manager can still imitate one. It is in the display's trusted set already.
+- **It holds the keyboard and the pointer**, with the chords suspended. A password's path is then
+  kernel → `input-server` → compositor → `view-prompt` → broker → `auth-service`.
+- **In a session on the display, `with` prompts there.** That is the remedy for the same-backend
+  limit, as `pkexec` asks a graphical agent.
+  - The requester never holds the password. A new `Prompt` op asks the broker to prompt, and `Held`
+    paces the check as it paces `Password`'s.
+  - Only the session on the display may ask: `OpenSession` gains a flag that only the supervisor
+    channel sets.
+- **Not guaranteed:**
+  - a look-alike inside an application's own window — a secure attention key is the next step if
+    that matters;
+  - a compromised trusted path;
+  - protection from someone looking over a shoulder.
+- **The trigger is unchanged.**
+
+**Docs:**
+- the new document, and the deferral;
+- the plan: F.4, the Docs box, and Part F;
+- the root `CLAUDE.md`'s list of what `design/` holds;
+- `implementation-plan.md`.
+
+**Verified in proportion**, since the change is documents and one source comment:
+- `check-docs` and `check-deferrals`, the two gates a document and a marker move;
+- the host tests, since the comment is in the compositor's source;
+- the image build.
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Part F, reviewed (PR #346): the question keeps the keyboard, and the broker decides
+
+No blocking findings. Two worth fixing and two optional, all four taken.
+
+**The waiting dialog took the keyboard from the editor's question** (finding 2).
+- Focus is the topmost window that takes it, and opening the dialog put it on top. Half a second
+  after Log out, the editor's "discard?" lost the keyboard to a dialog that answers only Escape,
+  as Cancel. A person pressing Escape to keep editing cancelled the logout instead.
+- **The shell now gives the keyboard back when the window that had it was an application's
+  transient one**: its question, or a menu. It raises that window, and the log says so.
+  - A normal window is not raised back, since it could cover the dialog.
+  - The shell tracks the last window to gain focus, whatever its role, because the window list
+    holds no dialogs.
+- **`check-logout` step 3 now presses Escape once the dialog is up.** The editor must answer
+  *keep editing*, and the logout must not be cancelled. Step 5 then discards in the question the
+  editor asks again.
+  - No receipt from the editor can be waited for: it announces only its first gain.
+  - None is needed. The shell logs after the compositor has answered the raise, and a key is routed
+    to whatever the stack says then.
+- **Control:** the log line kept, the raise skipped. The Escape cancelled the logout, and step 3
+  timed out waiting for the editor.
+
+**The desktop's refusal read a listing the broker cuts at 2 KiB** (finding 3).
+- `List` stops at the first row that does not fit and says nothing. `libviews::access` read a
+  `power` row past the cut as "no rule" and refused a Shut down the policy allows.
+- That is the worse direction for a pre-check: it makes an allowed action impossible from the
+  desktop.
+- **A truncation flag would have kept the mirror.** A client would still re-derive the broker's
+  rule, and every refusal found by reading would stay uncertain. So the broker answers the question
+  itself:
+  - **`Decide` (`0x0E0F`)**: a view and a program in, and back the outcome a `Request` would get.
+    It runs nothing and takes no handle.
+  - Its answer is `Policy::would`: the bare-name refusal a request makes, then `decide`.
+    Host-tested for each outcome and reason, and for the first matching rule's `auth`.
+  - `libviews::access`, its tests, and `view-broker`'s agreement test are gone. `libviews::decide`
+    replaces them.
+- **`List` is unchanged, and documented as cut.** The broker now logs when it cuts one, since
+  `with --list` shows a cut listing as whole.
+
+**Two docs** (findings 1 and 4):
+- `desktop-shell.md` §4 said "there is no logout".
+- The root `CLAUDE.md` counted two gates on the release image, and called `check-login` the only
+  one where the display arm exists for a person. `check-logout` is both, and `test-interactive`'s
+  "the one gate" had been stale since `check-login`.
+
+**Docs:**
+- `desktop-shell.md` §4 and §4b;
+- `rsproto-views-ops.md`: `Decide`, and `List`'s cut;
+- `views-toml-schema.md`, the plan, and the root `CLAUDE.md`.
+
+The local gate set stays at 36 and is green (fgb50).
+
+No kernel change; no ABI hash impact. An rsproto op is not a hash input.

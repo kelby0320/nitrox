@@ -99,7 +99,9 @@ static STOP_ASKED: AtomicBool = AtomicBool::new(false);
 
 /// How long a session's leader has, once asked to stop, before its supervisor goes on without it.
 /// Shorter than `service-mgr`'s bound on the supervisor itself, 10 s, which must cover it.
-const LEADER_STOP_NS: u64 = 5_000_000_000;
+/// **Public, because a leader's own wait must fit inside it** — `desktop-shell`'s for its windows
+/// (administration Part F.2), whose host test compares the two.
+pub const LEADER_STOP_NS: u64 = 5_000_000_000;
 
 /// **Whether this process has been asked to stop** (administration Part E.4c). A supervisor asks
 /// after a session ends, and exits rather than prompting again: a shutdown is under way.
@@ -130,12 +132,21 @@ fn kprint(msg: &[u8]) {
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// What a session's namespace is built from.
+/// What a session's namespace — **or an application's** — is built from.
 ///
 /// A struct rather than seven positional arguments because the two columns differ in exactly
 /// one of them and a bool in the seventh position is unreadable at the call site.
+///
+/// **One vocabulary, three builders** (administration Part F.1): both login supervisors build a
+/// session with this, and `desktop-shell` builds each application's namespace with it too, so
+/// the two cannot drift. They had: an application's builder was `desktop-shell`'s own until F.1,
+/// and it never bound `/session/user`, so `whoami` in a desktop terminal said "no session
+/// identity". The view broker derives a view from its caller's namespace and builds nothing from
+/// a recipe.
 pub struct NamespaceSpec<'a> {
-    /// The supervisor's own namespace, resolved from for direct-handle binds.
+    /// The namespace direct handles and disks are resolved from: the supervisor's own — the root
+    /// namespace — for a session, and **the session's** for an application, whose disks are the
+    /// session's to pass on.
     pub root_ns: u64,
     /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
     pub fs_endpoint: u64,
@@ -247,6 +258,49 @@ pub struct NamespaceSpec<'a> {
     /// service without the view broker's `services` grant, which binds an admin endpoint at
     /// `/dev/services/admin` in a view.
     pub services_endpoint: u64,
+    /// Bind `/applications`, the profile server's projection of each package's desktop entries.
+    /// **True for a session**, whose shell and desktop list them; **false for an application**,
+    /// which launches nothing by name from a menu (administration Part F.1).
+    pub bind_applications: bool,
+    /// The compositor's forwarding endpoint, bound at **`/dev/draw/new` alone**, with the base
+    /// `/new`: an application may open windows and nothing else there, and `manage` — the desktop
+    /// shell's — is unreachable. `0` binds nothing, as for a session: the graphical supervisor
+    /// binds `/dev/draw` whole for `desktop-shell` itself. **Required when asked for**: a build
+    /// whose `new` does not bind fails, since an application that cannot draw is not one
+    /// (administration Part F.1, from `desktop-shell`'s own builder).
+    pub draw_endpoint: u64,
+    /// `desktop-shell`'s own endpoint, bound at `/dev/desktop`, so an application can name the
+    /// desktops (M8 Part F). `0` binds nothing, as for a session.
+    pub desktop_endpoint: u64,
+}
+
+/// **What a namespace built from a [`NamespaceSpec`] holds**, as its builder found it: the
+/// namespace, and which of its optional members bound. `desktop-shell` reports from this; the
+/// supervisors read it through [`session_has_bin`] and its siblings, which
+/// [`build_namespace`] records.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Built {
+    /// The namespace handle.
+    pub ns: u64,
+    /// `/bin` bound.
+    pub bin: bool,
+    /// `/dev/tty` bound.
+    pub tty: bool,
+    /// `/dev/console` bound.
+    pub console: bool,
+    /// `/dev/clipboard` bound.
+    pub clipboard: bool,
+    /// `/dev/views` bound, at the session's base.
+    pub views: bool,
+    /// `/dev/devices` bound.
+    pub devices: bool,
+    /// `/storage` and `/dev/storage` both bound.
+    pub storage: bool,
+    /// How many block devices were rebound from `root_ns`: `0` unless [`NamespaceSpec::bind_blk`]
+    /// asked, and the source had some.
+    pub disks: usize,
+    /// `/dev/desktop` bound.
+    pub desktop: bool,
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -414,7 +468,30 @@ pub fn views_close_session(sup: u64, id: u64) {
 /// an installer session does. Proves `BIND_NAMESPACE` + subtree scoping + shared-
 /// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
 /// `root_ns` is session-mgr's inherited namespace (to resolve the console).
+///
+/// [`build`], recording what bound for [`session_has_bin`] and its siblings — the supervisors'
+/// shape, one session built at a time.
 pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
+    let Some(b) = build(spec) else { return 0 };
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe {
+        SESSION_HAS_BLK = b.disks > 0;
+        SESSION_HAS_BIN = b.bin;
+        SESSION_HAS_TTY = b.tty;
+        SESSION_HAS_CONSOLE = b.console;
+        SESSION_HAS_CLIPBOARD = b.clipboard;
+        SESSION_HAS_VIEWS = b.views;
+        SESSION_HAS_DEVICES = b.devices;
+        SESSION_HAS_STORAGE = b.storage;
+    }
+    b.ns
+}
+
+/// **Build a namespace from `spec`**, a session's or an application's, and say what bound
+/// (administration Part F.1). `None` if a member it cannot do without did not: the namespace
+/// itself, `/home` when there is a home, or `/dev/draw/new` when asked for. Every other member is
+/// reported and skipped when it fails, since a session or an application without it still runs.
+pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     let NamespaceSpec {
         root_ns,
         fs_endpoint,
@@ -431,34 +508,60 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         devices_endpoint,
         storage_endpoint,
         services_endpoint,
+        bind_applications,
+        draw_endpoint,
+        desktop_endpoint,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
+    // SAFETY: register-only syscall; returns a fresh namespace handle or an error.
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
         kprint(b"libsession: ns_create FAIL\n");
-        return 0;
+        return None;
     }
     let ns = ns as u64;
-    // `/home` → the fs-server endpoint scoped to the user's home subtree. The kernel
-    // shares init's fs registration (bind-mount) and prepends `home` to every forwarded
-    // suffix. Requires BIND_NAMESPACE (re-delegated) + BIND on `ns`.
-    let sub = b"/home";
-    let br = unsafe {
-        syscall6(
-            SYS_NS_BIND,
-            ns,
-            sub.as_ptr() as u64,
-            sub.len() as u64,
-            fs_endpoint,
-            home.as_ptr() as u64,
-            home.len() as u64,
-        )
-    };
-    if br != 0 {
-        kprint(b"libsession: /home subtree bind FAIL\n");
+    let give_up = |why: &[u8]| {
+        kprint(why);
         // SAFETY: closing the namespace we created.
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
-        return 0;
+        None
+    };
+    // `/dev/draw/new` → the compositor, **narrowly** (administration Part F.1, from
+    // `desktop-shell`'s own builder): the six-argument bind with the base `/new`, so a resolve of
+    // `/dev/draw/new` reaches the compositor as `new` and nothing under `/dev/draw` reaches
+    // `manage`. `desktop-shell` checks that before it launches (`verify_app_namespace`).
+    if draw_endpoint != 0 {
+        let path = b"/dev/draw/new";
+        let base = b"/new";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let dr = unsafe {
+            syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, draw_endpoint, base.as_ptr() as u64, base.len() as u64)
+        };
+        if dr != 0 {
+            return give_up(b"libsession: /dev/draw/new bind FAIL\n");
+        }
+    }
+    // `/home` → the fs-server endpoint scoped to the user's home subtree. The kernel
+    // shares init's fs registration (bind-mount) and prepends `home` to every forwarded
+    // suffix. Requires BIND_NAMESPACE (re-delegated) + BIND on `ns`. **Required when there is a
+    // home**: an application starts with `PWD=/home`, and a session's shell with its home.
+    if !home.is_empty() {
+        let sub = b"/home";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let br = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                sub.as_ptr() as u64,
+                sub.len() as u64,
+                fs_endpoint,
+                home.as_ptr() as u64,
+                home.len() as u64,
+            )
+        };
+        if br != 0 {
+            return give_up(b"libsession: /home subtree bind FAIL\n");
+        }
     }
     // `/bin` → the profile server, whole-tree (no subtree base): a lookup of `/bin/list`
     // reaches it with suffix `list`, and it probes the system profile's packages in the
@@ -511,25 +614,29 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         //
         // Non-fatal for the same reason `/bin` is: a session that cannot enumerate applications
         // still runs every one of them by name.
-        let apps = b"/applications";
-        // **Absolute**: `SubtreeBase::from_path` runs `validate_path`, which rejects a bare
-        // component. The forwarded suffix therefore carries the leading slash too, which is what
-        // `profile-server`'s `split_suffix` strips.
-        let base = b"/applications";
-        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-        let ar = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                apps.as_ptr() as u64,
-                apps.len() as u64,
-                profile_endpoint,
-                base.as_ptr() as u64,
-                base.len() as u64,
-            )
-        };
-        if ar != 0 {
-            kprint(b"libsession: /applications bind FAIL (the modal will be empty)\n");
+        // **A session's alone** (administration Part F.1): an application launches nothing by
+        // name from a menu, and a member bound for nothing is still authority held.
+        if bind_applications {
+            let apps = b"/applications";
+            // **Absolute**: `SubtreeBase::from_path` runs `validate_path`, which rejects a bare
+            // component. The forwarded suffix therefore carries the leading slash too, which is what
+            // `profile-server`'s `split_suffix` strips.
+            let base = b"/applications";
+            // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+            let ar = unsafe {
+                syscall6(
+                    SYS_NS_BIND,
+                    ns,
+                    apps.as_ptr() as u64,
+                    apps.len() as u64,
+                    profile_endpoint,
+                    base.as_ptr() as u64,
+                    base.len() as u64,
+                )
+            };
+            if ar != 0 {
+                kprint(b"libsession: /applications bind FAIL (the modal will be empty)\n");
+            }
         }
         has_bin = pr == 0;
     }
@@ -548,7 +655,13 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     // server behind this prefix instead; clients do not change when that happens, because
     // a server answers a resolve with a memory object too. See
     // `TODO(session-metadata-server)`.
-    bind_session_user(ns, user);
+    //
+    // **An application's too** (administration Part F.1): `desktop-shell` reads its session's and
+    // passes the name on, so `whoami` in a desktop terminal answers as it does at a serial prompt.
+    // An empty name binds nothing.
+    if !user.is_empty() {
+        bind_session_user(ns, user);
+    }
 
     // `/dev/tty` → the terminal server, so a program in the session can obtain a *cooked*
     // terminal it can also write to — and, once every client has moved, has no way to
@@ -749,22 +862,41 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     // Each device's `info` leaf is a snapshot object, so it is resolved once here and bound
     // beside its device. Device facts do not change while a machine runs — a disk does not
     // become a partition — and nothing here supports hot-plug.
-    let has_blk = bind_blk && rebind_block_devices(root_ns, ns) > 0;
-    if bind_blk && !has_blk {
+    let disks = if bind_blk { rebind_block_devices(root_ns, ns) } else { 0 };
+    if bind_blk && disks == 0 {
         kprint(b"libsession: installer session asked for disks and found none\n");
     }
-    // SAFETY: single-threaded session-mgr; one namespace is built at a time.
-    unsafe {
-        SESSION_HAS_BLK = has_blk;
-        SESSION_HAS_BIN = has_bin;
-        SESSION_HAS_TTY = has_tty;
-        SESSION_HAS_CONSOLE = has_console;
-        SESSION_HAS_CLIPBOARD = has_clipboard;
-        SESSION_HAS_VIEWS = has_views;
-        SESSION_HAS_DEVICES = has_devices;
-        SESSION_HAS_STORAGE = has_storage;
+    // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application (M8 Part F): the
+    // desktops, named. No base. Non-fatal: an application without it still draws.
+    let mut has_desktop = false;
+    if desktop_endpoint != 0 {
+        let at = b"/dev/desktop";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let r = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, desktop_endpoint, 0, 0) };
+        if r != 0 {
+            kprint(b"libsession: /dev/desktop bind FAIL\n");
+        }
+        has_desktop = r == 0;
     }
-    ns
+    Some(Built {
+        ns,
+        bin: has_bin,
+        tty: has_tty,
+        console: has_console,
+        clipboard: has_clipboard,
+        views: has_views,
+        devices: has_devices,
+        storage: has_storage,
+        disks,
+        desktop: has_desktop,
+    })
+}
+
+/// **How many block devices `ns` holds**, read as [`rebind_block_devices`] reads them.
+/// `desktop-shell` asks this of its session once, since only an installer session has any, and
+/// passes them on to what it launches only then (administration Part F.1).
+pub fn block_device_count(ns: u64) -> usize {
+    block_indices(ns, &[]).len()
 }
 
 /// Hand every block device reachable from `from_ns` to `to_ns`, with its `info` snapshot, and

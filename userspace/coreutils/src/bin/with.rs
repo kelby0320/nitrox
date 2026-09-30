@@ -23,6 +23,10 @@
 //! **It reads the password, not the broker** — on the terminal its shell handed it, echo off, with
 //! `coreutils::prompt`, which `account` shares. The broker holds each check for the session's delay
 //! after a wrong one, and ends a request after three.
+//!
+//! **The request itself is `libviews`'** (administration Part F.3): the desktop's Restart and Shut
+//! down make the same one, for `shutdown` in the `power` view. What is `with`'s is the prompt, the
+//! relay, and the policy's `--show` and `--install`.
 
 #![no_std]
 #![no_main]
@@ -33,7 +37,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use coreutils::ipc::{call, close, lookup, outcome, recv, send, wait};
 use coreutils::prompt::ask_password;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
@@ -45,6 +48,8 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::wire::{Value, write_value};
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
+use libviews::ipc::{call, close, lookup, outcome, recv, send, wait};
+use libviews::{Handed, REQUEST_ID};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -81,7 +86,7 @@ fn dup(h: u64) -> u64 {
 
 /// The view broker, through this session's `/dev/views`.
 fn broker(stage: &Stage) -> u64 {
-    let ch = lookup(stage.namespace, b"/dev/views", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    let ch = libviews::broker(stage.namespace);
     if ch == 0 {
         stage.die(b"with: this session has no view broker (/dev/views)\n", EXIT_FAILURE);
     }
@@ -115,21 +120,14 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// `with --list`: the views this session's person may use, as `Table<{view, run, password}>`.
 fn list(stage: &Stage) -> ! {
     let ch = broker(stage);
-    let Some((false, body)) = call(ch, OP_VIEWS_LIST, 1, &[], &[]) else {
-        let why = b"with: the broker could not list your views (does the policy read?)\n";
-        stage.die(why, EXIT_FAILURE);
+    let rows = match libviews::list(ch, u64::MAX) {
+        Ok(rows) => rows,
+        Err(libviews::Failed::Refused) => {
+            stage.die(b"with: the broker could not list your views (does the policy read?)\n", EXIT_FAILURE)
+        }
+        Err(libviews::Failed::Garbled) => stage.die(b"with: the broker's listing did not read\n", EXIT_FAILURE),
+        Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
-    let mut rows: Vec<(String, String, bool)> = Vec::new();
-    let parsed = parse_rows(&body, |r| {
-        rows.push((
-            String::from_utf8_lossy(r.view).into_owned(),
-            String::from_utf8_lossy(r.run).into_owned(),
-            r.password,
-        ))
-    });
-    if parsed.is_none() {
-        stage.die(b"with: the broker's listing did not read\n", EXIT_FAILURE);
-    }
     match stage.streams.stdout {
         Some(h) => {
             let schema = Schema::new()
@@ -138,9 +136,8 @@ fn list(stage: &Stage) -> ! {
                 .field("password", TypeTag::Bool, TypeModifiers::NONE);
             let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE));
             let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
-                for (view, run, password) in &rows {
-                    let row =
-                        [Value::Str(view.clone()), Value::Str(run.clone()), Value::Bool(*password)];
+                for r in &rows {
+                    let row = [Value::Str(r.view.clone()), Value::Str(r.run.clone()), Value::Bool(r.password)];
                     tw.write_row(&row)?;
                 }
                 tw.finish_with_status(0)
@@ -152,8 +149,8 @@ fn list(stage: &Stage) -> ! {
         None => {
             let lines: Vec<String> = rows
                 .iter()
-                .map(|(v, r, p)| {
-                    alloc::format!("{v}  {r}  {}", if *p { "password" } else { "no password" })
+                .map(|r| {
+                    alloc::format!("{}  {}  {}", r.view, r.run, if r.password { "password" } else { "no password" })
                 })
                 .collect();
             for l in &lines {
@@ -259,39 +256,20 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     // The program's streams are `with`'s own: stdin and stdout move to it. `stderr` and the
     // terminal go as **duplicates** — `with` still needs one to report on and the other to ask
     // for a password on.
-    let mut bits = 0u8;
-    let mut handles: Vec<u64> = alloc::vec![copy as u64];
-    if let Some(h) = stage.streams.stdin {
-        bits |= REQ_STDIN;
-        handles.push(h);
-    }
-    if let Some(h) = stage.streams.stdout {
-        bits |= REQ_STDOUT;
-        handles.push(h);
-    }
-    if let Some(h) = stage.streams.stderr.map(dup).filter(|&d| d != 0) {
-        bits |= REQ_STDERR;
-        handles.push(h);
-    }
     let term = stage.terminal.unwrap_or(0);
-    if term != 0 {
-        let d = dup(term);
-        if d != 0 {
-            bits |= REQ_TERMINAL;
-            handles.push(d);
-        }
-    }
-    let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
-    let mut body = alloc::vec![0u8; IPC_PAYLOAD_SIZE - 64];
-    let (v, p) = (view.as_bytes(), program.as_bytes());
-    let Some(n) = build_request(&mut body, bits, v, p, &arg_bytes, &env) else {
-        stage.die(b"with: the request is too large\n", EXIT_USAGE);
+    let handed = Handed {
+        ns: copy as u64,
+        stdin: stage.streams.stdin,
+        stdout: stage.streams.stdout,
+        stderr: stage.streams.stderr.map(dup).filter(|&d| d != 0),
+        terminal: Some(term).filter(|&t| t != 0).map(dup).filter(|&d| d != 0),
     };
-    let mut rid = 1u64;
-    let (mut o, mut why) = match call(ch, OP_VIEWS_REQUEST, rid, &body[..n], &handles) {
-        Some((false, body)) => outcome(&body),
-        _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
+    let (mut o, mut why) = match libviews::request(ch, view, program, args, &env, handed, u64::MAX) {
+        Ok(answer) => answer,
+        Err(libviews::Failed::TooLarge) => stage.die(b"with: the request is too large\n", EXIT_USAGE),
+        Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
+    let mut rid = REQUEST_ID;
     let mut tries = 0u8;
     while o == Outcome::NeedPassword || o == (Outcome::Denied { retry: true }) {
         if term == 0 {
@@ -316,11 +294,11 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
             stage.die(b"with: cancelled\n", EXIT_FAILURE);
         };
         rid += 1;
-        let answer = call(ch, OP_VIEWS_PASSWORD, rid, &pw, &[]);
+        let answer = libviews::password(ch, rid, &pw);
         scrub(&mut pw);
         (o, why) = match answer {
-            Some((false, body)) => outcome(&body),
-            _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
+            Ok(answer) => answer,
+            Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
         };
     }
     if o != Outcome::Started {

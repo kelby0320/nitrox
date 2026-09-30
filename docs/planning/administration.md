@@ -503,7 +503,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `service-manager.md` has always said); `services.toml` moved onto the root
       filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
-- [ ] **F — the desktop's share** — *detailed below, F.1–F.4 (2026-09-29).* `desktop-shell`
+- [x] **F — the desktop's share** — *detailed below, F.1–F.4 (2026-09-29); complete
+      2026-09-29.* `desktop-shell`
       building application namespaces in the same vocabulary; the graphical prompt's design
       written down, with its trigger; and, handed on by Part E, **a power menu** — Log out,
       Restart, Shut down — that **closes a session's windows first**.
@@ -2361,7 +2362,7 @@ programs to close with unsaved work in mind (E.4a).
   there**: the person started it from a terminal, the machine is going down, and a question the
   shell could not wait for would be a lie. A modified buffer in the editor is lost then, as it is
   today.
-- **The graphical prompt's design is written down** in `docs/design/graphical-prompt.md`: what it <!-- check-docs: allow-missing -->
+- **The graphical prompt's design is written down** in `docs/design/graphical-prompt.md`: what it
   must guarantee, how, and its trigger. Nothing is built.
 
 ### Logging out, end to end
@@ -2387,7 +2388,11 @@ and the session would end with the editor's process left to notice (*Left alone*
 
 ### The pieces, in dependency order
 
-- [ ] **F.1 — one vocabulary for namespaces.**
+- [x] **F.1 — one vocabulary for namespaces.** *(Landed 2026-09-29, as drawn. Booted first: an
+      application's `/session/user` resolved `NotFound`. `libsession::build` returns what it bound,
+      a `Built`, so `desktop-shell` can report it, and `build_namespace` wraps it for the
+      supervisors, recording their `session_has_*`; `block_device_count` tells `desktop-shell` once
+      whether its session has disks.)*
       - `NamespaceSpec` gains `/dev/draw/new` and `/dev/desktop`, and makes optional what an
         application does not get: `/applications` and the console.
       - `desktop-shell` builds each application's namespace with `libsession::build_namespace`,
@@ -2402,7 +2407,12 @@ and the session would end with the editor's process left to notice (*Left alone*
           manage" — names it. **Not `check-terminal`** (PR #345 review): its `nxterm` is a
           test-image service in `service-mgr`'s namespace, in no session, and `whoami` there fails
           by design.
-- [ ] **F.2 — the power menu, and Log out.**
+- [x] **F.2 — the power menu, and Log out.** *(Landed 2026-09-29. Three things differ from the
+      text below: **the waiting dialog is a popup hung under the power button**, as the menu is —
+      a `dialog` is held for the manager to place, and the manager is the shell — so it never
+      covers the editor's question, centred on the editor; **`check-logout` has a seventh step**, a
+      shutdown typed at a terminal, the one gate on the stop path's 3 s; and the editor's answer is
+      *discard*, not "Don't save". `desktop-session-mgr` now says "greeter presented again".)*
       - `IconKind::Power`, host-tested by painting and counting ink, as a present-but-invisible
         widget would otherwise pass.
       - The top bar's right-hand button, and `menu_anchor` hanging a menu from either edge.
@@ -2424,7 +2434,16 @@ and the session would end with the editor's process left to notice (*Left alone*
         5. Log out again, and **Don't save** in the editor: the greeter comes back;
         6. log in again, open a terminal, Log out: nothing to ask, and the greeter comes back at
            once.
-- [ ] **F.3 — Restart and Shut down.**
+- [x] **F.3 — Restart and Shut down.** *(Landed 2026-09-29. Four things differ from the text
+      below. **A refusal comes before any window is asked**: `desktop-shell` asks the broker with a
+      new `Decide`, which answers as a request would and runs nothing, so a password policy does
+      not cost a person their windows. (First a reading of the person's `List`, which the PR #346
+      review found the broker cuts at 2 KiB.)
+      **The library is `libviews`**, and `coreutils::ipc` moved into it. **`check-logout` has nine
+      steps in three boots**: F.2's typed shutdown became `with power shutdown --reboot`, so the
+      halt can come last. And **End anyway had asked its window again**: a destroyed window is
+      listed until the compositor gets to it, and `Closing` took it for a new one — the first End
+      anyway a gate pressed found it.)*
       - The Views client's round trip moves out of `with` into a library `desktop-shell` reaches.
       - The two rows, each through the broker's `power` view after the windows are closed; a
         refusal shown in a dialog, and a request for a password refused naming the graphical
@@ -2434,7 +2453,15 @@ and the session would end with the editor's process left to notice (*Left alone*
            its greeter;
         8. log in, **Shut down**: "It is now safe to turn off your computer." read off the screen
            with `check-fbcon`'s decoder.
-- [ ] **F.4 — the graphical prompt, written down.** `docs/design/graphical-prompt.md`: <!-- check-docs: allow-missing -->
+- [x] **F.4 — the graphical prompt, written down.** `docs/design/graphical-prompt.md`: *(Landed
+      2026-09-29. **The second bullet was not true of today's compositor**, and the document says
+      so: an application's popup is placed where it asks, at any size, above the bars, and takes
+      the keyboard — a probe put one the size of the screen at (0,0). So keeping applications off
+      the panels is the prompt's first piece, recorded as `TODO(app-covers-panels)`. The document
+      also settles who draws it — a helper the broker spawns, `view-prompt`, not the broker or the
+      compositor — how only the broker reaches it — a `prompt` suffix answered only through the
+      root namespace's binding, with sessions binding `/dev/draw` at a base — and that `with`, in a
+      session on the display, prompts there.)*
       - **only the broker can open it**, so no program can present a look-alike asking for a
         password;
       - the compositor draws it **above everything, the desktop dimmed behind it**, which no
@@ -2444,7 +2471,7 @@ and the session would end with the editor's process left to notice (*Left alone*
       - **its trigger**, unchanged: the first desktop action the policy will not allow without a
         password — unmounting a USB stick from Files (Phase 6), or a Settings application. A power
         policy asking for a password would fire it early, and F.3's refusal says so.
-- [ ] **Docs.**
+- [x] **Docs.**
       - `desktop-shell.md`: the power menu, ending a session, closing windows first.
       - `graphical-session.md`: the logout path, and its process tree's ending.
       - `views-toml-schema.md`: that the desktop asks for `power` as `with` does.

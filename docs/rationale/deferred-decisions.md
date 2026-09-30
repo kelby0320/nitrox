@@ -396,6 +396,22 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**An application's surface can cover the bars — `TODO(app-covers-panels)`.** A `popup` is never
+held for the manager: it is placed where its creator asks, relative to its parent and negative
+offsets included, at any size, and pushed on top of the stack, where the topmost window that takes
+focus has the keyboard. A probe (administration Part F.4, 2026-09-29) put an application's popup the
+size of the screen at (0,0), above the top bar, holding the keyboard. Nothing refuses a `panel` on
+an application's connection either. An application can draw anything, then, including a desktop
+dimmed behind something asking for a password — though it cannot read another window's pixels or
+take a key typed into another window.
+
+**Harmless until something depends on the bars being the system's, and the graphical prompt does**
+([`graphical-prompt.md`](../design/graphical-prompt.md) Guarantee 2). **Trigger: building it.** The
+fix is the prompt's first piece:
+- the manager's surface connection opened through `manage`, so the compositor knows it;
+- an application's popup kept inside the work area;
+- a panel refused on any other connection.
+
 **A popup does not follow its parent — `TODO(popup-follows-parent)`.** A popup's offset is
 resolved against its parent's origin once, when it is created (M6 C1); the compositor stores
 absolute origins and nothing re-places a child when its parent moves. So a manager that moves a

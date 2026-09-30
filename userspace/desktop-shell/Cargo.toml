@@ -24,10 +24,12 @@ edition = "2024"
 # lives once it does.
 libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
-# **Only for `rebind_block_devices`** (Phase 5 Part H.1): handing an installer session's disks on
-# to the program it launches is the same operation a session manager performs one level up, and
-# `userspace/CLAUDE.md` puts a helper with two consumers below both of them. The shell takes no
-# other part of this crate — it is not a supervisor of sessions.
+# **The namespace builder** (administration Part F.1): an application's namespace is built from
+# the same `NamespaceSpec` the login supervisors build a session's from, so the two cannot drift
+# apart again — `/session/user` had. With it `block_device_count`, which says once whether this is
+# an installer session whose disks an application gets, and `LEADER_STOP_NS`, which the ending's
+# test holds the shell's own stop wait inside. The shell takes nothing else from this crate: it is
+# not a supervisor of sessions. (Until F.1, `rebind_block_devices` was all it took.)
 libsession = { path = "../libsession" }
 # `io` for `session::Dir`: the Applications menu reads /applications as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }
@@ -41,6 +43,10 @@ libstream = { path = "../libstream", features = ["io"] }
 # Whole-file reads, for the session's theme: the shell opens `/home/theme.toml` once and hands
 # every application the result on the environment record it already forwards (M11 Part C).
 libfs = { path = "../libfs" }
+# The view broker's client (administration Part F.3): Restart and Shut down ask the broker for
+# `shutdown` in the `power` view, with the same request `with` makes, and read the person's
+# listing first so a refusal comes before any window is asked to close.
+libviews = { path = "../libviews" }
 
 # The pure half — the desktop-entry parser, the Applications menu's filter, and the top bar and
 # its menus as element trees (`panel`) — so it can be host-tested.

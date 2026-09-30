@@ -60,6 +60,8 @@ The userspace runtime is layered. Don't reach below your layer:
 ```
 Application                              ← user code
   ↓
+libviews                                 ← the view broker's client (asking to run in a view)
+  ↓
 libfs                                    ← whole-file + path helpers (no protocol of its own)
   ↓
 libstream  librsproto                    ← typed I/O, RS protocol
@@ -77,6 +79,12 @@ its operations are namespace and memory syscalls. It was `coreutils::fs` until M
 moved down when a second consumer arrived, which is the rule to apply generally: **a helper with
 one consumer belongs to that consumer; a helper with two belongs below both.** An application
 reaching into another application's crate to borrow one is the shape that rule exists to catch.
+
+`libviews` is the same rule applied again (administration Part F.3): the request that asks the view
+broker to run a program in a view was `with`'s, and its channel plumbing `coreutils::ipc`, until the
+desktop's Restart and Shut down had to make it too. `with`, `account` and `desktop-shell` use it.
+It sits above `libfs`, whose `lookup_wait` finds `/dev/views`, and owns no wire format — the codec
+is `librsproto::views`. How a person is asked for a password stays with each caller.
 
 A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo. `libheap` (the freeing heap that backs `alloc`) is a foundation alongside `libkern`: it depends only on `libkern` + `core`, and the top-level binary registers it as the `#[global_allocator]`.
 

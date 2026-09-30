@@ -125,7 +125,7 @@ pub fn paint_over<F, Msg, C>(
     draw(fb, font, theme, element, layout, damage, theme.foreground, TextStyle::default(), custom);
 }
 
-/// Draw a window control inside `rect`, clipped to `clip`.
+/// Draw a glyph — a window control, or the power symbol — inside `rect`, clipped to `clip`.
 ///
 /// **Centred in a square derived from the box** rather than sized in pixels, so the glyphs stay
 /// proportionate if the title bar's height ever changes — which it will, the day chrome metrics
@@ -168,6 +168,31 @@ fn draw_icon<F: Framebuffer + ?Sized>(
                 let step = i as i32;
                 bar(Rect::new(x + step, y + step, STROKE, 1));
                 bar(Rect::new(x + step, y + (side - 1) as i32 - step, STROKE, 1));
+            }
+        }
+        // **The power symbol** (administration Part F.2): a ring `STROKE` thick, open over the
+        // top where the bar comes down through it to the centre. Worked a pixel at a time in
+        // doubled coordinates, so the centre of an even box is an integer and the ring is
+        // symmetric about it — a dozen pixels on a side, where a routine for arcs would be more
+        // code than the glyph.
+        IconKind::Power => {
+            // **Even**, so the two-pixel bar has a centre to straddle: an odd box would put it a
+            // pixel off. Only this glyph rounds; the window controls keep the box they had.
+            let s = (side & !1) as i32;
+            let (outer, inner) = (s * s, (s - 2 * STROKE as i32) * (s - 2 * STROKE as i32));
+            for py in 0..s {
+                for px in 0..s {
+                    let (dx, dy) = (2 * px + 1 - s, 2 * py + 1 - s);
+                    let d = dx * dx + dy * dy;
+                    // The gap: the ring's top, within about 35° either side of straight up.
+                    let in_gap = dy < 0 && dx.abs() * 7 < s * 4;
+                    let ring = d <= outer && d > inner && !in_gap;
+                    // The bar: `STROKE` columns about the centre, from the top down to it.
+                    let stem = dx.abs() < STROKE as i32 && dy < 0;
+                    if ring || stem {
+                        bar(Rect::new(x + px, y + py, 1, 1));
+                    }
+                }
             }
         }
     }
@@ -498,6 +523,54 @@ mod tests {
         let d: Element<Msg> = sized(Size::new(120, 30), crate::element::bold(text("status")));
         let damage = tree.update(&d, &layout(&d, Rect::new(0, 0, W, H), &m)).expect("diffs");
         assert!(damage.is_some(), "a bold status line must be redrawn");
+    }
+
+    /// **The power symbol is a ring open at the top with a bar down to its centre**
+    /// (administration Part F.2) — painted and read back, and read in terms the other glyphs fail:
+    /// a close cross is inked at its centre, a maximise square along its whole top edge, and a
+    /// minimise bar has no top at all.
+    #[test]
+    fn the_power_glyph_is_an_open_ring_with_a_bar() {
+        use crate::element::{IconKind, icon};
+        let (f, t) = (font(), Theme::default());
+        let glyph = |kind: IconKind| {
+            let mut b = fb();
+            let e: Element<Msg> = sized(Size::new(40, 40), icon(kind));
+            go(&mut b, &f, &t, &e, Rect::new(0, 0, W, H));
+            // The ink's bounding box, and a reader of it.
+            let inked: Vec<(u32, u32)> =
+                (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| fb_has_ink(&b, &t, x, y)).collect();
+            (b, inked)
+        };
+        let (b, inked) = glyph(IconKind::Power);
+        assert!(!inked.is_empty(), "the power glyph drew nothing");
+        let (x0, x1) = (inked.iter().map(|p| p.0).min().unwrap(), inked.iter().map(|p| p.0).max().unwrap());
+        let (y0, y1) = (inked.iter().map(|p| p.1).min().unwrap(), inked.iter().map(|p| p.1).max().unwrap());
+        let on = |x: u32, y: u32| fb_has_ink(&b, &t, x, y);
+        // Square, and symmetric left to right.
+        assert_eq!(x1 - x0, y1 - y0, "not square: {x0}..{x1} by {y0}..{y1}");
+        for &(x, y) in &inked {
+            assert!(on(x0 + x1 - x, y), "not symmetric at ({x},{y})");
+        }
+        let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+        // The bar at the top centre — `cx` is its left column, the box being even — and **the
+        // gap beside it, a row down**: a closed ring's top reaches that row two pixels either
+        // side of the bar, which the top row alone cannot show, since there a closed ring is
+        // inked only where the bar is anyway.
+        assert!(on(cx, y0) && on(cx + 1, y0), "no bar at the top centre");
+        assert!(!on(cx - 2, y0 + 1) && !on(cx + 3, y0 + 1), "the ring is closed at the top");
+        // The ring's sides at the middle, and its bottom — and hollow below the centre.
+        assert!(on(x0, cy) && on(x1, cy), "no ring at the sides");
+        assert!(on(cx, y1), "the ring is open at the bottom");
+        assert!(!on(cx, cy + (y1 - cy) / 2), "filled below the centre");
+        // **And the other glyphs fail what it passes**, so this reads the shape and not merely
+        // some ink: the cross is inked at its centre, the square along its top.
+        let (bc, _) = glyph(IconKind::Close);
+        assert!(fb_has_ink(&bc, &t, 20, 20), "the close cross should be inked at its centre");
+        let (bm, maxi) = glyph(IconKind::Maximise);
+        let top = maxi.iter().map(|p| p.1).min().unwrap();
+        let left = maxi.iter().map(|p| p.0).min().unwrap();
+        assert!(fb_has_ink(&bm, &t, left + 1, top), "the square's top edge runs its whole width");
     }
 
     /// A rounded fill is rounded at its **own** corners — not at a partial repaint's.

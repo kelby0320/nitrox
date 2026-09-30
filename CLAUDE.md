@@ -61,6 +61,7 @@ cargo xtask check-terminal # click into nxterm, type, and check the shell's answ
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
 cargo xtask check-images   # test vs release initramfs and root: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
+cargo xtask check-logout   # the power menu: log out past the editor's question; restart; shut down
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
@@ -97,7 +98,7 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
-`cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
+`cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
 expect-driven rather than sleep-driven.
 
@@ -131,17 +132,30 @@ writes its working directory as `OSC 7`, `libterm` reads it and `nxterm` shows i
 window's name — three crates whose host tests cannot see each other, so a boot is what makes them
 agree on the bytes.
 
-`cargo xtask check-login` is the **graphical login gate**, and the second of the two that boot a
-release image. It drives the greeter with the PS/2 injection `check-input` and `check-terminal`
-use — a wrong password, then a right one, then a session — and it is the only gate where the
-display arm exists for a person rather than for a test: everything else display-side boots
-`--selftest`. It runs unconditionally in CI's QEMU job. Landed with M7 Part D, deliberately
-*before* the shell it will eventually show, so Parts E and F land against a gate that exists.
+`cargo xtask check-login` is the **graphical login gate**, on the release image as
+`test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection
+`check-input` and `check-terminal` use — a wrong password, then a right one, then a session — and it
+and `check-logout` are the gates where the display arm exists for a person rather than for a test:
+every other display gate boots `--selftest`. It runs unconditionally in CI's QEMU job. Landed with
+M7 Part D, deliberately *before* the shell it will eventually show, so Parts E and F land against a
+gate that exists.
 
 **It must boot the release image**, not the test one. In a `--selftest` boot the greeter is
 bottom-most — `service-mgr` brings the login chain up after the servers and before every other
 declared service, which is what keeps `check-display`'s reference windows undisturbed — so it holds
 no keyboard and nothing typed reaches it.
+
+`cargo xtask check-logout` is the **ending a session gate** (administration Parts F.2 and F.3), on
+the release image for `check-login`'s reason, and in CI's QEMU job. From the desktop's power menu,
+in one QEMU run of **three boots**: a **Log out** that asks every window to close and waits on the
+editor's "discard?" question, with the shell's waiting dialog naming it; **Cancel**, and the
+session goes on; Log out again and discard, and **the greeter comes back**; a logout with nothing
+to ask, which ends at once; a **restart typed at a terminal**, which asks the windows too and has
+the shell gone inside its supervisor's bound; the menu's **Restart**, the editor ended anyway and
+the view broker asked for `shutdown --reboot`; and its **Shut down**, with "It is now safe to turn
+off your computer." read off the screen with `check-fbcon`'s decoder. It boots with a reset allowed
+to reboot, unlike every other release boot. It aims at the power button and the dialogs' buttons
+from `chrome`, and chooses the menu's rows by the keyboard.
 
 `cargo xtask check-fbcon` is the **no-serial-port gate** (Phase 5 Part B): the laptop Phase 5
 targets has no COM1, so the kernel draws everything COM1 receives on the screen until a client is
@@ -325,8 +339,10 @@ wrong about how something works:
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
   is what a subsystem *will* be. Today it holds `fault-survival.md`
   (added 2026-08-19), which is not a display document at all — it is where the kernel's
-  fault-survival intent is written down — and `nitrox-shell/`, the designed-but-not-built
-  appearance of the desktop, which `docs/planning/desktop-refresh.md` adopts. What is built has moved out —
+  fault-survival intent is written down — `graphical-prompt.md` (added 2026-09-29), the password
+  prompt the view broker will open on the display once something needs one, and `nitrox-shell/`,
+  the designed-but-not-built appearance of the desktop, which `docs/planning/desktop-refresh.md`
+  adopts. What is built has moved out —
   `input-subsystem.md` and `widget-toolkit.md` graduated on 2026-08-12, `desktop-shell.md` and
   `graphical-session.md` on 2026-08-25 with Milestone 7, `ui-composition-model.md` on
   2026-08-26 with Milestone 8, and `display-substrate.md` on 2026-08-30 (owed by Milestone 9 and

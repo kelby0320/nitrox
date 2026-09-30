@@ -2,25 +2,28 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-22**, when the desktop refresh's Part E replaced the
-overview's thumbnail grid and desktop sidebar with the design's **cards per desktop**, and a
-click on a window in another desktop's card learned to switch there before raising it — Milestone 7 Part E built the shell and M8 Part C
-added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
-click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
-Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
-reservation, holding a PNG the theme names and this shell decodes, because the shell holds
-`/home` and a theme where the compositor holds neither; **M13 Part C made the overview a
-translucent `ARGB8888` surface over the live desktop**, replacing the dimmed copy of the wallpaper
-it used to redraw; **M14 Part H made the applications modal list desktop entries** rather than
-every program in `/bin`; **Phase 5 Part E laid it out on the screen it is on** — every bar, the
-wallpaper, the overview and the placement cascade sized from `/dev/draw/screen` rather than a
-written-down 1280×800 (see [`clipboard.md`](clipboard.md) and `display-arm-plan.md` M12 decision
-2); and **the desktop refresh's Part C (checked 2026-09-18) gave it the design's panels** — 30
-pixels each on the panel ground: an Applications *menu* that still filters as you type and a
-Places menu, replacing the applications modal (§4), and a bottom bar with show-desktop, restyled
-window buttons and a bounded desktop switcher, replacing the indicator (§7);
-[`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
-2026-08-25, revision 2.
+**Partly built, and checked 2026-09-29**, when administration Part F.3 gave the power menu
+**Restart** and **Shut down**, asked of the view broker once the windows have closed (§4b). Part F.2
+had given the top bar that **power menu** at its right-hand end the same day, and taught the shell
+to **end its session**, closing its windows first. Before that, checked 2026-09-22, when the desktop
+refresh's Part E replaced the overview's thumbnail grid and desktop sidebar with the design's
+**cards per desktop**, and a click on a window in another desktop's card learned to switch there
+before raising it — Milestone 7 Part E built the shell and M8 Part C added its second bar; M12 Part
+A added dialog placement and made the taskbar's insist a second click; M12 Part E bound
+`/dev/clipboard` into every application namespace it constructs, and Part F gave it the
+**wallpaper** — a full-screen bottom-most `Role::Panel` with a zero reservation, holding a PNG the
+theme names and this shell decodes, because the shell holds `/home` and a theme where the compositor
+holds neither; **M13 Part C made the overview a translucent `ARGB8888` surface over the live
+desktop**, replacing the dimmed copy of the wallpaper it used to redraw; **M14 Part H made the
+applications modal list desktop entries** rather than every program in `/bin`; **Phase 5 Part E laid
+it out on the screen it is on** — every bar, the wallpaper, the overview and the placement cascade
+sized from `/dev/draw/screen` rather than a written-down 1280×800 (see
+[`clipboard.md`](clipboard.md) and `display-arm-plan.md` M12 decision 2); and **the desktop
+refresh's Part C (checked 2026-09-18) gave it the design's panels** — 30 pixels each on the panel
+ground: an Applications *menu* that still filters as you type and a Places menu, replacing the
+applications modal (§4), and a bottom bar with show-desktop, restyled window buttons and a bounded
+desktop switcher, replacing the indicator (§7); [`desktop-shell`](../../userspace/desktop-shell) is
+the code. Graduated from `design/` on 2026-08-25, revision 2.
 
 **This document outruns its code on purpose, so read it section by section.** What is built:
 the **top bar** (§3) and its **Applications and Places menus** (§4) — `/applications` listed
@@ -224,12 +227,13 @@ compositor. That is the cheap option kept open rather than exercised.
 
 ## 4. The Applications and Places menus
 
-**Two words on the top bar, each opening a menu that hangs from it** (desktop refresh, Part C,
-which took the design's panels). `Applications` carries the design's accent dot; the clock is
-centred on the screen, not on what the words leave; the right-hand end the design gives quick
-settings and notifications is empty, because neither exists (§9). The bar is a `libui` `Child`
-like every application's window, so its words are routed and light under the pointer, and the
-menus hang from where a layout of the bar says the words are.
+**Two words on the top bar, each opening a menu that hangs from it** (desktop refresh, Part C, which
+took the design's panels), **and since administration Part F.2 a power button at its right-hand
+end** (§4b). `Applications` carries the design's accent dot; the clock is centred on the screen, not
+on what the words leave; the design gives the right-hand end quick settings and notifications, which
+do not exist (§9), and the power button is there instead. The bar is a `libui` `Child` like every
+application's window, so its words are routed and light under the pointer, and the menus hang from
+where a layout of the bar says the words are.
 
 It replaced the **applications modal**: a 320×240 popup at the bar's corner, a search field over a
 scrolling list. The design's menu is a menu, and following it literally would have lost the one
@@ -276,8 +280,8 @@ live with (maintainer, 2026-09-17) — a flat list until there are enough to nee
 **icons**: the design's are three CSS boxes, and an icon is an asset question — a format, where the
 files live beside a desktop entry, who draws them — rather than a drawing one; three glyphs keyed
 by program name would be the thing that has to be removed when that is answered. And
-**`Run Application…` and `End session` are absent, not disabled**: the launcher is deferred and
-there is no logout, and a row that does nothing is worse than none.
+**`Run Application…` and `End session` are absent, not disabled**: the launcher is deferred, and
+ending a session lives in the power menu (§4b) rather than here.
 
 **The Places menu** is `Home`, `Documents`, `Downloads`, `Pictures` and `Root`, each with a swatch
 — the accent, and `deny` for the root, the one place past the person's own files — and its path
@@ -317,6 +321,72 @@ part that matters; which program it picks is data.
 answer would be about the *shell's* namespace rather than the caller's or the opener's — three
 namespaces that agree today only because one process builds all three. What the path turns out to
 be is reported by whatever opens it, in the window the person who asked is looking at.
+
+### 4b. The power menu, and ending the session
+
+**Built with administration Part F.2.** The top bar's right-hand end is a **power button** — the
+power symbol, `libui`'s `IconKind::Power`, lit as the words are — opening the **power menu**, hung
+right-aligned under it so it stays on the screen. It holds **Log out**, **Restart** and **Shut
+down** — the last two destructive rows, drawn in `deny`, since they end every session on the machine
+(Part F.3). The maintainer placed it there, departing from the design's `End session` row in the
+Applications menu. `Left` and `Right` move between it and the other two, as a menu bar's do.
+
+**Ending a session closes its windows first.** The decisions are `desktop_shell::ending`, which
+is host-tested; the loop asks and draws:
+1. The shell sends `Manage::RequestClose` to every **normal** window it manages — every desktop's,
+   whoever opened it — and to any opened while it waits. **Never to a dialog**: a dialog is its
+   parent's to answer for, and `nxedit` reads a manager's close on its question as *keep editing*.
+2. Each client closes, or asks its own question: the editor's *discard unsaved changes?*.
+3. **Half a second in**, with any still open, the **waiting dialog** comes up: a popup hung under
+   the power button as the menu is — a `dialog` would be held for the manager to place, and the
+   manager is this shell — naming how many are left and the first two by title, with **End
+   anyway** and **Cancel**. It stays until answered; a press elsewhere, to answer the editor,
+   does not dismiss it.
+
+   **It does not take the keyboard from an application's question** (PR #346 review). Opening it
+   makes it the topmost window that takes focus, so when the window that had the keyboard was an
+   application's transient one — its question, or a menu — the shell raises that back and the
+   keys stay where the person was answering. A normal window is not raised back, since it could
+   cover the dialog. With the keyboard, the dialog answers **Escape**, as Cancel, and nothing
+   else: End anyway has no key, as the editor's *discard* has none.
+4. **Cancel** keeps the session: nothing more is asked, and what was asked stays asked. **End
+   anyway** sends `Manage::Close` to every window still open, and remembers them: a destroyed
+   window is listed until the compositor has got to it, and is neither asked again nor waited for.
+5. With none left, **Log out** is the shell exiting. `desktop-session-mgr` reaps it, tells the
+   view broker the session ended, closes the namespace, and presents the greeter again — the
+   first thing to end a graphical session and leave the machine running.
+
+**Restart and Shut down** (Part F.3) end the session the same way, then ask the view broker, as
+`with power shutdown` does and with the same request, from `libviews`:
+- **Before any window is asked**, the shell asks the broker with `Views::Decide`, which answers as
+  a request would and runs nothing. A policy that would refuse, or would ask for a password, is
+  refused there, so a person never loses their windows to a request that was never going to run.
+- **With the windows gone**, it asks for `shutdown` — `--reboot` for Restart — in the `power`
+  view, handing the broker **an application's namespace**, built and verified as a launch's is,
+  not its own: the session's binds `/dev/draw` whole and so reaches `manage`, and a view derived
+  from it would give `shutdown` that too. The broker's audit records it as it records `with`'s.
+- `service-mgr`'s sequence then asks this session to end. With nothing left open the shell goes
+  at once.
+- **A refusal is a dialog**, hung where the waiting dialog is, saying what did not happen and why,
+  with **Close**. **A policy that asks for a password is refused**: the desktop has no prompt to ask
+  with, and the dialog says only a terminal can ask yet. That is the graphical prompt's trigger
+  firing (administration Part F.4), which the console line names. A `shutdown` that runs and
+  exits unsuccessfully is reported the same way.
+
+**A shutdown started elsewhere** — `with power shutdown` in a terminal, or on the serial console —
+reaches the shell as a terminate request (administration Part E.4c). It asks every window the same
+way and exits once they have or after **3 s of its own, with no dialog**: inside the 5 s
+`libsession::spawn_leader` gives a leader, whose clock starts before the shell hears of the stop,
+so the supervisor never gives up on the shell first. A question an application raised then goes
+unanswered, and the machine stops.
+
+**What it does not do**: kill a process. End anyway destroys a window, and a program that goes on
+without its window runs until the machine stops, as one that ignores its session's end does.
+
+`check-logout` gates all of it, in CI and in one QEMU run of three boots: a logout that waits on
+the editor's question, one cancelled, one completed, one with nothing to ask, a restart typed at a
+terminal, a Restart that ends the editor anyway, and a Shut down read off the screen. The refusal
+is host-tested only: the seeded policy never refuses.
 
 ## 5. What the shell settled about the toolkit
 

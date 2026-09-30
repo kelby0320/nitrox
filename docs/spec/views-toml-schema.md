@@ -1,6 +1,6 @@
 # `views.toml` — the view broker's policy
 
-**Status: normative for what is built (2026-09-29, Part E.6).** Read by `userspace/view-broker/`
+**Status: normative for what is built (2026-09-29, Part F.3).** Read by `userspace/view-broker/`
 (`view_broker::policy`) from `/system/views.toml`, **for every request**. The build seeds one;
 an installed system's comes from the installer (administration Part G).
 
@@ -92,6 +92,17 @@ is a denial. There are no `deny` rules yet, so "first" matters only for which `a
 
 A denial says what was missing: a view that does not exist, a view no rule lets the principal
 use, or a program that view does not let them run.
+
+**The desktop asks as `with` does** (administration Part F.3): the power menu's Restart and Shut
+down ask for `shutdown` — `--reboot` for Restart — in the `power` view, with the same request, so
+this file decides them and the broker's audit records them. Two differences:
+- **It asks first, with `Decide`**, which answers as the request would and runs nothing, so a
+  refusal comes before it has closed a window. It used to read the answer off the person's listing
+  (`List`), which the broker cuts at 2 KiB; a `power` row past the cut read as "no rule" (PR #346
+  review).
+- **It cannot answer a password.** A rule for `power` with `auth = "password"` is refused on the
+  desktop, saying only a terminal can ask yet; `with power shutdown` there still asks. The
+  graphical prompt is designed, not built (administration Part F.4).
 
 **A policy that does not read denies everything**, and the reason — with its line — is logged and
 returned to whoever asked.

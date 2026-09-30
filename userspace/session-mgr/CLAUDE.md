@@ -115,7 +115,10 @@ the tty endpoint where the profile endpoint belongs.
 
 ## What a session namespace contains
 
-`libsession::build_namespace` builds it, for this column and the graphical one:
+`libsession::build_namespace` builds it, for this column and the graphical one — and, since
+administration Part F.1, `libsession::build` builds each application's in the graphical session,
+from the same `NamespaceSpec`, with `/applications` and the console off and `/dev/draw/new` and
+`/dev/desktop` on:
 - `/home` — the user's home, a subtree of the fs-server;
 - `/bin` — the profile server, whole-tree;
 - `/applications` — the profile server's projection of each package's desktop entries;

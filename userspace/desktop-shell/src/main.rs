@@ -90,7 +90,8 @@ use desktop_shell::{
     Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop,
     parse_entry,
 };
-use desktop_shell::panel::{self, BottomMsg, MenuMsg, TopMsg};
+use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
+use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
 use libui::window::Child;
 use libui::paint::{FontMetrics, Theme, paint_over};
@@ -164,9 +165,9 @@ fn kprint(msg: &[u8]) {
 }
 
 /// **A shutdown asked this shell to stop** (administration Part E.4c): its session's supervisor
-/// passed the request on. The shell exits; what it launched is not asked in this part, and goes
-/// when the compositor it draws through is stopped (Part F's session menu is where asking them,
-/// with unsaved work in mind, belongs).
+/// passed the request on. Since Part F.2 the windows are asked to close first — the loop's
+/// `Asked::Stop`, bounded at `ending::STOP_WAIT_NS` with no dialog — and this is the exit once
+/// they have, or the bound has run out, or there was nothing to ask.
 fn stop() -> ! {
     kprint(b"desktop-shell: asked to stop, exiting\n");
     // SAFETY: terminating this process.
@@ -646,7 +647,10 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
-/// Construct the namespace one application runs in, and return its handle.
+/// Construct the namespace one application runs in: [`libsession::build`], from the same
+/// [`libsession::NamespaceSpec`] the login supervisors build sessions from (administration Part
+/// F.1). This shell had a builder of its own until F.1, and it had drifted: it never bound
+/// `/session/user`, so `whoami` in a desktop terminal said "no session identity".
 ///
 /// **The load-bearing part of the shell**, and the reason it holds `BIND_NAMESPACE` at all.
 /// `ui-composition-model.md` §5a rests the guarantee that *an application cannot compose other
@@ -677,289 +681,70 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
-#[allow(clippy::too_many_arguments)]
-fn build_app_namespace(
-    draw: u64,
-    fs: u64,
-    tty: u64,
-    profile: u64,
-    home: &str,
-    desktop: u64,
-    clipboard: u64,
-    views: u64,
-    views_base: &str,
-    devices: u64,
-    storage: u64,
-    services: u64,
-) -> u64 {
-    let ns = unsafe { syscall0(SYS_NS_CREATE) };
-    if ns < 0 {
-        kprint(b"desktop-shell: application ns_create FAIL\n");
-        return 0;
+/// **What an application gets, and why each** — the reasons this shell's builder carried, kept
+/// with the choice now that `libsession` does the binding:
+/// - **`/dev/draw/new`, narrowly**, above.
+/// - **`/home`, the user's subtree**, because the environment names it: `session_env` sets `HOME`
+///   and `PWD` to `/home`, and a namespace where that resolves to nothing gives a shell whose every
+///   relative path fails (PR #238 review, finding 3). Required when there is a home.
+/// - **`/bin`, scoped**, because a terminal has to host a shell; scoped, so `/bin/applications`
+///   does not reach the applications projection (PR #279 review, blocking 1).
+/// - **No `/applications`**: nothing in an application reads it, and an application holds no
+///   authority to spawn from a menu — `Desktop::Open` exists because of that.
+/// - **`/dev/tty`**, the tty server, where each resolve mints a fresh terminal — so two emulators
+///   share nothing, and the binding need not be per window.
+/// - **`/system/fonts`**, read-only, so it can render text.
+/// - **`/dev/desktop` and `/dev/clipboard` are capability decisions**, granted deliberately for v1:
+///   every application in the session can create, switch and name desktops, and read what anything
+///   else copied (M12 decision 1). Bound here rather than into the session, whose namespace is this
+///   shell's own and has nothing else running in it (PR #239 review, finding 1).
+/// - **`/dev/views` at the session's base**, so `with` in a terminal launched here reaches the view
+///   broker as this session; an application cannot choose another base.
+/// - **`/dev/devices`, `/storage`, `/dev/storage` and `/dev/services`**, the session's own binds of
+///   info-only endpoints: none reaches a class, a mount or a start.
+/// - **`/session/user`**, since F.1: who the session is for, as the session has it.
+/// - **The session's disks, in an installer session alone** (PR #308 review, blocking 1): rebound
+///   from the session's namespace, which is why that is the spec's `root_ns`. Without it an
+///   installer typed at a desktop terminal finds no disk, and on the laptop there is no other way
+///   in.
+///
+/// `None` if the namespace could not be built with what it cannot do without.
+fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
+    let built = libsession::build(&libsession::NamespaceSpec {
+        root_ns: l.session_ns,
+        fs_endpoint: l.fs,
+        profile_endpoint: l.profile,
+        tty_endpoint: l.tty,
+        clipboard_endpoint: l.clipboard,
+        home: l.home.as_bytes(),
+        user: l.user.as_bytes(),
+        bind_fonts: true,
+        bind_console: false,
+        bind_blk: l.disks,
+        views_endpoint: l.views,
+        views_base: l.views_base.as_bytes(),
+        devices_endpoint: l.devices,
+        storage_endpoint: l.storage,
+        services_endpoint: l.services,
+        bind_applications: false,
+        draw_endpoint: l.draw,
+        desktop_endpoint: l.desktop,
+    })?;
+    if built.desktop {
+        kprint(b"desktop-shell: application /dev/desktop bound\n");
     }
-    let ns = ns as u64;
+    Some(built)
+}
 
-    // `/dev/draw/new`, narrow. See this function's doc for why the base is `/new`.
-    let path = b"/dev/draw/new";
-    let base = b"/new";
-    // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-    let dr = unsafe {
-        syscall6(
-            SYS_NS_BIND,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            draw,
-            base.as_ptr() as u64,
-            base.len() as u64,
-        )
+/// **The session's user**, read from its `/session/user` as `whoami` reads it: the name up to the
+/// first NUL or newline. Empty if the session has none, which binds none into an application.
+fn session_user(session_ns: u64) -> alloc::string::String {
+    let Ok(bytes) = libfs::read_file(session_ns, b"/session/user") else {
+        kprint(b"desktop-shell: the session has no /session/user\n");
+        return alloc::string::String::new();
     };
-    if dr != 0 {
-        kprint(b"desktop-shell: application /dev/draw/new bind FAIL\n");
-        // SAFETY: closing the namespace we just created.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
-        return 0;
-    }
-
-    // **No `/applications`, deliberately.** The *session* namespace has it and this one does not,
-    // so `nxsh` on the serial console can list the installed applications and the same `nxsh`
-    // inside `nxterm` cannot. Nothing in an application reads it, and an application holds no
-    // authority to spawn in the first place — `Desktop::Open` exists because of that — so the
-    // binding would be a hole in a sandbox with nothing on the other side of it. (This was filed
-    // as a symptom of there being no account that sees more of the system; administration Part A
-    // answered that with views, reached by `with`, and the asymmetry stands on its own.)
-    //
-    // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
-    // session itself gets — an application that could not draw text would be a window of
-    // rectangles.
-    if fs != 0 {
-        let fpath = b"/system/fonts";
-        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-        let fr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                fpath.as_ptr() as u64,
-                fpath.len() as u64,
-                fs,
-                fpath.as_ptr() as u64,
-                fpath.len() as u64,
-            )
-        };
-        if fr != 0 {
-            kprint(b"desktop-shell: application /system/fonts bind FAIL\n");
-        }
-    }
-
-    // **`/dev/tty`, which is `graphical-session.md` §6.1's first shape and Part F's answer.**
-    //
-    // The path names the tty *server*, not a device: each resolve mints a **fresh terminal**
-    // (`tty-server`'s `open_tty`), exactly as `/dev/draw/new` mints a compositor session per
-    // caller. So two terminal emulators in two namespaces each get their own, attach their own
-    // backend, and share nothing — the binding does not need to be per-window because the
-    // minting already is.
-    //
-    // §6.1's *second* shape — absent from application namespaces, the terminal handed down —
-    // stays true one level in: `nxterm` resolves this to obtain a terminal, then hands **that
-    // handle** to the `nxsh` it hosts, because a binding cannot name a particular window. The
-    // emulator does not need to name one; it makes one.
-    if tty != 0 {
-        let tpath = b"/dev/tty";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let tr = unsafe {
-            syscall4(SYS_NS_BIND, ns, tpath.as_ptr() as u64, tpath.len() as u64, tty)
-        };
-        if tr != 0 {
-            kprint(b"desktop-shell: application /dev/tty bind FAIL\n");
-        }
-    }
-
-    // **`/bin`, because a terminal has to be able to host a shell.** `nxterm` spawns `nxsh`,
-    // and without this it launches, finds a font and a terminal, and then reports
-    // `/bin/nxsh not found` — a window that opens and immediately has nothing in it.
-    //
-    // **What an application namespace holds is `/dev/draw/new`, `/system/fonts`, `/dev/tty`,
-    // `/bin` and the user's `/home`** — the session's members less the manager channel and
-    // less `/session/user`, and with `/dev/draw` narrowed to `/new` rather than the session's
-    // whole subtree. That narrowing is what M7 is about. *Which* applications get which of
-    // these is a per-application policy and a later question: there is no manifest to read it
-    // from, and inventing one here would be guessing at what `ui-composition-model.md` wants
-    // before anything asks.
-    if profile != 0 {
-        let bpath = b"/bin";
-        // **Scoped**, which is what keeps this bind from also handing over `/applications`
-        // (PR #279 review, blocking 1). Unscoped, `/bin/applications` forwarded as a bare
-        // `applications` and reached the applications projection's root — so the omission
-        // documented four lines up was not an omission at all.
-        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-        let br = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                bpath.as_ptr() as u64,
-                bpath.len() as u64,
-                profile,
-                bpath.as_ptr() as u64,
-                bpath.len() as u64,
-            )
-        };
-        if br != 0 {
-            kprint(b"desktop-shell: application /bin bind FAIL\n");
-        }
-    }
-
-    // **`/dev/desktop`, and binding it is a capability decision** — every application in this
-    // session can then create, switch and name desktops, which is strictly more than one has
-    // otherwise, since it cannot even raise its own window. Granted deliberately for v1: the
-    // narrow-bind that withholds `/dev/draw/manage` while granting `new` is available here too,
-    // but withholding mutation would leave `desktop switch` with no way to work, and a binding
-    // whose only consumer is disarmed is the shape the `desktop-endpoint` deferral existed to refuse.
-    //
-    // **Bound here rather than into the session namespace.** The session namespace is the
-    // shell's own and nothing else runs in it, so a binding there would have no consumer at
-    // all — while a `/bin` command runs under the `nxsh` a terminal spawned, whose namespace is
-    // this one (PR #239 review, finding 1).
-    if desktop != 0 {
-        let dpath = b"/dev/desktop";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let dr = unsafe {
-            syscall4(SYS_NS_BIND, ns, dpath.as_ptr() as u64, dpath.len() as u64, desktop)
-        };
-        if dr != 0 {
-            kprint(b"desktop-shell: application /dev/desktop bind FAIL\n");
-        } else {
-            kprint(b"desktop-shell: application /dev/desktop bound\n");
-        }
-    }
-
-    // **`/dev/clipboard`, so applications can copy and paste** (M12 Part E). It is bound here
-    // for `/dev/desktop`'s reason: the session namespace is the shell's own and nothing else
-    // runs in it, so a binding there alone would have no consumer — while the editor, the
-    // browser, the terminal and any `clip` a pipeline runs all live in namespaces this
-    // function builds.
-    //
-    // **And granting it is a capability decision, exactly as `/dev/desktop` is.** Everything
-    // in this session can then read what anything else copied. That is M12 decision 1's
-    // accepted position — the binding is the authority, and the trigger for narrowing it is an
-    // application inside a session that the person does not trust, which is the day profiles
-    // stop being a build-time idea. The mechanism for narrowing needs no protocol change: an
-    // endpoint attenuated to `RIGHT_SEND` before it reaches here is an application that can
-    // copy and not read.
-    if clipboard != 0 {
-        let cpath = b"/dev/clipboard";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let cr = unsafe {
-            syscall4(SYS_NS_BIND, ns, cpath.as_ptr() as u64, cpath.len() as u64, clipboard)
-        };
-        if cr != 0 {
-            kprint(b"desktop-shell: application /dev/clipboard bind FAIL\n");
-        }
-    }
-
-    // **`/home`, scoped to the user's subtree — because otherwise the environment lies.**
-    // `session_env()` sets `HOME` and `PWD` to `/home`, and `launch` forwards that record
-    // unchanged, so a terminal opened here started its `nxsh` with `PWD=/home` in a namespace
-    // where `/home` resolved to nothing. `nxsh` resolves every relative path against `PWD`, so
-    // `list .`, `cd`, and `open ./x` all failed in the graphical column while passing in the
-    // serial one — and no gate saw it, because the grid renders only under `test-harness`
-    // (PR #238 review, finding 3).
-    //
-    // The six-argument bind, with `home` as the subtree base: the same shape
-    // `libsession::build_namespace` uses, so an application sees exactly the user's home and
-    // not the `/home` above it. Binding the fs endpoint whole-tree here would hand every
-    // application every user's files, which is the opposite of what this function is for.
-    if fs != 0 && !home.is_empty() {
-        let hpath = b"/home";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let hr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                hpath.as_ptr() as u64,
-                hpath.len() as u64,
-                fs,
-                home.as_ptr() as u64,
-                home.len() as u64,
-            )
-        };
-        if hr != 0 {
-            kprint(b"desktop-shell: application /home subtree bind FAIL\n");
-        }
-    }
-
-    // **`/dev/views`, at the session's base** (administration Part A.4), so `with` typed in a
-    // terminal launched here reaches the view broker as *this* session: the base is the identity,
-    // and an application cannot choose another. The same bind the session itself got.
-    if views != 0 && !views_base.is_empty() {
-        let vpath = b"/dev/views";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let vr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                vpath.as_ptr() as u64,
-                vpath.len() as u64,
-                views,
-                views_base.as_ptr() as u64,
-                views_base.len() as u64,
-            )
-        };
-        if vr != 0 {
-            kprint(b"desktop-shell: application /dev/views bind FAIL\n");
-        }
-    }
-
-    // **`/dev/devices`, at the base `/info`** (administration Part B.4) — the same bind the session
-    // got, so `list /dev/devices` in a terminal launched here lists the machine's devices. The
-    // endpoint is info-only, so no path under it reaches a class to subscribe to.
-    if devices != 0 {
-        let dpath = b"/dev/devices";
-        let base = b"/info";
-        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-        let dr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                dpath.as_ptr() as u64,
-                dpath.len() as u64,
-                devices,
-                base.as_ptr() as u64,
-                base.len() as u64,
-            )
-        };
-        if dr != 0 {
-            kprint(b"desktop-shell: application /dev/devices bind FAIL\n");
-        }
-    }
-
-    // **`/storage` at the base `/fs`, and `/dev/storage` at `/info`** (administration Part C.6) —
-    // the session's two binds of the storage service's session endpoint, so a program launched
-    // here reaches every mounted filesystem and the table of what each disk holds. The endpoint
-    // answers nothing else, so however this shell binds it, no path under it mounts anything.
-    if storage != 0 {
-        for (at, base) in [(&b"/storage"[..], &b"/fs"[..]), (b"/dev/storage", b"/info")] {
-            // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
-            let sr = unsafe {
-                syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, storage, base.as_ptr() as u64, base.len() as u64)
-            };
-            if sr != 0 {
-                kprint(b"desktop-shell: application /storage bind FAIL\n");
-            }
-        }
-    }
-
-    // **`/dev/services`** (administration Part E.2b) — `service-mgr`'s session endpoint, so a
-    // program launched here lists the services. It answers the table and nothing else, so however
-    // this shell binds it, no path under it starts or stops one.
-    if services != 0 {
-        let at = b"/dev/services";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let r = unsafe { syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, services, 0, 0) };
-        if r != 0 {
-            kprint(b"desktop-shell: application /dev/services bind FAIL\n");
-        }
-    }
-    ns
+    let end = bytes.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(bytes.len());
+    alloc::string::String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Check the application namespace grants `new` and withholds `manage`, before anything runs
@@ -979,6 +764,7 @@ fn verify_app_namespace(
     expect_desktop: bool,
     expect_devices: bool,
     expect_storage: bool,
+    expect_user: bool,
 ) -> bool {
     let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if new_h != 0 {
@@ -1094,8 +880,27 @@ fn verify_app_namespace(
             }
             st == 0 && dir != 0
         });
+    // **`/session/user` is reported, not required** (administration Part F.1), for `/dev/devices`'
+    // reason: an application that cannot say whose session it is in still runs. Resolved: it is a
+    // snapshot bound directly, so nothing is forwarded and nothing can deadlock.
+    let user = expect_user && {
+        let (st, h) = ns_lookup(ns, b"/session/user", RIGHT_MAP_READ);
+        if h != 0 {
+            // SAFETY: closing a handle this check obtained.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        }
+        if st != 0 || h == 0 {
+            Line::new()
+                .s(b"desktop-shell: application namespace cannot reach /session/user (status ")
+                .i(st as i64)
+                .s(b")")
+                .end();
+        }
+        st == 0 && h != 0
+    };
     Line::new()
         .s(b"desktop-shell: application namespace grants new + /home")
+        .s(if user { b" + /session/user" } else { b"" })
         .s(if devices { b" + /dev/devices" } else { b"" })
         .s(if storage { b" + /storage" } else { b"" })
         .s(b", withholds manage")
@@ -1268,6 +1073,11 @@ struct Launcher<'a> {
     services: u64,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
+    /// The session's user, bound as `/session/user` in an application's namespace (administration
+    /// Part F.1). Empty binds nothing.
+    user: &'a str,
+    /// Whether the session has disks — an installer session — so an application gets them too.
+    disks: bool,
     /// The environment record an application reads its `HOME` from.
     env: &'a libstream::wire::Record,
     /// Whether a namespace this shell builds actually gates. False disables launching outright.
@@ -1293,42 +1103,29 @@ impl Launcher<'_> {
 /// The body of [`Launcher::launch`], kept a free function so the long sequence of handle
 /// bookkeeping reads as it did before the context was gathered.
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
-    let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
-        (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
-    let (views, views_base, devices, storage, services) = (l.views, l.views_base, l.devices, l.storage, l.services);
+    let (session_ns, draw, desktop, home, env) = (l.session_ns, l.draw, l.desktop, l.home, l.env);
+    let (devices, storage) = (l.devices, l.storage);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(
-        draw, fs, tty, profile, home, desktop, clipboard, views, views_base, devices, storage, services,
-    );
-    if app_ns == 0 {
+    let Some(built) = build_app_namespace(l) else {
         return false;
-    }
-    // **The disks, if this session has any** (Phase 5 Part H.1). It has them only on an installer
-    // boot, where a supervisor handed them over deliberately; on every other session this finds
-    // nothing and binds nothing.
-    //
-    // **Without this the disks stop at the shell.** The session namespace is the shell's own, and
-    // every program it launches gets the namespace built above — so an installer typed at a
-    // terminal would resolve nothing, and on the laptop the graphical session is the *only* way
-    // to log in, there being no serial port (PR #308 review, blocking 1). The shell passes the
-    // devices on exactly as it passes its endpoints.
-    //
-    // Ambient within an installer session, and deliberately so: that session exists to write a
-    // disk. Per-program grants are what `docs/planning/administration.md`'s broker is for.
-    let disks = libsession::rebind_block_devices(session_ns, app_ns);
-    if disks > 0 {
+    };
+    let app_ns = built.ns;
+    // **The disks, if this session has any** (Phase 5 Part H.1), which the builder rebinds from the
+    // session's namespace: an installer boot's, handed over deliberately. See
+    // [`build_app_namespace`] for why an application gets them.
+    if built.disks > 0 {
         Line::new()
             .s(b"desktop-shell: ")
-            .u(disks as u64)
+            .u(built.disks as u64)
             .s(b" block device(s) into ")
             .untrusted(program.as_bytes())
             .s(b"'s namespace (installer session)")
             .end();
     }
-    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0) {
+    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0, !l.user.is_empty()) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
@@ -1689,9 +1486,10 @@ const MAX_LOGGED_THEME_ISSUES: usize = 8;
 const CASCADE_STEP: i32 = 24;
 
 /// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
-/// sessions, and the notification channel, where a shutdown's terminate request arrives
-/// (administration Part E.4c).
-static mut WAIT_HANDLES: [u64; 4 + MAX_DESKTOP_SESSIONS] = [0; 4 + MAX_DESKTOP_SESSIONS];
+/// sessions, the notification channel, where a shutdown's terminate request arrives
+/// (administration Part E.4c), and the view broker's while a Restart or a Shut down it started
+/// runs (Part F.3).
+static mut WAIT_HANDLES: [u64; 5 + MAX_DESKTOP_SESSIONS] = [0; 5 + MAX_DESKTOP_SESSIONS];
 /// The shell's notification channel: set once at startup, and waited on with the rest.
 static mut SHELL_NOTIF: u64 = 0;
 /// Where [`stop_asked`] reads a notification.
@@ -1708,8 +1506,8 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// Every other server in this tree already sizes it this way (`compositor`,
 /// `logging-service`, `fs-server-ext4`); `session-mgr` waits on exactly one handle, where one
 /// record is right. Found by the PR #257 reviewer while reading something else.
-static mut WAIT_RESULTS: [u8; 24 * (4 + MAX_DESKTOP_SESSIONS)] =
-    [0; 24 * (4 + MAX_DESKTOP_SESSIONS)];
+static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] =
+    [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
@@ -1898,39 +1696,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
     };
 
-    let mut may_launch = false;
-    if draw_endpoint != 0 {
-        let app_ns =
-            build_app_namespace(
-                draw_endpoint,
-                fs_endpoint,
-                tty_endpoint,
-                profile_endpoint,
-                home,
-                desktop_endpoint,
-                clipboard_endpoint,
-                views_endpoint,
-                views_base,
-                devices_endpoint,
-                storage_endpoint,
-                services_endpoint,
-            );
-        if app_ns != 0 {
-            may_launch = verify_app_namespace(
-                app_ns,
-                !home.is_empty(),
-                desktop_endpoint != 0,
-                devices_endpoint != 0,
-                storage_endpoint != 0,
-            );
-            // SAFETY: closing the namespace; nothing has been launched into it yet.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
-        }
-    }
-    if !may_launch {
-        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
-    }
-    let launcher = Launcher {
+    // **Who the session is for, and whether it has disks**, read once from the session's own
+    // namespace (administration Part F.1): an application gets the one as `/session/user`, and the
+    // other only on an installer boot. Neither changes while the session lasts.
+    let user = session_user(session_ns);
+    let disks = libsession::block_device_count(session_ns) > 0;
+    let mut launcher = Launcher {
         session_ns,
         draw: draw_endpoint,
         fs: fs_endpoint,
@@ -1944,9 +1715,32 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         storage: storage_endpoint,
         services: services_endpoint,
         home,
+        user: &user,
+        disks,
         env: &env,
-        enabled: may_launch,
+        enabled: false,
     };
+    // **An application's namespace, built and checked before any is launched**, by the builder a
+    // launch uses: a shell that cannot build a gated one launches nothing.
+    let mut may_launch = false;
+    if draw_endpoint != 0
+        && let Some(built) = build_app_namespace(&launcher)
+    {
+        may_launch = verify_app_namespace(
+            built.ns,
+            !home.is_empty(),
+            desktop_endpoint != 0,
+            devices_endpoint != 0,
+            storage_endpoint != 0,
+            !user.is_empty(),
+        );
+        // SAFETY: closing the namespace; nothing has been launched into it yet.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, built.ns) };
+    }
+    if !may_launch {
+        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
+    }
+    launcher.enabled = may_launch;
 
     Line::new()
         .s(b"desktop-shell: top bar presented, window ")
@@ -2188,7 +1982,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // arrows, Enter, Escape and Left/Right between the two menus behave as they do everywhere
     // else — and Left/Right is the only way to reach `Places` without a pointer.
     let mut bar = BarMenus {
-        state: MenuState::new(2),
+        // Three: Applications, Places, and the power menu (administration Part F.2), which Left
+        // and Right move between as a menu bar's do.
+        state: MenuState::new(3),
         win: None,
         query: TextFieldState::new(),
         programs: &programs,
@@ -2199,6 +1995,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // **The desktop-name prompt, a popup of its own** since the menu stopped being a modal it
     // could borrow.
     let mut prompt: Option<Child> = None;
+    // **A session end under way** (administration Part F.2): the windows asked to close, and the
+    // dialog naming what is left. `Closing` decides what happens; this loop asks and draws.
+    let mut closing: Option<Closing> = None;
+    let mut ending_win: Option<Child> = None;
+    // **The window that last gained the keyboard**, whatever its role — which the window list
+    // does not say, since a dialog is not in it. The waiting dialog gives the keyboard back to
+    // an application's question it would otherwise take it from (PR #346 review, finding 2).
+    let mut last_focus: u32 = 0;
+    // **A Restart or a Shut down asked for** (administration Part F.3): the view broker's channel
+    // while `shutdown` runs, and what it is for. The terminate request `service-mgr`'s sequence
+    // then sends is what ends this shell; the channel is how a `shutdown` that failed is heard.
+    let mut powering: Option<(u64, Ending)> = None;
+    // **Why one did not happen**, while the dialog saying so is up.
+    let mut refused: Option<(Child, Ending, Refusal)> = None;
+    // Where that dialog hangs: right-aligned under the power button, as the power menu does, so it
+    // never covers a question an application centred on its own window.
+    let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
     let mut name = TextFieldState::new();
     // The overview: its window, the thumbnails it is showing, and which one is being dragged.
     let mut overview: Option<u32> = None;
@@ -2253,7 +2066,75 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
         }
-        let deadline = if sent_request || session.events_pending() > 0 { 0 } else { next_tick };
+        // **Drive a session end** (administration Part F.2) before choosing how long to sleep: ask any
+        // window not asked yet — every one the first time, and one opened while the end waits — and
+        // do what `Closing` says, which may be a deadline of its own.
+        let mut ending_deadline = u64::MAX;
+        let mut ended = None;
+        if let Some(c) = closing.as_mut() {
+            if let Some(m) = manager.as_mut() {
+                let windows: alloc::vec::Vec<(u32, alloc::string::String)> =
+                    entries.iter().map(|e| (e.id, entry_title(e))).collect();
+                for id in c.sync(&windows) {
+                    request_close(m, id);
+                    sent_request = true;
+                }
+            }
+            match c.next(now_ns().unwrap_or(u64::MAX)) {
+                Next::Wait { until } => ending_deadline = until,
+                Next::Dialog => {
+                    let opening = ending_win.is_none();
+                    show_ending_dialog(&mut session, &mut ending_win, c, window, ending_anchor, &theme, &font);
+                    // **The keyboard goes back to the question it was taken from** (PR #346 review,
+                    // finding 2). A new window is the topmost that takes focus, so the dialog took
+                    // the keyboard from the editor's "discard?" — and answers only Escape, as
+                    // Cancel, so a person answering the editor cancelled the logout instead.
+                    // **Only an application's transient window gets it back** — its question, or a
+                    // menu it had open — since focus is a raise, and raising a normal window could
+                    // cover the dialog. One in the window list, or one of ours, keeps it where it is.
+                    let ours_now = [window, bottom.unwrap_or(0), bar.id().unwrap_or(0), wallpaper_window];
+                    let transient = last_focus != 0
+                        && !ours_now.contains(&last_focus)
+                        && prompt.as_ref().map(|p| p.id()) != Some(last_focus)
+                        && refused.as_ref().map(|(r, _, _)| r.id()) != Some(last_focus)
+                        && !entries.iter().any(|e| e.id == last_focus);
+                    if opening
+                        && ending_win.is_some()
+                        && transient
+                        && let Some(m) = manager.as_mut()
+                        && raise_id(m, last_focus)
+                    {
+                        Line::new()
+                            .s(b"desktop-shell: the keyboard back to window ")
+                            .u(last_focus as u64)
+                            .s(b", the question it was taken from")
+                            .end();
+                        sent_request = true;
+                    }
+                }
+                Next::End(asked) => {
+                    if let Some(d) = ending_win.take() {
+                        d.close(&mut session);
+                    }
+                    ended = Some(asked);
+                }
+            }
+        }
+        // **Every window is gone.** Log out and a stop end the shell here; Restart and Shut down ask
+        // the view broker for `shutdown`, and the shell goes on until `service-mgr`'s sequence asks
+        // it to stop — or says why not, and the session goes on without its windows.
+        if let Some(asked) = ended {
+            closing = None;
+            match asked {
+                Asked::Person(e) if e.power_args().is_some() => match ask_to_power(&launcher, e) {
+                    Ok(ch) => powering = Some((ch, e)),
+                    Err(r) => show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font),
+                },
+                _ => end_session(asked),
+            }
+        }
+        let deadline =
+            if sent_request || session.events_pending() > 0 { 0 } else { next_tick.min(ending_deadline) };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
@@ -2282,6 +2163,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 WAIT_HANDLES[n as usize] = SHELL_NOTIF;
                 n += 1;
             }
+            if let Some((ch, _)) = powering {
+                WAIT_HANDLES[n as usize] = ch;
+                n += 1;
+            }
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
@@ -2292,8 +2177,54 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         };
         // SAFETY: single-threaded; set once at startup.
         let notif = unsafe { SHELL_NOTIF };
+        // **A stop asks the windows too** (administration Part F.2): every one is asked to close, and
+        // the shell goes once they have or after `STOP_WAIT_NS`, inside the leader's bound — with no
+        // dialog, since the machine is going down. It overrides a person's end already under way.
+        // With nothing to ask, or no clock to bound the wait with, it goes at once, as it did.
         if notif != 0 && stop_asked(notif) {
-            stop();
+            let Some(now) = now_ns().filter(|_| manager.is_some()) else { stop() };
+            if !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop)) {
+                if let Some(d) = ending_win.take() {
+                    d.close(&mut session);
+                }
+                if let Some((d, _, _)) = refused.take() {
+                    d.close(&mut session);
+                }
+                kprint(b"desktop-shell: asked to stop; asking every window to close first\n");
+                closing = Some(Closing::begin(Asked::Stop, now));
+            }
+        }
+        // **What became of a Restart or a Shut down asked for** (administration Part F.3), unless
+        // the stop it was for has come. `shutdown` exits once `service-mgr` has begun, so a clean
+        // exit is only that; anything else did not happen, and the dialog says so.
+        if let Some((ch, e)) = powering
+            && !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop))
+        {
+            let heard = match libviews::ipc::recv(ch) {
+                Ok(Some((librsproto::views::OP_VIEWS_EXITED, _, _, body))) => {
+                    let (code, crashed) = librsproto::views::parse_exited(&body).unwrap_or((1, true));
+                    Some((code == 0 && !crashed).then_some(()).ok_or_else(|| Refusal::exited(code, crashed)))
+                }
+                Ok(_) => None,
+                Err(()) => Some(Err(Refusal::Failed(alloc::string::String::from(failed::BROKER_GONE)))),
+            };
+            match heard {
+                None => {}
+                Some(Ok(())) => {
+                    libviews::ipc::close(ch);
+                    powering = None;
+                    Line::new()
+                        .s(b"desktop-shell: ")
+                        .s(e.title().as_bytes())
+                        .s(b" has begun; waiting to be asked to stop")
+                        .end();
+                }
+                Some(Err(r)) => {
+                    libviews::ipc::close(ch);
+                    powering = None;
+                    show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font);
+                }
+            }
         }
         // **Drained before the compositor's events**, so a `Switch` that changes what the bar
         // shows is reflected by the same iteration's redraw rather than the next one's.
@@ -2334,6 +2265,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 bar.id().unwrap_or(0),
                 prompt.as_ref().map_or(0, |c| c.id()),
                 wallpaper_window,
+                ending_win.as_ref().map_or(0, |c| c.id()),
+                refused.as_ref().map_or(0, |(c, _, _)| c.id()),
             ];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
@@ -2344,6 +2277,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 m,
                 &mut next_origin,
                 &mut entries,
+                &mut last_focus,
                 &ours,
                 &mut fired,
                 &mut layout,
@@ -2783,6 +2717,28 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             launcher.launch(FOLDER_OPENER, &[p.path.as_str()]);
                         }
                     }
+                    // **The power menu** (administration Parts F.2 and F.3): begin ending the
+                    // session. The loop's top asks the windows and waits; a second choice while one
+                    // is under way, or while a Restart or a Shut down is, changes nothing.
+                    //
+                    // **A Restart or a Shut down the policy would refuse is refused here**, before a
+                    // window is asked to close: found after the windows had gone, the refusal would
+                    // have cost the person them for nothing.
+                    Some(MenuMsg::End(ending)) => {
+                        if closing.is_none() && powering.is_none() {
+                            if let Some((d, _, _)) = refused.take() {
+                                d.close(&mut session);
+                            }
+                            Line::new().s(b"desktop-shell: ending the session: ").s(ending.title().as_bytes()).end();
+                            let refusal = ending.power_args().and_then(|_| power_refusal(session_ns));
+                            match refusal {
+                                Some(r) => show_refusal(
+                                    &mut session, &mut refused, ending, r, window, ending_anchor, &theme, &font,
+                                ),
+                                None => closing = Some(Closing::begin(Asked::Person(ending), now_ns().unwrap_or(0))),
+                            }
+                        }
+                    }
                     Some(MenuMsg::Nothing) | None => {}
                 }
                 // **Launched, then closed** — the modal's order, and the one a reader of the log
@@ -2790,6 +2746,83 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // consequence. `check-login` and `shot` read the two lines in this order.
                 if finished {
                     bar.close(&mut session);
+                }
+                continue;
+            }
+            // **The waiting dialog's own input** (administration Part F.2): End anyway, Cancel — its
+            // buttons, its close button, or Escape. **It is not dismissed by a press elsewhere**, as
+            // a menu is: the person is expected to press elsewhere, to answer an application's own
+            // question, and the dialog stays until it is answered or has nothing left to name.
+            if ending_win.as_ref().map(|c| c.id()) == Some(w) {
+                let mut chose = None;
+                match &event {
+                    libsurface::WindowEvent::Key(k) if k.pressed != 0 && k.keycode == KEY_ESC => {
+                        chose = Some(EndingMsg::Cancel);
+                    }
+                    libsurface::WindowEvent::Pointer(_) => {
+                        if let (Some(d), Some(c)) = (ending_win.as_mut(), closing.as_ref()) {
+                            let view = ending_view(c, d.hovered_key(), &theme);
+                            chose = d.route(&view, &font, &theme, &event).first().copied();
+                            if chose.is_none() {
+                                let view = ending_view(c, d.hovered_key(), &theme);
+                                d.present(&mut session, &view, &font, &theme);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                match chose {
+                    Some(EndingMsg::Cancel) => {
+                        if let Some(d) = ending_win.take() {
+                            d.close(&mut session);
+                        }
+                        closing = None;
+                        kprint(b"desktop-shell: ending the session cancelled; it goes on\n");
+                    }
+                    Some(EndingMsg::EndAnyway) => {
+                        if let (Some(c), Some(m)) = (closing.as_mut(), manager.as_mut()) {
+                            let left = c.end_anyway();
+                            Line::new()
+                                .s(b"desktop-shell: ending anyway, closing ")
+                                .u(left.len() as u64)
+                                .s(b" window(s)")
+                                .end();
+                            for id in left {
+                                insist_on_close(m, id);
+                            }
+                            sent_request = true;
+                        }
+                    }
+                    Some(EndingMsg::Nothing) | None => {}
+                }
+                continue;
+            }
+            // **The refusal's own input** (administration Part F.3): Close, the frame's close,
+            // Escape, Enter, or a press elsewhere — it is a report, and there is nothing to decide.
+            if refused.as_ref().map(|(c, _, _)| c.id()) == Some(w) {
+                let mut close_it = matches!(event, libsurface::WindowEvent::Dismissed);
+                match &event {
+                    libsurface::WindowEvent::Key(k)
+                        if k.pressed != 0 && (k.keycode == KEY_ESC || k.keycode == KEY_ENTER) =>
+                    {
+                        close_it = true;
+                    }
+                    libsurface::WindowEvent::Pointer(_) => {
+                        if let Some((d, e, r)) = refused.as_mut() {
+                            let view = panel::refusal_dialog(*e, r, d.hovered_key(), &theme);
+                            let chose = d.route(&view, &font, &theme, &event).first().copied();
+                            close_it = chose == Some(RefusalMsg::Close);
+                            if chose.is_none() {
+                                let view = panel::refusal_dialog(*e, r, d.hovered_key(), &theme);
+                                d.present(&mut session, &view, &font, &theme);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if close_it && let Some((d, _, _)) = refused.take() {
+                    d.close(&mut session);
+                    kprint(b"desktop-shell: refusal dialog closed\n");
                 }
                 continue;
             }
@@ -3356,7 +3389,6 @@ fn ask_to_close(
     window: u32,
     asked: &mut alloc::vec::Vec<(u32, u64)>,
 ) {
-    use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
     let now = now_ns();
     let armed = asked
         .iter()
@@ -3367,22 +3399,33 @@ fn ask_to_close(
         }
         return;
     }
-    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
-    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+    if !request_close(mgr, window) {
         return;
     }
-    let mut reply = [0u8; 64];
-    if mgr.request(OP_MGR_REQUEST_CLOSE, &body, None, &mut reply).is_err() {
-        Line::new().s(b"desktop-shell: RequestClose refused for window ").u(window as u64).end();
-        return;
-    }
-    Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
     // An expired entry for this window is replaced rather than joined: one window is being
     // asked about once, however many times the question has been put.
     asked.retain(|&(id, _)| id != window);
     if let Some(n) = now {
         asked.push((window, n.saturating_add(INSIST_WINDOW_NS)));
     }
+}
+
+/// **Ask a window's client to close it** — `Manage::RequestClose`, the polite half. `true` if the
+/// compositor forwarded it. The taskbar's ask ([`ask_to_close`]) and a session end
+/// (administration Part F.2) both come here.
+fn request_close(mgr: &mut ChannelTransport, window: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_REQUEST_CLOSE, &body, None, &mut reply).is_err() {
+        Line::new().s(b"desktop-shell: RequestClose refused for window ").u(window as u64).end();
+        return false;
+    }
+    Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
+    true
 }
 
 /// Destroy a window whose client did not answer — `Manage::Close`.
@@ -3627,6 +3670,18 @@ fn raise_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
     // coincidence stops being right the moment either side grows (PR #242 review, finding 8).
     let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
     if (MgrWindowRef { window: e.id, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
+}
+
+/// Raise the window `id` and give it the keyboard — [`raise_window`] for a window the list does
+/// not hold, such as an application's question.
+fn raise_id(mgr: &mut ChannelTransport, id: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_RAISE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window: id, other: 0 }).write(&mut body).is_none() {
         return false;
     }
     let mut reply = [0u8; 64];
@@ -4654,6 +4709,7 @@ fn place_new_windows(
     mgr: &mut ChannelTransport,
     next_origin: &mut i32,
     entries: &mut alloc::vec::Vec<WinEntry>,
+    last_focus: &mut u32,
     ours: &[u32],
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
@@ -4752,6 +4808,9 @@ fn place_new_windows(
                         let was = e.focused;
                         e.focused = has && e.id == f.window;
                         dirty |= was != e.focused;
+                    }
+                    if has {
+                        *last_focus = f.window;
                     }
                 }
                 continue;
@@ -5075,7 +5134,7 @@ struct BarMenus<'a> {
     /// The home an application sees, which the places are written from.
     home: &'a str,
     /// Where each menu hangs, by index — see [`menu_anchors`].
-    anchors: [(i32, i32); 2],
+    anchors: [(i32, i32); 3],
 }
 
 impl BarMenus<'_> {
@@ -5091,8 +5150,11 @@ impl BarMenus<'_> {
 
     /// What the log calls the menu that is open — or was, for a line about closing it.
     fn what(&self) -> &'static str {
-        let which = self.win.as_ref().map(|(w, _)| *w).or(self.state.open());
-        if which == Some(panel::PLACES) { "places menu" } else { "applications menu" }
+        match self.win.as_ref().map(|(w, _)| *w).or(self.state.open()) {
+            Some(panel::PLACES) => "places menu",
+            Some(panel::POWER) => "power menu",
+            _ => "applications menu",
+        }
     }
 
     /// Close whatever is open, choosing nothing.
@@ -5158,7 +5220,9 @@ impl BarMenus<'_> {
         if which == panel::APPS {
             l.s(b"applications menu open, window ").u(id as u64).s(b" listing ").u(self.programs.len() as u64);
         } else {
-            l.s(b"places menu open, window ").u(id as u64);
+            // **Named by `what`**, which knows all three: a two-way branch here called the power
+            // menu the places menu (administration Part F.2).
+            l.s(self.what().as_bytes()).s(b" open, window ").u(id as u64);
         }
         l.end();
         self.win = Some((which, c));
@@ -5196,19 +5260,234 @@ impl BarMenus<'_> {
     }
 }
 
-/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`] and
-/// [`panel::PLACES`].
+/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`], [`panel::PLACES`]
+/// and [`panel::POWER`] — the last **right-aligned** under the power button, so it stays on the
+/// screen (administration Part F.2).
 ///
 /// **Read off a layout of the bar**, not written down: a word's position is a fact about the bar,
 /// and the menu hanging from it is the one thing that has to agree.
-fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 2] {
+fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 3] {
+    let view = panel::top_bar(clock, None, None, theme);
+    let metrics = FontMetrics::new(font, theme.font_px);
+    let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &metrics);
+    let fallback = (panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP);
+    let at = |key| libui::layout::locate(&view, &l, key).map_or(fallback, panel::menu_anchor);
+    let power = libui::layout::locate(&view, &l, panel::POWER_KEY).map_or(fallback, |word| {
+        panel::menu_anchor_right(word, popup_width(&panel::power_menu(), theme, &metrics))
+    });
+    [at(panel::APPS_KEY), at(panel::PLACES_KEY), power]
+}
+
+/// How wide `menu` draws as a popup — what a right-hung menu's anchor needs.
+fn popup_width(menu: &libui::menu::Menu<MenuMsg>, theme: &Theme, metrics: &FontMetrics<'_>) -> u32 {
+    let view = libui::menu::popup(menu, &MenuState::new(1), panel::ROW_KEY_BASE, None, theme);
+    libui::layout::measure(
+        &view,
+        libui::layout::Constraints::loose(libdraw::geom::Size::new(u32::MAX / 4, u32::MAX / 4)),
+        metrics,
+    )
+    .w
+}
+
+/// Where the waiting dialog hangs (administration Part F.2): right-aligned under the power button,
+/// as the power menu is, [`libui::widget::DIALOG_W`] wide.
+fn ending_anchor(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> (i32, i32) {
     let view = panel::top_bar(clock, None, None, theme);
     let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &FontMetrics::new(font, theme.font_px));
-    let at = |key| {
-        libui::layout::locate(&view, &l, key)
-            .map_or((panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP), panel::menu_anchor)
+    libui::layout::locate(&view, &l, panel::POWER_KEY).map_or(
+        (screen.width as i32 - libui::widget::DIALOG_W as i32 - panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP),
+        |word| panel::menu_anchor_right(word, libui::widget::DIALOG_W),
+    )
+}
+
+/// The waiting dialog as `c` has it now. A stop has no dialog, so only a person's end is drawn.
+fn ending_view(c: &Closing, hovered: Option<u64>, theme: &Theme) -> Element<EndingMsg> {
+    let ending = match c.asked() {
+        Asked::Person(e) => e,
+        Asked::Stop => Ending::LogOut,
     };
-    [at(panel::APPS_KEY), at(panel::PLACES_KEY)]
+    panel::ending_dialog(ending, &c.question(), hovered, theme)
+}
+
+/// **Bring the waiting dialog up, or draw it again** with what it names now (administration Part
+/// F.2). A popup of the top bar's, as the menus are, rather than a `dialog`: a dialog is held for
+/// the manager to place, and the manager is this shell, which would be waiting on itself. Its
+/// origin is logged, since `check-logout` aims at its buttons from it.
+fn show_ending_dialog(
+    session: &mut Session<ChannelTransport>,
+    win: &mut Option<Child>,
+    c: &Closing,
+    parent: u32,
+    at: (i32, i32),
+    theme: &Theme,
+    font: &Font,
+) {
+    if let Some(d) = win.as_mut() {
+        let view = ending_view(c, d.hovered_key(), theme);
+        d.present(session, &view, font, theme);
+        Line::new().s(b"desktop-shell: ").s(c.question().0.as_bytes()).end();
+        return;
+    }
+    let view = ending_view(c, None, theme);
+    let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
+        kprint(b"desktop-shell: waiting dialog CreateWindow FAILED\n");
+        return;
+    };
+    if !d.present(session, &view, font, theme) {
+        d.close(session);
+        return;
+    }
+    Line::new()
+        .s(b"desktop-shell: waiting dialog open, window ")
+        .u(d.id() as u64)
+        .s(b" at ")
+        .i(at.0 as i64)
+        .s(b",")
+        .i(at.1 as i64)
+        .s(b": ")
+        .s(c.question().0.as_bytes())
+        .end();
+    *win = Some(d);
+}
+
+/// **The session ends** (administration Part F.2), every window closed or ended anyway: the shell
+/// exits, and `desktop-session-mgr` does the rest — tells the broker, closes the namespace, and
+/// presents the greeter. A stop exits as it always has (E.4c). Restart and Shut down do not come
+/// here: they ask the broker, and a stop follows ([`ask_to_power`]).
+fn end_session(asked: Asked) -> ! {
+    if asked == Asked::Stop {
+        stop();
+    }
+    kprint(b"desktop-shell: logging out, exiting\n");
+    // SAFETY: terminating this process.
+    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// **How long the shell waits for the view broker** before calling it gone. It answers a listing or
+/// a request at once — a request's program is spawned, not waited for — and the shell has a
+/// screen to keep answering, so this bounds only a broker that has stopped.
+const BROKER_WAIT_NS: u64 = 5_000_000_000;
+
+/// When a wait on the broker begun now gives up.
+fn broker_deadline() -> u64 {
+    now_ns().map_or(u64::MAX, |n| n.saturating_add(BROKER_WAIT_NS))
+}
+
+/// **Whether this session's policy would refuse a Restart or a Shut down** (administration Part
+/// F.3), asked of the broker with `Decide` before any window is asked to close — its own rule,
+/// running nothing. `None` to go on. The request after the windows close is still what decides.
+fn power_refusal(session_ns: u64) -> Option<Refusal> {
+    let ch = libviews::broker(session_ns);
+    if ch == 0 {
+        return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
+    }
+    let answer = libviews::decide(ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
+    libviews::ipc::close(ch);
+    match answer {
+        Ok((outcome, why)) => Refusal::from_answer(outcome, why),
+        Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
+    }
+}
+
+/// **Ask the view broker for `shutdown`** (administration Part F.3), the windows gone: in the
+/// `power` view, `--reboot` for Restart, as `with power shutdown` asks — the same request, from
+/// `libviews`. The broker's channel while `shutdown` runs, or why it is not running.
+///
+/// **An application's namespace goes to the broker, not this shell's.** The session's binds
+/// `/dev/draw` whole and so reaches `manage`; a view derived from it would hand `shutdown` that too.
+/// F.1's builder makes the one an application gets, which reaches `/dev/draw/new` alone.
+///
+/// **A password is not asked for**: the desktop has no prompt to ask with, so the channel is
+/// closed — the broker's cue to drop the request — and the refusal says so.
+fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
+    use libviews::Outcome;
+    let failure = |why: &str| Refusal::Failed(alloc::string::String::from(why));
+    let ch = libviews::broker(l.session_ns);
+    if ch == 0 {
+        return Err(failure(failed::NO_BROKER));
+    }
+    let Some(built) = build_app_namespace(l) else {
+        libviews::ipc::close(ch);
+        return Err(failure(failed::NO_NAMESPACE));
+    };
+    // **Verified as a launch's is**, by the process that built it: that `shutdown`'s view cannot
+    // reach `manage` rests on the same narrow bind.
+    let (home, desktop, devices, storage, user) =
+        (!l.home.is_empty(), l.desktop != 0, l.devices != 0, l.storage != 0, !l.user.is_empty());
+    if !verify_app_namespace(built.ns, home, desktop, devices, storage, user) {
+        libviews::ipc::close(built.ns);
+        libviews::ipc::close(ch);
+        kprint(b"desktop-shell: application namespace is not gated; not asking the broker\n");
+        return Err(failure(failed::NO_NAMESPACE));
+    }
+    let args = ending.power_args().unwrap_or(&[]);
+    let handed = libviews::Handed { ns: built.ns, ..libviews::Handed::default() };
+    let refusal = match libviews::request(ch, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
+        Ok((Outcome::Started, _)) => {
+            Line::new()
+                .s(b"desktop-shell: ")
+                .s(ending.title().as_bytes())
+                .s(b": the broker started ")
+                .s(POWER_PROGRAM.as_bytes())
+                .s(b" in the ")
+                .s(POWER_VIEW.as_bytes())
+                .s(b" view")
+                .end();
+            return Ok(ch);
+        }
+        Ok((Outcome::NeedPassword, _)) => Refusal::Password,
+        Ok((Outcome::Denied { .. }, why)) => Refusal::Refused(why),
+        Err(f) => failure(f.why()),
+    };
+    libviews::ipc::close(ch);
+    Err(refusal)
+}
+
+/// **Say why a Restart or a Shut down did not happen** (administration Part F.3): on the console,
+/// and in a dialog hung where the waiting dialog is, under the power button, replacing any refusal
+/// already up. Its origin is logged, as the waiting dialog's is.
+#[allow(clippy::too_many_arguments)]
+fn show_refusal(
+    session: &mut Session<ChannelTransport>,
+    slot: &mut Option<(Child, Ending, Refusal)>,
+    ending: Ending,
+    refusal: Refusal,
+    parent: u32,
+    at: (i32, i32),
+    theme: &Theme,
+    font: &Font,
+) {
+    // Escaped: a broker's reason can quote the policy's own text back.
+    Line::new()
+        .s(b"desktop-shell: ")
+        .s(ending.title().as_bytes())
+        .s(b" ")
+        .untrusted(refusal.log().as_bytes())
+        .end();
+    if let Some((d, _, _)) = slot.take() {
+        d.close(session);
+    }
+    let view = panel::refusal_dialog(ending, &refusal, None, theme);
+    let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
+        kprint(b"desktop-shell: refusal dialog CreateWindow FAILED\n");
+        return;
+    };
+    if !d.present(session, &view, font, theme) {
+        d.close(session);
+        return;
+    }
+    Line::new()
+        .s(b"desktop-shell: refusal dialog open, window ")
+        .u(d.id() as u64)
+        .s(b" at ")
+        .i(at.0 as i64)
+        .s(b",")
+        .i(at.1 as i64)
+        .end();
+    *slot = Some((d, ending, refusal));
 }
 
 /// Open the desktop-name prompt: above the bottom bar's right-hand end, where the desktop's name

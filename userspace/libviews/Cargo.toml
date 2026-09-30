@@ -1,0 +1,19 @@
+[package]
+name = "libviews"
+version = "0.1.0"
+edition = "2024"
+
+# `libviews` — the view broker's client: asking the broker to run a program in a view
+# (docs/spec/rsproto-views-ops.md), and the channel plumbing that carries it. It was `with`'s own,
+# and `coreutils::ipc`, until the desktop's power menu needed to ask too (administration Part
+# F.3): a helper with two consumers belongs below both, `userspace/CLAUDE.md`'s rule.
+[dependencies]
+libkern = { path = "../libkern" }
+# The Views codec: requests, outcomes and listings.
+librsproto = { path = "../librsproto" }
+# `lookup_wait`, for `/dev/views`.
+libfs = { path = "../libfs" }
+
+[lib]
+name = "libviews"
+path = "src/lib.rs"

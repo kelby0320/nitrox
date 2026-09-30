@@ -330,8 +330,8 @@ one:
 > binding a copy can remove.
 
 No namespace built to confine depends on covering (checked 2026-09-23). A
-session's (`libsession::build_namespace`) and an application's (`desktop-shell`'s
-`build_app_namespace`) bind subtrees — `/home`, `/bin`, `/applications`,
+session's and an application's — both built by `libsession::build` since administration Part
+F.1, an application's from `desktop-shell` — bind subtrees — `/home`, `/bin`, `/applications`,
 `/system/fonts`, `/dev/…` — with nothing narrower beneath any of them that hides
 part of it, and a view adds only `/dev/blk/<n>` and its `info`, the same server's
 two names for one disk. Services share `init`'s root, which binds the whole root

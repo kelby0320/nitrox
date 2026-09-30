@@ -757,6 +757,9 @@ impl WindowStack {
         // then overrides. The arm below says so; this paragraph used to say "lands at the
         // origin" and was left behind by that change (PR #265 review, finding 3).
         let origin = match req.role {
+            // **Anywhere its creator asks, at any size, and above the bars** — an application's
+            // popup can cover the whole screen and take the keyboard, which is what a password
+            // prompt must be able to rule out: `TODO(app-covers-panels)`.
             Role::Popup { parent } => {
                 // The parent is known to exist: checked directly above, and nothing between
                 // here and there can remove it.
