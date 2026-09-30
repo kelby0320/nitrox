@@ -4144,10 +4144,9 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // disk, so it is the only place the rule's input is real, and the fact is what makes a
     // machine's own disks auto-mount read-only (C.5b).
     s.expect("storage-service: a live boot")?;
-    // **And this boot is not an installer boot.** The live image's third menu entry starts a
-    // session that can write every disk in the machine; the ordinary entry must not, and absence
-    // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
-    // Asserted against the whole transcript at the end of the run, below.
+    // **And no session on this boot holds a disk** — none does on any entry since administration
+    // Part G.3 — and absence is the kind of property that rots silently: nothing fails when a
+    // sandbox quietly widens. Asserted both ways at the end of the run, below.
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
     if took > LIVE_MOUNT_TO_GREETER {
@@ -13097,7 +13096,9 @@ fn cmd_test() -> R<()> {
     // target, and every reason to refuse one. `--lib` skips the `#![no_main]` bin. The
     // arithmetic is here rather than in the program because its mistakes destroy a disk and are
     // invisible in a boot that succeeds — a root partition one block into the backup array
-    // installs a machine that works until something rewrites the table.
+    // installs a machine that works until something rewrites the table. Since PR #348's review
+    // they also copy a pristine root into an empty filesystem in memory and write the first
+    // account over it, since `check-install`, the only boot that installs, is not in CI.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
@@ -16146,9 +16147,10 @@ fn profile_programs() -> Vec<&'static str> {
     // nothing, which is the failure this list exists to make impossible.
     v.push("nxedit");
     // The installer (Phase 5 Part H.1). In `/bin` and **not** in the Applications menu: it is a
-    // command-line tool like the coreutils, run from a terminal in the installer session, and a
-    // menu entry would offer a person a window that does not exist. It ships in every image for
-    // the reason `build_userspace_bin` gives — authority is the session's, not the program's.
+    // command-line tool like the coreutils, typed at a terminal as `with admin nxinstall`, and a
+    // menu entry would offer a person a window that does not exist. It ships in every image
+    // because its authority is the view's, not the program's (administration Part G.3): run
+    // without one, it finds no disk.
     v.push("nxinstall");
     v
 }

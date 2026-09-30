@@ -8,13 +8,21 @@
 //! something rewrites it (`libgpt`'s own `last_usable` test, PR #308 review).
 //!
 //! **Numbers, not handles.** This module takes what a device *reported* and returns extents; it
-//! opens nothing, reads nothing and cannot write. That is what lets it depend on `libgpt` alone
-//! and run on the host. Since administration Part G.2 it also says which disks the view does not
-//! hold and why ([`withheld`]), from tables the binary read — still opening nothing.
+//! opens nothing, reads nothing and cannot write. That is what lets it run on the host. Since
+//! administration Part G.2 it also says which disks the view does not hold and why ([`withheld`]),
+//! from tables the binary read — still opening nothing.
+//!
+//! **And what goes on the root** ([`copy`], [`account`]), since PR #348's review: the copy of the
+//! pristine root and the account written in the build's place. These do read and write, but
+//! through `fs_server_ext4`'s `BlockReader` and `BlockWriter` rather than a handle — the program
+//! hands them a window onto a partition, and a host test hands them a disk in memory.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+pub mod account;
+pub mod copy;
 
 use libgpt::table::{ARRAY_BLOCKS, FIRST_USABLE, Partition, TYPE_EFI_SYSTEM, TYPE_LINUX_FS};
 
@@ -71,7 +79,7 @@ pub fn block_index(name: &str) -> Option<usize> {
 /// is for, and a script that stops on it stops correctly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The devices this session can reach were listed.
+    /// The devices this view can reach were listed.
     Listed,
     /// What an install would do was reported. Nothing was written.
     Planned,

@@ -6,18 +6,21 @@ edition = "2024"
 # The installer: Phase 5 Part H.1 of `docs/planning/phase-5-bare-metal.md`.
 #
 # **A Nitrox program, not an `xtask`** — the open question Part H carried, settled towards
-# self-hosting: the system installs itself, from a terminal in the installer session, using
+# self-hosting: the system installs itself, typed at a terminal as `with admin nxinstall`, using
 # the same namespace rules as everything else. It holds no authority of its own; it can reach
-# a disk only because the session it runs in was given one (`libsession::installer_boot`).
+# a disk only because the view it runs in was given one (the view broker's `disks` grant,
+# administration Part G.3).
 #
 # Split lib/bin the way `nxfiles` is, for a different reason: what the bin does is I/O, and
-# what the lib does is decide where two partitions go. The second is arithmetic that destroys
-# a disk when it is wrong and looks perfect in a boot that succeeds, so it is host-tested.
+# what the lib does is decide where two partitions go, and what goes on the root. Both are
+# mistakes that look perfect in a boot that succeeds — arithmetic that destroys a disk, a copy
+# that ships the build's account — so they are host-tested.
 [dependencies]
 # The partition table, written whole and read whole. The lib needs it too — a `Layout`
 # becomes `Partition`s — which is why it is not behind a feature.
 libgpt = { path = "../libgpt" }
-# **The ext4 format library**, which is this crate's other half of the job: `mkfs` lays out a
+# **The ext4 format library**, which is this crate's other half of the job, and the lib's since
+# PR #348's review, whose tests copy one filesystem into another in memory: `mkfs` lays out a
 # filesystem the size of the partition and `create_file`/`mkdir_at`/`grow_file` fill it. The
 # crate is named for the server, and its lib is the format — the same lib the server's bin is
 # a syscall shim around. Part H.2's plan named these functions, so the dependency is the
@@ -31,7 +34,8 @@ libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
 # The first account (administration Part G.2): asked on the terminal with `libprompt`, checked and
 # written with `libusers`, and made the administrator by the seeded policy, which the build writes
-# with the same `view_broker::policy::seed`.
+# with the same `view_broker::policy::seed`. An application's crate, taken deliberately: the seed
+# is the broker's own file, kept beside the reader it must agree with (`userspace/CLAUDE.md`).
 libprompt = { path = "../libprompt" }
 libusers = { path = "../libusers" }
 view-broker = { path = "../view-broker" }

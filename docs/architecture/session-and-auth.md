@@ -222,7 +222,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/dev/services` | `service-mgr`'s **session** endpoint for its services | the table of services, `all.tsm`, and nothing to start or stop one with — [`rsproto-services-ops.md`](../spec/rsproto-services-ops.md) |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
-`/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
+`/dev/blk`, on every boot. *Absence is the sandbox* — this is Nitrox's "sandboxing by
 namespace construction, not permission denial."
 
 **No exception.** From Phase 5 Part H.1 until administration Part G.3 there was one: the live
@@ -335,7 +335,7 @@ The process the human drives. In the introducing slice it is an explicit
 **throwaway** — the real shell arrives in Phase 4 — whose only job is to demonstrate
 that the constructed session works: it runs in the session namespace, writes to and
 reads back a file under `/home`, and cannot reach anything outside its namespace (a
-lookup of `/dev/blk` simply fails — the name is not bound, on every boot but an installer one). It is intentionally
+lookup of `/dev/blk` simply fails — the name is not bound). It is intentionally
 minimal and disposable.
 
 The interactive entry point of a healthy system is session-mgr's `login:` prompt on

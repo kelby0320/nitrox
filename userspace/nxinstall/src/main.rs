@@ -48,7 +48,6 @@
 
 extern crate alloc;
 
-mod copy;
 mod device;
 
 use alloc::format;
@@ -212,16 +211,16 @@ fn random_guid() -> Option<[u8; 16]> {
 // Block devices
 // ---------------------------------------------------------------------------------------------
 
-/// One block device this session can reach.
+/// One block device this view can reach.
 struct Device {
     /// Its index under `/dev/blk`.
     index: usize,
     /// The device handle, with read **and** write.
     ///
     /// Not "whatever the binding allowed": [`devices`] asks for both, so a device bound read-only
-    /// is left out of the list rather than appearing in it read-only. `libsession` binds both
-    /// today; a session that granted less would need a second lookup here rather than a different
-    /// comment (PR #309 review).
+    /// is left out of the list rather than appearing in it read-only. The `disks` grant binds both
+    /// (`libsession::rebind_block_devices_except`); a grant that gave less would need a second
+    /// lookup here rather than a different comment (PR #309 review).
     handle: u64,
     /// What it says it is.
     info: BlockDeviceInfo,
@@ -401,11 +400,11 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
     match (esp, root) {
         (Some(esp), Some(root)) => Ok(Sources { esp, root, root_extent }),
         (None, _) => Err(String::from(
-            "no installable ESP among this session's devices. That module is carried by the \
+            "no installable ESP among this view's devices. That module is carried by the \
              live image's install entry alone — an ordinary live boot does not load it.",
         )),
         (_, None) => Err(format!(
-            "no root to install among this session's devices: none of them holds a partition \
+            "no root to install among this view's devices: none of them holds a partition \
              named {}. That module, a pristine copy of the system, is carried by the live image's \
              install entry alone, as the ESP is.",
             String::from_utf8_lossy(SOURCE_LABEL)
@@ -584,8 +583,8 @@ fn install(
                           and its boot partition written; nothing readable is on the root."))?;
     say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
 
-    // The source is the live root's own partition *inside* the RAM disk, read as the bytes on
-    // the device rather than through this session's view of them — see `copy`'s module doc.
+    // The source is the pristine root's partition *inside* its RAM disk, read as the bytes on the
+    // device, since nothing mounts it — see `nxinstall::copy`'s module doc.
     let (src, _src_scratch) = match partition_io(
         srcs.root.handle,
         srcs.root_extent.0 * BLOCK as u64,
@@ -602,7 +601,7 @@ fn install(
         srcs.root.path(),
         String::from_utf8_lossy(SOURCE_LABEL)
     ));
-    let copied = copy::copy_tree(&src, &dst, now, PASS_OVER, say)
+    let copied = nxinstall::copy::copy_tree(&src, &dst, now, nxinstall::account::PASS_OVER, say)
         .map_err(|e| format!("copying the root filesystem failed: {e:?}"))?;
     say(&format!(
         "  {} director(ies), {} file(s), {}",
@@ -614,7 +613,9 @@ fn install(
     // **The machine's own account** (administration Part G.2), where the copy passed over the
     // build's: its record, the policy that makes it the administrator, and its home.
     say(&format!("making {}'s account, its administrator", String::from_utf8_lossy(&account.name)));
-    write_account(&dst, account, now).map_err(|e| format!("writing the first account failed: {e}"))?;
+    let salt = random_guid().ok_or("the kernel would not give out random bytes for a salt")?;
+    nxinstall::account::write(&dst, &account.name, &account.password, &salt, now)
+        .map_err(|e| format!("writing the first account failed: {e}"))?;
     log(&format!(
         "the first account is {}, its administrator",
         String::from_utf8_lossy(&account.name)
@@ -692,14 +693,6 @@ impl Drop for Scratch {
 // The first account, and the disks in use
 // ---------------------------------------------------------------------------------------------
 
-/// **What the copy leaves for the installer to write** (administration Part G.2): the build's
-/// accounts' homes — `/home` is made, empty — and its users and policy, which name the build's demo
-/// account. The new machine gets its own.
-const PASS_OVER: &[&[u8]] = &[b"/home", b"/system/users", b"/system/views.toml"];
-
-/// The user database's first lines, as the build writes them.
-const USERS_HEADER: &[u8] = b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n";
-
 /// The new machine's first account, as the person gave it.
 struct Account {
     /// Its name, which `libusers::valid_name` admits.
@@ -737,38 +730,6 @@ fn ask_account(term: u64, say: &mut dyn FnMut(&str)) -> Option<Account> {
             None
         }
     }
-}
-
-/// **Write the account onto the new root**: `/system/users` with its one record under a fresh salt,
-/// the seeded policy naming it administrator, and `/home/<name>` with the three folders a home has
-/// (`libfs::HOME_FOLDERS`, as the view broker makes them for `account --add`).
-fn write_account<D>(dst: &D, account: &Account, now: i64) -> Result<(), String>
-where
-    D: fs_server_ext4::BlockReader + fs_server_ext4::BlockWriter,
-{
-    let salt = random_guid().ok_or("the kernel would not give out random bytes for a salt")?;
-    let mut home = [0u8; 64];
-    let n = libusers::home_for(&account.name, &mut home).ok_or("the account's home would not fit")?;
-    let home = &home[..n];
-    let mut line = alloc::vec![0u8; libusers::MAX_FILE];
-    let len = libusers::write_record(&mut line, &account.name, home, &account.password, &salt)
-        .map_err(|r| String::from_utf8_lossy(r.why()).into_owned())?;
-    let mut users = Vec::from(USERS_HEADER);
-    users.extend_from_slice(&line[..len]);
-    libkern::scrub(&mut line);
-    let wrote = copy::put_file(dst, b"/system", b"users", &users, now);
-    libkern::scrub(&mut users);
-    wrote.map_err(|e| format!("/system/users: {e:?}"))?;
-
-    let name = core::str::from_utf8(&account.name).map_err(|_| "the account's name is not text")?;
-    copy::put_file(dst, b"/system", b"views.toml", view_broker::policy::seed(name).as_bytes(), now)
-        .map_err(|e| format!("/system/views.toml: {e:?}"))?;
-
-    copy::put_dir(dst, b"/home", &account.name, now).map_err(|e| format!("{}: {e:?}", String::from_utf8_lossy(home)))?;
-    for folder in libfs::HOME_FOLDERS {
-        copy::put_dir(dst, home, folder.as_bytes(), now).map_err(|e| format!("{folder}: {e:?}"))?;
-    }
-    Ok(())
 }
 
 /// **The disks this view does not hold, and why**, from `/dev/devices`' and `/dev/storage`'s

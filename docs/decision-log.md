@@ -32326,3 +32326,62 @@ No kernel change; no ABI hash impact.
 - an installer that is the broker's client and makes a machine its own administrator.
 
 Phase 6, USB, is next. Its plan already carries what this phase deferred to it.
+
+## 2026-09-30 — Part G, reviewed (PR #348): the account write host-tested, and three docs
+
+One blocking finding, docs only, and two optional. All three taken. The reviewer ran
+`check-install`, which CI does not, and it passed.
+
+**Three current-behaviour docs still described the installer session G.3 removed** (finding 1).
+- `boot-flow.md`'s `check-install` row counted "the six devices a session and then the shell hand
+  on", which the gate now asserts never happen. The row now says the gate is a reinstall.
+- `session-and-auth.md` said `/dev/blk` is absent "on every boot but one", two lines above the
+  paragraph beginning "**No exception.**". It said so again in the user-shell section.
+- Two xtask comments said the same. `profile_programs` now gives the installer's authority as the
+  view's.
+
+**Swept for the class, which found more:**
+- `nxinstall`'s own manifest named `libsession::installer_boot`.
+- `nxinstall` said "this session" where it runs in a view, in two error messages among the rest.
+- A comment said the copy reads "the live root's own partition", which was stale since G.1.
+- **`/proc/cmdline`.** The kernel's comments and `boot-flow.md` said userspace reads `install`
+  there, and nothing reads any word since G.3. The kernel's log line for a word it does not know
+  said "userspace reads it at /proc/cmdline". It now says the line is "served whole" there, since
+  a person booting an old stick would otherwise read that the word still does something. The file
+  itself stays: a person debugging a boot wants to see it.
+
+**`nxinstall → view-broker`** (finding 2). `userspace/CLAUDE.md` says an application reaching
+into another's crate is the shape its layering rule catches. What `nxinstall` takes is
+`view_broker::policy::seed`, the broker's own file rather than a helper. The seed lives beside
+`Policy::parse` because the two have to agree, and one host test there holds them together. The
+rules file now says so, and says the format moves below its writers if a third appears, as the user
+database's did.
+
+**The account write had no coverage in CI** (finding 3). `copy` and the account write lived in the
+binary, where no host test reaches, and `check-install` is on demand.
+- **They moved into the lib**: `nxinstall::copy`, and `nxinstall::account` with `PASS_OVER` and
+  `write`. The binary keeps the salt's randomness and the device I/O.
+- **A host test copies a pristine root in miniature into an empty filesystem in memory**, over
+  `PASS_OVER`, and writes the account. Then it checks:
+  - `/home` holds the new home alone, with its folders;
+  - `/system/users` holds one record, the new account's;
+  - the policy is the seed naming it;
+  - the rest came across whole.
+- **The review's premise did not hold.** It said losing a `/system` entry from `PASS_OVER` "at
+  least fails loudly", because `create_file` finds the file there. It does find it, and hands it
+  back: `create_file` is idempotent. `put_file` then wrote over the copied file in place, so a
+  shorter replacement would have kept the old file's tail. The first control, `/system/users`
+  dropped, **passed the new test**, because the new record happened to be the longer one.
+  - **`put_file` now refuses a name that is taken**, with `Exists`, as `put_dir` already did
+    through `mkdir_at`.
+  - **Controls**, each failing the test:
+    - `/home` dropped: "left: [alice, dana]";
+    - `/system/users` dropped: "/system/users: Exists";
+    - `/system/views.toml` dropped: likewise;
+    - the seed naming `alice`;
+    - the folders not made.
+  - **The guard's own control:** without it, `/system/users` dropped passes again.
+
+The local gate set stays at 36 and is green (fgb54).
+
+A kernel log line and comments changed, and no ABI hash input did.

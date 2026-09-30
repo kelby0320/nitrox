@@ -28,8 +28,6 @@
 //! **Timestamps.** Every entry is stamped with the install's own clock rather than the
 //! source's, because that is what happened: these files were created now.
 
-extern crate alloc;
-
 use alloc::vec::Vec;
 
 use fs_server_ext4::{BlockReader, BlockWriter, BlockRun, FsError, ext4};
@@ -176,10 +174,19 @@ where
 /// **Make `dir/name` in the destination holding `bytes`** — a file the installer writes rather
 /// than copies (administration Part G.2): the new machine's users, its policy. Small, so one
 /// buffer the size of the file's blocks.
+///
+/// **`Exists` if the name is taken**, as [`put_dir`] is. `create_file` hands back a file that is
+/// already there, and writing over it would leave the copied file's tail past a shorter
+/// replacement — so a pass-over list that lost one of these paths would install a file that is
+/// neither the build's nor the installer's, silently (PR #348 review). Refused, it fails the install
+/// before the root is used.
 pub fn put_file<D>(dst: &D, dir: &[u8], name: &[u8], bytes: &[u8], now: i64) -> Result<(), FsError>
 where
     D: BlockReader + BlockWriter,
 {
+    if taken(dst, dir, name)? {
+        return Err(FsError::Exists);
+    }
     let path = join(dir, name);
     ext4::create_file(dst, dir, name, now)?;
     if bytes.is_empty() {
@@ -244,6 +251,23 @@ where
     let parent = ext4::resolve_dir(dst, dir)?;
     ext4::mkdir_at(dst, parent, name, now)?;
     Ok(())
+}
+
+/// Whether the directory at `dir` holds an entry named `name`, of any kind.
+fn taken<D: BlockReader>(dst: &D, dir: &[u8], name: &[u8]) -> Result<bool, FsError> {
+    let ino = ext4::resolve_dir(dst, dir)?;
+    let mut found = false;
+    let mut cursor = 0u64;
+    loop {
+        let next = ext4::read_dir(dst, ino, cursor, |_ino, _ft, entry| {
+            found = entry == name;
+            !found
+        })?;
+        if found || next == 0 {
+            return Ok(found);
+        }
+        cursor = next;
+    }
 }
 
 /// `dir` + `/` + `name`, without a double slash at the root.

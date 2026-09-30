@@ -95,6 +95,13 @@ account. The channel plumbing a password crosses, scrubbed after every send, mov
 **Which question to ask, and when, stays with each caller**; how a question is put to a terminal is
 `libprompt`'s.
 
+**`nxinstall` takes the `view-broker` crate, and that is deliberate** (administration Part G.2): an
+application depending on another's crate is the shape the rule above catches, but what it takes is
+`view_broker::policy::seed`, the policy a machine starts with — the broker's own file, not a helper.
+The seed lives beside `Policy::parse` because the two have to agree, and one host test there holds
+what the build and the installer write to what the broker reads. Should a third writer appear, the
+format moves below all of them, as the user database's did into `libusers`.
+
 A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo. `libheap` (the freeing heap that backs `alloc`) is a foundation alongside `libkern`: it depends only on `libkern` + `core`, and the top-level binary registers it as the `#[global_allocator]`.
 
 There is **no `librt` crate** — the Go-style fiber scheduler and a standalone sync-wrapper crate were cut (see the 2026-07-13 decision log). In-process concurrency is `async` tasks on the libos executor; blocking convenience for sequential callers is a small `block_on` in libos.
