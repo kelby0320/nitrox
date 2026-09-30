@@ -3363,8 +3363,9 @@ const TARGET_MODEL: &str = "NITROX-TEST-DISK";
 /// The target disk's serial.
 const TARGET_SERIAL: &str = "INSTALL01";
 /// How many block devices an installer session sees on this gate's boot: the target disk, the
-/// two Limine modules, and the `nitrox-live` partition the GPT scan finds inside `root.img`.
-const SESSION_DEVICES: usize = 4;
+/// three Limine modules, and the partitions the GPT scan finds inside two of them — `root.img`'s
+/// `nitrox-live` and, since administration Part G.1, `install-root.img`'s `nitrox-source`.
+const SESSION_DEVICES: usize = 6;
 
 /// What the kernel calls the RAM disk `root.img` becomes — the running system's own root, and
 /// the device this gate points the installer at to prove it refuses one.
@@ -3724,6 +3725,22 @@ fn run_install_steps(
     //    two do not: an ordinary live boot does not read it, hold it, or publish it.
     session.expect("ramdisk: module 2 (/boot/install-esp.img)")?;
     println!("  ok: the installer entry loaded the installable ESP as a block device");
+    // **And the pristine root** (administration Part G.1), which the installer copies from.
+    session.expect("ramdisk: module 3 (/boot/install-root.img)")?;
+    println!("  ok: the installer entry loaded the pristine root as a block device");
+    // **Which the storage service left unmounted, and said why**: mounted, it would be in use, and
+    // `disks` would withhold it from `nxinstall`. The line is its report of the partition.
+    session.expect(&format!("(partition {}): ext4", libgpt::INSTALL_SOURCE_LABEL))?;
+    let report = session.rest_of_line()?;
+    if !report.contains("the installer's source, left unmounted") {
+        return Err(format!(
+            "the storage service's report of {} is {report:?}, not the installer's source left \
+             unmounted",
+            libgpt::INSTALL_SOURCE_LABEL
+        )
+        .into());
+    }
+    println!("  ok: the storage service left the pristine root unmounted, as the installer's source");
 
     // 4. The graphical login, which on the laptop is the only way in.
     session.expect("desktop-session-mgr: greeter presented")?;
@@ -3744,10 +3761,10 @@ fn run_install_steps(
     //    not a property of the boot; it is built when somebody logs in, out of what the boot
     //    permitted.
     //
-    //    **Four, and the number is the assertion.** `/dev/blk/0` is the target disk, 1 and 2 are
-    //    the two modules, and 3 is the `nitrox-live` partition the GPT scan found *inside*
-    //    `root.img` — which is precisely why `/dev/blk/<n>` is not "the n-th disk" and why this
-    //    part built a way to tell them apart. A count that drifts means the registry's shape
+    //    **Six, and the number is the assertion.** `/dev/blk/0` is the target disk, 1 to 3 are
+    //    the three modules, and 4 and 5 are the `nitrox-live` and `nitrox-source` partitions the
+    //    GPT scan found *inside* `root.img` and `install-root.img` — which is precisely why
+    //    `/dev/blk/<n>` is not "the n-th disk" and why this part built a way to tell them apart. A count that drifts means the registry's shape
     //    changed under the installer, and the installer picks a target out of it by index.
     session.expect(&format!("libsession: {SESSION_DEVICES} block device(s) handed to a namespace"))?;
     println!("  ok: the installer session was handed the disks");
@@ -3806,6 +3823,13 @@ fn run_install_steps(
     // gate can read: a release terminal does not narrate its grid.
     session.expect(&format!("nxinstall: installing to /dev/blk/0 ({identity})"))?;
     println!("  ok: the installer named the disk back and started");
+    // **From the pristine root**, not the live one the session runs from (administration G.1).
+    session.expect("nxinstall: copying the root from ")?;
+    let from = session.rest_of_line()?;
+    if !from.trim_end().ends_with(&format!("'s {}", libgpt::INSTALL_SOURCE_LABEL)) {
+        return Err(format!("the installer copied its root from {from:?}, not the pristine root").into());
+    }
+    println!("  ok: the root came from the pristine copy —{}", from.trim_end());
     // **A filesystem it made, not one it copied** (Phase 5 Part H.2). The size in this line is
     // the *partition's*, which is the whole point: H.1 put a 24 MiB filesystem on it.
     session.expect("nxinstall: wrote the partition table, the boot partition, and a ")?;
@@ -14008,6 +14032,44 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
         "check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓",
         release_tree.len()
     );
+
+    // **The pristine root is the root too** (administration Part G.1). `install-root.img` is what
+    // the installer copies onto a disk, so it is held to the same tree as `root.img` — and its one
+    // partition is found, as `nxinstall` finds it, by `libgpt`'s reader and the shared name.
+    let install_root = dir.join(format!("{tag}-install-root.img"));
+    let _ = fs::remove_file(&install_root);
+    run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/install-root.img").arg(&install_root))?;
+    let front = fs::read(&install_root)?;
+    let table = front
+        .get(..libgpt::table::FRONT_BYTES)
+        .and_then(|f| libgpt::table::read(f).ok())
+        .ok_or_else(|| format!("{what} image's install-root.img holds no partition table libgpt reads"))?;
+    let part = table.by_name(libgpt::INSTALL_SOURCE_LABEL.as_bytes()).ok_or_else(|| {
+        format!(
+            "{what} image's install-root.img has no partition named {}: the installer would find \
+             no root to copy, and the storage service would not know to leave it unmounted",
+            libgpt::INSTALL_SOURCE_LABEL
+        )
+    })?;
+    let source_fs = dir.join(format!("{tag}-install-root.ext4"));
+    let start = (part.first_lba * 512) as usize;
+    let len = (part.blocks() * 512) as usize;
+    fs::write(&source_fs, front.get(start..start + len).ok_or("install-root.img is shorter than its partition")?)?;
+    let source_tree = ext4_tree(&source_fs, &dir.join(format!("{tag}-install-root")))?;
+    let problems = tree_problems(&release_tree, &source_tree, &format!("{what} install root"));
+    if !problems.is_empty() {
+        return Err(format!(
+            "the filesystem inside {what} image's install-root.img is not {base} image's root: \
+             {problems:?}. It is what the installer copies, built from the same `stage_rootfs` \
+             tree as root.img."
+        )
+        .into());
+    }
+    println!(
+        "check-images: {what} install-root.img's {} holds {base} root's {} entries ✓",
+        libgpt::INSTALL_SOURCE_LABEL,
+        release_tree.len()
+    );
     if mode.stages_test_data() {
         return Ok(());
     }
@@ -15762,6 +15824,12 @@ const LIVE_ROOT_PARTLABEL: &str = "nitrox-live";
 /// The RAM disk takes writes; they are gone at power-off.
 const LIVE_ROOT_SLACK_MIB: u64 = 16;
 
+/// Room the pristine root, `install-root.img`, gets beyond what is staged on it (administration
+/// Part G.1): **for `mke2fs`'s own tables, not for writing**. Nothing mounts the pristine copy and
+/// nothing writes it, so it carries none of [`LIVE_ROOT_SLACK_MIB`], and every MiB saved is one the
+/// firmware does not read off the stick on the install entry.
+const INSTALL_ROOT_MARGIN_MIB: u64 = 4;
+
 /// Ceiling on `root.img`. **Its reason is the firmware**: the whole file is read off a USB stick
 /// by UEFI Boot Services before the kernel runs, on a laptop whose USB stack is the firmware's.
 /// Today's release root stages about 8 MiB; an image near this size means something large got
@@ -16313,6 +16381,33 @@ fn assemble_live_image(
         .arg(((root_sectors * 512) / 4096).to_string()))?;
     splice_into(&root_img, root_lba * 512, &rootfs)?;
 
+    // 1b. **The installer's source** (administration Part G.1): `install-root.img`, a pristine copy
+    //     of the same staged tree in a GPT whose one partition is `nitrox-source`. `nxinstall`
+    //     copies it, where it used to copy the live root raw — a root the session writes to and
+    //     `init` has mounted, so `disks` withholds it and a raw read could tear. The partition's
+    //     name is distinct because the live root is found by its label, and it is the name the
+    //     storage service passes over, so nothing mounts the copy. Sized to its files and
+    //     `mke2fs`'s tables, since nothing writes it.
+    let install_root = work.join("install-root.img");
+    let source_mib = staged.div_ceil(MIB) + INSTALL_ROOT_MARGIN_MIB;
+    fs::File::create(&install_root)?.set_len((source_mib + 2) * MIB)?;
+    run(Command::new("sgdisk")
+        .arg("--clear")
+        .arg("-n").arg("1:2048:0")
+        .arg("-t").arg("1:8300")
+        .arg("-c").arg(format!("1:{}", libgpt::INSTALL_SOURCE_LABEL))
+        .arg(&install_root))?;
+    let (source_lba, source_sectors) = partition_extent(&install_root, 1)?;
+    let sourcefs = work.join("install-root.ext4");
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-d").arg(&staging)
+        .arg(&sourcefs)
+        .arg(((source_sectors * 512) / 4096).to_string()))?;
+    splice_into(&install_root, source_lba * 512, &sourcefs)?;
+
     // 2. **The ESP the installer writes to a disk** (Phase 5 Part H.1): a FAT32 filesystem built
     //    by the same `build_esp` every image uses, carrying the *release* menu — no module lines,
     //    and an initramfs whose `init.toml` names `gpt-partlabel:nitrox-root`. It rides as a
@@ -16353,13 +16448,14 @@ fn assemble_live_image(
         &[],
     )?;
 
-    // 3. Limine's configuration: the release one, with `root.img` and the installable ESP as
-    //    modules and a menu with a hardware-report entry and an installer entry.
+    // 3. Limine's configuration: the release one, with `root.img` as a module and a menu with a
+    //    hardware-report entry and an installer entry, which alone loads the installable ESP and
+    //    the pristine root.
     let conf = work.join("limine.conf");
     fs::write(&conf, live_limine_conf(&fs::read_to_string(limine_conf())?)?)?;
 
     // 4. The stick: one ESP big enough for all of it.
-    let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path()]
+    let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path(), install_root.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))
         .sum::<Result<u64, _>>()?;
@@ -16386,11 +16482,14 @@ fn assemble_live_image(
         &[
             (root_img.as_path(), "/boot/root.img"),
             (install_esp.as_path(), "/boot/install-esp.img"),
+            (install_root.as_path(), "/boot/install-root.img"),
         ],
     )?;
     splice_into(out, esp_lba * 512, &esp)?;
     println!(
-        "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), stick {} MiB",
+        "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), install-root.img {} MiB, \
+         stick {} MiB",
+        source_mib + 2,
         esp_mib + 2
     );
     Ok(())
@@ -16450,16 +16549,18 @@ fn live_limine_conf(base: &str) -> R<String> {
     // path to a disk, which is the point: authority arrives by choosing this entry, and later by
     // a broker that authenticates (`docs/planning/administration.md`).
     //
-    // **The installable ESP rides on this entry alone.** Limine loads a module because the entry
-    // the person chose names it, so a module line here costs the other two boots nothing: an
-    // ordinary live boot does not read 33 MiB more off the stick, hold it in RAM for the rest of
-    // the session, and publish a block device no session can reach. The plan's worry about what
-    // firmware reads before the kernel runs is therefore a worry about *installing*, which is the
-    // one boot where paying it buys something.
+    // **The installable ESP rides on this entry alone**, and since administration Part G.1 **the
+    // pristine root beside it**. Limine loads a module because the entry the person chose names
+    // it, so a module line here costs the other two boots nothing: an ordinary live boot does not
+    // read them off the stick, hold them in RAM for the rest of the session, or publish block
+    // devices no session can use. The plan's worry about what firmware reads before the kernel
+    // runs is therefore a worry about *installing*, which is the one boot where paying it buys
+    // something.
     let install_entry = default_entry
         .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
         .replacen("\n    path:", "\n    cmdline: install\n    path:", 1)
-        + "\n    module_path: boot():/boot/install-esp.img";
+        + "\n    module_path: boot():/boot/install-esp.img"
+        + "\n    module_path: boot():/boot/install-root.img";
     Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
 }
 
@@ -17778,7 +17879,8 @@ mod diag_tests {
              \x20   path: boot():/boot/kernel\n\
              \x20   module_path: boot():/boot/initramfs\n\
              \x20   module_path: boot():/boot/root.img\n\
-             \x20   module_path: boot():/boot/install-esp.img\n"
+             \x20   module_path: boot():/boot/install-esp.img\n\
+             \x20   module_path: boot():/boot/install-root.img\n"
         );
         // **The default entry carries no command line**, which is what keeps an ordinary live
         // boot sandboxed: `install` is what reaches a session, and only the third entry says it.
@@ -17791,6 +17893,12 @@ mod diag_tests {
             conf.matches("install-esp.img").count(),
             1,
             "only the installer entry loads the installable ESP: {conf}"
+        );
+        // **Nor the pristine root** (administration Part G.1), for the same reason.
+        assert_eq!(
+            conf.matches("install-root.img").count(),
+            1,
+            "only the installer entry loads the pristine root: {conf}"
         );
     }
 

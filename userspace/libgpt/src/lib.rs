@@ -15,3 +15,13 @@
 
 pub mod crc32;
 pub mod table;
+
+/// **The partition the installer copies its root from** (administration Part G.1): the one
+/// partition of `install-root.img`, a pristine copy of the release root that the live stick's
+/// install entry loads as a module, as it loads the ESP.
+///
+/// **One name, read by three.** The build names the partition with it. The storage service passes
+/// a partition of this name over when it auto-mounts, since a mounted one is in use and `disks`
+/// would withhold it. And `nxinstall` finds its source by it. A second spelling anywhere would be a
+/// source the installer cannot find, or one the storage service mounts out from under it.
+pub const INSTALL_SOURCE_LABEL: &str = "nitrox-source";

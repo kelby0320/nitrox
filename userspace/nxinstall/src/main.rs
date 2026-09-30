@@ -81,10 +81,12 @@ const EXIT_FAILURE: i64 = 1;
 /// scheduler; at this size it is 132.
 const CHUNK: u64 = 256 * 1024;
 
-/// The GPT name the live image's root partition carries, which is how the root *source* is
-/// recognised among the RAM disks. It is deliberately not `nitrox-root`: the thing being copied
-/// is the live root, and what it becomes is named by the table this program writes.
-const LIVE_LABEL: &[u8] = b"nitrox-live";
+/// The GPT name of the partition the root is copied from, which is how the root *source* is
+/// recognised among the RAM disks: `install-root.img`'s, the pristine copy of the release root the
+/// install entry loads (administration Part G.1). **Not the live root's `nitrox-live`**, which the
+/// session writes to and `init` has mounted; and not `nitrox-root`, which is what the copy becomes,
+/// named by the table this program writes.
+const SOURCE_LABEL: &[u8] = libgpt::INSTALL_SOURCE_LABEL.as_bytes();
 
 /// The block size of every filesystem this system makes or reads, and of the one it copies
 /// from. 4 KiB is the reader's scratch and the page size, so a file's blocks map to pages.
@@ -353,7 +355,7 @@ fn human(bytes: u64) -> String {
 struct Sources<'a> {
     /// The installable ESP, copied onto the boot partition whole.
     esp: &'a Device,
-    /// The live root image, whose *inner* partition is copied onto the root partition.
+    /// The pristine root image, whose *inner* partition is copied onto the root partition.
     root: &'a Device,
     /// Where the filesystem sits inside `root`: `(first block, block count)`.
     root_extent: (u64, u64),
@@ -364,7 +366,7 @@ struct Sources<'a> {
 /// **By what they contain, not what they are called.** A module's name is `module 2
 /// (/boot/install-esp.img)` — a path in a build script, which is the wrong thing for an
 /// installer to depend on. A FAT volume says so in its boot sector, and the root image carries a
-/// partition table naming [`LIVE_LABEL`]; both are properties of the bytes being copied.
+/// partition table naming [`SOURCE_LABEL`]; both are properties of the bytes being copied.
 fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
     let mut esp = None;
     let mut root = None;
@@ -384,7 +386,7 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
             continue;
         }
         if let Ok(t) = table::read(&front) {
-            if let Some(p) = t.by_name(LIVE_LABEL) {
+            if let Some(p) = t.by_name(SOURCE_LABEL) {
                 root = Some(d);
                 root_extent = (p.first_lba, p.blocks());
             }
@@ -397,8 +399,10 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
              live image's install entry alone — an ordinary live boot does not load it.",
         )),
         (_, None) => Err(format!(
-            "no root image among this session's devices: none of them holds a partition named {}.",
-            String::from_utf8_lossy(LIVE_LABEL)
+            "no root to install among this session's devices: none of them holds a partition \
+             named {}. That module, a pristine copy of the system, is carried by the live image's \
+             install entry alone, as the ESP is.",
+            String::from_utf8_lossy(SOURCE_LABEL)
         )),
     }
 }
@@ -584,6 +588,13 @@ fn install(
         None => return Err(String::from("could not allocate a transfer buffer for the source")),
     };
     say("copying the root filesystem");
+    // **Which root, in the system log** (administration Part G.1): the pristine copy, not the live
+    // root the session is running from — the difference `check-install` asserts.
+    log(&format!(
+        "copying the root from {}'s {}",
+        srcs.root.path(),
+        String::from_utf8_lossy(SOURCE_LABEL)
+    ));
     let copied = copy::copy_tree(&src, &dst, now, say)
         .map_err(|e| format!("copying the root filesystem failed: {e:?}"))?;
     say(&format!(

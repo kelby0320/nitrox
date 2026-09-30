@@ -32134,3 +32134,52 @@ in place before merge.
 - **G.2's `check-install` cannot see the grant** (optional). Its view derives from an installer
   session that binds every disk already. G.3's reinstall is the first in-guest proof, and the plan
   says so.
+
+## 2026-09-30 — Administration Part G.1: the pristine source
+
+The live stick's install entry loads a third module, **`install-root.img`**: the release root
+again, pristine, in a GPT whose one partition is `nitrox-source`. `nxinstall` copies its root from
+there, where it used to read the live root raw.
+
+**The pieces:**
+- **`libgpt::INSTALL_SOURCE_LABEL`**, one constant for the three that read the name:
+  - the build, which names the partition with it (`xtask` takes `libgpt` for it);
+  - the storage service, which passes such a partition over;
+  - `nxinstall`, which finds its source by it.
+- **The image.** It is built from the same staged tree as `root.img`, with 4 MiB of margin for
+  `mke2fs` in place of the live root's 16 MiB of slack, since nothing writes it. It comes to
+  16 MiB, where `root.img` is 28. The install entry alone loads it, as it alone loads the ESP.
+- **The storage service passes it over, by its name.**
+  - Its report of the device ends `the installer's source, left unmounted`, so a gate can match the
+    reason rather than an absence.
+  - The host test builds an install boot's devices plus a test image's scratch RAM disk. It plans
+    the older install and the scratch disk, and not the source. It then renames the partition one
+    letter off and plans it too, which proves the name did the skipping.
+- **`nxinstall`** logs `copying the root from /dev/blk/3's nitrox-source`. The missing-source
+  message says the module rides on the install entry alone.
+- **`check-images`** holds `install-root.img`'s `nitrox-source` to the release root, file for file.
+  It finds the partition with `libgpt`'s own reader, the one `nxinstall` uses.
+- **`check-install`**:
+  - asserts module 3 is loaded;
+  - asserts the storage service's report of the source;
+  - asserts the copy's source;
+  - counts six session devices where there were four: the disk, the three modules, and
+    `nitrox-live` and `nitrox-source` inside two of them. The count was learned from a boot, not
+    guessed.
+
+**Controls, each failing `check-install`:**
+- **`nxinstall` looking for `nitrox-live` again**: "copied its root from /dev/blk/1's nitrox-live,
+  not the pristine root".
+- **The storage service without the skip**: its report says "mounted at /storage/nitrox-source
+  (ro)".
+
+The session is still the installer session: `nxinstall` sees every disk whether or not `disks`
+would grant it, and that ends in G.3.
+
+**Docs:**
+- `boot-flow.md`: the stick's layout, the modules, and `check-images`' four checks;
+- `storage.md` §6;
+- the root `CLAUDE.md`'s `check-images` and `check-install`;
+- the plan and `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.

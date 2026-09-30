@@ -596,6 +596,12 @@ pub mod mounts {
     /// among it, and none of those devices is mounted again. **None at all without
     /// `init_known`**: a device whose `init` mount went unmatched would look free here, and it could
     /// be the running root.
+    ///
+    /// **Nor the installer's source** (administration Part G.1): a partition named
+    /// [`libgpt::INSTALL_SOURCE_LABEL`], the pristine root the install entry loads. Mounted, it
+    /// would be in use, and the `disks` grant would withhold it from `nxinstall`, which copies it.
+    /// **The rule is the name, not "a RAM disk"**: a test image's scratch filesystem is a RAM disk
+    /// this service mounts, for `boot-probe`.
     pub fn automount(devices: &[Device], already: &[Mounted], live: bool, init_known: bool) -> Vec<Plan> {
         if !init_known {
             return Vec::new();
@@ -607,11 +613,22 @@ pub mod mounts {
             if !matches!(d.found, Found::Ext4 { .. }) || already.iter().any(|m| m.device == d.record.id) {
                 continue;
             }
+            if is_install_source(d) {
+                continue;
+            }
             let label = labels::unique(&labels::preferred(d), &taken);
             taken.push(label.clone());
             plan.push(Plan { device: d.record.id, label, mode });
         }
         plan
+    }
+
+    /// Whether `d` is the installer's pristine source: a partition named
+    /// [`libgpt::INSTALL_SOURCE_LABEL`] (administration Part G.1). A partition's record carries
+    /// its GPT name, which is what the build wrote and what `nxinstall` looks for.
+    pub fn is_install_source(d: &Device) -> bool {
+        d.record.kind() == libkern::device::DeviceKind::Partition
+            && d.record.name() == libgpt::INSTALL_SOURCE_LABEL.as_bytes()
     }
 }
 

@@ -1,6 +1,7 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-28, when administration Part E.1a moved the nine system
+**Status:** Current (last checked 2026-09-30, when administration Part G.1 gave the install entry
+a third module, `install-root.img`, the pristine root the installer copies; before that 2026-09-28, when administration Part E.1a moved the nine system
 servers from `init` to `service-mgr` (steps 5 and 6), and E.1c their declarations and the profile
 manifest from the initramfs to the root; before that 2026-09-25, when administration Part C.8 added the test live image `check-storage` boots; earlier that day, when Part C.5a added `storage-service` to init's bindings, straight after `device-mgr`; before that 2026-09-24, when administration Part B.2 added `device-mgr` to init's bindings and the overview's list of them — which still showed `auth-service` under `service-mgr` — was matched to init; before that 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
@@ -84,22 +85,32 @@ nitrox-live.img (GPT — one partition)
     ├── /boot/initramfs               ← the release one, but init.toml names nitrox-live
     ├── /boot/root.img                ← GPT image, one ext4 partition "nitrox-live":
     │                                     the release root, built by the same staging
-    └── /boot/install-esp.img         ← FAT32 image: the ESP an *installed* machine boots
-                                          from. The release menu, and the release
-                                          initramfs, which names nitrox-root
+    ├── /boot/install-esp.img         ← FAT32 image: the ESP an *installed* machine boots
+    │                                     from. The release menu, and the release
+    │                                     initramfs, which names nitrox-root
+    └── /boot/install-root.img        ← GPT image, one ext4 partition "nitrox-source":
+                                          the release root again, pristine — what the
+                                          installer copies (administration Part G.1)
 ```
 
 **Which modules a boot loads depends on the entry chosen**, because Limine loads what the entry
 names. All three load the initramfs and `root.img`; only `Nitrox — install to this machine` also
-loads `install-esp.img`, so an ordinary live boot does not read a further 33 MiB off the stick,
-hold it for the session, or publish a block device no session on that boot could reach. The
-kernel publishes every module after the initramfs as a RAM-backed block device
+loads `install-esp.img` and `install-root.img`, so an ordinary live boot does not read a further
+50 MiB off the stick, hold it for the session, or publish block devices no session on that boot
+could use. The kernel publishes every module after the initramfs as a RAM-backed block device
 (`kernel/src/io/ramdisk.rs`); `init` mounts `root.img`'s partition as it would a disk, and the
-installer reads both its sources — `install-esp.img` and `root.img` — as ordinary devices.
+installer reads both its sources — `install-esp.img` and `install-root.img` — as ordinary devices.
 
-`cargo xtask check-images` holds three things: the live initramfs to the release one but for
-`etc/init.toml`, the filesystem inside `root.img` to the release root partition's, and the
-filesystem inside `install-esp.img` to the **release image's own ESP**, file for file. The third
+**The installer copies `install-root.img`, not `root.img`** (administration Part G.1). The live root
+is written by the session and mounted by `init`, so a copy of it carries the session's writes and
+can tear; `install-root.img` is the same staged tree, never mounted and never written. Its partition
+is named `nitrox-source` — `libgpt::INSTALL_SOURCE_LABEL`, which the storage service passes over
+when it auto-mounts — and it carries none of the live root's slack, about 16 MiB today.
+
+`cargo xtask check-images` holds four things: the live initramfs to the release one but for
+`etc/init.toml`, the filesystems inside `root.img` and inside `install-root.img`'s `nitrox-source`
+to the release root partition's, and the filesystem inside `install-esp.img` to the **release
+image's own ESP**, file for file. The third
 is what catches a module built with the live `limine.conf` or the live initramfs — an installed
 machine that mounts the stick it was installed from, which boots once, on the desk, and never
 again.
@@ -385,7 +396,7 @@ tty server: its whole precondition is that the normal path failed. See
 | `cargo xtask test-interactive` | The login chain end to end over the serial console, expect-driven: the login prompt, a rejected password, a successful login, and shell behaviour after it. |
 | `cargo xtask check-fbcon` | The same boot with **no serial port at all** (`-serial none`), read back off the screen: the kernel's first and last lines, userspace's up to the compositor, the hand-over, and a panic taking the screen back. |
 | `cargo xtask check-live` | The **live image** booted as a USB stick with no disk: the menu's countdown boots its default entry with no command line, the root module becomes a RAM disk, `init` mounts and reads through it, the greeter comes up within a bound a tick-bound RAM disk cannot meet, and a serial login writes under `/home`. |
-| `cargo xtask check-install` | The live image's **installer entry**, on demand rather than in CI: Limine's menu found and its *third* entry chosen, the `install-esp.img` module that entry alone loads becoming a block device, the disk identifying itself, the four devices a session and then the shell hand on, a graphical login, a terminal from the Applications menu, and `nxinstall` typed at the shell in it — then **that disk booted on its own**, mounting `gpt-partlabel:nitrox-root` and reaching a greeter with no stick attached. |
+| `cargo xtask check-install` | The live image's **installer entry**, on demand rather than in CI: Limine's menu found and its *third* entry chosen, the `install-esp.img` and `install-root.img` modules that entry alone loads becoming block devices, the disk identifying itself, the storage service leaving `nitrox-source` unmounted as the installer's source, the six devices a session and then the shell hand on, a graphical login, a terminal from the Applications menu, and `nxinstall` typed at the shell in it — then **that disk booted on its own**, mounting `gpt-partlabel:nitrox-root` and reaching a greeter with no stick attached. |
 | `cargo xtask check-report` | The live image's **hardware report**, with no serial port: Limine's menu found and its second entry chosen, each report page read off the screen and a key pressed for the next, the facts that machine has asserted from the pages — a declined AHCI controller, the module disk, no UART — and the boot going on to the hand-over. `test-qemu` asserts the facts its own boot has from the transcript: the tables, CPUs and IOAPIC, a claimed AHCI controller, COM1 present. |
 
 See [qemu integration tests](../conventions/qemu-integration-tests.md).

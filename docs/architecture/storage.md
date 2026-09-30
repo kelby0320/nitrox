@@ -2,12 +2,14 @@
 
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
-since Part E.1b; its shutdown unmount built with Part E.4a; last checked 2026-09-29.**
+since Part E.1b; its shutdown unmount built with Part E.4a; the installer's source passed over
+since Part G.1; last checked 2026-09-30.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
 - **Mounting** (C.5b): every ext4 `init` did not mount is auto-mounted, read-only on a live boot,
-  with an `fs-server-ext4` and a namespace of its own, and named by its label.
+  with an `fs-server-ext4` and a namespace of its own, and named by its label — bar the installer's
+  source, a partition named `nitrox-source` (§6).
   `/svc/storage/fs/<label>/…` answers with `SUBNAMESPACE`, so a resolve continues in that
   namespace.
 - **The session endpoint** (C.5b): minted at `/svc/storage/session-endpoint`, answering the
@@ -128,7 +130,14 @@ makes the auto-mount read-only (§6). A root matched to no device is not a live 
 ## 6. Mounting
 
 **What is mounted at boot is every ext4 that is not already mounted**: `init`'s mounts are never
-mounted again, and FAT waits for Phase 6's server. **On a live boot every auto-mount is read-only**,
+mounted again, and FAT waits for Phase 6's server.
+
+**Bar one: the installer's source** (administration Part G.1). A partition named `nitrox-source`
+(`libgpt::INSTALL_SOURCE_LABEL`) is `install-root.img`'s, the pristine root the live stick's install
+entry loads for `nxinstall` to copy. Mounted, it would be in use, and the `disks` grant would
+withhold it from the installer. **The rule is the name, not "a RAM disk"**: a test image's scratch
+filesystem is a RAM disk this service mounts for `boot-probe`. The service's report of the device
+says so: `the installer's source, left unmounted`. **On a live boot every auto-mount is read-only**,
 since the machine's own disks are the install target and nothing written to one by accident could
 be taken back. An administrator's explicit mount (C.5c) will be writable either way; it is the
 automatic one that has to be careful.

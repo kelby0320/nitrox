@@ -2696,7 +2696,11 @@ demo account.
 
 Each keeps `check-install` passing: it is on demand, but in the local gate set.
 
-- [ ] **G.1 — the pristine source.**
+- [x] **G.1 — the pristine source.** *(Landed 2026-09-30, as drawn. `install-root.img` is 16 MiB:
+      the staged tree, `mke2fs`'s margin and the GPT. The storage service's report of the source
+      says `the installer's source, left unmounted`, so `check-install` matches the reason rather
+      than an absence, and `nxinstall` logs the partition it copies from. `check-install`'s session
+      sees six devices now: the disk, three modules, and the two partitions inside them.)*
   - `install-root.img`: the release root in a GPT with one `nitrox-source` partition, built beside
     `root.img` and loaded by the install entry.
   - **The storage service passes over `nitrox-source`.** Host-tested on an install boot's devices:

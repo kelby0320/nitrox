@@ -8,12 +8,16 @@
 //!
 //! ## What it copies from, which had to be decided
 //!
-//! **The source's bytes on the device, not the running system's view of them.** The live root
-//! is a RAM disk this session has been writing to, and a write reaches the device only when
-//! something syncs the file — so the two differ, and the difference is whatever the session
-//! has touched: a login writing under `/home`, a shell's history. Reading the device installs
-//! **the system as it shipped**, which is what an installer should produce; reading the live
-//! view would install a machine carrying one session's accidents.
+//! **A pristine copy of the system, which nothing mounts and nothing writes** (administration Part
+//! G.1): `install-root.img`, which the live stick's install entry loads beside the ESP. Copying it
+//! installs **the system as it shipped**, which is what an installer should produce.
+//!
+//! **Not the live root.** Until G.1 this read the live root's own RAM disk, raw. But the session
+//! writes that root, and every writer here syncs what it writes, so the copy carried whatever the
+//! session had touched — a login under `/home`, a shell's history. And `init` has it mounted, so a read could meet a directory
+//! block half-way through being rewritten. Linux's live installers copy the read-only image under
+//! the live root for the same reasons; this system's live root has nothing under it, so the image
+//! is a second copy.
 //!
 //! ## What it does not carry
 //!

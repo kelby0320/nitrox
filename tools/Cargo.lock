@@ -100,6 +100,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "libgpt"
+version = "0.1.0"
+
+[[package]]
 name = "libinput"
 version = "0.1.0"
 dependencies = [
@@ -232,6 +236,7 @@ dependencies = [
  "fs-server-ext4",
  "libcrypto",
  "libdraw",
+ "libgpt",
  "libterm",
  "libui",
  "libusers",

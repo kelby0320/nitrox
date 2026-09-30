@@ -1184,6 +1184,10 @@ fn report(d: &Device, mounts: &[Mounted]) {
     if let Some(m) = mount {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
+    } else if storage_service::mounts::is_install_source(d) {
+        // **Said, not left to an absence** (administration Part G.1): a gate can then match the
+        // reason the pristine root was passed over, rather than only fail to find its mount.
+        line.s(b"; the installer's source, left unmounted");
     }
     line.end();
 }

@@ -120,8 +120,9 @@ a release image carry the same `init`.
 start differing in anything new — in their initramfs, and since administration Part E.1c in their
 roots, where the service declarations and the profile manifest now are. It holds the **live image**
 to the same rule: its initramfs may differ from the release one only in `etc/init.toml`, and the
-filesystem inside its `root.img` must be the release root partition's, file for file. The **test
-live image** `check-storage` boots is held the same way to a `--selftest` image.
+filesystem inside its `root.img` must be the release root partition's, file for file, as must the
+one inside the install entry's `install-root.img`, the pristine root the installer copies. The
+**test live image** `check-storage` boots is held the same way to a `--selftest` image.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
@@ -180,13 +181,14 @@ timer tick instead of its own interrupt takes 3 s or more), and that a serial lo
 
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
 `check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
-menu entry with a blank disk attached, and drives the path a person takes on the laptop —
-Limine's menu, the **graphical** greeter, a terminal from the Applications menu, and `nxinstall`
-typed at the shell in it. Nothing reads the terminal's grid (a release image deliberately does
-not narrate it), so what it asserts on **in the guest** is the kernel log: the ESP module that
-entry alone loads, the four devices the session and then the shell hand on, and the milestones a
-destructive operation records. It also aims the installer at the RAM disk holding the running
-root, named correctly, and asserts nothing was installed to it.
+menu entry with a blank disk attached, and drives the path a person takes on the laptop — Limine's
+menu, the **graphical** greeter, a terminal from the Applications menu, and `nxinstall` typed at the
+shell in it. Nothing reads the terminal's grid (a release image deliberately does not narrate it),
+so what it asserts on **in the guest** is the kernel log: the ESP module that entry alone loads with
+the pristine root beside it, which the storage service leaves unmounted and the installer copies
+from, the six devices the session and then the shell hand on, and the milestones a destructive
+operation records. It also aims the installer at the RAM disk holding the running root, named
+correctly, and asserts nothing was installed to it.
 
 **Then it carves the root partition off the written disk and checks it on the host**, which is
 where H.2's claims live — a boot proves the filesystem works and says nothing about its size, and
