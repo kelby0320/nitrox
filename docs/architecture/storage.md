@@ -2,12 +2,14 @@
 
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
-since Part E.1b; its shutdown unmount built with Part E.4a; last checked 2026-09-29.**
+since Part E.1b; its shutdown unmount built with Part E.4a; the installer's source passed over
+since Part G.1; last checked 2026-09-30.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
 - **Mounting** (C.5b): every ext4 `init` did not mount is auto-mounted, read-only on a live boot,
-  with an `fs-server-ext4` and a namespace of its own, and named by its label.
+  with an `fs-server-ext4` and a namespace of its own, and named by its label — bar the installer's
+  source, a partition named `nitrox-source` (§6).
   `/svc/storage/fs/<label>/…` answers with `SUBNAMESPACE`, so a resolve continues in that
   namespace.
 - **The session endpoint** (C.5b): minted at `/svc/storage/session-endpoint`, answering the
@@ -128,7 +130,14 @@ makes the auto-mount read-only (§6). A root matched to no device is not a live 
 ## 6. Mounting
 
 **What is mounted at boot is every ext4 that is not already mounted**: `init`'s mounts are never
-mounted again, and FAT waits for Phase 6's server. **On a live boot every auto-mount is read-only**,
+mounted again, and FAT waits for Phase 6's server.
+
+**Bar one: the installer's source** (administration Part G.1). A partition named `nitrox-source`
+(`libgpt::INSTALL_SOURCE_LABEL`) is `install-root.img`'s, the pristine root the live stick's install
+entry loads for `nxinstall` to copy. Mounted, it would be in use, and the `disks` grant would
+withhold it from the installer. **The rule is the name, not "a RAM disk"**: a test image's scratch
+filesystem is a RAM disk this service mounts for `boot-probe`. The service's report of the device
+says so: `the installer's source, left unmounted`. **On a live boot every auto-mount is read-only**,
 since the machine's own disks are the install target and nothing written to one by accident could
 be taken back. An administrator's explicit mount (C.5c) will be writable either way; it is the
 automatic one that has to be careful.
@@ -284,10 +293,10 @@ binds the service itself at `/svc/storage`.
 | `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
-| `test-interactive` | The serial session is built with `/storage`. `list /dev/storage` names a table per device, and `open /dev/storage/all.tsm \| filter mounted == "/"` prints the root's row, `init`'s. `list /storage` lists filesystems, not tables, and on a release boot none. **`with admin nxinstall` lists the ESP and never `/dev/blk/0` or the root**, where before C.6 it listed the disk under a live server |
+| `test-interactive` | The serial session is built with `/storage`. `list /dev/storage` names a table per device, and `open /dev/storage/all.tsm \| filter mounted == "/"` prints the root's row, `init`'s. `list /storage` lists filesystems, not tables, and on a release boot none. **`with admin nxinstall` lists the ESP and never `/dev/blk/0` or the root**, where before C.6 it listed the disk under a live server; since administration Part G.2 a line naming `/dev/blk/0` is only its message on `stderr`, that it holds the running system, and that message must be there |
 | `test-qemu` (`boot-probe`), `disk` | **`disk` in the admin view, run as `with admin disk` runs it**: `--unmount nitrox-scratch` writes its one-row table to stdout and exits 0, and the service's table then shows the scratch disk unmounted. `--mount /dev/blk/<n>` writes `blk-<n>`, `nitrox-scratch` and `/storage/nitrox-scratch`, and the table shows it mounted writable again. **With every admin session taken, `disk --unmount` exits 1 and its `stderr` names the service's `WouldBlock`**, not the grant, and the mount stays |
 | `test-interactive`, `disk` | `disk --list \| filter mounted == "/"` prints the root's row, `init`'s, in a session with no grant. **`disk --mount` there fails naming the `storage` grant and `with`.** Through `with admin` and a typed password, the same mount reaches the service and is refused by it: the ESP holds FAT, which it recognises and cannot serve. A release boot has nothing it could mount, so the service's own refusal is the evidence the grant arrived |
-| `check-login` | The graphical session has `/storage`, and so does every application namespace the shell builds. In a desktop terminal, `with admin nxinstall /dev/blk/0 x` is refused because that disk is not in the view at all |
+| `check-login` | The graphical session has `/storage`, and so does every application namespace the shell builds. In a desktop terminal, `with admin nxinstall /dev/blk/0 x` is refused: that disk is not in the view at all, and since administration Part G.2 the installer says why — it holds the running system, as the tables report `init`'s mount |
 | `test-qemu` (`boot-probe`), mounts | Through `/svc/storage`: `fs` lists `nitrox-scratch` as a directory. Its `README` reads. **A file created, written through a mapping and synced there is on the device**, read back from the RAM disk raw, since a re-resolve would only read the page cache. A session endpoint bound at `/storage` with the base `/fs` and at `/dev/storage` with `/info` reaches the same file and the same table, and bound with no base it mints nothing. An unknown label is `NotFound` |
 
 Host tests hold the rest: FAT against sectors `mformat` wrote and a real protective MBR, ext4

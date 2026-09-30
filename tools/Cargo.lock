@@ -100,6 +100,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libfs"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
+name = "libgpt"
+version = "0.1.0"
+
+[[package]]
+name = "libheap"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "libinput"
 version = "0.1.0"
 dependencies = [
@@ -110,6 +129,14 @@ dependencies = [
 [[package]]
 name = "libkern"
 version = "0.1.0"
+
+[[package]]
+name = "liblog"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
 
 [[package]]
 name = "libm"
@@ -127,6 +154,25 @@ dependencies = [
 [[package]]
 name = "librsproto"
 version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
+name = "libsession"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+ "libstream",
+]
+
+[[package]]
+name = "libstream"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
 
 [[package]]
 name = "libsurface"
@@ -226,16 +272,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "view-broker"
+version = "0.1.0"
+dependencies = [
+ "libfs",
+ "libheap",
+ "libkern",
+ "liblog",
+ "librsproto",
+ "libsession",
+ "libstream",
+ "libusers",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
  "libcrypto",
  "libdraw",
+ "libgpt",
  "libterm",
  "libui",
  "libusers",
  "png",
+ "view-broker",
 ]
 
 [[package]]

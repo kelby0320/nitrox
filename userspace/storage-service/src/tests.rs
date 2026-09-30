@@ -462,6 +462,40 @@ fn two_filesystems_with_one_label_are_told_apart() {
     assert_eq!(labels, ["data", "data-2"]);
 }
 
+/// **The installer's source is passed over, by its name** (administration Part G.1). An install
+/// boot beside a disk holding an older install: the live root, which `init` mounted; the
+/// installable ESP; the pristine root, `install-root.img`'s `nitrox-source`; and the SATA disk's
+/// `nitrox-root`. And a test image's scratch filesystem, a RAM disk holding ext4 with no partition
+/// table, which `boot-probe` needs mounted. Mounted, the source would be in use, and `disks` would
+/// withhold it from `nxinstall`.
+#[test]
+fn the_installers_source_is_passed_over_and_nothing_else() {
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true) };
+    let install_boot = |source_name: &str| {
+        std::vec![
+            dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
+            dev(rec(5, DeviceKind::RamDisk, 1, NO_PARENT, "root.img", 57_344), Found::Nothing),
+            dev(rec(6, DeviceKind::RamDisk, 2, NO_PARENT, "install-esp.img", 67_584), Found::Fat { label: String::new() }),
+            dev(rec(7, DeviceKind::RamDisk, 3, NO_PARENT, "install-root.img", 24_576), Found::Nothing),
+            dev(rec(8, DeviceKind::Partition, 4, 3, "nitrox-root", 196_541), ext4("")),
+            dev(rec(9, DeviceKind::Partition, 5, 5, "nitrox-live", 53_248), ext4("")),
+            dev(rec(10, DeviceKind::Partition, 6, 7, source_name, 20_480), ext4("")),
+            dev(rec(11, DeviceKind::RamDisk, 7, NO_PARENT, "scratch.img", 16_384), ext4("nitrox-scratch")),
+        ]
+    };
+    let init = [Mounted { device: 9, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
+    let planned = |ds: &[Device]| automount(ds, &init, true, true).into_iter().map(|p| p.device).collect::<Vec<_>>();
+    assert_eq!(
+        planned(&install_boot(libgpt::INSTALL_SOURCE_LABEL)),
+        [8, 11],
+        "the older install and the scratch RAM disk, and not the source"
+    );
+    // **The name is the rule**: one letter off and the same partition is mounted, which is what
+    // proves the skip above was the name's doing and not something else about that device.
+    assert_eq!(planned(&install_boot("nitrox-sourcf")), [8, 10, 11]);
+}
+
 #[test]
 fn a_mount_is_under_storage() {
     assert_eq!(at("nitrox-root"), "/storage/nitrox-root");

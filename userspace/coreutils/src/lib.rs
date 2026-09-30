@@ -5,9 +5,10 @@
 //!
 //! - [`stage`] — the Tier-0/Tier-1 startup prologue: streams, `argv`, `stderr`, exits.
 //! - [`args`] — GNU-style flag parsing (`--long`, `-f`, `--`, `--help`/`--version`).
-//! - [`ipc`] — one request, one reply, for a stage that is a server's client: the view broker's,
-//!   or a terminal's.
-//! - [`prompt`] — a password asked for on the stage's terminal, echo off, once or twice.
+//!
+//! **Asking a person on a terminal** is [`libprompt`], and the view broker's client [`libviews`] —
+//! each moved out when a program that is not a coreutil needed it (administration Parts F.3 and
+//! G.2).
 //!
 //! The **filesystem** half is [`libfs`], not something in here — it moved out in M10 Part A
 //! when a graphical file browser needed it and did not need any of the above. The directory
@@ -24,7 +25,6 @@
 extern crate alloc;
 
 pub mod args;
-pub mod prompt;
 pub mod stage;
 /// Calendar arithmetic and duration parsing.
 ///

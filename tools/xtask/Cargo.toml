@@ -16,6 +16,13 @@ libcrypto = { path = "../../userspace/libcrypto" }
 # the same `write_record` `auth-service` and `account` write through, so the build cannot write a
 # line the service reads differently.
 libusers = { path = "../../userspace/libusers" }
+# The installer's source partition's name (administration Part G.1): the build writes it on
+# `install-root.img`'s one partition, the storage service passes it over and `nxinstall` finds its
+# source by it, so all three read `libgpt::INSTALL_SOURCE_LABEL` rather than spelling it.
+libgpt = { path = "../../userspace/libgpt" }
+# The policy the build seeds, `view_broker::policy::seed` (administration Part G.2): the installer
+# writes the same one onto an installed machine, naming its first account, so there is one text.
+view-broker = { path = "../../userspace/view-broker" }
 # The display gate renders the expected image itself rather than comparing against a
 # golden file checked into the repo. `libdraw`'s core is `core + alloc` with no
 # dependencies, so the host build is free; the `io` feature (syscalls) stays off.

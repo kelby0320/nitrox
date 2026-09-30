@@ -756,10 +756,11 @@ fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
     let flags = cmdline::parse(line, |ignored| match ignored {
         // **Not "ignored": passed on.** The kernel acts on the words it knows and serves the
         // whole line at `/proc/cmdline`, so a word it does not recognise may still be somebody's
-        // — `install` is `session-mgr`'s (Phase 5 Part H.1). Saying "ignoring" of a word that
-        // decides what the machine does would be the log lying about the boot.
+        // — `install` was `session-mgr`'s from Phase 5 Part H.1 until administration Part G.3.
+        // Saying "ignoring" of a word that might decide what the machine does would be the log
+        // lying about the boot; saying userspace reads it, when nothing does today, would be too.
         Ignored::Unknown(word) => kprintln!(
-            "cmdline: \"{}\" is not a kernel flag; userspace reads it at /proc/cmdline",
+            "cmdline: \"{}\" is not a kernel flag; it is served whole at /proc/cmdline",
             Printable(word)
         ),
         Ignored::BadValue(word) => kprintln!(
@@ -1233,8 +1234,9 @@ fn run_first_userspace() {
             proc_self_status_rights,
         ),
         // `/proc/cmdline` — the line this boot was given, as text. Not under `/proc/self`: it is
-        // one fact about the machine, the same for every reader. `session-mgr` looks for
-        // `install` in it (Phase 5 Part H.1), and a person debugging a boot wants to see it.
+        // one fact about the machine, the same for every reader, and a person debugging a boot
+        // wants to see it. (`session-mgr` looked for `install` in it from Phase 5 Part H.1 until
+        // administration Part G.3.)
         (
             &b"/proc/cmdline"[..],
             KernelServerId::ProcCmdline,

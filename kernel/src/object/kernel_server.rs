@@ -222,9 +222,9 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// a reader matching words does not want to strip one).
 ///
 /// **The kernel does not interpret every word of it.** It reads the flags it acts on at boot
-/// (`cmdline::parse`) and serves the line whole, so a word meant for userspace — `install`, which
-/// selects the installer session (Phase 5 Part H.1) — needs no kernel-side list to survive the
-/// journey. A non-empty `suffix` is *not found*; this is a leaf.
+/// (`cmdline::parse`) and serves the line whole, so a word meant for userspace needs no
+/// kernel-side list to survive the journey. (None is read today; `install` was, from Phase 5 Part
+/// H.1 until administration Part G.3.) A non-empty `suffix` is *not found*; this is a leaf.
 fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);

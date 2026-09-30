@@ -4,11 +4,11 @@
 //! **Below `with` because the desktop asks too** (administration Part F.3). The request was
 //! `with`'s own until the power menu's Restart and Shut down needed to make it, from `desktop-shell`,
 //! which cannot reach into a coreutil — `userspace/CLAUDE.md`'s rule for a helper with a second
-//! consumer. `with`, `account` and `desktop-shell` use it; `coreutils::ipc` came with it as
-//! [`ipc`].
+//! consumer. `with`, `account` and `desktop-shell` use it. The channel plumbing it speaks through
+//! is `libprompt::ipc`, which moved there with the prompts in administration Part G.2.
 //!
-//! **What stays with each caller is how it asks a person.** `with` prompts on its terminal for a
-//! password. The desktop has no graphical prompt yet (`docs/design/graphical-prompt.md`), so a
+//! **What stays with each caller is how it asks a person.** This crate asks no one: `with` prompts
+//! on its terminal for a password, with `libprompt`. The desktop has no graphical prompt yet (`docs/design/graphical-prompt.md`), so a
 //! policy asking for one is a refusal there, and [`decide`] lets it find that out before it closes
 //! a window.
 
@@ -16,7 +16,7 @@
 
 extern crate alloc;
 
-pub mod ipc;
+use libprompt::ipc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,6 +27,15 @@ use librsproto::views::{
     OP_VIEWS_DECIDE, OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN, REQ_STDOUT,
     REQ_TERMINAL, build_decide, build_request, parse_rows,
 };
+
+/// The view broker's answer, as the outcome and its reason. An answer that does not read is a
+/// denial saying so.
+pub fn outcome(body: &[u8]) -> (Outcome, String) {
+    match librsproto::views::parse_outcome(body) {
+        Some((o, why)) => (o, String::from_utf8_lossy(why).into_owned()),
+        None => (Outcome::Denied { retry: false }, String::from("the broker's answer did not read")),
+    }
+}
 
 /// Where a session's namespace binds the broker.
 pub const BROKER_PATH: &[u8] = b"/dev/views";
@@ -135,7 +144,7 @@ pub fn request(
         return Err(Failed::NoAnswer);
     }
     match ipc::answer(ch, REQUEST_ID, deadline) {
-        Some((false, body)) => Ok(ipc::outcome(&body)),
+        Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
     }
@@ -145,7 +154,7 @@ pub fn request(
 /// it has checked it — after the session's delay, when the last one was wrong.
 pub fn password(ch: u64, request_id: u64, pw: &[u8]) -> Result<(Outcome, String), Failed> {
     match ipc::call(ch, OP_VIEWS_PASSWORD, request_id, pw, &[]) {
-        Some((false, body)) => Ok(ipc::outcome(&body)),
+        Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
     }
@@ -203,7 +212,7 @@ pub fn decide(ch: u64, view: &str, program: &str, deadline: u64) -> Result<(Outc
         return Err(Failed::NoAnswer);
     }
     match ipc::answer(ch, REQUEST_ID, deadline) {
-        Some((false, body)) => Ok(ipc::outcome(&body)),
+        Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
     }

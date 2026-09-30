@@ -74,6 +74,7 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libprompt",
  "librsproto",
  "libstream",
  "libtime",
@@ -104,6 +105,7 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libprompt",
  "librsproto",
  "libsession",
  "libstream",
@@ -250,6 +252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libprompt"
+version = "0.1.0"
+dependencies = [
+ "libfs",
+ "libkern",
+ "librsproto",
+ "libusers",
+]
+
+[[package]]
 name = "librsproto"
 version = "0.1.0"
 dependencies = [
@@ -323,6 +335,7 @@ version = "0.1.0"
 dependencies = [
  "libfs",
  "libkern",
+ "libprompt",
  "librsproto",
 ]
 
@@ -385,7 +398,10 @@ dependencies = [
  "libgpt",
  "libheap",
  "libkern",
+ "libprompt",
  "libstream",
+ "libusers",
+ "view-broker",
 ]
 
 [[package]]

@@ -1,8 +1,11 @@
 # `views.toml` — the view broker's policy
 
-**Status: normative for what is built (2026-09-29, Part F.3).** Read by `userspace/view-broker/`
-(`view_broker::policy`) from `/system/views.toml`, **for every request**. The build seeds one;
-an installed system's comes from the installer (administration Part G).
+**Status: normative for what is built (2026-09-30, Part G.2).** Read by `userspace/view-broker/`
+(`view_broker::policy`) from `/system/views.toml`, **for every request**. A machine starts with
+**the seeded policy**, `view_broker::policy::seed(name)` — the example below, for `alice`, with
+comments added. The build writes it naming the demo account, and `nxinstall` writes it onto an
+installed machine naming the first account it made (administration Part G.2). One function, so an
+installed machine starts under the policy every gate has run under.
 
 Conceptually `sudoers` — who may use which view, for which programs, proved how — but not its
 syntax. A view is a profile's grants added to the caller's own namespace; see

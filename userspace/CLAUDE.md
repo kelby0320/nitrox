@@ -62,6 +62,8 @@ Application                              ← user code
   ↓
 libviews                                 ← the view broker's client (asking to run in a view)
   ↓
+libprompt                                ← asking a person on a terminal; the scrubbing plumbing
+  ↓
 libfs                                    ← whole-file + path helpers (no protocol of its own)
   ↓
 libstream  librsproto                    ← typed I/O, RS protocol
@@ -81,10 +83,24 @@ one consumer belongs to that consumer; a helper with two belongs below both.** A
 reaching into another application's crate to borrow one is the shape that rule exists to catch.
 
 `libviews` is the same rule applied again (administration Part F.3): the request that asks the view
-broker to run a program in a view was `with`'s, and its channel plumbing `coreutils::ipc`, until the
-desktop's Restart and Shut down had to make it too. `with`, `account` and `desktop-shell` use it.
-It sits above `libfs`, whose `lookup_wait` finds `/dev/views`, and owns no wire format — the codec
-is `librsproto::views`. How a person is asked for a password stays with each caller.
+broker to run a program in a view was `with`'s until the desktop's Restart and Shut down had to make
+it too. `with`, `account` and `desktop-shell` use it. It owns no wire format — the codec is
+`librsproto::views` — and it asks no person anything.
+
+`libprompt` is the rule a third time (administration Part G.2): asking a person on the terminal
+their program was handed — a line, a password, a new password twice — was `coreutils::prompt`
+until `nxinstall`, which is not a coreutil and never talks to the broker, needed it for the first
+account. The channel plumbing a password crosses, scrubbed after every send, moved with it from
+`libviews`, which speaks through it; it sits above `libfs`, whose `lookup_wait` its `lookup` uses.
+**Which question to ask, and when, stays with each caller**; how a question is put to a terminal is
+`libprompt`'s.
+
+**`nxinstall` takes the `view-broker` crate, and that is deliberate** (administration Part G.2): an
+application depending on another's crate is the shape the rule above catches, but what it takes is
+`view_broker::policy::seed`, the policy a machine starts with — the broker's own file, not a helper.
+The seed lives beside `Policy::parse` because the two have to agree, and one host test there holds
+what the build and the installer write to what the broker reads. Should a third writer appear, the
+format moves below all of them, as the user database's did into `libusers`.
 
 A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo. `libheap` (the freeing heap that backs `alloc`) is a foundation alongside `libkern`: it depends only on `libkern` + `core`, and the top-level binary registers it as the `#[global_allocator]`.
 

@@ -1678,26 +1678,6 @@ interpolation it needs: a `fill` of a picture smaller than the screen draws it a
 **Trigger: a screen larger than the picture a person wants filling it** — the first 2560×1440
 screen with the shipped 1920×1200 picture is one.
 
-**Making a new user's folders on first login — `TODO(home-folders)`.** M14 Part D gave `nxfiles`
-a sidebar of common locations, and the folders it points at — Documents, Downloads, Pictures — are
-staged into the demo home by the image build. That is right while there is exactly one home
-shipped with the system and wrong the moment there are real users: a home created by
-`session-mgr` would have none of them, and the sidebar would offer three rows that all say the
-directory is not there.
-
-The right answer is for the session to create them when it first builds a user's namespace, which
-needs a decision about *where the list lives* — a profile default, a skeleton directory, or the
-shell's own — rather than the three lines of `mkdir`. **Trigger: the second home**, whether that
-is a second demo user or the first real one.
-
-**Resolved for every home an administrator adds (administration Part D.3, 2026-09-25), and not by
-the session.** The maintainer's call in Part D's detail pass: **whoever makes a home makes its
-folders**, from `libfs::HOME_FOLDERS`, the list the sidebar already reads — over a session making
-missing folders at each login, and over a skeleton directory. The view broker makes the home for
-`AddAccount`, so every account added on a running system gets them. **Still open for one home**:
-the first account's, which Part G's installer writes onto the installed disk and must make the
-same way. The tag stays until it does.
-
 **Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
 `nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a
 browser that hides them and a chooser that does not are one directory listed two ways by two
@@ -2140,6 +2120,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A new user's folders (`home-folders`) | 2026-09-30 | **Whoever makes a home makes its folders**, from `libfs::HOME_FOLDERS`, the list `nxfiles`' sidebar and the shell's Places menu read — the maintainer's call in administration Part D's detail pass, over a session making missing folders at each login and over a skeleton directory. The view broker made them for every account `account --add` adds from Part D.3, and **Part G.2's installer makes them for the first**: it writes the new machine's one account, its policy and `/home/<name>` with the three folders onto the installed root, where it used to copy the build's demo home. `check-install` reads them off the installed disk on the host. |
 | A press whose release never arrives (`lost-release`) | 2026-09-23 | **QEMU held it.** Its PS/2 queue is sixteen bytes, and a packet that will not fit stays in the device's state until the next injected event (`ps2_mouse_send_packet`, the same in 8.2 and 11.0). A gate injects a click's release last and then waits, so after a walk that filled the queue the press went and the release waited for ever. Proven by a guest probe that held the i8042 drain for a 3-step walk and a click: ten releases held of ten, and QEMU's trace showed no button-up packet until the next event. The gates now flush — an event that moves nothing, which can only deliver what was injected — after a click's press receipt and while waiting after any other release (`expect_after_pointer`): ten of ten through the real `click_at`, none without its flush. **Guarded since PR #331's review**: the `ps2-hold-gate` kernel feature, which `test-harness` implies, holds the i8042 drain after F9, and `check-input` builds the held release with it on every run — asserting the release is held, then that each flush delivers it. The entry's reasoning ruled out everything *in* the guest correctly, and said a fix had to be below the gate; the loss was below the guest, in the injector, so the gate — the one thing that knows it has stopped injecting — is where the fix belongs. |
 | An account that can see more than one user's own (`admin-visibility`) | 2026-09-23 | Administration Part A answered the three questions the entry asked. **An administrator is a mode, not a second account**: a *view* — the caller's own namespace plus a profile's grants — that a person reaches with `with`, proved by their own password, when `/system/views.toml` lets them. What such a view may do is what its profile grants (`disks`, first). The symptom the entry opened with — application namespaces omit `/applications` — was never the deferral's to fix: it stands on its own, because nothing in an application reads it, and `desktop-shell` now says so without the tag. |
 | Cross-group inode/block allocation (`fs-server-ext4`) | 2026-09-17 | Both allocators scan every block group — `alloc_block` from the goal's group outward, `alloc_inode` from the first with a free one — clamped to the last group's short tail. The trigger fired exactly as written: `nxinstall` made a root the size of a 931 GiB disk and it held about 112 MiB. Phase 5 Part H.2. |

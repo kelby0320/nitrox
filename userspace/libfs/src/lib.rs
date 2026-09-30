@@ -749,9 +749,9 @@ pub fn join(dir: &[u8], name: &[u8]) -> String {
 /// The folders a session's home holds for a person's own files — between Home and Root in every
 /// list of [`places`].
 ///
-/// **Named here, and made by whoever makes a home**: the image build for the demo home, and since
-/// administration Part D.3 the view broker for every account an administrator adds. The first
-/// account's home, which Part G's installer makes, is the one still owed (`TODO(home-folders)`).
+/// **Named here, and made by whoever makes a home**: the image build for the demo home, since
+/// administration Part D.3 the view broker for every account an administrator adds, and since Part
+/// G.2 `nxinstall` for an installed machine's first account.
 /// A place whose directory is absent is still offered — opening it says so, which is the same
 /// answer a typed path gets.
 ///

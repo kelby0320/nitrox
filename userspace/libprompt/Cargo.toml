@@ -1,0 +1,21 @@
+[package]
+name = "libprompt"
+version = "0.1.0"
+edition = "2024"
+
+# `libprompt` — asking a person on the terminal their program was handed: a line, a password, a new
+# password twice, and the scrubbing request-and-reply plumbing a password crosses. It was
+# `coreutils::prompt` and `libviews::ipc` until `nxinstall` became a third consumer (administration
+# Part G.2): the installer is not a coreutil and never talks to the view broker.
+[dependencies]
+libkern = { path = "../libkern" }
+# The terminal ops and the envelope.
+librsproto = { path = "../librsproto" }
+# The password rules `confirm` holds a new password to.
+libusers = { path = "../libusers" }
+# `lookup_wait`, for `ipc::lookup`.
+libfs = { path = "../libfs" }
+
+[lib]
+name = "libprompt"
+path = "src/lib.rs"

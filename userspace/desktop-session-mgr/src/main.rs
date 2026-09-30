@@ -190,9 +190,6 @@ fn run_session(
         // Its clients render text, and a constructed namespace has no font without this.
         bind_fonts: true,
         bind_console: false,
-        // **Only on an installer boot** (Phase 5 Part H.1) — the same decision the serial column
-        // makes, from the same reader, because both build sessions and neither may differ.
-        bind_blk: libsession::installer_boot(root_ns),
         views_endpoint: if opened.is_some() { views } else { 0 },
         views_base: &views_base[..base_len],
         devices_endpoint: devices,

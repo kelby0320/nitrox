@@ -1989,7 +1989,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          The baseline the grant is measured against: the same program, a moment later, sees
     //          them only because the broker bound them.
     s.send("nxinstall")?;
-    s.expect("no block devices in this session")?;
+    // "in this view" since administration Part G.2, which also says how to get the disks: the
+    // grant, through `with admin`.
+    s.expect("no block devices in this view")?;
     s.expect("/home>")?;
     //      (b) **Refused by the policy, and nothing asked.** `install` lets alice run `nxinstall`
     //          and nothing else; a request for `nxsh` there is refused before any password, and
@@ -2030,14 +2032,25 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     }
     s.expect("/home>")?;
     let listing = s.transcript()[listing_from..].to_string();
+    // **Never a row, and the disk named as what it is** (administration Part G.2). Since G.2 the
+    // installer says, on `stderr`, why a disk it cannot have is missing — and the serial terminal
+    // shows `stderr` beside the table. So the claim is now per line: a line naming a withheld
+    // device must be that message, and `/dev/blk/0`'s must be there, saying it holds the running
+    // system. The root partition, `/dev/blk/2`, is never named at all: the message is per disk.
     for withheld in ["/dev/blk/0", "/dev/blk/2"] {
-        if listing.contains(withheld) {
+        if let Some(row) = listing.lines().find(|l| l.contains(withheld) && !l.contains("holds the running system")) {
             return Err(format!(
                 "`with admin nxinstall` listed {withheld}, which is in use (init's root, or the disk \
-                 holding it): {listing:?}"
+                 holding it): {row:?}"
             )
             .into());
         }
+    }
+    if !listing.lines().any(|l| l.contains("/dev/blk/0 (") && l.contains("holds the running system")) {
+        return Err(format!(
+            "`with admin nxinstall` did not say /dev/blk/0 holds the running system: {listing:?}"
+        )
+        .into());
     }
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
@@ -3362,45 +3375,65 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
 const TARGET_MODEL: &str = "NITROX-TEST-DISK";
 /// The target disk's serial.
 const TARGET_SERIAL: &str = "INSTALL01";
-/// How many block devices an installer session sees on this gate's boot: the target disk, the
-/// two Limine modules, and the `nitrox-live` partition the GPT scan finds inside `root.img`.
-const SESSION_DEVICES: usize = 4;
-
-/// What the kernel calls the RAM disk `root.img` becomes — the running system's own root, and
-/// the device this gate points the installer at to prove it refuses one.
-const RAMDISK_IDENTITY: &str = "module 1 (/boot/root.img)";
+/// What the kernel calls the RAM disk `install-root.img` becomes — the pristine root, which the
+/// view holds, and the device this gate points the installer at to prove it refuses a RAM disk as
+/// a target (administration Part G.3). Until then it was `root.img`'s, which the view no longer
+/// reaches: it holds the running system, and `disks` withholds it.
+const RAMDISK_IDENTITY: &str = "module 3 (/boot/install-root.img)";
+/// **The account `check-install` makes the new machine's first** (administration Part G.2): a
+/// fixture, as `DEMO_USER` is, and one the build does not make, so a login as it can only have
+/// come from what the installer wrote.
+const INSTALL_ACCOUNT: &str = "dana";
+/// Its password: letters and spaces, since it is typed on PS/2 at a terminal and at a greeter.
+const INSTALL_PASSWORD: &str = "a quiet morning by the lake";
 
 /// How big the gate's blank disk is. Small enough to write quickly under TCG, large enough for a
 /// 33 MiB boot partition and a root partition with room left over.
 const TARGET_MIB: u64 = 512;
 
-/// `cargo xtask check-install` — install to a blank disk, then boot that disk on its own.
+/// `cargo xtask check-install` — **reinstall** onto a disk holding an install, from an ordinary
+/// session, then boot that disk on its own.
 ///
 /// **On demand, like `check-resolutions`**: two boots and a 512 MiB image is not a per-PR cost.
 ///
 /// The first boot is the whole path a person takes on the laptop, driven the way they drive it:
 /// the live image's third menu entry, the **graphical** greeter (that machine has no serial port,
-/// so its greeter is the only way in), a terminal launched from the Applications menu, and the
-/// installer typed at the shell in it. Nothing here reads the terminal's grid — a release image
-/// deliberately does not narrate it — so what the gate asserts on is the kernel log: the module
-/// the install entry loads, the devices the session and then the shell hand on, and the
-/// milestones `nxinstall` records for a destructive operation — including the *refusal* of one,
-/// which is an event in its own right and the only part of a refusal a gate can see.
+/// so its greeter is the only way in), a terminal launched from the Applications menu, and `with
+/// admin nxinstall` typed at the shell in it. Nothing here reads the terminal's grid — a release
+/// image deliberately does not narrate it — so what the gate asserts on is the kernel log: the
+/// modules the install entry loads, what the storage service mounted and left alone, the broker's
+/// audit, and the milestones `nxinstall` records for a destructive operation — including the
+/// *refusal* of one, which is an event in its own right and the only part of a refusal a gate can
+/// see.
+///
+/// **A reinstall since administration Part G.3**: the target is a copy of the release disk, so the
+/// live boot auto-mounts its `nitrox-root` read-only and `disks` withholds it. The installer
+/// refuses it as in use, `with admin disk --unmount nitrox-root` frees it, and then it installs.
+/// No session on the boot holds a disk; everything the installer reaches, it reaches through the
+/// grant.
 ///
 /// The second boot is the only assertion that really matters: the disk alone, no stick, and a
-/// greeter on it.
+/// greeter on it that knows the account the installer made.
 fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
-    cmd_image_live()?;
-    let ovmf = locate_ovmf()?;
     let work = build_cache();
     fs::create_dir_all(&work).ok();
 
-    // **A blank disk, made fresh.** Reusing one left by an earlier run would let an install that
-    // wrote nothing pass on the last run's bytes — the gate's own version of a stale artifact.
+    // **A copy of the release disk, grown, and made fresh** (administration Part G.3). A disk that
+    // already holds an install, since that is what a reinstall meets: its `nitrox-root`
+    // auto-mounted read-only on the live boot, and so withheld from `disks` until it is unmounted.
+    // **Grown to `TARGET_MIB`**, because the release disk is 128 MiB and a root installed on it is
+    // one block group, which `check_installed_root`'s write past group 0 cannot cross. The old
+    // install survives the growing: its primary GPT still describes 128 MiB, and `nitrox-root`
+    // sits inside it. Reusing a disk left by an earlier run would let an install that wrote nothing
+    // pass on the last run's bytes — the gate's own version of a stale artifact.
+    cmd_image(BuildMode::Normal)?;
     let target = work.join("install-target.img");
     let _ = fs::remove_file(&target);
-    fs::File::create(&target)?.set_len(TARGET_MIB * 1024 * 1024)?;
+    fs::copy(image_path(), &target)?;
+    fs::OpenOptions::new().write(true).open(&target)?.set_len(TARGET_MIB * 1024 * 1024)?;
+    cmd_image_live()?;
+    let ovmf = locate_ovmf()?;
 
     let identity = format!("{TARGET_MODEL} ({TARGET_SERIAL})");
     let qmp_sock = work.join("qmp-install.sock");
@@ -3435,7 +3468,7 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    println!("xtask: install gate — booting the live image's installer entry with a blank disk…\n");
+    println!("xtask: install gate — booting the live image's installer entry beside a disk holding an install…\n");
     let mut session = Session::spawn(cmd, "check-install")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
     let result = run_install_steps(&mut session, &mut qmp, &dump, &identity);
@@ -3449,28 +3482,38 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
     // records a milestone; this asserts none names that device. The assertion is an absence, and
     // what makes an absence mean something here is that the install which followed it succeeded
     // — the same pairing `check-live` and this gate's step 5 make across two gates.
-    if let Some(line) = transcript.lines().find(|l| l.contains("installing to /dev/blk/1")) {
+    if let Some(line) = transcript
+        .lines()
+        .find(|l| l.contains("nxinstall: installing to") && !l.contains("installing to /dev/blk/0 "))
+    {
         println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
         return Err(format!(
-            "the installer wrote to a RAM disk: {line:?}. `/dev/blk/1` is memory the bootloader \
-             loaded — the running system's own root — and writing it destroys the machine that \
-             is running and survives nothing. Refusing it is what `BlockKind` exists for."
+            "the installer wrote to something other than the target: {line:?}. Step 7b aimed it at a \
+             RAM disk — memory the bootloader loaded — and writing one survives nothing. Refusing \
+             it is what `BlockKind` exists for."
         )
         .into());
     }
     println!("  ok: and it refused the RAM disk it was pointed at, named correctly");
+    install_gate_no_passwords(&transcript, "the first boot")?;
 
     // Before booting it: what the boot cannot tell us about the filesystem.
     check_installed_root(&target, &work)?;
+    check_installed_account(&target, &work)?;
 
     // The second boot: what was written, on its own.
     println!("\nxtask: booting the installed disk with no stick…\n");
+    let boot_qmp = work.join("qmp-install-boot.sock");
+    let _ = fs::remove_file(&boot_qmp);
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", target.display()))
         .arg("-display")
         .arg("none")
+        // **A login this time** (administration Part G.2), so the greeter needs keys.
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", boot_qmp.display()))
         .arg("-chardev")
         .arg("stdio,id=hostserial,signal=off")
         .arg("-serial")
@@ -3482,11 +3525,15 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut session = Session::spawn(cmd, "check-install-boot")?;
-    let result = run_installed_boot_steps(&mut session);
+    let mut qmp = Qmp::connect(&boot_qmp)?;
+    let result = run_installed_boot_steps(&mut session, &mut qmp);
     let transcript = session.finish();
-    match result {
+    match result.and_then(|()| install_gate_no_passwords(&transcript, "the installed disk's boot")) {
         Ok(()) => {
-            println!("\nxtask: installed to a blank disk, and that disk boots to a greeter ✓");
+            println!(
+                "\nxtask: reinstalled onto a disk that held an install, and that disk boots to a greeter \
+                 that knows only {INSTALL_ACCOUNT} ✓"
+            );
             Ok(())
         }
         Err(e) => {
@@ -3494,6 +3541,72 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
             Err(e)
         }
     }
+}
+
+/// **Neither password this gate typed is in what the guest printed** (administration Part G.2):
+/// the live account's, at `with`'s prompts and a greeter, and the new account's, at the installer's
+/// prompts and a greeter. Each was typed with echo off or into a masked field.
+fn install_gate_no_passwords(transcript: &str, which: &str) -> R<()> {
+    for (whose, pw) in [(DEMO_USER, DEMO_PASSWORD), (INSTALL_ACCOUNT, INSTALL_PASSWORD)] {
+        if transcript.contains(pw) {
+            return Err(format!("{whose}'s password is in {which}'s transcript").into());
+        }
+    }
+    println!("  ok: neither password typed is in {which}'s transcript");
+    Ok(())
+}
+
+/// **The installed root holds the new machine's account and no other** (administration Part G.2),
+/// read on the host out of the partition the installer wrote, with the code the guest serves it
+/// with:
+/// - `/system/users` has one record, `INSTALL_ACCOUNT`'s, at `/home/<name>`;
+/// - `/system/views.toml` reads, and makes it the one administrator — `alice` is not one;
+/// - `/home` holds its home alone, with the three folders a home has, and no `alice`.
+fn check_installed_account(disk: &Path, work: &Path) -> R<()> {
+    use fs_server_ext4::ext4;
+    let fs_img = work.join("installed-account.ext4");
+    carve_partition(disk, 2, &fs_img)?;
+    let img = MemFs(std::cell::RefCell::new(fs::read(&fs_img)?));
+    let read = |path: &str| -> R<Vec<u8>> {
+        let mut out = vec![0u8; 64 * 1024];
+        let n = ext4::read_file(&img, path.as_bytes(), &mut out).map_err(|e| format!("read {path}: {e:?}"))?;
+        out.truncate(n);
+        Ok(out)
+    };
+    let users = read("/system/users")?;
+    let records: Vec<(String, String)> = libusers::records(&users)
+        .map(|r| (String::from_utf8_lossy(r.name).into_owned(), String::from_utf8_lossy(r.home).into_owned()))
+        .collect();
+    let home = format!("/home/{INSTALL_ACCOUNT}");
+    if records != [(INSTALL_ACCOUNT.to_string(), home.clone())] {
+        return Err(format!("/system/users holds {records:?}, not {INSTALL_ACCOUNT} alone").into());
+    }
+    println!("  ok: /system/users holds {INSTALL_ACCOUNT} alone, at {home}");
+    let policy_text = String::from_utf8(read("/system/views.toml")?)?;
+    let policy = view_broker::policy::parse(&policy_text).map_err(|e| format!("/system/views.toml does not read: {e}"))?;
+    let admins = policy.administrators(&[INSTALL_ACCOUNT, DEMO_USER]);
+    if admins != [INSTALL_ACCOUNT] {
+        return Err(format!("the installed policy makes {admins:?} administrators, not {INSTALL_ACCOUNT} alone").into());
+    }
+    println!("  ok: the installed policy makes {INSTALL_ACCOUNT} the one administrator");
+    let mut homes = Vec::new();
+    let home_ino = ext4::resolve_dir(&img, b"/home").map_err(|e| format!("/home: {e:?}"))?;
+    ext4::read_dir(&img, home_ino, 0, |_, _, name| {
+        if name != b"." && name != b".." {
+            homes.push(String::from_utf8_lossy(name).into_owned());
+        }
+        true
+    })
+    .map_err(|e| format!("list /home: {e:?}"))?;
+    if homes != [INSTALL_ACCOUNT] {
+        return Err(format!("/home holds {homes:?}, not {INSTALL_ACCOUNT}'s home alone").into());
+    }
+    for folder in ["Documents", "Downloads", "Pictures"] {
+        let path = format!("{home}/{folder}");
+        ext4::resolve_dir(&img, path.as_bytes()).map_err(|e| format!("{path}: {e:?}"))?;
+    }
+    println!("  ok: /home holds {home} alone, with Documents, Downloads and Pictures");
+    Ok(())
 }
 
 /// An in-memory filesystem image, for holding an installed root to the code that will serve it.
@@ -3724,6 +3837,44 @@ fn run_install_steps(
     //    two do not: an ordinary live boot does not read it, hold it, or publish it.
     session.expect("ramdisk: module 2 (/boot/install-esp.img)")?;
     println!("  ok: the installer entry loaded the installable ESP as a block device");
+    // **And the pristine root** (administration Part G.1), which the installer copies from.
+    session.expect("ramdisk: module 3 (/boot/install-root.img)")?;
+    println!("  ok: the installer entry loaded the pristine root as a block device");
+    // **The disk holds an install, auto-mounted read-only** (administration Part G.3): the
+    // reinstall's premise, and why `disks` will withhold it. The storage service's report of the
+    // partition, in registry order, before the modules' partitions below.
+    session.expect("(partition nitrox-root): ext4")?;
+    let root_report = session.rest_of_line()?;
+    if !root_report.contains("mounted at /storage/nitrox-root (ro)") {
+        return Err(format!(
+            "the target's nitrox-root is reported {root_report:?}, not auto-mounted read-only — \
+             the reinstall this gate exists for needs the live boot to have mounted it"
+        )
+        .into());
+    }
+    println!("  ok: the target's older install is auto-mounted read-only, as a live boot does");
+    // **And the pristine root's device**, from the same report: where it lands among the devices
+    // depends on the target's partitions, which the storage service numbers, so it is read here
+    // rather than written down.
+    let pristine = session
+        .transcript()
+        .lines()
+        .find(|l| l.contains(&format!("(ramdisk {RAMDISK_IDENTITY})")))
+        .and_then(|l| l.split("blk-").nth(1)?.split(' ').next()?.parse::<u32>().ok())
+        .ok_or("the storage service reported no pristine root module")?;
+    // **Which the storage service left unmounted, and said why**: mounted, it would be in use, and
+    // `disks` would withhold it from `nxinstall`. The line is its report of the partition.
+    session.expect(&format!("(partition {}): ext4", libgpt::INSTALL_SOURCE_LABEL))?;
+    let report = session.rest_of_line()?;
+    if !report.contains("the installer's source, left unmounted") {
+        return Err(format!(
+            "the storage service's report of {} is {report:?}, not the installer's source left \
+             unmounted",
+            libgpt::INSTALL_SOURCE_LABEL
+        )
+        .into());
+    }
+    println!("  ok: the storage service left the pristine root unmounted, as the installer's source");
 
     // 4. The graphical login, which on the laptop is the only way in.
     session.expect("desktop-session-mgr: greeter presented")?;
@@ -3734,23 +3885,14 @@ fn run_install_steps(
     session.expect("desktop-session-mgr: login ok -> home=")?;
     println!("  ok: logged in at the greeter");
 
-    // 5. **The positive counterpart to `check-live`'s absence assertion** (PR #308 review,
-    //    optional 8): that gate proves an ordinary live boot reaches no disk, and until now
-    //    nothing proved an installer boot reaches one — a pair where only the negative exists
-    //    passes just as well when the feature has stopped working entirely. Three devices: the
-    //    disk, and the two modules the bootloader loaded.
-    //
-    //    **After the login, because that is when a session namespace exists.** Authority here is
-    //    not a property of the boot; it is built when somebody logs in, out of what the boot
-    //    permitted.
-    //
-    //    **Four, and the number is the assertion.** `/dev/blk/0` is the target disk, 1 and 2 are
-    //    the two modules, and 3 is the `nitrox-live` partition the GPT scan found *inside*
-    //    `root.img` — which is precisely why `/dev/blk/<n>` is not "the n-th disk" and why this
-    //    part built a way to tell them apart. A count that drifts means the registry's shape
-    //    changed under the installer, and the installer picks a target out of it by index.
-    session.expect(&format!("libsession: {SESSION_DEVICES} block device(s) handed to a namespace"))?;
-    println!("  ok: the installer session was handed the disks");
+    // 5. **No session holds a disk** (administration Part G.3). The install entry's sessions are
+    //    ordinary: what the installer reaches, it reaches through the `disks` grant, and until the
+    //    first `with` nothing on this boot has been handed one. `libsession` says whenever it hands
+    //    any, so the absence here, and the grant's line later, are the two halves.
+    if let Some(line) = session.transcript().lines().find(|l| l.contains("block device(s) handed to a namespace")) {
+        return Err(format!("a namespace was handed disks before anything asked for a view: {line:?}").into());
+    }
+    println!("  ok: the session holds no disk");
     session.expect("desktop-shell: up (graphical session leader)")?;
 
     // 6. A terminal, from the Applications menu — the path a person takes, keyboard only,
@@ -3770,42 +3912,74 @@ fn run_install_steps(
     type_into_menu(qmp, session, "nxterm")?;
     press(qmp, "ret")?;
 
-    // **And the devices reach the program, not just the session.** This is the line PR #308's
-    // review added after a probe through a *serial* login had convinced me otherwise: an
-    // application namespace is built by `desktop-shell`, and until that fix it had no
-    // `/dev/blk`, so an installer typed at a terminal would have resolved nothing. On the laptop
-    // this is the only path there is.
-    session.expect(&format!(
-        "desktop-shell: {SESSION_DEVICES} block device(s) into nxterm's namespace (installer session)"
-    ))?;
     session.expect("desktop-shell: placed window ")?;
-    println!("  ok: a terminal opened with the disks in its namespace");
+    println!("  ok: a terminal opened");
 
-    // 7. **The refusal, first, and named correctly.** `/dev/blk/1` is the module the running
-    //    system's root is inside, and the identity typed here is its real one — so the *only*
-    //    reason to refuse is what the device **is**. Ordered before the real install so its
-    //    proof is available: nothing may say it installed to `/dev/blk/1`, and the transcript is
-    //    checked for that after the install that follows has succeeded, which is what stops the
-    //    absence from being satisfied by an installer that never ran at all.
-    type_at_terminal(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
+    // 7. **The disk, refused as in use** (administration Part G.3). `/dev/blk/0` is the target —
+    //    the AHCI disk is registered before the modules, which this gate asserts rather than
+    //    assumes — and `disks` withheld it, since its `nitrox-root` is mounted. The installer says
+    //    why and names the command that frees it; the log line is the part of that a gate can see.
+    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/0 \"{identity}\""))?;
+    session.expect("nxinstall: refused /dev/blk/0: it is in use")?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
+    println!("  ok: the target was refused as in use, since its older install is mounted");
+    // **And the grant is what reached the installer**: the other half of step 5's absence. Read
+    // from the transcript, since the broker logs it before its `started`, which is already past.
+    if !session.transcript().contains("block device(s) handed to a namespace") {
+        return Err("`with admin nxinstall` ran with no disks handed to its view".into());
+    }
+    println!("  ok: the view was handed its disks by the grant");
+
+    // 7b. **A RAM disk, refused for being one, and named correctly.** The pristine root is a RAM
+    //    disk the view holds, and the identity typed here is its real one — so the *only* reason to
+    //    refuse is what the device **is**. Until G.3 this was `root.img`, which the view no longer
+    //    reaches. Ordered before the real install so its proof is available: nothing may say it
+    //    installed to a RAM disk, and the transcript is checked for that after the install that
+    //    follows has succeeded, which is what stops the absence from being satisfied by an
+    //    installer that never ran at all.
+    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/{pristine} \"{RAMDISK_IDENTITY}\""))?;
     // **The positive half, and it is what makes the absence below mean anything.** An
     // absence alone is satisfied by a command that never ran, by a character going astray so
     // the operand named nothing, and by a refusal for the wrong *reason* — the name check
     // rather than the kind check. This line says which check fired (PR #309 review, 7).
-    session.expect("nxinstall: refused /dev/blk/1: it is a ram disk, not a disk")?;
-    println!("  ok: the RAM disk was refused for being one, named correctly");
+    session.expect(&format!("nxinstall: refused /dev/blk/{pristine}: it is a ram disk, not a disk"))?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
+    println!("  ok: the pristine root, a RAM disk, was refused for being one, named correctly");
 
-    // 8. The installer, typed at the shell in it.
-    //
-    //    **`/dev/blk/0` is the disk**, and this gate asserts that rather than assuming it: the
-    //    AHCI disk is registered before the two modules, so a change in that order should fail
-    //    here rather than silently install to something else. The line above named it.
-    type_at_terminal(qmp, &format!("nxinstall /dev/blk/0 \"{identity}\""))?;
+    // 8. **Freed, as the installer said** (administration Part G.3): `with admin disk --unmount`,
+    //    naming the label, and the storage service's own line that it went.
+    install_gate_with_admin(qmp, session, "disk", " --unmount nitrox-root")?;
+    session.expect("storage-service: unmounted nitrox-root")?;
+    session.expect("view: alice admin disk — exited, code 0")?;
+    println!("  ok: `with admin disk --unmount nitrox-root` freed the target");
+
+    // 8b. The installer, again, and now the disk is in the view.
+    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/0 \"{identity}\""))?;
+
+    // **The first account, asked after the confirmation** (administration Part G.2). Each answer
+    // is typed after the installer's receipt for it: the name's before it is asked, each
+    // password's once echo is off, so nothing typed is echoed or early.
+    session.expect("nxinstall: asking for the first account")?;
+    type_answer(qmp, INSTALL_ACCOUNT)?;
+    session.expect("nxinstall: asking for its password")?;
+    type_answer(qmp, INSTALL_PASSWORD)?;
+    session.expect("nxinstall: asking for the password again")?;
+    type_answer(qmp, INSTALL_PASSWORD)?;
+    println!("  ok: the installer asked for the first account, and was answered");
 
     // What a destructive operation leaves in the system log, which is also the only thing this
     // gate can read: a release terminal does not narrate its grid.
     session.expect(&format!("nxinstall: installing to /dev/blk/0 ({identity})"))?;
     println!("  ok: the installer named the disk back and started");
+    // **From the pristine root**, not the live one the session runs from (administration G.1).
+    session.expect("nxinstall: copying the root from ")?;
+    let from = session.rest_of_line()?;
+    if !from.trim_end().ends_with(&format!("'s {}", libgpt::INSTALL_SOURCE_LABEL)) {
+        return Err(format!("the installer copied its root from {from:?}, not the pristine root").into());
+    }
+    println!("  ok: the root came from the pristine copy —{}", from.trim_end());
+    session.expect(&format!("nxinstall: the first account is {INSTALL_ACCOUNT}, its administrator"))?;
+    println!("  ok: it made {INSTALL_ACCOUNT} the new machine's first account and its administrator");
     // **A filesystem it made, not one it copied** (Phase 5 Part H.2). The size in this line is
     // the *partition's*, which is the whole point: H.1 put a 24 MiB filesystem on it.
     session.expect("nxinstall: wrote the partition table, the boot partition, and a ")?;
@@ -3823,11 +3997,23 @@ fn run_install_steps(
     // off next, and a drive may still hold the last sectors in its cache.
     session.expect("nxinstall: flushed the disk's write cache")?;
     println!("  ok: the installer flushed the disk before saying done");
+    session.expect("view: alice admin nxinstall — exited, code 0")?;
+    Ok(())
+}
+
+/// **`with admin <program><args>`, at the terminal** (administration Part G.2): the command, then
+/// the live stick account's password once the broker's audit says it is asking — the receipt
+/// `check-login` types after too — and its start.
+fn install_gate_with_admin(qmp: &mut Qmp, session: &mut Session, program: &str, args: &str) -> R<()> {
+    type_at_terminal(qmp, &format!("with admin {program}{args}"))?;
+    session.expect(&format!("view: alice admin {program} — allowed, asking for a password"))?;
+    type_answer(qmp, DEMO_PASSWORD)?;
+    session.expect(&format!("view: alice admin {program} — started"))?;
     Ok(())
 }
 
 /// The second boot: the installed disk, alone.
-fn run_installed_boot_steps(session: &mut Session) -> R<()> {
+fn run_installed_boot_steps(session: &mut Session, qmp: &mut Qmp) -> R<()> {
     // **It found its root by the label this installer wrote**, not by the one the live image
     // used: the bytes copied in are the live root's, and what makes them `nitrox-root` is the
     // partition table `nxinstall` built.
@@ -3837,6 +4023,22 @@ fn run_installed_boot_steps(session: &mut Session) -> R<()> {
     // And no module disk: nothing is riding along this time.
     session.expect("desktop-session-mgr: greeter presented")?;
     println!("  ok: the greeter came up on the installed system");
+    // **The live stick's account is not this machine's** (administration Part G.2): refused, with
+    // the password that worked on the stick — tested before the new account, so a greeter that
+    // let anyone in could not pass on the right one.
+    type_at_greeter(qmp, session, DEMO_USER)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, DEMO_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect("desktop-session-mgr: login denied")?;
+    println!("  ok: the live stick's {DEMO_USER} is refused");
+    type_at_greeter(qmp, session, INSTALL_ACCOUNT)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, INSTALL_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect(&format!("desktop-session-mgr: login ok -> home=/home/{INSTALL_ACCOUNT}"))?;
+    session.expect("desktop-shell: up (graphical session leader)")?;
+    println!("  ok: {INSTALL_ACCOUNT}, the account the installer made, logs in to a desktop");
     Ok(())
 }
 
@@ -3942,10 +4144,9 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // disk, so it is the only place the rule's input is real, and the fact is what makes a
     // machine's own disks auto-mount read-only (C.5b).
     s.expect("storage-service: a live boot")?;
-    // **And this boot is not an installer boot.** The live image's third menu entry starts a
-    // session that can write every disk in the machine; the ordinary entry must not, and absence
-    // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
-    // Asserted against the whole transcript at the end of the run, below.
+    // **And no session on this boot holds a disk** — none does on any entry since administration
+    // Part G.3 — and absence is the kind of property that rots silently: nothing fails when a
+    // sandbox quietly widens. Asserted both ways at the end of the run, below.
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
     if took > LIVE_MOUNT_TO_GREETER {
@@ -3994,15 +4195,19 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.expect("/home>")?;
     println!("  ok: and /dev/devices lists it as a ramdisk");
 
-    // **An ordinary live boot reaches no disk** (Phase 5 Part H.1). The live image's third menu
-    // entry starts a session that can write every disk in the machine; this entry must not, and a
-    // widened sandbox is exactly the kind of regression nothing fails on. Asserted over the whole
-    // transcript, because what is being checked is an **absence**.
+    // **A session reaches no disk** (Phase 5 Part H.1; administration Part G.3). Since G.3 no
+    // session on any entry does — a program gets one only through the view broker's `disks` grant
+    // — and a widened sandbox is exactly the kind of regression nothing fails on. So it is seen
+    // both ways: the installer, asked in the session, finds none, and no namespace on this boot
+    // was handed one, which `libsession` says whenever it hands any.
+    s.send("nxinstall")?;
+    s.expect("no block devices in this view")?;
+    s.expect("/home>")?;
     let text = s.transcript();
-    if let Some(line) = text.lines().find(|l| l.contains("installer session")) {
+    if let Some(line) = text.lines().find(|l| l.contains("block device(s) handed to a namespace")) {
         return Err(format!(
-            "an ordinary live boot built an installer session: {line:?}. `/dev/blk` reaches a \
-             session only when the boot asked for it (`cmdline: install`), which this one did not"
+            "a namespace on an ordinary live boot was handed disks: {line:?}. Nothing here asked \
+             for a view, so nothing should have"
         )
         .into());
     }
@@ -8108,20 +8313,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "with admin nxinstall")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
     // No leading Enter here, unlike `type_at_terminal`: at a password prompt one would be an empty
-    // password. Paced like it, before every key.
-    for c in DEMO_PASSWORD.chars() {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        press(&mut qmp, &qcode)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    press(&mut qmp, "ret")?;
+    // password.
+    type_answer(&mut qmp, DEMO_PASSWORD)?;
     session.expect("view: alice admin nxinstall — started")?;
     session.expect("view: alice admin nxinstall — exited, code 0")?;
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
@@ -8132,20 +8325,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      all. Until C.6 this step passed on that disk too, which was the weaker claim.
     type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0 x")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
-    for c in DEMO_PASSWORD.chars() {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        press(&mut qmp, &qcode)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    press(&mut qmp, "ret")?;
-    session.expect("nxinstall: refused /dev/blk/0: not a block device in this session")?;
+    type_answer(&mut qmp, DEMO_PASSWORD)?;
+    // **Refused as the running system** (administration Part G.2), which the installer now knows:
+    // the tables say `init` mounted its root partition.
+    session.expect("nxinstall: refused /dev/blk/0: it holds the running system")?;
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: and it did not see /dev/blk/0, the disk holding init's root");
 
@@ -9155,6 +9338,27 @@ fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
         // back — uppercase, quotes, brackets — and a second map would be a second thing to
         // keep correct. A character neither knows is an error there rather than a silent
         // skip, because a dropped character makes a *different command line*.
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+    }
+    std::thread::sleep(PER_KEY);
+    press(qmp, "ret")?;
+    Ok(())
+}
+
+/// **Type an answer at a prompt a program is waiting at, then Enter** — a password at `with`'s, a
+/// name or a password at `nxinstall`'s. Paced like [`type_at_terminal`], before every key, but with
+/// **no leading Enter**: at a prompt it would be an empty answer.
+fn type_answer(qmp: &mut Qmp, text: &str) -> R<()> {
+    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
+    for c in text.chars() {
+        std::thread::sleep(PER_KEY);
         let (qcode, shift) = qcode_for(c)?;
         if shift {
             qmp.send_key("shift", true)?;
@@ -12892,7 +13096,9 @@ fn cmd_test() -> R<()> {
     // target, and every reason to refuse one. `--lib` skips the `#![no_main]` bin. The
     // arithmetic is here rather than in the program because its mistakes destroy a disk and are
     // invisible in a boot that succeeds — a root partition one block into the backup array
-    // installs a machine that works until something rewrites the table.
+    // installs a machine that works until something rewrites the table. Since PR #348's review
+    // they also copy a pristine root into an empty filesystem in memory and write the first
+    // account over it, since `check-install`, the only boot that installs, is not in CI.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
@@ -13126,6 +13332,17 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libfs")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libprompt` — asking a person on a terminal (administration Part G.2): the new password typed
+    // twice, held to `libusers`' rules. It was `coreutils::prompt`, whose tests ran under
+    // `-p coreutils`; moved, they would stop running unless named here.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libprompt")
         .arg("--lib")
         .arg("--target")
         .arg(&host)
@@ -13944,27 +14161,6 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
     names.sort();
     names.dedup();
     let differ: Vec<&String> = names.into_iter().filter(|k| r.get(*k) != l.get(*k)).collect();
-    // **The marker, asserted in both directions** (Phase 5 Part H.1). The kernel serves the
-    // command line to every image alike, so `install` is honoured only where this file is: the
-    // live image must carry it and a release image must not. Both halves, because a check that
-    // only refused it in the release image would pass just as happily if it stopped being built
-    // at all, and the installer session would then be unreachable with nothing failing.
-    const MARKER: &str = "etc/install-allowed";
-    if !l.contains_key(MARKER) {
-        return Err(format!(
-            "{what} initramfs must carry `{MARKER}`: it is what permits an installer session, \
-             and without it the live image's own install entry does nothing"
-        )
-        .into());
-    }
-    if r.contains_key(MARKER) {
-        return Err(format!(
-            "{base} initramfs must not carry `{MARKER}` — it is what keeps an installer session \
-             a live-image thing rather than something any boot can ask for"
-        )
-        .into());
-    }
-    let differ: Vec<&String> = differ.into_iter().filter(|k| k.as_str() != MARKER).collect();
     if differ != ["etc/init.toml"] {
         return Err(format!(
             "{what} initramfs must differ from {base} one in `etc/init.toml` alone — the root's \
@@ -14006,6 +14202,44 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
     }
     println!(
         "check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓",
+        release_tree.len()
+    );
+
+    // **The pristine root is the root too** (administration Part G.1). `install-root.img` is what
+    // the installer copies onto a disk, so it is held to the same tree as `root.img` — and its one
+    // partition is found, as `nxinstall` finds it, by `libgpt`'s reader and the shared name.
+    let install_root = dir.join(format!("{tag}-install-root.img"));
+    let _ = fs::remove_file(&install_root);
+    run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/install-root.img").arg(&install_root))?;
+    let front = fs::read(&install_root)?;
+    let table = front
+        .get(..libgpt::table::FRONT_BYTES)
+        .and_then(|f| libgpt::table::read(f).ok())
+        .ok_or_else(|| format!("{what} image's install-root.img holds no partition table libgpt reads"))?;
+    let part = table.by_name(libgpt::INSTALL_SOURCE_LABEL.as_bytes()).ok_or_else(|| {
+        format!(
+            "{what} image's install-root.img has no partition named {}: the installer would find \
+             no root to copy, and the storage service would not know to leave it unmounted",
+            libgpt::INSTALL_SOURCE_LABEL
+        )
+    })?;
+    let source_fs = dir.join(format!("{tag}-install-root.ext4"));
+    let start = (part.first_lba * 512) as usize;
+    let len = (part.blocks() * 512) as usize;
+    fs::write(&source_fs, front.get(start..start + len).ok_or("install-root.img is shorter than its partition")?)?;
+    let source_tree = ext4_tree(&source_fs, &dir.join(format!("{tag}-install-root")))?;
+    let problems = tree_problems(&release_tree, &source_tree, &format!("{what} install root"));
+    if !problems.is_empty() {
+        return Err(format!(
+            "the filesystem inside {what} image's install-root.img is not {base} image's root: \
+             {problems:?}. It is what the installer copies, built from the same `stage_rootfs` \
+             tree as root.img."
+        )
+        .into());
+    }
+    println!(
+        "check-images: {what} install-root.img's {} holds {base} root's {} entries ✓",
+        libgpt::INSTALL_SOURCE_LABEL,
         release_tree.len()
     );
     if mode.stages_test_data() {
@@ -15762,6 +15996,12 @@ const LIVE_ROOT_PARTLABEL: &str = "nitrox-live";
 /// The RAM disk takes writes; they are gone at power-off.
 const LIVE_ROOT_SLACK_MIB: u64 = 16;
 
+/// Room the pristine root, `install-root.img`, gets beyond what is staged on it (administration
+/// Part G.1): **for `mke2fs`'s own tables, not for writing**. Nothing mounts the pristine copy and
+/// nothing writes it, so it carries none of [`LIVE_ROOT_SLACK_MIB`], and every MiB saved is one the
+/// firmware does not read off the stick on the install entry.
+const INSTALL_ROOT_MARGIN_MIB: u64 = 4;
+
 /// Ceiling on `root.img`. **Its reason is the firmware**: the whole file is read off a USB stick
 /// by UEFI Boot Services before the kernel runs, on a laptop whose USB stack is the firmware's.
 /// Today's release root stages about 8 MiB; an image near this size means something large got
@@ -15877,41 +16117,12 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
 
 /// The policy the build seeds at `/system/views.toml` — see where it is staged.
 ///
-/// **A function rather than a literal**, because the account name is `DEMO_USER` and a policy that
-/// named someone the build did not make would deny everything while reading perfectly well.
+/// **`view_broker::policy::seed`, naming `DEMO_USER`** (administration Part G.2): the installer
+/// writes the same policy onto an installed machine, naming its first account, so the two cannot
+/// drift. A policy that named someone the build did not make would deny everything while reading
+/// perfectly well.
 fn seeded_views_toml() -> String {
-    format!(
-        "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
-         # Seeded by the build; an installed system's comes from the installer.\n\
-         \n\
-         [profile.admin]\n\
-         grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\"]\n\
-         \n\
-         [profile.install]\n\
-         grants = [\"disks\"]\n\
-         \n\
-         [profile.power]\n\
-         grants = [\"power\"]\n\
-         \n\
-         [[rule]]\n\
-         who  = [\"{DEMO_USER}\"]\n\
-         use  = [\"admin\"]\n\
-         run  = [\"*\"]\n\
-         auth = \"password\"\n\
-         \n\
-         [[rule]]\n\
-         who  = [\"{DEMO_USER}\"]\n\
-         use  = [\"install\"]\n\
-         run  = [\"nxinstall\"]\n\
-         auth = \"password\"\n\
-         \n\
-         # The person at the machine may power it off, as with a desktop's power button.\n\
-         [[rule]]\n\
-         who  = [\"*\"]\n\
-         use  = [\"power\"]\n\
-         run  = [\"shutdown\"]\n\
-         auth = \"none\"\n"
-    )
+    view_broker::policy::seed(DEMO_USER)
 }
 
 /// The programs a session gets through its profile: the coreutils, plus `nxsh`.
@@ -15936,9 +16147,10 @@ fn profile_programs() -> Vec<&'static str> {
     // nothing, which is the failure this list exists to make impossible.
     v.push("nxedit");
     // The installer (Phase 5 Part H.1). In `/bin` and **not** in the Applications menu: it is a
-    // command-line tool like the coreutils, run from a terminal in the installer session, and a
-    // menu entry would offer a person a window that does not exist. It ships in every image for
-    // the reason `build_userspace_bin` gives — authority is the session's, not the program's.
+    // command-line tool like the coreutils, typed at a terminal as `with admin nxinstall`, and a
+    // menu entry would offer a person a window that does not exist. It ships in every image
+    // because its authority is the view's, not the program's (administration Part G.3): run
+    // without one, it finds no disk.
     v.push("nxinstall");
     v
 }
@@ -15992,20 +16204,6 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
         init_toml.push_str(TEST_BINDS_TOML);
     }
     cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
-    if root == RootDevice::Live {
-        // **What makes `install` a live-image word** (Phase 5 Part H.1). The kernel serves the
-        // command line to every image alike, so without this an installed machine would honour
-        // `install` too — and a firmware menu that lets somebody type a command line is a
-        // firmware menu that hands them a session with every disk in it. The word is necessary
-        // and this file is the sufficient half; a release image ships no such file, so the word
-        // means nothing there (PR #308 review, optional 7).
-        cpio_entry(
-            &mut buf,
-            1,
-            "etc/install-allowed",
-            b"This image may run an installer session when the boot says `install`.\n",
-        );
-    }
     // **The declarations and the profile manifest are not here** (administration Part E.1c): both
     // are on the root, at `/system/services.toml` and `/system/profiles/system.toml`, read after
     // `init` has mounted it. Neither has a bootstrap reason, and neither could be edited here —
@@ -16313,6 +16511,33 @@ fn assemble_live_image(
         .arg(((root_sectors * 512) / 4096).to_string()))?;
     splice_into(&root_img, root_lba * 512, &rootfs)?;
 
+    // 1b. **The installer's source** (administration Part G.1): `install-root.img`, a pristine copy
+    //     of the same staged tree in a GPT whose one partition is `nitrox-source`. `nxinstall`
+    //     copies it, where it used to copy the live root raw — a root the session writes to and
+    //     `init` has mounted, so `disks` withholds it and a raw read could tear. The partition's
+    //     name is distinct because the live root is found by its label, and it is the name the
+    //     storage service passes over, so nothing mounts the copy. Sized to its files and
+    //     `mke2fs`'s tables, since nothing writes it.
+    let install_root = work.join("install-root.img");
+    let source_mib = staged.div_ceil(MIB) + INSTALL_ROOT_MARGIN_MIB;
+    fs::File::create(&install_root)?.set_len((source_mib + 2) * MIB)?;
+    run(Command::new("sgdisk")
+        .arg("--clear")
+        .arg("-n").arg("1:2048:0")
+        .arg("-t").arg("1:8300")
+        .arg("-c").arg(format!("1:{}", libgpt::INSTALL_SOURCE_LABEL))
+        .arg(&install_root))?;
+    let (source_lba, source_sectors) = partition_extent(&install_root, 1)?;
+    let sourcefs = work.join("install-root.ext4");
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-d").arg(&staging)
+        .arg(&sourcefs)
+        .arg(((source_sectors * 512) / 4096).to_string()))?;
+    splice_into(&install_root, source_lba * 512, &sourcefs)?;
+
     // 2. **The ESP the installer writes to a disk** (Phase 5 Part H.1): a FAT32 filesystem built
     //    by the same `build_esp` every image uses, carrying the *release* menu — no module lines,
     //    and an initramfs whose `init.toml` names `gpt-partlabel:nitrox-root`. It rides as a
@@ -16353,13 +16578,14 @@ fn assemble_live_image(
         &[],
     )?;
 
-    // 3. Limine's configuration: the release one, with `root.img` and the installable ESP as
-    //    modules and a menu with a hardware-report entry and an installer entry.
+    // 3. Limine's configuration: the release one, with `root.img` as a module and a menu with a
+    //    hardware-report entry and an installer entry, which alone loads the installable ESP and
+    //    the pristine root.
     let conf = work.join("limine.conf");
     fs::write(&conf, live_limine_conf(&fs::read_to_string(limine_conf())?)?)?;
 
     // 4. The stick: one ESP big enough for all of it.
-    let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path()]
+    let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path(), install_root.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))
         .sum::<Result<u64, _>>()?;
@@ -16386,11 +16612,14 @@ fn assemble_live_image(
         &[
             (root_img.as_path(), "/boot/root.img"),
             (install_esp.as_path(), "/boot/install-esp.img"),
+            (install_root.as_path(), "/boot/install-root.img"),
         ],
     )?;
     splice_into(out, esp_lba * 512, &esp)?;
     println!(
-        "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), stick {} MiB",
+        "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), install-root.img {} MiB, \
+         stick {} MiB",
+        source_mib + 2,
         esp_mib + 2
     );
     Ok(())
@@ -16401,8 +16630,8 @@ const LIVE_MENU_TIMEOUT_SECS: u32 = 5;
 
 /// The live image's boot-menu entry that boots into the hardware report (Phase 5 Part D.2).
 const LIVE_REPORT_ENTRY: &str = "Nitrox — hardware report";
-/// The live menu's third entry: the installer session. Its `cmdline: install` reaches userspace
-/// through `/proc/cmdline`; the kernel does not act on it.
+/// The live menu's third entry, which loads what the installer copies: the installable ESP and the
+/// pristine root. Its sessions are ordinary (administration Part G.3).
 const LIVE_INSTALL_ENTRY: &str = "Nitrox — install to this machine";
 
 /// The live image's `limine.conf`, from the release one (`base`): `root.img` as a second module,
@@ -16444,22 +16673,23 @@ fn live_limine_conf(base: &str) -> R<String> {
     if !report_entry.contains("cmdline: hwreport") {
         return Err("boot/limine.conf's entry has no `path:` line to put the command line beside".into());
     }
-    // **The installer's own entry** (Phase 5 Part H.1). `install` means nothing to the kernel —
-    // it serves the line at `/proc/cmdline` and `libsession` looks for the word — and what it
-    // selects is a *session* whose namespace includes `/dev/blk`. An ordinary live boot has no
-    // path to a disk, which is the point: authority arrives by choosing this entry, and later by
-    // a broker that authenticates (`docs/planning/administration.md`).
+    // **The installer's own entry** (Phase 5 Part H.1). **It carries modules, not authority**
+    // (administration Part G.3): until then it passed `cmdline: install`, which made its sessions
+    // hold every disk. Now its sessions are ordinary, a program reaches a disk only through the
+    // view broker's `disks` grant — `with admin nxinstall` — and what the entry adds is the two
+    // things that installer copies.
     //
-    // **The installable ESP rides on this entry alone.** Limine loads a module because the entry
-    // the person chose names it, so a module line here costs the other two boots nothing: an
-    // ordinary live boot does not read 33 MiB more off the stick, hold it in RAM for the rest of
-    // the session, and publish a block device no session can reach. The plan's worry about what
-    // firmware reads before the kernel runs is therefore a worry about *installing*, which is the
-    // one boot where paying it buys something.
+    // **The installable ESP rides on this entry alone**, and since administration Part G.1 **the
+    // pristine root beside it**. Limine loads a module because the entry the person chose names
+    // it, so a module line here costs the other two boots nothing: an ordinary live boot does not
+    // read them off the stick, hold them in RAM for the rest of the session, or publish block
+    // devices no session can use. The plan's worry about what firmware reads before the kernel
+    // runs is therefore a worry about *installing*, which is the one boot where paying it buys
+    // something.
     let install_entry = default_entry
         .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
-        .replacen("\n    path:", "\n    cmdline: install\n    path:", 1)
-        + "\n    module_path: boot():/boot/install-esp.img";
+        + "\n    module_path: boot():/boot/install-esp.img"
+        + "\n    module_path: boot():/boot/install-root.img";
     Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
 }
 
@@ -16593,8 +16823,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     }
     // **The folders the browser's sidebar offers** (M14 Part D). Staged here for the demo home.
     // Whoever makes a home makes them: the view broker for every account an administrator adds
-    // (administration Part D.3), and Part G's installer for the first, which is what
-    // `TODO(home-folders)` still waits on.
+    // (administration Part D.3), and the installer for an installed machine's first (Part G.2).
     //
     // **Spelled twice, and checked by a boot rather than by the compiler.** `libfs` names the
     // same three in `HOME_FOLDERS` and this crate does not link it — that is the same reason the
@@ -17774,16 +18003,18 @@ mod diag_tests {
              \n\
              /Nitrox — install to this machine\n\
              \x20   protocol: limine\n\
-             \x20   cmdline: install\n\
              \x20   path: boot():/boot/kernel\n\
              \x20   module_path: boot():/boot/initramfs\n\
              \x20   module_path: boot():/boot/root.img\n\
-             \x20   module_path: boot():/boot/install-esp.img\n"
+             \x20   module_path: boot():/boot/install-esp.img\n\
+             \x20   module_path: boot():/boot/install-root.img\n"
         );
-        // **The default entry carries no command line**, which is what keeps an ordinary live
-        // boot sandboxed: `install` is what reaches a session, and only the third entry says it.
+        // **No entry says `install`** (administration Part G.3): nothing reads it now, and a
+        // session is ordinary whichever entry booted. The report entry's `hwreport` is the only
+        // command line.
         let first = conf.split("\n\n").nth(1).expect("the default entry");
         assert!(!first.contains("cmdline:"), "the default entry must pass nothing: {first:?}");
+        assert_eq!(conf.matches("cmdline:").count(), 1, "hwreport alone: {conf}");
         // **And carries no installable ESP**, which is what keeps it as cheap to boot as it was:
         // the module is 33 MiB of firmware reads and of permanently-held RAM, and an ordinary
         // session could not reach the device it becomes anyway.
@@ -17791,6 +18022,12 @@ mod diag_tests {
             conf.matches("install-esp.img").count(),
             1,
             "only the installer entry loads the installable ESP: {conf}"
+        );
+        // **Nor the pristine root** (administration Part G.1), for the same reason.
+        assert_eq!(
+            conf.matches("install-root.img").count(),
+            1,
+            "only the installer entry loads the pristine root: {conf}"
         );
     }
 

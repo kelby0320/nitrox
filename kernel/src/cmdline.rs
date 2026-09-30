@@ -32,10 +32,11 @@ pub enum Ignored<'a> {
 
 /// The command line this boot was given, for `/proc/cmdline` to serve.
 ///
-/// **Userspace has its own questions about it.** The kernel reads the words it acts on
-/// ([`Flags`]) and nothing else — `install`, which selects the installer session (Phase 5 Part
-/// H.1), means nothing here and everything to `session-mgr`. Rather than the kernel carrying a
-/// list of words it does not use, the line is served whole and each reader looks for its own.
+/// **Userspace may have its own questions about it.** The kernel reads the words it acts on
+/// ([`Flags`]) and nothing else. Rather than the kernel carrying a list of words it does not use,
+/// the line is served whole and each reader looks for its own. No program looks for one today:
+/// `install`, which selected the installer session from Phase 5 Part H.1, went with that session
+/// in administration Part G.3.
 static LINE: crate::libkern::SpinLock<&'static [u8]> =
     crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, &[]);
 

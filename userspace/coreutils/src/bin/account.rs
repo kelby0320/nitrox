@@ -31,7 +31,7 @@
 //! ## Passwords
 //!
 //! Asked on the terminal the shell handed this stage, echo off, a new one twice
-//! (`coreutils::prompt`, shared with `with`). **Never from a stream**, and never echoed, logged or
+//! (`libprompt`, shared with `with`). **Never from a stream**, and never echoed, logged or
 //! kept: every copy is zeroed once it has been sent. What the broker or the file edit said is
 //! written to `stderr` and, escaped, on the console, since a terminal on a release image renders
 //! nothing a gate can read.
@@ -46,8 +46,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libviews::ipc::{call, lookup, outcome};
-use coreutils::prompt::{ask_new_password, ask_password};
+use libprompt::ipc::{call, lookup};
+use libprompt::{ask_new_password, ask_password};
+use libviews::outcome;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::debug::Line;

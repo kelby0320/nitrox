@@ -21,7 +21,7 @@
 //! its own, moved to the program, and what comes back is an exit status.
 //!
 //! **It reads the password, not the broker** — on the terminal its shell handed it, echo off, with
-//! `coreutils::prompt`, which `account` shares. The broker holds each check for the session's delay
+//! `libprompt`, which `account` shares. The broker holds each check for the session's delay
 //! after a wrong one, and ends a request after three.
 //!
 //! **The request itself is `libviews`'** (administration Part F.3): the desktop's Restart and Shut
@@ -37,7 +37,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use coreutils::prompt::ask_password;
+use libprompt::ask_password;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
 use libkern::scrub;
@@ -48,7 +48,8 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::wire::{Value, write_value};
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
-use libviews::ipc::{call, close, lookup, outcome, recv, send, wait};
+use libprompt::ipc::{call, close, lookup, recv, send, wait};
+use libviews::outcome;
 use libviews::{Handed, REQUEST_ID};
 
 #[global_allocator]

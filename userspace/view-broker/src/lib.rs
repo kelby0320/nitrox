@@ -450,6 +450,54 @@ pub mod policy {
         Ok(policy)
     }
 
+    /// **The policy a machine starts with, naming `name` its administrator** (administration Part
+    /// G.2): the build seeds it naming the demo account, and `nxinstall` writes it onto an installed
+    /// machine naming the first account it made. One text for both, so the policy an installed
+    /// machine starts with is the one every gate has run under.
+    ///
+    /// - **`admin`** grants everything, for every program, behind `name`'s password: what makes
+    ///   `name` an administrator ([`Policy::administrators`]).
+    /// - **`install`** grants `disks` alone, for `nxinstall` alone: a narrower view for the one
+    ///   program that needs disks, and the rule a gate is refused by when it asks for another.
+    /// - **`power`** lets the person at the machine turn it off, as a desktop's power button does.
+    ///
+    /// `name` is not checked here: the build's is a constant, and the installer checks the name it
+    /// asks for with `libusers`' rule, which admits no character a TOML string would need escaped.
+    pub fn seed(name: &str) -> String {
+        format!(
+            "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
+             # Made with this machine's root, by the build or by the installer.\n\
+             \n\
+             [profile.admin]\n\
+             grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\"]\n\
+             \n\
+             [profile.install]\n\
+             grants = [\"disks\"]\n\
+             \n\
+             [profile.power]\n\
+             grants = [\"power\"]\n\
+             \n\
+             [[rule]]\n\
+             who  = [\"{name}\"]\n\
+             use  = [\"admin\"]\n\
+             run  = [\"*\"]\n\
+             auth = \"password\"\n\
+             \n\
+             [[rule]]\n\
+             who  = [\"{name}\"]\n\
+             use  = [\"install\"]\n\
+             run  = [\"nxinstall\"]\n\
+             auth = \"password\"\n\
+             \n\
+             # The person at the machine may power it off, as with a desktop's power button.\n\
+             [[rule]]\n\
+             who  = [\"*\"]\n\
+             use  = [\"power\"]\n\
+             run  = [\"shutdown\"]\n\
+             auth = \"none\"\n"
+        )
+    }
+
     impl Policy {
         /// Decide whether `principal` may run `program` in `view`. **The first matching rule
         /// decides**; none matching is a denial. The reason names what was missing, so the
@@ -1170,6 +1218,19 @@ auth = "password"
         assert_eq!(p.would("alice", "admin", "shutdown"), denied("`admin` does not let alice run `shutdown`"));
         assert_eq!(p.would("alice", "nothere", "date"), denied("there is no view called `nothere`"));
         assert_eq!(p.would("alice", "power", "/bin/shutdown"), denied("a program is a bare name, resolved under /bin"));
+    }
+
+    /// **The seed makes its one account the one administrator** (administration Part G.2), and
+    /// nobody else anything but the power button: what an installed machine starts with.
+    #[test]
+    fn the_seed_makes_its_account_the_one_administrator() {
+        let p = parse(&seed("bob")).expect("the seed reads");
+        assert_eq!(p.administrators(&["alice", "bob", "carol"]), ["bob"]);
+        assert!(matches!(p.decide("bob", "admin", "disk"), Decision::Allow { auth: Auth::Password, .. }));
+        assert!(matches!(p.decide("bob", "install", "nxinstall"), Decision::Allow { auth: Auth::Password, .. }));
+        assert!(matches!(p.decide("alice", "admin", "disk"), Decision::Deny(_)), "the demo account is not in it");
+        assert!(matches!(p.decide("carol", "power", "shutdown"), Decision::Allow { auth: Auth::None, .. }));
+        assert!(matches!(p.decide("carol", "power", "date"), Decision::Deny(_)));
     }
 
     /// **The guard at its neighbours.** Only a profile granting `views`, with `run = ["*"]`, for

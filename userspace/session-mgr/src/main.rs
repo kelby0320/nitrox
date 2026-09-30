@@ -316,10 +316,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 // The console *is* this column's terminal, so the serial session binds it.
                 // The graphical column will pass `false` — governing decision 3.
                 bind_console: true,
-                // **Only on an installer boot** (Phase 5 Part H.1): a session that can write
-                // every disk in the machine exists to install one, and the live image starts it
-                // from its own boot-menu entry.
-                bind_blk: libsession::installer_boot(root_ns),
                 views_endpoint: if views.is_some() { views_endpoint } else { 0 },
                 views_base: &views_base[..views.map_or(0, |v| v.1)],
                 devices_endpoint,

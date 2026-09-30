@@ -26,10 +26,10 @@ libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
 # **The namespace builder** (administration Part F.1): an application's namespace is built from
 # the same `NamespaceSpec` the login supervisors build a session's from, so the two cannot drift
-# apart again — `/session/user` had. With it `block_device_count`, which says once whether this is
-# an installer session whose disks an application gets, and `LEADER_STOP_NS`, which the ending's
-# test holds the shell's own stop wait inside. The shell takes nothing else from this crate: it is
-# not a supervisor of sessions. (Until F.1, `rebind_block_devices` was all it took.)
+# apart again — `/session/user` had. With it `LEADER_STOP_NS`, which the ending's test holds the
+# shell's own stop wait inside. The shell takes nothing else from this crate: it is not a supervisor
+# of sessions. (Until F.1, `rebind_block_devices` was all it took; until G.3, `block_device_count`
+# too, to pass an installer session's disks on.)
 libsession = { path = "../libsession" }
 # `io` for `session::Dir`: the Applications menu reads /applications as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }
@@ -47,6 +47,9 @@ libfs = { path = "../libfs" }
 # `shutdown` in the `power` view, with the same request `with` makes, and read the person's
 # listing first so a refusal comes before any window is asked to close.
 libviews = { path = "../libviews" }
+# The plumbing the broker's channel is spoken through: its `recv` and `close` (Part G.2 moved it
+# out of `libviews`).
+libprompt = { path = "../libprompt" }
 
 # The pure half — the desktop-entry parser, the Applications menu's filter, and the top bar and
 # its menus as element trees (`panel`) — so it can be host-tested.

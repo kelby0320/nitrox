@@ -8,10 +8,21 @@
 //! something rewrites it (`libgpt`'s own `last_usable` test, PR #308 review).
 //!
 //! **Numbers, not handles.** This module takes what a device *reported* and returns extents; it
-//! opens nothing, reads nothing and cannot write. That is what lets it depend on `libgpt` alone
-//! and run on the host.
+//! opens nothing, reads nothing and cannot write. That is what lets it run on the host. Since
+//! administration Part G.2 it also says which disks the view does not hold and why ([`withheld`]),
+//! from tables the binary read — still opening nothing.
+//!
+//! **And what goes on the root** ([`copy`], [`account`]), since PR #348's review: the copy of the
+//! pristine root and the account written in the build's place. These do read and write, but
+//! through `fs_server_ext4`'s `BlockReader` and `BlockWriter` rather than a handle — the program
+//! hands them a window onto a partition, and a host test hands them a disk in memory.
 
 #![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod account;
+pub mod copy;
 
 use libgpt::table::{ARRAY_BLOCKS, FIRST_USABLE, Partition, TYPE_EFI_SYSTEM, TYPE_LINUX_FS};
 
@@ -42,9 +53,9 @@ pub const LOGICAL_BLOCK: u32 = 512;
 /// leading zero but `0` itself, so one device has one spelling (administration Part B.5).
 ///
 /// **The installer lists what its namespace holds** rather than probing `/dev/blk/0`, `1`, … for
-/// the first miss. It runs in a view (`with admin nxinstall`) or an installer session's
-/// application namespace, and in both, what it may write is exactly what is bound — so the
-/// listing is the whole answer, and a view granted one disk has a gap the probe stopped at.
+/// the first miss. It runs in a view (`with admin nxinstall`), where what it may write is exactly
+/// what the `disks` grant bound — so the listing is the whole answer, and a view granted one disk
+/// has a gap the probe stopped at.
 pub fn block_index(name: &str) -> Option<usize> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) || (bytes.len() > 1 && bytes[0] == b'0') {
@@ -68,7 +79,7 @@ pub fn block_index(name: &str) -> Option<usize> {
 /// is for, and a script that stops on it stops correctly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The devices this session can reach were listed.
+    /// The devices this view can reach were listed.
     Listed,
     /// What an install would do was reported. Nothing was written.
     Planned,
@@ -185,6 +196,127 @@ pub fn plan(
         return Err(PlanError::TooSmall { have: disk_blocks, need });
     }
     Ok(Layout { esp_first, esp_last, root_first, root_last })
+}
+
+pub mod withheld {
+    //! **A disk the view does not hold, and why** (administration Part G.2).
+    //!
+    //! `nxinstall` runs in a view, whose disks the `disks` grant chose when `with` started it: every
+    //! block device but those in use. So a disk the machine has and the view lacks is one in use,
+    //! and the person is told which, and what frees it, rather than finding it missing. Two
+    //! tables every view can read say so: `/dev/devices`, for the disks and which partitions are
+    //! theirs, and `/dev/storage`, for where each is mounted and by whom.
+    //!
+    //! - **Mounted by the storage service**: the command that unmounts it. `disk --unmount` takes
+    //!   the mount's **label** — the last part of `/storage/<label>` — not the path (PR #347
+    //!   review).
+    //! - **Mounted by `init`**: the running system, and no command. The storage service never
+    //!   unmounts `init`'s mounts.
+
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// A block device as `/dev/devices` lists it. An empty field is one the table left `Null`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Device {
+        /// `blk-<n>`, which is also its name in `/dev/storage`.
+        pub name: String,
+        /// `disk`, `partition` or `ramdisk`.
+        pub kind: String,
+        /// `/dev/blk/<n>`.
+        pub path: String,
+        /// A disk's model and serial, a RAM disk's module.
+        pub description: String,
+        /// The name of the device it belongs to: a partition's disk.
+        pub parent: String,
+    }
+
+    /// A block device as the storage service reports it. An empty field is `Null`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Mount {
+        /// `blk-<n>`.
+        pub name: String,
+        /// Where a filesystem on it is mounted: `/`, or `/storage/<label>`.
+        pub at: String,
+        /// Who mounted it: `init` or `storage`.
+        pub by: String,
+    }
+
+    /// Why a disk is not in the view.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Why {
+        /// The storage service mounted a filesystem on it: the mount's label, and where.
+        Mounted {
+            /// What `disk --unmount` takes.
+            label: String,
+            /// `/storage/<label>`.
+            at: String,
+        },
+        /// `init` mounted a filesystem on it: it holds the running system.
+        Running,
+    }
+
+    /// A disk the view does not hold.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Withheld {
+        /// `/dev/blk/<n>`, as it would be in the view.
+        pub path: String,
+        /// Its model and serial, or its module.
+        pub description: String,
+        /// Why.
+        pub why: Why,
+    }
+
+    /// **Every disk and RAM disk the machine has and the view does not reach, that something has
+    /// mounted**, in the table's order. `reachable` is the view's own `/dev/blk/<n>` paths. A disk
+    /// missing for no reason the tables give — nothing on it mounted — is left out: there is nothing
+    /// true to say about it.
+    pub fn withheld(devices: &[Device], mounts: &[Mount], reachable: &[&str]) -> Vec<Withheld> {
+        let mut out = Vec::new();
+        for d in devices.iter().filter(|d| (d.kind == "disk" || d.kind == "ramdisk") && !d.path.is_empty()) {
+            if reachable.contains(&d.path.as_str()) {
+                continue;
+            }
+            let on = |name: &str| mounts.iter().find(|m| m.name == name && !m.at.is_empty());
+            let mut found: Vec<&Mount> = on(&d.name).into_iter().collect();
+            for p in devices.iter().filter(|p| p.parent == d.name) {
+                found.extend(on(&p.name));
+            }
+            let why = if found.iter().any(|m| m.by == "init") {
+                Why::Running
+            } else if let Some(m) = found.iter().find(|m| m.by == "storage") {
+                let label = String::from(m.at.rsplit('/').next().unwrap_or_default());
+                Why::Mounted { label, at: m.at.clone() }
+            } else {
+                continue;
+            };
+            out.push(Withheld { path: d.path.clone(), description: d.description.clone(), why });
+        }
+        out
+    }
+
+    impl Withheld {
+        /// What to tell the person, in one line.
+        pub fn message(&self) -> String {
+            match &self.why {
+                Why::Mounted { label, at } => format!(
+                    "{} ({}) is in use: {label} is mounted at {at}. Unmount it with `with admin disk \
+                     --unmount {label}`, then run nxinstall again.",
+                    self.path, self.description
+                ),
+                Why::Running => format!("{} ({}) holds the running system.", self.path, self.description),
+            }
+        }
+
+        /// What the system log says when a person names it as the target.
+        pub fn refusal(&self) -> &'static str {
+            match self.why {
+                Why::Mounted { .. } => "it is in use",
+                Why::Running => "it holds the running system",
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +458,89 @@ mod tests {
             plan(2 * 1024 * 1024, 4096, 33 * 2048, 24 * 2048),
             Err(PlanError::BlockSize(4096))
         );
+    }
+
+    use super::withheld::{Device, Mount, Why, Withheld, withheld};
+
+    fn dev(name: &str, kind: &str, path: &str, description: &str, parent: &str) -> Device {
+        Device {
+            name: name.into(),
+            kind: kind.into(),
+            path: path.into(),
+            description: description.into(),
+            parent: parent.into(),
+        }
+    }
+
+    fn mount(name: &str, at: &str, by: &str) -> Mount {
+        Mount { name: name.into(), at: at.into(), by: by.into() }
+    }
+
+    /// **A reinstall's install boot** (administration Part G.2): the SATA disk holding an older
+    /// install, auto-mounted by the storage service; the live root's RAM disk, whose partition
+    /// `init` mounted; the two module sources, which the view holds. The disk is named with the
+    /// command that frees it — by the mount's label — and the live root as the running system.
+    #[test]
+    fn a_withheld_disk_is_named_with_what_frees_it() {
+        let devices = [
+            dev("blk-0", "disk", "/dev/blk/0", "QEMU HARDDISK (QM00002)", "pci-0"),
+            dev("blk-1", "ramdisk", "/dev/blk/1", "module 1 (/boot/root.img)", ""),
+            dev("blk-2", "ramdisk", "/dev/blk/2", "module 2 (/boot/install-esp.img)", ""),
+            dev("blk-3", "ramdisk", "/dev/blk/3", "module 3 (/boot/install-root.img)", ""),
+            dev("blk-4", "partition", "/dev/blk/4", "NITROX_ESP", "blk-0"),
+            dev("blk-5", "partition", "/dev/blk/5", "nitrox-root", "blk-0"),
+            dev("blk-6", "partition", "/dev/blk/6", "nitrox-live", "blk-1"),
+            dev("blk-7", "partition", "/dev/blk/7", "nitrox-source", "blk-3"),
+            dev("kbd-0", "keyboard", "", "", ""),
+        ];
+        let mounts = [
+            mount("blk-5", "/storage/nitrox-root", "storage"),
+            mount("blk-6", "/", "init"),
+            mount("blk-7", "", ""),
+        ];
+        let reachable = ["/dev/blk/2", "/dev/blk/3", "/dev/blk/7"];
+        let w = withheld(&devices, &mounts, &reachable);
+        assert_eq!(
+            w,
+            [
+                Withheld {
+                    path: "/dev/blk/0".into(),
+                    description: "QEMU HARDDISK (QM00002)".into(),
+                    why: Why::Mounted { label: "nitrox-root".into(), at: "/storage/nitrox-root".into() },
+                },
+                Withheld {
+                    path: "/dev/blk/1".into(),
+                    description: "module 1 (/boot/root.img)".into(),
+                    why: Why::Running,
+                },
+            ]
+        );
+        // The command names the label, which is what `disk --unmount` takes, and not the path.
+        assert!(w[0].message().contains("`with admin disk --unmount nitrox-root`"), "{}", w[0].message());
+        assert!(!w[0].message().contains("--unmount /storage"));
+        assert!(w[1].message().ends_with("holds the running system."));
+        assert!(!w[1].message().contains("unmount"), "init's mounts are never unmounted");
+        assert_eq!((w[0].refusal(), w[1].refusal()), ("it is in use", "it holds the running system"));
+    }
+
+    /// **A release boot**: the disk under `/` is the running system. A disk the view lacks with
+    /// nothing mounted on it is not named, since the tables give no reason to; one the view holds
+    /// is not named either, mounted or not.
+    #[test]
+    fn only_a_mounted_disk_the_view_lacks_is_named() {
+        let devices = [
+            dev("blk-0", "disk", "/dev/blk/0", "QEMU HARDDISK (QM00001)", "pci-0"),
+            dev("blk-1", "partition", "/dev/blk/1", "NITROX_ESP", "blk-0"),
+            dev("blk-2", "partition", "/dev/blk/2", "nitrox-root", "blk-0"),
+            dev("blk-3", "disk", "/dev/blk/3", "SPARE (S1)", "pci-0"),
+            dev("blk-4", "disk", "/dev/blk/4", "HELD (H1)", "pci-0"),
+        ];
+        let mounts = [mount("blk-2", "/", "init"), mount("blk-4", "/storage/data", "storage")];
+        let w = withheld(&devices, &mounts, &["/dev/blk/1", "/dev/blk/4"]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!((w[0].path.as_str(), &w[0].why), ("/dev/blk/0", &Why::Running));
+        // A bare filesystem on the disk itself, with no partition table, counts as the disk's.
+        let bare = withheld(&devices, &mounts, &["/dev/blk/1"]);
+        assert_eq!(bare[1].why, Why::Mounted { label: "data".into(), at: "/storage/data".into() });
     }
 }

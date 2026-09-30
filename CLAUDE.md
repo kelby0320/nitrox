@@ -120,8 +120,9 @@ a release image carry the same `init`.
 start differing in anything new — in their initramfs, and since administration Part E.1c in their
 roots, where the service declarations and the profile manifest now are. It holds the **live image**
 to the same rule: its initramfs may differ from the release one only in `etc/init.toml`, and the
-filesystem inside its `root.img` must be the release root partition's, file for file. The **test
-live image** `check-storage` boots is held the same way to a `--selftest` image.
+filesystem inside its `root.img` must be the release root partition's, file for file, as must the
+one inside the install entry's `install-root.img`, the pristine root the installer copies. The
+**test live image** `check-storage` boots is held the same way to a `--selftest` image.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
@@ -175,27 +176,35 @@ second Limine module, which the kernel publishes as a RAM disk — attached as a
 the AHCI controller empty, so no storage driver is involved: the laptop's first boot, before there
 is a USB driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
-timer tick instead of its own interrupt takes 3 s or more), and that a serial login writes under
-`/home`. It runs in CI's QEMU job.
+timer tick instead of its own interrupt takes 3 s or more), that a serial login writes under
+`/home`, and that the session reaches no disk — none does on any entry since administration Part
+G.3. It runs in CI's QEMU job.
 
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
-`check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
-menu entry with a blank disk attached, and drives the path a person takes on the laptop —
-Limine's menu, the **graphical** greeter, a terminal from the Applications menu, and `nxinstall`
-typed at the shell in it. Nothing reads the terminal's grid (a release image deliberately does
-not narrate it), so what it asserts on **in the guest** is the kernel log: the ESP module that
-entry alone loads, the four devices the session and then the shell hand on, and the milestones a
-destructive operation records. It also aims the installer at the RAM disk holding the running
-root, named correctly, and asserts nothing was installed to it.
+`check-resolutions`: two boots, and a 512 MiB disk image. **It is a reinstall** (administration Part
+G.3): the disk is a copy of the release disk, grown to 512 MiB, so it holds an install. The first
+boot boots the live image's third menu entry with that disk attached, and drives the path a person
+takes on the laptop — Limine's menu, the **graphical** greeter, a terminal from the Applications
+menu, and `with admin nxinstall` typed at the shell in it. Nothing reads the terminal's grid (a
+release image deliberately does not narrate it), so what it asserts on **in the guest** is the
+kernel log: the ESP module that entry alone loads with the pristine root beside it, which the
+storage service leaves unmounted and the installer copies from; the disk's older install
+auto-mounted read-only; a session that holds no disk, and a view the `disks` grant filled; the
+target refused as in use, `with admin disk --unmount nitrox-root` freeing it, and the install
+proceeding; the installer's questions for the new machine's first account answered (Part G.2); and
+the milestones a destructive operation records. It also aims the installer at the pristine root, a
+RAM disk, named correctly, and asserts nothing was installed to it.
 
-**Then it carves the root partition off the written disk and checks it on the host**, which is
-where H.2's claims live — a boot proves the filesystem works and says nothing about its size, and
-H.1's install booted perfectly with 24 MiB on a 477 MiB partition. Three claims: `e2fsck -fn`
-finds it clean, its superblock's block count is the *partition's*, and **a write lands past block
-group 0**, done with the allocator the guest runs because a size assertion passes just as well
-with allocation confined to the first group. The file goes to a copy, so the disk that boots is
-the one the installer made. The second boot is that disk alone, with no stick, and a greeter on
-it.
+**Then it carves the root partition off the written disk and checks it on the host**, which is where
+H.2's claims live — a boot proves the filesystem works and says nothing about its size, and H.1's
+install booted perfectly with 24 MiB on a 477 MiB partition. Three claims: `e2fsck -fn` finds it
+clean, its superblock's block count is the *partition's*, and **a write lands past block group 0**,
+done with the allocator the guest runs because a size assertion passes just as well with allocation
+confined to the first group. The file goes to a copy, so the disk that boots is the one the
+installer made. **And the account** (Part G.2): `/system/users` holds the new account alone, the
+policy makes it the one administrator, and `/home` holds its home alone, with its three folders. The
+second boot is that disk alone, with no stick: its greeter refuses the live stick's `alice` and logs
+the new account in, and neither boot's transcript holds either password.
 
 `cargo xtask check-recovery` is the **recovery gate** (administration Part D.5), on demand like
 `check-install`: two boots and a copy of the release disk. It is the one account path nobody
@@ -435,6 +444,7 @@ Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem
 (`docs/planning/desktop-refresh.md`), adopting a polished design, and then **administration**
 (`docs/planning/administration.md`) — elevation and the tools an installed system needs. The
 refresh is first because the admin tools are UI surfaces. **The refresh is complete as of
-2026-09-22** — all eleven parts, A–K — so administration is the current work. Phases are **not renumbered**: the
-numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
+2026-09-22** — all eleven parts, A–K — and **administration as of 2026-09-30**, all seven parts,
+A–G, the last being an installer that runs in an ordinary session as the view broker's client.
+Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
 portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

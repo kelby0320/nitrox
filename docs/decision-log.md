@@ -32134,3 +32134,254 @@ in place before merge.
 - **G.2's `check-install` cannot see the grant** (optional). Its view derives from an installer
   session that binds every disk already. G.3's reinstall is the first in-guest proof, and the plan
   says so.
+
+## 2026-09-30 — Administration Part G.1: the pristine source
+
+The live stick's install entry loads a third module, **`install-root.img`**: the release root
+again, pristine, in a GPT whose one partition is `nitrox-source`. `nxinstall` copies its root from
+there, where it used to read the live root raw.
+
+**The pieces:**
+- **`libgpt::INSTALL_SOURCE_LABEL`**, one constant for the three that read the name:
+  - the build, which names the partition with it (`xtask` takes `libgpt` for it);
+  - the storage service, which passes such a partition over;
+  - `nxinstall`, which finds its source by it.
+- **The image.** It is built from the same staged tree as `root.img`, with 4 MiB of margin for
+  `mke2fs` in place of the live root's 16 MiB of slack, since nothing writes it. It comes to
+  16 MiB, where `root.img` is 28. The install entry alone loads it, as it alone loads the ESP.
+- **The storage service passes it over, by its name.**
+  - Its report of the device ends `the installer's source, left unmounted`, so a gate can match the
+    reason rather than an absence.
+  - The host test builds an install boot's devices plus a test image's scratch RAM disk. It plans
+    the older install and the scratch disk, and not the source. It then renames the partition one
+    letter off and plans it too, which proves the name did the skipping.
+- **`nxinstall`** logs `copying the root from /dev/blk/3's nitrox-source`. The missing-source
+  message says the module rides on the install entry alone.
+- **`check-images`** holds `install-root.img`'s `nitrox-source` to the release root, file for file.
+  It finds the partition with `libgpt`'s own reader, the one `nxinstall` uses.
+- **`check-install`**:
+  - asserts module 3 is loaded;
+  - asserts the storage service's report of the source;
+  - asserts the copy's source;
+  - counts six session devices where there were four: the disk, the three modules, and
+    `nitrox-live` and `nitrox-source` inside two of them. The count was learned from a boot, not
+    guessed.
+
+**Controls, each failing `check-install`:**
+- **`nxinstall` looking for `nitrox-live` again**: "copied its root from /dev/blk/1's nitrox-live,
+  not the pristine root".
+- **The storage service without the skip**: its report says "mounted at /storage/nitrox-source
+  (ro)".
+
+The session is still the installer session: `nxinstall` sees every disk whether or not `disks`
+would grant it, and that ends in G.3.
+
+**Docs:**
+- `boot-flow.md`: the stick's layout, the modules, and `check-images`' four checks;
+- `storage.md` §6;
+- the root `CLAUDE.md`'s `check-images` and `check-install`;
+- the plan and `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Administration Part G.2: the installer in a view, and the first account
+
+`with admin nxinstall` names every disk it cannot have and says why. After the confirmation it
+asks for the new machine's first account on its terminal. The installed root then holds that
+account alone, the seeded policy making it the administrator, and its home.
+
+**The pieces:**
+- **`libprompt`**, a crate of its own.
+  - It holds `coreutils::prompt`, now with a line prompt, and the scrubbing plumbing that was
+    `libviews::ipc`. `with`, `account` and `nxinstall` prompt with it. `libviews` and
+    `desktop-shell` speak through its `ipc`.
+  - `outcome()`, which parses a Views answer, stayed with the broker's client as
+    `libviews::outcome`.
+  - **The password prompts log a receipt once echo is off** (`ask_password_then`,
+    `ask_new_password_then`), one per read. Echo goes back on between the two reads, so a gate
+    that typed both copies after one receipt could echo the second into the grid.
+- **`view_broker::policy::seed(name)`**, the build's policy as a function. The build calls it
+  naming the demo account, and the installer naming the first account. A host test holds it to
+  making its one account the one administrator.
+- **`nxinstall`**:
+  - **`nxinstall::withheld`**, host-tested: from `/dev/devices` and `/dev/storage`'s tables, the
+    disks the machine has and the view does not, and why. One the storage service mounted comes
+    with `with admin disk --unmount <label>`; one `init` mounted holds the running system. The
+    lines go to `stderr`, and naming such a disk as the target is refused with the same reason.
+  - **The account, after the confirmation.** It asks a name, which must pass `libusers`' rule,
+    then a password twice. It logs a receipt for each question, and a cancelled or wrong answer
+    writes nothing. A program with no terminal is refused before anything is written.
+  - **`copy_tree` passes over `/home`'s contents, `/system/users` and `/system/views.toml`.**
+    `put_file` and `put_dir` then write the one record under a fresh salt, the seeded policy, and
+    `/home/<name>` with `libfs::HOME_FOLDERS`. **`TODO(home-folders)` is resolved.**
+  - It logs `the first account is <name>, its administrator`, and never the password.
+- **`check-install`**:
+  - runs `with admin nxinstall` for its refusal and its install, typing the live account's password
+    after the broker's audit receipt;
+  - answers the account's questions after each receipt;
+  - on the host, finds `/system/users` holding the one account, the policy making it the one
+    administrator, and `/home` holding its home alone with the three folders;
+  - on the second boot, which now has a QMP socket, sees `alice` refused and the new account let
+    in;
+  - finds neither password in either transcript.
+- **The listing's new messages, in three other gates:**
+  - `check-login` 9a2 expects `/dev/blk/0` to be refused as the running system;
+  - `test-interactive` 20b(a) expects "no block devices in this view";
+  - `test-interactive` 20b(d) reads the serial terminal, where `stderr` shows beside the table. So
+    "the table is unchanged" did not keep it passing. It now requires every line naming a withheld
+    device to be that device's message, and `/dev/blk/0`'s message to be present.
+
+**Controls, each failing its gate:**
+- **The copy entering `/home`**: `check-install` says "/home holds [alice, dana]".
+- **The seed naming `alice`**: "the installed policy makes [alice] administrators".
+- **No messages for withheld disks**: `test-interactive` says "did not say /dev/blk/0 holds the
+  running system". The first run of this control failed earlier, on the reworded no-disks line,
+  which proved nothing. The step was fixed and the control run again.
+
+**One visible consequence.** The first account's home has the three folders and no theme or
+wallpaper, as Part D decided for every new home. So an installed machine's first desktop is the
+built-in theme on its ground colour, where the build's demo home carries the photograph.
+
+**Not observable by a gate:** a receipt logged before echo was off. What it risks is a password
+echoed into a desktop terminal's grid, and nothing reads the grid.
+
+**Docs:**
+- `nxinstall`'s module doc, and `libviews`' and `coreutils`' crate docs;
+- `userspace/CLAUDE.md`'s layering;
+- `views-toml-schema.md`: a machine's first policy is the seed;
+- `session-and-auth.md`: an installed machine's user database;
+- `storage.md`'s gate rows, `boot-flow.md`, `device-manager.md` and `graphical-prompt.md`;
+- the root `CLAUDE.md`, `deferred-decisions.md`, the plan and `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Administration Part G.3: every session ordinary, and the phase complete
+
+No session holds a disk now, on any boot entry. The installer runs as `with admin nxinstall` and
+reaches its disks through the view broker's `disks` grant. `check-install` reinstalls onto a disk
+that holds an install. With it **Part G is complete, and so is administration**, all seven parts.
+
+**Removed:**
+- The live stick's `cmdline: install`, and the `etc/install-allowed` marker that made the word mean
+  something. `check-images` now holds the live initramfs to the release one but for `etc/init.toml`
+  alone.
+- From `libsession`:
+  - `installer_boot` and its two readers;
+  - `NamespaceSpec::bind_blk` and `Built::disks`;
+  - `block_device_count`, the plain `rebind_block_devices`, and `session_has_blk`.
+
+  `rebind_block_devices_except`, the broker's grant, stays. Its doc now says it is the one way a
+  disk reaches a program.
+- The two supervisors' `bind_blk`, and `desktop-shell`'s pass-through of a session's disks into
+  every application.
+- **`block_indices`' second source.** It read a namespace's own bindings when there was no
+  registry, which was for `desktop-shell` to pass a session's disks on. A source with no registry
+  now hands on nothing.
+
+**`check-install` is a reinstall.**
+- **The target** is a copy of the release disk, grown to 512 MiB. At 128 MiB the installed root is
+  one block group (PR #347 review). The old install's primary GPT still finds `nitrox-root`, and
+  the storage service auto-mounts it read-only.
+- **The gate asserts, in order:**
+  - the auto-mount;
+  - a session holding no disk;
+  - the target refused as in use, with the grant's line proving the view was filled by the grant;
+  - the pristine root refused as a RAM disk. Its index is read off the storage service's report,
+    since the target's partitions now number the devices;
+  - `with admin disk --unmount nitrox-root`, and the storage service's `unmounted nitrox-root`;
+  - then G.2's install and account, the host checks, and the second boot.
+- **`install_gate_with_admin` takes the program**, since `disk` goes through it too.
+- **One mistake before the first run.** An `expect` for the grant's line, placed after
+  `started`, would have waited for the *next* grant: the broker logs the grant before `started`,
+  and `expect` consumes what it scans. The gate reads the transcript for that line instead.
+
+**`check-live` asserts the absence positively.** Its check matched the words "installer session",
+which nothing prints now, so it would have passed on any boot. It now runs `nxinstall` in its
+serial session and expects "no block devices in this view", and finds no namespace on the boot
+handed a disk.
+
+**Controls:**
+- **A `disks` grant that withheld nothing** fails `check-install` at step 7. The installer never
+  refused the target, since the target was in its view.
+- The two G.2 controls, and the ones on the source and the storage service from G.1, stand as
+  they were.
+
+**Docs:**
+- `session-and-auth.md`: no exception now;
+- `boot-flow.md`: the install entry carries modules, not authority;
+- `device-manager.md`, and `session-mgr/CLAUDE.md`;
+- the root `CLAUDE.md`: `check-install`, `check-live`, and the Status — administration complete;
+- the plan: G.3, the Docs box, Part G and its Status line;
+- `implementation-plan.md`.
+
+No kernel change; no ABI hash impact.
+
+**What the phase built**, for whoever reads this next:
+- views, and a broker that grants them;
+- a device manager with coldplug;
+- storage: write-back, and mounts;
+- accounts;
+- services, power, the clock and the log;
+- the desktop's power menu;
+- an installer that is the broker's client and makes a machine its own administrator.
+
+Phase 6, USB, is next. Its plan already carries what this phase deferred to it.
+
+## 2026-09-30 — Part G, reviewed (PR #348): the account write host-tested, and three docs
+
+One blocking finding, docs only, and two optional. All three taken. The reviewer ran
+`check-install`, which CI does not, and it passed.
+
+**Three current-behaviour docs still described the installer session G.3 removed** (finding 1).
+- `boot-flow.md`'s `check-install` row counted "the six devices a session and then the shell hand
+  on", which the gate now asserts never happen. The row now says the gate is a reinstall.
+- `session-and-auth.md` said `/dev/blk` is absent "on every boot but one", two lines above the
+  paragraph beginning "**No exception.**". It said so again in the user-shell section.
+- Two xtask comments said the same. `profile_programs` now gives the installer's authority as the
+  view's.
+
+**Swept for the class, which found more:**
+- `nxinstall`'s own manifest named `libsession::installer_boot`.
+- `nxinstall` said "this session" where it runs in a view, in two error messages among the rest.
+- A comment said the copy reads "the live root's own partition", which was stale since G.1.
+- **`/proc/cmdline`.** The kernel's comments and `boot-flow.md` said userspace reads `install`
+  there, and nothing reads any word since G.3. The kernel's log line for a word it does not know
+  said "userspace reads it at /proc/cmdline". It now says the line is "served whole" there, since
+  a person booting an old stick would otherwise read that the word still does something. The file
+  itself stays: a person debugging a boot wants to see it.
+
+**`nxinstall → view-broker`** (finding 2). `userspace/CLAUDE.md` says an application reaching
+into another's crate is the shape its layering rule catches. What `nxinstall` takes is
+`view_broker::policy::seed`, the broker's own file rather than a helper. The seed lives beside
+`Policy::parse` because the two have to agree, and one host test there holds them together. The
+rules file now says so, and says the format moves below its writers if a third appears, as the user
+database's did.
+
+**The account write had no coverage in CI** (finding 3). `copy` and the account write lived in the
+binary, where no host test reaches, and `check-install` is on demand.
+- **They moved into the lib**: `nxinstall::copy`, and `nxinstall::account` with `PASS_OVER` and
+  `write`. The binary keeps the salt's randomness and the device I/O.
+- **A host test copies a pristine root in miniature into an empty filesystem in memory**, over
+  `PASS_OVER`, and writes the account. Then it checks:
+  - `/home` holds the new home alone, with its folders;
+  - `/system/users` holds one record, the new account's;
+  - the policy is the seed naming it;
+  - the rest came across whole.
+- **The review's premise did not hold.** It said losing a `/system` entry from `PASS_OVER` "at
+  least fails loudly", because `create_file` finds the file there. It does find it, and hands it
+  back: `create_file` is idempotent. `put_file` then wrote over the copied file in place, so a
+  shorter replacement would have kept the old file's tail. The first control, `/system/users`
+  dropped, **passed the new test**, because the new record happened to be the longer one.
+  - **`put_file` now refuses a name that is taken**, with `Exists`, as `put_dir` already did
+    through `mkdir_at`.
+  - **Controls**, each failing the test:
+    - `/home` dropped: "left: [alice, dana]";
+    - `/system/users` dropped: "/system/users: Exists";
+    - `/system/views.toml` dropped: likewise;
+    - the seed naming `alice`;
+    - the folders not made.
+  - **The guard's own control:** without it, `/system/users` dropped passes again.
+
+The local gate set stays at 36 and is green (fgb54).
+
+A kernel log line and comments changed, and no ABI hash input did.

@@ -8,12 +8,16 @@
 //!
 //! ## What it copies from, which had to be decided
 //!
-//! **The source's bytes on the device, not the running system's view of them.** The live root
-//! is a RAM disk this session has been writing to, and a write reaches the device only when
-//! something syncs the file — so the two differ, and the difference is whatever the session
-//! has touched: a login writing under `/home`, a shell's history. Reading the device installs
-//! **the system as it shipped**, which is what an installer should produce; reading the live
-//! view would install a machine carrying one session's accidents.
+//! **A pristine copy of the system, which nothing mounts and nothing writes** (administration Part
+//! G.1): `install-root.img`, which the live stick's install entry loads beside the ESP. Copying it
+//! installs **the system as it shipped**, which is what an installer should produce.
+//!
+//! **Not the live root.** Until G.1 this read the live root's own RAM disk, raw. But the session
+//! writes that root, and every writer here syncs what it writes, so the copy carried whatever the
+//! session had touched — a login under `/home`, a shell's history. And `init` has it mounted, so a read could meet a directory
+//! block half-way through being rewritten. Linux's live installers copy the read-only image under
+//! the live root for the same reasons; this system's live root has nothing under it, so the image
+//! is a second copy.
 //!
 //! ## What it does not carry
 //!
@@ -23,8 +27,6 @@
 //!
 //! **Timestamps.** Every entry is stamped with the install's own clock rather than the
 //! source's, because that is what happened: these files were created now.
-
-extern crate alloc;
 
 use alloc::vec::Vec;
 
@@ -50,15 +52,21 @@ pub struct Copied {
     pub bytes: u64,
 }
 
-/// Copy everything under the source's root into the destination's.
+/// Copy everything under the source's root into the destination's, **but what `pass_over` names**.
 ///
 /// The destination must be a filesystem with an empty root — [`fs_server_ext4::mkfs::format`]
 /// makes one. `say` is called once per directory so a person watching sees progress; a tree of
 /// a few hundred entries takes long enough on real hardware to need it.
+///
+/// **`pass_over` is paths from the root** (administration Part G.2). A directory named there is
+/// made empty — `/home`, whose accounts are the build's — and a file named there is not made at
+/// all: `/system/users` and `/system/views.toml`, which the installer writes for the new machine's
+/// own account.
 pub fn copy_tree<S, D>(
     src: &S,
     dst: &D,
     now: i64,
+    pass_over: &[&[u8]],
     say: &mut dyn FnMut(&str),
 ) -> Result<Copied, FsError>
 where
@@ -96,13 +104,17 @@ where
 
         for (ft, name) in entries {
             let child = join(&dir, &name);
+            let passed = pass_over.contains(&child.as_slice());
             match ft {
                 FT_DIR => {
                     let parent = ext4::resolve_dir(dst, &dir)?;
                     ext4::mkdir_at(dst, parent, &name, now)?;
                     out.dirs += 1;
-                    pending.push(child);
+                    if !passed {
+                        pending.push(child);
+                    }
                 }
+                FT_REG if passed => {}
                 FT_REG => {
                     out.bytes += copy_file(src, dst, &dir, &name, &child, now, &mut buf)?;
                     out.files += 1;
@@ -146,7 +158,6 @@ where
     // the previous block, and on a filesystem this empty that is the next one.
     ext4::grow_file(dst, path, size, now)?;
 
-    let bs = ext4::block_size(dst)? as u64;
     let mut at = 0u64;
     while at < size as u64 {
         let want = ((size as u64 - at) as usize).min(buf.len());
@@ -154,40 +165,109 @@ where
         if got == 0 {
             return Err(FsError::Io); // a short read of a file we just sized
         }
-        // **Zero the tail of the final block.** Only `size` bytes are the file's, but the
-        // block is written whole, and what follows them would otherwise be whatever the disk
-        // held before — invisible through the filesystem, and still on the disk.
-        let end = (got as u64).div_ceil(bs) * bs;
-        buf[got..end as usize].fill(0);
-
-        // Where the destination put those blocks. Re-mapped per chunk rather than once,
-        // because a file large enough to need several extents has no single run.
-        let mut runs = [BlockRun::default(); 8];
-        let first_block = at / bs;
-        let count = end / bs;
-        let n = ext4::map_range(dst, path, first_block, count, &mut runs)?;
-        let mut written = 0u64;
-        for run in &runs[..n] {
-            if run.device_lba == 0 {
-                return Err(FsError::Corrupt); // a hole in a file we just grew
-            }
-            let bytes = run.length as u64 * bs;
-            let take = bytes.min(end - written);
-            dst.write_at(
-                run.device_lba * bs,
-                &buf[written as usize..(written + take) as usize],
-            )?;
-            written += take;
-            if written >= end {
-                break;
-            }
-        }
-        if written < end {
-            return Err(FsError::TooLarge); // more runs than the map buffer holds
-        }
+        write_range(dst, path, at, buf, got)?;
         at += got as u64;
     }
     Ok(size as u64)
+}
+
+/// **Make `dir/name` in the destination holding `bytes`** — a file the installer writes rather
+/// than copies (administration Part G.2): the new machine's users, its policy. Small, so one
+/// buffer the size of the file's blocks.
+///
+/// **`Exists` if the name is taken**, as [`put_dir`] is. `create_file` hands back a file that is
+/// already there, and writing over it would leave the copied file's tail past a shorter
+/// replacement — so a pass-over list that lost one of these paths would install a file that is
+/// neither the build's nor the installer's, silently (PR #348 review). Refused, it fails the install
+/// before the root is used.
+pub fn put_file<D>(dst: &D, dir: &[u8], name: &[u8], bytes: &[u8], now: i64) -> Result<(), FsError>
+where
+    D: BlockReader + BlockWriter,
+{
+    if taken(dst, dir, name)? {
+        return Err(FsError::Exists);
+    }
+    let path = join(dir, name);
+    ext4::create_file(dst, dir, name, now)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    ext4::grow_file(dst, &path, bytes.len(), now)?;
+    let bs = ext4::block_size(dst)? as usize;
+    let mut buf = Vec::new();
+    buf.resize(bytes.len().div_ceil(bs) * bs, 0u8);
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let written = write_range(dst, &path, 0, &mut buf, bytes.len());
+    // What the installer writes this way includes a password's verifier; the buffer goes back
+    // to the heap zeroed either way.
+    buf.fill(0);
+    written
+}
+
+/// Write `buf[..got]`, the file's bytes from `at`, to the blocks the destination gave `path`
+/// there. `buf` must hold `got` rounded up to a block; the tail past `got` is zeroed here.
+fn write_range<D>(dst: &D, path: &[u8], at: u64, buf: &mut [u8], got: usize) -> Result<(), FsError>
+where
+    D: BlockReader + BlockWriter,
+{
+    let bs = ext4::block_size(dst)? as u64;
+    // **Zero the tail of the final block.** Only `got` bytes are the file's, but the block is
+    // written whole, and what follows them would otherwise be whatever the disk held before —
+    // invisible through the filesystem, and still on the disk.
+    let end = (got as u64).div_ceil(bs) * bs;
+    buf[got..end as usize].fill(0);
+
+    // Where the destination put those blocks. Re-mapped per chunk rather than once, because a
+    // file large enough to need several extents has no single run.
+    let mut runs = [BlockRun::default(); 8];
+    let first_block = at / bs;
+    let count = end / bs;
+    let n = ext4::map_range(dst, path, first_block, count, &mut runs)?;
+    let mut written = 0u64;
+    for run in &runs[..n] {
+        if run.device_lba == 0 {
+            return Err(FsError::Corrupt); // a hole in a file we just grew
+        }
+        let bytes = run.length as u64 * bs;
+        let take = bytes.min(end - written);
+        dst.write_at(run.device_lba * bs, &buf[written as usize..(written + take) as usize])?;
+        written += take;
+        if written >= end {
+            break;
+        }
+    }
+    if written < end {
+        return Err(FsError::TooLarge); // more runs than the map buffer holds
+    }
+    Ok(())
+}
+
+/// **Make `dir/name` an empty directory in the destination** (administration Part G.2): the new
+/// account's home and its folders.
+pub fn put_dir<D>(dst: &D, dir: &[u8], name: &[u8], now: i64) -> Result<(), FsError>
+where
+    D: BlockReader + BlockWriter,
+{
+    let parent = ext4::resolve_dir(dst, dir)?;
+    ext4::mkdir_at(dst, parent, name, now)?;
+    Ok(())
+}
+
+/// Whether the directory at `dir` holds an entry named `name`, of any kind.
+fn taken<D: BlockReader>(dst: &D, dir: &[u8], name: &[u8]) -> Result<bool, FsError> {
+    let ino = ext4::resolve_dir(dst, dir)?;
+    let mut found = false;
+    let mut cursor = 0u64;
+    loop {
+        let next = ext4::read_dir(dst, ino, cursor, |_ino, _ft, entry| {
+            found = entry == name;
+            !found
+        })?;
+        if found || next == 0 {
+            return Ok(found);
+        }
+        cursor = next;
+    }
 }
 
 /// `dir` + `/` + `name`, without a double slash at the root.

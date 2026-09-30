@@ -703,10 +703,9 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// - **`/dev/devices`, `/storage`, `/dev/storage` and `/dev/services`**, the session's own binds of
 ///   info-only endpoints: none reaches a class, a mount or a start.
 /// - **`/session/user`**, since F.1: who the session is for, as the session has it.
-/// - **The session's disks, in an installer session alone** (PR #308 review, blocking 1): rebound
-///   from the session's namespace, which is why that is the spec's `root_ns`. Without it an
-///   installer typed at a desktop terminal finds no disk, and on the laptop there is no other way
-///   in.
+/// - **No disks.** A program reaches one only through the view broker's `disks` grant, as `with
+///   admin nxinstall` does (administration Part G.3). Until then an installer session's disks were
+///   rebound into every application from here.
 ///
 /// `None` if the namespace could not be built with what it cannot do without.
 fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
@@ -720,7 +719,6 @@ fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Built> {
         user: l.user.as_bytes(),
         bind_fonts: true,
         bind_console: false,
-        bind_blk: l.disks,
         views_endpoint: l.views,
         views_base: l.views_base.as_bytes(),
         devices_endpoint: l.devices,
@@ -1076,8 +1074,6 @@ struct Launcher<'a> {
     /// The session's user, bound as `/session/user` in an application's namespace (administration
     /// Part F.1). Empty binds nothing.
     user: &'a str,
-    /// Whether the session has disks — an installer session — so an application gets them too.
-    disks: bool,
     /// The environment record an application reads its `HOME` from.
     env: &'a libstream::wire::Record,
     /// Whether a namespace this shell builds actually gates. False disables launching outright.
@@ -1113,18 +1109,6 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
         return false;
     };
     let app_ns = built.ns;
-    // **The disks, if this session has any** (Phase 5 Part H.1), which the builder rebinds from the
-    // session's namespace: an installer boot's, handed over deliberately. See
-    // [`build_app_namespace`] for why an application gets them.
-    if built.disks > 0 {
-        Line::new()
-            .s(b"desktop-shell: ")
-            .u(built.disks as u64)
-            .s(b" block device(s) into ")
-            .untrusted(program.as_bytes())
-            .s(b"'s namespace (installer session)")
-            .end();
-    }
     if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0, devices != 0, storage != 0, !l.user.is_empty()) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
@@ -1696,11 +1680,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
     };
 
-    // **Who the session is for, and whether it has disks**, read once from the session's own
-    // namespace (administration Part F.1): an application gets the one as `/session/user`, and the
-    // other only on an installer boot. Neither changes while the session lasts.
+    // **Who the session is for**, read once from the session's own namespace (administration Part
+    // F.1): an application gets it as `/session/user`. It does not change while the session lasts.
     let user = session_user(session_ns);
-    let disks = libsession::block_device_count(session_ns) > 0;
     let mut launcher = Launcher {
         session_ns,
         draw: draw_endpoint,
@@ -1716,7 +1698,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         services: services_endpoint,
         home,
         user: &user,
-        disks,
         env: &env,
         enabled: false,
     };
@@ -2200,7 +2181,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if let Some((ch, e)) = powering
             && !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop))
         {
-            let heard = match libviews::ipc::recv(ch) {
+            let heard = match libprompt::ipc::recv(ch) {
                 Ok(Some((librsproto::views::OP_VIEWS_EXITED, _, _, body))) => {
                     let (code, crashed) = librsproto::views::parse_exited(&body).unwrap_or((1, true));
                     Some((code == 0 && !crashed).then_some(()).ok_or_else(|| Refusal::exited(code, crashed)))
@@ -2211,7 +2192,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             match heard {
                 None => {}
                 Some(Ok(())) => {
-                    libviews::ipc::close(ch);
+                    libprompt::ipc::close(ch);
                     powering = None;
                     Line::new()
                         .s(b"desktop-shell: ")
@@ -2220,7 +2201,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         .end();
                 }
                 Some(Err(r)) => {
-                    libviews::ipc::close(ch);
+                    libprompt::ipc::close(ch);
                     powering = None;
                     show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font);
                 }
@@ -5385,7 +5366,7 @@ fn power_refusal(session_ns: u64) -> Option<Refusal> {
         return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
     }
     let answer = libviews::decide(ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
-    libviews::ipc::close(ch);
+    libprompt::ipc::close(ch);
     match answer {
         Ok((outcome, why)) => Refusal::from_answer(outcome, why),
         Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
@@ -5410,7 +5391,7 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
         return Err(failure(failed::NO_BROKER));
     }
     let Some(built) = build_app_namespace(l) else {
-        libviews::ipc::close(ch);
+        libprompt::ipc::close(ch);
         return Err(failure(failed::NO_NAMESPACE));
     };
     // **Verified as a launch's is**, by the process that built it: that `shutdown`'s view cannot
@@ -5418,8 +5399,8 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
     let (home, desktop, devices, storage, user) =
         (!l.home.is_empty(), l.desktop != 0, l.devices != 0, l.storage != 0, !l.user.is_empty());
     if !verify_app_namespace(built.ns, home, desktop, devices, storage, user) {
-        libviews::ipc::close(built.ns);
-        libviews::ipc::close(ch);
+        libprompt::ipc::close(built.ns);
+        libprompt::ipc::close(ch);
         kprint(b"desktop-shell: application namespace is not gated; not asking the broker\n");
         return Err(failure(failed::NO_NAMESPACE));
     }
@@ -5442,7 +5423,7 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
         Ok((Outcome::Denied { .. }, why)) => Refusal::Refused(why),
         Err(f) => failure(f.why()),
     };
-    libviews::ipc::close(ch);
+    libprompt::ipc::close(ch);
     Err(refusal)
 }
 
