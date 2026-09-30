@@ -503,7 +503,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       `service-manager.md` has always said); `services.toml` moved onto the root
       filesystem; `service-mgr`'s admin endpoint and `service`; the system-control object, FADT, the
       power operation, and `shutdown`; `SYSTEM_CLOCK` and `date --set`; the log's read op and `log`.
-- [ ] **F — the desktop's share** — *detailed below, F.1–F.4 (2026-09-29).* `desktop-shell`
+- [x] **F — the desktop's share** — *detailed below, F.1–F.4 (2026-09-29); complete
+      2026-09-29.* `desktop-shell`
       building application namespaces in the same vocabulary; the graphical prompt's design
       written down, with its trigger; and, handed on by Part E, **a power menu** — Log out,
       Restart, Shut down — that **closes a session's windows first**.
@@ -2361,7 +2362,7 @@ programs to close with unsaved work in mind (E.4a).
   there**: the person started it from a terminal, the machine is going down, and a question the
   shell could not wait for would be a lie. A modified buffer in the editor is lost then, as it is
   today.
-- **The graphical prompt's design is written down** in `docs/design/graphical-prompt.md`: what it <!-- check-docs: allow-missing -->
+- **The graphical prompt's design is written down** in `docs/design/graphical-prompt.md`: what it
   must guarantee, how, and its trigger. Nothing is built.
 
 ### Logging out, end to end
@@ -2451,7 +2452,15 @@ and the session would end with the editor's process left to notice (*Left alone*
            its greeter;
         8. log in, **Shut down**: "It is now safe to turn off your computer." read off the screen
            with `check-fbcon`'s decoder.
-- [ ] **F.4 — the graphical prompt, written down.** `docs/design/graphical-prompt.md`: <!-- check-docs: allow-missing -->
+- [x] **F.4 — the graphical prompt, written down.** `docs/design/graphical-prompt.md`: *(Landed
+      2026-09-29. **The second bullet was not true of today's compositor**, and the document says
+      so: an application's popup is placed where it asks, at any size, above the bars, and takes
+      the keyboard — a probe put one the size of the screen at (0,0). So keeping applications off
+      the panels is the prompt's first piece, recorded as `TODO(app-covers-panels)`. The document
+      also settles who draws it — a helper the broker spawns, `view-prompt`, not the broker or the
+      compositor — how only the broker reaches it — a `prompt` suffix answered only through the
+      root namespace's binding, with sessions binding `/dev/draw` at a base — and that `with`, in a
+      session on the display, prompts there.)*
       - **only the broker can open it**, so no program can present a look-alike asking for a
         password;
       - the compositor draws it **above everything, the desktop dimmed behind it**, which no
@@ -2461,7 +2470,7 @@ and the session would end with the editor's process left to notice (*Left alone*
       - **its trigger**, unchanged: the first desktop action the policy will not allow without a
         password — unmounting a USB stick from Files (Phase 6), or a Settings application. A power
         policy asking for a password would fire it early, and F.3's refusal says so.
-- [ ] **Docs.**
+- [x] **Docs.**
       - `desktop-shell.md`: the power menu, ending a session, closing windows first.
       - `graphical-session.md`: the logout path, and its process tree's ending.
       - `views-toml-schema.md`: that the desktop asks for `power` as `with` does.

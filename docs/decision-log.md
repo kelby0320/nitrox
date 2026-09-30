@@ -31922,3 +31922,69 @@ be changing the release image it boots in place. The refusal is host-tested only
 The local gate set stays at 36 and is green (fgb49).
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.4: the graphical prompt, written down
+
+[`docs/design/graphical-prompt.md`](design/graphical-prompt.md): designed, not built. With it
+**Part F is complete**.
+
+**The plan's premise was not true of today's compositor.** Its bullet said the compositor draws
+the prompt with the desktop dimmed behind it, "which no client surface can do".
+- **An application's popup is never held for the manager.** It is placed where its creator asks,
+  negative offsets included, at any size, and pushed on top of the stack. The topmost window that
+  takes focus has the keyboard.
+- **A host probe proved it**, and was not kept. It created a bar, an application's window, and a
+  popup of that window the size of the screen. The popup landed at (0,0), above the bar, and was
+  the focus candidate.
+- **Nothing refuses a `panel` on an application's connection either.**
+
+So **keeping applications off the panels is the prompt's first piece**:
+- the manager's connection is opened through `manage`, so the compositor knows it;
+- an application's popup is kept in the work area;
+- a panel is refused on any other connection.
+
+It is recorded as `TODO(app-covers-panels)`, marked where a popup is placed, and triggered by
+building the prompt.
+
+**What the document settles:**
+- **Only the broker opens it.** The prompt is a `prompt` suffix of `/dev/draw`, answered only on a
+  resolve with no base, which is one through the root namespace's binding. Sessions bind
+  `/dev/draw` at a base, as they bind `/dev/views`.
+  - Today the shell's whole `/dev/draw` would reach it, and the shell would be in the password's
+    path.
+  - The root namespace's other holders are every system service. `TODO(svc-auth-ungated)` already
+    names that trusted set.
+- **A helper draws it**: `view-prompt`, spawned by the broker for each prompt, holding the prompt
+  endpoint and the fonts. The broker stays small, and the compositor grows no toolkit.
+- **It is a layer above the stack.** The manager is not told of it and can neither capture nor close
+  it.
+  - The dim covers the bars, and a strip over the top bar is the tell: a password prompt that
+    leaves the top bar undimmed is not the system's.
+  - The manager can still imitate one. It is in the display's trusted set already.
+- **It holds the keyboard and the pointer**, with the chords suspended. A password's path is then
+  kernel → `input-server` → compositor → `view-prompt` → broker → `auth-service`.
+- **In a session on the display, `with` prompts there.** That is the remedy for the same-backend
+  limit, as `pkexec` asks a graphical agent.
+  - The requester never holds the password. A new `Prompt` op asks the broker to prompt, and `Held`
+    paces the check as it paces `Password`'s.
+  - Only the session on the display may ask: `OpenSession` gains a flag that only the supervisor
+    channel sets.
+- **Not guaranteed:**
+  - a look-alike inside an application's own window — a secure attention key is the next step if
+    that matters;
+  - a compromised trusted path;
+  - protection from someone looking over a shoulder.
+- **The trigger is unchanged.**
+
+**Docs:**
+- the new document, and the deferral;
+- the plan: F.4, the Docs box, and Part F;
+- the root `CLAUDE.md`'s list of what `design/` holds;
+- `implementation-plan.md`.
+
+**Verified in proportion**, since the change is documents and one source comment:
+- `check-docs` and `check-deferrals`, the two gates a document and a marker move;
+- the host tests, since the comment is in the compositor's source;
+- the image build.
+
+No kernel change; no ABI hash impact.

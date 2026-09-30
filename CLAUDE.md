@@ -338,8 +338,10 @@ wrong about how something works:
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
   is what a subsystem *will* be. Today it holds `fault-survival.md`
   (added 2026-08-19), which is not a display document at all — it is where the kernel's
-  fault-survival intent is written down — and `nitrox-shell/`, the designed-but-not-built
-  appearance of the desktop, which `docs/planning/desktop-refresh.md` adopts. What is built has moved out —
+  fault-survival intent is written down — `graphical-prompt.md` (added 2026-09-29), the password
+  prompt the view broker will open on the display once something needs one, and `nitrox-shell/`,
+  the designed-but-not-built appearance of the desktop, which `docs/planning/desktop-refresh.md`
+  adopts. What is built has moved out —
   `input-subsystem.md` and `widget-toolkit.md` graduated on 2026-08-12, `desktop-shell.md` and
   `graphical-session.md` on 2026-08-25 with Milestone 7, `ui-composition-model.md` on
   2026-08-26 with Milestone 8, and `display-substrate.md` on 2026-08-30 (owed by Milestone 9 and
