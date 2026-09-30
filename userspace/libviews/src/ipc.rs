@@ -1,10 +1,12 @@
-//! **One request, one reply** — the channel plumbing a coreutil that is a *client* of a server
-//! needs: send a message, wait, and take the answer to it.
+//! **One request, one reply** — the channel plumbing a client of the view broker needs: send a
+//! message, wait, and take the answer to it.
 //!
-//! Moved here from `with` when `account` became its second user (administration Part D.4). Both
-//! speak to the view broker and prompt on a terminal, and a password passes through these buffers
-//! on the way to either, so **every buffer here is zeroed once the kernel has the message** — a
-//! copy left in a stack frame is a copy nothing else will overwrite.
+//! Moved out of `with` when `account` became its second user (administration Part D.4), into
+//! `coreutils::ipc`, and out of `coreutils` into this crate when the desktop became a third (Part
+//! F.3). Every user speaks to the view broker, and `coreutils::prompt` borrows it to ask a terminal
+//! for a password. A password passes through these buffers on the way to either, so **every buffer
+//! here is zeroed once the kernel has the message** — a copy left in a stack frame is a copy nothing
+//! else will overwrite.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,6 +29,14 @@ pub fn close(h: u64) {
 
 /// Wait on `handles`; the index of one that is ready. At most four.
 pub fn wait(handles: &[u64]) -> Option<usize> {
+    wait_until(handles, u64::MAX)
+}
+
+/// [`wait`], giving up at `deadline` on the monotonic clock: `None` then too.
+///
+/// **For a caller that must not hang on the broker**: `with` has nothing else to do while it waits,
+/// and the desktop has a screen to keep answering.
+pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
     let mut results = [0u8; 24 * 4];
     if handles.len() > 4 {
         return None;
@@ -38,7 +48,7 @@ pub fn wait(handles: &[u64]) -> Option<usize> {
             handles.as_ptr() as u64,
             handles.len() as u64,
             results.as_mut_ptr() as u64,
-            u64::MAX,
+            deadline,
         )
     };
     if n < 1 {
@@ -114,8 +124,14 @@ pub fn call(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> 
     if !send(ch, op, request_id, body, handles) {
         return None;
     }
+    answer(ch, request_id, u64::MAX)
+}
+
+/// The reply to `request_id` on `ch`, as `(is_error, body)`, skipping anything else that arrives
+/// first. `None` if the peer went away, or `deadline` passed, before it came.
+pub fn answer(ch: u64, request_id: u64, deadline: u64) -> Option<(bool, Vec<u8>)> {
     loop {
-        wait(&[ch])?;
+        wait_until(&[ch], deadline)?;
         match recv(ch) {
             Ok(Some((_, rid, err, body))) if rid == request_id => return Some((err, body)),
             Ok(_) => continue,

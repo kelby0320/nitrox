@@ -1132,6 +1132,50 @@ auth = "password"
         assert_eq!(p.rows_for("carol"), []);
     }
 
+    /// **A listing says what `decide` would** (administration Part F.3). The desktop reads the
+    /// person's listing with `libviews::access` and refuses a Restart or a Shut down from it before
+    /// asking a window to close, so a listing read as "allowed" where the broker would ask for a
+    /// password would cost a person their windows and then refuse them anyway. Every principal, view
+    /// and program, over the seed and a policy whose rules overlap: one listing the same view twice,
+    /// the first not running the program and the second running it without a password.
+    #[test]
+    fn a_listing_says_what_decide_would() {
+        const OVERLAP: &str = "[profile.admin]\ngrants = [\"disks\"]\n[profile.power]\ngrants = [\"power\"]\n\
+            [[rule]]\nwho = [\"alice\"]\nuse = [\"power\", \"admin\"]\nrun = [\"date\"]\nauth = \"password\"\n\
+            [[rule]]\nwho = [\"*\"]\nuse = [\"power\"]\nrun = [\"shutdown\", \"date\"]\nauth = \"none\"\n\
+            [[rule]]\nwho = [\"bob\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
+        let mut kinds = [0usize; 3];
+        for text in [SEED, OVERLAP] {
+            let p = parse(text).unwrap();
+            for who in ["alice", "bob", "carol"] {
+                let rows: Vec<libviews::Row> = p
+                    .rows_for(who)
+                    .into_iter()
+                    .map(|(view, run, password)| libviews::Row { view, run, password })
+                    .collect();
+                for view in ["admin", "power", "install", "absent"] {
+                    for program in ["shutdown", "date", "nxinstall", "disk"] {
+                        let listed = libviews::access(&rows, view, program);
+                        let kind = match p.decide(who, view, program) {
+                            Decision::Allow { auth: Auth::None, .. } => 0,
+                            Decision::Allow { auth: Auth::Password, .. } => 1,
+                            Decision::Deny(_) => 2,
+                        };
+                        kinds[kind] += 1;
+                        let agrees = match listed {
+                            libviews::Access::Allowed => kind == 0,
+                            libviews::Access::Password => kind == 1,
+                            libviews::Access::Refused(_) => kind == 2,
+                        };
+                        assert!(agrees, "{who} {view} {program}: the listing says {listed:?}, decide {kind}");
+                    }
+                }
+            }
+        }
+        // Each answer came up, so no arm of the comparison passed by never being reached.
+        assert!(kinds.iter().all(|&n| n > 0), "{kinds:?}");
+    }
+
     /// **The guard at its neighbours.** Only a profile granting `views`, with `run = ["*"]`, for
     /// someone makes an administrator; one step away on each axis does not. Every case parses, so
     /// an empty answer is the guard's and not the reader's.

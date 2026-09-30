@@ -5,7 +5,8 @@
 **Built, and checked 2026-09-29** — Milestone 7 (Parts A–F). Graduated from `design/` on 2026-08-25,
 revision 2. On 2026-09-29 administration Part E.4c made both supervisors and their leaders end when
 a shutdown asks (§4), and Part F.1 had `desktop-shell` build applications' namespaces with
-`libsession`, which gave them `/session/user` (§6), and Part F.2 a way to log out (§4). On
+`libsession`, which gave them `/session/user` (§6), Part F.2 a way to log out (§4), and Part F.3
+a way to restart or shut the machine down from the desktop, through the view broker (§4). On
 2026-09-28 administration Part E.1a moved the servers from `init`'s children to `service-mgr`'s
 (§3's diagram), and Part E.1b handed the supervisors `service-mgr`'s routes to them in place of the
 servers' own endpoints. On 2026-09-25 administration Part D.1 made `auth-service` the user
@@ -326,6 +327,12 @@ one asks — naming what is left in a dialog with End anyway and Cancel — and 
 left. The supervisor then does what it does at any session's end, and presents the greeter again:
 the first way to end a graphical session and leave the machine running. See
 [`desktop-shell.md`](desktop-shell.md) §4b.
+
+**Restart and Shut down end the machine from the same menu** (administration Part F.3). The windows
+close as for Log out; then `desktop-shell` asks the view broker for `shutdown` in the `power` view,
+as `with power shutdown` does, handing it an application's namespace rather than the session's.
+The shutdown that follows is the one above, arriving at a leader with nothing left open, which
+exits at once — so the session's end, seen from the supervisor, is a shutdown's, not a logout's.
 
 **Step 1 is not a trivial difference.** `session-mgr` opens its prompt's `Tty` the way any
 program does, and closes it at session end as the revocation point. `desktop-session-mgr` must be

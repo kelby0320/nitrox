@@ -2433,7 +2433,15 @@ and the session would end with the editor's process left to notice (*Left alone*
         5. Log out again, and **Don't save** in the editor: the greeter comes back;
         6. log in again, open a terminal, Log out: nothing to ask, and the greeter comes back at
            once.
-- [ ] **F.3 — Restart and Shut down.**
+- [x] **F.3 — Restart and Shut down.** *(Landed 2026-09-29. Four things differ from the text
+      below. **A refusal the listing predicts comes before any window is asked**: `desktop-shell`
+      reads the person's `List` and applies the broker's rule to it (`libviews::access`, held to
+      `decide` by the broker's tests), so a password policy does not cost a person their windows.
+      **The library is `libviews`**, and `coreutils::ipc` moved into it. **`check-logout` has nine
+      steps in three boots**: F.2's typed shutdown became `with power shutdown --reboot`, so the
+      halt can come last. And **End anyway had asked its window again**: a destroyed window is
+      listed until the compositor gets to it, and `Closing` took it for a new one — the first End
+      anyway a gate pressed found it.)*
       - The Views client's round trip moves out of `with` into a library `desktop-shell` reaches.
       - The two rows, each through the broker's `power` view after the windows are closed; a
         refusal shown in a dialog, and a request for a password refused naming the graphical

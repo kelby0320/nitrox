@@ -78,6 +78,7 @@ dependencies = [
  "libstream",
  "libtime",
  "libusers",
+ "libviews",
 ]
 
 [[package]]
@@ -109,6 +110,7 @@ dependencies = [
  "libsurface",
  "libtime",
  "libui",
+ "libviews",
 ]
 
 [[package]]
@@ -316,6 +318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libviews"
+version = "0.1.0"
+dependencies = [
+ "libfs",
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "logging-service"
 version = "0.1.0"
 dependencies = [
@@ -505,4 +516,5 @@ dependencies = [
  "libsession",
  "libstream",
  "libusers",
+ "libviews",
 ]

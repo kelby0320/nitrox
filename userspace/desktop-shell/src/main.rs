@@ -90,8 +90,8 @@ use desktop_shell::{
     Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop,
     parse_entry,
 };
-use desktop_shell::ending::{Asked, Closing, Ending, Next};
-use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, TopMsg};
+use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
+use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
 use libui::window::Child;
 use libui::paint::{FontMetrics, Theme, paint_over};
@@ -1486,9 +1486,10 @@ const MAX_LOGGED_THEME_ISSUES: usize = 8;
 const CASCADE_STEP: i32 = 24;
 
 /// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
-/// sessions, and the notification channel, where a shutdown's terminate request arrives
-/// (administration Part E.4c).
-static mut WAIT_HANDLES: [u64; 4 + MAX_DESKTOP_SESSIONS] = [0; 4 + MAX_DESKTOP_SESSIONS];
+/// sessions, the notification channel, where a shutdown's terminate request arrives
+/// (administration Part E.4c), and the view broker's while a Restart or a Shut down it started
+/// runs (Part F.3).
+static mut WAIT_HANDLES: [u64; 5 + MAX_DESKTOP_SESSIONS] = [0; 5 + MAX_DESKTOP_SESSIONS];
 /// The shell's notification channel: set once at startup, and waited on with the rest.
 static mut SHELL_NOTIF: u64 = 0;
 /// Where [`stop_asked`] reads a notification.
@@ -1505,8 +1506,8 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// Every other server in this tree already sizes it this way (`compositor`,
 /// `logging-service`, `fs-server-ext4`); `session-mgr` waits on exactly one handle, where one
 /// record is right. Found by the PR #257 reviewer while reading something else.
-static mut WAIT_RESULTS: [u8; 24 * (4 + MAX_DESKTOP_SESSIONS)] =
-    [0; 24 * (4 + MAX_DESKTOP_SESSIONS)];
+static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] =
+    [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
@@ -1998,6 +1999,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // dialog naming what is left. `Closing` decides what happens; this loop asks and draws.
     let mut closing: Option<Closing> = None;
     let mut ending_win: Option<Child> = None;
+    // **A Restart or a Shut down asked for** (administration Part F.3): the view broker's channel
+    // while `shutdown` runs, and what it is for. The terminate request `service-mgr`'s sequence
+    // then sends is what ends this shell; the channel is how a `shutdown` that failed is heard.
+    let mut powering: Option<(u64, Ending)> = None;
+    // **Why one did not happen**, while the dialog saying so is up.
+    let mut refused: Option<(Child, Ending, Refusal)> = None;
     // Where that dialog hangs: right-aligned under the power button, as the power menu does, so it
     // never covers a question an application centred on its own window.
     let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
@@ -2059,6 +2066,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // window not asked yet — every one the first time, and one opened while the end waits — and
         // do what `Closing` says, which may be a deadline of its own.
         let mut ending_deadline = u64::MAX;
+        let mut ended = None;
         if let Some(c) = closing.as_mut() {
             if let Some(m) = manager.as_mut() {
                 let windows: alloc::vec::Vec<(u32, alloc::string::String)> =
@@ -2077,8 +2085,21 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     if let Some(d) = ending_win.take() {
                         d.close(&mut session);
                     }
-                    end_session(asked);
+                    ended = Some(asked);
                 }
+            }
+        }
+        // **Every window is gone.** Log out and a stop end the shell here; Restart and Shut down ask
+        // the view broker for `shutdown`, and the shell goes on until `service-mgr`'s sequence asks
+        // it to stop — or says why not, and the session goes on without its windows.
+        if let Some(asked) = ended {
+            closing = None;
+            match asked {
+                Asked::Person(e) if e.power_args().is_some() => match ask_to_power(&launcher, e) {
+                    Ok(ch) => powering = Some((ch, e)),
+                    Err(r) => show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font),
+                },
+                _ => end_session(asked),
             }
         }
         let deadline =
@@ -2111,6 +2132,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 WAIT_HANDLES[n as usize] = SHELL_NOTIF;
                 n += 1;
             }
+            if let Some((ch, _)) = powering {
+                WAIT_HANDLES[n as usize] = ch;
+                n += 1;
+            }
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
@@ -2131,8 +2156,43 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 if let Some(d) = ending_win.take() {
                     d.close(&mut session);
                 }
+                if let Some((d, _, _)) = refused.take() {
+                    d.close(&mut session);
+                }
                 kprint(b"desktop-shell: asked to stop; asking every window to close first\n");
                 closing = Some(Closing::begin(Asked::Stop, now));
+            }
+        }
+        // **What became of a Restart or a Shut down asked for** (administration Part F.3), unless
+        // the stop it was for has come. `shutdown` exits once `service-mgr` has begun, so a clean
+        // exit is only that; anything else did not happen, and the dialog says so.
+        if let Some((ch, e)) = powering
+            && !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop))
+        {
+            let heard = match libviews::ipc::recv(ch) {
+                Ok(Some((librsproto::views::OP_VIEWS_EXITED, _, _, body))) => {
+                    let (code, crashed) = librsproto::views::parse_exited(&body).unwrap_or((1, true));
+                    Some((code == 0 && !crashed).then_some(()).ok_or_else(|| Refusal::exited(code, crashed)))
+                }
+                Ok(_) => None,
+                Err(()) => Some(Err(Refusal::Failed(alloc::string::String::from(failed::BROKER_GONE)))),
+            };
+            match heard {
+                None => {}
+                Some(Ok(())) => {
+                    libviews::ipc::close(ch);
+                    powering = None;
+                    Line::new()
+                        .s(b"desktop-shell: ")
+                        .s(e.title().as_bytes())
+                        .s(b" has begun; waiting to be asked to stop")
+                        .end();
+                }
+                Some(Err(r)) => {
+                    libviews::ipc::close(ch);
+                    powering = None;
+                    show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font);
+                }
             }
         }
         // **Drained before the compositor's events**, so a `Switch` that changes what the bar
@@ -2175,6 +2235,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 prompt.as_ref().map_or(0, |c| c.id()),
                 wallpaper_window,
                 ending_win.as_ref().map_or(0, |c| c.id()),
+                refused.as_ref().map_or(0, |(c, _, _)| c.id()),
             ];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
@@ -2624,16 +2685,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             launcher.launch(FOLDER_OPENER, &[p.path.as_str()]);
                         }
                     }
-                    // **The power menu** (administration Part F.2): begin ending the session. The
-                    // loop's top asks the windows and waits; a second choice while one is under
-                    // way changes nothing.
+                    // **The power menu** (administration Parts F.2 and F.3): begin ending the
+                    // session. The loop's top asks the windows and waits; a second choice while one
+                    // is under way, or while a Restart or a Shut down is, changes nothing.
+                    //
+                    // **A Restart or a Shut down the policy would refuse is refused here**, before a
+                    // window is asked to close: found after the windows had gone, the refusal would
+                    // have cost the person them for nothing.
                     Some(MenuMsg::End(ending)) => {
-                        if closing.is_none() {
-                            Line::new()
-                                .s(b"desktop-shell: ending the session: ")
-                                .s(panel::ending_title(ending).as_bytes())
-                                .end();
-                            closing = Some(Closing::begin(Asked::Person(ending), now_ns().unwrap_or(0)));
+                        if closing.is_none() && powering.is_none() {
+                            if let Some((d, _, _)) = refused.take() {
+                                d.close(&mut session);
+                            }
+                            Line::new().s(b"desktop-shell: ending the session: ").s(ending.title().as_bytes()).end();
+                            let refusal = ending.power_args().and_then(|_| power_refusal(session_ns));
+                            match refusal {
+                                Some(r) => show_refusal(
+                                    &mut session, &mut refused, ending, r, window, ending_anchor, &theme, &font,
+                                ),
+                                None => closing = Some(Closing::begin(Asked::Person(ending), now_ns().unwrap_or(0))),
+                            }
                         }
                     }
                     Some(MenuMsg::Nothing) | None => {}
@@ -2691,6 +2762,35 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         }
                     }
                     Some(EndingMsg::Nothing) | None => {}
+                }
+                continue;
+            }
+            // **The refusal's own input** (administration Part F.3): Close, the frame's close,
+            // Escape, Enter, or a press elsewhere — it is a report, and there is nothing to decide.
+            if refused.as_ref().map(|(c, _, _)| c.id()) == Some(w) {
+                let mut close_it = matches!(event, libsurface::WindowEvent::Dismissed);
+                match &event {
+                    libsurface::WindowEvent::Key(k)
+                        if k.pressed != 0 && (k.keycode == KEY_ESC || k.keycode == KEY_ENTER) =>
+                    {
+                        close_it = true;
+                    }
+                    libsurface::WindowEvent::Pointer(_) => {
+                        if let Some((d, e, r)) = refused.as_mut() {
+                            let view = panel::refusal_dialog(*e, r, d.hovered_key(), &theme);
+                            let chose = d.route(&view, &font, &theme, &event).first().copied();
+                            close_it = chose == Some(RefusalMsg::Close);
+                            if chose.is_none() {
+                                let view = panel::refusal_dialog(*e, r, d.hovered_key(), &theme);
+                                d.present(&mut session, &view, &font, &theme);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if close_it && let Some((d, _, _)) = refused.take() {
+                    d.close(&mut session);
+                    kprint(b"desktop-shell: refusal dialog closed\n");
                 }
                 continue;
             }
@@ -5204,7 +5304,8 @@ fn show_ending_dialog(
 
 /// **The session ends** (administration Part F.2), every window closed or ended anyway: the shell
 /// exits, and `desktop-session-mgr` does the rest — tells the broker, closes the namespace, and
-/// presents the greeter. A stop exits as it always has (E.4c).
+/// presents the greeter. A stop exits as it always has (E.4c). Restart and Shut down do not come
+/// here: they ask the broker, and a stop follows ([`ask_to_power`]).
 fn end_session(asked: Asked) -> ! {
     if asked == Asked::Stop {
         stop();
@@ -5215,6 +5316,131 @@ fn end_session(asked: Asked) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// **How long the shell waits for the view broker** before calling it gone. It answers a listing or
+/// a request at once — a request's program is spawned, not waited for — and the shell has a
+/// screen to keep answering, so this bounds only a broker that has stopped.
+const BROKER_WAIT_NS: u64 = 5_000_000_000;
+
+/// When a wait on the broker begun now gives up.
+fn broker_deadline() -> u64 {
+    now_ns().map_or(u64::MAX, |n| n.saturating_add(BROKER_WAIT_NS))
+}
+
+/// **Whether this session's policy would refuse a Restart or a Shut down** (administration Part
+/// F.3), read off the person's listing before any window is asked to close: `libviews::access` is
+/// the broker's own rule applied to it. `None` to go on. The request after the windows close is
+/// still what decides.
+fn power_refusal(session_ns: u64) -> Option<Refusal> {
+    let ch = libviews::broker(session_ns);
+    if ch == 0 {
+        return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
+    }
+    let rows = libviews::list(ch, broker_deadline());
+    libviews::ipc::close(ch);
+    match rows {
+        Ok(rows) => Refusal::from_access(libviews::access(&rows, POWER_VIEW, POWER_PROGRAM)),
+        Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
+    }
+}
+
+/// **Ask the view broker for `shutdown`** (administration Part F.3), the windows gone: in the
+/// `power` view, `--reboot` for Restart, as `with power shutdown` asks — the same request, from
+/// `libviews`. The broker's channel while `shutdown` runs, or why it is not running.
+///
+/// **An application's namespace goes to the broker, not this shell's.** The session's binds
+/// `/dev/draw` whole and so reaches `manage`; a view derived from it would hand `shutdown` that too.
+/// F.1's builder makes the one an application gets, which reaches `/dev/draw/new` alone.
+///
+/// **A password is not asked for**: the desktop has no prompt to ask with, so the channel is
+/// closed — the broker's cue to drop the request — and the refusal says so.
+fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
+    use libviews::Outcome;
+    let failure = |why: &str| Refusal::Failed(alloc::string::String::from(why));
+    let ch = libviews::broker(l.session_ns);
+    if ch == 0 {
+        return Err(failure(failed::NO_BROKER));
+    }
+    let Some(built) = build_app_namespace(l) else {
+        libviews::ipc::close(ch);
+        return Err(failure(failed::NO_NAMESPACE));
+    };
+    // **Verified as a launch's is**, by the process that built it: that `shutdown`'s view cannot
+    // reach `manage` rests on the same narrow bind.
+    let (home, desktop, devices, storage, user) =
+        (!l.home.is_empty(), l.desktop != 0, l.devices != 0, l.storage != 0, !l.user.is_empty());
+    if !verify_app_namespace(built.ns, home, desktop, devices, storage, user) {
+        libviews::ipc::close(built.ns);
+        libviews::ipc::close(ch);
+        kprint(b"desktop-shell: application namespace is not gated; not asking the broker\n");
+        return Err(failure(failed::NO_NAMESPACE));
+    }
+    let args = ending.power_args().unwrap_or(&[]);
+    let handed = libviews::Handed { ns: built.ns, ..libviews::Handed::default() };
+    let refusal = match libviews::request(ch, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
+        Ok((Outcome::Started, _)) => {
+            Line::new()
+                .s(b"desktop-shell: ")
+                .s(ending.title().as_bytes())
+                .s(b": the broker started ")
+                .s(POWER_PROGRAM.as_bytes())
+                .s(b" in the ")
+                .s(POWER_VIEW.as_bytes())
+                .s(b" view")
+                .end();
+            return Ok(ch);
+        }
+        Ok((Outcome::NeedPassword, _)) => Refusal::Password,
+        Ok((Outcome::Denied { .. }, why)) => Refusal::Refused(why),
+        Err(f) => failure(f.why()),
+    };
+    libviews::ipc::close(ch);
+    Err(refusal)
+}
+
+/// **Say why a Restart or a Shut down did not happen** (administration Part F.3): on the console,
+/// and in a dialog hung where the waiting dialog is, under the power button, replacing any refusal
+/// already up. Its origin is logged, as the waiting dialog's is.
+#[allow(clippy::too_many_arguments)]
+fn show_refusal(
+    session: &mut Session<ChannelTransport>,
+    slot: &mut Option<(Child, Ending, Refusal)>,
+    ending: Ending,
+    refusal: Refusal,
+    parent: u32,
+    at: (i32, i32),
+    theme: &Theme,
+    font: &Font,
+) {
+    // Escaped: a broker's reason can quote the policy's own text back.
+    Line::new()
+        .s(b"desktop-shell: ")
+        .s(ending.title().as_bytes())
+        .s(b" ")
+        .untrusted(refusal.log().as_bytes())
+        .end();
+    if let Some((d, _, _)) = slot.take() {
+        d.close(session);
+    }
+    let view = panel::refusal_dialog(ending, &refusal, None, theme);
+    let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
+        kprint(b"desktop-shell: refusal dialog CreateWindow FAILED\n");
+        return;
+    };
+    if !d.present(session, &view, font, theme) {
+        d.close(session);
+        return;
+    }
+    Line::new()
+        .s(b"desktop-shell: refusal dialog open, window ")
+        .u(d.id() as u64)
+        .s(b" at ")
+        .i(at.0 as i64)
+        .s(b",")
+        .i(at.1 as i64)
+        .end();
+    *slot = Some((d, ending, refusal));
 }
 
 /// Open the desktop-name prompt: above the bottom bar's right-hand end, where the desktop's name

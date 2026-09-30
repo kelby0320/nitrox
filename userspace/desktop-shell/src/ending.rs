@@ -11,16 +11,125 @@
 //!
 //! The binary owns the windows and the requests; this owns the decisions: what is still open, when
 //! the dialog comes up, what it says, and when the session may end.
+//!
+//! **Restart and Shut down** (Part F.3) end the same way, and then ask the view broker for
+//! `shutdown` in the `power` view, as `with power shutdown` does: [`Ending::power_args`] is what
+//! they ask for, and a [`Refusal`] what the dialog says when it does not happen.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// What ending the session is for. Restart and Shut down join it in F.3.
+/// What ending the session is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ending {
     /// The shell exits once its windows are gone, and the greeter comes back.
     LogOut,
+    /// **The machine restarts** (Part F.3): once the windows are gone the shell asks the view
+    /// broker for `shutdown --reboot` in the [`POWER_VIEW`], and `service-mgr`'s sequence then ends
+    /// every session, this one included.
+    Restart,
+    /// **The machine stops**: `shutdown` in the [`POWER_VIEW`], the same way.
+    ShutDown,
+}
+
+/// The view Restart and Shut down ask for: the seeded policy lets anyone run `shutdown` in it, with
+/// no password.
+pub const POWER_VIEW: &str = "power";
+
+/// The program they ask to run there.
+pub const POWER_PROGRAM: &str = "shutdown";
+
+impl Ending {
+    /// What the power menu's row, the dialogs' titles and the log call it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Ending::LogOut => "Log out",
+            Ending::Restart => "Restart",
+            Ending::ShutDown => "Shut down",
+        }
+    }
+
+    /// **What it asks the view broker to run once the windows are gone**: [`POWER_PROGRAM`]'s
+    /// arguments, or `None` for Log out, which asks nobody.
+    pub fn power_args(self) -> Option<&'static [&'static str]> {
+        match self {
+            Ending::LogOut => None,
+            Ending::Restart => Some(&["--reboot"]),
+            Ending::ShutDown => Some(&[]),
+        }
+    }
+}
+
+/// **Why a Restart or a Shut down did not happen** (Part F.3), which a dialog says.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    /// **The policy asks for the person's password, and the desktop has no prompt to ask with.**
+    /// Refused rather than asked for in some other way: the graphical prompt's design says what one
+    /// must guarantee (`docs/design/graphical-prompt.md`), and this is its trigger firing.
+    Password,
+    /// The policy said no, or the broker did: its reason.
+    Refused(String),
+    /// Nothing said no, and it did not happen: why.
+    Failed(String),
+}
+
+/// **Why a Restart or a Shut down did not happen when nothing refused it**, as the dialog says —
+/// here, where the tests that check they fit it can see them.
+pub mod failed {
+    /// The session's namespace has no `/dev/views`.
+    pub const NO_BROKER: &str = "this session has no view broker";
+    /// The application-shaped namespace the request hands the broker could not be built.
+    pub const NO_NAMESPACE: &str = "no namespace could be built to ask from";
+    /// The broker's channel closed while `shutdown` ran.
+    pub const BROKER_GONE: &str = "the view broker went away";
+}
+
+impl Refusal {
+    /// **`shutdown` ran and did not start a shutdown**: it exited with `code`, or `crashed`. Its
+    /// own reason is on the console; the desktop hands it no stream to say it on.
+    pub fn exited(code: i32, crashed: bool) -> Refusal {
+        Refusal::Failed(if crashed {
+            String::from("shutdown crashed")
+        } else {
+            format!("shutdown stopped with status {code}")
+        })
+    }
+
+    /// What a listing's [`libviews::Access`] means for a Restart or a Shut down: `None` to go on.
+    pub fn from_access(access: libviews::Access) -> Option<Refusal> {
+        match access {
+            libviews::Access::Allowed => None,
+            libviews::Access::Password => Some(Refusal::Password),
+            libviews::Access::Refused(why) => Some(Refusal::Refused(why)),
+        }
+    }
+
+    /// **The dialog's two lines**: that `ending` did not happen, and why — in `libui`'s fixed
+    /// question, like the waiting dialog's. A password's says where one can be asked for.
+    pub fn lines(&self, ending: Ending) -> (String, String) {
+        match self {
+            Refusal::Password => (
+                String::from("The policy asks for your password, which"),
+                String::from("only a terminal can ask for yet."),
+            ),
+            Refusal::Refused(why) => (format!("{} was refused:", ending.title()), why.clone()),
+            Refusal::Failed(why) => (format!("{} did not happen:", ending.title()), why.clone()),
+        }
+    }
+
+    /// What the console says after the title: whether it was refused, and why — a password's
+    /// naming the prompt whose trigger it is.
+    pub fn log(&self) -> String {
+        match self {
+            Refusal::Password => String::from(
+                "refused: the policy asks for a password, and the desktop has no graphical prompt yet \
+                 (the trigger in docs/design/graphical-prompt.md)",
+            ),
+            Refusal::Refused(why) => format!("refused: {why}"),
+            Refusal::Failed(why) => format!("did not happen: {why}"),
+        }
+    }
 }
 
 /// Who asked for the session to end, which decides how long it waits and whether it asks.
@@ -54,6 +163,9 @@ pub struct Closing {
     asked: Asked,
     /// Each window asked to close and still open, and its title as the dialog names it.
     open: Vec<(u32, String)>,
+    /// **The windows ended anyway**, which the compositor destroys when it gets to it: listed until
+    /// then, and neither asked again nor waited for.
+    ended: Vec<u32>,
     /// When it began, on the monotonic clock.
     began: u64,
     /// Whether the dialog is up.
@@ -82,7 +194,7 @@ impl Closing {
     /// An end asked for by `asked`, beginning at `now`. Nothing is open until the first
     /// [`sync`](Self::sync), which returns every window to ask.
     pub fn begin(asked: Asked, now: u64) -> Closing {
-        Closing { asked, open: Vec::new(), began: now, dialog: false, changed: false }
+        Closing { asked, open: Vec::new(), ended: Vec::new(), began: now, dialog: false, changed: false }
     }
 
     /// Who asked.
@@ -97,9 +209,10 @@ impl Closing {
     pub fn sync(&mut self, windows: &[(u32, String)]) -> Vec<u32> {
         let before = self.open.len();
         self.open.retain(|(id, _)| windows.iter().any(|(w, _)| w == id));
+        self.ended.retain(|id| windows.iter().any(|(w, _)| w == id));
         let mut changed = self.open.len() != before;
         let mut fresh = Vec::new();
-        for (id, title) in windows {
+        for (id, title) in windows.iter().filter(|(id, _)| !self.ended.contains(id)) {
             match self.open.iter_mut().find(|(o, _)| o == id) {
                 Some((_, t)) if t != title => {
                     *t = title.clone();
@@ -166,9 +279,15 @@ impl Closing {
 
     /// **End anyway**: the windows still open, which the caller destroys (`Manage::Close`), and
     /// nothing left to wait for — the next [`next`](Self::next) is [`Next::End`].
+    ///
+    /// **Remembered, since a destroy is not immediate**: the windows are still listed on the next
+    /// [`sync`](Self::sync), and one taken for a window opened while the end waited would be asked
+    /// again and named by the dialog, which is what `check-logout`'s first End anyway found
+    /// (administration Part F.3).
     pub fn end_anyway(&mut self) -> Vec<u32> {
-        let ids = self.open.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<u32> = self.open.iter().map(|(id, _)| *id).collect();
         self.open.clear();
+        self.ended.extend_from_slice(&ids);
         ids
     }
 }
@@ -244,6 +363,12 @@ mod tests {
         assert_eq!(c.next(T0 + DIALOG_AFTER_NS), Next::Dialog);
         assert_eq!(c.end_anyway(), vec![9]);
         assert_eq!(c.next(T0 + DIALOG_AFTER_NS + 1), Next::End(Asked::Person(Ending::LogOut)));
+        // **Still listed until the compositor has destroyed it**, and neither asked again nor
+        // waited for — while a window opened since is.
+        assert_eq!(c.sync(&windows(&[(9, "notes.txt")])), Vec::<u32>::new());
+        assert_eq!(c.next(T0 + DIALOG_AFTER_NS + 2), Next::End(Asked::Person(Ending::LogOut)));
+        assert_eq!(c.sync(&windows(&[(9, "notes.txt"), (12, "later")])), vec![12]);
+        assert_eq!(c.question().1, "later");
     }
 
     /// **A stop waits 3 s, and never asks**: no dialog however long it waits, and the end at the
@@ -259,6 +384,34 @@ mod tests {
         // **Inside the leader's bound, with a second to spare**, which is the whole reason for the
         // number: the supervisor's clock starts before the shell hears of the stop.
         assert!(STOP_WAIT_NS + 1_000_000_000 <= libsession::LEADER_STOP_NS);
+    }
+
+    /// **Restart and Shut down ask for `shutdown`, and Log out asks nobody**; Restart's is the
+    /// reboot. A row that asked for nothing would end the session and leave the machine running.
+    #[test]
+    fn restart_and_shut_down_ask_for_shutdown_and_log_out_asks_nobody() {
+        assert_eq!(Ending::LogOut.power_args(), None);
+        assert_eq!(Ending::Restart.power_args(), Some(&["--reboot"][..]));
+        assert_eq!(Ending::ShutDown.power_args(), Some(&[][..]));
+        assert_eq!((POWER_VIEW, POWER_PROGRAM), ("power", "shutdown"));
+    }
+
+    /// **What a listing means**: allowed goes on; a password, or a refusal, is said before a window
+    /// is asked to close — each in its own words.
+    #[test]
+    fn a_listing_that_would_not_start_it_is_a_refusal() {
+        assert_eq!(Refusal::from_access(libviews::Access::Allowed), None);
+        assert_eq!(Refusal::from_access(libviews::Access::Password), Some(Refusal::Password));
+        let why = String::from("no rule lets you use `power`");
+        assert_eq!(Refusal::from_access(libviews::Access::Refused(why.clone())), Some(Refusal::Refused(why.clone())));
+        assert_eq!(
+            Refusal::Refused(why.clone()).lines(Ending::ShutDown),
+            (String::from("Shut down was refused:"), why)
+        );
+        assert_eq!(Refusal::Failed(String::from("x")).lines(Ending::Restart).0, "Restart did not happen:");
+        // **The password's refusal names the prompt's trigger** on the console, where the design
+        // doc's reader will look for it.
+        assert!(Refusal::Password.log().contains("docs/design/graphical-prompt.md"));
     }
 
     /// **The dialog names two and counts the rest**, at the bound and past it.

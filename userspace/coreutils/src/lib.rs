@@ -24,7 +24,6 @@
 extern crate alloc;
 
 pub mod args;
-pub mod ipc;
 pub mod prompt;
 pub mod stage;
 /// Calendar arithmetic and duration parsing.

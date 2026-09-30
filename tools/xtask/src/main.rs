@@ -4551,6 +4551,15 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
     // **And the screen says so**, read with the kernel console's own glyphs: the laptop has no
     // COM1. The machine is halted, so the frame is still.
     let mut qmp = Qmp::connect(qmp_sock)?;
+    expect_safe_on_screen(&mut qmp, dump)?;
+    println!("  ok: the screen, read back as text, ends in the message");
+    Ok(())
+}
+
+/// **A halted machine's screen ends in "It is now safe to turn off your computer."**, read back
+/// as text with the kernel console's own glyphs and layout (`check-fbcon`'s decoder) — what a
+/// person sees on a machine with no serial port. `check-shutdown` and `check-logout` read it.
+fn expect_safe_on_screen(qmp: &mut Qmp, dump: &Path) -> R<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         qmp.screendump(dump)?;
@@ -4558,7 +4567,7 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
         let frame = Frame::read(w, h, &rgb);
         let last = frame.lines().iter().rev().find(|l| !l.is_empty()).map(|l| l.to_string());
         if frame.is_console() && last.as_deref() == Some("It is now safe to turn off your computer.") {
-            break;
+            return Ok(());
         }
         if std::time::Instant::now() > deadline {
             return Err(format!(
@@ -4570,8 +4579,6 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    println!("  ok: the screen, read back as text, ends in the message");
-    Ok(())
 }
 
 /// **What a shutdown's COM1 must show**: the sessions ended when asked, every service stopped but
@@ -5340,13 +5347,25 @@ const STAGED_APPLICATIONS: usize = 3;
 /// 6. log in again, open a terminal, and Log out: **nothing to ask**, so no waiting dialog, and the
 ///    greeter comes back;
 /// 7. log in again, open the editor with a key typed into it and a terminal, and type
-///    `with power shutdown` there: **a shutdown started elsewhere asks the windows too** — the
-///    editor asks, no dialog comes, and the shell goes after its own 3 s, **inside its supervisor's
-///    5 s**, so no leader is left "still running after it was asked to stop"; then the machine
-///    halts. No other gate reaches this path: `check-shutdown` has no graphical session.
+///    `with power shutdown --reboot` there: **a shutdown started elsewhere asks the windows too** —
+///    the editor asks, no dialog comes, and the shell goes after its own 3 s, **inside its
+///    supervisor's 5 s**, so no leader is left "still running after it was asked to stop"; then the
+///    machine resets, and **a second boot's greeter** comes up. No other gate reaches this path:
+///    `check-shutdown` has no graphical session;
+/// 8. log in, open the editor with a key typed into it, and choose **Restart** (administration Part
+///    F.3): the editor asks, the waiting dialog names it, and **End anyway** destroys its window;
+///    then the shell asks the view broker for `shutdown --reboot` in the `power` view, `service-mgr`'s
+///    sequence asks the shell to stop, it goes at once with nothing left open, and **a third boot's
+///    greeter** comes up;
+/// 9. log in, and choose **Shut down**: nothing to ask, the broker starts `shutdown`, and the
+///    machine halts — "It is now safe to turn off your computer." **read off the screen** with
+///    `check-fbcon`'s decoder, as on the laptop, which has no serial port.
+///
+/// **Two resets and a halt in one QEMU run**, so it boots with a reset allowed to reboot — three
+/// boots, and the order is forced: the halt must be last.
 ///
 /// **Aimed, not measured**: the power button at `chrome::POWER_FROM_RIGHT` in from the right edge,
-/// the menu's row by the keyboard, and the dialogs' buttons at `chrome`'s published centres from
+/// the menu's rows by the keyboard, and the dialogs' buttons at `chrome`'s published centres from
 /// the origins the shell logs — the rule every screen gate here keeps (M11 decision 2).
 fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
@@ -5355,7 +5374,7 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     fs::create_dir_all(&work).ok();
     let qmp_sock = work.join("qmp-logout.sock");
     println!("xtask: logout gate — booting the release image…\n");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "check-logout", &qmp_sock, size)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-logout", &qmp_sock, size, true)?;
     const APPS_CLICK: (i32, i32) = (60, 12);
     let power_click = (size.w as i32 - chrome::POWER_FROM_RIGHT, 12);
 
@@ -5371,7 +5390,7 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: the editor is open (window {editor}) with something to lose");
 
     // 3. Log out: the editor asks, and the shell names it.
-    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
     let placed = session.rest_of_line()?;
@@ -5393,7 +5412,7 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: Cancel kept the session");
 
     // 5. Log out again, and discard: the greeter comes back.
-    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
     logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
     click_at(&mut qmp, &mut session, qx + chrome::DIALOG_LEFT_CX, qy + chrome::DIALOG_BUTTON_CY)?;
     session.expect("nxedit: discarding the unsaved buffer")?;
@@ -5405,7 +5424,7 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     // 6. Log in again; a terminal; Log out — nothing to ask.
     logout_gate_login(&mut qmp, &mut session, size)?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxterm")?;
-    logout_gate_choose(&mut qmp, &mut session, power_click)?;
+    logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
     let from = session.transcript().len();
     session.expect("desktop-shell: logging out, exiting")?;
     if session.transcript()[from..].contains("desktop-shell: waiting dialog open") {
@@ -5414,33 +5433,101 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-session-mgr: greeter presented again")?;
     println!("  ok: with nothing to ask, the session ended at once and the greeter came back");
 
-    // 7. A shutdown typed at a terminal, with the editor holding something to lose.
+    // 7. A restart typed at a terminal, with the editor holding something to lose.
     logout_gate_login(&mut qmp, &mut session, size)?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
     press(&mut qmp, "z")?;
     session.expect("nxedit: buffer rev 1")?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxterm")?;
-    type_at_terminal(&mut qmp, "with power shutdown")?;
+    type_at_terminal(&mut qmp, "with power shutdown --reboot")?;
     session.expect("desktop-shell: asked to stop; asking every window to close first")?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
-    // **To the halt, then read back**: a shell that outlived its supervisor's bound never says it is
-    // exiting before the machine stops, so waiting for that line would time out rather than say why.
+    // **To the reset, then read back**: a shell that outlived its supervisor's bound never says it
+    // is exiting before the machine goes, so waiting for that line would time out rather than say
+    // why.
     let from = session.transcript().len();
-    session.expect("It is now safe to turn off your computer.")?;
-    let after = &session.transcript()[from..];
+    session.expect(RESET)?;
+    let after = session.transcript()[from..].to_string();
     if after.contains("desktop-shell: waiting dialog open") {
         return Err("a shutdown started at a terminal brought up the waiting dialog".into());
     }
-    if after.contains("desktop-shell is still running after it was asked to stop")
-        || !after.contains("desktop-shell: asked to stop, exiting")
+    logout_gate_stopped_in_time(&after)?;
+    session.expect(BOOT_GREETER)?;
+    println!("  ok: a restart from a terminal asked the windows, waited without a dialog, and a second boot came up");
+
+    // 8. Restart from the desktop, with the editor holding something to lose: End anyway.
+    logout_gate_login(&mut qmp, &mut session, size)?;
+    logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
+    press(&mut qmp, "z")?;
+    session.expect("nxedit: buffer rev 1")?;
+    logout_gate_choose(&mut qmp, &mut session, power_click, RESTART)?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    let (wx, wy) = logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
+    // **Read back from the click**, not from the shell's line: `shutdown` runs as soon as the broker
+    // has spawned it, and can say it is restarting before the shell has heard it was started.
+    let from = session.transcript().len();
+    click_at(&mut qmp, &mut session, wx + chrome::DIALOG_LEFT_CX, wy + chrome::DIALOG_BUTTON_CY)?;
+    session.expect("desktop-shell: ending anyway, closing 1 window(s)")?;
+    session.expect("desktop-shell: Restart: the broker started shutdown in the power view")?;
+    session.expect(RESET)?;
+    let after = session.transcript()[from..].to_string();
+    for line in ["shutdown: restarting", "service-mgr: shutting down, to reboot, as asked"] {
+        if !after.contains(line) {
+            return Err(format!("the desktop's Restart reset the machine without `{line}`").into());
+        }
+    }
+    logout_gate_stopped_in_time(&after)?;
+    session.expect(BOOT_GREETER)?;
+    println!("  ok: Restart waited for the editor, ended it anyway, asked the broker, and a third boot came up");
+
+    // 9. Shut down from the desktop: the message, on the screen.
+    logout_gate_login(&mut qmp, &mut session, size)?;
+    let from = session.transcript().len();
+    logout_gate_choose(&mut qmp, &mut session, power_click, SHUT_DOWN)?;
+    session.expect("desktop-shell: Shut down: the broker started shutdown in the power view")?;
+    session.expect("It is now safe to turn off your computer.")?;
+    let after = session.transcript()[from..].to_string();
+    for line in ["shutdown: shutting down", "service-mgr: shutting down, as asked"] {
+        if !after.contains(line) {
+            return Err(format!("the desktop's Shut down halted the machine without `{line}`").into());
+        }
+    }
+    logout_gate_stopped_in_time(&after)?;
+    expect_safe_on_screen(&mut qmp, &build_cache().join("check-logout-halt.ppm"))?;
+    println!("  ok: Shut down asked the broker, and the screen, read back as text, says it is safe to turn off");
+    println!(
+        "\nxtask: logout gate PASSED — a logout waited for the editor's question, was cancelled, then \
+         ended; one with nothing to ask ended at once; a restart from a terminal asked the windows; \
+         and the desktop restarted the machine and shut it down ✓"
+    );
+    Ok(())
+}
+
+/// The power menu's rows, as `check-logout` chooses them: each by pressing Down that many times, so
+/// their order is `desktop-shell`'s `panel` test's, which pins it (M11 decision 2).
+const LOG_OUT: (&str, usize) = ("Log out", 1);
+/// See [`LOG_OUT`].
+const RESTART: (&str, usize) = ("Restart", 2);
+/// See [`LOG_OUT`].
+const SHUT_DOWN: (&str, usize) = ("Shut down", 3);
+
+/// What a reset says last on COM1, before the next boot's first line.
+const RESET: &str = "power: resetting through the FADT's reset register";
+
+/// **The greeter of a boot**, and not the one presented again after a logout, whose line begins the
+/// same way.
+const BOOT_GREETER: &str = "desktop-session-mgr: greeter presented,";
+
+/// **The shell went when asked, inside its supervisor's bound**, in the stretch of `transcript` a
+/// shutdown or a restart covered.
+fn logout_gate_stopped_in_time(transcript: &str) -> R<()> {
+    if transcript.contains("desktop-shell is still running after it was asked to stop")
+        || !transcript.contains("desktop-shell: asked to stop, exiting")
     {
         return Err(
             "the shell outlived its supervisor's bound: its own wait for the windows must end first".into(),
         );
     }
-    println!("  ok: a shutdown from a terminal asked the windows, waited without a dialog, and halted");
-    println!("\nxtask: logout gate PASSED — a logout waited for the editor's question, was cancelled, \
-              then ended; one with nothing to ask ended at once; and a shutdown asked the windows ✓");
     Ok(())
 }
 
@@ -5472,13 +5559,16 @@ fn logout_gate_launch(qmp: &mut Qmp, session: &mut Session, apps: (i32, i32), pr
     Ok(id)
 }
 
-/// Open the power menu at `power` and choose its first row, Log out, by the keyboard.
-fn logout_gate_choose(qmp: &mut Qmp, session: &mut Session, power: (i32, i32)) -> R<()> {
+/// Open the power menu at `power` and choose `row` — one of [`LOG_OUT`], [`RESTART`] and
+/// [`SHUT_DOWN`] — by the keyboard.
+fn logout_gate_choose(qmp: &mut Qmp, session: &mut Session, power: (i32, i32), row: (&str, usize)) -> R<()> {
     click_at(qmp, session, power.0, power.1)?;
     session.expect("desktop-shell: power menu open")?;
-    press(qmp, "down")?;
+    for _ in 0..row.1 {
+        press(qmp, "down")?;
+    }
     press(qmp, "ret")?;
-    session.expect("desktop-shell: ending the session: Log out")?;
+    session.expect(&format!("desktop-shell: ending the session: {}", row.0))?;
     Ok(())
 }
 
@@ -5803,7 +5893,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     let qmp_sock = work.join("qmp-login.sock");
 
     println!("xtask: graphical login gate — booting the release image…\n");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock, size)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock, size, false)?;
 
     // 0. **The AHCI controller took the MSI path in a *release* image.** `test-qemu` already
     //    adjudicates this (`check_ahci_msi_path`), but only for the selftest build — and the
@@ -10057,7 +10147,7 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     fs::create_dir_all(&work).ok();
     let dump = work.join("shot.ppm");
     let qmp_sock = work.join("qmp-shot.sock");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock, size)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock, size, false)?;
 
     // A closure would borrow both halves for the rest of the function, so the capture is a
     // statement each time — four lines, and no plumbing to read past.
@@ -10236,15 +10326,20 @@ fn placed_window(session: &mut Session) -> R<(i32, i32, u32, u32)> {
 
 /// Boot the **release** image headless with a QMP socket and the serial on stdio.
 ///
-/// Shared by `check-login` and `shot`, which are the two things that boot the image a person
+/// Shared by `check-login`, `check-logout` and `shot`, the things that boot the image a person
 /// would actually use — every other gate boots `--selftest`. The three that do build this
-/// command themselves and differ from each other in the image mode and the flags; these two are
-/// identical, and two identical copies of a boot are how the second one quietly stops matching.
+/// command themselves and differ from each other in the image mode and the flags; these are
+/// identical, and identical copies of a boot are how the second one quietly stops matching.
+///
+/// **`reboot` lets a reset reboot the guest** rather than end QEMU: `check-logout` restarts the
+/// machine twice and goes on in the boots that follow (administration Part F.3). Everything else
+/// keeps `-no-reboot`, so a guest that resets by accident ends the run rather than booting again.
 fn spawn_release_guest(
     accel: Accel,
     gate: &'static str,
     qmp_sock: &Path,
     size: DisplaySize,
+    reboot: bool,
 ) -> R<(Session, Qmp)> {
     let ovmf = locate_ovmf()?;
     // Removed rather than reused: a socket left by a killed run is a file `Qmp::connect` will
@@ -10266,10 +10361,12 @@ fn spawn_release_guest(
         .arg("chardev:hostserial")
         .arg("-smp")
         .arg("4")
-        .arg("-no-reboot")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    if !reboot {
+        cmd.arg("-no-reboot");
+    }
 
     let session = Session::spawn(cmd, gate)?;
     let mut qmp = Qmp::connect(qmp_sock)?;
@@ -13010,6 +13107,17 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libfs")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libviews` — the view broker's client (administration Part F.3): a request's handles in the
+    // order the broker takes them, and reading a listing for the answer a request would get. The
+    // agreement of that reading with the broker's own rule is `view-broker`'s test, above.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libviews")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

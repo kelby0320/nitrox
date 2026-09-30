@@ -31832,3 +31832,93 @@ second, and it did.
 The local gate set grows to 36 with `check-logout` and its `--kvm` run, and is green (fgb48).
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-29 — Administration Part F.3: Restart and Shut down
+
+The power menu gains **Restart** and **Shut down**, as destructive rows. Each ends the session the
+way Log out does — every window asked to close, the waiting dialog, End anyway and Cancel — and
+then asks the view broker for `shutdown`, `--reboot` for Restart, in the `power` view, with the
+request `with power shutdown` makes.
+
+**The pieces:**
+- **`libviews`, a new crate: the view broker's client.** The request was `with`'s own, in a
+  coreutil the desktop cannot reach; `userspace/CLAUDE.md`'s rule puts a helper with a second
+  consumer below both.
+  - It holds the request — its handles in the order the broker takes them, its body, the round
+    trip — with the password step and the listing. `coreutils::ipc`, the plumbing that scrubs
+    what a password passes through, moved in with it.
+  - **Waits can end.** `with` has nothing else to do while the broker thinks; the desktop has a
+    screen to keep answering, so it bounds a broker that has stopped at 5 s.
+  - **Every handle a request carries is gone when it returns**: sent, the broker's; not sent,
+    closed. `with` exits on a failure, so it never needed this; the shell lives on.
+- **A refusal before any window is asked**, which the plan did not have. Found after the windows
+  closed, a policy that refuses, or one that wants a password, would have cost the person their
+  windows — the editor's question included — for nothing.
+  - The shell reads the person's `List` first. Its rows are what `decide` reads, one per view per
+    rule in the policy's order, so the first row naming the view and the program is the rule that
+    decides. `libviews::access` is that reading.
+  - **The broker's tests hold it to `decide`**, over the seed and a policy whose rules overlap,
+    for every principal, view and program. A reading that took any passwordless row rather than
+    the first fails that test.
+  - The request after the windows close still decides, and a refusal then is shown too.
+- **The request hands the broker an application's namespace**, built with F.1's builder and
+  verified as a launch's is, rather than the session's, which reaches `manage`.
+  - On `Started` **the channel stays open**. A client channel that closes while its program runs
+    is a Stop, so closing it would stop `shutdown`.
+  - The shell then waits for its terminate request. An `Exited` of 0 means the shutdown has
+    begun; anything else is a refusal.
+  - A password is never answered: the channel closes, which drops the request.
+- **The refusal is a dialog**, a popup under the power button as the waiting dialog is.
+  - It uses `libui`'s fixed frame: two lines, and **Close** in the right half, where Cancel is.
+  - A password's reads "The policy asks for your password, which / only a terminal can ask for
+    yet." Its console line names the graphical prompt's trigger.
+  - A host test checks that every refusal the shell can say fits the frame, at both text sizes. A
+    longer line fails it.
+- **End anyway asked its window again**, which F.2 shipped and this part's gate found.
+  - A destroyed window is still listed until the compositor has got to it. The next `sync` took it
+    for a new one: it asked it to close again, was refused, and redrew the dialog naming it.
+  - `Closing` now remembers what it ended. F.2's host test ended a window and stopped there, and
+    F.2's gate never pressed End anyway.
+- **`desktop-shell`'s manifest said it took only `rebind_block_devices` from `libsession`**, which
+  F.1 made false. It is corrected.
+
+**`check-logout`**, now nine steps in three boots in one QEMU run:
+7. **F.2's typed shutdown is `with power shutdown --reboot` now**, because the halt must come
+   last. Its assertions are the same, and a second boot's greeter follows.
+8. **Restart**, with the editor holding something to lose: the waiting dialog names it, End
+   anyway, the broker starts `shutdown --reboot`, and a third boot's greeter.
+9. **Shut down**: the message on COM1, and read off the screen with `check-fbcon`'s decoder.
+   `check-shutdown`'s reader is shared now, as `expect_safe_on_screen`.
+
+`spawn_release_guest` takes `reboot`, which only this gate passes. **The first run read back from
+the shell's "started" line and missed `shutdown: restarting`.** `shutdown` can print that before
+the shell hears it was started, so the read-back now starts at the click. A restart also logs
+"shutting down, to reboot, as asked", not the halt's line.
+
+**Controls, each failing:**
+- **A Restart that asks for `shutdown` without `--reboot`** halts the machine, and step 8 times
+  out waiting for the reset.
+- **`access` reading any passwordless row**: the broker's agreement test.
+- **`Closing` without the memory of what it ended**: the End anyway test.
+- **A refusal line longer than the frame**: the fit test.
+
+**Not gated: a refusal.** The seeded policy never refuses, and a gate that installed another would
+be changing the release image it boots in place. The refusal is host-tested only.
+
+**Under TCG** the gate passes in 1m28s.
+
+**Docs:**
+- `desktop-shell.md` §4b, and its Status;
+- `graphical-session.md` §4, and its Status;
+- `views-toml-schema.md`: the desktop asks as `with` does;
+- `rsproto-views-ops.md`:
+  - the namespace a request sends is its sender's choice;
+  - a listing can be read for a decision;
+  - `libviews`;
+- `userspace/CLAUDE.md`'s layering;
+- the root `CLAUDE.md`'s `check-logout`, and `desktop-refresh.md`;
+- the plan, and `implementation-plan.md`, where F.1 and F.2 had not been recorded either.
+
+The local gate set stays at 36 and is green (fgb49).
+
+No kernel change; no ABI hash impact.

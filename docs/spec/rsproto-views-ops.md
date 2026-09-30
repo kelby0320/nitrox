@@ -1,7 +1,9 @@
 # rsproto — Views operations (`0x0Exx`)
 
-**Status: normative for what is built (2026-09-25).** Every op below is implemented in
-`userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`. Written with
+**Status: normative for what is built (2026-09-29).** Every op below is implemented in
+`userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`; the client half —
+`Request`, `Password` and `List`, and reading a listing for a decision — is
+`userspace/libviews/`, which `with`, `account` and `desktop-shell` share (Part F.3). Written with
 administration Part A.3; the policy endpoint, `Show` and `Install` since Part D.2; the accounts
 endpoint, its three ops, `Accounts` and `ChangePassword` since Part D.3. See
 [`administration.md`](../planning/administration.md) § *Part A in detail* for the design and why
@@ -85,9 +87,12 @@ Run a program in a view. Request body:
 | each argument | u16 length + bytes |
 | env | u32 length + a TSM1 `Record` ([typed-stream-format](typed-stream-format.md)), opaque to the codec |
 
-Transferred handles, in order: **a namespace** (always — a copy of the caller's own, from
-`sys_ns_derive`, since the one a process is spawned with cannot be transferred), then each stream
-whose bit is set, then the terminal. A count that disagrees with the bits is refused.
+Transferred handles, in order: **a namespace** (always), then each stream whose bit is set, then
+the terminal. A count that disagrees with the bits is refused. **The namespace is the one the view
+is built from**, and its sender chooses it: `with` sends a copy of its own, from `sys_ns_derive`,
+since the one a process is spawned with cannot be transferred; `desktop-shell`'s Restart and Shut
+down send an application's, which it built, so the view does not reach the window manager the
+session's does (Part F.3).
 
 Reply: an outcome — `NeedPassword` when the rule asks for one, `Started`, or `Denied` with the
 policy's reason. On `Started`:
@@ -138,6 +143,12 @@ Request: empty. Reply: a u16 row count, then per row: view (u16 length + bytes),
 (u16 length + bytes — `*`, or names separated by spaces), and a password flag (1 byte). What the
 session's principal may use, one row per view a rule lets them use, in the policy's order. A policy
 that does not read is an error reply (`InvalidArgument`).
+
+**A client can read a `Request`'s answer off it**: the first row naming the view whose programs
+include the program is the rule that decides, and its flag says whether a password is asked;
+none is a denial. `libviews::access` is that reading, and the broker's tests hold it to the
+broker's own. `desktop-shell` asks it before closing a window for a Restart or a Shut down (Part
+F.3); the `Request` still decides.
 
 ### `Check` (`0x0E07`) — client
 

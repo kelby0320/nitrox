@@ -34,7 +34,7 @@ use libui::widget::{
     dialog_frame, popup_frame, text_field, title_bar,
 };
 
-use crate::ending::Ending;
+use crate::ending::{Ending, Refusal};
 use crate::{Application, BAR_H, matches_app};
 
 /// The Applications menu's index in the bar's table — see [`menus`].
@@ -201,11 +201,20 @@ pub fn menus(
     alloc::vec![apps_menu(apps, query), places_menu(places, home, theme), power_menu()]
 }
 
-/// **The power menu** (administration Part F.2): ending the session. **Log out alone until F.3**,
-/// which adds Restart and Shut down — a row that does nothing is worse than none, the desktop
-/// refresh's rule.
+/// **The power menu** (administration Parts F.2 and F.3): ending the session, or the machine.
+/// **Restart and Shut down are destructive rows**, drawn in `deny`: they end every session on the
+/// machine, not just this one. Neither asks here — the windows are asked to close first, and the
+/// policy decides.
 pub fn power_menu() -> Menu<MenuMsg> {
-    Menu { title: "Power", items: alloc::vec![Item::plain("Log out", MenuMsg::End(Ending::LogOut))] }
+    let row = |e: Ending| Item::plain(e.title(), MenuMsg::End(e));
+    Menu {
+        title: "Power",
+        items: alloc::vec![
+            row(Ending::LogOut),
+            row(Ending::Restart).destructive(true),
+            row(Ending::ShutDown).destructive(true),
+        ],
+    }
 }
 
 /// The applications `query` matches, **keyed by index into the unfiltered list**.
@@ -340,13 +349,6 @@ pub const ENDING_END_KEY: u64 = 202;
 /// Its Cancel button's.
 pub const ENDING_CANCEL_KEY: u64 = 203;
 
-/// What the dialog's title says the session is ending for.
-pub fn ending_title(ending: Ending) -> &'static str {
-    match ending {
-        Ending::LogOut => "Log out",
-    }
-}
-
 /// **The waiting dialog** (administration Part F.2): what a session end is still waiting for —
 /// [`Closing::question`](crate::ending::Closing::question)'s two lines — with **End anyway** and
 /// **Cancel**. `libui`'s fixed question, two lines over two buttons, so its buttons land where
@@ -359,7 +361,7 @@ pub fn ending_dialog(
     theme: &Theme,
 ) -> Element<EndingMsg> {
     let buttons = TitleButtons { minimise: None, maximise: None, close: Some(EndingMsg::Cancel) };
-    let bar = title_bar(ending_title(ending), None, true, EndingMsg::Nothing, buttons, hovered, theme)
+    let bar = title_bar(ending.title(), None, true, EndingMsg::Nothing, buttons, hovered, theme)
         .key(ENDING_TITLE_KEY);
     let lines = padding(
         Insets::all(DIALOG_PAD),
@@ -378,6 +380,54 @@ pub fn ending_dialog(
         ]),
         DIALOG_GAP,
     );
+    dialog_frame(bar, lines, answers, true, theme)
+}
+
+// ---- the refusal ----------------------------------------------------------------------------
+
+/// What the refusal dialog's controls ask for (administration Part F.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefusalMsg {
+    /// Put it away.
+    Close,
+    /// What the title bar's drag carries: the dialog stays where the shell put it.
+    Nothing,
+}
+
+/// The refusal dialog's title bar's key.
+pub const REFUSAL_TITLE_KEY: u64 = 210;
+/// Its two lines'.
+pub const REFUSAL_TEXT_KEY: u64 = 211;
+/// The empty half where a question's first answer would be.
+pub const REFUSAL_GAP_KEY: u64 = 212;
+/// Its Close button's.
+pub const REFUSAL_CLOSE_KEY: u64 = 213;
+
+/// **Why a Restart or a Shut down did not happen** (administration Part F.3): the [`Refusal`]'s two
+/// lines, and **Close**. A report, not a question, so it has one answer, in the right-hand half
+/// where the waiting dialog's Cancel is — `DIALOG_RIGHT_CX` names it — and closing the frame means
+/// the same. Hung where the waiting dialog is, under the power button.
+pub fn refusal_dialog(
+    ending: Ending,
+    refusal: &Refusal,
+    hovered: Option<u64>,
+    theme: &Theme,
+) -> Element<RefusalMsg> {
+    let buttons = TitleButtons { minimise: None, maximise: None, close: Some(RefusalMsg::Close) };
+    let bar = title_bar(ending.title(), None, true, RefusalMsg::Nothing, buttons, hovered, theme)
+        .key(REFUSAL_TITLE_KEY);
+    let (first, second) = refusal.lines(ending);
+    let lines =
+        padding(Insets::all(DIALOG_PAD), column(alloc::vec![text(first), text(second)])).key(REFUSAL_TEXT_KEY);
+    let close = button(
+        "Close",
+        RefusalMsg::Close,
+        WidgetState { hovered: hovered == Some(REFUSAL_CLOSE_KEY), ..Default::default() },
+        theme,
+    )
+    .key(REFUSAL_CLOSE_KEY)
+    .flex(1);
+    let answers = with_spacing(row(alloc::vec![text("").key(REFUSAL_GAP_KEY).flex(1), close]), DIALOG_GAP);
     dialog_frame(bar, lines, answers, true, theme)
 }
 
@@ -873,21 +923,34 @@ mod tests {
         }
     }
 
-    /// **The power menu is Log out alone**, until F.3, and it is the table's third menu.
+    /// **The power menu is Log out, Restart and Shut down**, in that order — `check-logout` reaches
+    /// each by pressing Down that many times — the last two destructive, and it is the table's
+    /// third menu (administration Parts F.2 and F.3).
     #[test]
-    fn the_power_menu_logs_out() {
+    fn the_power_menu_logs_out_restarts_and_shuts_down() {
         let table = menus(&staged(), "", &libfs::places("/home"), "/home", &Theme::light());
         assert_eq!(table.len(), 3);
         assert_eq!(table[POWER].title, "Power");
-        let rows: Vec<(&str, MenuMsg)> = table[POWER]
+        let rows: Vec<(&str, MenuMsg, bool)> = table[POWER]
             .items
             .iter()
             .filter_map(|it| match it {
-                Item::Action { label, msg, enabled: true, .. } => Some((label.as_ref(), *msg)),
+                Item::Action { label, msg, enabled: true, destructive, .. } => {
+                    Some((label.as_ref(), *msg, *destructive))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(rows, [("Log out", MenuMsg::End(Ending::LogOut))]);
+        assert_eq!(
+            rows,
+            [
+                ("Log out", MenuMsg::End(Ending::LogOut), false),
+                ("Restart", MenuMsg::End(Ending::Restart), true),
+                ("Shut down", MenuMsg::End(Ending::ShutDown), true),
+            ]
+        );
+        // Every row is a choice: nothing the keyboard's Down would stop on and choose nothing with.
+        assert_eq!(table[POWER].items.len(), rows.len());
     }
 
     /// **The power menu hangs right-aligned and stays on the screen**: its right edge
@@ -938,6 +1001,71 @@ mod tests {
         let close = locate(&view, &l, libui::widget::TITLE_CLOSE_KEY).expect("the close button");
         let (cx, cy) = (close.origin.x + close.size.w as i32 / 2, close.origin.y + close.size.h as i32 / 2);
         assert_eq!(click(&view, bounds, &m, cx, cy), [EndingMsg::Cancel], "closing the dialog is Cancel");
+    }
+
+    /// **The refusal dialog's Close lands where the waiting dialog's Cancel does**, the left half
+    /// answers nothing, and closing the frame is Close — the fixed frame, so `DIALOG_RIGHT_CX` names
+    /// its button as it does the other's.
+    #[test]
+    fn the_refusal_dialogs_close_lands_where_libui_says() {
+        use libui::widget::{DIALOG_BUTTON_CY, DIALOG_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_W};
+        let f = font();
+        let theme = Theme::light();
+        let m = FontMetrics::new(&f, theme.font_px);
+        let view = refusal_dialog(Ending::ShutDown, &Refusal::Password, None, &theme);
+        let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
+        assert_eq!((size.w, size.h), (DIALOG_W, DIALOG_H));
+        let bounds = Rect::new(0, 0, size.w, size.h);
+        assert_eq!(click(&view, bounds, &m, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), [RefusalMsg::Close]);
+        assert!(click(&view, bounds, &m, DIALOG_LEFT_CX, DIALOG_BUTTON_CY).is_empty(), "the empty half");
+        let l = layout(&view, bounds, &m);
+        let close = locate(&view, &l, libui::widget::TITLE_CLOSE_KEY).expect("the close button");
+        let (cx, cy) = (close.origin.x + close.size.w as i32 / 2, close.origin.y + close.size.h as i32 / 2);
+        assert_eq!(click(&view, bounds, &m, cx, cy), [RefusalMsg::Close]);
+    }
+
+    /// **Every refusal the shell can say fits the dialog's width**, at both text sizes — two lines
+    /// in `libui`'s fixed question, where a line that runs past the frame is cut off mid-reason.
+    /// The broker's own reasons can name a person, which no test can bound; these are the rest.
+    #[test]
+    fn every_refusal_the_shell_says_fits_the_dialog() {
+        use crate::ending::failed;
+        let f = font();
+        let refusals = [
+            Refusal::Password,
+            Refusal::Refused(String::from("no rule lets you use `power`")),
+            Refusal::Refused(String::from("`power` does not let you run `shutdown`")),
+            Refusal::Failed(String::from(failed::NO_BROKER)),
+            Refusal::Failed(String::from(failed::NO_NAMESPACE)),
+            Refusal::Failed(String::from(failed::BROKER_GONE)),
+            Refusal::Failed(String::from(libviews::Failed::NoAnswer.why())),
+            Refusal::Failed(String::from(libviews::Failed::Refused.why())),
+            Refusal::Failed(String::from(libviews::Failed::Garbled.why())),
+            Refusal::exited(-2147483648, false),
+            Refusal::exited(1, true),
+        ];
+        // The listing's own two reasons, as `libviews` words them.
+        assert_eq!(
+            libviews::access(&[], "power", "shutdown"),
+            libviews::Access::Refused(String::from("no rule lets you use `power`"))
+        );
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for ending in [Ending::Restart, Ending::ShutDown] {
+                for r in &refusals {
+                    let view = refusal_dialog(ending, r, None, &theme);
+                    let bounds = Rect::new(0, 0, libui::widget::DIALOG_W, libui::widget::DIALOG_H);
+                    let l = layout(&view, bounds, &m);
+                    let room = locate(&view, &l, REFUSAL_TEXT_KEY).expect("the lines").size.w - 2 * DIALOG_PAD;
+                    let (a, b) = r.lines(ending);
+                    for line in [a, b] {
+                        let e: Element<RefusalMsg> = text(line.clone());
+                        let w = libui::layout::measure(&e, Constraints::loose(Size::new(4000, 4000)), &m).w;
+                        assert!(w <= room, "{line:?} is {w} wide in {room} at {} px", theme.font_px);
+                    }
+                }
+            }
+        }
     }
 
     /// The bar keeps diffing as a word lights and its menu opens — a shape `diff` refuses is a bar

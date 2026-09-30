@@ -830,8 +830,8 @@ visits rather than works in.
 - **Desktop icons** — the Places menu covers it.
 - **`End session`** — needs a logout path, and probably a System menu to live in. *(Built by
   administration Part F.2, 2026-09-29, somewhere else by the maintainer's call: a **power menu**
-  at the top bar's right-hand end, with Log out — and Restart and Shut down from F.3 — rather than
-  a row in the Applications menu.)*
+  at the top bar's right-hand end, with Log out — and Restart and Shut down, which F.3 added the
+  same day — rather than a row in the Applications menu.)*
 - **The dark-mode focus outline** — we are indicating focus on the titlebar instead.
 
 ## Open questions for review
