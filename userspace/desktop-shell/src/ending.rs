@@ -96,12 +96,12 @@ impl Refusal {
         })
     }
 
-    /// What a listing's [`libviews::Access`] means for a Restart or a Shut down: `None` to go on.
-    pub fn from_access(access: libviews::Access) -> Option<Refusal> {
-        match access {
-            libviews::Access::Allowed => None,
-            libviews::Access::Password => Some(Refusal::Password),
-            libviews::Access::Refused(why) => Some(Refusal::Refused(why)),
+    /// What the broker's answer to `Decide` means for a Restart or a Shut down: `None` to go on.
+    pub fn from_answer(outcome: libviews::Outcome, why: String) -> Option<Refusal> {
+        match outcome {
+            libviews::Outcome::Started => None,
+            libviews::Outcome::NeedPassword => Some(Refusal::Password),
+            libviews::Outcome::Denied { .. } => Some(Refusal::Refused(why)),
         }
     }
 
@@ -396,14 +396,16 @@ mod tests {
         assert_eq!((POWER_VIEW, POWER_PROGRAM), ("power", "shutdown"));
     }
 
-    /// **What a listing means**: allowed goes on; a password, or a refusal, is said before a window
-    /// is asked to close — each in its own words.
+    /// **What the broker's answer means**: one that would start goes on; a password, or a refusal,
+    /// is said before a window is asked to close — each in its own words.
     #[test]
-    fn a_listing_that_would_not_start_it_is_a_refusal() {
-        assert_eq!(Refusal::from_access(libviews::Access::Allowed), None);
-        assert_eq!(Refusal::from_access(libviews::Access::Password), Some(Refusal::Password));
-        let why = String::from("no rule lets you use `power`");
-        assert_eq!(Refusal::from_access(libviews::Access::Refused(why.clone())), Some(Refusal::Refused(why.clone())));
+    fn an_answer_that_would_not_start_it_is_a_refusal() {
+        use libviews::Outcome;
+        assert_eq!(Refusal::from_answer(Outcome::Started, String::new()), None);
+        assert_eq!(Refusal::from_answer(Outcome::NeedPassword, String::new()), Some(Refusal::Password));
+        let why = String::from("no rule lets alice use `power`");
+        let denied = Outcome::Denied { retry: false };
+        assert_eq!(Refusal::from_answer(denied, why.clone()), Some(Refusal::Refused(why.clone())));
         assert_eq!(
             Refusal::Refused(why.clone()).lines(Ending::ShutDown),
             (String::from("Shut down was refused:"), why)

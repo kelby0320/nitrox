@@ -280,8 +280,8 @@ live with (maintainer, 2026-09-17) — a flat list until there are enough to nee
 **icons**: the design's are three CSS boxes, and an icon is an asset question — a format, where the
 files live beside a desktop entry, who draws them — rather than a drawing one; three glyphs keyed
 by program name would be the thing that has to be removed when that is answered. And
-**`Run Application…` and `End session` are absent, not disabled**: the launcher is deferred and
-there is no logout, and a row that does nothing is worse than none.
+**`Run Application…` and `End session` are absent, not disabled**: the launcher is deferred, and
+ending a session lives in the power menu (§4b) rather than here.
 
 **The Places menu** is `Home`, `Documents`, `Downloads`, `Pictures` and `Root`, each with a swatch
 — the accent, and `deny` for the root, the one place past the person's own files — and its path
@@ -342,6 +342,13 @@ is host-tested; the loop asks and draws:
    manager is this shell — naming how many are left and the first two by title, with **End
    anyway** and **Cancel**. It stays until answered; a press elsewhere, to answer the editor,
    does not dismiss it.
+
+   **It does not take the keyboard from an application's question** (PR #346 review). Opening it
+   makes it the topmost window that takes focus, so when the window that had the keyboard was an
+   application's transient one — its question, or a menu — the shell raises that back and the
+   keys stay where the person was answering. A normal window is not raised back, since it could
+   cover the dialog. With the keyboard, the dialog answers **Escape**, as Cancel, and nothing
+   else: End anyway has no key, as the editor's *discard* has none.
 4. **Cancel** keeps the session: nothing more is asked, and what was asked stays asked. **End
    anyway** sends `Manage::Close` to every window still open, and remembers them: a destroyed
    window is listed until the compositor has got to it, and is neither asked again nor waited for.
@@ -351,10 +358,9 @@ is host-tested; the loop asks and draws:
 
 **Restart and Shut down** (Part F.3) end the session the same way, then ask the view broker, as
 `with power shutdown` does and with the same request, from `libviews`:
-- **Before any window is asked**, the shell reads the person's listing (`Views::List`) and applies
-  the broker's own rule to it (`libviews::access`, held to `decide` by the broker's tests). A policy
-  that would refuse, or would ask for a password, is refused there, so a person never loses their
-  windows to a request that was never going to run.
+- **Before any window is asked**, the shell asks the broker with `Views::Decide`, which answers as
+  a request would and runs nothing. A policy that would refuse, or would ask for a password, is
+  refused there, so a person never loses their windows to a request that was never going to run.
 - **With the windows gone**, it asks for `shutdown` — `--reboot` for Restart — in the `power`
   view, handing the broker **an application's namespace**, built and verified as a launch's is,
   not its own: the session's binds `/dev/draw` whole and so reaches `manage`, and a view derived

@@ -2,8 +2,8 @@
 
 **Status: normative for what is built (2026-09-29).** Every op below is implemented in
 `userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`; the client half —
-`Request`, `Password` and `List`, and reading a listing for a decision — is
-`userspace/libviews/`, which `with`, `account` and `desktop-shell` share (Part F.3). Written with
+`Request`, `Password`, `List` and `Decide` — is `userspace/libviews/`, which `with`, `account` and
+`desktop-shell` share (Part F.3). Written with
 administration Part A.3; the policy endpoint, `Show` and `Install` since Part D.2; the accounts
 endpoint, its three ops, `Accounts` and `ChangePassword` since Part D.3. See
 [`administration.md`](../planning/administration.md) § *Part A in detail* for the design and why
@@ -23,7 +23,7 @@ principal.
 |---|---|---|---|
 | forwarding endpoint | `/svc/views`, bound by `service-mgr`; by a login supervisor at `/dev/views` in each session, with the subtree base `/s/<session>` | — | `Namespace::Resolve` |
 | supervisor channel | `/svc/views/session`, from the root namespace | `session` | `OpenSession`, `CloseSession` |
-| client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Check`, `Accounts`, `ChangePassword`; receives `Exited` |
+| client channel | `/dev/views`, from inside a session | `s/<session>` | `Request`, `Password`, `Stop`, `List`, `Decide`, `Check`, `Accounts`, `ChangePassword`; receives `Exited` |
 | policy channel | `/dev/policy`, from inside a view with the `views` grant, which the broker binds there with the base `/policy/<session>` | `policy/<session>` | `Show`, `Install` |
 | accounts channel | `/dev/accounts`, from inside a view with the `accounts` grant, bound the same way with the base `/accounts/<session>` | `accounts/<session>` | `AddAccount`, `RemoveAccount`, `SetPassword` |
 
@@ -144,11 +144,20 @@ Request: empty. Reply: a u16 row count, then per row: view (u16 length + bytes),
 session's principal may use, one row per view a rule lets them use, in the policy's order. A policy
 that does not read is an error reply (`InvalidArgument`).
 
-**A client can read a `Request`'s answer off it**: the first row naming the view whose programs
-include the program is the rule that decides, and its flag says whether a password is asked;
-none is a denial. `libviews::access` is that reading, and the broker's tests hold it to the
-broker's own. `desktop-shell` asks it before closing a window for a Restart or a Shut down (Part
-F.3); the `Request` still decides.
+**The reply is cut at 2 KiB**, at the first row that does not fit, and says nothing of it. A
+client must not read a decision off it — the PR #346 review found that a `power` row past the cut
+read as "no rule". `Decide` is the question to ask.
+
+### `Decide` (`0x0E0F`) — client
+
+**What a `Request` for a program in a view would be answered, running nothing** (Part F.3, PR
+#346 review). Request body: the view (u16 length + bytes), then the program (u16 length + bytes),
+with nothing after. Reply: an outcome — `Started` if it would start with no password,
+`NeedPassword`, or `Denied` with the reason a `Request` would give; a body that does not read is
+`Denied`, "the question does not read". It takes no handle, starts nothing, and is not audited:
+it tells the session what its `List` already does. `desktop-shell` asks it before closing a window
+for a Restart or a Shut down. The `Request` that follows still decides: the policy can change in
+between.
 
 ### `Check` (`0x0E07`) — client
 

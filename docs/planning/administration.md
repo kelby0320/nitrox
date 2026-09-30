@@ -2435,9 +2435,10 @@ and the session would end with the editor's process left to notice (*Left alone*
         6. log in again, open a terminal, Log out: nothing to ask, and the greeter comes back at
            once.
 - [x] **F.3 — Restart and Shut down.** *(Landed 2026-09-29. Four things differ from the text
-      below. **A refusal the listing predicts comes before any window is asked**: `desktop-shell`
-      reads the person's `List` and applies the broker's rule to it (`libviews::access`, held to
-      `decide` by the broker's tests), so a password policy does not cost a person their windows.
+      below. **A refusal comes before any window is asked**: `desktop-shell` asks the broker with a
+      new `Decide`, which answers as a request would and runs nothing, so a password policy does
+      not cost a person their windows. (First a reading of the person's `List`, which the PR #346
+      review found the broker cuts at 2 KiB.)
       **The library is `libviews`**, and `coreutils::ipc` moved into it. **`check-logout` has nine
       steps in three boots**: F.2's typed shutdown became `with power shutdown --reboot`, so the
       halt can come last. And **End anyway had asked its window again**: a destroyed window is

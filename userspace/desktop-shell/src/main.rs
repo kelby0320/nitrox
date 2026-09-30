@@ -1999,6 +1999,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // dialog naming what is left. `Closing` decides what happens; this loop asks and draws.
     let mut closing: Option<Closing> = None;
     let mut ending_win: Option<Child> = None;
+    // **The window that last gained the keyboard**, whatever its role — which the window list
+    // does not say, since a dialog is not in it. The waiting dialog gives the keyboard back to
+    // an application's question it would otherwise take it from (PR #346 review, finding 2).
+    let mut last_focus: u32 = 0;
     // **A Restart or a Shut down asked for** (administration Part F.3): the view broker's channel
     // while `shutdown` runs, and what it is for. The terminate request `service-mgr`'s sequence
     // then sends is what ends this shell; the channel is how a `shutdown` that failed is heard.
@@ -2079,7 +2083,34 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             match c.next(now_ns().unwrap_or(u64::MAX)) {
                 Next::Wait { until } => ending_deadline = until,
                 Next::Dialog => {
-                    show_ending_dialog(&mut session, &mut ending_win, c, window, ending_anchor, &theme, &font)
+                    let opening = ending_win.is_none();
+                    show_ending_dialog(&mut session, &mut ending_win, c, window, ending_anchor, &theme, &font);
+                    // **The keyboard goes back to the question it was taken from** (PR #346 review,
+                    // finding 2). A new window is the topmost that takes focus, so the dialog took
+                    // the keyboard from the editor's "discard?" — and answers only Escape, as
+                    // Cancel, so a person answering the editor cancelled the logout instead.
+                    // **Only an application's transient window gets it back** — its question, or a
+                    // menu it had open — since focus is a raise, and raising a normal window could
+                    // cover the dialog. One in the window list, or one of ours, keeps it where it is.
+                    let ours_now = [window, bottom.unwrap_or(0), bar.id().unwrap_or(0), wallpaper_window];
+                    let transient = last_focus != 0
+                        && !ours_now.contains(&last_focus)
+                        && prompt.as_ref().map(|p| p.id()) != Some(last_focus)
+                        && refused.as_ref().map(|(r, _, _)| r.id()) != Some(last_focus)
+                        && !entries.iter().any(|e| e.id == last_focus);
+                    if opening
+                        && ending_win.is_some()
+                        && transient
+                        && let Some(m) = manager.as_mut()
+                        && raise_id(m, last_focus)
+                    {
+                        Line::new()
+                            .s(b"desktop-shell: the keyboard back to window ")
+                            .u(last_focus as u64)
+                            .s(b", the question it was taken from")
+                            .end();
+                        sent_request = true;
+                    }
                 }
                 Next::End(asked) => {
                     if let Some(d) = ending_win.take() {
@@ -2246,6 +2277,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 m,
                 &mut next_origin,
                 &mut entries,
+                &mut last_focus,
                 &ours,
                 &mut fired,
                 &mut layout,
@@ -3644,6 +3676,18 @@ fn raise_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
     mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
 }
 
+/// Raise the window `id` and give it the keyboard — [`raise_window`] for a window the list does
+/// not hold, such as an application's question.
+fn raise_id(mgr: &mut ChannelTransport, id: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_RAISE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window: id, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
+}
+
 /// Minimize `window`.
 fn minimize_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
     use librsproto::surface::OP_MGR_SET_MINIMIZED;
@@ -4665,6 +4709,7 @@ fn place_new_windows(
     mgr: &mut ChannelTransport,
     next_origin: &mut i32,
     entries: &mut alloc::vec::Vec<WinEntry>,
+    last_focus: &mut u32,
     ours: &[u32],
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
@@ -4763,6 +4808,9 @@ fn place_new_windows(
                         let was = e.focused;
                         e.focused = has && e.id == f.window;
                         dirty |= was != e.focused;
+                    }
+                    if has {
+                        *last_focus = f.window;
                     }
                 }
                 continue;
@@ -5329,18 +5377,17 @@ fn broker_deadline() -> u64 {
 }
 
 /// **Whether this session's policy would refuse a Restart or a Shut down** (administration Part
-/// F.3), read off the person's listing before any window is asked to close: `libviews::access` is
-/// the broker's own rule applied to it. `None` to go on. The request after the windows close is
-/// still what decides.
+/// F.3), asked of the broker with `Decide` before any window is asked to close — its own rule,
+/// running nothing. `None` to go on. The request after the windows close is still what decides.
 fn power_refusal(session_ns: u64) -> Option<Refusal> {
     let ch = libviews::broker(session_ns);
     if ch == 0 {
         return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
     }
-    let rows = libviews::list(ch, broker_deadline());
+    let answer = libviews::decide(ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
     libviews::ipc::close(ch);
-    match rows {
-        Ok(rows) => Refusal::from_access(libviews::access(&rows, POWER_VIEW, POWER_PROGRAM)),
+    match answer {
+        Ok((outcome, why)) => Refusal::from_answer(outcome, why),
         Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
     }
 }

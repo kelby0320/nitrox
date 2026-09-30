@@ -21,12 +21,6 @@ libusers = { path = "../libusers" }
 # bare-target event loop, which cannot build on host (`#![no_main]`). Not alloc-free: a policy
 # and a table of sessions are sized by what the file and the logins say, so `main.rs` registers
 # `libheap` as the `#[global_allocator]`.
-# **Only in the tests**: `libviews::access` reads the person's listing the way `decide` reads the
-# policy — the desktop refuses a Restart or a Shut down from it before closing a window
-# (administration Part F.3) — and a test here holds the two to agreeing.
-[dev-dependencies]
-libviews = { path = "../libviews" }
-
 [lib]
 name = "view_broker"
 path = "src/lib.rs"

@@ -31988,3 +31988,57 @@ building the prompt.
 - the image build.
 
 No kernel change; no ABI hash impact.
+
+## 2026-09-30 — Part F, reviewed (PR #346): the question keeps the keyboard, and the broker decides
+
+No blocking findings. Two worth fixing and two optional, all four taken.
+
+**The waiting dialog took the keyboard from the editor's question** (finding 2).
+- Focus is the topmost window that takes it, and opening the dialog put it on top. Half a second
+  after Log out, the editor's "discard?" lost the keyboard to a dialog that answers only Escape,
+  as Cancel. A person pressing Escape to keep editing cancelled the logout instead.
+- **The shell now gives the keyboard back when the window that had it was an application's
+  transient one**: its question, or a menu. It raises that window, and the log says so.
+  - A normal window is not raised back, since it could cover the dialog.
+  - The shell tracks the last window to gain focus, whatever its role, because the window list
+    holds no dialogs.
+- **`check-logout` step 3 now presses Escape once the dialog is up.** The editor must answer
+  *keep editing*, and the logout must not be cancelled. Step 5 then discards in the question the
+  editor asks again.
+  - No receipt from the editor can be waited for: it announces only its first gain.
+  - None is needed. The shell logs after the compositor has answered the raise, and a key is routed
+    to whatever the stack says then.
+- **Control:** the log line kept, the raise skipped. The Escape cancelled the logout, and step 3
+  timed out waiting for the editor.
+
+**The desktop's refusal read a listing the broker cuts at 2 KiB** (finding 3).
+- `List` stops at the first row that does not fit and says nothing. `libviews::access` read a
+  `power` row past the cut as "no rule" and refused a Shut down the policy allows.
+- That is the worse direction for a pre-check: it makes an allowed action impossible from the
+  desktop.
+- **A truncation flag would have kept the mirror.** A client would still re-derive the broker's
+  rule, and every refusal found by reading would stay uncertain. So the broker answers the question
+  itself:
+  - **`Decide` (`0x0E0F`)**: a view and a program in, and back the outcome a `Request` would get.
+    It runs nothing and takes no handle.
+  - Its answer is `Policy::would`: the bare-name refusal a request makes, then `decide`.
+    Host-tested for each outcome and reason, and for the first matching rule's `auth`.
+  - `libviews::access`, its tests, and `view-broker`'s agreement test are gone. `libviews::decide`
+    replaces them.
+- **`List` is unchanged, and documented as cut.** The broker now logs when it cuts one, since
+  `with --list` shows a cut listing as whole.
+
+**Two docs** (findings 1 and 4):
+- `desktop-shell.md` §4 said "there is no logout".
+- The root `CLAUDE.md` counted two gates on the release image, and called `check-login` the only
+  one where the display arm exists for a person. `check-logout` is both, and `test-interactive`'s
+  "the one gate" had been stale since `check-login`.
+
+**Docs:**
+- `desktop-shell.md` §4 and §4b;
+- `rsproto-views-ops.md`: `Decide`, and `List`'s cut;
+- `views-toml-schema.md`, the plan, and the root `CLAUDE.md`.
+
+The local gate set stays at 36 and is green (fgb50).
+
+No kernel change; no ABI hash impact. An rsproto op is not a hash input.

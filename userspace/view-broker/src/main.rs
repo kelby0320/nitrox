@@ -793,6 +793,19 @@ impl Broker {
                 let _ = send(ch, op, request_id, RS_FLAG_REPLY, &[], &[]);
             }
             OP_VIEWS_LIST => self.list(ch, request_id, &principal),
+            // **What a `Request` would be answered, running nothing** (administration Part F.3,
+            // PR #346 review): the desktop asks before it closes a window for a Restart or a Shut
+            // down. Not audited, as `List` is not: it tells the session only what `List` does.
+            OP_VIEWS_DECIDE => {
+                let question = parse_decide(&body)
+                    .and_then(|(v, p)| Some((core::str::from_utf8(v).ok()?, core::str::from_utf8(p).ok()?)));
+                let (o, why) = match (question, self.read_policy()) {
+                    (None, _) => (Outcome::Denied { retry: false }, String::from("the question does not read")),
+                    (Some(_), Err(e)) => (Outcome::Denied { retry: false }, e),
+                    (Some((view, program)), Ok(policy)) => policy.would(&principal, view, program),
+                };
+                reply_outcome(ch, op, request_id, o, &why);
+            }
             OP_VIEWS_CHECK => {
                 let verdict = self.judge(&body).map(|_| ());
                 match verdict {
@@ -1421,9 +1434,19 @@ impl Broker {
         };
         let mut out = [0u8; 2048];
         let mut at = 2;
-        for (view, run, password) in policy.rows_for(principal) {
-            let row = Row { view: view.as_bytes(), run: run.as_bytes(), password };
+        let rows = policy.rows_for(principal);
+        for (i, (view, run, password)) in rows.iter().enumerate() {
+            let row = Row { view: view.as_bytes(), run: run.as_bytes(), password: *password };
             if push_row(&mut out, &mut at, &row).is_none() {
+                // **Said, since the reply cannot say it** (PR #346 review): a listing cut here
+                // reads as whole, and `rsproto-views-ops.md` tells clients not to decide from it.
+                Line::new()
+                    .s(b"view-broker: a listing cut at ")
+                    .u(i as u64)
+                    .s(b" of ")
+                    .u(rows.len() as u64)
+                    .s(b" rows, the rest past 2 KiB")
+                    .end();
                 break;
             }
         }

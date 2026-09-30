@@ -67,6 +67,13 @@ pub const OP_VIEWS_REMOVE_ACCOUNT: u16 = 0x0E0D;
 /// Accounts endpoint → broker: set an account's password, without its current one. Body: a name
 /// and a password, as [`OP_VIEWS_ADD_ACCOUNT`]'s. Reply: an [`Outcome`].
 pub const OP_VIEWS_SET_PASSWORD: u16 = 0x0E0E;
+/// Client → broker: **what would a `Request` for this program in this view be answered?** Body
+/// [`build_decide`]. Reply: an [`Outcome`] — `Started` meaning it would start with no password,
+/// `NeedPassword`, or `Denied` with the policy's reason. It runs nothing and takes no handle: it
+/// tells a session what its `List` already does, from the broker's own rule rather than a
+/// client's reading of the rows (administration Part F.3, PR #346 review). The desktop asks it
+/// before closing a window for a Restart or a Shut down.
+pub const OP_VIEWS_DECIDE: u16 = 0x0E0F;
 
 /// The longest policy `Show` answers with and `Install` takes: one message's body, with room for
 /// its header.
@@ -449,6 +456,31 @@ pub fn parse_password_change(body: &[u8]) -> Option<(&[u8], &[u8])> {
     crate::auth::parse_account_request(body).map(|r| (r.username, r.password))
 }
 
+/// Write a `Decide` body: the view, then the program, each a `u16` length and its bytes.
+pub fn build_decide(out: &mut [u8], view: &[u8], program: &[u8]) -> Option<usize> {
+    let n = 4 + view.len() + program.len();
+    if view.len() > u16::MAX as usize || program.len() > u16::MAX as usize || out.len() < n {
+        return None;
+    }
+    put_u16(out, 0, view.len() as u16);
+    out[2..2 + view.len()].copy_from_slice(view);
+    let at = 2 + view.len();
+    put_u16(out, at, program.len() as u16);
+    out[at + 2..n].copy_from_slice(program);
+    Some(n)
+}
+
+/// Parse a `Decide` body into `(view, program)`, **accounted for exactly**: a length past the
+/// body, or a byte left after the program, is `None`.
+pub fn parse_decide(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    let vl = get_u16(body.get(..2)?, 0) as usize;
+    let view = body.get(2..2 + vl)?;
+    let at = 2 + vl;
+    let pl = get_u16(body.get(at..at + 2)?, 0) as usize;
+    let program = body.get(at + 2..at + 2 + pl)?;
+    (at + 2 + pl == body.len()).then_some((view, program))
+}
+
 /// `RemoveAccount`'s flag: remove the account's home too. Without it the home is kept.
 pub const REMOVE_HOME: u8 = 1 << 0;
 
@@ -626,6 +658,27 @@ mod tests {
         assert!(parse_remove_account(&[0b10, b'b']).is_none(), "a flag nobody defined");
         assert!(parse_remove_account(&[]).is_none());
         assert!(build_remove_account(&mut buf, b"", true).is_none());
+    }
+
+    #[test]
+    fn a_decide_is_a_view_and_a_program_accounted_for_exactly() {
+        let mut buf = [0u8; 64];
+        let n = build_decide(&mut buf, b"power", b"shutdown").unwrap();
+        assert_eq!(parse_decide(&buf[..n]), Some((&b"power"[..], &b"shutdown"[..])));
+        // Bytes no writer here makes, each refused rather than read.
+        assert!(parse_decide(&buf[..n - 1]).is_none(), "short a byte of the program");
+        let mut long = buf[..n].to_vec();
+        long.push(0);
+        assert!(parse_decide(&long).is_none(), "a byte left over");
+        let mut past = buf[..n].to_vec();
+        past[0] = 0xFF;
+        assert!(parse_decide(&past).is_none(), "a view length past the body");
+        assert!(parse_decide(&[5, 0]).is_none(), "a length and nothing after it");
+        assert!(parse_decide(&[]).is_none(), "empty");
+        // Empty names are the broker's to refuse, not the codec's.
+        let n = build_decide(&mut buf, b"", b"").unwrap();
+        assert_eq!(parse_decide(&buf[..n]), Some((&b""[..], &b""[..])));
+        assert!(build_decide(&mut [0u8; 8], b"power", b"shutdown").is_none(), "too small a buffer");
     }
 
     #[test]

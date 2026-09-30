@@ -96,10 +96,10 @@ use, or a program that view does not let them run.
 **The desktop asks as `with` does** (administration Part F.3): the power menu's Restart and Shut
 down ask for `shutdown` — `--reboot` for Restart — in the `power` view, with the same request, so
 this file decides them and the broker's audit records them. Two differences:
-- **It reads the person's listing first** (`List`), and applies this section's rule to it
-  (`libviews::access`), so a refusal comes before it has closed a window. The listing has a row for
-  each view each rule names, in the file's order, so its first row naming the view and the program
-  is the rule that decides.
+- **It asks first, with `Decide`**, which answers as the request would and runs nothing, so a
+  refusal comes before it has closed a window. It used to read the answer off the person's listing
+  (`List`), which the broker cuts at 2 KiB; a `power` row past the cut read as "no rule" (PR #346
+  review).
 - **It cannot answer a password.** A rule for `power` with `auth = "password"` is refused on the
   desktop, saying only a terminal can ask yet; `with power shutdown` there still asks. The
   graphical prompt is designed, not built (administration Part F.4).

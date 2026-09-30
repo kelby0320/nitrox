@@ -5340,9 +5340,11 @@ const STAGED_APPLICATIONS: usize = 3;
 /// 1. log in at the greeter;
 /// 2. open the editor from the Applications menu, and type a key, so it has something to lose;
 /// 3. the power menu's **Log out**: the shell asks the editor's window to close, the editor asks
-///    whether to discard, and half a second later **the shell's waiting dialog names it**;
+///    whether to discard, and half a second later **the shell's waiting dialog names it** —
+///    **without taking the keyboard from the editor's question** (PR #346 review, finding 2):
+///    Escape answers the question, *keep editing*, and the logout goes on waiting;
 /// 4. **Cancel**, and the session goes on — the Applications menu still opens;
-/// 5. Log out again, and **discard** in the editor's question, still up from step 3: the editor
+/// 5. Log out again, and **discard** in the editor's question, asked again: the editor
 ///    closes, the shell exits, and **the greeter comes back**;
 /// 6. log in again, open a terminal, and Log out: **nothing to ask**, so no waiting dialog, and the
 ///    greeter comes back;
@@ -5394,13 +5396,25 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
     let placed = session.rest_of_line()?;
-    let (_, parent, qx, qy, _, _) = parse_dialog_placement(&placed)
+    let (placed_id, parent, _, _, _, _) = parse_dialog_placement(&placed)
         .ok_or_else(|| format!("could not read the editor's question's placement from {placed:?}"))?;
     if parent != editor {
         return Err(format!("the question placed is on window {parent}, not the editor's {editor}").into());
     }
     let (wx, wy) = logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
     println!("  ok: Log out asked the editor, which asked about its buffer, and the shell named it");
+    // **The keyboard is still the question's**: the dialog gave it back, so Escape reaches the
+    // editor — *keep editing* — and not the dialog, where it would be Cancel. No receipt from the
+    // editor to wait for: it announces only its first gain. None is needed: the shell logs after
+    // the compositor has answered the raise, and a key is routed to whatever the stack says then.
+    session.expect(&format!("desktop-shell: the keyboard back to window {placed_id}"))?;
+    let from = session.transcript().len();
+    press(&mut qmp, "esc")?;
+    session.expect("nxedit: close cancelled, still editing")?;
+    if session.transcript()[from..].contains("desktop-shell: ending the session cancelled") {
+        return Err("Escape, meant for the editor's question, cancelled the logout".into());
+    }
+    println!("  ok: the waiting dialog left the keyboard with the editor's question");
 
     // 4. Cancel, and the session goes on.
     click_at(&mut qmp, &mut session, wx + chrome::DIALOG_RIGHT_CX, wy + chrome::DIALOG_BUTTON_CY)?;
@@ -5411,8 +5425,13 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: applications menu closed")?;
     println!("  ok: Cancel kept the session");
 
-    // 5. Log out again, and discard: the greeter comes back.
+    // 5. Log out again, and discard in the question the editor asks again: the greeter comes back.
     logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    session.expect("desktop-shell: placed dialog ")?;
+    let placed = session.rest_of_line()?;
+    let (_, _, qx, qy, _, _) = parse_dialog_placement(&placed)
+        .ok_or_else(|| format!("could not read the editor's second question's placement from {placed:?}"))?;
     logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
     click_at(&mut qmp, &mut session, qx + chrome::DIALOG_LEFT_CX, qy + chrome::DIALOG_BUTTON_CY)?;
     session.expect("nxedit: discarding the unsaved buffer")?;

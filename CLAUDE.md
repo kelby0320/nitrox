@@ -98,7 +98,7 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
-`cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
+`cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
 expect-driven rather than sleep-driven.
 
@@ -132,12 +132,13 @@ writes its working directory as `OSC 7`, `libterm` reads it and `nxterm` shows i
 window's name — three crates whose host tests cannot see each other, so a boot is what makes them
 agree on the bytes.
 
-`cargo xtask check-login` is the **graphical login gate**, and the second of the two that boot a
-release image. It drives the greeter with the PS/2 injection `check-input` and `check-terminal`
-use — a wrong password, then a right one, then a session — and it is the only gate where the
-display arm exists for a person rather than for a test: everything else display-side boots
-`--selftest`. It runs unconditionally in CI's QEMU job. Landed with M7 Part D, deliberately
-*before* the shell it will eventually show, so Parts E and F land against a gate that exists.
+`cargo xtask check-login` is the **graphical login gate**, on the release image as
+`test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection
+`check-input` and `check-terminal` use — a wrong password, then a right one, then a session — and it
+and `check-logout` are the gates where the display arm exists for a person rather than for a test:
+every other display gate boots `--selftest`. It runs unconditionally in CI's QEMU job. Landed with
+M7 Part D, deliberately *before* the shell it will eventually show, so Parts E and F land against a
+gate that exists.
 
 **It must boot the release image**, not the test one. In a `--selftest` boot the greeter is
 bottom-most — `service-mgr` brings the login chain up after the servers and before every other

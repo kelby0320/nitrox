@@ -9,7 +9,7 @@
 //!
 //! **What stays with each caller is how it asks a person.** `with` prompts on its terminal for a
 //! password. The desktop has no graphical prompt yet (`docs/design/graphical-prompt.md`), so a
-//! policy asking for one is a refusal there, and [`access`] lets it find that out before it closes
+//! policy asking for one is a refusal there, and [`decide`] lets it find that out before it closes
 //! a window.
 
 #![cfg_attr(not(test), no_std)]
@@ -18,15 +18,14 @@ extern crate alloc;
 
 pub mod ipc;
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
 pub use librsproto::views::Outcome;
 use librsproto::views::{
-    OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN, REQ_STDOUT, REQ_TERMINAL,
-    build_request, parse_rows,
+    OP_VIEWS_DECIDE, OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN, REQ_STDOUT,
+    REQ_TERMINAL, build_decide, build_request, parse_rows,
 };
 
 /// Where a session's namespace binds the broker.
@@ -49,7 +48,7 @@ pub enum Failed {
     /// It could not be sent, or the broker went away or ran past the deadline before answering.
     NoAnswer,
     /// The broker answered with an error rather than an answer: for a listing, a policy that does
-    /// not read.
+    /// not read; for anything else, a broker that does not know the op.
     Refused,
     /// The answer did not read.
     Garbled,
@@ -61,7 +60,7 @@ impl Failed {
         match self {
             Failed::TooLarge => "the request is too large",
             Failed::NoAnswer => "the view broker did not answer",
-            Failed::Refused => "the view broker could not read the policy",
+            Failed::Refused => "the view broker answered with an error",
             Failed::Garbled => "the view broker's answer did not read",
         }
     }
@@ -188,48 +187,32 @@ pub fn list(ch: u64, deadline: u64) -> Result<Vec<Row>, Failed> {
     }
 }
 
-/// What the broker would answer a request, as a listing says.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Access {
-    /// It would start the program.
-    Allowed,
-    /// It would ask for the person's password first.
-    Password,
-    /// It would refuse, for this reason.
-    Refused(String),
-}
-
-/// **What the broker would answer a request for `program` in `view`**, read off `rows` — the
-/// person's [`list`].
+/// **What the broker would answer a request for `program` in `view`** — the outcome and its
+/// reason — asked with `Decide`, which runs nothing.
 ///
-/// **The broker's own rule, applied to what it lists**: the first rule naming the view whose
-/// programs include this one decides, and its password flag is the answer. The listing has one row
-/// for each view each rule names, in the policy's order, so the first matching row is that rule.
-/// `view-broker`'s tests hold the two to agreeing. A policy changed between the listing and the
+/// **The broker's own rule, not a reading of `List`.** This was a client applying the rule to the
+/// listing's rows until the PR #346 review found the broker cuts a listing at 2 KiB: a row past the
+/// cut read as "no rule", refusing what the policy allows. A policy changed between this and the
 /// request is the request's to answer: this is a way to know before asking, not a way to ask.
-pub fn access(rows: &[Row], view: &str, program: &str) -> Access {
-    let mut may_use = false;
-    for r in rows.iter().filter(|r| r.view == view) {
-        may_use = true;
-        if r.run == "*" || r.run.split(' ').any(|n| !n.is_empty() && n == program) {
-            return if r.password { Access::Password } else { Access::Allowed };
-        }
+pub fn decide(ch: u64, view: &str, program: &str, deadline: u64) -> Result<(Outcome, String), Failed> {
+    let mut body = [0u8; 512];
+    let Some(n) = build_decide(&mut body, view.as_bytes(), program.as_bytes()) else {
+        return Err(Failed::TooLarge);
+    };
+    if !ipc::send(ch, OP_VIEWS_DECIDE, REQUEST_ID, &body[..n], &[]) {
+        return Err(Failed::NoAnswer);
     }
-    Access::Refused(if may_use {
-        format!("`{view}` does not let you run `{program}`")
-    } else {
-        format!("no rule lets you use `{view}`")
-    })
+    match ipc::answer(ch, REQUEST_ID, deadline) {
+        Some((false, body)) => Ok(ipc::outcome(&body)),
+        Some((true, _)) => Err(Failed::Refused),
+        None => Err(Failed::NoAnswer),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use librsproto::views::parse_request;
-
-    fn row(view: &str, run: &str, password: bool) -> Row {
-        Row { view: view.into(), run: run.into(), password }
-    }
 
     #[test]
     fn a_requests_handles_are_in_the_order_the_broker_takes_them() {
@@ -251,36 +234,5 @@ mod tests {
         let r = parse_request(&body[..n]).unwrap();
         assert_eq!(r.handle_count(), handles.len());
         assert_eq!((r.view, r.program), (&b"power"[..], &b"shutdown"[..]));
-    }
-
-    #[test]
-    fn access_is_the_first_rule_naming_the_view_that_runs_the_program() {
-        let rows = [row("admin", "*", true), row("power", "shutdown", false)];
-        assert_eq!(access(&rows, "power", "shutdown"), Access::Allowed);
-        assert_eq!(access(&rows, "admin", "shutdown"), Access::Password);
-        // A rule for the view that does not run it is passed over for a later one that does.
-        let rows = [row("power", "date", true), row("power", "shutdown date", false)];
-        assert_eq!(access(&rows, "power", "shutdown"), Access::Allowed);
-        assert_eq!(access(&rows, "power", "date"), Access::Password);
-        // `*` is every program, and a name is matched whole, not as a prefix.
-        assert_eq!(access(&[row("power", "*", false)], "power", "shutdown"), Access::Allowed);
-        assert_eq!(
-            access(&[row("power", "shut", false)], "power", "shutdown"),
-            Access::Refused("`power` does not let you run `shutdown`".into())
-        );
-    }
-
-    #[test]
-    fn access_says_which_refusal() {
-        assert_eq!(access(&[], "power", "shutdown"), Access::Refused("no rule lets you use `power`".into()));
-        assert_eq!(
-            access(&[row("admin", "*", true)], "power", "shutdown"),
-            Access::Refused("no rule lets you use `power`".into())
-        );
-        // A rule with no programs lists as an empty run, and runs nothing — not the empty name.
-        assert_eq!(
-            access(&[row("power", "", false)], "power", ""),
-            Access::Refused("`power` does not let you run ``".into())
-        );
     }
 }

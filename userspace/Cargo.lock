@@ -516,5 +516,4 @@ dependencies = [
  "libsession",
  "libstream",
  "libusers",
- "libviews",
 ]

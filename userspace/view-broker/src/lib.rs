@@ -475,6 +475,22 @@ pub mod policy {
             })
         }
 
+        /// **What a `Request` for `program` in `view` would be answered**, as the outcome and its
+        /// reason — `Decide`'s answer (administration Part F.3, PR #346 review). A `Request`
+        /// refuses a program that is not a bare name before it reads the policy, so this does
+        /// too; after that it is [`decide`](Self::decide), with the rule's `auth` as the outcome.
+        pub fn would(&self, principal: &str, view: &str, program: &str) -> (librsproto::views::Outcome, String) {
+            use librsproto::views::Outcome;
+            if !is_bare_name(program) {
+                return (Outcome::Denied { retry: false }, "a program is a bare name, resolved under /bin".to_string());
+            }
+            match self.decide(principal, view, program) {
+                Decision::Deny(reason) => (Outcome::Denied { retry: false }, reason),
+                Decision::Allow { auth: Auth::Password, .. } => (Outcome::NeedPassword, String::new()),
+                Decision::Allow { auth: Auth::None, .. } => (Outcome::Started, String::new()),
+            }
+        }
+
         /// What `principal` may use: one row per view a rule lets them use — the view, the
         /// programs, and whether a password is asked for — in the policy's order.
         pub fn rows_for(&self, principal: &str) -> Vec<(String, String, bool)> {
@@ -1132,48 +1148,28 @@ auth = "password"
         assert_eq!(p.rows_for("carol"), []);
     }
 
-    /// **A listing says what `decide` would** (administration Part F.3). The desktop reads the
-    /// person's listing with `libviews::access` and refuses a Restart or a Shut down from it before
-    /// asking a window to close, so a listing read as "allowed" where the broker would ask for a
-    /// password would cost a person their windows and then refuse them anyway. Every principal, view
-    /// and program, over the seed and a policy whose rules overlap: one listing the same view twice,
-    /// the first not running the program and the second running it without a password.
+    /// **`Decide` answers as a `Request` would** (administration Part F.3, PR #346 review): the
+    /// three outcomes, each reason, and the first matching rule's `auth` — the overlapping rules
+    /// below list `power` twice, the first not running `shutdown` and asking a password, the
+    /// second running it without one. `Decide` replaced a client's reading of `List`, which the
+    /// broker cuts at 2 KiB, so a `power` row past the cut read as "no rule".
     #[test]
-    fn a_listing_says_what_decide_would() {
-        const OVERLAP: &str = "[profile.admin]\ngrants = [\"disks\"]\n[profile.power]\ngrants = [\"power\"]\n\
-            [[rule]]\nwho = [\"alice\"]\nuse = [\"power\", \"admin\"]\nrun = [\"date\"]\nauth = \"password\"\n\
-            [[rule]]\nwho = [\"*\"]\nuse = [\"power\"]\nrun = [\"shutdown\", \"date\"]\nauth = \"none\"\n\
-            [[rule]]\nwho = [\"bob\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
-        let mut kinds = [0usize; 3];
-        for text in [SEED, OVERLAP] {
-            let p = parse(text).unwrap();
-            for who in ["alice", "bob", "carol"] {
-                let rows: Vec<libviews::Row> = p
-                    .rows_for(who)
-                    .into_iter()
-                    .map(|(view, run, password)| libviews::Row { view, run, password })
-                    .collect();
-                for view in ["admin", "power", "install", "absent"] {
-                    for program in ["shutdown", "date", "nxinstall", "disk"] {
-                        let listed = libviews::access(&rows, view, program);
-                        let kind = match p.decide(who, view, program) {
-                            Decision::Allow { auth: Auth::None, .. } => 0,
-                            Decision::Allow { auth: Auth::Password, .. } => 1,
-                            Decision::Deny(_) => 2,
-                        };
-                        kinds[kind] += 1;
-                        let agrees = match listed {
-                            libviews::Access::Allowed => kind == 0,
-                            libviews::Access::Password => kind == 1,
-                            libviews::Access::Refused(_) => kind == 2,
-                        };
-                        assert!(agrees, "{who} {view} {program}: the listing says {listed:?}, decide {kind}");
-                    }
-                }
-            }
-        }
-        // Each answer came up, so no arm of the comparison passed by never being reached.
-        assert!(kinds.iter().all(|&n| n > 0), "{kinds:?}");
+    fn decide_answers_as_a_request_would() {
+        use librsproto::views::Outcome;
+        let p = parse(
+            "[profile.admin]\ngrants = [\"disks\"]\n[profile.power]\ngrants = [\"power\"]\n\
+             [[rule]]\nwho = [\"alice\"]\nuse = [\"power\", \"admin\"]\nrun = [\"date\"]\nauth = \"password\"\n\
+             [[rule]]\nwho = [\"*\"]\nuse = [\"power\"]\nrun = [\"shutdown\", \"date\"]\nauth = \"none\"\n",
+        )
+        .unwrap();
+        let denied = |why: &str| (Outcome::Denied { retry: false }, String::from(why));
+        assert_eq!(p.would("alice", "power", "shutdown"), (Outcome::Started, String::new()));
+        assert_eq!(p.would("alice", "power", "date"), (Outcome::NeedPassword, String::new()), "the first rule decides");
+        assert_eq!(p.would("bob", "power", "date"), (Outcome::Started, String::new()));
+        assert_eq!(p.would("bob", "admin", "date"), denied("no rule lets bob use `admin`"));
+        assert_eq!(p.would("alice", "admin", "shutdown"), denied("`admin` does not let alice run `shutdown`"));
+        assert_eq!(p.would("alice", "nothere", "date"), denied("there is no view called `nothere`"));
+        assert_eq!(p.would("alice", "power", "/bin/shutdown"), denied("a program is a bare name, resolved under /bin"));
     }
 
     /// **The guard at its neighbours.** Only a profile granting `views`, with `run = ["*"]`, for

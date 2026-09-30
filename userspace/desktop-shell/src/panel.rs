@@ -1033,8 +1033,9 @@ mod tests {
         let f = font();
         let refusals = [
             Refusal::Password,
-            Refusal::Refused(String::from("no rule lets you use `power`")),
-            Refusal::Refused(String::from("`power` does not let you run `shutdown`")),
+            // The broker's own words, from `view_broker::policy::Policy::would`, for a short name.
+            Refusal::Refused(String::from("no rule lets alice use `power`")),
+            Refusal::Refused(String::from("`power` does not let alice run `shutdown`")),
             Refusal::Failed(String::from(failed::NO_BROKER)),
             Refusal::Failed(String::from(failed::NO_NAMESPACE)),
             Refusal::Failed(String::from(failed::BROKER_GONE)),
@@ -1044,11 +1045,6 @@ mod tests {
             Refusal::exited(-2147483648, false),
             Refusal::exited(1, true),
         ];
-        // The listing's own two reasons, as `libviews` words them.
-        assert_eq!(
-            libviews::access(&[], "power", "shutdown"),
-            libviews::Access::Refused(String::from("no rule lets you use `power`"))
-        );
         for theme in themes() {
             let m = FontMetrics::new(&f, theme.font_px);
             for ending in [Ending::Restart, Ending::ShutDown] {
