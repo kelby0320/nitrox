@@ -508,7 +508,8 @@ The review's main lesson is that this is not only a userspace phase. Collected i
       building application namespaces in the same vocabulary; the graphical prompt's design
       written down, with its trigger; and, handed on by Part E, **a power menu** — Log out,
       Restart, Shut down — that **closes a session's windows first**.
-- [ ] **G — the installer, the broker's first client** (decided 2026-09-17). **The installer's boot
+- [ ] **G — the installer, the broker's first client** — *detailed below, G.1–G.3 (2026-09-30).*
+      (Decided 2026-09-17.) **The installer's boot
       entry stays** — it is still the one that loads the 33 MiB installable ESP, which is H.1's
       reasoning and still sound — **but its session stops being special**. It becomes an ordinary
       session in which the person types `with admin nxinstall`, with the binary unchanged (decided
@@ -2514,6 +2515,281 @@ has not moved. **F.2 before F.3.** F.4 can go anywhere.
 - **The launcher**, and the design's `System` and `Run Application…` rows: the refresh's deferrals,
   unchanged.
 
+
+## Part G in detail *(2026-09-30)*
+
+**The installer, the broker's first client.** The live stick's install entry stops starting a
+special session. A person logs in as on any boot, opens a terminal, and types `with admin
+nxinstall`. The installer reaches its disks through the `disks` grant, like any program in a view,
+and it makes the new machine's first account and administrator rather than copying the build's
+demo account.
+
+**Decided before (2026-09-17, 2026-09-22):** the install entry stays, since it alone loads the
+33 MiB installable ESP; its session stops being special; the installer is the same `nxinstall`.
+
+**The maintainer's calls (2026-09-30):**
+- **The installer copies a pristine copy of the root**, which the install entry loads as a module
+  of its own, as it loads the ESP.
+  - Chosen after comparing Linux's live installers. The ones that copy the live system copy the
+    read-only image *under* the live root — Ubuntu's squashfs, Fedora's base layer — never the
+    root the session writes.
+  - Nitrox's live root is a plain writable RAM disk with nothing under it, so the pristine source
+    has to be a second copy. It costs its size in RAM, on that boot only, and as much again for
+    the firmware to read off the stick.
+  - Rejected:
+    - an immutable live root with `/home` on a RAM disk of its own, which is Linux's shape but a
+      redesign of the live image;
+    - copying the running root's files through a new read-only grant;
+    - reading the live root raw, which can tear while the session writes.
+- **A disk in use is the person's to release.** A reinstall's target is auto-mounted read-only on
+  the live boot, so `disks` withholds it. `nxinstall` names what is mounted and the command that
+  unmounts it. Nothing is unmounted as a side effect of asking for a view: a view's disks are fixed
+  when `with` starts the program, so the installer could not unmount one and then see it.
+- **The first account is asked on the terminal, after the confirmation**: a name, echo on, then a
+  password twice, echo off. The confirm line stays as it is.
+
+### The spike: what already exists, and what is missing
+
+- **The install entry** is the live menu's third, `Nitrox — install to this machine`.
+  - It loads `install-esp.img` as a module and passes `cmdline: install`.
+  - With the image's `/initramfs/etc/install-allowed` marker, `libsession::installer_boot` then
+    has both login supervisors build an **installer session**. Its `bind_blk` rebinds every block
+    device into it, and `desktop-shell` rebinds them into every application it launches (F.1).
+  - That is the only way a disk reaches `nxinstall` on the laptop today.
+- **`nxinstall` copies two RAM disks** (`sources`):
+  - the ESP module, whole, onto the boot partition;
+  - the live root's `nitrox-live` partition, file by file, into a fresh ext4 the partition's size
+    (`copy::copy_tree`, Phase 5 Part H.2).
+  - **It reads the live root raw**, to install "the system as it shipped" rather than one
+    session's writes (`copy.rs`'s module doc).
+- **So an installed machine has the live stick's account.** The copy carries `/system/users` with
+  `alice`, `/home/alice`, and the seeded `/system/views.toml` naming her. **That is what G ends.**
+- **`disks` withholds what is in use** (C.6): every mounted partition and its disk, as the storage
+  service answers `InUse`. On a live boot that includes:
+  - the RAM disk holding the live root, which `init` mounts read-write;
+  - a previous install's disk, which the storage service auto-mounts read-only.
+
+  So **an ordinary `with admin nxinstall` reaches neither the source nor a reinstall's target**,
+  as C's consequences said it would.
+- **The storage service auto-mounts every ext4 device it finds**, RAM disks included
+  (`mounts::automount`). A second root image would be auto-mounted, and so withheld too.
+- **`nxinstall` reads no terminal.** Its confirmation is an operand because, when it was written,
+  no program could read one.
+  - Part A gave every stage a terminal of its own, and `coreutils::prompt` reads a password on it.
+  - `with` hands its program the terminal, and `nxinstall`'s setup carries one it ignores.
+- **The pieces for an account exist.**
+  - `libusers::write_record` writes a record from a name, a password and a salt its caller draws;
+    the offline `account` and the build's seeder use it.
+  - `libfs::HOME_FOLDERS` names a new home's three folders. `TODO(home-folders)` is open for the
+    installer's first account alone.
+- **The seeded policy is `xtask`'s** (`seeded_views_toml`), naming `DEMO_USER`. The installer needs
+  the same policy naming someone else.
+- **`services.toml` and the profile manifest are on the root** since E.1c, so they ride in the copy,
+  and the installed machine gets the release's (E's consequence for G).
+- **`check-install`** boots the stick's install entry beside a **blank** 512 MiB disk.
+  - It logs in graphically as `alice`, and types `nxinstall` in a terminal.
+  - It asserts the installer session's four devices, the milestones, and a refusal of the live
+    root's RAM disk ("it is a ram disk").
+  - Then it carves and checks the root on the host, and boots the disk alone to a greeter.
+
+### The shape
+
+- **The install entry is the default entry plus two modules**: `install-esp.img`, as now, and
+  **`install-root.img`**, the pristine root.
+  - `install-root.img` is the release root: the same filesystem as `root.img`'s, in a GPT whose
+    one partition is **`nitrox-source`**. The label differs because the live root is found by its
+    label (`gpt-partlabel:nitrox-live`), and two would be ambiguous.
+  - **It is built without the live root's slack.** `root.img` is 28 MiB: about 10 MiB of files and
+    `LIVE_ROOT_SLACK_MIB`'s 16 MiB of room for the session to write in. The pristine copy is never
+    written, so it holds the files and little more — about 12 MiB today, in RAM on that boot only,
+    and read off the stick by the firmware, which is what `LIVE_ROOT_MAX_MIB` limits.
+  - `check-images` holds its filesystem to the release root partition's, file for file, as it
+    holds `root.img`'s.
+  - **No `cmdline: install`, and no `install-allowed` marker.** Nothing downstream asks for them.
+- **The storage service leaves the pristine root unmounted.** A partition named `nitrox-source` is
+  the installer's source, not storage, and is passed over as a filesystem the service cannot read
+  is. It must stay unmounted for `disks` to grant it.
+  - **The rule is the label, not "a RAM disk".** A `--selftest` image's `scratch.img` is an ext4 RAM
+    disk the storage service mounts for `boot-probe`, and it must go on being mounted.
+  - `nxinstall` and the storage service read the label from one constant.
+- **Every session is ordinary.** Removed:
+  - `installer_boot`, and the supervisors' `bind_blk: installer_boot(..)`;
+  - `desktop-shell`'s pass-through of a session's disks, and `block_device_count`;
+  - `NamespaceSpec::bind_blk`, with them.
+
+  The broker's `rebind_block_devices_except` stays: it becomes the one way a disk reaches a
+  program.
+- **`nxinstall` runs in a view**: `with admin nxinstall`, or `with install nxinstall`, since the
+  seeded `install` profile grants `disks` alone and is the narrower of the two.
+  - **Its sources** are the ESP module, found by its FAT boot sector as now, and the pristine root,
+    found by `nitrox-source`. Both are unmounted RAM disks, so `disks` grants them. The live root
+    is not reachable, and `nxinstall` never needs it.
+  - **A disk in use is named, not guessed at.** `nxinstall` reads `/dev/devices` and
+    `/dev/storage`'s tables, which every view has. A disk the system has and the view lacks is one
+    `disks` withheld, and the storage service's table says where its partition is mounted, and by
+    whom:
+    - **by the storage service**: "`/dev/blk/2` QEMU HARDDISK (QM00002) is in use: `nitrox-root` is
+      mounted at `/storage/nitrox-root`. Unmount it with `with admin disk --unmount nitrox-root`,
+      then run `nxinstall` again." The command names the **label**, which is what `disk
+      --unmount` takes (PR #347 review);
+    - **by `init`**: "`/dev/blk/0` holds the running system", and no command, since the storage
+      service never unmounts `init`'s mounts. On a release boot that is the disk under `/`; on the
+      live stick, `root.img`.
+    - Naming either disk as the target says the same, rather than "not in this view".
+  - **Those lines are messages, on `stderr`.** The table on `stdout` stays what the view can use,
+    so what reads it is unchanged: `boot-probe` step 3b, `test-interactive` 20b(d) and
+    `check-login` 9a2 assert the disk under `init`'s root, the root and the scratch disk are never
+    among its rows — C.6's only in-guest proof that `disks` withholds anything (PR #347 review).
+  - **The confirmation stays an operand.** The account questions come after it.
+    - Once the plan is confirmed, `nxinstall` asks **`account name:`** with echo on, and checks the
+      answer against `libusers`' rule.
+    - Then it asks **`password:`** and **`again:`** with echo off, and checks them as `account
+      --add` does.
+    - Nothing is written until both are answered. A cancelled prompt — Ctrl-C, or the terminal
+      closing — writes nothing.
+  - **The prompts move below `coreutils`, into a crate of their own, `libprompt`**, and gain a line
+    prompt with echo on. `nxinstall` is their third consumer, the rule that created `libviews`.
+    - **Not into `libviews`** (PR #347 review). Its doc and `userspace/CLAUDE.md` both say how a
+      person is asked stays with each caller. `nxinstall` would be a consumer of `libviews` that
+      never talks to the broker, and `confirm` would bring `libusers` into it.
+    - **The scrubbing plumbing moves with them**: `libviews::ipc` becomes `libprompt::ipc`, and
+      `libviews` takes it from there. The prompts need it, and so does the broker's client.
+    - `libprompt` depends on `libusers`, for the rules `confirm` checks a new password against.
+- **What it writes on the root:**
+  - the pristine root's files, **except `/home`'s contents, `/system/users` and
+    `/system/views.toml`** (`copy_tree` learns what to pass over);
+  - **`/system/users`**, with the one account, through `libusers::write_record` and a fresh salt;
+  - **`/system/views.toml`**, naming that account. It is the seeded policy, produced by one
+    function that both the build and the installer call, `view_broker::policy::seed(name)`. A host
+    test holds it to making `name` the one administrator;
+  - **`/home/<name>`**, with `libfs::HOME_FOLDERS`' three folders, which closes
+    `TODO(home-folders)`;
+  - the partition table, the ESP and the flush, as now.
+- **The milestones name the account, never the password.** One says `nxinstall: the first account
+  is bob, its administrator`. The password is scrubbed once `libusers` has hashed it.
+
+### An install, end to end
+
+1. A person boots the stick on a machine that holds an older install, and chooses **install to this
+   machine**. Limine loads the kernel, the initramfs, `root.img`, `install-esp.img` and
+   `install-root.img`.
+2. The storage service auto-mounts the old install's `nitrox-root` read-only at
+   `/storage/nitrox-root`, and passes over the pristine root.
+3. They log in at the greeter as the stick's own account, open a terminal, and type `with admin
+   nxinstall`. `with` asks for the stick account's password.
+4. `nxinstall` lists what it can use: the two RAM disks it copies from, which it will refuse as
+   targets. Then it says what it cannot: `root.img`, which holds the running system, and the SATA
+   disk, in use, mounted at `/storage/nitrox-root`, with the command to unmount it.
+5. They run `with admin disk --unmount nitrox-root`. Then `with admin nxinstall` lists the disk,
+   and `with admin nxinstall /dev/blk/2` prints the plan and the line that confirms it.
+6. They type the line. `nxinstall` asks for an account name — `bob` — and a password, twice.
+7. It writes:
+   - the partition table and the ESP;
+   - a filesystem the partition's size, with the pristine root's files;
+   - `bob`'s record, the policy naming him, and `/home/bob` with its folders.
+
+   Then it flushes, and says it is done.
+8. They take the stick out and restart. The disk boots to its greeter, which knows only `bob`. `bob`
+   logs in, and `with admin` asks for his password and runs.
+
+### The pieces, in dependency order
+
+Each keeps `check-install` passing: it is on demand, but in the local gate set.
+
+- [ ] **G.1 — the pristine source.**
+  - `install-root.img`: the release root in a GPT with one `nitrox-source` partition, built beside
+    `root.img` and loaded by the install entry.
+  - **The storage service passes over `nitrox-source`.** Host-tested on an install boot's devices:
+    the SATA disk beside it is still auto-mounted, and so is a test image's scratch RAM disk.
+  - `nxinstall` takes its root from `nitrox-source`. It is still in the installer session here.
+  - Gates:
+    - `check-images`: the new module's filesystem is the release root's, file for file;
+    - `check-install`: the module is loaded, and the install copies from it;
+    - `check-live`, `check-storage` and `check-recovery`, unchanged.
+- [ ] **G.2 — the installer in a view, and the first account.**
+  - `nxinstall` names a disk it lacks from `/dev/devices` and `/dev/storage`, with the command that
+    frees it.
+  - `libprompt`, with `coreutils::prompt` and `libviews::ipc` moved into it, and a line prompt.
+  - The account questions after the confirmation.
+  - `copy_tree` passes over `/home`'s contents, `/system/users` and `/system/views.toml`.
+  - `/system/users`, `/system/views.toml` and `/home/<name>` are written.
+  - `view_broker::policy::seed`, which the build seeds from too.
+  - Gates:
+    - host tests: the seeded policy makes the named account the one administrator; the account
+      rules at their neighbours; a withheld disk named from the two tables;
+    - **`check-install`**, which **cannot yet see the `disks` grant** (PR #347 review). Until G.3,
+      `nxinstall`'s view is derived from an installer session, whose namespace already binds every
+      `/dev/blk/*`, and the grant's rebind passes over a path already bound. So an auto-mounted
+      `nitrox-source` would still pass here. G.3's reinstall is the first in-guest proof that the
+      source reaches `nxinstall` through `disks`. This gate checks:
+      - `with admin nxinstall` from the terminal;
+      - the account questions typed;
+      - on the host: `/system/users` holds the one account, the policy makes it the one
+        administrator, and `/home/<name>` has its folders, with no `/home/alice`;
+      - the second boot's greeter refuses `alice`, and logs the new account in;
+      - neither password in the transcript.
+- [ ] **G.3 — every session ordinary, and a reinstall.**
+  - Removed: `installer_boot`, the marker, `cmdline: install`, the supervisors' `bind_blk`,
+    `desktop-shell`'s pass-through, `block_device_count` and `NamespaceSpec::bind_blk`.
+  - **`check-install` reinstalls**: its target is a copy of the release disk, holding an install,
+    not a blank one, **grown to `TARGET_MIB`** (PR #347 review).
+    - **Grown, because the release disk is 128 MiB.** After the 33 MiB ESP, `nxinstall::plan`
+      leaves a root of about 94 MiB, which `mkfs` lays out as one block group of 32,768 blocks. Then
+      `check_installed_root`'s write past block group 0, H.2's claim, has no group to cross into.
+    - **The old install survives the growing.** Its primary GPT still describes 128 MiB, and its
+      partitions sit inside that, so the kernel finds `nitrox-root` and the storage service
+      auto-mounts it, which is the point of a reinstall. `nxinstall` writes a table for the whole
+      disk.
+    - `nxinstall` names it as in use; `with admin disk --unmount` frees it; the install proceeds.
+    - The refusal of a RAM disk as a target is aimed at the pristine root, which the view can
+      reach. The live root is no longer reachable at all.
+  - Gates:
+    - `check-images`: the live initramfs differs from the release one in `etc/init.toml` alone;
+    - **every gate**, since no session hands out a disk now;
+    - **`check-install`**, the reinstall.
+- [ ] **Docs.**
+  - `session-and-auth.md`, `device-manager.md` and `boot-flow.md` describe the installer session.
+  - `storage.md`: a `nitrox-source` partition is not auto-mounted. Its gate rows for `nxinstall`'s
+    refusals change too: `check-login` 9a2's `/dev/blk/0` is now refused as the running system,
+    not as a disk the view lacks.
+  - `nxinstall`'s module doc: its authority, now a view, and the terminal it now reads.
+  - `userspace/CLAUDE.md`'s layering, and `libviews`' crate doc: `libprompt`, and the plumbing that
+    moved into it.
+  - `views-toml-schema.md`: the installed machine's policy.
+  - The root `CLAUDE.md`'s `check-install` paragraph.
+  - `deferred-decisions.md`: `TODO(home-folders)` resolved.
+
+### What to compare on the day
+
+- **`check-install`**, on demand: a reinstall from an ordinary session, onto a disk holding an
+  install, and a machine that knows only its new account.
+- **`check-images`**, in CI: the pristine root, and the marker's absence.
+- **`nxinstall`'s listing, in CI**: `boot-probe` step 3b in `test-qemu`, `test-interactive` 20b(d)
+  and `check-login` 9a2 read it. The table on `stdout` is unchanged, since the in-use disks are
+  messages on `stderr`. `check-login`'s refusal of `/dev/blk/0` says "the running system" now, and
+  the step is re-aimed if what it matches moves.
+- **Every other CI gate, unchanged**: none boots the install entry, and a session that hands out no
+  disk changes nothing on the default entries.
+
+### Consequences for earlier parts
+
+- **Phase 5 Part H.1's installer session goes**, and with it:
+  - the reason `desktop-shell` passes a session's disks to applications (F.1, PR #345 review);
+  - C's "second raw path" (*Part C in detail*, consequences).
+- **`test-interactive` step 20b(d), `check-login` step 9a2 and `boot-probe` step 3b** run `with
+  admin nxinstall` on a release or test boot. Its table does not change; its messages gain the disks
+  it cannot use, and `/dev/blk/0` is refused as the running system.
+- **The live stick keeps its own account.** It is the account a person installs *with*, not one it
+  installs. `check-live`, `check-storage` and `check-recovery` log in as it, unchanged.
+
+### Left alone
+
+- **A graphical installer.** The terminal is the installer's interface, on the laptop too.
+- **Partitioning choices**: the whole disk, as now. Dual boot, and encryption.
+- **Installing packages or over a network.** The copy is of the release, as shipped.
+- **Carrying the live session onto the install**: its accounts, its `/home` and its policy.
+- **Freeing a disk automatically.** A view's disks are fixed at spawn; the person unmounts.
+
 ## Gates
 
 | Part | What proves it |
@@ -2524,7 +2800,7 @@ has not moved. **F.2 before F.3.** F.4 can go anywhere.
 | D | `account --add`, `--password` and `--remove` at a real prompt; and **a recovery gate**, `check-recovery`, on demand like `check-install`: boot the live image, reset a password on the installed disk offline, boot that disk, and log in with the new one |
 | E | **every existing gate** unchanged, for `service-mgr` starting what `init` did; **`check-shutdown`**, in CI: write through a mapping without syncing, run `with power shutdown`, read the message off the screen with `check-fbcon`'s reader, then check on the host — `e2fsck` clean, the superblock marked clean, **and the file's contents present**. `shutdown --reboot` seen as a second boot, with the clock set before it read back after; `check-images` comparing the roots; `service`, `date --set` and `log` in `test-interactive` |
 | F | **every existing gate**, for `desktop-shell` building applications' namespaces through `libsession`; `check-login` asserting an application's namespace grants `/session/user`; **`check-logout`**, in CI: from the desktop, a logout that waits for the editor's question, one cancelled, a restart that ends a window anyway, and a shutdown whose message is read off the screen |
-| G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised |
+| G | `check-install` driving `with admin nxinstall` from an ordinary session, **onto a disk that already holds a Nitrox install** — a reinstall, not a blank disk, so the auto-mount rule is exercised — freeing it with `with admin disk --unmount`, making the first account, and booting to a machine that knows only that account |
 
 ## Deferred from this phase
 
