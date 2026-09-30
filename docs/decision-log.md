@@ -32050,7 +32050,7 @@ install entry stops starting a special session. A person logs in as on any boot,
 and types `with admin nxinstall`. The installer gets its disks through the `disks` grant. It makes
 the new machine's first account and administrator, not a copy of the build's demo account.
 
-**The spike found the plan's two warnings real, and one it had not named.**
+**The spike confirmed three things the plan had named.**
 - **The source.** `nxinstall` copies the live root by reading its RAM disk raw, to install the
   system as shipped. But `disks` withholds every mounted device (C.6), and `init` mounts the live
   root read-write. An ordinary view cannot reach it.
@@ -32065,8 +32065,9 @@ the new machine's first account and administrator, not a copy of the build's dem
   - This followed a look at how Linux's live installers work, asked for before deciding. Those
     that copy the live system copy the read-only image under the live root — Ubuntu's squashfs,
     Fedora's base layer — never the root the session writes.
-  - Nitrox's live root has nothing under it, so the pristine source is a second copy: about 80 MiB
-    more RAM, on that boot only.
+  - Nitrox's live root has nothing under it, so the pristine source is a second copy. It costs its
+    size in RAM on that boot only, and as much again read off the stick. Built without the live
+    root's 16 MiB of slack, since it is never written, that is about 12 MiB today.
   - Rejected:
     - an immutable live root with `/home` on a RAM disk of its own, which is Linux's shape but a
       redesign of the live image;
@@ -32090,8 +32091,8 @@ the new machine's first account and administrator, not a copy of the build's dem
   The broker's grant becomes the one way a disk reaches a program.
 - **`nxinstall` names a withheld disk** from `/dev/devices` and `/dev/storage`'s tables, which every
   view has.
-- **`coreutils::prompt` moves to `libviews::prompt`**, now that `nxinstall` is its third consumer,
-  and gains a line prompt.
+- **`coreutils::prompt` moves into a crate of its own, `libprompt`**, now that `nxinstall` is its
+  third consumer, and gains a line prompt. The scrubbing plumbing moves with it from `libviews`.
 - **What the installer writes on the root:**
   - the pristine root's files, except `/home`'s contents, `/system/users` and `/system/views.toml`;
   - the one account, through `libusers`;
@@ -32101,4 +32102,35 @@ the new machine's first account and administrator, not a copy of the build's dem
   - G.1, the pristine source;
   - G.2, the installer in a view, and the first account;
   - G.3, every session ordinary, with `check-install` becoming a reinstall onto a copy of the
-    release disk.
+    release disk grown to 512 MiB.
+
+## 2026-09-30 — Part G's detail pass, reviewed (PR #347)
+
+No blocking findings. Five worth fixing and one optional, all taken, and the entry above corrected
+in place before merge.
+
+- **A reinstall onto the release disk could not pass `check-install`.**
+  - The release disk is 128 MiB, which leaves the installed root about 94 MiB: one block group, so
+    H.2's write past group 0 has nowhere to go.
+  - The target is now a copy **grown to 512 MiB**. Its old primary GPT still finds `nitrox-root`
+    inside the first 128 MiB, so the auto-mount is still exercised.
+- **The command the installer was to print would have failed.** `disk --unmount` takes a label,
+  not a path. And the rule would have offered an unmount for `init`'s root, which the storage
+  service never unmounts.
+  - The plan now prints `with admin disk --unmount nitrox-root`.
+  - It names a disk `init` mounted as the running system, with no command.
+  - Both go to `stderr`. The table on `stdout` stays what the view can use, which three CI checks
+    read: `boot-probe` 3b, `test-interactive` 20b(d) and `check-login` 9a2. They are C.6's only
+    in-guest proof that `disks` withholds anything, and a new row there would have turned CI red.
+- **"Every CI gate, unchanged" was false.** `check-images` changes, and so does the listing those
+  three read. *What to compare* now names each.
+- **Two statements in the entry above were false.**
+  - It said "about 80 MiB". `root.img` is 28 MiB; the 80 MiB was the stick's ESP. The pristine copy
+    needs no slack, so it is about 12 MiB.
+  - It said "one it had not named". The plan had named the account problem three times.
+- **`libviews::prompt` contradicted two rules files**, and would have made `nxinstall` a client of
+  the broker's library that never talks to the broker. The prompts go to a crate of their own,
+  `libprompt`, and the plumbing moves with them.
+- **G.2's `check-install` cannot see the grant** (optional). Its view derives from an installer
+  session that binds every disk already. G.3's reinstall is the first in-guest proof, and the plan
+  says so.
