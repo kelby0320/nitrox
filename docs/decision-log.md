@@ -32042,3 +32042,63 @@ No blocking findings. Two worth fixing and two optional, all four taken.
 The local gate set stays at 36 and is green (fgb50).
 
 No kernel change; no ABI hash impact. An rsproto op is not a hash input.
+
+## 2026-09-30 — Part G's detail pass: an ordinary session installs, from a pristine copy
+
+Part G is the last of the phase: **the installer, the broker's first client**. The live stick's
+install entry stops starting a special session. A person logs in as on any boot, opens a terminal,
+and types `with admin nxinstall`. The installer gets its disks through the `disks` grant. It makes
+the new machine's first account and administrator, not a copy of the build's demo account.
+
+**The spike found the plan's two warnings real, and one it had not named.**
+- **The source.** `nxinstall` copies the live root by reading its RAM disk raw, to install the
+  system as shipped. But `disks` withholds every mounted device (C.6), and `init` mounts the live
+  root read-write. An ordinary view cannot reach it.
+- **The target.** A previous install's disk is auto-mounted read-only on a live boot, so it is
+  withheld too.
+- **The account.** The copy carries the build's `alice`, her home and the policy naming her, so an
+  installed machine has the live stick's account and password.
+
+**The maintainer's calls:**
+- **A pristine copy of the root is the source.** The install entry loads it as a module of its
+  own, `install-root.img`, with its partition named `nitrox-source`.
+  - This followed a look at how Linux's live installers work, asked for before deciding. Those
+    that copy the live system copy the read-only image under the live root — Ubuntu's squashfs,
+    Fedora's base layer — never the root the session writes.
+  - Nitrox's live root has nothing under it, so the pristine source is a second copy: about 80 MiB
+    more RAM, on that boot only.
+  - Rejected:
+    - an immutable live root with `/home` on a RAM disk of its own, which is Linux's shape but a
+      redesign of the live image;
+    - copying the running root's files through a new grant;
+    - reading the live root raw, which can tear.
+- **A disk in use is the person's to release.** `nxinstall` names what is mounted and the command
+  that unmounts it, since a view's disks are fixed when `with` starts the program. Nothing is
+  unmounted as a side effect of asking for a view.
+- **The first account is asked on the terminal**: after the confirmation, a name with echo on, then
+  a password twice with echo off. The confirm line stays as it is.
+
+**What the pass settled from those:**
+- **The storage service passes over `nitrox-source`, by its label.** The first draft said "no RAM
+  disk is auto-mounted", which was false: a `--selftest` image's `scratch.img` is an ext4 RAM disk
+  the service mounts for `boot-probe`. That draft would have broken `test-qemu`'s storage probes.
+- **Every session is ordinary.** Removed:
+  - `installer_boot`, the `install-allowed` marker and `cmdline: install`;
+  - the supervisors' `bind_blk`, `desktop-shell`'s pass-through of a session's disks, and
+    `NamespaceSpec::bind_blk`.
+
+  The broker's grant becomes the one way a disk reaches a program.
+- **`nxinstall` names a withheld disk** from `/dev/devices` and `/dev/storage`'s tables, which every
+  view has.
+- **`coreutils::prompt` moves to `libviews::prompt`**, now that `nxinstall` is its third consumer,
+  and gains a line prompt.
+- **What the installer writes on the root:**
+  - the pristine root's files, except `/home`'s contents, `/system/users` and `/system/views.toml`;
+  - the one account, through `libusers`;
+  - the seeded policy naming it, from a `view_broker::policy::seed(name)` that the build uses too;
+  - its home, with `libfs::HOME_FOLDERS`, which closes `TODO(home-folders)`.
+- **Three pieces**, each keeping `check-install` passing:
+  - G.1, the pristine source;
+  - G.2, the installer in a view, and the first account;
+  - G.3, every session ordinary, with `check-install` becoming a reinstall onto a copy of the
+    release disk.
