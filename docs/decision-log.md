@@ -32385,3 +32385,44 @@ binary, where no host test reaches, and `check-install` is on demand.
 The local gate set stays at 36 and is green (fgb54).
 
 A kernel log line and comments changed, and no ABI hash input did.
+
+## 2026-09-30 — A program in a view had no `stderr`: the installer printed nothing on the laptop
+
+**Found on the laptop**, the first install since Part G. `with admin nxinstall /dev/blk/0` took the
+password and printed nothing: no plan, and no line to confirm it with. Reproduced under QEMU with a
+screendump of the terminal, which showed the same. The refusals Part G.2 added ("is in use …
+Unmount it with …") had never reached a desktop terminal either.
+
+**The cause.** `nxsh` gives each stage its `stderr` with `SEND | TRANSFER`. `with` hands its program
+a *duplicate* of its own `stderr`, keeping one to report on, and `sys_handle_duplicate` needs
+`DUPLICATE`. So the duplicate failed, `with` dropped it without a word, and the broker started every
+program with no `stderr`. Each line those programs wrote went to `kprint`: COM1 under QEMU, and
+nowhere a person can see on a machine with no serial port once the desktop is up. This was true of
+every program run through `with` since Part A.
+
+**Why no gate saw it.** On the serial console the two paths look alike, since `kprint` is COM1 too.
+- `test-interactive` 20b(d) read the installer's messages there and passed.
+- The G.2 entry above says 20b(d) reads "the serial terminal, where `stderr` shows beside the
+  table". What showed there was `kprint`.
+- The desktop gates that run `with` (`check-login` 9a2, `check-install`) read only the console's
+  audit lines, since a release terminal does not narrate its grid.
+
+**The fix:**
+- **`nxsh` gives a stage's `stderr` `DUPLICATE` too.** A stage could already transfer its one copy
+  away, so this lets it keep one as well and reaches nothing new. `pipeline-stdio.md` now names the
+  rights.
+- **`with` says when it cannot hand `stderr` on**, as `nxsh` says of a stage, rather than degrading
+  quietly.
+- **`nxinstall`'s confirmation line reads `with admin nxinstall …`.** The bare form it printed
+  resolves no disk.
+
+**The gate is `test-interactive` 20b(d), on the colour.** The shell paints every diagnostic it
+drains, and `kprint` paints nothing. So `/dev/blk/0`'s message must arrive in the diagnostic colour.
+- **Control:** the shell's `DUPLICATE` masked out. 20b(d) fails at that check, and every step before
+  it passes. `with`'s new warning appears in the transcript.
+- The screendump probe that found it is not kept: `check-install` boots a release image and reads
+  no grid.
+
+**Docs:** `console-and-tty.md` (and its Status), `pipeline-stdio.md`.
+
+No kernel change; no ABI hash impact.

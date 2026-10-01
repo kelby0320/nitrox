@@ -2052,6 +2052,22 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         )
         .into());
     }
+    //          **And it said so on the terminal, not on the kernel log.** On this serial console the
+    //          two look alike: a program with no `stderr` writes to `kprint`, which is COM1 too, so
+    //          the line above passed while every program `with` ran had none — and on the laptop,
+    //          whose kernel log nobody sees once the desktop is up, the installer printed nothing
+    //          after the password (2026-09-30). What tells them apart is the shell: it paints each
+    //          diagnostic it drains, and `kprint` paints nothing.
+    if !listing.contains("\x1b[91m/dev/blk/0 (") {
+        return Err(format!(
+            "`with admin nxinstall`'s message about /dev/blk/0 did not come through the shell: it \
+             is not in the diagnostic colour, so it reached the console by `kprint` — the program \
+             was given no `stderr`, and on a machine with no serial port nobody would see it: \
+             {listing:?}"
+        )
+        .into());
+    }
+    println!("  ok: and a program in a view reaches the terminal through its `stderr`");
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
     s.send("with admin whoami")?;

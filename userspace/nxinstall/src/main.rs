@@ -1001,7 +1001,8 @@ fn run(
         say("  everything already on that disk is lost");
         say("");
         say("nothing has been written. To go ahead, name the disk back:");
-        say(&format!("  nxinstall {} \"{}\"", target.path(), identity));
+        // **The line as it is typed**, in its view: a bare `nxinstall` resolves no disk.
+        say(&format!("  with admin nxinstall {} \"{}\"", target.path(), identity));
         // **A plan is an answer, not a failure** — see `Outcome`. This is the ordinary first
         // step through the program, and exiting non-zero put `nxsh: pipeline failed` directly
         // under the line telling a person what to type next.

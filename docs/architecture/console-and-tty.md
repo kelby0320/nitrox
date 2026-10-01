@@ -1,6 +1,6 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-09-23**, when every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-09-30**, when a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -39,7 +39,10 @@ says so — "echo and line editing live in userspace".
 a terminal writes its prompt, its results and its errors to the **tty** it was handed
 (2026-08-12); and since 2026-09-17 a *stage's* diagnostics do too — `nxsh` gives every program it
 spawns a send end of one shared `stderr` and drains it into that terminal
-(`userspace/nxsh/src/main.rs`), as does `display`'s output. Before that a program's diagnostics
+(`userspace/nxsh/src/main.rs`), as does `display`'s output. Since 2026-09-30 so does a program a
+stage runs **in a view**: `with` hands it a duplicate of its own `stderr`, which needs the stage's
+to carry `DUPLICATE` — until then it did not, and such a program's every line went to `kprint`.
+Before that a program's diagnostics
 fell back to `kprint`, which reaches COM1 and nothing else, so on a machine with no serial port
 they reached nobody at all; the laptop Phase 5 targets is what made that visible.
 
