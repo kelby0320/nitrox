@@ -280,6 +280,8 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     };
     let mut rid = REQUEST_ID;
     let mut tries = 0u8;
+    // TODO(view-grace): every request asks; the broker could remember a success on this terminal
+    // for a few minutes, as `sudo` does. See deferred-decisions.md.
     while o == Outcome::NeedPassword || o == (Outcome::Denied { retry: true }) {
         if term == 0 {
             let why = b"with: a password is needed and there is no terminal to ask on\n";

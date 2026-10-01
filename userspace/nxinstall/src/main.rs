@@ -1,9 +1,9 @@
 //! `nxinstall` — install this system onto a disk, with an account of its own.
 //!
 //! ```text
-//! with admin nxinstall                         # the disks it can use, and why any other is in use
-//! with admin nxinstall /dev/blk/2              # what it would do, and the words to confirm it with
-//! with admin nxinstall /dev/blk/2 "QEMU HARDDISK (QM00002)"   # do it, after asking for an account
+//! with admin nxinstall              # the disks it can use, and why any other is in use
+//! with admin nxinstall /dev/blk/2   # what it would do; then, asked, `yes`, an account, and do it
+//! with admin nxinstall --help
 //! ```
 //!
 //! ## It holds no authority of its own
@@ -20,19 +20,22 @@
 //! with the command that frees it; one `init` mounted holds the running system. Those lines go to
 //! `stderr` — the table on `stdout` stays what the view can use.
 //!
-//! ## The confirmation is an argument; the account is asked
+//! ## The confirmation and the account are asked
 //!
-//! A destructive operation should be hard to do by accident, and "type the disk's identity back"
-//! is the form that resists a reflex — unlike `[y/N]`, which a person answers before reading. A
-//! first run prints the plan and the exact line that would carry it out; running that line is the
-//! confirmation, and the dangerous form cannot be reached by holding Return: the identity has to
-//! come from somewhere, and the only place it exists is the report the first run printed.
+//! **Naming a disk prints the plan and asks**, on the terminal its program was handed: the disk,
+//! what goes on it, that everything on it is lost, and `type yes to erase it and install`. Anything
+//! but `yes` writes nothing (`nxinstall::confirmed`). A whole word rather than `[y/N]`, because a
+//! single key is answered before the question is read; the plan is on the screen above it.
 //!
-//! **Then it asks for the new machine's first account** (Part G.2, the maintainer's call), on the
-//! terminal its program was handed: a name, echo on, and a password twice, echo off, with
-//! `libprompt`. That became possible when Part A gave every stage a terminal; until then no program
-//! read one, which is why the confirmation was an operand in the first place. Nothing is written
-//! until both are answered.
+//! **Until 2026-10-01 the confirmation was an operand**: a first run printed the plan and a line
+//! carrying the disk's identity, and running that line was the go-ahead. That was the only form
+//! possible when no program could read a terminal — Part A gave every stage one — and on the laptop
+//! it was the hard part of an install: an identity of a model and serial, typed back with its
+//! quotes. The maintainer's call, after that attempt: ask, as installers do.
+//!
+//! **Then it asks for the new machine's first account** (Part G.2, the maintainer's call): a name,
+//! echo on, and a password twice, echo off, with `libprompt`. Nothing is written until all three
+//! questions are answered.
 //!
 //! ## What it writes
 //!
@@ -92,6 +95,27 @@ const CHUNK: u64 = 256 * 1024;
 /// session writes to and `init` has mounted; and not `nitrox-root`, which is what the copy becomes,
 /// named by the table this program writes.
 const SOURCE_LABEL: &[u8] = libgpt::INSTALL_SOURCE_LABEL.as_bytes();
+
+/// **What `--help` prints**, a line per message. Written for the person at the live stick, who
+/// has the program's name and nothing else: what it does, the two ways to run it, and that the
+/// disks come with the view.
+const HELP: &[&str] = &[
+    "usage: with admin nxinstall [DEVICE]",
+    "",
+    "Install Nitrox onto a disk, erasing it, with a first account of its own.",
+    "",
+    "  with admin nxinstall          list the disks it can install to, and say",
+    "                                why any other is in use and how to free it",
+    "  with admin nxinstall DEVICE   show what installing to DEVICE would do,",
+    "                                ask before going ahead, ask for the new",
+    "                                machine's first account, and install",
+    "",
+    "DEVICE is a disk as the listing names it, such as /dev/blk/0. Nothing is",
+    "written until every question is answered.",
+    "",
+    "Run it from the live stick's \"install to this machine\" entry, through",
+    "`with admin`: the disks come with the view, and nxinstall alone has none.",
+];
 
 /// The block size of every filesystem this system makes or reads, and of the one it copies
 /// from. 4 KiB is the reader's scratch and the page size, so a file's blocks map to pages.
@@ -702,32 +726,36 @@ struct Account {
 }
 
 /// **Ask for the first account on `term`**: a name, echo on, then a password twice, echo off
-/// (administration Part G.2, the maintainer's call). `None`, having said why, if either was not
-/// given or does not keep `libusers`' rules — before anything is written.
+/// (administration Part G.2, the maintainer's call). Having said why, before anything is written:
+/// `Declined` if a question was cancelled, and `NotInstalled` if an answer does not keep
+/// `libusers`' rules or the two passwords differ.
 ///
 /// **Each question logs its receipt**, since nothing reads a desktop terminal's grid: the name's
 /// before it is asked, and each password's once echo is off, so what a gate types next is neither
 /// echoed nor early.
-fn ask_account(term: u64, say: &mut dyn FnMut(&str)) -> Option<Account> {
+fn ask_account(term: u64, say: &mut dyn FnMut(&str)) -> Result<Account, nxinstall::Outcome> {
+    use nxinstall::Outcome;
     log("asking for the first account");
     let Some(name) = libprompt::ask_line(term, b"the new machine's first account: name: ") else {
         say("cancelled; nothing was written.");
-        return None;
+        return Err(Outcome::Declined);
     };
     if !libusers::valid_name(&name) {
         say(
             "an account's name is 1 to 32 of a-z, 0-9, `_` and `-`, starting with a letter or `_`. \
              Nothing was written.",
         );
-        return None;
+        return Err(Outcome::NotInstalled);
     }
     // Two receipts that do not share a prefix, since a gate matches on a line's start.
     let asked = &mut |n: u8| log(if n == 1 { "asking for its password" } else { "asking for the password again" });
     match libprompt::ask_new_password_then(term, b"password: ", asked) {
-        Ok(password) => Some(Account { name, password }),
+        Ok(password) => Ok(Account { name, password }),
         Err(why) => {
             say(&format!("{}; nothing was written.", why.why()));
-            None
+            // A cancelled question is the person's no; two passwords that differ, or one the
+            // rules refuse, is an answer that could not be used.
+            Err(if why == libprompt::NewPassword::Cancelled { Outcome::Declined } else { Outcome::NotInstalled })
         }
     }
 }
@@ -854,8 +882,24 @@ fn run(
     use nxinstall::Outcome;
     let mut say = |line: &str| say_to(stderr, line);
 
-    let devs = devices(namespace);
     let operands: Vec<&String> = argv.iter().skip(1).collect();
+    // **Before anything is looked up**, so `nxinstall --help` answers without a view.
+    if operands.iter().any(|o| o.as_str() == "--help") {
+        for line in HELP {
+            say(line);
+        }
+        return Outcome::Help;
+    }
+    if let Some(flag) = operands.iter().find(|o| o.starts_with('-')) {
+        say(&format!("nxinstall: no option {flag}; `nxinstall --help` says what it takes"));
+        return Outcome::Usage;
+    }
+    if operands.len() > 1 {
+        say("usage: with admin nxinstall [DEVICE] -- `nxinstall --help` says more");
+        return Outcome::Usage;
+    }
+
+    let devs = devices(namespace);
     // **The disks the view does not hold, and why** (administration Part G.2): each is in use.
     // Messages, on `stderr` — the table on `stdout` stays what the view can use, which is what
     // `boot-probe`, `test-interactive` and `check-login` read to prove `disks` withholds anything.
@@ -892,22 +936,13 @@ fn run(
         }
         return Outcome::Listed;
     }
-    if operands.len() > 2 {
-        say("usage: nxinstall [DEVICE [IDENTITY]]");
-        return Outcome::Usage;
-    }
 
-    // **An install that was *asked for* and refused is an event; a plan is not.** Someone
-    // naming a device and its identity is asking to destroy a disk, and what stopped that
-    // belongs in the system log beside the milestones an install leaves — not least because
-    // it is the only thing a gate can see, the refusal itself being a conversation on a
-    // terminal (PR #309 review, 7). The one-operand form logs nothing: it is a question.
-    let requested = operands.len() == 2;
-    let refuse = |what: &str| {
-        if requested {
-            log(&format!("refused {}: {what}", operands[0]));
-        }
-    };
+    // **An install that was asked for and refused is an event.** Naming a device is asking to
+    // destroy a disk — the plan and the question that follow are the start of that, not a
+    // separate query — and what stopped it belongs in the system log beside the milestones an
+    // install leaves, not least because it is the only thing a gate can see, the refusal itself
+    // being a conversation on a terminal (PR #309 review, 7).
+    let refuse = |what: &str| log(&format!("refused {}: {what}", operands[0]));
 
     // The target, by the path the listing printed.
     let wanted = operands[0].as_str();
@@ -986,52 +1021,47 @@ fn run(
 
     let identity = target.name();
     let block = target.info.logical_block_size as u64;
-    if operands.len() == 1 {
-        say(&format!(
-            "{} is {} ({})",
-            target.path(),
-            identity,
-            human(target.info.byte_capacity())
-        ));
-        say(&format!(
-            "  a boot partition of {} and a root partition of {}",
-            human(layout.esp_blocks() * block),
-            human(layout.root_blocks() * block)
-        ));
-        say("  everything already on that disk is lost");
-        say("");
-        say("nothing has been written. To go ahead, name the disk back:");
-        // **The line as it is typed**, in its view: a bare `nxinstall` resolves no disk.
-        say(&format!("  with admin nxinstall {} \"{}\"", target.path(), identity));
-        // **A plan is an answer, not a failure** — see `Outcome`. This is the ordinary first
-        // step through the program, and exiting non-zero put `nxsh: pipeline failed` directly
-        // under the line telling a person what to type next.
-        return Outcome::Planned;
-    }
+    say(&format!(
+        "{} is {} ({})",
+        target.path(),
+        identity,
+        human(target.info.byte_capacity())
+    ));
+    say(&format!(
+        "  a boot partition of {} and a root partition of {}",
+        human(layout.esp_blocks() * block),
+        human(layout.root_blocks() * block)
+    ));
+    say("  everything already on that disk is lost");
 
-    if operands[1].as_str() != identity.as_str() {
-        say(&format!(
-            "that is not what {} is called, so nothing was written. It is \"{}\".",
-            target.path(),
-            identity
-        ));
-        // **The reason, not what was typed.** A console line never carries a person's
-        // keystrokes; that the two did not match is the program's own finding.
-        refuse("the name given did not match");
-        return Outcome::NotInstalled;
-    }
-
-    // **The first account, asked on the terminal after the confirmation** (administration Part
-    // G.2): the maintainer's call. Nothing has been written, and nothing is until both answers are
-    // in; a cancelled prompt leaves the disk as it was.
+    // **Asked, on the terminal** (2026-10-01, the maintainer's call): the plan is on the screen
+    // above the question, and only `yes` goes ahead. Then the account (administration Part G.2).
+    // Nothing has been written, and nothing is until all of it is answered.
     let Some(term) = terminal else {
-        say("the new machine's first account is asked for on a terminal, and this program was given none. Nothing was written.");
-        refuse("no terminal to ask for the first account on");
+        say("this installer asks before it writes, on a terminal, and was given none. Nothing was written.");
+        refuse("no terminal to ask on");
         return Outcome::NotInstalled;
     };
-    let Some(mut account) = ask_account(term, &mut say) else {
-        refuse("the first account was not given");
-        return Outcome::NotInstalled;
+    // The receipt a gate waits for before it types the answer, since nothing reads a desktop
+    // terminal's grid — as each of the account's questions has one.
+    log("asking to go ahead");
+    let question = format!("erase {} and install Nitrox? type yes to go ahead: ", target.path());
+    let answer = libprompt::ask_line(term, question.as_bytes());
+    if !answer.as_deref().is_some_and(nxinstall::confirmed) {
+        say("nothing was written.");
+        log(&format!("not going ahead; nothing was written to {}", target.path()));
+        return Outcome::Declined;
+    }
+    let mut account = match ask_account(term, &mut say) {
+        Ok(account) => account,
+        Err(outcome) => {
+            if outcome == Outcome::Declined {
+                log(&format!("the account was not given; nothing was written to {}", target.path()));
+            } else {
+                refuse("the first account was not one the rules allow");
+            }
+            return outcome;
+        }
     };
 
     say(&format!("installing to {} ({})", target.path(), identity));

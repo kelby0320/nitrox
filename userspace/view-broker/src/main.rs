@@ -560,8 +560,12 @@ impl Broker {
                 let id = self.sessions.open(principal);
                 let mut out = [0u8; 8];
                 let n = build_session_id(&mut out, id).unwrap_or(0);
-                let _ = send(ch, op, request_id, RS_FLAG_REPLY, &out[..n], &[]);
+                // **Logged before the reply, not after it.** The supervisor builds the session's
+                // namespace on the reply and says so, and a line logged after the send could land
+                // after that one — which is what `test-interactive` step 4 met, waiting for a line
+                // its own `expect` had scanned past (2026-10-01). Before the send, it cannot.
                 Line::new().s(b"view-broker: session ").u(id).s(b" opened").end();
+                let _ = send(ch, op, request_id, RS_FLAG_REPLY, &out[..n], &[]);
             }
             OP_VIEWS_CLOSE_SESSION => {
                 let Some(id) = parse_session_id(&body) else {

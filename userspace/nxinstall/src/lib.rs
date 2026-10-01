@@ -74,15 +74,21 @@ pub fn block_index(name: &str) -> Option<usize> {
 /// attempt on the laptop, 2026-09-17).
 ///
 /// Asking for an install and not getting one is a failure whatever refused it — a wrong kind of
-/// device, a name that did not match, a disk too small, an I/O error part-way. In all of those
+/// device, a disk too small, an answer the rules refuse, an I/O error part-way. In all of those
 /// the caller asked for something that did not happen, which is exactly what a non-zero status
 /// is for, and a script that stops on it stops correctly.
+///
+/// **Saying no is not a failure** (2026-10-01). A person shown the plan who answers anything but
+/// `yes`, or who cancels a question, has had what they asked for: to be asked. They are told that
+/// nothing was written, and `pipeline failed` under that would read as though something broke.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// The devices this view can reach were listed.
     Listed,
-    /// What an install would do was reported. Nothing was written.
-    Planned,
+    /// The usage was printed, as `--help` asks.
+    Help,
+    /// The person was asked to go ahead, or for the account, and did not. Nothing was written.
+    Declined,
     /// The install completed.
     Installed,
     /// An install was asked for and did not happen. Nothing was written, or the failure says
@@ -96,11 +102,18 @@ impl Outcome {
     /// The process exit status.
     pub fn status(self) -> i64 {
         match self {
-            Outcome::Listed | Outcome::Planned | Outcome::Installed => 0,
+            Outcome::Listed | Outcome::Help | Outcome::Declined | Outcome::Installed => 0,
             Outcome::NotInstalled => 1,
             Outcome::Usage => 2,
         }
     }
+}
+
+/// **Whether `answer` is the go-ahead**: `yes`, in any case, with the line's surrounding blanks
+/// ignored — and nothing else. Not `y`, which is a reflex; and not a prefix or a longer word that
+/// starts with it, since a person who typed `yesterday` was not answering.
+pub fn confirmed(answer: &[u8]) -> bool {
+    answer.trim_ascii().eq_ignore_ascii_case(b"yes")
 }
 
 /// Why a target cannot be installed to. Each is a sentence a person can act on, which is why
@@ -433,13 +446,13 @@ mod tests {
         assert!(plan(exact - 1, 512, 33 * 2048, 24 * 2048).is_err(), "one block short");
     }
 
-    /// **A question answered is not a failure.** The two-step confirmation is the *ordinary*
-    /// path through this program — a person is meant to run the one-operand form, read it, and
-    /// then run what it prints — so reporting it as a failure puts `pipeline failed` under
-    /// every correct use of the installer.
+    /// **A question answered is not a failure.** Reading the plan and saying no is an ordinary
+    /// path through this program, as is asking for its usage, so reporting either as a failure
+    /// puts `pipeline failed` under a correct use of the installer.
     #[test]
-    fn asking_what_would_happen_succeeds_and_asking_for_an_install_that_did_not_happen_does_not() {
-        assert_eq!(Outcome::Planned.status(), 0, "a plan is an answer, not a failure");
+    fn saying_no_succeeds_and_asking_for_an_install_that_did_not_happen_does_not() {
+        assert_eq!(Outcome::Declined.status(), 0, "saying no is an answer, not a failure");
+        assert_eq!(Outcome::Help.status(), 0);
         assert_eq!(Outcome::Listed.status(), 0);
         assert_eq!(Outcome::Installed.status(), 0);
         // And the half that must stay non-zero: a script that asked for an install and did not
@@ -448,6 +461,18 @@ mod tests {
         assert_ne!(Outcome::Usage.status(), 0);
         // Usage is distinguishable from a refusal, which is the split every program here uses.
         assert_ne!(Outcome::Usage.status(), Outcome::NotInstalled.status());
+    }
+
+    /// **`yes`, and only `yes`.** Each refusal here is an answer a person might give meaning
+    /// something else, or by reflex; the accepted ones are the same word typed loosely.
+    #[test]
+    fn only_yes_goes_ahead() {
+        for yes in [&b"yes"[..], b"YES", b"Yes", b"  yes ", b"yes\r", b"\tyes"] {
+            assert!(confirmed(yes), "{:?} is the go-ahead", core::str::from_utf8(yes));
+        }
+        for no in [&b""[..], b"y", b"Y", b"no", b"ye", b"yess", b"yesterday", b"yes please", b"oui", b"\n"] {
+            assert!(!confirmed(no), "{:?} is not", core::str::from_utf8(no));
+        }
     }
 
     /// 4 Kn disks exist, `libgpt` addresses 512-byte blocks throughout, and the difference is

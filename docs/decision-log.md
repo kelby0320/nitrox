@@ -32426,3 +32426,74 @@ drains, and `kprint` paints nothing. So `/dev/blk/0`'s message must arrive in th
 **Docs:** `console-and-tty.md` (and its Status), `pipeline-stdio.md`.
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-01 — The installer asks before it writes, and says how it is used
+
+**The maintainer's call, after an install attempt on the laptop.** The confirmation was an operand:
+`with admin nxinstall /dev/blk/0` printed the plan and a line carrying the disk's identity, a model
+and serial in quotes, and running that line was the go-ahead. That was the only form possible when
+no program could read a terminal, and Part A changed that. On the laptop the identity was the hard
+part of an install, and it ended in `pipeline failed`. "The nxinstall program can and should ask
+for confirmation before it does the install. Most installers do something like that."
+
+**Now naming a disk shows the plan and asks**: `erase /dev/blk/0 and install Nitrox? type yes to go
+ahead:`, on the terminal its program was handed. Then the account questions, as Part G.2 decided.
+- **`yes` and only `yes`**, in any case and ignoring blanks around it (`nxinstall::confirmed`,
+  host-tested for each near miss: `y`, `ye`, `yess`, `yesterday`, `yes please`). A whole word
+  rather than `[y/N]`, since a single key is answered before the question is read. The plan is on
+  the screen above it.
+- **Saying no is not a failure.** `Outcome::Declined` exits 0, as does cancelling one of the
+  account's questions. A person who was asked and said no got what they asked for, and `pipeline
+  failed` under "nothing was written" would read as though something broke. An answer the rules
+  refuse, such as two passwords that differ, still exits 1.
+- **The identity operand is gone**, and with it the check that it matched. A second operand is a
+  usage error.
+- **A refusal is logged whenever a disk is named**, since naming one is now the request. The gates'
+  refusal lines are unchanged.
+- **The receipts**: "asking to go ahead" before the question, and "not going ahead; nothing was
+  written to …" after a no.
+
+**`--help`** (the maintainer: "it's impossible for a user to figure out how to use it"). `nxinstall`
+took `--help` for a disk and said it was not one. It now prints its usage before looking anything
+up, so it answers without a view, and refuses any other flag. **The sweep the maintainer asked
+for:**
+- Every coreutil takes `--help` through `coreutils::args`, all seventeen acting on it; `with` and
+  `nxsh` take it too.
+- `nxinstall` was the one command-line program without it.
+- The three windowed programs take no flags. `nxterm` reads no arguments, and `nxfiles` and
+  `nxedit` take a path.
+
+**Gates:**
+- `check-install` drives the new path. Steps 7 and 7b name the disk alone. Step 8b answers `no`
+  once, which must write nothing and exit 0, then `yes`.
+- `check-login` 9a2 names `/dev/blk/0` alone.
+- **Control:** `confirmed` loosened to "starts with y" fails `only_yes_goes_ahead`.
+
+**Two ordering races, found by this change's first gate run:**
+- **The broker logged "session N opened" after replying.** `session-mgr` builds the namespace on the
+  reply and says so, so the two lines could land either way round. `test-interactive` step 4
+  expects the broker's first, and it timed out waiting for a line its own `expect` had scanned
+  past. The broker now logs before the reply, which makes the order hold by construction. Its
+  "ended" was already logged before its reply.
+- **`check-install`'s helper waited for the broker's "started"** before the program's own lines.
+  That line is an audit record, which the logging service prints after the program is running, so
+  it can arrive after the program's first line. It had held because `nxinstall` does several round
+  trips first. The helper no longer waits for it: the program's own next line says it started.
+
+**Seen on a screendump of the install, and not changed here:** everything `nxinstall` prints is a
+diagnostic on `stderr`, so the shell paints its plan, its progress and its usage in the error
+colour, and the same is true of every coreutil's `--help`. Which output is a diagnostic, and
+whether progress and usage should be, is a question for every program rather than for this one.
+
+**A follow-on, recorded rather than built:** `with` asks for the password on every request, and the
+maintainer would like `sudo`'s grace period. `TODO(view-grace)` in `deferred-decisions.md` sets out
+what needs deciding. The key is the hard part: nothing today tells the broker that two terminal
+handles are one terminal.
+
+**Docs:**
+- `nxinstall`'s crate doc;
+- `boot-flow.md`'s and `storage.md`'s gate rows;
+- the root `CLAUDE.md`'s `check-install` paragraph;
+- `deferred-decisions.md`.
+
+No kernel change; no ABI hash impact.
