@@ -32531,3 +32531,60 @@ PR removed the line before either reached `main`, so that bullet now says so (fi
 was unmerged, so it was edited in place).
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-01 — Phase 6 scoped: USB without kernel modules
+
+Phase 6's plan was a sketch written on 2026-09-10, before Phase 5 and administration. Checked
+against the code and discussed with the maintainer, it is now scoped into eight parts, A–H
+([`phase-6-usb.md`](planning/phase-6-usb.md)). Each gets a detail pass when it is next.
+
+**The maintainer's calls:**
+- **No kernel modules in this phase.** The sketch's Definition of Done wanted one driver loaded as
+  a module, and the deferral's trigger was "hot-pluggable hardware". That trigger ran two things
+  together: a device that *arrives* needs a driver that binds when it does, and a compiled-in USB
+  driver does exactly that.
+  - Both machines need the same USB drivers. xHCI is one standard interface, as AHCI is, and the
+    one AHCI driver already serves QEMU and the laptop.
+  - The first machine-specific drivers are Phase 8's two NICs, and even those can be compiled in
+    and decline where their device is absent.
+  - The trigger is restated in `deferred-decisions.md`: a driver that should not be in every image,
+    a driver restarted without a reboot, or one built outside this tree. **What Tier 2 is** —
+    kernel modules or userspace drivers — is recorded as open, since `drivers-and-irps.md`
+    describes both.
+- **HID in boot protocol, decoded in the kernel** into the `InputEvent` records the PS/2 driver
+  emits. A userspace HID parser would have put a second record format between the kernel and
+  `input-server`. Report descriptors are deferred.
+- **A USB tablet is deferred**, with report descriptors and the `EV_ABS` mapping it needs.
+- **A removable stick is the session's**: writable when auto-mounted, on a live boot too, and
+  ejectable without a password. Internal disks keep today's rules. The graphical prompt's trigger
+  does not arrive here.
+- **Copy throughput is measured on the laptop first**, and the Definition of Done's number is set
+  after (`TODO(fs-throughput)`, which named this phase as its trigger).
+- **Five small items from the laptop install come first**, the grace period for `with` among
+  them.
+
+**What the check found** (the plan's *What exists*, and three corrections to the sketch):
+- **The sketch's first argument was false.** "Phase 5 ends with a keyboard and no mouse": the
+  trackpad has worked since the laptop's first boot, through the i8042. USB input stays in the
+  Definition of Done, as the first devices that come and go and the second input producer.
+- **The vector pool does not need to grow yet.** A QEMU boot with a RAM disk takes six of eight
+  (`0x30`–`0x35`, the RAM disk's software vector among them), and the xHCI uses one interrupter
+  for seven. It grows at the next device that wants one.
+- **A thumb drive's partition table is MBR or none**, and the kernel reads GPT only, at boot,
+  polled with interrupts masked.
+- **No kernel thread can wait.** The idle thread and the reaper are the only two, each parked by
+  hand. Enumeration needs waits, so a general facility is built at its second consumer: a kernel
+  thread that blocks on an event or a deadline. A state machine driven by DPCs and timers was
+  weighed and set aside.
+- **The device table never loses an entry**, so departure is new kernel work. A departed record
+  keeps its served index retired, its I/O completes `PeerClosed`, and the registry gains a
+  generation and a notification to the device manager. That is an ABI change, as is
+  `DeviceKind::UsbDevice`.
+- **Once mass storage works, a live boot's own stick appears as a disk.** The kernel reads its GPT
+  disk GUID from Limine's file record. The storage service passes it over, and `nxinstall` refuses
+  it.
+- **QEMU can boot with the i8042 off**, so a gate's USB keyboard is the only keyboard.
+
+Docs only: the plan, `implementation-plan.md`, `deferred-decisions.md` (the Tier 2 trigger, FAT,
+USB HID, `EV_ABS`, `TODO(fs-throughput)`) and `drivers-and-irps.md` (the open Tier 2 question).
+No ABI hash impact.

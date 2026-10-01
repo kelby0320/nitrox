@@ -75,6 +75,22 @@ optional hardware that isn't on the boot path.
 > USB devices are the first that are not, and they arrive as several consumers at once (HID,
 > mass storage, per-device), which is the condition this project builds an abstraction under.
 > See [`phase-6-usb.md`](../planning/phase-6-usb.md).
+>
+> **It did not fire** (2026-10-01, the maintainer's call in Phase 6's scoping). The trigger ran two
+> things together: a device that *arrives* needs a driver that can bind when it does, and a
+> compiled-in USB driver binding at arrival is exactly that — no code has to arrive with the
+> device. Both machines need the same USB drivers, since xHCI is one standard interface, as AHCI
+> is. **The trigger is now**: a driver that should not be in every image (Wi-Fi is the likely
+> first), a driver that must be restarted without a reboot, or one built outside this tree. Two
+> NIC drivers in [Phase 8](../planning/phase-8-networking.md), one per machine, are not enough on
+> their own: each can be compiled in and decline where its device is absent, as AHCI declines.
+>
+> **Which Tier 2 is, is open.** The table in
+> [`drivers-and-irps.md`](../architecture/drivers-and-irps.md) § *Module tiers* says modules loaded
+> into the kernel at runtime; its § *`InterruptObject`* says userspace drivers that hold an
+> interrupt and their device's registers and service the hardware from a process. In a capability
+> system the second fits: a crashed driver is a process to restart, and the kernel needs no ELF
+> linker or ABI hash. It is decided when the trigger fires, before the loader is built.
 
 **MSI-X (table-based message-signalled interrupts).** **MSI** itself landed in Phase 5 Part A
 (2026-09-11) and has moved to the Resolved table; MSI-X did not, and it is a different mechanism
@@ -1029,9 +1045,20 @@ is the point of the arrangement (`docs/architecture/input-subsystem.md` §1) —
 kernel change when it arrives. Trigger: hardware, or a laptop touchpad. Multitouch
 additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised 2026-08-06.
 
+> **USB HID and hotplug are scheduled, and not where this said** (2026-10-01, Phase 6's scoping).
+> The USB stack is a Tier 1 kernel driver, so a userspace HID parser would need a second record
+> format between the kernel and `input-server`. The maintainer's call: **boot protocol, decoded in
+> the kernel** into the same `InputEvent` records the PS/2 driver emits, as PS/2 decodes scancodes
+> there (Phase 6 Parts B and C). **HID report descriptors** stay deferred, until a device needs one
+> — a tablet, extra keys. Multitouch and gestures stay deferred with them.
+
 **Input: `EV_ABS` device-space → screen-space mapping.** Absolute coordinates are meaningless
 without knowing the device's resolution and the screen's, and nothing decides who maps them.
 Not needed until a touchscreen or a tablet. Raised 2026-08-06.
+
+> **A USB tablet was considered for Phase 6 and deferred** (2026-10-01). QEMU's `usb-tablet` would
+> end the `--grab` dance — the guest's pointer would follow the host's — but it needs HID report
+> descriptors and this mapping, so it is its own work.
 
 **~~Input: who owns accumulated pointer position.~~ Decided 2026-08-10 — the compositor
 owns it.** The `input-server` sees every device; the compositor owns the screen. What settled
@@ -1529,6 +1556,9 @@ not only in the doc that decided it.
 > **The workflow arrived from a different direction** (2026-09-10): a USB thumb drive is
 > FAT32, so Phase 6 needs this whether or not anybody ever updates a bootloader in place. The
 > ESP-write case comes free with it, and Phase 5's installer would like it.
+>
+> **Scheduled** (2026-10-01): Phase 6 Part E, `fs-server-fat` read-write, FAT12/16/32 with long
+> names. The read-only first step is skipped: a stick is written to.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
 of a directory for a record with enough slack before appending a new block, and the server
@@ -1577,6 +1607,11 @@ IPC round trips — resolve, create, grow, map, write, sync — none of them bat
 wrong: a write-back mapping was blamed for a 45× cost that turned out to be a dropped
 write-combining attribute, and only a number on the real machine settled it. **Trigger**: the
 first time somebody is waiting on it, or the next phase that moves bulk data — which is USB.
+
+> **Scheduled** (2026-10-01): Phase 6 Part H. `nxsh` gains `time`; an ext4 copy and a copy to a
+> stick are timed on the laptop; what dominates is fixed; and only then does the phase's Definition
+> of Done get its number. `fs-server-fat`'s write path batches from its first version, so the new
+> server is not one more suspect.
 
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
