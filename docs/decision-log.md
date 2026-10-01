@@ -32490,6 +32490,9 @@ maintainer would like `sudo`'s grace period. `TODO(view-grace)` in `deferred-dec
 what needs deciding. The key is the hard part: nothing today tells the broker that two terminal
 handles are one terminal.
 
+**On the laptop**, the maintainer reports the install succeeded with this build: the first install
+there from a view, through the `disks` grant, since administration Part G.
+
 **Docs:**
 - `nxinstall`'s crate doc;
 - `boot-flow.md`'s and `storage.md`'s gate rows;
