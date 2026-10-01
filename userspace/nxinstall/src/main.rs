@@ -22,10 +22,11 @@
 //!
 //! ## The confirmation and the account are asked
 //!
-//! **Naming a disk prints the plan and asks**, on the terminal its program was handed: the disk,
-//! what goes on it, that everything on it is lost, and `type yes to erase it and install`. Anything
-//! but `yes` writes nothing (`nxinstall::confirmed`). A whole word rather than `[y/N]`, because a
-//! single key is answered before the question is read; the plan is on the screen above it.
+//! **Naming a disk shows the plan and asks**, in one write to the terminal its program was handed:
+//! the disk, what goes on it, that everything on it is lost, and `erase /dev/blk/N and install
+//! Nitrox? type yes to go ahead:`. Anything but `yes` writes nothing (`nxinstall::confirmed`). A
+//! whole word rather than `[y/N]`, because a single key is answered before the question is read;
+//! the plan is on the screen above it, since the two are one write (PR #349 review).
 //!
 //! **Until 2026-10-01 the confirmation was an operand**: a first run printed the plan and a line
 //! carrying the disk's identity, and running that line was the go-ahead. That was the only form
@@ -837,11 +838,12 @@ fn kind_name(k: BlockKind) -> &'static str {
 /// Separate from [`say_to`], which talks to the person running the program. This is the record
 /// an install leaves behind: on the machine Phase 5 targets there is no serial port and the
 /// terminal's scrollback goes away with the session, so "what did the installer actually do"
-/// has to survive somewhere. Only the milestones — a refusal is a conversation, not an event.
+/// has to survive somewhere. The milestones, and each refusal of a disk a person named: what
+/// stopped an install is part of the record, and the only part of it a gate can see.
 ///
-/// **Never the operand.** The identity logged here is read back out of the device's own `info`,
-/// not taken from the command line: what a person typed does not belong on a console, and the
-/// two strings are equal exactly when the install proceeds anyway.
+/// **Never what was typed.** A path or an identity logged here is read back out of the tables or
+/// the device's own `info`, not taken from the command line: what a person typed does not belong
+/// on a console, and an operand that names no device is logged as that, without itself.
 fn log(line: &str) {
     let mut bytes = Vec::from(&b"nxinstall: "[..]);
     bytes.extend_from_slice(line.as_bytes());
@@ -942,7 +944,10 @@ fn run(
     // separate query — and what stopped it belongs in the system log beside the milestones an
     // install leaves, not least because it is the only thing a gate can see, the refusal itself
     // being a conversation on a terminal (PR #309 review, 7).
-    let refuse = |what: &str| log(&format!("refused {}: {what}", operands[0]));
+    //
+    // **The path is one the tables name**, the target's or a withheld disk's — equal to what was
+    // typed, but never taken from it: an operand that names nothing is logged without itself.
+    let refuse = |path: &str, what: &str| log(&format!("refused {path}: {what}"));
 
     // The target, by the path the listing printed.
     let wanted = operands[0].as_str();
@@ -951,11 +956,11 @@ fn run(
         // machine has and the view lacks was withheld, and the person can act on why.
         if let Some(w) = withheld.iter().find(|w| w.path == wanted) {
             say(&w.message());
-            refuse(w.refusal());
+            refuse(&w.path, w.refusal());
             return Outcome::NotInstalled;
         }
         say(&format!("{wanted} is not a block device this view can reach."));
-        refuse("not a block device in this view");
+        log("refused an operand that names no block device in this view");
         return Outcome::NotInstalled;
     };
 
@@ -969,7 +974,7 @@ fn run(
                 "{wanted} is a partition, not a disk. An install writes a partition table, which \
                  would destroy the disk this partition is part of."
             ));
-            refuse("it is a partition, not a disk");
+            refuse(&target.path(), "it is a partition, not a disk");
             return Outcome::NotInstalled;
         }
         BlockKind::RamDisk => {
@@ -977,24 +982,24 @@ fn run(
                 "{wanted} is memory published as a disk — one of the modules this live system is \
                  running from. Writing it would destroy the running system and survive nothing."
             ));
-            refuse("it is a ram disk, not a disk");
+            refuse(&target.path(), "it is a ram disk, not a disk");
             return Outcome::NotInstalled;
         }
         BlockKind::Unknown => {
             say(&format!(
                 "{wanted} does not say what it is, so this installer will not write to it."
             ));
-            refuse("it does not say what it is");
+            refuse(&target.path(), "it does not say what it is");
             return Outcome::NotInstalled;
         }
     }
     if target.info.name().is_empty() {
         say(&format!(
-            "{wanted} reports no model or serial, so there is nothing to confirm it by. This \
+            "{wanted} reports no model or serial, so the plan could not say which disk it is. This \
              installer will not write to a disk it cannot name."
         ));
-        refuse("it reports no model or serial");
-            return Outcome::NotInstalled;
+        refuse(&target.path(), "it reports no model or serial");
+        return Outcome::NotInstalled;
     }
 
     let Some((mem, addr)) = scratch(CHUNK) else {
@@ -1014,38 +1019,38 @@ fn run(
         Ok(l) => l,
         Err(e) => {
             say(&e);
-            refuse("the disk cannot take the install");
+            refuse(&target.path(), "the disk cannot take the install");
             return Outcome::NotInstalled;
         }
     };
 
-    let identity = target.name();
-    let block = target.info.logical_block_size as u64;
-    say(&format!(
-        "{} is {} ({})",
-        target.path(),
-        identity,
-        human(target.info.byte_capacity())
-    ));
-    say(&format!(
-        "  a boot partition of {} and a root partition of {}",
-        human(layout.esp_blocks() * block),
-        human(layout.root_blocks() * block)
-    ));
-    say("  everything already on that disk is lost");
-
-    // **Asked, on the terminal** (2026-10-01, the maintainer's call): the plan is on the screen
-    // above the question, and only `yes` goes ahead. Then the account (administration Part G.2).
-    // Nothing has been written, and nothing is until all of it is answered.
+    // **Asked, on the terminal** (2026-10-01, the maintainer's call): only `yes` goes ahead. Then
+    // the account (administration Part G.2). Nothing has been written, and nothing is until all of
+    // it is answered.
     let Some(term) = terminal else {
         say("this installer asks before it writes, on a terminal, and was given none. Nothing was written.");
-        refuse("no terminal to ask on");
+        refuse(&target.path(), "no terminal to ask on");
         return Outcome::NotInstalled;
     };
+    // **The plan and the question in one write** (PR #349 review). Sent to `stderr`, the plan
+    // reached the screen whenever the shell next drained it, and nothing ordered that against a
+    // question written to the terminal — the shape `with` met with "wrong password" landing under
+    // its next prompt. One channel and one write, so the plan is above the question it explains.
+    let identity = target.name();
+    let block = target.info.logical_block_size as u64;
+    let question = format!(
+        "{} is {} ({})\r\n  a boot partition of {} and a root partition of {}\r\n  everything \
+         already on that disk is lost\r\nerase {} and install Nitrox? type yes to go ahead: ",
+        target.path(),
+        identity,
+        human(target.info.byte_capacity()),
+        human(layout.esp_blocks() * block),
+        human(layout.root_blocks() * block),
+        target.path()
+    );
     // The receipt a gate waits for before it types the answer, since nothing reads a desktop
     // terminal's grid — as each of the account's questions has one.
     log("asking to go ahead");
-    let question = format!("erase {} and install Nitrox? type yes to go ahead: ", target.path());
     let answer = libprompt::ask_line(term, question.as_bytes());
     if !answer.as_deref().is_some_and(nxinstall::confirmed) {
         say("nothing was written.");
@@ -1058,7 +1063,7 @@ fn run(
             if outcome == Outcome::Declined {
                 log(&format!("the account was not given; nothing was written to {}", target.path()));
             } else {
-                refuse("the first account was not one the rules allow");
+                refuse(&target.path(), "the first account was not one the rules allow");
             }
             return outcome;
         }

@@ -32413,8 +32413,8 @@ every program run through `with` since Part A.
   rights.
 - **`with` says when it cannot hand `stderr` on**, as `nxsh` says of a stage, rather than degrading
   quietly.
-- **`nxinstall`'s confirmation line reads `with admin nxinstall …`.** The bare form it printed
-  resolves no disk.
+- **`nxinstall`'s confirmation line read `with admin nxinstall …`**, since the bare form it printed
+  resolves no disk. The next entry removed the line altogether, before either reached `main`.
 
 **The gate is `test-interactive` 20b(d), on the colour.** The shell paints every diagnostic it
 drains, and `kprint` paints nothing. So `/dev/blk/0`'s message must arrive in the diagnostic colour.
@@ -32498,5 +32498,36 @@ there from a view, through the `disks` grant, since administration Part G.
 - `boot-flow.md`'s and `storage.md`'s gate rows;
 - the root `CLAUDE.md`'s `check-install` paragraph;
 - `deferred-decisions.md`.
+
+No kernel change; no ABI hash impact.
+
+## 2026-10-01 — PR #349, reviewed: the plan in the question's write
+
+Nothing blocking. One finding worth fixing and two optional ones, all taken.
+
+**Text the identity confirmation left behind** (finding 1):
+- **The crate doc** quoted a question the program does not ask.
+- **`log()`'s doc** described the identity comparison this PR deleted. It also said a refusal is not
+  an event, while `refuse` had just become unconditional.
+- **`refuse` logged the operand as typed**, which the rule "never what a person typed" forbids. The
+  path logged is now the one the tables name. It equals what was typed, but is never taken from it.
+  An operand that names no device is logged without itself: "refused an operand that names no
+  block device in this view". The gates' refusal lines are unchanged.
+- **A disk with no model or serial** was refused because "there is nothing to confirm it by". That
+  was no longer true. It is now refused because the plan could not say which disk it is.
+
+**The plan and the question took two routes to the screen** (finding 2).
+- The plan went to `stderr`, which the shell drains when it next looks. The question went to the
+  stage's terminal. Nothing ordered the two, and the whole-word answer leans on the plan being above
+  the question.
+- `with` had met this shape before: "wrong password" sent to `stderr` landed under its next prompt.
+- The reviewer could not make it fail under QEMU. They noted that the laptop, with no serial port
+  to slow the log write in between, narrows the gap that hid it.
+- **The plan is now part of the question's own write**, `\r\n`-separated, which is the fix `with`
+  uses. A side effect: the plan is no longer painted in the error colour.
+
+**The 2026-09-30 entry above** recorded the confirmation line's `with admin` prefix as a fix. This
+PR removed the line before either reached `main`, so that bullet now says so (finding 3; the entry
+was unmerged, so it was edited in place).
 
 No kernel change; no ABI hash impact.
