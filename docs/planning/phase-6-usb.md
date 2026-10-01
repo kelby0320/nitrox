@@ -15,7 +15,7 @@ closes it. **Nothing below describes current behaviour.**
 |---|---|
 | **In** | **An xHCI host-controller driver**, one for both machines. **USB enumeration** at boot and after it, with devices that **arrive and depart**. **HID keyboards and mice** in boot protocol. **USB mass storage** as block devices, with **MBR** partition tables and whole-disk filesystems beside GPT. **`fs-server-fat`**, read-write. **Removable media** a session can use and eject. **Formatting and partitioning** (`disk --format`, `disk --partition`). **Copy throughput**, measured on the laptop and then fixed where it is worst. |
 | **Out** | **Kernel modules** (Tier 2), and with them module matching. I²C-HID. USB tablets and other absolute pointers. HID report descriptors. USB 3 streams and UAS. Isochronous transfers (audio, webcams). External hubs. USB device mode. exFAT. |
-| **Before it** | Five small items from the laptop install (*Before Phase 6*, below), the grace period for `with` among them. |
+| **Before it** | Five small items from the laptop install, in [their own plan](laptop-polish.md), the grace period for `with` among them. |
 
 ## Decisions, 2026-10-01
 
@@ -315,14 +315,9 @@ On the laptop and in the gates:
 
 ## Before Phase 6
 
-Five items found by the laptop install, done first at the maintainer's direction:
-- **The grace period for `with`** (`TODO(view-grace)`), which needs a way for the broker to tell
-  two terminal handles are one terminal.
-- **Empty table cells** drawn blank rather than as `null`.
-- **A model and serial column in `disk --list`**.
-- **The build's commit** shown at boot and in the shell's banner, so a stale stick shows itself.
-- **Which output is a diagnostic**: a program's usage and progress are drawn in the error colour
-  because they go to `stderr`.
+Five items found by the laptop install, done first at the maintainer's direction, are planned in
+[`laptop-polish.md`](laptop-polish.md): the grace period for `with`, blank table cells, the disk's
+model in `disk --list`, the build's commit on the screen, and which output is a diagnostic.
 
 ## Docs this phase owes
 

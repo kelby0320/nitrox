@@ -1690,6 +1690,12 @@ second request within minutes". What it needs deciding:
 
 **Trigger: scheduled**, as a follow-on to administration, at the maintainer's request.
 
+> **Scheduled and shaped** (2026-10-01): [`laptop-polish.md`](../planning/laptop-polish.md) Part A.
+> The maintainer's call is **the session and the terminal**: `tty-server` answers `Tty::Identify`
+> with an id for a terminal's backend, shared by its siblings and impossible to forge, and the
+> broker remembers a success per session, terminal and view for five minutes. Keyed on the session
+> alone, it would carry to every window and application in a desktop session.
+
 **A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
 settings a person can drive: the theme file, and the desktops `/dev/desktop` already serves. It
 was M11 Part F, "allowed to slip", and slipped — and rather than move it into M12 it became

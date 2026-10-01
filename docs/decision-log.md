@@ -32588,3 +32588,44 @@ against the code and discussed with the maintainer, it is now scoped into eight 
 Docs only: the plan, `implementation-plan.md`, `deferred-decisions.md` (the Tier 2 trigger, FAT,
 USB HID, `EV_ABS`, `TODO(fs-throughput)`) and `drivers-and-irps.md` (the open Tier 2 question).
 No ABI hash impact.
+
+## 2026-10-01 — Polish from the laptop install: a plan of its own
+
+The five small items the laptop install turned up were listed in Phase 6's plan. There they had no
+checkbox, no gate and no row in the phase table, which is the state that kept the module loader
+moving between plans. At the maintainer's direction they are now
+[`laptop-polish.md`](planning/laptop-polish.md), between administration and Phase 6, with a part
+and a gate each:
+- A: a grace period for `with`;
+- B: blank table cells;
+- C: the disk's model in `disk --list`;
+- D: the build's commit on the screen;
+- E: a level on every `stderr` message.
+
+A comes first.
+
+**Part A — keyed on the session and the terminal** (the maintainer's call).
+- The maintainer first suggested a window for a set time, whatever the terminal, with a concern
+  that a serial login would then get `with admin` without a password.
+- That concern would hold only if the window were keyed on the person. A serial login and a desktop
+  login are separate broker sessions, so keying on the session alone already keeps them apart.
+- What the session alone does not keep apart is the desktop's own windows and applications:
+  `desktop-shell` binds `/dev/views` into everything it launches, so all of them would share the
+  window.
+- So it is keyed on the terminal too, as `sudo` does. `tty-server` answers a new `Tty::Identify`
+  with its backend's id, shared by siblings, and the id cannot be forged because it arrives over
+  the handle the broker was given. No kernel change.
+
+**Part E — levels on `stderr`, not progress on `stdout`** (the maintainer's call, after a
+discussion). The maintainer's first instinct was that progress belongs on `stdout`, and `stderr` is
+for errors.
+- **`--help` does move to `stdout`**: it is what was asked for.
+- **Progress stays on `stderr`.** `stdout` is the pipeline's value, which `nxsh` gathers and shows
+  when the pipeline ends, so progress there would arrive all at once and be piped as data. `dd`,
+  `curl` and `git` keep theirs off `stdout` for the same reason.
+- **What was wrong is that every `stderr` message is painted as an error.** Each will carry a level
+  (error, warning or notice), and a message without one is an error, so unchanged programs draw as
+  today.
+
+Docs only: the new plan, `phase-6-usb.md` (which now points to it), `implementation-plan.md` (a
+row), and `deferred-decisions.md` (`TODO(view-grace)` scheduled and shaped). No ABI hash impact.
