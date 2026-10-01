@@ -258,11 +258,19 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     // terminal go as **duplicates** — `with` still needs one to report on and the other to ask
     // for a password on.
     let term = stage.terminal.unwrap_or(0);
+    let stderr = stage.streams.stderr.map(dup).filter(|&d| d != 0);
+    if stage.streams.stderr.is_some() && stderr.is_none() {
+        // **Said, not degraded quietly**, as `nxsh` says it of a stage: a program with no `stderr`
+        // writes to the kernel log, which on a machine with no serial port reaches nobody. Until
+        // the shell gave its stages `DUPLICATE` this was every program `with` ran, and the first
+        // install from a view printed nothing after the password (2026-09-30).
+        say(stage, &alloc::format!("`{program}` gets no diagnostic channel; its messages go to the kernel log"));
+    }
     let handed = Handed {
         ns: copy as u64,
         stdin: stage.streams.stdin,
         stdout: stage.streams.stdout,
-        stderr: stage.streams.stderr.map(dup).filter(|&d| d != 0),
+        stderr,
         terminal: Some(term).filter(|&t| t != 0).map(dup).filter(|&d| d != 0),
     };
     let (mut o, mut why) = match libviews::request(ch, view, program, args, &env, handed, u64::MAX) {
@@ -272,6 +280,8 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     };
     let mut rid = REQUEST_ID;
     let mut tries = 0u8;
+    // TODO(view-grace): every request asks; the broker could remember a success on this terminal
+    // for a few minutes, as `sudo` does. See deferred-decisions.md.
     while o == Outcome::NeedPassword || o == (Outcome::Denied { retry: true }) {
         if term == 0 {
             let why = b"with: a password is needed and there is no terminal to ask on\n";

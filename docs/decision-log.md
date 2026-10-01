@@ -32385,3 +32385,149 @@ binary, where no host test reaches, and `check-install` is on demand.
 The local gate set stays at 36 and is green (fgb54).
 
 A kernel log line and comments changed, and no ABI hash input did.
+
+## 2026-09-30 — A program in a view had no `stderr`: the installer printed nothing on the laptop
+
+**Found on the laptop**, the first install since Part G. `with admin nxinstall /dev/blk/0` took the
+password and printed nothing: no plan, and no line to confirm it with. Reproduced under QEMU with a
+screendump of the terminal, which showed the same. The refusals Part G.2 added ("is in use …
+Unmount it with …") had never reached a desktop terminal either.
+
+**The cause.** `nxsh` gives each stage its `stderr` with `SEND | TRANSFER`. `with` hands its program
+a *duplicate* of its own `stderr`, keeping one to report on, and `sys_handle_duplicate` needs
+`DUPLICATE`. So the duplicate failed, `with` dropped it without a word, and the broker started every
+program with no `stderr`. Each line those programs wrote went to `kprint`: COM1 under QEMU, and
+nowhere a person can see on a machine with no serial port once the desktop is up. This was true of
+every program run through `with` since Part A.
+
+**Why no gate saw it.** On the serial console the two paths look alike, since `kprint` is COM1 too.
+- `test-interactive` 20b(d) read the installer's messages there and passed.
+- The G.2 entry above says 20b(d) reads "the serial terminal, where `stderr` shows beside the
+  table". What showed there was `kprint`.
+- The desktop gates that run `with` (`check-login` 9a2, `check-install`) read only the console's
+  audit lines, since a release terminal does not narrate its grid.
+
+**The fix:**
+- **`nxsh` gives a stage's `stderr` `DUPLICATE` too.** A stage could already transfer its one copy
+  away, so this lets it keep one as well and reaches nothing new. `pipeline-stdio.md` now names the
+  rights.
+- **`with` says when it cannot hand `stderr` on**, as `nxsh` says of a stage, rather than degrading
+  quietly.
+- **`nxinstall`'s confirmation line read `with admin nxinstall …`**, since the bare form it printed
+  resolves no disk. The next entry removed the line altogether, before either reached `main`.
+
+**The gate is `test-interactive` 20b(d), on the colour.** The shell paints every diagnostic it
+drains, and `kprint` paints nothing. So `/dev/blk/0`'s message must arrive in the diagnostic colour.
+- **Control:** the shell's `DUPLICATE` masked out. 20b(d) fails at that check, and every step before
+  it passes. `with`'s new warning appears in the transcript.
+- The screendump probe that found it is not kept: `check-install` boots a release image and reads
+  no grid.
+
+**Docs:** `console-and-tty.md` (and its Status), `pipeline-stdio.md`.
+
+No kernel change; no ABI hash impact.
+
+## 2026-10-01 — The installer asks before it writes, and says how it is used
+
+**The maintainer's call, after an install attempt on the laptop.** The confirmation was an operand:
+`with admin nxinstall /dev/blk/0` printed the plan and a line carrying the disk's identity, a model
+and serial in quotes, and running that line was the go-ahead. That was the only form possible when
+no program could read a terminal, and Part A changed that. On the laptop the identity was the hard
+part of an install, and it ended in `pipeline failed`. "The nxinstall program can and should ask
+for confirmation before it does the install. Most installers do something like that."
+
+**Now naming a disk shows the plan and asks**: `erase /dev/blk/0 and install Nitrox? type yes to go
+ahead:`, on the terminal its program was handed. Then the account questions, as Part G.2 decided.
+- **`yes` and only `yes`**, in any case and ignoring blanks around it (`nxinstall::confirmed`,
+  host-tested for each near miss: `y`, `ye`, `yess`, `yesterday`, `yes please`). A whole word
+  rather than `[y/N]`, since a single key is answered before the question is read. The plan is on
+  the screen above it.
+- **Saying no is not a failure.** `Outcome::Declined` exits 0, as does cancelling one of the
+  account's questions. A person who was asked and said no got what they asked for, and `pipeline
+  failed` under "nothing was written" would read as though something broke. An answer the rules
+  refuse, such as two passwords that differ, still exits 1.
+- **The identity operand is gone**, and with it the check that it matched. A second operand is a
+  usage error.
+- **A refusal is logged whenever a disk is named**, since naming one is now the request. The gates'
+  refusal lines are unchanged.
+- **The receipts**: "asking to go ahead" before the question, and "not going ahead; nothing was
+  written to …" after a no.
+
+**`--help`** (the maintainer: "it's impossible for a user to figure out how to use it"). `nxinstall`
+took `--help` for a disk and said it was not one. It now prints its usage before looking anything
+up, so it answers without a view, and refuses any other flag. **The sweep the maintainer asked
+for:**
+- Every coreutil takes `--help` through `coreutils::args`, all seventeen acting on it; `with` and
+  `nxsh` take it too.
+- `nxinstall` was the one command-line program without it.
+- The three windowed programs take no flags. `nxterm` reads no arguments, and `nxfiles` and
+  `nxedit` take a path.
+
+**Gates:**
+- `check-install` drives the new path. Steps 7 and 7b name the disk alone. Step 8b answers `no`
+  once, which must write nothing and exit 0, then `yes`.
+- `check-login` 9a2 names `/dev/blk/0` alone.
+- **Control:** `confirmed` loosened to "starts with y" fails `only_yes_goes_ahead`.
+
+**Two ordering races, found by this change's first gate run:**
+- **The broker logged "session N opened" after replying.** `session-mgr` builds the namespace on the
+  reply and says so, so the two lines could land either way round. `test-interactive` step 4
+  expects the broker's first, and it timed out waiting for a line its own `expect` had scanned
+  past. The broker now logs before the reply, which makes the order hold by construction. Its
+  "ended" was already logged before its reply.
+- **`check-install`'s helper waited for the broker's "started"** before the program's own lines.
+  That line is an audit record, which the logging service prints after the program is running, so
+  it can arrive after the program's first line. It had held because `nxinstall` does several round
+  trips first. The helper no longer waits for it: the program's own next line says it started.
+
+**Seen on a screendump of the install, and not changed here:** everything `nxinstall` prints is a
+diagnostic on `stderr`, so the shell paints its plan, its progress and its usage in the error
+colour, and the same is true of every coreutil's `--help`. Which output is a diagnostic, and
+whether progress and usage should be, is a question for every program rather than for this one.
+
+**A follow-on, recorded rather than built:** `with` asks for the password on every request, and the
+maintainer would like `sudo`'s grace period. `TODO(view-grace)` in `deferred-decisions.md` sets out
+what needs deciding. The key is the hard part: nothing today tells the broker that two terminal
+handles are one terminal.
+
+**On the laptop**, the maintainer reports the install succeeded with this build: the first install
+there from a view, through the `disks` grant, since administration Part G.
+
+**Docs:**
+- `nxinstall`'s crate doc;
+- `boot-flow.md`'s and `storage.md`'s gate rows;
+- the root `CLAUDE.md`'s `check-install` paragraph;
+- `deferred-decisions.md`.
+
+No kernel change; no ABI hash impact.
+
+## 2026-10-01 — PR #349, reviewed: the plan in the question's write
+
+Nothing blocking. One finding worth fixing and two optional ones, all taken.
+
+**Text the identity confirmation left behind** (finding 1):
+- **The crate doc** quoted a question the program does not ask.
+- **`log()`'s doc** described the identity comparison this PR deleted. It also said a refusal is not
+  an event, while `refuse` had just become unconditional.
+- **`refuse` logged the operand as typed**, which the rule "never what a person typed" forbids. The
+  path logged is now the one the tables name. It equals what was typed, but is never taken from it.
+  An operand that names no device is logged without itself: "refused an operand that names no
+  block device in this view". The gates' refusal lines are unchanged.
+- **A disk with no model or serial** was refused because "there is nothing to confirm it by". That
+  was no longer true. It is now refused because the plan could not say which disk it is.
+
+**The plan and the question took two routes to the screen** (finding 2).
+- The plan went to `stderr`, which the shell drains when it next looks. The question went to the
+  stage's terminal. Nothing ordered the two, and the whole-word answer leans on the plan being above
+  the question.
+- `with` had met this shape before: "wrong password" sent to `stderr` landed under its next prompt.
+- The reviewer could not make it fail under QEMU. They noted that the laptop, with no serial port
+  to slow the log write in between, narrows the gap that hid it.
+- **The plan is now part of the question's own write**, `\r\n`-separated, which is the fix `with`
+  uses. A side effect: the plan is no longer painted in the error colour.
+
+**The 2026-09-30 entry above** recorded the confirmation line's `with admin` prefix as a fix. This
+PR removed the line before either reached `main`, so that bullet now says so (finding 3; the entry
+was unmerged, so it was edited in place).
+
+No kernel change; no ABI hash impact.

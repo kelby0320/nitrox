@@ -1633,6 +1633,28 @@ clean.
 
 ### Userspace
 
+**A grace period for `with` — `TODO(view-grace)`.** Every `with` asks for the password, so an
+install — `with admin disk --unmount`, then `with admin nxinstall` twice — is the same password
+three times in a minute. `sudo` remembers a success for a few minutes on that terminal. The
+maintainer asked for it as a follow-on after the first install from a view on the laptop
+(2026-10-01); `administration.md` had carried it as "a timestamp that skips the prompt for a
+second request within minutes". What it needs deciding:
+- **Where it lives.** In the broker, which checks the password; `with` is the caller's program
+  and holds nothing worth trusting.
+- **What it is keyed by.** The session the broker already knows from its forwarding endpoint's
+  base, and the terminal, as `sudo`'s per-tty tickets are. A terminal reaches the broker as a
+  handle `with` sends, and nothing today says two handles name the same terminal:
+  `sys_handle_stat`'s `HandleInfo` carries no object identity. So either the kernel gives one, or
+  `tty-server` mints a token per terminal the broker can compare.
+- **What it covers.** The same principal, for every view whose rule asks for a password, or per
+  view; a policy field per rule (`grace = "5m"`) or one length for all.
+- **What ends it.** The time; the session or the terminal ending; a wrong password; and a way to
+  end it by hand, as `sudo -k` does.
+- **What it costs.** Anything else run on that terminal inside the window rides along, which is
+  `sudo`'s trade too and is why the key is the terminal and not the session.
+
+**Trigger: scheduled**, as a follow-on to administration, at the maintainer's request.
+
 **A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
 settings a person can drive: the theme file, and the desktops `/dev/desktop` already serves. It
 was M11 Part F, "allowed to slip", and slipped — and rather than move it into M12 it became

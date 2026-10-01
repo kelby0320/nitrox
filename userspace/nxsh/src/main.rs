@@ -32,7 +32,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libkern::abi::{HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
-use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
+use libkern::handle::{RIGHT_DUPLICATE, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
 use libkern::syscall::{
     SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
     SYS_MEMORY_MAP,
@@ -339,8 +339,18 @@ impl Host for NitroxHost {
             // **A duplicate per stage, because a setup message *moves* its handles.** The
             // sink is shared, so each stage needs its own reference to it; handing the same
             // handle to two stages would leave the second with nothing.
+            //
+            // **With `DUPLICATE`, because a stage may hand its `stderr` on.** `with` runs its
+            // program in a view and gives it a duplicate of its own, keeping one to report on.
+            // Without the right that duplicate fails, the program starts with no `stderr`, and
+            // every line it writes goes to the kernel log — which on the laptop is nowhere: the
+            // first install from a view printed nothing after the password (2026-09-30). A stage
+            // could already transfer its one copy away; duplicating it lets the stage keep one
+            // too, and reaches nothing new.
             // SAFETY: register-only syscall on a channel endpoint this shell owns.
-            let err_dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, err_tx, RIGHT_SEND | RIGHT_TRANSFER) };
+            let err_dup = unsafe {
+                syscall2(SYS_HANDLE_DUPLICATE, err_tx, RIGHT_SEND | RIGHT_TRANSFER | RIGHT_DUPLICATE)
+            };
             if err_dup <= 0 {
                 // **Say so rather than degrade quietly.** A stage with no `stderr` falls back
                 // to `kprint`, which on a machine with no serial port reaches nobody — the

@@ -85,7 +85,10 @@ streams** as the next handle. Room remains (`IPC_HANDLE_MAX = 8`) for later addi
 - **stdout** — the write end of the downstream pipe. Absent for a *sink* stage.
 - **stderr** — a **shared diagnostic sink** (design §1: "separate from the pipe,
   surfaces to display/log"), *not* a per-adjacency pipe. The parent typically passes
-  the same shared send-end (a `DUPLICATE`) to every stage in a pipeline.
+  the same shared send-end (a `DUPLICATE`) to every stage in a pipeline, with `SEND`,
+  `TRANSFER` **and `DUPLICATE`**: a stage may hand its `stderr` on and keep its own, as `with`
+  does for the program it runs in a view. Without `DUPLICATE` that program starts with no
+  `stderr` and its diagnostics fall back to the kernel log (2026-09-30).
 
 ### Payload
 

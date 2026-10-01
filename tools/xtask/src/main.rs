@@ -2052,6 +2052,22 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         )
         .into());
     }
+    //          **And it said so on the terminal, not on the kernel log.** On this serial console the
+    //          two look alike: a program with no `stderr` writes to `kprint`, which is COM1 too, so
+    //          the line above passed while every program `with` ran had none — and on the laptop,
+    //          whose kernel log nobody sees once the desktop is up, the installer printed nothing
+    //          after the password (2026-09-30). What tells them apart is the shell: it paints each
+    //          diagnostic it drains, and `kprint` paints nothing.
+    if !listing.contains("\x1b[91m/dev/blk/0 (") {
+        return Err(format!(
+            "`with admin nxinstall`'s message about /dev/blk/0 did not come through the shell: it \
+             is not in the diagnostic colour, so it reached the console by `kprint` — the program \
+             was given no `stderr`, and on a machine with no serial port nobody would see it: \
+             {listing:?}"
+        )
+        .into());
+    }
+    println!("  ok: and a program in a view reaches the terminal through its `stderr`");
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
     s.send("with admin whoami")?;
@@ -3919,7 +3935,7 @@ fn run_install_steps(
     //    the AHCI disk is registered before the modules, which this gate asserts rather than
     //    assumes — and `disks` withheld it, since its `nitrox-root` is mounted. The installer says
     //    why and names the command that frees it; the log line is the part of that a gate can see.
-    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/0 \"{identity}\""))?;
+    install_gate_with_admin(qmp, session, "nxinstall", " /dev/blk/0")?;
     session.expect("nxinstall: refused /dev/blk/0: it is in use")?;
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: the target was refused as in use, since its older install is mounted");
@@ -3931,17 +3947,16 @@ fn run_install_steps(
     println!("  ok: the view was handed its disks by the grant");
 
     // 7b. **A RAM disk, refused for being one, and named correctly.** The pristine root is a RAM
-    //    disk the view holds, and the identity typed here is its real one — so the *only* reason to
-    //    refuse is what the device **is**. Until G.3 this was `root.img`, which the view no longer
-    //    reaches. Ordered before the real install so its proof is available: nothing may say it
+    //    disk the view holds, so the *only* reason to refuse it is what the device **is**. Until
+    //    G.3 this was `root.img`, which the view no longer reaches. Ordered before the real install so its proof is available: nothing may say it
     //    installed to a RAM disk, and the transcript is checked for that after the install that
     //    follows has succeeded, which is what stops the absence from being satisfied by an
     //    installer that never ran at all.
-    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/{pristine} \"{RAMDISK_IDENTITY}\""))?;
+    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/{pristine}"))?;
     // **The positive half, and it is what makes the absence below mean anything.** An
     // absence alone is satisfied by a command that never ran, by a character going astray so
-    // the operand named nothing, and by a refusal for the wrong *reason* — the name check
-    // rather than the kind check. This line says which check fired (PR #309 review, 7).
+    // the operand named nothing, and by a refusal for the wrong *reason*. This line says which
+    // check fired (PR #309 review, 7).
     session.expect(&format!("nxinstall: refused /dev/blk/{pristine}: it is a ram disk, not a disk"))?;
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: the pristine root, a RAM disk, was refused for being one, named correctly");
@@ -3953,8 +3968,19 @@ fn run_install_steps(
     session.expect("view: alice admin disk — exited, code 0")?;
     println!("  ok: `with admin disk --unmount nitrox-root` freed the target");
 
-    // 8b. The installer, again, and now the disk is in the view.
-    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/0 \"{identity}\""))?;
+    // 8b. **The installer, again, and now the disk is in the view — and it asks first** (2026-10-01).
+    //     Answered `no` once: nothing may be written, and saying so is not a failure. The plan and
+    //     the question are on a grid nothing here reads, so the receipt is what the answer waits
+    //     for, and the line after it is what says the `no` was heard.
+    install_gate_with_admin(qmp, session, "nxinstall", " /dev/blk/0")?;
+    session.expect("nxinstall: asking to go ahead")?;
+    type_answer(qmp, "no")?;
+    session.expect("nxinstall: not going ahead; nothing was written to /dev/blk/0")?;
+    session.expect("view: alice admin nxinstall — exited, code 0")?;
+    println!("  ok: the installer asked before writing, and `no` wrote nothing");
+    install_gate_with_admin(qmp, session, "nxinstall", " /dev/blk/0")?;
+    session.expect("nxinstall: asking to go ahead")?;
+    type_answer(qmp, "yes")?;
 
     // **The first account, asked after the confirmation** (administration Part G.2). Each answer
     // is typed after the installer's receipt for it: the name's before it is asked, each
@@ -3970,7 +3996,7 @@ fn run_install_steps(
     // What a destructive operation leaves in the system log, which is also the only thing this
     // gate can read: a release terminal does not narrate its grid.
     session.expect(&format!("nxinstall: installing to /dev/blk/0 ({identity})"))?;
-    println!("  ok: the installer named the disk back and started");
+    println!("  ok: the installer went ahead on `yes` and named the disk it is writing");
     // **From the pristine root**, not the live one the session runs from (administration G.1).
     session.expect("nxinstall: copying the root from ")?;
     let from = session.rest_of_line()?;
@@ -4003,12 +4029,17 @@ fn run_install_steps(
 
 /// **`with admin <program><args>`, at the terminal** (administration Part G.2): the command, then
 /// the live stick account's password once the broker's audit says it is asking — the receipt
-/// `check-login` types after too — and its start.
+/// `check-login` types after too.
+///
+/// **It does not wait for the broker's `started`.** That line is an audit record, which reaches the
+/// console through the logging service, after the program is already running — so it can arrive
+/// after the program's own first line, and waiting for it would scan past the line the caller
+/// waits for next (`expect` consumes what it scans past). The caller's next `expect` is a line of
+/// the program's, which says it started.
 fn install_gate_with_admin(qmp: &mut Qmp, session: &mut Session, program: &str, args: &str) -> R<()> {
     type_at_terminal(qmp, &format!("with admin {program}{args}"))?;
     session.expect(&format!("view: alice admin {program} — allowed, asking for a password"))?;
     type_answer(qmp, DEMO_PASSWORD)?;
-    session.expect(&format!("view: alice admin {program} — started"))?;
     Ok(())
 }
 
@@ -8320,10 +8351,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
     //      **And not the one in use** (administration Part C.6). Code 0 above says the grant bound
     //      something, which on a release boot is the ESP alone. The disk holding `init`'s root is
-    //      `/dev/blk/0`, and naming it with an identity makes `nxinstall` log its refusal on the
-    //      console, where a release image's gate can read it: the disk is not in the session at
-    //      all. Until C.6 this step passed on that disk too, which was the weaker claim.
-    type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0 x")?;
+    //      `/dev/blk/0`, and naming it makes `nxinstall` log its refusal on the console, where a
+    //      release image's gate can read it: the disk is not in the session at all. Until C.6
+    //      this step passed on that disk too, which was the weaker claim.
+    type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
     type_answer(&mut qmp, DEMO_PASSWORD)?;
     // **Refused as the running system** (administration Part G.2), which the installer now knows:

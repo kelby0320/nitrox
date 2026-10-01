@@ -190,10 +190,11 @@ release image deliberately does not narrate it), so what it asserts on **in the 
 kernel log: the ESP module that entry alone loads with the pristine root beside it, which the
 storage service leaves unmounted and the installer copies from; the disk's older install
 auto-mounted read-only; a session that holds no disk, and a view the `disks` grant filled; the
-target refused as in use, `with admin disk --unmount nitrox-root` freeing it, and the install
-proceeding; the installer's questions for the new machine's first account answered (Part G.2); and
-the milestones a destructive operation records. It also aims the installer at the pristine root, a
-RAM disk, named correctly, and asserts nothing was installed to it.
+target refused as in use, `with admin disk --unmount nitrox-root` freeing it, and the installer
+asking before it writes — a `no` that writes nothing, then a `yes`; its questions for the new
+machine's first account answered (Part G.2); and the milestones a destructive operation records.
+It also aims the installer at the pristine root, a RAM disk, named correctly, and asserts nothing
+was installed to it.
 
 **Then it carves the root partition off the written disk and checks it on the host**, which is where
 H.2's claims live — a boot proves the filesystem works and says nothing about its size, and H.1's
