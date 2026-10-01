@@ -32531,3 +32531,149 @@ PR removed the line before either reached `main`, so that bullet now says so (fi
 was unmerged, so it was edited in place).
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-01 — Phase 6 scoped: USB without kernel modules
+
+Phase 6's plan was a sketch written on 2026-09-10, before Phase 5 and administration. Checked
+against the code and discussed with the maintainer, it is now scoped into eight parts, A–H
+([`phase-6-usb.md`](planning/phase-6-usb.md)). Each gets a detail pass when it is next.
+
+**The maintainer's calls:**
+- **No kernel modules in this phase.** The sketch's Definition of Done wanted one driver loaded as
+  a module, and the deferral's trigger was "hot-pluggable hardware". That trigger ran two things
+  together: a device that *arrives* needs a driver that binds when it does, and a compiled-in USB
+  driver does exactly that.
+  - Both machines need the same USB drivers. xHCI is one standard interface, as AHCI is, and the
+    one AHCI driver already serves QEMU and the laptop.
+  - The first machine-specific drivers are Phase 8's two NICs, and even those can be compiled in
+    and decline where their device is absent.
+  - The trigger is restated in `deferred-decisions.md`: a driver that should not be in every image,
+    a driver restarted without a reboot, or one built outside this tree. **What Tier 2 is** —
+    kernel modules or userspace drivers — is recorded as open, since `drivers-and-irps.md`
+    describes both.
+- **HID in boot protocol, decoded in the kernel** into the `InputEvent` records the PS/2 driver
+  emits. A userspace HID parser would have put a second record format between the kernel and
+  `input-server`. Report descriptors are deferred, and with them a mouse's wheel, which boot
+  protocol does not carry.
+- **A USB tablet is deferred**, with report descriptors and the `EV_ABS` mapping it needs.
+- **A removable stick is the session's**: writable when auto-mounted, on a live boot too, and
+  ejectable without a password. Internal disks keep today's rules. The graphical prompt's trigger
+  does not arrive here.
+- **Copy throughput is measured on the laptop first**, and the Definition of Done's number is set
+  after (`TODO(fs-throughput)`, which named this phase as its trigger).
+- **Five small items from the laptop install come first**, the grace period for `with` among
+  them.
+
+**What the check found** (the plan's *What exists*, and three corrections to the sketch):
+- **The sketch's first argument was false.** "Phase 5 ends with a keyboard and no mouse": the
+  trackpad has worked since the laptop's first boot, through the i8042. USB input stays in the
+  Definition of Done, as the first devices that come and go and the second input producer.
+- **The vector pool does not need to grow yet.** A release boot takes at most five of eight —
+  AHCI, COM1 (taken whether or not a UART answers), the i8042's two and the RAM disk's software
+  vector — and a self-test boot adds the PIT's, for six. The xHCI uses one interrupter, for seven
+  at most. It grows at the next device that wants one.
+- **A thumb drive's partition table is MBR or none**, and the kernel reads GPT only, at boot,
+  polled with interrupts masked.
+- **Kernel threads and a deadline wait exist** (`sched::spawn`, `sched::wait_on`), and kernel
+  code already sleeps with them. What is new is a long-lived kernel thread blocking in `wait_on`:
+  the hub thread, which runs enumeration as a sequence. A state machine driven by DPCs and timers
+  was weighed and set aside.
+- **The device table never loses an entry**, so departure is new kernel work. A departed record
+  keeps its served index retired, its I/O completes `PeerClosed`, and the registry gains a
+  generation and a notification to the device manager. The new notification kind changes the ABI
+  hash; `DeviceKind::UsbDevice` and the registry's fields are not hash inputs, and
+  `abi-sync-check` guards them.
+- **Once mass storage works, a live boot's own stick appears as a disk.** The kernel reads its GPT
+  disk GUID from Limine's file record. The storage service passes it over, and `nxinstall` refuses
+  it.
+- **QEMU can boot with the i8042 off**, so a gate's USB keyboard is the only keyboard.
+
+Docs only: the plan, `implementation-plan.md`, `deferred-decisions.md` (the Tier 2 trigger, FAT,
+USB HID, `EV_ABS`, `TODO(fs-throughput)`) and `drivers-and-irps.md` (the open Tier 2 question).
+No ABI hash impact.
+
+## 2026-10-01 — Polish from the laptop install: a plan of its own
+
+The five small items the laptop install turned up were listed in Phase 6's plan. There they had no
+checkbox, no gate and no row in the phase table, which is the state that kept the module loader
+moving between plans. At the maintainer's direction they are now
+[`laptop-polish.md`](planning/laptop-polish.md), between administration and Phase 6, with a part
+and a gate each:
+- A: a grace period for `with`;
+- B: blank table cells;
+- C: the disk's model in `disk --list`;
+- D: the build's commit on the screen;
+- E: a level on every `stderr` message.
+
+A comes first.
+
+**Part A — keyed on the session and the terminal** (the maintainer's call).
+- The maintainer first suggested a window for a set time, whatever the terminal, with a concern
+  that a serial login would then get `with admin` without a password.
+- That concern would hold only if the window were keyed on the person. A serial login and a desktop
+  login are separate broker sessions, so keying on the session alone already keeps them apart.
+- What the session alone does not keep apart is the desktop's own windows and applications:
+  `desktop-shell` binds `/dev/views` into everything it launches, so all of them would share the
+  window.
+- So it is keyed on the terminal too, as `sudo` does. **The broker learns the terminal from
+  `tty-server`, never from the caller.** `with` asks its own terminal for a one-time token
+  (`Tty::Token`), puts it in the request, and the broker redeems it over its own channel to
+  `tty-server`, which says which backend it was minted for. A process holding no terminal on that
+  backend cannot get one. No kernel change.
+
+**Part E — levels on `stderr`, not progress on `stdout`** (the maintainer's call, after a
+discussion). The maintainer's first instinct was that progress belongs on `stdout`, and `stderr` is
+for errors.
+- **`--help` does move to `stdout`**: it is what was asked for.
+- **Progress stays on `stderr`.** `stdout` is the pipeline's value, which `nxsh` gathers and shows
+  when the pipeline ends, so progress there would arrive all at once and be piped as data. `dd`,
+  `curl` and `git` keep theirs off `stdout` for the same reason.
+- **What was wrong is that every `stderr` message is painted as an error.** Each will carry a level
+  (error, warning or notice), and a message without one is an error, so unchanged programs draw as
+  today.
+
+Docs only: the new plan, `phase-6-usb.md` (which now points to it), `implementation-plan.md` (a
+row), and `deferred-decisions.md` (`TODO(view-grace)` scheduled and shaped). No ABI hash impact.
+
+## 2026-10-01 — PR #350, reviewed: a token the broker redeems, and threads that already wait
+
+Two blocking findings, four worth fixing and three optional, all taken. The two entries above were
+unmerged, so they were corrected in place.
+
+**`Tty::Identify` could be forged** (blocking). The first shape had the broker ask the terminal
+handle in a request which terminal it was. But the caller chooses that handle, any process can
+create a channel pair, and `sys_handle_stat` reports an `IpcChannel` for a real terminal and a fake
+one alike. An application holding `/dev/views` could have answered as another window's terminal,
+trying ids until one matched, and been started in `admin` with no password.
+- **The broker now hears the identity from `tty-server` over its own channel.** `with` asks its
+  terminal for a one-time token, 128 random bits valid for a few seconds, and sends it with the
+  request. The broker redeems it with `tty-server`.
+- **The broker never calls out on a handle a caller sent**, so a channel that never answers cannot
+  stall it.
+- The part's gate gains a forgery control: a test client's own channel posing as a terminal, with
+  a made-up token, is asked for a password.
+
+**Kernel threads that wait already exist** (blocking). The scoping said no kernel thread could
+wait, so Part A was sized around building one. But `sched::spawn` makes kernel threads,
+`sched::wait_on` blocks on objects with a deadline, and kernel code already sleeps with it.
+- The search that should have found this printed a reference to `spawn`, which was read past.
+- What is new is narrower: the hub thread is the first long-lived kernel thread to block in
+  `wait_on`.
+
+**Docs that described what the plan reverses**: `device-manager.md` and `overview.md` (a driver
+manager handing driver processes devices), `input-subsystem.md` (USB HID in `input-server`), and
+`desktop-shell.md` (no pointer until USB).
+
+**The rest:**
+- **The vector count.** The PIT's vector is the self-test's, and COM1's is taken whether or not a
+  UART answers. The conclusion stood.
+- **Part E's gate.** Step 20b(d)'s coloured line is `nxinstall`'s listing note, not a refusal. Those
+  notes become warnings, so it stays painted: on serial an unpainted message cannot be told from
+  `kprint`. `nxsh --help` reaches nobody on the laptop, falling through to `kprint` with no
+  terminal, and Part E now covers it.
+- **Boot protocol has no wheel.** It is recorded as a cost of that call.
+- **The ABI column.** `DeviceKind` is not a hash input; the notification kind is.
+- **Tier 2's wording.** Register access from a process is a capability question of its own.
+- **The graphical prompt's trigger.** It no longer names ejecting a stick.
+
+Docs only; no ABI hash impact.
