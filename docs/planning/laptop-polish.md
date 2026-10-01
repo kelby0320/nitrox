@@ -93,6 +93,77 @@ itself.**
 [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md),
 [`session-and-auth.md`](../architecture/session-and-auth.md), the deferral resolved.
 
+### Part A in detail *(2026-10-01)*
+
+**The maintainer's calls**, the questions the sketch left:
+- **Five minutes, fixed.** A per-rule length in `views.toml` waits for someone to need it.
+- **Per view.** A password typed for `admin` skips the prompt for `admin` requests only.
+- **`with --forget` forgets the whole session's windows**, every terminal's. Forgetting more is the
+  safe direction, and it needs no token.
+
+**The spike.** What the design rests on, checked against the source:
+- **A backend's id is a `u32` from a counter**, never reused in a run; the console is `0`
+  (`tty_server::routing`). Every sibling of a terminal shares its backend.
+- **Resolving `/dev/tty` gives a fresh terminal channel**, on the console backend, and the server
+  holds at most fourteen terminals (`MAX_TTYS`). So the broker does not keep one: it opens one to
+  redeem a token and closes it after.
+- **Any process can draw random bytes** (`sys_entropy_create`), as `nxinstall` does for a GUID.
+- **The broker already calls servers it trusts synchronously, with a deadline** — the storage
+  service's `InUse`, `auth-service`'s check — and drops the channel when one does not answer. The
+  redeem is the same shape.
+- **A `Request` is a sequence of fields ending with the environment**, so a token can be an
+  optional field after it, and a caller that sends none — `desktop-shell`'s Restart — is
+  unchanged.
+- **Sixteen gate sites wait for `with`'s prompt**, most of them in `test-interactive`'s run of
+  `with admin` steps on one serial terminal, and all of them would stop being asked after the first
+  password. A gate whose subject is the prompt runs **`with --forget` first**, so no gate's outcome
+  depends on five minutes passing or not under TCG.
+
+**The wire:**
+- **`Tty::Token` (`0x0B0A`)**, on a terminal: no body. Reply: 16 bytes, a token for the terminal's
+  backend, valid for thirty seconds and once.
+- **`Tty::Redeem` (`0x0B0B`)**, on any terminal: the 16 bytes. Reply: the backend's id, 4 bytes,
+  and the token is gone; or `NotFound` for one never minted, already redeemed, or expired.
+- **`Request` gains an optional last field**: a byte, `0` or `16`, then that many bytes of token.
+  Any other length is refused.
+- **`Forget` (`0x0E10`)**, client: no body, empty reply. The session's windows are gone.
+
+**The broker:**
+- **On a request whose rule asks for a password**, a token is redeemed first. A window for this
+  session, this backend and this view that has not expired starts the program without asking. The
+  audit says `allowed, within the grace period`.
+- **Otherwise it asks, as today**, remembering the backend the token named. When the password
+  succeeds, a window opens for that session, backend and view.
+- **A refused password closes every window of the session.** So does `Forget`, and so does the
+  session ending.
+- **A request whose token names nothing**, or that has none, asks. A redeem that does not answer
+  within its deadline counts as naming nothing.
+- **The windows live in a table in the library**, host-tested at their expiry and either side of
+  it, per view, per backend and per session.
+
+**`with`:**
+- Before it asks the broker, it asks its own terminal for a token, and sends it if it got one.
+- **`with --forget`** sends `Forget` and prints nothing, as `sudo -k` prints nothing.
+
+**The pieces:**
+- [ ] **A.1 — tokens in `tty-server`.** A `tokens` module in its library, host-tested: one minted
+  and redeemed, one redeemed twice, one never minted, one expired at thirty seconds and one just
+  short of it, and a full table. `Token` and `Redeem` in the server.
+- [ ] **A.2 — the broker's window, and `with`.** The request's token field and `Forget` in
+  `librsproto`, with tests that hand the parser bodies a correct writer would not produce; the
+  window table; the redeem; the audit; `with`'s token and `--forget`.
+- [ ] **A.3 — the gates.**
+  - `boot-probe`, in `test-qemu`, opens a session as a supervisor does, takes a real token from a
+    terminal of its own, and answers the prompt with the build's fixture password. Then it checks
+    that a second real token is started without asking. It checks that each of these is asked: a
+    made-up token, a reused one, another view, a token from a terminal on a backend of its own —
+    one it attached, as `nxterm` does for a window — and a request after `Forget` (**the forgery
+    control**, and the per-terminal claim).
+  - `test-interactive` gains the step for a person: `with admin` twice in a row asks once, and once
+    more after `with --forget`. Every step whose subject is the prompt forgets first.
+  - The other serial gates, and `check-install`'s helper, forget first.
+  - `check-login` 9a2: the second request in the same desktop terminal is not asked.
+
 ## Part B — an empty table cell drawn blank
 
 **What exists.** `nxsh` renders `Value::Null` as `null` everywhere (`userspace/nxsh/src/value.rs`),
