@@ -284,6 +284,7 @@ request. It is the most trusted process in userspace after `init`, and should be
   first desktop surface needing an action the policy will not allow without a password. *Shut down*
   is not one: the `power` rule lets the person at the machine power off, as every desktop does. The
   first real candidates are unmounting a USB stick from Files (Phase 6) and a Settings application.
+  (The first is not one now: Phase 6 lets a session eject a stick without a password, 2026-10-01.)
 
 ### The spawn
 

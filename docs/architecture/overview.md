@@ -189,7 +189,7 @@ The driver framework uses I/O Request Packets (IRPs) flowing through driver stac
 
 Userspace drivers are possible — the kernel can grant a userspace resource server an `InterruptObject` handle and program the IOMMU to constrain DMA to memory regions the driver legitimately holds.
 
-What the drivers find is readable from userspace. The kernel's device table is served at `/dev/registry` in the root namespace, and a userspace **device manager** hands each device to the service that owns its class: the keyboard and mouse to the input server, as handles rather than paths. Everyone else reads the table as typed tables at `/dev/devices`. Phase 6's driver manager is that component extended.
+What the drivers find is readable from userspace. The kernel's device table is served at `/dev/registry` in the root namespace, and a userspace **device manager** hands each device to the service that owns its class: the keyboard and mouse to the input server, as handles rather than paths. Everyone else reads the table as typed tables at `/dev/devices`. Phase 6 gives it a real source of arrivals and departures; matching devices to driver modules waits with Tier 2.
 
 See: [drivers and IRP architecture](drivers-and-irps.md), [the device manager](device-manager.md).
 

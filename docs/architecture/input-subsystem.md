@@ -347,9 +347,14 @@ sandboxed compositor a construction rather than a feature.
   is its own capability-model question. This design is what will later host such a driver
   without the compositor noticing, because the record format and `/dev/input/new` do not
   change.
-- **USB HID, multitouch slots, gesture recognition.** All land in the
-  `input-server` or `libinput` when there is hardware to justify them. None requires a
-  kernel change, which is the point of the arrangement.
+- **USB HID — scheduled, in the kernel** (2026-10-01, Phase 6 Parts B and C). The USB stack is a
+  Tier 1 kernel driver, so its keyboard and mouse decode boot-protocol reports into this record
+  format in the kernel, as the PS/2 driver decodes scancodes; decoding in `input-server` would have
+  put a second format before it. HID report descriptors — a tablet, extra keys, a mouse's wheel —
+  stay deferred.
+- **Multitouch slots, gesture recognition.** Land in the `input-server` or `libinput` when there is
+  hardware to justify them. Neither requires a kernel change, which is the point of the
+  arrangement.
 - **A hotplug event source.** The input server already takes devices as they arrive and depart
   — up to eight, each `Departed` retiring its slot — because the device manager's replay is how
   it gets even the i8042's two. What is missing is anything that *produces* a later arrival or a

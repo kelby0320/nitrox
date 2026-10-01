@@ -373,10 +373,11 @@ built against this exact kernel (see `docs/spec/abi-version-hash.md`). That
 machinery is **deferred**; everything Phase 2 needs (PCI, AHCI, GPT) is Tier 1.
 
 **What Tier 2 is, is open** (2026-10-01). This table says modules loaded into the kernel at
-runtime; § *`InterruptObject`* above anticipates userspace drivers that hold an interrupt and
-their device's registers. Phase 6's USB drivers are Tier 1 — a device that arrives needs a driver
-that binds when it does, not code that arrives with it — so neither is built yet. See the Tier 2
-entry in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
+runtime; § *`InterruptObject`* above anticipates "future userspace (Tier 2) drivers" that hold an
+interrupt. Reaching their device's registers from a process is a capability question of its own
+([`input-subsystem.md`](input-subsystem.md) §6). Phase 6's USB drivers are Tier 1 — a device that
+arrives needs a driver that binds when it does, not code that arrives with it — so neither is built
+yet. See the Tier 2 entry in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
 
 ## Block-device drivers as resource servers
 

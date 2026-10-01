@@ -35,9 +35,9 @@ The maintainer's calls, after a discussion of the sketch and a check of it again
 
   Modules wait for a driver that should not be in every image (Wi-Fi is the likely first), a driver
   restarted without a reboot, or one built outside this tree. **Which Tier 2 is** — kernel modules
-  loaded at runtime, or drivers in userspace processes holding their device's registers and an
-  `InterruptObject` — is open: [`drivers-and-irps.md`](../architecture/drivers-and-irps.md)
-  describes both. It is recorded in
+  loaded at runtime, or drivers in userspace processes that hold an `InterruptObject` (and, a
+  capability question of its own, their device's registers) — is open:
+  [`drivers-and-irps.md`](../architecture/drivers-and-irps.md) describes both. It is recorded in
   [`deferred-decisions.md`](../rationale/deferred-decisions.md), not decided here.
 - **HID: boot protocol, decoded in the kernel.** The USB keyboard and mouse drivers decode the
   fixed boot-protocol reports into the `InputEvent` records the PS/2 driver emits, as PS/2 turns
@@ -63,13 +63,15 @@ The maintainer's calls, after a discussion of the sketch and a check of it again
   other reasons: they are the first devices that come and go, and the second input producer, which
   is what proves `libinput`'s boundary.
 - **The module loader** is out (above).
-- **"Grow the device-interrupt vector pool"** — not needed yet. The pool holds eight, and a QEMU
-  boot with a RAM disk takes six: the PIT, the RAM disk's software completion vector, AHCI, COM1,
-  the keyboard and the mouse (`0x30`–`0x35`). A live boot on the laptop, with no COM1, takes
-  five. The xHCI's eight MSI vectors are what it *offers*; the driver uses one interrupter and asks
-  for one, which makes seven. USB's devices take none — they are all behind the controller. The
-  pool grows when the next device wants a vector, which is Phase 8's network card at the latest,
-  since `register_device_handler` panics when it is empty.
+- **"Grow the device-interrupt vector pool"** — not needed yet. The pool holds eight, and a
+  release boot takes at most five: AHCI, COM1 (taken whether or not a UART answers), the i8042's
+  two and the RAM disk's software completion vector, as `kernel/src/io/ramdisk.rs` lists them. A
+  self-test boot adds the PIT's, for six. The xHCI's eight MSI vectors are what it *offers*; the
+  driver uses one interrupter and asks for one, which makes seven at most. USB's devices take
+  none — they are all behind the controller. The pool grows when the next device wants a vector,
+  which is Phase 8's network card at the latest, since `register_device_handler` panics when it
+  is empty. (The scoping first said six for a QEMU boot and blamed the laptop's five on its missing
+  COM1; the PIT's vector is the self-test's, and COM1's is taken regardless — PR #350 review.)
 - **`fs-server-fat` read-write** stays, and the sketch understated what reaching a stick takes:
   thumb drives are formatted with an MBR partition table or none at all, and the kernel reads GPT
   only.
@@ -87,10 +89,14 @@ The maintainer's calls, after a discussion of the sketch and a check of it again
   served index; `/dev/registry` serves a snapshot.
 - **The GPT reader runs at boot, polled, with interrupts masked** (`read_blocking`), and reads GPT
   only. There is no MBR partition parsing.
-- **The kernel has two threads of its own**, the idle thread and the reaper, each with a bespoke
-  park. There is no general kernel thread and no way for one to sleep until a deadline. DPCs run
-  at the interrupt tail and must not block (`kernel/src/dpc.rs`). The PS/2 driver's lost-byte
-  sweep rides the timer tick.
+- **Kernel threads exist, and so does a deadline wait.** `sched::spawn` creates a kernel thread
+  running a function, and `sched::wait_on` blocks the current thread on kernel objects until one
+  signals or an absolute deadline passes; `park_briefly` in `kernel/src/object/file_object.rs`
+  sleeps with it, and the page-cache fill waits on a `PendingOperation` with it. **What has not
+  happened is a long-lived kernel thread blocking in `wait_on`**: the self-test workers never call
+  it, and the reaper parks by hand, for a reason of its own. DPCs run at the interrupt tail and
+  must not block (`kernel/src/dpc.rs`). (The scoping first said no kernel thread could wait; the
+  search that would have found `spawn` printed it and was misread — PR #350 review.)
 - **What a driver needs exists**: `DmaBuffer` (physically contiguous, zeroed, page- or
   block-aligned, from the buddy allocator), `map_mmio` for uncached BARs, and MSI from Phase 5
   Part A. No IOMMU is programmed; DMA is to physical addresses.
@@ -143,16 +149,16 @@ per endpoint. Every ring segment is a `DmaBuffer` page, so none crosses the 64 K
 specification forbids. The interrupt's DPC drains the event ring and completes what each event
 finishes; port status changes become work for the hub thread.
 
-### A kernel thread that can wait
+### The hub thread
 
-**The reaper is the first kernel thread that waits; the USB hub thread is the second**, so this is
-where a general facility is built. A kernel thread can be created with a body, and it can block
-until **an event is signalled or a deadline passes**. Enumeration is a sequence of steps with
-waits between them — 100 ms for a newly connected device to settle, a port reset, 10 ms of
-recovery, then control transfers that each complete on an interrupt. Written as a thread it reads
-top to bottom. The alternative, a state machine advanced by DPCs and timer callbacks, was weighed
-and set aside: it puts the same sequence into a dozen states, and a host test of it tests the
-machine rather than the sequence.
+**A kernel thread from `sched::spawn` that waits with `sched::wait_on`** — on a transfer's
+`PendingOperation`, on the controller's port-change signal, or on nothing until a deadline.
+Enumeration is a sequence of steps with waits between them — 100 ms for a newly connected device
+to settle, a port reset, 10 ms of recovery, then control transfers that each complete on an
+interrupt. Written as a thread it reads top to bottom. The alternative, a state machine advanced by
+DPCs and timer callbacks, was weighed and set aside: it puts the same sequence into a dozen states,
+and a host test of it tests the machine rather than the sequence. **It is the first long-lived
+kernel thread to block in `wait_on`**, so Part A's gate is also that path's first exercise.
 
 The same thread scans a newly arrived disk's partitions, which today's GPT reader can only do at
 boot with interrupts masked.
@@ -195,11 +201,15 @@ of the registry and the one place that hands devices out.
 
 The driver sets each HID interface to boot protocol and polls its interrupt-IN endpoint. A
 keyboard's eight-byte report becomes key presses and releases — HID usage to keycode through a
-table beside the scancode table — and a mouse's report becomes `REL_X`, `REL_Y`, the wheel and
-button events, each stamped at the interrupt. They are served at `/dev/input/raw/<n>`, like the
-i8042's two, and reach `input-server` through the manager. The keyboard's Caps Lock and Num Lock
-lights are a `SET_REPORT`, sent when the compositor's modifier state changes; whether that is in
-scope is Part B's detail pass.
+table beside the scancode table — and a mouse's report becomes button events, `REL_X` and `REL_Y`,
+each stamped at the interrupt. They are served at `/dev/input/raw/<n>`, like the i8042's two, and
+reach `input-server` through the manager. The keyboard's Caps Lock and Num Lock lights are a
+`SET_REPORT`, sent when the compositor's modifier state changes; whether that is in scope is Part
+B's detail pass.
+
+**Boot protocol has no wheel.** HID 1.11 defines a boot mouse's report as buttons, X and Y, and
+anything after them is the device's own. The wheel needs report descriptors, so it is a cost of the
+boot-protocol call, deferred with them (PR #350 review).
 
 ### Mass storage
 
@@ -263,10 +273,10 @@ the number the Definition of Done then holds.
 
 | Change | Why | ABI hash |
 |---|---|---|
-| Kernel threads that block on an event or a deadline | the hub thread; partition scans after boot | no |
+| The hub thread: the first long-lived kernel thread blocking in `wait_on` | enumeration; partition scans after boot | no |
 | The xHCI driver, USB enumeration, the class table | Parts A–D | no |
 | HID boot keyboard and mouse | Part B | no |
-| `DeviceKind::UsbDevice`; a departed flag and a generation in the registry | Parts A and C | **yes** — `libkern::device` is shared |
+| `DeviceKind::UsbDevice`; a departed flag and a generation in the registry | Parts A and C | no — not a hash input; `abi-sync-check` guards `libkern::device` |
 | A registry-changed notification kind | Part C | **yes** — a notification kind is ABI |
 | Bulk-only transport and SCSI as a block device | Part D | no |
 | MBR partition tables, whole-disk filesystems, partition scans at runtime | Part D | no |
@@ -278,7 +288,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 
 | Part | What | Gate |
 |---|---|---|
-| **A** | **xHCI and enumeration, reported.** Kernel threads that wait; the xHCI driver; enumeration at boot and on later port changes; `UsbDevice` records; the hardware report's USB page. | `test-qemu` boots with `usb-kbd`, `usb-mouse` and `usb-storage` attached and asserts each enumerated with its IDs and class. `check-report` asserts the live stick listed. On the laptop, the report's USB page is the survey this plan lacks. |
+| **A** | **xHCI and enumeration, reported.** The hub thread; the xHCI driver; enumeration at boot and on later port changes; `UsbDevice` records; the hardware report's USB page. | `test-qemu` boots with `usb-kbd`, `usb-mouse` and `usb-storage` attached and asserts each enumerated with its IDs and class. `check-report` asserts the live stick listed. On the laptop, the report's USB page is the survey this plan lacks. |
 | **B** | **HID keyboard and mouse, at boot.** Boot protocol, the usage table, the nodes, `input-server` taking them from the manager's replay. | A gate on a machine with **`i8042=off`**: a key and a click from USB reach a window, and a login at the greeter goes through. `test-interactive` and the other release gates unchanged with the i8042 on. |
 | **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the notification, the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
 | **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. |
@@ -304,7 +314,8 @@ On the laptop and in the gates:
 
 - **Kernel modules**, and matching devices to modules (the decision above).
 - **I²C-HID**: the trackpad already works through the i8042.
-- **Absolute pointers and HID report descriptors**: a tablet, a touchscreen, extra keys.
+- **Absolute pointers and HID report descriptors**: a tablet, a touchscreen, extra keys, and a
+  mouse's wheel, which boot protocol does not carry.
 - **USB 3 streams and UAS**: one bulk-only command at a time.
 - **Isochronous transfers**: audio, webcams.
 - **External hubs**: devices on the controller's own ports only.
@@ -325,8 +336,8 @@ model in `disk --list`, the build's commit on the screen, and which output is a 
   and grown by each part after it.
 - **`device-manager.md`**: the event source (C). **`input-subsystem.md`**: the second producer
   (B, C). **`storage.md`**: FAT, removable media, eject and the watch (D–F).
-- **`drivers-and-irps.md`**: kernel threads (A), and the Tier 2 question recorded rather than
-  answered.
+- **`drivers-and-irps.md`**: the hub thread's waits (A), and the Tier 2 question recorded rather
+  than answered.
 - **`deferred-decisions.md`**: read-write FAT resolved (E), `TODO(fs-throughput)` resolved or
   narrowed (H), the module loader's trigger restated (this pass).
 - **The root `CLAUDE.md`**: each new gate.

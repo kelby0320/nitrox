@@ -32,8 +32,11 @@ Before it, every consumer found its own devices:
 - nothing outside the kernel could list the device table at all.
 
 **Devices move as handles, not paths.** An owner is handed its own duplicate of each device's node,
-so an owner that exits cannot take a device from the next one. Phase 6's driver manager is this
-component extended: it hands a driver process a `Handle<DeviceNode>` the same way.
+so an owner that exits cannot take a device from the next one. Phase 6 gives it a real event
+source — a notification when the kernel's registry changes
+([`phase-6-usb.md`](../planning/phase-6-usb.md) Part C) — and no driver processes: USB's drivers
+are Tier 1. Matching a device to a driver module, and handing a driver process a
+`Handle<DeviceNode>` the same way, waits with Tier 2 (2026-10-01).
 
 ## 2. The pieces
 

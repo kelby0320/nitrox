@@ -247,8 +247,9 @@ opens it again, as on every window's menu bar.
 **`Super+A`, not a tap of `Super`** (Phase 5). A bare modifier is the chord a *launcher* wants —
 one field over applications, files and settings — and this is the applications menu, so the tap is
 left unspent for that. It is also what makes the menu reachable at all on a machine with no
-pointer: the word sits on a `panel`, panels take no keyboard focus, and the laptop Phase 5
-targets has no pointing device until USB (Phase 6).
+pointer: the word sits on a `panel`, and panels take no keyboard focus. (The laptop Phase 5
+targets was expected to have none until USB; its trackpad turned out to work through the i8042,
+2026-09-15.)
 
 **Typing narrows it.** A filter field sits above the rows, every key the menu does not claim is
 the field's, and the menu is as tall as what matches — it shrinks as you type, a popup resizing

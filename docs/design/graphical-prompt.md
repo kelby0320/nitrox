@@ -112,10 +112,12 @@ It is not a dialog service for applications, and it stores nothing.
   - **In a session not on the display** — the serial console — `with` prompts on its terminal as
     today. There the limit stays, as it is `sudo`'s.
 
-### 4. Its trigger, unchanged
+### 4. Its trigger
 
-**The first desktop action the policy will not allow without a password**: unmounting a USB stick
-from Files (Phase 6), or a Settings application.
+**The first desktop action the policy will not allow without a password**: a Settings
+application, or unmounting an internal disk from Files. Unmounting a USB stick from Files was the
+first candidate until Phase 6's scoping made ejecting a removable stick a session's own action,
+with no password (2026-10-01).
 
 - A `power` rule asking for a password would fire it early. Until then Part F.3's refusal says so.
 - The terminal remedy rides along with the build. It is not a trigger of its own: Part A accepted

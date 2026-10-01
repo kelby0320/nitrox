@@ -88,7 +88,8 @@ optional hardware that isn't on the boot path.
 > **Which Tier 2 is, is open.** The table in
 > [`drivers-and-irps.md`](../architecture/drivers-and-irps.md) § *Module tiers* says modules loaded
 > into the kernel at runtime; its § *`InterruptObject`* says userspace drivers that hold an
-> interrupt and their device's registers and service the hardware from a process. In a capability
+> interrupt and service the hardware from a process — which also needs their device's registers
+> reachable from one, a capability question of its own (`input-subsystem.md` §6). In a capability
 > system the second fits: a crashed driver is a process to restart, and the kernel needs no ELF
 > linker or ABI hash. It is decided when the trigger fires, before the loader is built.
 
@@ -1691,10 +1692,12 @@ second request within minutes". What it needs deciding:
 **Trigger: scheduled**, as a follow-on to administration, at the maintainer's request.
 
 > **Scheduled and shaped** (2026-10-01): [`laptop-polish.md`](../planning/laptop-polish.md) Part A.
-> The maintainer's call is **the session and the terminal**: `tty-server` answers `Tty::Identify`
-> with an id for a terminal's backend, shared by its siblings and impossible to forge, and the
-> broker remembers a success per session, terminal and view for five minutes. Keyed on the session
-> alone, it would carry to every window and application in a desktop session.
+> The maintainer's call is **the session and the terminal**, and the broker remembers a success per
+> session, terminal and view for five minutes. Keyed on the session alone, it would carry to every
+> window and application in a desktop session. **The broker learns the terminal from `tty-server`,
+> never from the caller**: `with` asks its terminal for a one-time token, and the broker redeems it
+> over its own channel to `tty-server`. A first version had the broker ask the caller's terminal
+> handle which terminal it was, which the caller could answer itself (PR #350 review).
 
 **A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
 settings a person can drive: the theme file, and the desktops `/dev/desktop` already serves. It
