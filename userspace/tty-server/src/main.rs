@@ -34,10 +34,12 @@ use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
     OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING,
-    OP_TTY_OUTPUT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, RS_FLAG_ERROR,
+    OP_TTY_OUTPUT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN,
+    OP_TTY_WRITE, RS_FLAG_ERROR,
     RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink};
+use tty_server::tokens::Tokens;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -203,6 +205,34 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
     if waited != 1 { (-1, 0) } else { (status, value) }
+}
+
+/// The monotonic clock, in nanoseconds: what a token's thirty seconds are measured on.
+fn now_ns() -> u64 {
+    let mut ns: u64 = 0;
+    // SAFETY: a valid writable `u64` out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut ns) as u64) };
+    ns
+}
+
+/// A token's 128 bits, from the kernel CSPRNG — **or none**: a token made up when the pool will
+/// not answer is a token someone else could make up too, and without one the caller is asked for
+/// its password, which is safe.
+fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
+    // SAFETY: register-only syscall.
+    let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
+    if h < 0 {
+        return None;
+    }
+    let h = h as u64;
+    let mut buf = [0u8; tty_server::tokens::LEN];
+    // SAFETY: a valid writable buffer of `LEN` bytes.
+    let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, buf.len() as u64, 0) };
+    // A positive return is a PO: the pool is not seeded yet, so wait for the fill.
+    let ok = r == 0 || (r > 0 && po_wait(r as u64).0 == 0);
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    ok.then_some(buf)
 }
 
 /// A connected channel pair, or `None`.
@@ -442,7 +472,7 @@ fn free_tty(reg: &mut Registry, ch: u64) {
 }
 
 /// Handle one request on terminal `i`'s channel. Returns `false` if the terminal is gone.
-fn serve_tty(reg: &mut Registry, ch: u64) -> bool {
+fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
         syscall4(
@@ -505,6 +535,21 @@ fn serve_tty(reg: &mut Registry, ch: u64) -> bool {
             }
         }
         OP_TTY_OPEN_SIBLING => open_sibling(reg, ch, request_id),
+        // **A token for this terminal's backend** (laptop polish Part A): what lets the view
+        // broker learn which terminal a request came from without asking the requester.
+        OP_TTY_TOKEN => match (reg.backend_of_terminal(ch), random_token()) {
+            (Some(backend), Some(token)) => {
+                tokens.mint(token, backend, now_ns());
+                reply(ch, op, request_id, &token);
+            }
+            (None, _) => reply_error(ch, op, request_id, KError::NotFound.as_i32()),
+            (_, None) => reply_error(ch, op, request_id, KError::KernelError.as_i32()),
+        },
+        // Which backend a token names, once. On any terminal: knowing the token is the proof.
+        OP_TTY_REDEEM => match tokens.redeem(body, now_ns()) {
+            Some(backend) => reply(ch, op, request_id, &backend.to_le_bytes()),
+            None => reply_error(ch, op, request_id, KError::NotFound.as_i32()),
+        },
         OP_TTY_CLOSE => {
             reply(ch, OP_TTY_CLOSE, request_id, &[]);
             return false;
@@ -558,6 +603,7 @@ fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
 fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut control: u64) -> ! {
     kprint(b"tty-server: serving /dev/tty over the console\n");
     let mut reg = Registry::new();
+    let mut tokens = Tokens::new();
     let mut read_po: u64 = 0;
     // Rebuilt each turn beside the wait set, so a handle's slot and its meaning cannot drift.
     let mut backend_at: Vec<(u64, u32)> = Vec::new();
@@ -676,7 +722,7 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
                 read_po = 0; // consumed; the next iteration submits another
                 perform(&reg.feed(CONSOLE, &bytes));
             } else if reg.channels().any(|c| c == h) {
-                if !serve_tty(&mut reg, h) {
+                if !serve_tty(&mut reg, &mut tokens, h) {
                     free_tty(&mut reg, h);
                 }
             } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied() {

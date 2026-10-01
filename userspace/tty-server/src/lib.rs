@@ -438,6 +438,11 @@ pub mod routing {
             self.backends.iter().find(|b| b.sink == Sink::Channel(ch)).map(|b| b.id)
         }
 
+        /// The backend terminal `ch` belongs to, if it exists — what `Tty::Token` names.
+        pub fn backend_of_terminal(&self, ch: u64) -> Option<u32> {
+            self.ttys.iter().find(|t| t.ch == ch).map(|t| t.backend)
+        }
+
         /// Where terminal `ch` writes, if it exists.
         pub fn sink_of(&self, ch: u64) -> Option<Sink> {
             let t = self.ttys.iter().find(|t| t.ch == ch)?;
@@ -760,6 +765,159 @@ pub mod routing {
     /// Bytes a single raw read takes at most.
     const RAW_CHUNK: usize = 64;
 
+}
+
+/// **One-time tokens naming a terminal's backend** — `Tty::Token` and `Tty::Redeem` (laptop polish
+/// Part A).
+///
+/// The view broker remembers a password per session, terminal and view, and has to learn the
+/// terminal from this server rather than from its caller: a channel the caller hands it could be
+/// one the caller serves itself, answering as any terminal it likes. So the caller asks its own
+/// terminal for a token, sends the token, and the broker redeems it here over a channel it opened
+/// itself. A token is 128 random bits, names one backend, and is good **once and briefly**.
+pub mod tokens {
+    use alloc::vec::Vec;
+
+    /// Bytes in a token: the wire's length, not a second one.
+    pub const LEN: usize = librsproto::TTY_TOKEN_LEN;
+
+    /// How long a token lasts. `with` sends it at once and the broker redeems it on receipt, so
+    /// this only has to outlast a slow machine between the two — a TCG boot under load included.
+    pub const TTL_NS: u64 = 30_000_000_000;
+
+    /// Tokens kept at once. Each is redeemed or expires within [`TTL_NS`], so this bounds only a
+    /// burst; past it the oldest is dropped, which costs its holder a password prompt.
+    pub const CAPACITY: usize = 16;
+
+    struct Entry {
+        token: [u8; LEN],
+        backend: u32,
+        expires: u64,
+    }
+
+    /// The tokens minted and not yet redeemed or expired.
+    #[derive(Default)]
+    pub struct Tokens {
+        live: Vec<Entry>,
+    }
+
+    /// Equal bytes, compared without stopping at the first difference.
+    fn same(a: &[u8; LEN], b: &[u8]) -> bool {
+        b.len() == LEN && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
+    impl Tokens {
+        /// No tokens.
+        pub fn new() -> Tokens {
+            Tokens { live: Vec::new() }
+        }
+
+        /// Keep `token` for `backend` until [`TTL_NS`] after `now`. Expired tokens go first; if
+        /// the table is still full, the oldest goes.
+        pub fn mint(&mut self, token: [u8; LEN], backend: u32, now: u64) {
+            self.live.retain(|e| e.expires > now);
+            if self.live.len() >= CAPACITY {
+                self.live.remove(0);
+            }
+            self.live.push(Entry { token, backend, expires: now.saturating_add(TTL_NS) });
+        }
+
+        /// The backend `token` was minted for — **once**: it is gone after this. `None` for a
+        /// token never minted, already redeemed, expired, or of the wrong length.
+        pub fn redeem(&mut self, token: &[u8], now: u64) -> Option<u32> {
+            let i = self.live.iter().position(|e| same(&e.token, token))?;
+            let e = self.live.remove(i);
+            (e.expires > now).then_some(e.backend)
+        }
+
+        /// Tokens held.
+        pub fn len(&self) -> usize {
+            self.live.len()
+        }
+
+        /// Whether none are held.
+        pub fn is_empty(&self) -> bool {
+            self.live.is_empty()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const T0: u64 = 1_000_000_000;
+
+        fn token(n: u8) -> [u8; LEN] {
+            [n; LEN]
+        }
+
+        #[test]
+        fn a_token_names_its_backend_once() {
+            let mut t = Tokens::new();
+            t.mint(token(1), 7, T0);
+            assert_eq!(t.redeem(&token(1), T0 + 1), Some(7));
+            assert_eq!(t.redeem(&token(1), T0 + 2), None, "a token is good once");
+            assert!(t.is_empty());
+        }
+
+        #[test]
+        fn a_token_never_minted_names_nothing() {
+            let mut t = Tokens::new();
+            t.mint(token(1), 7, T0);
+            assert_eq!(t.redeem(&token(2), T0), None);
+            // One byte off is not the token, whichever byte.
+            for i in 0..LEN {
+                let mut near = token(1);
+                near[i] ^= 1;
+                assert_eq!(t.redeem(&near, T0), None, "byte {i} differs");
+            }
+            assert_eq!(t.redeem(&token(1)[..LEN - 1], T0), None, "a short token");
+            assert_eq!(t.redeem(&token(1), T0), Some(7), "and the real one is still there");
+        }
+
+        /// **Its expiry, and the nanosecond either side of it.**
+        #[test]
+        fn a_token_expires_at_its_ttl() {
+            let mut t = Tokens::new();
+            t.mint(token(1), 7, T0);
+            assert_eq!(t.redeem(&token(1), T0 + TTL_NS - 1), Some(7), "just short of it");
+            t.mint(token(2), 8, T0);
+            assert_eq!(t.redeem(&token(2), T0 + TTL_NS), None, "at it");
+            assert!(t.is_empty(), "an expired token is gone once tried");
+        }
+
+        #[test]
+        fn a_full_table_drops_the_oldest_and_expired_go_first() {
+            let mut t = Tokens::new();
+            for n in 0..CAPACITY as u8 {
+                t.mint(token(n), n as u32, T0);
+            }
+            assert_eq!(t.len(), CAPACITY);
+            t.mint(token(200), 200, T0);
+            assert_eq!(t.len(), CAPACITY);
+            assert_eq!(t.redeem(&token(0), T0), None, "the oldest went");
+            assert_eq!(t.redeem(&token(1), T0), Some(1), "the next did not");
+            // Once the rest have expired, a mint makes room without dropping a live one.
+            t.mint(token(201), 201, T0 + TTL_NS);
+            assert_eq!(t.len(), 1);
+            assert_eq!(t.redeem(&token(201), T0 + TTL_NS), Some(201));
+        }
+
+        #[test]
+        fn siblings_share_a_backend_so_their_tokens_name_the_same_one() {
+            use super::super::routing::Registry;
+            let mut reg = Registry::new();
+            reg.open(10);
+            assert!(reg.open_sibling(11, 10));
+            assert_eq!(reg.backend_of_terminal(10), reg.backend_of_terminal(11));
+            assert_eq!(reg.backend_of_terminal(12), None, "no such terminal");
+            // A terminal given a backend of its own — a window's — names a different one.
+            reg.open(20);
+            let (window, _) = reg.attach_backend(20, 99).expect("terminal 20 exists");
+            assert_eq!(reg.backend_of_terminal(20), Some(window));
+            assert_ne!(reg.backend_of_terminal(20), reg.backend_of_terminal(10));
+        }
+    }
 }
 
 #[cfg(test)]

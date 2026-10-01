@@ -1669,36 +1669,6 @@ clean.
 
 ### Userspace
 
-**A grace period for `with` — `TODO(view-grace)`.** Every `with` asks for the password, so an
-install — `with admin disk --unmount`, then `with admin nxinstall` twice — is the same password
-three times in a minute. `sudo` remembers a success for a few minutes on that terminal. The
-maintainer asked for it as a follow-on after the first install from a view on the laptop
-(2026-10-01); `administration.md` had carried it as "a timestamp that skips the prompt for a
-second request within minutes". What it needs deciding:
-- **Where it lives.** In the broker, which checks the password; `with` is the caller's program
-  and holds nothing worth trusting.
-- **What it is keyed by.** The session the broker already knows from its forwarding endpoint's
-  base, and the terminal, as `sudo`'s per-tty tickets are. A terminal reaches the broker as a
-  handle `with` sends, and nothing today says two handles name the same terminal:
-  `sys_handle_stat`'s `HandleInfo` carries no object identity. So either the kernel gives one, or
-  `tty-server` mints a token per terminal the broker can compare.
-- **What it covers.** The same principal, for every view whose rule asks for a password, or per
-  view; a policy field per rule (`grace = "5m"`) or one length for all.
-- **What ends it.** The time; the session or the terminal ending; a wrong password; and a way to
-  end it by hand, as `sudo -k` does.
-- **What it costs.** Anything else run on that terminal inside the window rides along, which is
-  `sudo`'s trade too and is why the key is the terminal and not the session.
-
-**Trigger: scheduled**, as a follow-on to administration, at the maintainer's request.
-
-> **Scheduled and shaped** (2026-10-01): [`laptop-polish.md`](../planning/laptop-polish.md) Part A.
-> The maintainer's call is **the session and the terminal**, and the broker remembers a success per
-> session, terminal and view for five minutes. Keyed on the session alone, it would carry to every
-> window and application in a desktop session. **The broker learns the terminal from `tty-server`,
-> never from the caller**: `with` asks its terminal for a one-time token, and the broker redeems it
-> over its own channel to `tty-server`. A first version had the broker ask the caller's terminal
-> handle which terminal it was, which the caller could answer itself (PR #350 review).
-
 **A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
 settings a person can drive: the theme file, and the desktops `/dev/desktop` already serves. It
 was M11 Part F, "allowed to slip", and slipped — and rather than move it into M12 it became
@@ -2186,6 +2156,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A grace period for `with` (`view-grace`) | 2026-10-01 | **Remembered per session, terminal and view, for five minutes** — the laptop polish's Part A. `with` sends a one-time `Tty::Token` from its terminal and the broker redeems it with `tty-server` over its own channel, so a caller cannot claim another terminal; a refused password, `with --forget` and the session's end forget it. `boot-probe` holds the forgery control. |
 | A new user's folders (`home-folders`) | 2026-09-30 | **Whoever makes a home makes its folders**, from `libfs::HOME_FOLDERS`, the list `nxfiles`' sidebar and the shell's Places menu read — the maintainer's call in administration Part D's detail pass, over a session making missing folders at each login and over a skeleton directory. The view broker made them for every account `account --add` adds from Part D.3, and **Part G.2's installer makes them for the first**: it writes the new machine's one account, its policy and `/home/<name>` with the three folders onto the installed root, where it used to copy the build's demo home. `check-install` reads them off the installed disk on the host. |
 | A press whose release never arrives (`lost-release`) | 2026-09-23 | **QEMU held it.** Its PS/2 queue is sixteen bytes, and a packet that will not fit stays in the device's state until the next injected event (`ps2_mouse_send_packet`, the same in 8.2 and 11.0). A gate injects a click's release last and then waits, so after a walk that filled the queue the press went and the release waited for ever. Proven by a guest probe that held the i8042 drain for a 3-step walk and a click: ten releases held of ten, and QEMU's trace showed no button-up packet until the next event. The gates now flush — an event that moves nothing, which can only deliver what was injected — after a click's press receipt and while waiting after any other release (`expect_after_pointer`): ten of ten through the real `click_at`, none without its flush. **Guarded since PR #331's review**: the `ps2-hold-gate` kernel feature, which `test-harness` implies, holds the i8042 drain after F9, and `check-input` builds the held release with it on every run — asserting the release is held, then that each flush delivers it. The entry's reasoning ruled out everything *in* the guest correctly, and said a fix had to be below the gate; the loss was below the guest, in the injector, so the gate — the one thing that knows it has stopped injecting — is where the fix belongs. |
 | An account that can see more than one user's own (`admin-visibility`) | 2026-09-23 | Administration Part A answered the three questions the entry asked. **An administrator is a mode, not a second account**: a *view* — the caller's own namespace plus a profile's grants — that a person reaches with `with`, proved by their own password, when `/system/views.toml` lets them. What such a view may do is what its profile grants (`disks`, first). The symptom the entry opened with — application namespaces omit `/applications` — was never the deferral's to fix: it stands on its own, because nothing in an application reads it, and `desktop-shell` now says so without the tag. |

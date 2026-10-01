@@ -1,6 +1,7 @@
 # rsproto — Views operations (`0x0Exx`)
 
-**Status: normative for what is built (2026-09-29).** Every op below is implemented in
+**Status: normative for what is built (2026-10-01; the request's token and `Forget` with the
+laptop polish's Part A).** Every op below is implemented in
 `userspace/view-broker/` and encoded by `userspace/librsproto/src/views.rs`; the client half —
 `Request`, `Password`, `List` and `Decide` — is `userspace/libviews/`, which `with`, `account` and
 `desktop-shell` share (Part F.3). Written with
@@ -86,6 +87,16 @@ Run a program in a view. Request body:
 | argc | u16 |
 | each argument | u16 length + bytes |
 | env | u32 length + a TSM1 `Record` ([typed-stream-format](typed-stream-format.md)), opaque to the codec |
+| token | **optional**: a byte, `16`, then a `Tty::Token` ([`rsproto-tty-ops.md`](rsproto-tty-ops.md)); absent when the caller has none. Any other length is refused |
+
+**The token is how a password is remembered** (the laptop polish's Part A). When the rule asks for
+a password, the broker redeems the token with `tty-server`, over a terminal it resolves itself, to
+learn which terminal the request came from — never from the caller, whose terminal handle could be
+a channel it serves. A password that succeeds is remembered for that **session, terminal and
+view, for five minutes**, and a later request matching all three is `Started` without asking; the
+audit says `allowed, within the grace period`. A refused password forgets every window of the
+session, as do `Forget` and the session's end. No token, one that names nothing, or a redeem that
+does not answer: the request is asked, as before.
 
 Transferred handles, in order: **a namespace** (always), then each stream whose bit is set, then
 the terminal. A count that disagrees with the bits is refused. **The namespace is the one the view
@@ -147,6 +158,12 @@ that does not read is an error reply (`InvalidArgument`).
 **The reply is cut at 2 KiB**, at the first row that does not fit, and says nothing of it. A
 client must not read a decision off it — the PR #346 review found that a `power` row past the cut
 read as "no rule". `Decide` is the question to ask.
+
+### `Forget` (`0x0E10`) — client
+
+**Forget every password the session has remembered**, every terminal's (`with --forget`). Empty
+request and reply; audited as `view: <principal> — remembered passwords forgotten`. Forgetting
+more than one terminal's is the safe direction, and it needs no token.
 
 ### `Decide` (`0x0E0F`) — client
 

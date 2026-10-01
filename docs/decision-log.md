@@ -32677,3 +32677,68 @@ manager handing driver processes devices), `input-subsystem.md` (USB HID in `inp
 - **The graphical prompt's trigger.** It no longer names ejecting a stick.
 
 Docs only; no ABI hash impact.
+
+## 2026-10-01 — Laptop polish Part A: a password remembered per terminal
+
+`with` now remembers a password that succeeded **for the session, the terminal it was typed at,
+and the view it was for, for five minutes**. A refused password, `with --forget` and the session's
+end forget it. The maintainer's calls, at the part's detail pass:
+- a fixed five minutes;
+- per view;
+- `--forget` forgets the whole session, every terminal's.
+
+**How the broker learns the terminal, without the caller's word for it:**
+- `with` asks its own terminal for a `Tty::Token`: 128 random bits for the terminal's backend, good
+  once and for thirty seconds.
+- `with` sends the token as the request's optional last field.
+- The broker redeems it with `tty-server` over a terminal it resolves itself, and closes that
+  terminal after, since every terminal is a slot in the server's wait set. The call has a
+  two-second deadline, as the broker's other calls to servers it trusts have.
+
+No kernel change.
+
+**What the part found on the way:**
+- **The broker's redeem first read the reply without its flag.** I commented that an error reply's
+  body, read as a backend id, would give every refused token the same terminal. **That premise was
+  wrong**: an error body is twelve bytes and would never read as a four-byte id. The control that
+  tried it passed.
+  - The flag check stays, now commented as making the safety the flag's and not the error format's
+    length.
+  - The control that does fail is a broker that gives every refused token one terminal, by reading
+    a refusal as an id or by falling back to a default. Step 10 below catches that.
+- **The request's token field is strict**: the byte `16` and sixteen bytes, or nothing. The plan
+  said a `0` length would mean no token, but a correct writer never writes one, and the reader's
+  existing test refused a trailing byte.
+
+**Gates:**
+- `boot-probe`, in `test-qemu`, opens a session, takes real tokens from a terminal of its own, and
+  answers with the build's fixture password. Then:
+  - a second real token starts without asking;
+  - a made-up token, a reused one, no token, another view, and a token from a terminal it gave a
+    backend of its own are each asked;
+  - a real token still starts, so the window was open throughout;
+  - after `Forget`, it asks;
+  - **step 10**: a made-up token answered with the password opens no window another made-up token
+    can use.
+- **Controls, each failing at its own step:**
+  - the broker trusting any token (step 3);
+  - a refused token given one terminal (step 10);
+  - the window ignoring the terminal (step 7).
+
+  Host tests carry the view and `forget` controls.
+- `test-interactive` 20b(d2): the second `with admin` in a row on the serial console starts without
+  asking, and after `with --forget` the next asks.
+- `check-login` 9a2: the second request in one desktop terminal is not asked.
+- **Every other gate whose prompt is incidental forgets first**, through one helper per column
+  (`with_admin_asked`, and `check-install`'s). No gate's outcome depends on five minutes passing,
+  or not, under TCG.
+
+**Docs:**
+- `rsproto-tty-ops.md` (`Token`, `Redeem`);
+- `rsproto-views-ops.md` (the token field, the window, `Forget`);
+- `session-and-auth.md`;
+- `deferred-decisions.md` (`view-grace` resolved);
+- the plan.
+
+`TODO(view-grace)` is gone from `with.rs`. No ABI hash impact: the new ops are rsproto, not hash
+inputs.

@@ -3,9 +3,10 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md). Scheduled after
 [administration](administration.md), which is complete, and before [Phase 6](phase-6-usb.md).
 
-**Status: scoped 2026-10-01; nothing built.** Parts A and E were shaped with the maintainer on
-2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
-behaviour.**
+**Status: Part A built (2026-10-01); B–E scoped.** Parts A and E were shaped with the maintainer
+on 2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
+behaviour** — Part A's is in [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) and
+[`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md).
 
 ## Why it exists
 
@@ -60,9 +61,9 @@ itself.**
 **The design:**
 - **`Tty::Token`**, asked by `with` on its own terminal: `tty-server` mints a **one-time token**
   for that terminal's backend — the serial console, or one terminal window, shared by every sibling
-  of it — 128 random bits from the kernel's entropy, valid for a few seconds. Only a process holding
-  a terminal on that backend can get one: the shell and its stages, as `sudo`'s per-terminal window
-  admits every process on the terminal. A GUI application holds none.
+  of it — 128 random bits from the kernel's entropy, valid for thirty seconds. Only a process
+  holding a terminal on that backend can get one: the shell and its stages, as `sudo`'s
+  per-terminal window admits every process on the terminal. A GUI application holds none.
 - **`with` puts the token in its request**, beside the handles it already sends.
 - **The broker redeems it with `tty-server`** over its own channel, resolved from its own namespace
   (`tty-server` serves `/dev/tty` there): `tty-server` answers which backend the token was minted
@@ -124,8 +125,8 @@ itself.**
   backend, valid for thirty seconds and once.
 - **`Tty::Redeem` (`0x0B0B`)**, on any terminal: the 16 bytes. Reply: the backend's id, 4 bytes,
   and the token is gone; or `NotFound` for one never minted, already redeemed, or expired.
-- **`Request` gains an optional last field**: a byte, `0` or `16`, then that many bytes of token.
-  Any other length is refused.
+- **`Request` gains an optional last field**: the byte `16`, then the token; absent when the caller
+  has none. Any other length is refused, `0` included: a correct writer never writes one.
 - **`Forget` (`0x0E10`)**, client: no body, empty reply. The session's windows are gone.
 
 **The broker:**
@@ -146,13 +147,13 @@ itself.**
 - **`with --forget`** sends `Forget` and prints nothing, as `sudo -k` prints nothing.
 
 **The pieces:**
-- [ ] **A.1 — tokens in `tty-server`.** A `tokens` module in its library, host-tested: one minted
+- [x] **A.1 — tokens in `tty-server`.** A `tokens` module in its library, host-tested: one minted
   and redeemed, one redeemed twice, one never minted, one expired at thirty seconds and one just
   short of it, and a full table. `Token` and `Redeem` in the server.
-- [ ] **A.2 — the broker's window, and `with`.** The request's token field and `Forget` in
+- [x] **A.2 — the broker's window, and `with`.** The request's token field and `Forget` in
   `librsproto`, with tests that hand the parser bodies a correct writer would not produce; the
   window table; the redeem; the audit; `with`'s token and `--forget`.
-- [ ] **A.3 — the gates.**
+- [x] **A.3 — the gates.**
   - `boot-probe`, in `test-qemu`, opens a session as a supervisor does, takes a real token from a
     terminal of its own, and answers the prompt with the build's fixture password. Then it checks
     that a second real token is started without asking. It checks that each of these is asked: a

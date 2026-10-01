@@ -41,7 +41,9 @@ use libprompt::ask_password;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
 use libkern::scrub;
-use libkern::syscall::{SYS_HANDLE_DUPLICATE, SYS_NOTIF_RECV, SYS_NS_DERIVE, syscall1, syscall2, syscall4};
+use libkern::syscall::{
+    SYS_CLOCK_READ, SYS_HANDLE_DUPLICATE, SYS_NOTIF_RECV, SYS_NS_DERIVE, syscall1, syscall2, syscall4,
+};
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit};
 use librsproto::views::*;
 use libstream::channel::{ChannelSink, IpcPort};
@@ -56,6 +58,7 @@ use libviews::{Handed, REQUEST_ID};
 static ALLOC: libheap::Heap = libheap::Heap;
 
 const HELP: &[u8] = b"usage: with VIEW PROGRAM [ARG...]\n\
+    \x20      with --forget\n\
     \x20      with --list\n\
     \x20      with --check FILE\n\
     \x20      with --show [FILE]\n\
@@ -63,8 +66,10 @@ const HELP: &[u8] = b"usage: with VIEW PROGRAM [ARG...]\n\
     \n\
     Run PROGRAM in VIEW: this session's namespace plus what the view grants,\n\
     when /system/views.toml says you may. Asks for your password when the\n\
-    policy does. PROGRAM is a bare name; its output goes where with's would.\n\
+    policy does, and remembers it for five minutes on this terminal, for that\n\
+    view. PROGRAM is a bare name; its output goes where with's would.\n\
     \n\
+    \x20     --forget   forget every password this session has remembered\n\
     \x20     --list     the views you may use, as a table\n\
     \x20     --check    whether FILE is a valid policy\n\
     \x20     --show     the policy, or a copy of it written to FILE (needs the views grant)\n\
@@ -78,6 +83,15 @@ const VERSION: &[u8] = b"with (nitrox coreutils) 0.1.0\n";
 const TRIES: u8 = 3;
 
 static mut NOTIF: Notification = Notification::zeroed();
+
+/// When a token from this terminal stops being worth waiting for: two seconds from now. The terminal
+/// server answers from a table; this only bounds a terminal handle that is not one.
+fn token_deadline() -> u64 {
+    let mut ns: u64 = 0;
+    // SAFETY: a valid writable `u64` out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut ns) as u64) };
+    ns.saturating_add(2_000_000_000)
+}
 
 fn dup(h: u64) -> u64 {
     // SAFETY: duplicating a handle this process owns, with the rights a hand-over needs.
@@ -109,12 +123,23 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Some("--help") => stage.die(HELP, EXIT_OK),
         Some("--version") => stage.die(VERSION, EXIT_OK),
         Some("--list") if argv.len() == 1 => list(&stage),
+        Some("--forget") if argv.len() == 1 => forget(&stage),
         Some("--check") if argv.len() == 2 => check(&stage, argv[1]),
         Some("--show") if argv.len() <= 2 => show(&stage, argv.get(1).copied()),
         Some("--install") if argv.len() == 2 => install(&stage, argv[1]),
         Some(flag) if flag.starts_with("--") => stage.die(HELP, EXIT_USAGE),
         Some(_) if argv.len() >= 2 => run(&stage, argv[0], argv[1], &argv[2..]),
         _ => stage.die(HELP, EXIT_USAGE),
+    }
+}
+
+/// `with --forget`: every password this session has remembered, every terminal's, forgotten — as
+/// `sudo -k`, and silent as it is.
+fn forget(stage: &Stage) -> ! {
+    let ch = broker(stage);
+    match libviews::forget(ch, u64::MAX) {
+        Ok(()) => exit(EXIT_OK),
+        Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     }
 }
 
@@ -266,12 +291,17 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
         // install from a view printed nothing after the password (2026-09-30).
         say(stage, &alloc::format!("`{program}` gets no diagnostic channel; its messages go to the kernel log"));
     }
+    // **A token from this terminal**, so a password typed here can be remembered for it. The broker
+    // redeems it with the terminal server itself; the terminal handle below is not asked which
+    // terminal it is. None, and the request is asked for a password as before.
+    let token = (term != 0).then(|| libviews::token(term, token_deadline())).flatten();
     let handed = Handed {
         ns: copy as u64,
         stdin: stage.streams.stdin,
         stdout: stage.streams.stdout,
         stderr,
         terminal: Some(term).filter(|&t| t != 0).map(dup).filter(|&d| d != 0),
+        token,
     };
     let (mut o, mut why) = match libviews::request(ch, view, program, args, &env, handed, u64::MAX) {
         Ok(answer) => answer,
@@ -280,8 +310,6 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     };
     let mut rid = REQUEST_ID;
     let mut tries = 0u8;
-    // TODO(view-grace): every request asks; the broker could remember a success on this terminal
-    // for a few minutes, as `sudo` does. See deferred-decisions.md.
     while o == Outcome::NeedPassword || o == (Outcome::Denied { retry: true }) {
         if term == 0 {
             let why = b"with: a password is needed and there is no terminal to ask on\n";
