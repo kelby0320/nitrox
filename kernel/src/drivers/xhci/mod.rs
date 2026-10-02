@@ -723,7 +723,8 @@ pub fn start() {
 }
 
 /// **Wait for the hub thread's first round**, up to `bound_ns`, so the hardware report lists what
-/// is attached and the registry holds it before userspace reads it. A bound that passes is said;
+/// is attached and, once the devices are registered (Part A.3), the registry holds it before
+/// userspace reads it. A bound that passes is said;
 /// whatever is still enumerating arrives later.
 pub fn settle(bound_ns: u64) {
     let x = XHCI.load(Ordering::Acquire);

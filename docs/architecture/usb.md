@@ -108,18 +108,33 @@ enumerated; a disconnection disables the device's slot and frees its memory.
 **Per device**, each step logged if it fails, and the slot disabled again:
 1. a USB 2 port is reset and given its 10 ms recovery; a USB 3 port is enabled by link training,
    which is waited for;
-2. *Enable Slot*, then *Address Device* with the speed's default packet size;
+2. *Enable Slot*, then *Address Device* with the speed's default packet size, then 10 ms for
+   SET_ADDRESS to settle (USB 2.0 allows a device 2 ms; Linux waits 10);
 3. the device descriptor's first eight bytes, then *Evaluate Context* if `bMaxPacketSize0` differs
    from that default — **an exponent at SuperSpeed** (9 is 512), a byte count below it;
 4. the device descriptor, the configuration descriptor (nine bytes, then `wTotalLength`), string
-   descriptor 0, and the product and serial strings;
+   descriptor 0, and the product and serial strings. **A string the device stalls is passed over**
+   — a bad index or language is a common stall — and the default endpoint recovered with *Reset
+   Endpoint* and *Set TR Dequeue Pointer*, since a stall halts it until reset; any other failure
+   on a string ends the device, as on every step;
 5. **the class match, logged and not acted on**: HID boot keyboard `03/01/01`, HID boot mouse
    `03/01/02`, bulk-only mass storage `08/06/50`, a hub (listed, not supported), or nothing this
    kernel drives. No `SET_CONFIGURATION`: the class driver that binds sets the configuration.
 
 **Every command and transfer has a one-second deadline.** A device that misses a transfer's is
 abandoned and its slot disabled. A command that goes unanswered leaves the command ring in doubt —
-aborting it is not built — so the controller is marked wedged and nothing more is asked of it.
+aborting it is not built — so the controller is marked wedged and nothing more is asked of it, not
+even to disable a slot.
+
+**A slot is disabled before its memory is freed, and only then.** The controller reads and writes
+a device's contexts and rings until its slot is disabled — QEMU's *Disable Slot* itself writes the
+default endpoint's output context — so a failed enumeration and a departure both disable first. A
+slot that does not disable, or that a wedged controller cannot be asked about, **keeps its memory
+for good**: a few pages leaked is the price of not handing the controller memory it may yet write.
+
+**A connect change on a port that has a device is a departure**, then an arrival if something is
+there: a device pulled and another plugged in while the thread was busy — or a contact that bounced
+— leaves the port connected, and only the change bit says anything happened.
 
 **The log**, per device: `usb: port 9: 0627:0001 class 03/01/01, high-speed, "QEMU USB Keyboard
 (…)": HID boot keyboard`; the evaluation when it happens; `usb: first round: 5 device(s) in 209 ms`;
@@ -144,8 +159,14 @@ strings, printable ASCII, the serial in brackets as a disk's is.
   stick at SuperSpeed, a hub, and a smart-card reader — the device nothing matches, and the one
   whose default endpoint is not its speed's, so its enumeration evaluates it. On the host it
   asserts the controller's facts, the No Op's answer, the claim over MSI, each device's line, the
-  evaluation, and the first round **ending before `init` is spawned**; and it plugs a keyboard in
-  over QMP once the first round is logged, and pulls it out once it has arrived. Controls each fail
-  it: no doorbell write; a boot that does not wait; no evaluation; a DPC that ignores Transfer
-  Events — every device then times out, the boot's wait gives up at two seconds and says so, and
-  the boot goes on; a hub loop that ignores its wake; a disconnect that does nothing.
+  evaluation, and the first round **ending before `init` is spawned**. Over QMP it plugs a keyboard
+  in once the first round is logged; once it has arrived, **pauses the machine and swaps it for a
+  mouse on the same port**, so the guest finds a connect change on a port that still has a device;
+  and pulls the mouse out once it has arrived. Each arrival and departure is asserted, in order, on
+  one port. Controls each fail it: no doorbell write; a boot that does not wait; no evaluation; a
+  DPC that ignores Transfer Events — every device then times out, the boot's wait gives up at two
+  seconds and says so, and the boot goes on; a hub loop that ignores its wake; a disconnect that
+  does nothing; a connect change on an occupied port that keeps the old device. Two paths no gate
+  reaches are held by experiments recorded in the decision log: that QEMU's *Disable Slot* writes
+  the output context, which is why memory outlives the slot, and that a stalled request leaves the
+  endpoint answering nothing until it is recovered.

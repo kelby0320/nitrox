@@ -12608,26 +12608,51 @@ impl Session {
 const USB_FIRST_ROUND: &str = "usb: first round: ";
 /// The hot-plugged keyboard's arrival: a high-speed boot keyboard, after the first round.
 const HOT_KEYBOARD: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/01, high-speed, \"QEMU USB Keyboard"];
+/// The mouse swapped in for it on the same port: a high-speed boot mouse.
+const HOT_MOUSE: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse"];
 
-/// **A USB device plugged in after boot, then pulled out** (Phase 6 Part A.2): coldplug is the
-/// first round of hot-plug, and this is the second. Once the guest logs its first round, a keyboard
-/// is added over QMP; once it logs the keyboard's arrival, the keyboard is removed. The lines are
-/// asserted after the run by [`check_hot_plug`].
+/// **USB devices plugged in after boot, swapped, and pulled out** (Phase 6 Part A.2): coldplug is
+/// the first round of hot-plug, and these are the rounds after it.
+/// 1. Once the guest logs its first round, a keyboard is added over QMP.
+/// 2. Once it logs the keyboard's arrival, **the machine is paused**, the keyboard removed and a
+///    mouse added on the same QEMU port, and the machine resumed. The guest then finds a connect
+///    change on a port that still has a device — both changes landed before it looked — which is
+///    a replug it must take as a departure and an arrival. Paused, so the two always land together:
+///    a hub thread that keeps the old device fails it every time (PR #355 review).
+/// 3. Once it logs the mouse's arrival, the mouse is removed, and the QMP connection closed —
+///    QEMU serves one QMP client at a time, and the deadline's dump of the guest needs it.
 ///
-/// It lands on a root port only because `test-qemu`'s controller has eight connectors: with QEMU's
-/// four, the boot's four devices fill them and the keyboard goes behind the hub, where the driver
-/// does not look (PR #353 review).
+/// The lines are asserted after the run by [`check_hot_plug`]. It lands on a root port only because
+/// `test-qemu`'s controller has eight connectors: with QEMU's four, the boot's devices fill them and
+/// the keyboard goes behind the hub, where the driver does not look (PR #353 review).
 #[derive(Default)]
 struct HotPlug {
     stage: u8,
     from: usize,
     qmp: Option<Qmp>,
+    /// Why the hot-plug stopped early, reported after the run rather than ending it unexplained.
+    failed: Option<String>,
 }
 
 impl HotPlug {
-    /// Act on what the guest has said so far: plug in, or pull out, or nothing.
-    fn step(&mut self, transcript: &[u8], qmp_sock: &Path) -> R<()> {
+    /// Act on what the guest has said so far. A failure is kept for [`check_hot_plug`], and the
+    /// connection closed.
+    fn step(&mut self, transcript: &[u8], qmp_sock: &Path) {
+        if self.stage >= 3 {
+            return;
+        }
+        if let Err(e) = self.advance(transcript, qmp_sock) {
+            self.failed = Some(e.to_string());
+            self.stage = 3;
+            self.qmp = None;
+        }
+    }
+
+    fn advance(&mut self, transcript: &[u8], qmp_sock: &Path) -> R<()> {
         let text = String::from_utf8_lossy(transcript);
+        let after = |from: usize, fragments: &[&str]| {
+            text[from..].lines().any(|l| fragments.iter().all(|f| l.contains(f)))
+        };
         match self.stage {
             0 => {
                 let Some(at) = text.find(USB_FIRST_ROUND) else { return Ok(()) };
@@ -12636,12 +12661,30 @@ impl HotPlug {
                 self.from = at;
                 self.stage = 1;
             }
-            1 => {
-                let arrived = text[self.from..].lines().any(|l| HOT_KEYBOARD.iter().all(|f| l.contains(f)));
-                if arrived && let Some(qmp) = self.qmp.as_mut() {
-                    qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotkbd"}}"#)?;
-                    self.stage = 2;
-                }
+            1 if after(self.from, HOT_KEYBOARD) => {
+                let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
+                let usb = qmp.hmp("info usb")?;
+                let port = usb
+                    .lines()
+                    .find(|l| l.contains("ID: hotkbd"))
+                    .and_then(|l| l.split("Port ").nth(1))
+                    .and_then(|r| r.split(',').next())
+                    .ok_or_else(|| format!("QEMU's `info usb` does not place hotkbd: {usb:?}"))?
+                    .to_string();
+                qmp.execute(r#"{"execute":"stop"}"#)?;
+                qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotkbd"}}"#)?;
+                qmp.execute(&format!(
+                    r#"{{"execute":"device_add","arguments":{{"driver":"usb-mouse","id":"hotmouse","bus":"xhci.0","port":"{port}"}}}}"#
+                ))?;
+                qmp.execute(r#"{"execute":"cont"}"#)?;
+                self.from = text.len();
+                self.stage = 2;
+            }
+            2 if after(self.from, HOT_MOUSE) => {
+                let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
+                qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotmouse"}}"#)?;
+                self.qmp = None;
+                self.stage = 3;
             }
             _ => {}
         }
@@ -12649,11 +12692,14 @@ impl HotPlug {
     }
 }
 
-/// **The hot-plug's two lines**, in order after the first round: the keyboard's arrival on some
-/// port, then that port's disconnect with its slot disabled. And **the first round before
-/// userspace**: the boot waits for it, which the facts alone cannot show, since its lines would be
-/// there either way, later.
-fn check_hot_plug(transcript: &[u8]) -> R<()> {
+/// **The hot-plug's lines**, in order after the first round, all on one port: the keyboard's
+/// arrival; its departure when the mouse is swapped in; the mouse's arrival; the mouse's departure.
+/// Each departure with its slot disabled. And **the first round before userspace**: the boot waits
+/// for it, which the facts alone cannot show, since its lines would be there either way, later.
+fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
+    if let Some(why) = &hot.failed {
+        return Err(format!("the hot-plug could not be driven over QMP: {why}").into());
+    }
     let text = String::from_utf8_lossy(transcript);
     let Some(at) = text.find(USB_FIRST_ROUND) else {
         return Err("the USB hub thread never finished its first round".into());
@@ -12677,14 +12723,30 @@ fn check_hot_plug(transcript: &[u8]) -> R<()> {
         .and_then(|r| r.split(':').next())
         .ok_or_else(|| format!("no port in {line:?}"))?;
     let gone = format!("usb: port {port}: disconnected; slot ");
-    let rest = &after[after.find(line).unwrap_or(0)..];
-    let Some(left) = rest.lines().find(|l| l.contains(&gone)) else {
-        return Err(format!("the hot-plugged keyboard on port {port} was pulled out and its disconnect never logged").into());
-    };
-    if !left.contains("disabled") {
-        return Err(format!("port {port}'s disconnect did not disable its slot: {left:?}").into());
+    let mouse = format!("usb: port {port}: 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse");
+    let mut rest = &after[after.find(line).unwrap_or(0) + line.len()..];
+    for (what, want) in [
+        ("the keyboard's departure when the mouse was swapped in", gone.as_str()),
+        ("the mouse's arrival on the same port", mouse.as_str()),
+        ("the mouse's departure", gone.as_str()),
+    ] {
+        let Some(at) = rest.find(want) else {
+            return Err(format!(
+                "after the keyboard's arrival on port {port}, no line for {what} ({want:?}): a replug \
+                 the hub thread does not take as a departure and an arrival keeps the old device"
+            )
+            .into());
+        };
+        let found = rest[at..].lines().next().unwrap_or("");
+        if want == gone && !found.contains("disabled") {
+            return Err(format!("port {port}'s departure did not disable its slot: {found:?}").into());
+        }
+        rest = &rest[at + want.len()..];
     }
-    println!("xtask: a keyboard plugged in after boot was enumerated on port {port}, and its slot disabled when it left ✓");
+    println!(
+        "xtask: a keyboard plugged in after boot, swapped for a mouse while the machine was paused, \
+         and pulled out — each arrival and departure on port {port}, each slot disabled ✓"
+    );
     Ok(())
 }
 
@@ -12835,12 +12897,14 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             Some(st) => break st,
             None => {
                 if let Ok(g) = captured.lock() {
-                    hot.step(&g, &qmp_sock)?;
+                    hot.step(&g, &qmp_sock);
                 }
                 if std::time::Instant::now() >= deadline {
                     timed_out = true;
                     // **Interrogate before killing.** This is the whole point of owning the
-                    // deadline; once QEMU is dead the evidence is gone.
+                    // deadline; once QEMU is dead the evidence is gone. The hot-plug's connection
+                    // goes first: QEMU serves one QMP client at a time (PR #355 review).
+                    hot.qmp = None;
                     match Qmp::connect(&qmp_sock) {
                         Ok(mut qmp) => dump_guest_state(&mut qmp),
                         Err(e) => println!("\nxtask: could not reach QMP to dump state: {e}"),
@@ -12887,7 +12951,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_servers_are_service_mgrs(&transcript)?;
             check_system_control(&transcript)?;
             check_hardware_facts(&transcript)?;
-            check_hot_plug(&transcript)?;
+            check_hot_plug(&transcript, &hot)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }

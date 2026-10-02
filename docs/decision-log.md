@@ -33314,3 +33314,55 @@ The test now covers that, and its control fails it.
   descriptors. Six controls fail their tests.
 
 No ABI hash impact: a kernel thread and log lines.
+
+## 2026-10-02 — PR #355, reviewed: memory freed under a live slot
+
+One blocking finding, four worth fixing and three optional, all taken. The reviewer found the wait
+handoff sound; every finding was on the failure and hot-plug paths around it.
+
+**A failed enumeration freed the device's memory before disabling its slot** (blocking).
+`address_and_read` owned the device's contexts, ring and data page, so every failure after Address
+Device dropped them on return, and only then did `enumerate` queue Disable Slot. A departure whose
+Disable Slot failed freed them too.
+- **The premise, confirmed here:** the reviewer could not run the probe it described. Under a DPC
+  that ignores Transfer Events, so that every enumeration fails after Address Device, the default
+  endpoint's state in the output context was read just before and just after Disable Slot. It went
+  from 1 (Running) to 0 (Disabled). QEMU's Disable Slot writes that page, which the old order had
+  already handed back to the buddy allocator.
+- **The fix:** `enumerate` owns the memory, allocated before the slot, and `release` disables the
+  slot first and frees after.
+- **A slot that does not disable keeps its memory for good**: a few pages leaked rather than handed
+  back while the controller may still write them. So does a wedged controller's, since nothing more
+  may be asked of it, not even Disable Slot (optional finding 6).
+
+**Worth fixing:**
+- **A replug while the hub thread was busy was ignored.** A connect change on a port that still
+  has a device is now a departure, then an arrival if something is there.
+  - The gate's hot-plug now **pauses the machine**, swaps the keyboard for a mouse on the same QEMU
+    port, and resumes. The guest finds exactly that change every time, rather than when timing
+    allows.
+  - *Control:* the old scan keeps the keyboard, and the gate fails at the keyboard's departure.
+- **A stalled string read left the default endpoint halted**, and the next request waited out its
+  deadline behind it. Strings were read with `.ok()`.
+  - Now a stalled string is passed over, and the endpoint recovered with Reset Endpoint and Set TR
+    Dequeue Pointer. Any other failure on a string ends the device as on every step, since a
+    timeout can leave a transfer live on the ring.
+  - **Held by an experiment**, since no QEMU device's advertised string stalls. QEMU stalls a
+    configuration index past `bNumConfigurations` (`hw/usb/desc.c`). With the recovery after it,
+    every device was named and the gate passed. Without it, the next request timed out, as the
+    reviewer predicted from QEMU's "ep halted, not running schedule".
+- **The hot-plug's QMP connection stayed open**, and QEMU serves one client at a time, so the
+  deadline's dump of a hung guest would have waited out its timeout. It is now closed when the
+  hot-plug ends, and before the dump. A QMP error is kept and reported after the run, rather than
+  ending it unexplained.
+- **SET_ADDRESS's recovery interval** (USB 2.0 §9.2.6.3): 10 ms after Address Device, as Linux
+  waits. QEMU answers at once, so no gate can see it.
+
+**Optional, taken:**
+- **Tests for checks that could be deleted unnoticed:**
+  - `first_language`'s length check, fed as the driver feeds it: 255 bytes with zeros after;
+  - `device_prefix`'s type and length checks;
+  - the class match's interfaces-before-device rule, with an Interface Association composite.
+
+  Each fails its control.
+- **Three places said a boot device is already in the registry**, which is A.3's to make true.

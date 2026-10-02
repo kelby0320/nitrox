@@ -379,6 +379,35 @@ mod tests {
         assert_eq!(first_language(&hex("04030904")), Some(0x0409), "US English");
     }
 
+    /// **The checks a reviewer could delete without a test failing** (PR #355 review): a string
+    /// descriptor 0 too short to name a language, *as the driver hands it over* — 255 bytes with
+    /// zeros after it, where the zeros would read as language 0 — and a device prefix of the wrong
+    /// type or too short a length.
+    #[test]
+    fn a_short_language_list_and_a_mislabelled_prefix_are_not_read() {
+        let mut none = vec![2, kind::STRING];
+        none.resize(255, 0);
+        assert_eq!(first_language(&none), None, "no language listed, whatever follows it");
+        let mut prefix = KEYBOARD[..8].to_vec();
+        prefix[1] = kind::CONFIGURATION;
+        assert_eq!(device_prefix(&prefix), None, "another type");
+        let mut short = KEYBOARD[..8].to_vec();
+        short[0] = 7;
+        assert_eq!(device_prefix(&short), None, "bLength says it is shorter than the prefix");
+    }
+
+    /// **An interface's match before the device's class.** A composite device with an Interface
+    /// Association — device class `EF/02/01`, which matches nothing — and a keyboard interface is a
+    /// keyboard: reading the device's class first would call it nothing.
+    #[test]
+    fn a_composite_devices_interface_matches_before_its_device_class() {
+        let mut iad = KEYBOARD;
+        iad[4..7].copy_from_slice(&[0xEF, 0x02, 0x01]);
+        let iad = device(&iad).unwrap();
+        assert_eq!(class_match(&iad, &keyboard_config()), Match::BootKeyboard);
+        assert_eq!(record_class(&iad, &keyboard_config()), (0xEF, 0x02, 0x01), "the record keeps the device's");
+    }
+
     /// **A string, made printable**: UTF-16LE, anything outside printable ASCII as `?`, padding
     /// dropped, and cut to the space it is written into.
     #[test]

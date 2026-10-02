@@ -36,6 +36,10 @@ pub mod kind {
     pub const ADDRESS_DEVICE: u32 = 11;
     /// Evaluate Context Command.
     pub const EVALUATE_CONTEXT: u32 = 13;
+    /// Reset Endpoint Command: a halted endpoint to Stopped.
+    pub const RESET_ENDPOINT: u32 = 14;
+    /// Set TR Dequeue Pointer Command.
+    pub const SET_TR_DEQUEUE: u32 = 16;
     /// No Op Command: completes with Success and does nothing else.
     pub const NO_OP_COMMAND: u32 = 23;
     /// Transfer Event.
@@ -153,6 +157,19 @@ impl Trb {
     /// A command naming a slot: Disable Slot.
     pub const fn disable_slot(slot: u8) -> Trb {
         Trb([0, 0, 0, kind::DISABLE_SLOT << 10 | (slot as u32) << 24])
+    }
+
+    /// A command naming an endpoint, `dci` of `slot`: Reset Endpoint, with Transfer State Preserve
+    /// clear.
+    pub const fn endpoint_command(kind: u32, slot: u8, dci: u8) -> Trb {
+        Trb([0, 0, 0, kind << 10 | (dci as u32) << 16 | (slot as u32) << 24])
+    }
+
+    /// **Set TR Dequeue Pointer** for endpoint `dci` of `slot`: its dequeue pointer to `at`, a TRB's
+    /// address, with `cycle` as its Dequeue Cycle State.
+    pub const fn set_dequeue(at: u64, cycle: bool, slot: u8, dci: u8) -> Trb {
+        let lo = (at as u32 & !0xF) | cycle as u32;
+        Trb([lo, (at >> 32) as u32, 0, kind::SET_TR_DEQUEUE << 10 | (dci as u32) << 16 | (slot as u32) << 24])
     }
 
     /// A command taking an input context at `input` for `slot`: Address Device or Evaluate Context.
@@ -408,6 +425,11 @@ mod tests {
         assert_eq!(addr.0, [0x3000, 0, 0, kind::ADDRESS_DEVICE << 10 | 7 << 24], "BSR clear");
         assert_eq!(Trb::disable_slot(7).0[3], kind::DISABLE_SLOT << 10 | 7 << 24);
         assert_eq!(Trb::of_kind(kind::ENABLE_SLOT).0[3], 9 << 10, "slot type 0");
+        let reset = Trb::endpoint_command(kind::RESET_ENDPOINT, 7, 1);
+        assert_eq!(reset.0, [0, 0, 0, 14 << 10 | 1 << 16 | 7 << 24], "TSP clear");
+        let deq = Trb::set_dequeue(0x1_0000_2030, true, 7, 1);
+        assert_eq!(deq.0, [0x2031, 0x1, 0, 16 << 10 | 1 << 16 | 7 << 24], "the address with DCS, SCT 0");
+        assert_eq!(Trb::set_dequeue(0x2030, false, 7, 1).0[0], 0x2030);
     }
 
     /// A Transfer Event's endpoint and residual, from dwords 3 and 2.

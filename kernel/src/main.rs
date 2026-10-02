@@ -382,7 +382,8 @@ fn kernel_main() {
     record_framebuffer();
 
     // **The hub thread's first round, waited for** — bounded — so the report below lists what is
-    // attached, and a device present at boot is in the registry before `device-mgr` replays it.
+    // attached, and — once USB devices are registered, Part A.3 — a device present at boot is in the
+    // registry before `device-mgr` replays it.
     nitrox_kernel::drivers::settle();
 
     // The hardware report, on a boot whose command line asked for one (Phase 5 Part D.3): here,

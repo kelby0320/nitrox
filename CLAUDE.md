@@ -100,7 +100,8 @@ wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`. Since Phas
 boots with an **xHCI controller and five USB devices** — a keyboard at high speed, a mouse at full
 speed, a stick at SuperSpeed, a hub, and a smart-card reader nothing matches — asserts on the host
 what the controller and the hub thread's first round report, that the round ended before `init`,
-and **plugs a keyboard in over QMP and pulls it out**; every gate's controller is configured as the
+and **over QMP plugs a keyboard in, swaps it for a mouse on the same port while the machine is
+paused, and pulls that out**; every gate's controller is configured as the
 laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot give `qemu-xhci` MSI
 (`docs/architecture/usb.md`).
 
