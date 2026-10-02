@@ -96,7 +96,11 @@ password prompt would be the password). No line means the keystroke never left y
 headless and adjudicates the whole boot (kernel → init → mount → userspace demos)
 from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
-wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
+wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`. Since Phase 6 Part A it
+boots with an **xHCI controller and four USB devices** — a keyboard at high speed, a mouse at full
+speed, a stick at SuperSpeed and a hub — and asserts the controller's facts on the host; every
+gate's controller is configured as the laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot give `qemu-xhci`
+MSI (`docs/architecture/usb.md`).
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
@@ -174,7 +178,7 @@ in CI's QEMU job.
 Part C) — the release kernel and initramfs with the release root filesystem riding along as a
 second Limine module, which the kernel publishes as a RAM disk — attached as a **USB stick** with
 the AHCI controller empty, so no storage driver is involved: the laptop's first boot, before there
-is a USB driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
+is a USB storage driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
 timer tick instead of its own interrupt takes 3 s or more), that a serial login writes under
 `/home`, and that the session reaches no disk — none does on any entry since administration Part

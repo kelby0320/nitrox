@@ -1,7 +1,8 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-10-01, when the boot began by naming the commit it was built
-from — the laptop polish's Part D; before that 2026-09-30, when administration Part G.1 gave the
+**Status:** Current (last checked 2026-10-02, when `drivers::probe` began claiming the USB host
+controller — Phase 6 Part A.1 — and `usb=off` joined the command line; before that 2026-10-01,
+when the boot began by naming the commit it was built from — the laptop polish's Part D; before that 2026-09-30, when administration Part G.1 gave the
 install entry
 a third module, `install-root.img`, the pristine root the installer copies, and G.2 had the installer
 make the new machine's own first account; before that 2026-09-28, when administration Part E.1a moved the nine system
@@ -78,7 +79,7 @@ nitrox.hdd (128 MiB raw, GPT — two partitions)
 
 **The live image** (`cargo xtask image --live`, Phase 5 Part C) is the same boot with its root in
 RAM, for a machine whose storage the kernel cannot reach — a USB stick, before there is a USB
-driver:
+storage driver (the host controller has one since Phase 6 Part A; mass storage is its Part D):
 
 ```
 nitrox-live.img (GPT — one partition)
@@ -215,8 +216,9 @@ each step's rationale is in the source comments:
    report's first page, and named again in every shell's banner. Then `log_handoff`
    prints the bootloader and its version, the firmware type and base revision, the HHDM offset,
    the firmware's date, the boot entry's command line, and the memory map summed by kind; the
-   command line is then parsed (`kernel/src/cmdline.rs`) — `hwreport[=<seconds>]` is its one flag,
-   and a word it does not know is **passed on**, not ignored: the whole line is served at
+   command line is then parsed (`kernel/src/cmdline.rs`) — its flags are `hwreport[=<seconds>]`
+   and, since Phase 6 Part A, `usb=off`, which leaves the USB host controller to no driver — and a
+   word it does not know is **passed on**, not ignored: the whole line is served at
    `/proc/cmdline`, where `install` reached `libsession` from Part H.1 until administration Part
    G.3 — no program reads a word there today. Never fatal;
    `arch::Cpu::log_identity` prints the vendor, family/model/stepping and brand, and the

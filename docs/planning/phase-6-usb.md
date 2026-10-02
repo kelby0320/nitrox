@@ -464,7 +464,10 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
 
 - **A.1 The controller.** `drivers::xhci`'s bring-up in `probe`; the event ring's interrupt and
   DPC; the extended capabilities read, with Supported Protocol giving which ports are USB 2 and
-  which USB 3; each port's state at start, logged; `usb=off`.
+  which USB 3; each port's state at start, logged; `usb=off`. **Built 2026-10-02**, with the
+  controller running from `probe` so a No Op proves the rings, and the per-port log moved to
+  A.2's first round. QEMU's controller is configured as the laptop's, with MSI and no MSI-X,
+  because its default offers MSI-X alone (decision log).
 - **A.2 The hub thread and enumeration.** `drivers::start`; the first round and the boot's bounded
   wait; the per-device sequence through the strings; the class table; later connects and
   disconnects.

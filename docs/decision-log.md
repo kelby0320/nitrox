@@ -33120,3 +33120,133 @@ before their receipt, so the shell always spoke first:
   any list line at all.
 
 `check-login`, TCG and KVM, passes without the probe. The probe is removed.
+
+## 2026-10-02 — Phase 6 Part A.1: the xHCI controller, claimed
+
+`drivers::xhci` brings the controller up in `probe`, polled:
+1. D0, bus mastering;
+2. the firmware's handoff through USB Legacy Support;
+3. halt, then reset, with the 1 ms Intel pause between setting `HCRST` and the first poll;
+4. the context array, scratchpads, command ring and one event-ring segment;
+5. MSI, the controller running, and **a No Op through the command ring**, polled.
+
+Every wait is bounded. A failure declines the function with its reason, and a decline after the
+controller started stops it first. The DPC drains the event ring.
+
+Beside it:
+- `pci::power_up` saves the BARs and command register before raising a function to D0, for one
+  whose transition resets them.
+- `usb=off` joins the command line.
+- `drivers::probe` takes the flags.
+
+**What the first boot corrected:**
+- **QEMU's `qemu-xhci` on q35 defaults to `msi=off`** and offers MSI-X alone (`caps msix pcie`).
+  The plan said both machines have MSI. The driver declined it, as written, and the boot went on.
+  - The laptop's controller has MSI with eight vectors and no MSI-X. So **every gate's controller
+    is configured as the laptop's**, `msi=on,msix=off` (`XHCI_DEVICE` in `xtask`), and the
+    driver keeps the one mechanism that machine has.
+  - Building MSI-X instead would be code neither target needs, tested only on QEMU.
+- **QEMU numbers its USB 3 ports first**: 1–8, then USB 2 on 9–16, with `p2=8,p3=8`. The
+  Supported Protocol capabilities say so, and the driver reads them rather than assume an order.
+- The controller takes MSI vector `0x32`, before AHCI, since it is probed first at `00:03.0`.
+  The vectors in use are within the plan's count.
+
+**Changed from the plan, deliberately:**
+- **The controller runs from `probe`**, not from the hub thread, so a No Op proves the rings,
+  the doorbell and the event ring before anything depends on them.
+- **Each port's state at start is logged by A.2's first round**, after the debounce, when USB 3
+  links have trained. At `probe` a USB 3 port can still be training, and the line would say less
+  than it seems to.
+
+**Gates:**
+- `test-qemu` (TCG and KVM) boots `qemu-xhci,p2=8,p3=8` with a high-speed keyboard, a
+  full-speed mouse, a SuperSpeed stick and a hub.
+- On the host it asserts the controller's PCI line, its facts, the No Op's answer, and the
+  function claimed over MSI.
+- **In-guest control:** with no doorbell write, the No Op goes unanswered, the function is
+  declined with that reason, and the facts fail.
+- **Host tests, each with a control that fails it:**
+  - the producer ring, read back by a model of the controller across three wraps;
+  - the event ring's cycle;
+  - the capability walk and its window and bound;
+  - the PCI power-up, whose write must not clear `PME_Status`;
+  - `usb=off` and `usb=on`.
+
+No ABI hash impact: a driver and a command-line flag.
+
+## 2026-10-02 — PR #354's CI: QEMU 8.2's `qemu-xhci` cannot have MSI
+
+A.1's first CI run failed every boot that attached the controller, with "Property 'qemu-xhci.msi'
+not found". CI runs QEMU 8.2.2, from Ubuntu 24.04; the configuration had been read off QEMU 11.0.2's
+property list. In 8.2, `qemu-xhci`'s instance init sets `msi = OFF` and `msix = AUTO`, with no
+property to change either (`hw/usb/hcd-xhci-pci.c` at `v8.2.2`). So on CI's QEMU that device offers
+MSI-X alone, and the driver, which takes MSI as the laptop's controller has it, would decline it.
+
+**The gates use `nec-usb-xhci`.**
+- It is the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity, `1033:0194`.
+- In 8.2 it takes `msi` and `msix` as properties (`hcd-xhci-nec.c`), as it does in 11. Its
+  SuperSpeed ports come first, by its own default, as `qemu-xhci`'s do.
+- `p2` and `p3` belong to the shared core, aliased onto both models.
+- `XHCI_DEVICE` is `nec-usb-xhci,id=xhci,msi=on,msix=off`.
+
+**Checked under 8.2 before pushing, not by another CI round.** Ubuntu 24.04's QEMU, in a container:
+- It accepts the whole command line, including the smart-card reader A.2 adds.
+  `hw-usb-smartcard.so` ships in `qemu-system-common`, which `qemu-system-x86` depends on.
+- A boot of a fresh test image with `test-qemu`'s devices reports the controller's facts exactly
+  as QEMU 11 does, claims it over MSI, and reaches `boot-probe`'s PASS.
+- An earlier container boot of an image a `test-qemu` run had already used failed one
+  `boot-probe` check: those checks write to the image, so the copy carried the last run's state.
+
+The pinned PCI fact now holds only the identity and `caps msi64`, which both versions report.
+
+**What this cost:** the plan said "both machines have MSI", and A.1's first boot showed QEMU's
+default did not. The fix chose a property that only QEMU 11 has, so the fix was wrong for CI. A
+configuration choice is checked against the QEMU that CI runs.
+
+## 2026-10-02 — PR #354, reviewed: an interrupt thrown away while enabling
+
+One blocking finding, two worth fixing and two optional, all taken.
+
+**Enabling the interrupter could wedge the event ring for the rest of the boot** (blocking). The
+controller runs from `probe`, for the polled No Op, and the interrupter was enabled after it by
+writing `IMAN` with Interrupt Pending set. IP is write-one-to-clear. The failing sequence:
+1. An event posted after the No Op's last drain set IP and Event Handler Busy, with the
+   interrupter off, and raised nothing.
+2. The enable cleared that IP.
+3. EHB stayed set, and an interrupter with EHB set raises nothing more. Only the DPC clears EHB,
+   and only an interrupt runs the DPC.
+- The reviewer showed it in QEMU with port resets forced into the window: the DPC never ran for
+  the whole boot, and `test-qemu` passed.
+- **Reproduced here before the fix:** a port reset in the window and one after, with the DPC
+  logging after its drain. The log line never appeared, and the gate passed.
+- **The fix:** `IMAN` is written with Interrupt Enable alone, so a pending interrupt is kept. After
+  `INTE`, one more polled drain consumes whatever landed and writes the dequeue pointer with EHB
+  cleared. The drain only counts port changes, since the scheduler does not exist yet.
+- **The same experiment against the fix:** the event in the window is consumed by the final drain,
+  and the one after the enable sequence interrupts. The DPC ran, with two port changes counted.
+- **A false start, kept for the method.** The first experiment against the fix panicked: its log
+  line was printed inside the DPC while the event ring's leaf lock was held, and taking the serial
+  lock under it is a lock-order violation. That panic was itself the proof the DPC had run. The
+  probe was moved after the lock's release, and the unfixed code was rerun with the same probe to
+  compare like with like.
+
+**No A.1 gate takes an xHCI interrupt** (worth fixing). That is why the race passed CI. QEMU posts
+port events only while a controller runs, and `test-qemu`'s devices are attached before the reset.
+`usb.md` said the gates' "interrupt path is the laptop's"; it now says the gates' controller
+*signals* the way the laptop's does, and that the path is first exercised by A.2's enumeration.
+Every command A.2 sends completes through the interrupt, so its gate holds the path. A permanent
+gate for an event inside a microsecond window would need test-only code in the driver; the
+experiment above is the record instead.
+
+**A failed allocation freed the rings with the controller running** (worth fixing). `KBox::try_new`
+takes its value and drops it on failure, which happened after the controller was started. The state
+is now boxed before the controller runs. A decline after that point stops the controller before the
+box drops.
+
+**Optional, both taken:**
+- **Controller Not Ready is waited out before the first operational write** (xHCI 1.2 §4.2), as
+  Linux does before its halt. A function just raised from D3 by a resetting transition could
+  otherwise take the reset while not ready. Neither machine here would show it.
+- **Stale wording:** the live gate's comment and `CLAUDE.md` said the kernel has no USB driver,
+  and the driver's module doc and `usb.md` named `qemu-xhci` as the gates' controller. The first
+  A.1 entry above says `qemu-xhci,p2=8,p3=8`, and the CI entry after it is its correction.

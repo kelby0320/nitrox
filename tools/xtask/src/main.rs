@@ -3571,7 +3571,7 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
-        .arg("qemu-xhci,id=xhci")
+        .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
         .arg("-device")
@@ -4192,9 +4192,11 @@ fn run_installed_boot_steps(session: &mut Session, qmp: &mut Qmp) -> R<()> {
 /// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5
 /// Part C).
 ///
-/// Boots `nitrox-live.img` attached as a **USB stick** (`qemu-xhci` + `usb-storage`) with nothing
+/// Boots `nitrox-live.img` attached as a **USB stick** (an xHCI, [`XHCI_DEVICE`], + `usb-storage`) with nothing
 /// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
-/// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
+/// and the kernel, which has no USB storage driver, never reads it again — it claims and resets the
+/// controller (Phase 6 Part A) but nothing binds the stick until mass storage. Asserts over serial,
+/// in order:
 ///
 /// 1. no SATA disk — no storage driver carried the boot;
 /// 2. the second Limine module became a block device, and the GPT pass found a partition labelled
@@ -4211,7 +4213,7 @@ fn cmd_check_live(accel: Accel, size: DisplaySize) -> R<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
-        .arg("qemu-xhci,id=xhci")
+        .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
         .arg("-device")
@@ -4416,7 +4418,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
-        .arg("qemu-xhci,id=xhci")
+        .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_test_image_path().display()))
         .arg("-device")
@@ -5095,7 +5097,7 @@ fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
-        .arg("qemu-xhci,id=xhci")
+        .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
         .arg("-device")
@@ -5345,7 +5347,7 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
-        .arg("qemu-xhci,id=xhci")
+        .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
         .arg("-device")
@@ -12602,6 +12604,46 @@ impl Session {
     }
 }
 
+/// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). The laptop's
+/// Sunrise Point-LP controller has plain MSI with eight vectors and no MSI-X, and the driver takes
+/// the one interrupt mechanism that machine has, so every gate's controller is given it.
+///
+/// **`nec-usb-xhci`, not `qemu-xhci`**: the same xHCI core with the NEC µPD720200's identity
+/// (`1033:0194`). `qemu-xhci` offers MSI-X alone on q35, and only QEMU 11 lets that be changed —
+/// QEMU 8.2, which CI runs, hard-codes it, with no `msi` property, so the first version of this
+/// constant failed every CI boot that attached it (PR #354). The NEC model takes `msi` and `msix`
+/// in both, and numbers its SuperSpeed ports first, as `qemu-xhci` does.
+const XHCI_DEVICE: &str = "nec-usb-xhci,id=xhci,msi=on,msix=off";
+
+/// **The USB devices `test-qemu` boots with** (Phase 6 Part A): an xHCI controller with a device
+/// at each of three speeds and one nothing matches.
+/// - `usb-kbd` attaches at high speed, `usb-mouse` with `usb_version=1` at full speed, and
+///   `usb-storage` at SuperSpeed (QEMU 11.0.2's `info usb`). No QEMU USB device takes a low-speed
+///   setting.
+/// - `usb-hub` is the device nothing matches: external hubs are outside Phase 6.
+/// - **`p2=8,p3=8` gives eight connectors.** The defaults give four, which these four fill, and a
+///   device plugged in later would land behind the hub, where the driver does not look (PR #353
+///   review).
+/// - The stick is a blank image: nothing reads it until mass storage exists.
+fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
+    let stick = build_cache().join("test-qemu-usb-stick.img");
+    let f = fs::File::create(&stick).map_err(|e| format!("create {}: {e}", stick.display()))?;
+    f.set_len(16 * 1024 * 1024).map_err(|e| format!("size {}: {e}", stick.display()))?;
+    cmd.arg("-device")
+        .arg(format!("{XHCI_DEVICE},p2=8,p3=8"))
+        .arg("-device")
+        .arg("usb-kbd,bus=xhci.0")
+        .arg("-device")
+        .arg("usb-mouse,bus=xhci.0,usb_version=1")
+        .arg("-drive")
+        .arg(format!("if=none,id=usbstick,format=raw,file={}", stick.display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=usbstick")
+        .arg("-device")
+        .arg("usb-hub,bus=xhci.0");
+    Ok(())
+}
+
 /// Integration-test runner: build the `test-harness` image, boot it headless, and
 /// adjudicate the run from QEMU's exit code. The guest ends the run by writing a
 /// verdict to the `isa-debug-exit` device (init on success/failure, or the kernel
@@ -12645,6 +12687,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         .arg("-smp")
         .arg("4")
         .arg("-no-reboot");
+    test_qemu_usb_args(&mut cmd)?;
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -12787,7 +12830,7 @@ const EMULATED_MACHINE_FACTS: &[&[&str]] = &[
 ];
 
 /// The facts `test-qemu`'s boot adds to [`EMULATED_MACHINE_FACTS`]: its disk is on AHCI, so the
-/// controller is **claimed**, and it has a UART, so COM1 is **present**.
+/// controller is **claimed**, it has a UART, so COM1 is **present**, and an xHCI with devices.
 ///
 /// **The ACPI tables are pinned by signature and OEM, not address or length.** Read off the
 /// first run (2026-09-14): QEMU's FACP, APIC, HPET, MCFG and WAET, each `BOCHS BXPC`, plus a BGRT
@@ -12802,6 +12845,16 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["madt: lapic-nmi uid 0xff lint 1 flags 0x0"],
     &["pci 00:1f.2 8086:2922 class 01.06.01 pin 1 caps msi64"],
     &["drivers: 00:1f.2 claimed by ahci, MSI vec "],
+    // **The xHCI, claimed** (Phase 6 Part A.1), configured as the laptop's is: MSI, no MSI-X
+    // ([`XHCI_DEVICE`]). Its facts are QEMU's, read off the first boot: the USB 3 ports first, then
+    // the USB 2 ones, as its Supported Protocol capabilities say. And the rings, the doorbell and
+    // the event ring proved by a No Op before the outcome is claimed. Its PCI line is held to what
+    // QEMU 8.2 and 11 both say — the identity and a 64-bit MSI capability — since CI runs the first
+    // and a workstation may run the second.
+    &["pci 00:03.0 1033:0194 class 0c.03.30 ", "caps msi64"],
+    &["xhci: 00:03.0 up: xHCI 1.0, 16 ports (USB 2: 9-16, USB 3: 1-8), 64 slots, 32-byte contexts, 0 scratchpad(s)"],
+    &["xhci: 00:03.0: the command ring answers: a No Op completed"],
+    &["drivers: 00:03.0 claimed by xhci, MSI vec "],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.
@@ -12883,7 +12936,7 @@ fn check_hardware_facts(transcript: &[u8]) -> R<()> {
         )
         .into());
     }
-    println!("xtask: the boot reported QEMU's machine as it is — tables, CPUs, IOAPIC, framebuffer, a claimed AHCI, COM1 ✓");
+    println!("xtask: the boot reported QEMU's machine as it is — tables, CPUs, IOAPIC, framebuffer, a claimed AHCI and xHCI, COM1 ✓");
     Ok(())
 }
 
