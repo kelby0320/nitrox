@@ -1,6 +1,6 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-09-30**, when a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-10-02**, when a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -107,8 +107,11 @@ otherwise absorb by accident.
   because two kinds of code emit: the library asks
   [`Host::styled`](../../userspace/nxsh/src/host.rs) (the table header, which `display` renders),
   and the REPL loop knows its own `tty` and tests it directly (the banner, the prompt, and the
-  diagnostics it and its stages print). `Host::diag` paints nothing: its only callers are script
-  mode, which has no terminal. **The shell rather than each program**: output here is a
+  diagnostics it and its stages print). **A stage's diagnostic is painted by its level**
+  (2026-10-02): an error in the colour of the shell's own, a warning in its own, and a notice
+  plain — see [`pipeline-stdio.md`](../spec/pipeline-stdio.md) § *A diagnostic, and its level*.
+  `Host::diag` paints nothing: its only callers are script mode, which has no terminal. **The
+  shell rather than each program**: output here is a
   typed stream the shell renders, so colouring its renderer once colours every program's output,
   where a Unix terminal needs a `--color` flag and an `isatty` check per tool. It is an ordinary escape sequence in the output stream, so the discipline
   passes it through untouched, a backend that does not read it swallows it, and nothing here

@@ -3,7 +3,7 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md). Scheduled after
 [administration](administration.md), which is complete, and before [Phase 6](phase-6-usb.md).
 
-**Status: Parts A–D built (2026-10-01); E scoped.** Parts A and E were shaped with the maintainer
+**Status: complete — Parts A–D built 2026-10-01, E 2026-10-02.** Parts A and E were shaped with the maintainer
 on 2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
 behaviour** — Part A's is in [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) and
 [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md).
@@ -279,3 +279,68 @@ terminal it was run in.
 
 **Docs:** [`pipeline-stdio.md`](../spec/pipeline-stdio.md),
 [`console-and-tty.md`](../architecture/console-and-tty.md).
+
+### Part E in detail *(2026-10-02)*
+
+**The spike:**
+- **A diagnostic is one IPC message whose payload is the text**, nothing else
+  (`coreutils::stage::send_diag`, `nxinstall`'s `say_to`). `nxsh`'s `drain_diagnostics` paints
+  every one in `style::DIAG`, or prints it through `kprint` with no terminal.
+- **About 250 `stderr` writes in the coreutils, nearly all errors.** So a message with no level
+  must stay an error, and only the informational lines change.
+- **Every coreutil answers `--help` with the same two lines**, `stage.diag(HELP); exit(EXIT_OK)`;
+  `with` answers with `stage.die(HELP, EXIT_OK)`. `clip` already writes text to `stdout` as a
+  `TEXT_FALLBACK` stream, which `display` prints as lines.
+- **`nxsh` is handed a terminal in script mode and does not use it**: `run` sets the host's
+  terminal to none, so `--help` goes to `kprint`.
+- **The design has no warning colour.** ANSI bright yellow (`93`) is the one left, and the
+  palette, not the shell, decides what it looks like.
+
+**The design:**
+- **A level is a leading byte**: `0x01` a notice, `0x02` a warning, and a message whose first byte
+  is neither is an error, whole. No text starts with either control, and every unchanged sender
+  stays an error. The framing lives in `libstream::diag`, shared by every sender and the shell,
+  and host-tested.
+- **The shell paints by level**: an error in `DIAG`, a warning in a new `WARN` (bright yellow), and
+  a notice plain. Printed through `kprint`, the level byte is dropped.
+- **`Stage::answer`** writes a program's usage to `stdout` as a `TEXT_FALLBACK` stream, and exits 0.
+  With no `stdout` it sends the usage as a notice. Every coreutil and `with` use it, and
+  `nxinstall` does the same with its own lines; **`nxsh`** writes its usage on the terminal it was
+  handed, and through `kprint` only without one. **`--version` too**, found on the way: it was the
+  same two lines as `--help`, and the same answer drawn as an error.
+- **What is informational:** `nxinstall`'s progress, its "done" and "nothing was written." are
+  notices, and its notes on why a disk is missing are warnings. `with`'s "gets no diagnostic
+  channel" is a warning. The sweep of the coreutils' other lines decides theirs.
+
+**The sweep, as built.** Every other line stays an error. Notices: a result said in words where
+there is no `stdout` (`disk`'s "mounted at" and "unmounted", `service`'s, the text listings of
+`disk`, `service`, `desktop`, `account` and `with --list`), `shutdown`'s "shutting down" and
+"restarting", `account`'s "set a new password" and a broker's answer that it did what was asked
+(`account`, `with --check`, `with --install`), `with --show FILE`'s "wrote the policy to", and a
+cancelled question in `nxinstall`. Warnings: `date`'s clock set for this boot only, and `log`'s
+records dropped from the ring. **`with --show` with no file writes the policy to `stdout`**
+(`Stage::text_out`) rather than as one diagnostic, which a policy longer than a message's payload
+could not be — it went to the kernel log.
+
+**Gates:**
+- `test-interactive` 20b(d) asserts the **warning** colour on `nxinstall`'s listing note. That
+  stays the proof that the line came through `stderr` and not `kprint`.
+- `test-interactive` reads `disk --help` **not** in the error colour — and, since a notice is
+  drawn plain too, counts it: `disk --help | count` is 13 only if the usage is on `stdout`.
+- `test-interactive` 20d(b) reads `with --show FILE`'s notice plain. The `stderr` line names the
+  file where the console's says "a copy", so finding it proves the path. And `with --show` with no
+  file counts as many rows as that saved copy, which only `stdout` can give (PR #352 review).
+- The reset-before-the-line-ends check covers a warning as well as an error.
+- `check-terminal` reads `nxsh --help` in the grid, which only a terminal writes to: `kprint`
+  never reaches it.
+- Host tests on the framing, on a message with no level being an error, and on the shell's colour
+  for each level.
+
+- [x] **Built** (2026-10-02). **Controls, each failing at its own step:**
+  - every level painted as an error, the old paint: 20b(d);
+  - a notice painted as an error: 20d(b);
+  - `--help` sent as an error: the `disk --help` colour check;
+  - `--help` sent as a notice: the count, which reads nothing;
+  - `nxsh --help` through `kprint`: `check-terminal`, with the usage on the serial port and not
+    in the grid;
+  - `with --show` back to one diagnostic: the row count, which reads nothing.

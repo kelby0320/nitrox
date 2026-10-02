@@ -86,12 +86,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"clip: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     let (copying, listing) = (args.has("copy"), args.has("list"));
     if copying && listing {

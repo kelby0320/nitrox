@@ -32878,3 +32878,110 @@ reviewer deleted the call, and every gate passed.
 - The `views.toml` schema's `auth` row says a password is remembered per view, per terminal.
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-02 — Laptop polish Part E: a diagnostic's level, and `--help` on `stdout`
+
+On the laptop, `nxinstall`'s progress, its "done", and every program's `--help` were drawn in the
+error colour. The shell painted every message on `stderr` the same, because a message said nothing
+about what it was. The maintainer first suggested moving progress to `stdout`. It stays on
+`stderr`, because `stdout` is the pipeline's value and the shell shows it only when the pipeline
+ends (2026-10-01).
+
+**A level is one leading byte** (`libstream::diag`): `0x01` a notice, `0x02` a warning.
+- **A message whose first byte is neither is an error, whole.** Every sender that predates this
+  writes such messages, so nothing that was an error stopped being one, and about 250 error lines in
+  the coreutils needed no change.
+- No text starts with either control.
+- The shell strips the byte, and paints an error red (`SGR 91`), a warning bright yellow
+  (`SGR 93`, new; the design had no warning colour), and a notice plain. Through `kprint` the text
+  goes alone.
+
+**`--help` and `--version` are answers, not diagnostics.**
+- `Stage::answer` writes them to `stdout` as a `TEXT_FALLBACK` stream, which the shell prints as
+  lines and a pipeline can take, and sends them as a notice only with no `stdout`. Every coreutil
+  and `with` use it, and `nxinstall` does the same with its own lines.
+- `--version` was not in the plan: it was the same two lines as `--help`, drawn as an error the
+  same way.
+- **`nxsh --help`** writes on the terminal it was handed. In script mode the shell sets its
+  terminal aside, so the usage went to `kprint`, which nobody sees on a machine with no serial port.
+- **`with --show`** with no file writes the policy to `stdout` the same way. As one diagnostic, a
+  policy longer than a message's payload went to the kernel log.
+
+**What became a notice or a warning:**
+- **Notices:**
+  - `nxinstall`'s progress, "done", "nothing was written." and a cancelled question;
+  - a result said in words where there is no `stdout`;
+  - `shutdown`'s "shutting down";
+  - `account`'s "set a new password";
+  - a broker's answer that it did what was asked.
+- **Warnings:**
+  - `nxinstall`'s notes on a withheld disk;
+  - `with`'s "gets no diagnostic channel";
+  - `date`'s clock set for this boot only;
+  - `log`'s dropped records.
+- Everything else stays an error.
+
+**Gates, with controls:**
+- **`test-interactive` 20b(d)** asserts the warning colour on `nxinstall`'s note about `/dev/blk/0`.
+  On serial, colour is still what tells the shell's path from `kprint`.
+  - *Control:* every level painted red fails it.
+- **The `disk --help` check** reads the usage with no diagnostic colour.
+  - *Control:* `--help` sent as an error fails it.
+- **The count:** `disk --help | count` must be 13. A plain notice would pass the colour check, so
+  this is what proves the usage is on `stdout`.
+  - *Control:* `--help` sent as a notice reads nothing.
+- **20d(b)** reads `with --show FILE`'s notice plain. Its `stderr` line names the file, where the
+  console's says "a copy".
+  - *Control:* a notice painted red fails it.
+- The colour reset check covers a warning too.
+- **`check-terminal`** reads `nxsh --help` in the grid.
+  - *Control:* the usage through `kprint` reaches the serial port and not the grid.
+- Host tests cover the framing, a message with no level byte, and the colour for each level.
+
+Docs: `pipeline-stdio.md` (a section on the level), `shell-language.md` §1 and §10f,
+`console-and-tty.md` (and its Status), and the plan, which is now complete. No kernel change, so no
+ABI hash impact.
+
+## 2026-10-02 — PR #352's CI: a gate read a line still arriving
+
+`check-storage --kvm` failed in CI on the report line for the disk's root, read as
+`… mounted at /storage/nitrox-r`. The guest was right: the transcript dumped a moment later had
+more of the line.
+
+- **The gate was wrong, and has been since 2026-09-25.** It matched the line's prefix with
+  `expect`, then took the line straight from the transcript. `expect` returns as soon as the
+  prefix arrives, and the rest of a serial line comes in whatever chunks the host reads. KVM is
+  fast enough to read between them.
+- **`check-recovery` has the same code** and the same bug.
+- **`rest_of_line` already waits for the newline**, for this reason (PR #223's review), but only
+  covers the text after the match. Both gates also need the `blk-<n>` before it. The new
+  `Session::matched_line` waits the same way and returns the whole line, and both gates use it.
+
+**Proven before it was fixed.** A probe made `storage-service` emit that line in two pieces, half
+a second apart. The old code then failed every time, at `nitrox-roo` as in CI, in both gates. The
+new code passed both. The probe is removed.
+
+## 2026-10-02 — PR #352, reviewed: the shell is the exception
+
+One blocking finding and one worth fixing, both taken. The third, optional, is noted.
+
+**The spec said every program answers `--help` on `stdout`, and `nxsh` does not** (blocking).
+- `nxsh` keeps none of its streams, so `nxsh --help` writes on the terminal it was handed, and
+  cannot be piped.
+- `shell-language.md` §10f and `pipeline-stdio.md` now say the coreutils answer on `stdout`, and
+  name `nxsh` as the exception.
+- `pipeline-stdio.md` no longer says `nxinstall` has a `--version`. It answers `--help` only.
+
+**Nothing ran `with --show` without a file** (worth fixing). Putting back the old arm, one
+diagnostic, failed no gate. A policy longer than one message would have gone to the kernel log
+again.
+- 20d now runs `with admin with --show | count` against `open ./policy.txt | count`, the copy
+  20d(b) just saved. The two must be equal and above zero, which only `stdout` can give.
+- *Control:* the old arm back. The policy is drawn red on `stderr`, `count` gets nothing, and the
+  step fails.
+- **And a body that is not UTF-8** became one empty row: a blank line, and exit 0. `Stage::text_out`
+  now shows such bytes replaced, not dropped.
+
+**Optional, noted:** no gate sees `nxinstall`'s progress drawn as notices. `check-install` drives
+it in `nxterm`, whose grid drops colour, and `test-interactive` has no disk the installer may
+write. Other senders cover the mechanism, so each of those lines rests on its level choice alone.

@@ -81,12 +81,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"date: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     if args.has("set") {
         let [time] = args.operands.as_slice() else {
@@ -152,7 +150,7 @@ fn set(stage: &Stage, time: &str) {
         stage.die(b"date: the clock was not set\n", EXIT_FAILURE);
     }
     if r as u64 == CLOCK_SET_THIS_BOOT {
-        stage.diag(
+        stage.warn(
             b"date: the clock is set, but the hardware clock would not take it: it lasts until the \
               next boot\n",
         );

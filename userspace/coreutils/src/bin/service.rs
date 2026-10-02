@@ -91,12 +91,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"service: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [args.has("list"), args.has("start"), args.has("stop"), args.has("restart")];
@@ -144,7 +142,7 @@ fn list(stage: &Stage) -> i64 {
                 text.push_str(&cells.join("  "));
                 text.push('\n');
             }
-            stage.diag(text.as_bytes());
+            stage.note(text.as_bytes());
             b"text"
         }
     };
@@ -291,7 +289,7 @@ fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
             let row = alloc::vec![Value::Str(String::from(name)), Value::Str(String::from(verb.state()))];
             write_table(stage, h, &schema, &[row]);
         }
-        None => stage.diag(format!("{name} {}\n", verb.done()).as_bytes()),
+        None => stage.note(format!("{name} {}\n", verb.done()).as_bytes()),
     }
     Line::new().s(b"service: ").s(verb.done().as_bytes()).s(b" ").untrusted(name.as_bytes()).end();
     EXIT_OK

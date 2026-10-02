@@ -85,12 +85,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"disk: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [args.has("list"), args.has("mount"), args.has("unmount")];
@@ -138,7 +136,7 @@ fn list(stage: &Stage) -> i64 {
                 text.push_str(&cells.join("  "));
                 text.push('\n');
             }
-            stage.diag(text.as_bytes());
+            stage.note(text.as_bytes());
             b"text"
         }
     };
@@ -265,7 +263,7 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
             let row = alloc::vec![Value::Str(device.clone()), Value::Str(label.clone()), Value::Str(at.clone())];
             write_table(stage, h, &schema, &[row]);
         }
-        None => stage.diag(format!("{device} mounted at {at}\n").as_bytes()),
+        None => stage.note(format!("{device} mounted at {at}\n").as_bytes()),
     }
     Line::new().s(b"disk: mounted ").s(device.as_bytes()).s(b" at ").untrusted(at.as_bytes()).end();
     EXIT_OK
@@ -285,7 +283,7 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
         }
         // Not "and left clean": a read-only mount leaves a filesystem as it found it. `--list`
         // says how each was left.
-        None => stage.diag(format!("{label} unmounted\n").as_bytes()),
+        None => stage.note(format!("{label} unmounted\n").as_bytes()),
     }
     Line::new().s(b"disk: unmounted ").untrusted(label.as_bytes()).end();
     EXIT_OK

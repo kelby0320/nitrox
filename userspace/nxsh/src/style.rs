@@ -31,6 +31,21 @@ pub const HEADER: &str = "\x1b[90m";
 
 /// Bright red — a diagnostic. The design's `#D68A83`.
 pub const DIAG: &str = "\x1b[91m";
+/// Bright yellow — a warning (the laptop polish's Part E). The design has no warning colour, and
+/// this is the ANSI one left; the palette decides what it looks like.
+pub const WARN: &str = "\x1b[93m";
+
+/// **The colour a diagnostic of `level` is drawn in**: an error in [`DIAG`], a warning in
+/// [`WARN`], a notice in none. A notice is a program's progress or its answer, and painting it as
+/// a failure is the thing this exists to stop.
+pub fn for_level(level: libstream::diag::Level) -> Option<&'static str> {
+    use libstream::diag::Level;
+    match level {
+        Level::Error => Some(DIAG),
+        Level::Warning => Some(WARN),
+        Level::Notice => None,
+    }
+}
 
 /// Back to whatever the terminal's default is — **not** to a colour of our choosing, which is
 /// what `SGR 39` would be reaching for if the shell had opinions about the ground.
@@ -62,6 +77,22 @@ pub fn paint(on: bool, sgr: &str, text: &str) -> String {
     s.push_str(text);
     s.push_str(RESET);
     s
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+    use libstream::diag::Level;
+
+    /// **Each level its own colour, and a notice none** — and an error the colour every diagnostic
+    /// had, so a program that says nothing about its level draws as it did.
+    #[test]
+    fn each_level_has_its_colour() {
+        assert_eq!(for_level(Level::Error), Some(DIAG));
+        assert_eq!(for_level(Level::Warning), Some(WARN));
+        assert_eq!(for_level(Level::Notice), None);
+        assert_ne!(WARN, DIAG, "a warning is not drawn as an error");
+    }
 }
 
 #[cfg(test)]
