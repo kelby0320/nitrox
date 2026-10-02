@@ -328,7 +328,7 @@ Part A's report is the survey of what is attached.
 - **A record is PCI-shaped.** The table keeps beside each node what the node cannot say about
   itself: kind, served index, parent, driver. A non-block node's name is a word from its kind
   (`keyboard`), so a USB device's product name has nowhere to go yet. `DeviceRecord` has three
-  reserved bytes (`_pad`). `device-mgr` matches on `DeviceKind` exhaustively in three places.
+  reserved bytes (`_pad`). `device-mgr` matches on `DeviceKind` exhaustively in four places.
 - **What a driver needs exists**: 64-bit BAR sizing (`kernel/src/pci/mod.rs`), `map_mmio`,
   `DmaBuffer` (page-aligned and a power of two, so no ring segment crosses 64 KiB), `read_msi`
   and `program_msi`, `enable_bus_master`, and an outcome recorded per function.
@@ -337,8 +337,10 @@ Part A's report is the survey of what is attached.
   cannot be changed. The live stick's menu can.
 
 **QEMU 11.0.2, asked rather than remembered:**
-- `qemu-xhci` is `1b36:000d`, with a 64-bit BAR0, MSI and MSI-X, and **4 USB 2 and 4 USB 3
-  ports** (`p2`, `p3`).
+- `qemu-xhci` is `1b36:000d`, with a 64-bit BAR0, MSI and MSI-X. **`p2=4` and `p3=4` are four
+  connectors, not eight**: each has a USB 2 and a USB 3 port number (port *n* and *4+n*), and a
+  device takes whichever its speed needs. Four devices fill the root, and a fifth lands behind a
+  hub if one is attached. (The first version of this pass said eight ports — PR #353 review.)
 - `info usb` puts `usb-kbd` and `usb-mouse` at 480 Mb/s, and `usb-storage` at 5000 Mb/s on a USB
   3 port. `usb_version=1` attaches a device at 12 Mb/s. So a gate covers high, full and
   SuperSpeed. **Low speed, which most real mice use, no QEMU USB device takes a setting for**: the
@@ -350,20 +352,24 @@ Part A's report is the survey of what is attached.
 
 **The laptop** (the 2026-09-10 dump: `lspci -vv` and `/proc/interrupts` under Linux):
 - `00:14.0`, BAR0 64 KiB and 64-bit, MSI with eight vectors, no MSI-X: as the plan says.
-- **It was in D3 when the dump was taken**, because Linux suspends an idle controller. What the
-  firmware leaves it in at `ExitBootServices` is unknown, and in D3hot its registers read as all
-  ones. So the driver puts it in D0 through its power-management capability before anything else.
-  QEMU never takes this path.
+- **It was in D3 when the dump was taken** (`Status: D3 NoSoftRst+`), because Linux suspends an
+  idle controller. What the firmware leaves it in at `ExitBootServices` is unknown, and in D3hot
+  its registers read as all ones. So the driver puts it in D0 through its power-management
+  capability before anything else, and **waits the 10 ms** PCI PM 1.2 requires before touching it.
+  `NoSoftRst+` says the transition keeps the BARs and the command register; a function without it
+  is reset by the transition, and the driver restores both, as Linux's `pci_power_up` does. QEMU
+  never takes this path.
 - **No USB input is built in**: the keyboard is the i8042's and the touchpad is I²C (`ELAN0501`).
   Linux still took about 2,000 xHCI interrupts, so something internal is probably attached, such
   as a webcam or Bluetooth. The report will say.
-- **From Linux's `xhci-pci` quirk list, not verified here:**
-  - Intel hosts get a 1 ms pause after a controller reset, against rare hangs.
-  - This controller is listed as missing Cold Attach Status: a USB 3 device attached at boot can
-    leave its port in compliance mode, which a warm reset clears.
-
-  Both are taken as the laptop shows them. The report prints every port's state at start, so it
-  can show either.
+- **From Linux's `xhci` driver** (checked against its source by the PR #353 review):
+  - **Intel hosts need 1 ms between setting `HCRST` and the next register access**, which Linux's
+    comment says can otherwise hang the machine, rarely. The pause comes *before* the first poll —
+    the read it guards is the poll — so no bound on the loop can stand in for it.
+  - **This controller is on Linux's missing Cold Attach Status list**, which Linux applies only
+    after resume, citing an Intel PCH erratum. That a USB 3 device attached at boot could leave its
+    port in compliance mode is this plan's guess, not Linux's; the report prints every port's
+    state at start, so a stuck port would show, and a warm reset clears one.
 
 ### The shape
 
@@ -372,7 +378,8 @@ Part A's report is the survey of what is attached.
   - the controller into D0, and bus mastering on;
   - the BIOS handoff through the USB Legacy Support capability: OS-owned, a bounded wait for the
     firmware to let go, and its SMIs off;
-  - halt, then reset, waiting for Controller Not Ready to clear and then 1 ms;
+  - halt; then set `HCRST`, **pause 1 ms**, wait for `HCRST` to clear, and wait for Controller
+    Not Ready to clear (xHCI §5.4.1, in Linux's order);
   - the structures: the device context base array, the scratchpad buffers the controller asks
     for, the command ring, and one event-ring segment with its table, on interrupter 0;
   - MSI, and the outcome *claimed*.
@@ -397,8 +404,11 @@ On a machine with nothing attached, the round costs about 100 ms.
 **Per device:**
 1. A USB 2 port is reset; a USB 3 port is already enabled by link training.
 2. *Enable Slot*, then *Address Device*.
-3. The device descriptor's first eight bytes, then *Evaluate Context* if `bMaxPacketSize0`
-   differs from the speed's default.
+3. The device descriptor's first eight bytes, then *Evaluate Context* if the default endpoint's
+   maximum packet size differs from the speed's default. **At SuperSpeed `bMaxPacketSize0` is an
+   exponent** — 9 means 512 — and a byte count everywhere else. Compared literally, every
+   SuperSpeed device would get a maximum packet of 9, and QEMU would not notice: its xHCI reads
+   the field only for a debug message. The laptop's first USB 3 device would.
 4. The whole device descriptor, then the configuration descriptor: its nine bytes, then
    `wTotalLength`.
 5. String descriptor 0, then the product and serial strings.
@@ -413,7 +423,11 @@ disables the slot and is logged. **Its record stays** until Part C gives the reg
 which is the one place Part A is knowingly incomplete.
 
 **The record:**
-- `DeviceKind::UsbDevice` (8). `vendor` and `device` are `idVendor` and `idProduct`.
+- `DeviceKind::UsbDevice` (8). The record's `vendor` and `device` are `idVendor` and
+  `idProduct`. **The node's own descriptor stays PCI's**: vendor `0xFFFF`, as for every node that
+  is not a PCI function, because `pci_parent` (`kernel/src/device.rs`) reads any other vendor as
+  "has a PCI address", and a USB node's zero address would find the host bridge. The USB IDs live
+  in the table's entry, beside the name, and fill the record from there.
 - The class triple is the device descriptor's, or the first interface's when the device's is zero,
   as most are.
 - `driver` is `xhci`, and `parent` is the controller.
@@ -424,17 +438,21 @@ which is the one place Part A is knowingly incomplete.
 - The table keeps the name in the entry, beside the kind.
 - **One controller.** A second is declined, as AHCI drives one.
 
-**`device-mgr`** names a USB device `usb-<port>`, as a PCI function is named by its address. Its
-kind is `usb`, it has no path, its description is the name, IDs and speed, and its parent is the
-controller's function. So `list /dev/devices` shows them.
+**`device-mgr`** names a USB device **`usb-<id>`**, after its registry id. A port is reused when a
+device leaves and another arrives, and its record stays, so two records could share a port; a
+connector also has two port numbers. Every other name for a node that comes and goes is keyed on
+an index never reused, for the reason the Departure section gives. (The first version of this
+pass said `usb-<port>` — PR #353 review.) Its kind is `usb`, it has no path, its description is
+the name, IDs, port and speed, and its parent is the controller's function. So
+`list /dev/devices` shows them.
 
 **The log is the report.** One line per controller fact, one per port at start, one per device,
 and one when the first round ends. Illustratively, with the IDs left for the first boot to read:
 ```
 xhci: 00:14.0 up: 16 ports (USB 2: 1-12, USB 3: 13-16), 32 slots, 64-byte contexts, 4 scratchpads
-xhci: port 5 at start: connected, high-speed
-usb: port 5: vvvv:pppp class 03/01/01, high-speed, "QEMU USB Keyboard": HID boot keyboard
-usb: port 6: vvvv:pppp class 09/00/00, high-speed, "QEMU USB Hub": a hub, not supported
+xhci: port 1 at start: connected, high-speed
+usb: port 1: vvvv:pppp class 03/01/01, high-speed, "QEMU USB Keyboard": HID boot keyboard
+usb: port 4: vvvv:pppp class 09/00/00, full-speed, "QEMU USB Hub": a hub, not supported
 usb: first round: 4 device(s) in 310 ms
 ```
 
@@ -456,7 +474,8 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
 
 ### Gates
 
-- **`test-qemu`, TCG and KVM**, attaches `qemu-xhci` with:
+- **`test-qemu`, TCG and KVM**, attaches `qemu-xhci,p2=8,p3=8` — eight connectors, so the
+  hot-plug below reaches a root port rather than the hub — with:
   - `usb-kbd`, at high speed;
   - `usb-mouse,usb_version=1`, at full speed;
   - `usb-storage` over a blank image, at SuperSpeed;
@@ -469,7 +488,9 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
   the IDs, class, port and speed the log gave. A log line can be printed for a device the table
   never got.
 - **A hot-plug, from the host:** once the first round is logged, `device_add usb-kbd` over QMP
-  and its arrival line, then `device_del` and its disconnect line.
+  and its arrival line, then `device_del` and its disconnect line. With the default four
+  connectors the four devices above fill the root, and the keyboard would land behind the hub,
+  where Part A does not look: the gate would wait for a line that cannot come (QEMU, `info usb`).
 - **`check-report`**: the live stick's line on a report page.
 - **Host tests, in the kernel crate:**
   - TRBs, and a ring's enqueue across its link TRB with the cycle bit toggled;
@@ -478,6 +499,7 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
   - 32- and 64-byte contexts, and the scratchpad array;
   - descriptor parsing from bytes real devices sent, and from bytes no correct device sends: a
     short `bLength`, or a `wTotalLength` past the buffer;
+  - a SuperSpeed device descriptor with `bMaxPacketSize0 = 9`, read as 512;
   - the class table, including a hub and a composite device;
   - a UTF-16 string made printable;
   - `usb=off` on the command line.
@@ -499,10 +521,11 @@ records by kind and name, but that is to be checked when it is built.
 ### Docs Part A owes
 
 - **`docs/architecture/usb.md`**, new. <!-- check-docs: allow-missing -->
-- **`device-node.md`**: the kind, `port` and `speed`, and a sixth group in the registry's order,
-  published by a thread after boot.
+- **`device-node.md`**: the kind, `port` and `speed`, a sixth group in the registry's order,
+  published by a thread after boot, and **what `vendor` and `device` mean now**: a PCI function's
+  or a USB device's IDs, and `0xFFFF` for neither.
 - **`drivers-and-irps.md`**: the hub thread's waits.
-- **`device-manager.md`**: the `usb-<port>` names.
+- **`device-manager.md`**: the `usb-<id>` names.
 - **The root `CLAUDE.md`**: `test-qemu`'s USB devices.
 
 ## Definition of Done

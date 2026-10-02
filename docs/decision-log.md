@@ -33045,3 +33045,46 @@ removed from `device-manager.md` and `overview.md`. Corrected in the same change
 
 Docs only; no ABI hash impact. Part A's own kernel work has none either: a kind and two reserved
 bytes are not hash inputs, and `abi-sync-check` guards `libkern::device`.
+
+## 2026-10-02 — PR #353, reviewed: four connectors, not eight
+
+One blocking finding, two worth fixing and five optional, all taken. The reviewer checked the
+QEMU claims against QEMU 11.0.2 and its `hcd-xhci.c`, and the Linux quirks against Linux's
+`xhci` source.
+
+**The hot-plug gate could not pass** (blocking). `qemu-xhci`'s `p2=4` and `p3=4` are **four
+connectors**, each with a USB 2 and a USB 3 port number, not eight ports. The spike read the two
+properties as port counts.
+- The gate's four devices fill the root, and a hot-plugged keyboard lands behind the hub, where
+  Part A does not look.
+- Reproduced with `info usb` before fixing: the late keyboard is `Port 4.1` with the defaults, and
+  root `Port 5` with `p2=8,p3=8`.
+- The gate now gives the controller eight connectors.
+- The hub attaches at full speed, and the illustrative log line said high.
+
+**The Intel reset pause was in the wrong place** (worth fixing). Linux sets `HCRST`, pauses 1 ms,
+then polls for `HCRST` and then Controller Not Ready to clear. The plan polled first and paused
+after. Linux's comment says that read is the one that can hang, and a hung read is not something
+a bounded loop can catch.
+- The missing Cold Attach Status quirk is applied by Linux only after resume. A USB 3 port stuck
+  at boot is now worded as this plan's guess.
+
+**At SuperSpeed `bMaxPacketSize0` is an exponent** (worth fixing). Compared as a byte count, every
+SuperSpeed device would get a maximum packet of 9. QEMU's xHCI reads the field only for a debug
+message, so no gate would see it; the laptop's first USB 3 device would. The plan says so, and a
+host test reads a SuperSpeed descriptor's 9 as 512.
+
+**Optional, all taken:**
+- **`usb-<id>`, not `usb-<port>`**. Ports are reused and records stay, and a connector has two
+  port numbers. Every other name for a node that comes and goes is keyed on an index that is
+  never reused.
+- **D3hot to D0**: wait 10 ms, and restore the BARs and command register if the transition reset
+  them. The laptop dump shows `NoSoftRst+`, so there only the wait applies. The reviewer did not
+  have the dump.
+- **A USB node's own descriptor keeps vendor `0xFFFF`.** `pci_parent` reads any other vendor as
+  "has a PCI address", and a USB node's zero address would find the host bridge. The record's
+  `vendor` and `device` carry the USB IDs from the table's entry instead. `device-node.md` owes
+  the field's new meaning.
+- **`drivers-and-irps.md`'s Module tiers rule** still made hot-pluggable drivers Tier 2. The
+  file this PR already edits now states the rule the 2026-10-01 decisions made.
+- `device-mgr` matches `DeviceKind` exhaustively in four places, not three.
