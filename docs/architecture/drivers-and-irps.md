@@ -29,7 +29,9 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > as the fallback. § "Interrupts" and the ramdisk re-checked 2026-09-14, when Phase 5 Part C
 > made a Limine module a block device and gave it a completion interrupt of its own; § "Device
 > discovery" the same day, when Part D made drivers report what they did with each function.
-> § "Flush" added 2026-09-24, with administration Part C.2.
+> § "Flush" added 2026-09-24, with administration Part C.2. § "Module tiers" corrected 2026-10-02
+> (PR #353 review): its rule still made hot-pluggable drivers Tier 2, which Phase 6's decisions
+> reversed.
 
 ## Three concepts, kept distinct
 
@@ -238,8 +240,9 @@ the node. The userspace **driver manager** — matching nodes to Tier 2 modules
 and handing a driver process a `Handle<DeviceNode>` — is **deferred** (it needs
 the Tier 2 loader). **Its other half exists** (administration Part B, 2026-09-24): the device
 table is readable at `/dev/registry`, and `device-mgr` hands each node, as a handle, to the service
-that owns its class — the shape Phase 6 extends to driver processes. See
-[`device-manager.md`](device-manager.md).
+that owns its class. Driver processes would extend that shape, if Tier 2 turns out to mean them
+rather than kernel modules — an open question (§ *Module tiers*); Phase 6's USB drivers are
+Tier 1. See [`device-manager.md`](device-manager.md).
 
 **A matched driver reports what it did, and the device table keeps it** (Phase 5 Part D,
 2026-09-14). A driver's bring-up returns a
@@ -364,10 +367,13 @@ several commands is the better answer and is `TODO(block-transfer-split)`.
 | Tier | Where | Examples | Phase 2 |
 |---|---|---|---|
 | **Tier 1** | compiled into the kernel ELF, gated by Cargo features | `pci` (always on), `ahci`, `gpt` (always on), `nvme` (later) | **yes** |
-| **Tier 2** | loaded at runtime by a userspace driver manager (`SysCaps::LOAD_MODULE`) | hot-pluggable / optional hardware, debug tools | **deferred** |
+| **Tier 2** | loaded at runtime by a userspace driver manager (`SysCaps::LOAD_MODULE`) | a driver not every image should carry (Wi-Fi is the likely first), debug tools | **deferred** |
 
-**Rule:** boot-path drivers are Tier 1; hot-pluggable or optional ones are
-Tier 2. Tier 2 requires the kernel-module loader — an `export!` table, ELF
+**Rule:** a driver every image needs is Tier 1, whether its devices are there at boot or arrive
+later; Tier 2 is for one that should not be in every image, one restarted without a reboot, or
+one built outside this tree. (Until 2026-10-01 the rule said hot-pluggable drivers were Tier 2,
+which ran "a device that arrives" together with "code that arrives with it".) Tier 2 requires the
+kernel-module loader — an `export!` table, ELF
 relocation, and **ABI-hash** enforcement so a module is refused unless it was
 built against this exact kernel (see `docs/spec/abi-version-hash.md`). That
 machinery is **deferred**; everything Phase 2 needs (PCI, AHCI, GPT) is Tier 1.

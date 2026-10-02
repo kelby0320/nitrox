@@ -302,9 +302,11 @@ driver-to-node matching graduates to a userspace **device manager** with Tier 2
 (deferred); see `namespace-and-resource-servers.md` § "Liveness".
 
 The userspace **driver manager** (matching nodes to Tier 2 modules, handing a
-driver process a `Handle<DeviceNode>`) is Phase 6's, and extends the device
-manager the administration phase builds (`docs/planning/phase-6-usb.md`) — whose first half,
-handing each node to the owner of its class, is [`device-manager.md`](../architecture/device-manager.md).
+driver process a `Handle<DeviceNode>`) is deferred with Tier 2 itself: Phase 6's USB drivers
+are Tier 1, compiled in and binding when a device arrives, and whether Tier 2 means kernel
+modules or driver processes is open (`docs/planning/phase-6-usb.md` § *Decisions*). The half
+that exists, handing each node to the owner of its class, is
+[`device-manager.md`](../architecture/device-manager.md).
 
 ## Deferred
 

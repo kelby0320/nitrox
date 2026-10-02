@@ -6595,11 +6595,13 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // that it answered with the *work area* rather than the screen. What the client does with
     // the size is 6g's, which is where the whole round trip is read back.
     click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
-    session.expect("nxterm: asked the shell for window state 2")?;
-    session.expect(&format!(
+    // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
+    // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
+    let maximised = format!(
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
         work.0, work.1, work.2, work.3
-    ))?;
+    );
+    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised])?;
     println!("  ok: maximise asked for the work area, not the screen");
 
     // **And put it back, which is a gesture in its own right and the only one that sends
@@ -6620,8 +6622,12 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         work.0, work.1, work.2, work.3
     ))?;
     click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
-    session.expect("nxterm: asked the shell for window state 0")?;
-    session.expect(&format!("desktop-shell: restore window {term_id} to "))?;
+    // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
+    // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
+    session.expect_all(&[
+        "nxterm: asked the shell for window state 0",
+        &format!("desktop-shell: restore window {term_id} to "),
+    ])?;
     // The size is pinned by the client's own line rather than by the shell's: the shell prints
     // what it asked for, and what this step is about is the window going back to the shape it
     // had — which only the client can say it did.
@@ -6631,12 +6637,17 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **And minimise, end to end**, because nothing in it depends on a client honouring
     // anything: the window leaves the screen and the bar marks it with `_`.
     click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
-    session.expect("nxterm: asked the shell for window state 1")?;
-    session.expect(&format!("desktop-shell: client asked to minimize window {term_id}"))?;
-    // `_` is the bar's mark for a minimized window. The desktop count is not asserted: the
-    // lifecycle rule appends an empty desktop as soon as one has a window, so it is 2 here and
-    // says nothing about minimising.
-    session.expect(&format!("desktop-shell: window list on Desktop 1 of 2 [{term_id}:_ "))?;
+    // **In any order** (PR #353's CI, the same class one step down): `nxterm` logs its request
+    // after the compositor answers it, and the compositor answers once it has forwarded it, so the
+    // shell can be first. The list's `_` exists only after the minimise, so no earlier line
+    // answers for it. `_` is the bar's mark for a minimized window. The desktop count is not
+    // asserted: the lifecycle rule appends an empty desktop as soon as one has a window, so it is
+    // 2 here and says nothing about minimising.
+    session.expect_all(&[
+        "nxterm: asked the shell for window state 1",
+        &format!("desktop-shell: client asked to minimize window {term_id}"),
+        &format!("desktop-shell: window list on Desktop 1 of 2 [{term_id}:_ "),
+    ])?;
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
@@ -6650,8 +6661,12 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // a repeat, the client was told it had succeeded, and the button stayed dead until some other
     // state was asked for first (PR #249 review, blocking 1).
     click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
-    session.expect("nxterm: asked the shell for window state 1")?;
-    session.expect(&format!("desktop-shell: client asked to minimize window {term_id}"))?;
+    // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
+    // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
+    session.expect_all(&[
+        "nxterm: asked the shell for window state 1",
+        &format!("desktop-shell: client asked to minimize window {term_id}"),
+    ])?;
     println!("  ok: the minimise button still works after the taskbar restored the window");
     click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
@@ -7267,11 +7282,6 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
     click_at(&mut qmp, &mut session, moved_x + term_w as i32 - chrome::MAXIMISE_X, moved_y + chrome::TITLE_Y)?;
-    session.expect("nxterm: asked the shell for window state 2")?;
-    session.expect(&format!(
-        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
-        work.0, work.1, work.2, work.3
-    ))?;
     // **Two producers, one cause, so no order between them.** The shell logs the window's new
     // origin when the compositor's geometry event reaches it; the client logs the size it took
     // when the `Configure` reaches it. Both are downstream of the same apply and neither is
@@ -7279,12 +7289,22 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // a sequence this passed for two milestones and then failed in CI with both lines present
     // and the *first* expect having scanned past the second (2026-08-31).
     //
+    // **And the request and the shell's answer to it in the same wait** (PR #353's CI): `nxterm`
+    // logs the request after the compositor answers it, which is after the shell has it, so the
+    // shell's maximise *and its move* can both come before the client's line. Waited for apart,
+    // the first wait's cursor jumps past the move to the request, and the second takes the final
+    // geometry for the move.
+    //
     // The client's line says what it did with the size *and* what that came to in cells, which
     // is the difference between a window that grew and a terminal that can use the room: a grid
     // still 80x24 in a 1280x752 window would satisfy every other line here.
+    let maximised = format!(
+        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
+        work.0, work.1, work.2, work.3
+    );
     let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
     let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
-    session.expect_all(&[&moved, &took])?;
+    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised, &moved, &took])?;
     // And the committed geometry — the one the compositor reports and `/dev/draw/<id>/info`
     // answers with — is the work area exactly, not the work area rounded down to whole cells.
     session.expect(&format!(
@@ -8206,13 +8226,28 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // gate had never closed a second window.
     //
     // `Ctrl+W` on the new window: it has one tab, and closing the last tab closes the window.
+    //
+    // **Read from where the key was pressed, in either order.** The editor's receipt and the
+    // shell's list are two processes answering one event, and nothing orders them: this waited
+    // for the receipt and then for a list line, and when the shell spoke first the list was
+    // consumed on the way to the receipt and the wait ran out (PR #353's CI). A bare
+    // `expect_all` would not do either — the list line from opening the window is still unread,
+    // and would answer for the close.
+    let new_id = placed.split_whitespace().next().unwrap_or("").to_string();
+    let from = session.transcript().len();
     qmp.send_key("ctrl", true)?;
     press(&mut qmp, "w")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: closed a window")?;
-    // …and the editor is still running, which is the half that would have been lost. The
-    // *first* window answers, so the process did not exit with the second.
-    session.expect("desktop-shell: window list on cli of ")?;
+    // …and the editor is still running, which is the half that would have been lost: **a list
+    // made after the key, without the closed window and still with the first.**
+    let gone = format!("[{new_id}:");
+    session.line_since(
+        from,
+        "desktop-shell: window list on cli of ",
+        |l| !l.contains(&gone) && l.contains("notes.txt"),
+        std::time::Duration::from_secs(30),
+    )?;
     println!("  ok: closing one window left the other open");
 
     // **Give the first window the keyboard back**, because the new one took it — which is right,
@@ -8765,34 +8800,26 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         .ok_or_else(|| {
             format!("could not read the second dialog placement from {placed_again:?}")
         })?;
+    let from = session.transcript().len();
     click_at(&mut qmp, &mut session, dx2 + CONFIRM_DISCARD_CX, dy2 + CONFIRM_BUTTON_CY)?;
     session.expect("nxedit: discarding the unsaved buffer")?;
     session.expect("nxedit: closing")?;
-    // **The list the destroy produces**, read here because it is the one line whose position in
-    // the stream is known: the editor exits, the compositor destroys its windows, and the shell
-    // redraws the bar. Step 12 needs a slot out of it, and asking for a list line later would
-    // wait for a change that nothing is going to make.
-    // **Read until the list reflects the destroy, not merely the next time it changes.** The
-    // bar is redrawn for several reasons and two of them fire here in order: the dialog goes
-    // first, which hands the keyboard back to the editor and marks the list dirty while the
-    // editor is still in it, and only then does the process exit and take its window. Four
-    // attempts is a bound rather than a guess — nothing produces that many — and it fails
-    // naming the last line it saw.
-    let mut after_close = String::new();
-    for _ in 0..4 {
-        session.expect("desktop-shell: window list on ")?;
-        after_close = session.rest_of_line()?;
-        if taskbar_slot(&after_close, untitled_id).is_none() {
-            break;
-        }
-    }
-    if taskbar_slot(&after_close, untitled_id).is_some() {
-        return Err(format!(
-            "window {untitled_id} is still in the taskbar after the editor said it was closing: \
-             {after_close:?}"
-        )
-        .into());
-    }
+    // **The list the destroy produces.** Step 12 needs a slot out of it, and asking for a list line
+    // later would wait for a change that nothing is going to make.
+    //
+    // **The list that reflects the destroy, not merely the next one.** The bar is redrawn for
+    // several reasons and two of them fire here in order: the dialog goes first, which hands the
+    // keyboard back to the editor and marks the list dirty while the editor is still in it, and
+    // only then does the window go. **And read from the click, not from the receipt**: `nxedit`
+    // destroys its window *before* it says it is closing, so the shell's list can come first, and
+    // waiting for it after the receipt waited for a line already passed (PR #353's CI, where the
+    // same order closed the editor's second window).
+    let after_close = session.line_since(
+        from,
+        "desktop-shell: window list on ",
+        |rest| taskbar_slot(rest, untitled_id).is_none(),
+        std::time::Duration::from_secs(45),
+    )?;
     let slot = taskbar_slot(&after_close, edit_id).ok_or_else(|| {
         format!(
             "window {edit_id} is not in the taskbar list {after_close:?}, so it cannot be clicked"
@@ -12230,6 +12257,58 @@ impl Session {
         let start = g[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
         let end = g[self.cursor..].find('\n').map_or(g.len(), |i| self.cursor + i);
         Ok(g[start..end].trim().to_string())
+    }
+
+    /// The first whole line from transcript offset `from` on that holds `pat` and whose rest
+    /// satisfies `want` — **whether or not an `expect` has already scanned past it** — and the rest
+    /// of it after `pat`. Moves the cursor past it when it is ahead of the cursor.
+    ///
+    /// **For a line another process prints in answer to the same event as the line just
+    /// expected.** `expect` consumes what it scans past, so waiting for one process's receipt and
+    /// then for the other's line fails whenever the other spoke first, and `expect_all` cannot
+    /// tell the answer from an older line of the same shape that is still unread. Take `from`
+    /// before the action, and only what came after it counts (PR #353's CI: `nxedit` destroys a
+    /// window and then says so, and the shell's list of what is left can land in between).
+    fn line_since(
+        &mut self,
+        from: usize,
+        pat: &str,
+        want: impl Fn(&str) -> bool,
+        timeout: std::time::Duration,
+    ) -> R<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let mut at = from.min(g.len());
+                // Whole lines only: a line still arriving can satisfy `want` with half its text.
+                while let Some(nl) = g[at..].find('\n') {
+                    let line = &g[at..at + nl];
+                    if let Some(i) = line.find(pat) {
+                        let rest = line[i + pat.len()..].trim();
+                        if want(rest) {
+                            let rest = rest.to_string();
+                            self.cursor = self.cursor.max(at + nl + 1);
+                            self.sent_since_match.clear();
+                            return Ok(rest);
+                        }
+                    }
+                    at += nl + 1;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let seen: Vec<String> = {
+                    let g = self.out.lock().map_err(|_| "transcript lock")?;
+                    g[from.min(g.len())..].lines().filter(|l| l.contains(pat)).map(str::to_string).collect()
+                };
+                return Err(format!(
+                    "no line holding {pat:?} since the action was the one wanted within {timeout:?}; \
+                     the ones that came: {seen:?}"
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Wait up to `timeout` for `pat`, answering **whether it arrived** rather than failing.
