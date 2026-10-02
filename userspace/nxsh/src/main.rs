@@ -51,6 +51,13 @@ use nxsh::{Interp, RunMode};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
+/// **The commit this shell was built from**, as `xtask` set it (the laptop polish's Part D); the
+/// banner names it. `unknown` when built some other way.
+const BUILD_COMMIT: &str = match option_env!("NITROX_COMMIT") {
+    Some(c) => c,
+    None => "unknown",
+};
+
 const EXIT_OK: i64 = 0;
 const EXIT_SCRIPT_FAILED: i64 = 1;
 const EXIT_PARSE_ERROR: i64 = 2;
@@ -1142,17 +1149,11 @@ fn repl(
     tty_set_echo(tty, false);
     let mut disc = tty_server::Discipline::new();
 
-    // The banner in the design's cyan. The loop only runs with a terminal, and `tty` is it.
+    // The banner in the design's cyan. The loop only runs with a terminal, and `tty` is it. **It
+    // names the build** (the laptop polish's Part D), so every terminal says which system it is.
     tty_write(tty, b"\r\n");
-    tty_write(
-        tty,
-        nxsh::style::paint(
-            tty != 0,
-            nxsh::style::BANNER,
-            "nxsh: interactive shell (Ctrl-D or `exit` to leave)",
-        )
-        .as_bytes(),
-    );
+    let banner = alloc::format!("nxsh: interactive shell, Nitrox {BUILD_COMMIT} (Ctrl-D or `exit` to leave)");
+    tty_write(tty, nxsh::style::paint(tty != 0, nxsh::style::BANNER, &banner).as_bytes());
     tty_write(tty, b"\r\n");
 
     // `pending` accumulates across continuation lines. Deciding whether what has been typed

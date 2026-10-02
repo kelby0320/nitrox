@@ -1321,6 +1321,10 @@ stdin stream, not a flag-selected mode), so that specific idiom doesn't carry ov
 
 ## 11. REPL / interactive shell behavior
 
+**The banner names the build** (2026-10-01, the laptop polish's Part D): `nxsh: interactive shell,
+Nitrox <commit> (Ctrl-D or `exit` to leave)`, the commit the system was built from, so a terminal
+says which system it is.
+
 ### 11a. Prompt
 
 Shows the current namespace position (the `cd`-tracked equivalent of cwd) plus a status glyph
@@ -1398,6 +1402,12 @@ original rule.
 **REPL:** a top-level pipeline that isn't assigned (`let`/`mut`/`const`) and doesn't already end in
 a terminal generic operator implicitly gets `| display` appended — standard REPL ergonomics
 (Python, nushell, PowerShell all do some version of this).
+
+**How `display` draws a table** (2026-10-01, the laptop polish's Part B): its columns aligned
+under a header row, and **a cell whose value is `null` drawn blank** — the header already says
+what is missing, and a column of `null` reads as data. Only the cell: a `null` nested in a cell's
+list is still `[null]`, and a bare `null` is still displayed as `null`, since there it is the
+answer. A row ends at its last non-blank cell.
 
 **Script:** the opposite default — an unassigned bare expression statement evaluates and its
 result is silently discarded, not auto-displayed. A script with many bare invocations for side

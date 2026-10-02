@@ -42,7 +42,7 @@ use librsproto::auth::{
 };
 use librsproto::storage::{OP_STORAGE_IN_USE, parse_in_use};
 use librsproto::views::*;
-use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use librsproto::{OP_NS_RESOLVE, OP_TTY_REDEEM, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_TOKEN_LEN, decode, encode};
 use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
 use view_broker::accounts;
@@ -128,6 +128,10 @@ struct Pending {
     /// A password waiting in [`Broker::held`] to be checked: the `Password` request to answer,
     /// and the password.
     queued: Option<(u64, Vec<u8>)>,
+    /// **The terminal the request came from**, as `tty-server` named it when the broker redeemed
+    /// the request's token — never as the caller did. A password that succeeds is remembered for
+    /// it (the laptop polish's Part A); `None`, and nothing is remembered.
+    backend: Option<u32>,
 }
 
 enum State {
@@ -151,6 +155,10 @@ const STORAGE_ADMIN: &[u8] = b"/svc/storage/admin-endpoint";
 /// How long the storage service may take to answer `InUse`: it answers from what it holds, so this
 /// bounds a service that is wedged, not an ordinary wait.
 const IN_USE_WAIT_NS: u64 = 5_000_000_000;
+
+/// How long a token's redeem may take before the request is asked for a password instead. The
+/// terminal server answers from a table it holds; this only bounds a server that has stopped.
+const REDEEM_WAIT_NS: u64 = 2_000_000_000;
 
 /// **The storage service, as this broker reaches it** (administration Part C.6): an admin endpoint,
 /// which the `storage` grant binds into a view, and an admin session of the broker's own, on which
@@ -469,6 +477,41 @@ impl Broker {
             return None;
         }
         Some(ids)
+    }
+
+    /// **Which terminal a token was minted for**, asked of `tty-server` over a terminal this
+    /// broker resolves itself — never over one a caller sent, which could be a channel the caller
+    /// serves (PR #350 review). Resolved for the one question and closed after, since every
+    /// terminal is a slot in the server's wait set. `None` if the token names nothing or the server
+    /// does not answer in time: then the request is asked for a password, which is safe.
+    fn redeem(&mut self, token: &[u8; TTY_TOKEN_LEN]) -> Option<u32> {
+        let tty = ns_lookup(self.root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+        if tty == 0 {
+            return None;
+        }
+        let deadline = now_ns().saturating_add(REDEEM_WAIT_NS);
+        let backend = send(tty, OP_TTY_REDEEM, 1, 0, token, &[])
+            .then(|| loop {
+                match recv_full(tty) {
+                    // **An error reply is not an answer, by its flag.** Today its body is twelve
+                    // bytes and would not read as a backend id anyway, but that is the error
+                    // format's length rather than this check: were a refusal ever read as an id,
+                    // every token the server refused would name the same made-up terminal, and a
+                    // window opened under it would cover them all.
+                    Ok(Some((op, 1, flags, body))) if op == OP_TTY_REDEEM => {
+                        break (flags & RS_FLAG_ERROR == 0)
+                            .then(|| <[u8; 4]>::try_from(body.as_slice()).ok().map(u32::from_le_bytes))
+                            .flatten();
+                    }
+                    // A stray, or the error reply: nothing else is asked on this terminal.
+                    Ok(Some(_)) => received().into_iter().for_each(close),
+                    Ok(None) if wait_until(tty, deadline) => {}
+                    _ => break None,
+                }
+            })
+            .flatten();
+        close(tty);
+        backend
     }
 
     /// A record in the log — every request, failure and exit, and never a password.
@@ -797,6 +840,15 @@ impl Broker {
                 let _ = send(ch, op, request_id, RS_FLAG_REPLY, &[], &[]);
             }
             OP_VIEWS_LIST => self.list(ch, request_id, &principal),
+            // **`with --forget`** (the laptop polish's Part A): every remembered password of the
+            // session, every terminal's. Forgetting more than asked is the safe direction.
+            OP_VIEWS_FORGET => {
+                if let Some(s) = self.sessions.get_mut(session) {
+                    s.grace.forget();
+                }
+                self.audit(&alloc::format!("view: {principal} — remembered passwords forgotten"));
+                let _ = send(ch, op, request_id, RS_FLAG_REPLY, &[], &[]);
+            }
             // **What a `Request` would be answered, running nothing** (administration Part F.3,
             // PR #346 review): the desktop asks before it closes a window for a Restart or a Shut
             // down. Not audited, as `List` is not: it tells the session only what `List` does.
@@ -881,6 +933,7 @@ impl Broker {
             }
         };
         let what = alloc::format!("{principal} {view} {program}");
+        let token = r.token;
         let (grants, auth) = match policy.decide(principal, view, program) {
             Decision::Deny(reason) => {
                 self.audit(&alloc::format!("view: {what} — denied: {reason}"));
@@ -898,9 +951,22 @@ impl Broker {
             handles: hs,
             failures: 0,
             queued: None,
+            backend: None,
         };
+        let mut pending = pending;
         match auth {
             Auth::Password => {
+                // **Which terminal, from `tty-server` — not from the caller.** Redeemed only when a
+                // password would be asked: a request that needs none says nothing about a window.
+                pending.backend = token.and_then(|t| self.redeem(&t));
+                let session = self.clients[i].session;
+                let remembered = pending.backend.is_some_and(|b| {
+                    self.sessions.get(session).is_some_and(|s| s.grace.covers(b, view, now_ns()))
+                });
+                if remembered {
+                    self.audit(&alloc::format!("view: {what} — allowed, within the grace period"));
+                    return self.start(i, OP_VIEWS_REQUEST, request_id, pending, principal);
+                }
                 self.audit(&alloc::format!("view: {what} — allowed, asking for a password"));
                 self.clients[i].state = State::Password(pending);
                 reply_outcome(ch, OP_VIEWS_REQUEST, request_id, Outcome::NeedPassword, "");
@@ -964,15 +1030,21 @@ impl Broker {
             let State::Password(p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
                 return;
             };
+            // **Remembered for the terminal it was typed at**, and for this view, for five minutes.
+            if let (Some(b), Some(s)) = (p.backend, self.sessions.get_mut(session)) {
+                s.grace.remember(b, &p.view, now_ns());
+            }
             self.start(i, OP_VIEWS_PASSWORD, request_id, p, &principal);
             return;
         }
         p.failures += 1;
         let failures = p.failures;
         // From when the check ended, not when the wake that ran it began: the delay is the gap
-        // between one answer and the next check.
+        // between one answer and the next check. **A refused password forgets every window of the
+        // session**: someone at it does not know the password, so nothing typed earlier is assumed.
         if let Some(s) = self.sessions.get_mut(session) {
             s.pacing.failed(now_ns());
+            s.grace.forget();
         }
         self.audit(&alloc::format!("view: {what} — wrong password ({failures} of {MAX_FAILURES})"));
         if failures >= MAX_FAILURES {

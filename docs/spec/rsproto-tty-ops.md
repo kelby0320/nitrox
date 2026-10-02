@@ -1,9 +1,10 @@
 # rsproto — Tty operations (`0x0Bxx`)
 
-**Status: normative for what is built (2026-08-13; `OpenSibling` 2026-09-23).** `ReadLine`,
-`Read`, `Write`, `SetMode`, `Close` and `Interrupt` are implemented in `userspace/tty-server/`;
-`AttachBackend`, `Output` and `Input` landed with Milestone 5 Part C, and `OpenSibling` with
-administration Part A.2. Job control and terminal emulation are unbuilt —
+**Status: normative for what is built (2026-08-13; `OpenSibling` 2026-09-23; `Token` and `Redeem`
+2026-10-01).** `ReadLine`, `Read`, `Write`, `SetMode`, `Close` and `Interrupt` are implemented in
+`userspace/tty-server/`; `AttachBackend`, `Output` and `Input` landed with Milestone 5 Part C,
+`OpenSibling` with administration Part A.2, and `Token` and `Redeem` with the laptop polish's
+Part A. Job control and terminal emulation are unbuilt —
 see [`console-and-tty.md`](../architecture/console-and-tty.md) for the design and its staging.
 
 Written 2026-08-13, when Part C gave this category a **second channel role** and the contract
@@ -23,7 +24,7 @@ Since Part C there is a third role, the **backend channel**, held by a terminal 
 | Role | Speaks | Who holds it |
 |---|---|---|
 | forwarding endpoint | `Namespace::Resolve` | `/dev/tty`, bound by service-mgr; by session-mgr in each session |
-| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` | the program using the terminal |
+| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` / `Token` / `Redeem` | the program using the terminal; `Redeem` the view broker, on a terminal it resolves itself |
 | backend channel | `Output` (server→emulator), `Input` (emulator→server) | a terminal emulator |
 
 **A terminal is per resolver, not per session.** Each program that resolves `/dev/tty` gets its
@@ -154,6 +155,30 @@ password prompt that turns echo off on a sibling leaves the terminal it was mint
 Refused with `WouldBlock` when the server has no terminal to spare. Every terminal is a slot in
 the server's wait set, and the cap is the resolve's. A shell answers the refusal by running the
 stage without a terminal, which is what every stage had before this op.
+
+### `Token` (`0x0B0A`)
+
+Request: empty. Reply: **16 bytes**, a token naming the backend of the terminal it is sent on —
+the serial console, or one window, shared by every sibling. 128 random bits from the kernel's
+CSPRNG, good **once**, for **thirty seconds**. `KernelError` if the CSPRNG will not answer, **or has
+not seeded yet**: a token made up instead — or a buffer the read never filled — would be one anybody
+could make up. The server does not wait for the pool, which would hold every terminal still; the
+caller is asked for its password instead (PR #351 review).
+
+**Why it exists.** The view broker remembers a password per session, terminal and view (the
+laptop polish's Part A), and must not take a caller's word for which terminal it is at: a
+terminal handle in a request could be a channel the caller serves itself. `with` asks its own
+terminal for a token and sends the token; the broker redeems it. Only a process holding a
+terminal on a backend can get a token for it.
+
+### `Redeem` (`0x0B0B`)
+
+Request: a token's 16 bytes. Reply: the **backend id** it was minted for, a little-endian `u32`,
+and the token is gone. `NotFound` for a token never minted, already redeemed, or expired.
+
+Answered **on any terminal**: knowing the token is the proof, so the broker redeems over a
+terminal it resolved from its own namespace, not over one a caller sent. The server keeps sixteen
+tokens at most; past that the oldest goes, which costs its holder a password prompt.
 
 ## Lifetime
 

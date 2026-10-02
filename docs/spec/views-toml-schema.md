@@ -84,7 +84,7 @@ Each later part of the administration phase adds its grant to this table.
 | `who` | array | The accounts that may ask, or `["*"]`. `*` with other names is an error. |
 | `use` | array | Profiles, each defined in the file. |
 | `run` | array | Programs by bare name — no `/` — or `["*"]`. |
-| `auth` | string | `"password"`: the person's own password, checked by `auth-service`. `"none"`: nothing beyond being in the session. |
+| `auth` | string | `"password"`: the person's own password, checked by `auth-service` — and **remembered for five minutes for this view, on the terminal it was typed at** (the laptop polish's Part A; [`rsproto-views-ops.md`](rsproto-views-ops.md) § *Request*), so a second request there does not ask. `"none"`: nothing beyond being in the session. |
 
 All four are required, and each may be given once.
 

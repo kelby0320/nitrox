@@ -24,9 +24,10 @@ use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
 pub use librsproto::views::Outcome;
 use librsproto::views::{
-    OP_VIEWS_DECIDE, OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN, REQ_STDOUT,
-    REQ_TERMINAL, build_decide, build_request, parse_rows,
+    OP_VIEWS_DECIDE, OP_VIEWS_FORGET, OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN,
+    REQ_STDOUT, REQ_TERMINAL, build_decide, build_request, parse_rows,
 };
+use librsproto::{OP_TTY_TOKEN, TTY_TOKEN_LEN};
 
 /// The view broker's answer, as the outcome and its reason. An answer that does not read is a
 /// denial saying so.
@@ -89,6 +90,11 @@ pub struct Handed {
     pub stderr: Option<u64>,
     /// The terminal the program may prompt on.
     pub terminal: Option<u64>,
+    /// **A `Tty::Token` from the caller's own terminal** ([`token`]), so a password typed there
+    /// can be remembered for it (the laptop polish's Part A). Not a handle: the broker redeems it
+    /// with the terminal server itself, rather than trusting the terminal handle above to say which
+    /// terminal it is.
+    pub token: Option<[u8; TTY_TOKEN_LEN]>,
 }
 
 impl Handed {
@@ -131,7 +137,8 @@ pub fn request(
     let (bits, handles) = handed.wire();
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let mut body = alloc::vec![0u8; IPC_PAYLOAD_SIZE - 64];
-    let Some(n) = build_request(&mut body, bits, view.as_bytes(), program.as_bytes(), &arg_bytes, env) else {
+    let token = handed.token.as_ref();
+    let Some(n) = build_request(&mut body, bits, view.as_bytes(), program.as_bytes(), &arg_bytes, env, token) else {
         for h in handles {
             ipc::close(h);
         }
@@ -145,6 +152,36 @@ pub fn request(
     }
     match ipc::answer(ch, REQUEST_ID, deadline) {
         Some((false, body)) => Ok(outcome(&body)),
+        Some((true, _)) => Err(Failed::Refused),
+        None => Err(Failed::NoAnswer),
+    }
+}
+
+/// The request id a [`token`] is asked as. A terminal answers by id, and this one is never a read's.
+const TOKEN_REQUEST_ID: u64 = 0x544f_4b45;
+
+/// **A one-time token for terminal `term`** (`Tty::Token`): what a request carries so the broker
+/// can learn, from the terminal server and not from this caller, which terminal it came from.
+/// `None` if `term` does not answer one by `deadline` — it may not be a terminal at all — and then
+/// the request is simply asked for a password.
+pub fn token(term: u64, deadline: u64) -> Option<[u8; TTY_TOKEN_LEN]> {
+    if !ipc::send(term, OP_TTY_TOKEN, TOKEN_REQUEST_ID, &[], &[]) {
+        return None;
+    }
+    match ipc::answer(term, TOKEN_REQUEST_ID, deadline)? {
+        (false, body) => body.as_slice().try_into().ok(),
+        (true, _) => None,
+    }
+}
+
+/// **Forget every password the session on `ch` has remembered** (`with --forget`), every
+/// terminal's.
+pub fn forget(ch: u64, deadline: u64) -> Result<(), Failed> {
+    if !ipc::send(ch, OP_VIEWS_FORGET, REQUEST_ID, &[], &[]) {
+        return Err(Failed::NoAnswer);
+    }
+    match ipc::answer(ch, REQUEST_ID, deadline) {
+        Some((false, _)) => Ok(()),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
     }
@@ -225,7 +262,7 @@ mod tests {
 
     #[test]
     fn a_requests_handles_are_in_the_order_the_broker_takes_them() {
-        let all = Handed { ns: 1, stdin: Some(2), stdout: Some(3), stderr: Some(4), terminal: Some(5) };
+        let all = Handed { ns: 1, stdin: Some(2), stdout: Some(3), stderr: Some(4), terminal: Some(5), token: None };
         assert_eq!(all.wire(), (REQ_STDIN | REQ_STDOUT | REQ_STDERR | REQ_TERMINAL, alloc::vec![1, 2, 3, 4, 5]));
         // A gap is closed up: the broker counts the bits, not the slots.
         let some = Handed { ns: 1, stdout: Some(3), terminal: Some(5), ..Handed::default() };
@@ -239,7 +276,7 @@ mod tests {
         let h = Handed { ns: 1, stderr: Some(4), ..Handed::default() };
         let (bits, handles) = h.wire();
         let mut body = alloc::vec![0u8; IPC_PAYLOAD_SIZE - 64];
-        let n = build_request(&mut body, bits, b"power", b"shutdown", &[b"--reboot"], &[]).unwrap();
+        let n = build_request(&mut body, bits, b"power", b"shutdown", &[b"--reboot"], &[], None).unwrap();
         let r = parse_request(&body[..n]).unwrap();
         assert_eq!(r.handle_count(), handles.len());
         assert_eq!((r.view, r.program), (&b"power"[..], &b"shutdown"[..]));

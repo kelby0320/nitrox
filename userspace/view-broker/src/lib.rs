@@ -701,6 +701,64 @@ pub mod pacing {
     }
 }
 
+pub mod grace {
+    //! **Passwords remembered per terminal** (the laptop polish's Part A).
+    //!
+    //! A session remembers a password that succeeded **for the terminal it was typed at and the
+    //! view it was typed for**, for [`WINDOW_NS`]: a later request matching both skips the prompt.
+    //! The terminal is a `tty-server` backend id the broker redeemed from a token — never one the
+    //! caller named — so a window opened in one terminal is not one any other terminal, or an
+    //! application holding none, can use.
+
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// How long a password is remembered: five minutes, `sudo`'s, fixed (the maintainer's call).
+    pub const WINDOW_NS: u64 = 5 * 60 * 1_000_000_000;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Window {
+        backend: u32,
+        view: String,
+        until: u64,
+    }
+
+    /// One session's remembered passwords.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Windows {
+        open: Vec<Window>,
+    }
+
+    impl Windows {
+        /// Remember a password that succeeded at `now`, at terminal `backend`, for `view`. A window
+        /// already open there for that view starts again; expired ones go.
+        pub fn remember(&mut self, backend: u32, view: &str, now: u64) {
+            self.open.retain(|w| w.until > now && !(w.backend == backend && w.view == view));
+            self.open.push(Window { backend, view: String::from(view), until: now.saturating_add(WINDOW_NS) });
+        }
+
+        /// Whether a request at `now`, from terminal `backend`, for `view`, skips the prompt.
+        pub fn covers(&self, backend: u32, view: &str, now: u64) -> bool {
+            self.open.iter().any(|w| w.backend == backend && w.view == view && w.until > now)
+        }
+
+        /// Forget every window — `with --forget`, a refused password.
+        pub fn forget(&mut self) {
+            self.open.clear();
+        }
+
+        /// Windows held, expired ones included until the next `remember`.
+        pub fn len(&self) -> usize {
+            self.open.len()
+        }
+
+        /// Whether none are held.
+        pub fn is_empty(&self) -> bool {
+            self.open.is_empty()
+        }
+    }
+}
+
 pub mod sessions {
     //! Which sessions are open, and for whom.
     //!
@@ -708,6 +766,7 @@ pub mod sessions {
     //! end keeps a namespace with that session's `/dev/views` base in it; were the id handed out
     //! again, its requests would arrive with the next login's identity.
 
+    use crate::grace::Windows;
     use crate::pacing::Pacing;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -718,6 +777,8 @@ pub mod sessions {
         pub id: u64,
         pub principal: String,
         pub pacing: Pacing,
+        /// Its remembered passwords, which end with it.
+        pub grace: Windows,
     }
 
     /// Every open session.
@@ -744,7 +805,7 @@ pub mod sessions {
             let id = self.next;
             self.next += 1;
             let principal = String::from(principal);
-            self.open.push(Session { id, principal, pacing: Pacing::default() });
+            self.open.push(Session { id, principal, pacing: Pacing::default(), grace: Windows::default() });
             id
         }
 
@@ -1035,6 +1096,75 @@ pub mod suffix {
             n = n.checked_mul(10)?.checked_add((d - b'0') as u64)?;
         }
         Some(n)
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::grace::{WINDOW_NS, Windows};
+    use super::sessions::Sessions;
+
+    const T0: u64 = 10_000_000_000;
+
+    /// **The window's edge, and the nanosecond either side of it.**
+    #[test]
+    fn a_password_is_remembered_for_five_minutes() {
+        let mut w = Windows::default();
+        w.remember(3, "admin", T0);
+        assert!(w.covers(3, "admin", T0));
+        assert!(w.covers(3, "admin", T0 + WINDOW_NS - 1), "just short of five minutes");
+        assert!(!w.covers(3, "admin", T0 + WINDOW_NS), "at five minutes");
+        assert!(!w.covers(3, "admin", T0 + WINDOW_NS + 1), "past it");
+    }
+
+    /// **Per terminal and per view** — the maintainer's calls: another window, another view, or
+    /// both, still asks.
+    #[test]
+    fn a_window_covers_its_terminal_and_view_only() {
+        let mut w = Windows::default();
+        w.remember(3, "admin", T0);
+        assert!(!w.covers(4, "admin", T0), "another terminal");
+        assert!(!w.covers(3, "install", T0), "another view");
+        assert!(!w.covers(4, "install", T0), "both");
+        assert!(!Windows::default().covers(3, "admin", T0), "a session that typed nothing");
+    }
+
+    /// A second password at the same terminal for the same view starts the window again, and does
+    /// not leave two behind; one that has expired is dropped when another is remembered.
+    #[test]
+    fn remembering_again_restarts_the_window() {
+        let mut w = Windows::default();
+        w.remember(3, "admin", T0);
+        w.remember(3, "admin", T0 + WINDOW_NS - 1);
+        assert_eq!(w.len(), 1);
+        assert!(w.covers(3, "admin", T0 + 2 * WINDOW_NS - 2), "counted from the second");
+        w.remember(5, "admin", T0 + 3 * WINDOW_NS);
+        assert_eq!(w.len(), 1, "the expired one went");
+    }
+
+    /// `with --forget` and a refused password both forget every window of the session.
+    #[test]
+    fn forgetting_forgets_every_window() {
+        let mut w = Windows::default();
+        w.remember(3, "admin", T0);
+        w.remember(4, "install", T0);
+        w.forget();
+        assert!(w.is_empty());
+        assert!(!w.covers(3, "admin", T0) && !w.covers(4, "install", T0));
+    }
+
+    /// **The windows are the session's**: they end with it, and another session's are its own —
+    /// which is what keeps a password typed at the desktop out of a serial login.
+    #[test]
+    fn windows_belong_to_their_session() {
+        let mut sessions = Sessions::new();
+        let desktop = sessions.open("alice");
+        let serial = sessions.open("alice");
+        sessions.get_mut(desktop).unwrap().grace.remember(3, "admin", T0);
+        assert!(!sessions.get(serial).unwrap().grace.covers(3, "admin", T0), "another session");
+        let closed = sessions.close(desktop).unwrap();
+        assert!(closed.grace.covers(3, "admin", T0), "the window was the session's");
+        assert!(sessions.get(desktop).is_none());
     }
 }
 

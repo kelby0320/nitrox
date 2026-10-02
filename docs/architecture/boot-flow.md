@@ -1,6 +1,8 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-30, when administration Part G.1 gave the install entry
+**Status:** Current (last checked 2026-10-01, when the boot began by naming the commit it was built
+from — the laptop polish's Part D; before that 2026-09-30, when administration Part G.1 gave the
+install entry
 a third module, `install-root.img`, the pristine root the installer copies, and G.2 had the installer
 make the new machine's own first account; before that 2026-09-28, when administration Part E.1a moved the nine system
 servers from `init` to `service-mgr` (steps 5 and 6), and E.1c their declarations and the profile
@@ -207,7 +209,10 @@ each step's rationale is in the source comments:
    until a client is handed `/dev/framebuffer`, which on a machine with no serial port is the only
    diagnosis there is. See [the framebuffer console](framebuffer-console.md). (Serial came first,
    before the CPU tables, until Phase 5 Part B, 2026-09-14.)
-3. **What was handed over, and what this CPU is** (Phase 5 Part D, 2026-09-14). `log_handoff`
+3. **What was handed over, and what this CPU is** (Phase 5 Part D, 2026-09-14). First, **which
+   build this is**: `nitrox: built from <commit>`, the commit `xtask` built from, with `-dirty` for
+   a tree with changes (the laptop polish's Part D, 2026-10-01) — the first line of the hardware
+   report's first page, and named again in every shell's banner. Then `log_handoff`
    prints the bootloader and its version, the firmware type and base revision, the HHDM offset,
    the firmware's date, the boot entry's command line, and the memory map summed by kind; the
    command line is then parsed (`kernel/src/cmdline.rs`) — `hwreport[=<seconds>]` is its one flag,

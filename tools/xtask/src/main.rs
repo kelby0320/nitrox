@@ -331,7 +331,43 @@ impl BuildMode {
     }
 }
 
+/// **The commit this tree was built from**, as the running system shows it (the laptop polish's
+/// Part D): `git rev-parse --short=12 HEAD`, with `-dirty` when a tracked file differs from it, or
+/// `unknown` outside a repository. On 2026-10-01 a stick that had never been rewritten looked for an
+/// afternoon like a bug in the installer; a line on the screen naming the build would have said so
+/// at once.
+fn build_commit() -> String {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_root())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(head) = git(&["rev-parse", "--short=12", "HEAD"]).filter(|h| !h.is_empty()) else {
+        return String::from("unknown");
+    };
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    if dirty { format!("{head}-dirty") } else { head }
+}
+
+/// The line the kernel logs first on every boot, naming the commit this process built it from.
+fn built_from_line() -> String {
+    format!("nitrox: built from {}", env::var(COMMIT_ENV).unwrap_or_else(|_| String::from("unknown")))
+}
+
+/// The environment variable [`build_commit`]'s answer reaches every build through: the kernel's
+/// and `nxsh`'s `option_env!`, which rustc records as a dependency, so a new commit rebuilds the
+/// two crates that show it and nothing else.
+const COMMIT_ENV: &str = "NITROX_COMMIT";
+
 fn main() -> ExitCode {
+    // **Set once, for every child**: each cargo this process runs inherits it, so no build path —
+    // kernel, userspace, host tests — can forget to pass it. Before any thread exists.
+    // SAFETY: single-threaded at this point; nothing reads the environment concurrently.
+    unsafe { env::set_var(COMMIT_ENV, build_commit()) };
     let mut args = env::args().skip(1);
     let cmd = args.next();
     let rest: Vec<String> = args.collect();
@@ -1471,6 +1507,19 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
     }
 }
 
+/// **`with admin COMMAND`, asked for the password** — after `with --forget`, so the prompt is there
+/// whatever the steps before left remembered (the laptop polish's Part A). For a step whose subject
+/// is not the grace window: no gate waits on five minutes passing, or not, under TCG. The audit is
+/// waited for rather than the shell's prompt, since the two reach the console by different paths.
+fn with_admin_asked(s: &mut Session, command: &str) -> R<()> {
+    s.send("with --forget")?;
+    s.expect(&format!("view: {DEMO_USER} — remembered passwords forgotten"))?;
+    s.send(&format!("with admin {command}"))?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    Ok(())
+}
+
 /// The scenarios, in one boot. Returns the number of steps that passed.
 fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let mut steps = 0usize;
@@ -1539,6 +1588,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         return Err(format!("the serial session was built without /storage: ({built}").into());
     }
     s.expect("libsession: nxsh spawned into the session namespace")?;
+    // **The banner names the build** (the laptop polish's Part D): the commit this process built
+    // from, which every terminal now says before its first prompt.
+    let commit = env::var(COMMIT_ENV).unwrap_or_default();
+    s.expect(&format!("nxsh: interactive shell, Nitrox {commit} "))?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -2068,6 +2121,19 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         .into());
     }
     println!("  ok: and a program in a view reaches the terminal through its `stderr`");
+    //      (d2) **Remembered, for five minutes, on this terminal** (the laptop polish's Part A).
+    //           (d)'s password opened a window for the serial console and `admin`, so the same view
+    //           again starts without asking, and the audit says why. `with --forget` closes it, and
+    //           (e)'s first prompt is the proof that it did. Audit lines are waited for, not the
+    //           prompt: they reach the console through the logging service, in either order with it.
+    s.send("with admin whoami")?;
+    s.expect_all(&[
+        "view: alice admin whoami — allowed, within the grace period",
+        "view: alice admin whoami — exited, code 0",
+    ])?;
+    s.send("with --forget")?;
+    s.expect("view: alice — remembered passwords forgotten")?;
+    println!("  ok: a password remembered for this terminal and view, and forgotten when asked");
     //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
     //          delay, so this costs about four seconds.
     s.send("with admin whoami")?;
@@ -2080,9 +2146,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //      (f) **`Ctrl-C` stops a program started with `with`.** The shell asks `with` to stop,
     //          `with` asks the broker, and the broker asks the program — which is `sleep`, which
     //          listens. Sixty seconds is far past what this waits, so only a stop passes.
-    s.send("with admin sleep 60")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "sleep 60")?;
     s.expect("view: alice admin sleep — started")?;
     let asked = std::time::Instant::now();
     s.send_raw("\x03")?;
@@ -2116,8 +2180,22 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // 20c. **`disk`, with and without the grant** (administration Part C.7).
     //      (a) `--list` is the storage service's table, from any session: the row mounted at `/`
     //          is `init`'s root, matched on words the command does not contain.
+    let row_from = s.transcript().len();
     s.send("disk --list | filter mounted == \"/\"")?;
     s.expect_all(&["blk-2", "init"])?;
+    s.expect("/home>")?;
+    //          **And its empty cell is blank** (the laptop polish's Part B): `init`'s root is mounted
+    //          writable, so its `clean` is null, and the shell drew that as `null` until the table
+    //          drew an empty cell blank. The typed command holds no `null`, so any here is the row's.
+    let row = s.transcript()[row_from..].to_string();
+    if row.contains("null") {
+        return Err(format!("`disk --list` drew an empty cell as `null`: {row:?}").into());
+    }
+    //          **And a disk is named as the installer names it** (the laptop polish's Part C): the
+    //          `description` column carries the model and serial the SATA disk reports, which the
+    //          typed command does not contain.
+    s.send("disk --list | filter name == \"blk-0\"")?;
+    s.expect("QEMU HARDDISK (QM00001)")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
@@ -2130,9 +2208,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          nothing it could mount, so the refusal is the evidence the grant arrived; the
     //          successful mount and unmount through a view are `boot-probe`'s, on a test image's
     //          scratch disk.
-    s.send("with admin disk --mount /dev/blk/1")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "disk --mount /dev/blk/1")?;
     s.expect("it holds no filesystem this service can serve")?;
     s.expect("/home>")?;
     steps += 1;
@@ -2143,12 +2219,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("with --show")?;
     s.expect("with: cannot show the policy without the views grant")?;
     s.expect("/home>")?;
-    let admin = |s: &mut Session, command: &str| -> R<()> {
-        s.send(&format!("with admin {command}"))?;
-        s.expect("[with admin] password (1 of 3): ")?;
-        s.send(DEMO_PASSWORD)?;
-        Ok(())
-    };
+    let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     //      (b) A copy of the policy, to put back at the end.
     admin(s, "with --show ./policy.txt")?;
     s.expect("with: wrote the policy to a copy")?;
@@ -2233,9 +2304,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     //      (b) **Added through the `accounts` grant**: alice's password for the view, then bob's
     //          twice, echo off, on the terminal `with` handed on.
-    s.send("with admin account --add bob")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "account --add bob")?;
     s.expect("new password for bob: ")?;
     s.send(BOB_PASSWORD)?;
     s.expect("again: ")?;
@@ -2299,9 +2368,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
-    s.send("with admin account --remove bob --home")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "account --remove bob --home")?;
     s.expect("account: removed bob, and /home/bob with it")?;
     s.expect("/home>")?;
     s.send(&rows("bob"))?;
@@ -2331,15 +2398,11 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("need the services grant")?;
     s.expect("/home>")?;
     //      (c) **An essential service is refused by `service-mgr` itself**, grant or not.
-    s.send("with admin service --stop auth-service")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "service --stop auth-service")?;
     s.expect("it is essential")?;
     s.expect("/home>")?;
     //      (d) **The clipboard restarted, from this session**, answered once the new one is up.
-    s.send("with admin service --restart clipboard-server")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "service --restart clipboard-server")?;
     s.expect("service: restarted clipboard-server")?;
     s.expect("/home>")?;
     //      (e) **And the same session copies and pastes through it.** This session bound
@@ -2362,9 +2425,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //      (b) **Set through the `clock` grant**: the kernel says the RTC took it, and `date`
     //          reports the clock as it reads after. The epoch value is matched, since the typed
     //          command holds the date and would satisfy a match on it.
-    s.send("with admin date --set 2031-01-02T00:00:00Z --unix")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "date --set 2031-01-02T00:00:00Z --unix")?;
     s.expect("wall clock: set to 1925078400 (Unix epoch seconds, UTC); the RTC holds it")?;
     s.expect("1925078")?;
     s.expect("/home>")?;
@@ -2376,9 +2437,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //      (d) **A shell in the view passes it on**: `nxsh` spawns its stages with what it holds,
     //          so `date --set` works in `with admin nxsh` as the view's bindings do. A day later,
     //          so the kernel's line is this set's and not (b)'s.
-    s.send("with admin nxsh")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "nxsh")?;
     s.expect("/home>")?;
     s.send("date --set 2031-01-03T00:00:00Z --unix")?;
     s.expect("wall clock: set to 1925164800 (Unix epoch seconds, UTC); the RTC holds it")?;
@@ -2397,9 +2456,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          them, as a table. The row is the logging service's ring answering `Read`; the same
     //          record went to the console when it was written, before this was typed, so what is
     //          matched here can only be the row.
-    s.send("with admin log view-broker")?;
-    s.expect("[with admin] password (1 of 3): ")?;
-    s.send(DEMO_PASSWORD)?;
+    with_admin_asked(s, "log view-broker")?;
     s.expect("view: alice admin date — started")?;
     s.expect("/home>")?;
     steps += 1;
@@ -4037,6 +4094,10 @@ fn run_install_steps(
 /// waits for next (`expect` consumes what it scans past). The caller's next `expect` is a line of
 /// the program's, which says it started.
 fn install_gate_with_admin(qmp: &mut Qmp, session: &mut Session, program: &str, args: &str) -> R<()> {
+    // **Forgotten first**, so each step is asked whatever the one before it left remembered (the
+    // laptop polish's Part A): this gate's subject is the install, not the grace window.
+    type_at_terminal(qmp, "with --forget")?;
+    session.expect("view: alice — remembered passwords forgotten")?;
     type_at_terminal(qmp, &format!("with admin {program}{args}"))?;
     session.expect(&format!("view: alice admin {program} — allowed, asking for a password"))?;
     type_answer(qmp, DEMO_PASSWORD)?;
@@ -4468,12 +4529,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     println!("  ok: a write to it is refused NoAccess");
 
     // 4. Unmounted, and mounted writable, through the `storage` grant.
-    let admin = |s: &mut Session, command: &str| -> R<()> {
-        s.send(&format!("with admin {command}"))?;
-        s.expect("[with admin] password (1 of 3): ")?;
-        s.send(DEMO_PASSWORD)?;
-        Ok(())
-    };
+    let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
     s.expect("fs-server: unmounted; a read-only mount wrote nothing")?;
     s.expect(&format!(
@@ -5105,12 +5161,7 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     s.expect("/home>")?;
 
     // 3. **Writable**, through the live image's own administrator.
-    let admin = |s: &mut Session, command: &str| -> R<()> {
-        s.send(&format!("with admin {command}"))?;
-        s.expect("[with admin] password (1 of 3): ")?;
-        s.send(DEMO_PASSWORD)?;
-        Ok(())
-    };
+    let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
@@ -5375,6 +5426,13 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
         return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
     }
     println!("  ok: the pages say what this machine is — a declined AHCI controller, the module disk, no COM1");
+    // **And the first page says which build** (the laptop polish's Part D): the line a person
+    // checks first on a machine that misbehaves, before anything else on the report.
+    let built_from = built_from_line();
+    if !pages.first().is_some_and(|p| p.iter().any(|l| l.contains(&built_from))) {
+        return Err(format!("the report's first page does not say `{built_from}`").into());
+    }
+    println!("  ok: the first page names the build — {built_from}");
 
     // 4. The boot goes on, and the console hands the screen over.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -8354,12 +8412,18 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      `/dev/blk/0`, and naming it makes `nxinstall` log its refusal on the console, where a
     //      release image's gate can read it: the disk is not in the session at all. Until C.6
     //      this step passed on that disk too, which was the weaker claim.
+    //      **Not asked, in the same terminal, inside five minutes** (the laptop polish's Part A):
+    //      the password above opened a window for this window's terminal and `admin`, so the
+    //      broker starts this without a prompt, and nothing is typed. `boot-probe` holds the
+    //      window to its terminal and view, and the forgery control, on a test image.
     type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0")?;
-    session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
-    type_answer(&mut qmp, DEMO_PASSWORD)?;
     // **Refused as the running system** (administration Part G.2), which the installer now knows:
-    // the tables say `init` mounted its root partition.
-    session.expect("nxinstall: refused /dev/blk/0: it holds the running system")?;
+    // the tables say `init` mounted its root partition. Unordered with the audit line: that one
+    // reaches the console through the logging service, the refusal straight from `nxinstall`.
+    session.expect_all(&[
+        "view: alice admin nxinstall — allowed, within the grace period",
+        "nxinstall: refused /dev/blk/0: it holds the running system",
+    ])?;
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: and it did not see /dev/blk/0, the disk holding init's root");
 
@@ -12656,9 +12720,12 @@ fn check_hardware_facts(transcript: &[u8]) -> R<()> {
         LIMINE_VERSION.trim_start_matches('v')
     );
     let bootloader: &[&str] = &[&limine];
+    // **The build it is** (the laptop polish's Part D): the commit this process built from.
+    let built_from = built_from_line();
+    let commit: &[&str] = &[&built_from];
     let missing = missing_facts(
         &lines,
-        EMULATED_MACHINE_FACTS.iter().chain(TEST_QEMU_FACTS).copied().chain([bootloader]),
+        EMULATED_MACHINE_FACTS.iter().chain(TEST_QEMU_FACTS).copied().chain([bootloader, commit]),
     );
     if !missing.is_empty() {
         return Err(format!(

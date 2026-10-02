@@ -801,7 +801,11 @@ pub fn display(v: &Val, styled: bool) -> String {
         .iter()
         .map(|row| {
             row.iter()
-                .map(|c| Val::Data(c.clone()).render())
+                // **A null cell is drawn blank** (the laptop polish's Part B): the column's header
+                // already says what is missing, and a column of `null` under it reads as data.
+                // Only the cell itself — a null inside a list in a cell is still that list's
+                // `[null]`, and a bare `null` is still the answer `null`.
+                .map(|c| if *c == Value::Null { String::new() } else { Val::Data(c.clone()).render() })
                 .collect::<Vec<String>>()
         })
         .collect();
@@ -823,9 +827,13 @@ pub fn display(v: &Val, styled: bool) -> String {
     let mut out = crate::style::paint(styled, crate::style::HEADER, &head);
     out.push('\n');
     for row in &cells {
-        for (i, c) in row.iter().enumerate() {
+        // **A row ends at its last cell with something in it**, so blank cells at the end leave
+        // no run of padding behind them: a line that long would wrap a narrow terminal for nothing.
+        // Blank cells before it are padded as any other, which keeps the columns aligned.
+        let end = row.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
+        for (i, c) in row.iter().enumerate().take(end) {
             if i < widths.len() {
-                pad_into(&mut out, c, widths[i], i + 1 == row.len());
+                pad_into(&mut out, c, widths[i], i + 1 == end);
             }
         }
         out.push('\n');
@@ -1156,6 +1164,34 @@ mod tests {
     #[test]
     fn display_of_a_scalar_is_just_the_value() {
         assert_eq!(display(&Val::int(5), false), "5\n");
+    }
+
+    /// **A null cell is blank, and nothing else changes** (the laptop polish's Part B): its column
+    /// keeps its width and alignment, a bare `null` still says so, and a null nested in a cell's
+    /// list is still part of that list.
+    #[test]
+    fn a_null_cell_is_drawn_blank_and_a_bare_null_is_not() {
+        let schema = Schema::new()
+            .field("name", TypeTag::String, TypeModifiers::NONE)
+            .field("mounted", TypeTag::String, TypeModifiers::NULLABLE)
+            .field("by", TypeTag::String, TypeModifiers::NULLABLE);
+        let rows = vec![
+            vec![Value::Str("blk-0".into()), Value::Null, Value::Null],
+            vec![Value::Str("blk-2".into()), Value::Str("/".into()), Value::Str("init".into())],
+        ];
+        let t = Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows })));
+        let out = display(&t, false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "name   mounted  by");
+        assert_eq!(lines[1], "blk-0", "two blank cells, and no trailing padding after the last");
+        assert_eq!(lines[2], "blk-2  /        init");
+        assert!(!out.contains("null"), "{out:?}");
+
+        assert_eq!(display(&Val::Data(Value::Null), false), "null\n", "a bare null is the answer null");
+        let schema = Schema::new().field("xs", TypeTag::List, TypeModifiers::NONE);
+        let rows = vec![vec![Value::List(Arc::from(vec![Value::Null]))]];
+        let nested = Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows })));
+        assert!(display(&nested, false).contains("[null]"), "a null inside a cell's list stays");
     }
 
     /// A table's header row is coloured and its values are not.

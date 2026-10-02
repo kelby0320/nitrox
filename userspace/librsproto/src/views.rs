@@ -18,7 +18,7 @@
 //!
 //! Bodies are little-endian and byte-serialised into a caller buffer, like every category here.
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{TTY_TOKEN_LEN, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
 /// Supervisor → broker: open a session for the principal in the body (its bytes). The reply
 /// body is the new session's id, a `u64`. Ids increase and are never reused within a boot.
@@ -74,6 +74,10 @@ pub const OP_VIEWS_SET_PASSWORD: u16 = 0x0E0E;
 /// client's reading of the rows (administration Part F.3, PR #346 review). The desktop asks it
 /// before closing a window for a Restart or a Shut down.
 pub const OP_VIEWS_DECIDE: u16 = 0x0E0F;
+/// Client → broker: **forget every password this session has remembered** (`with --forget`, the
+/// laptop polish's Part A). Empty body, empty reply. Every terminal's window goes, so the next
+/// request whose rule asks for a password asks.
+pub const OP_VIEWS_FORGET: u16 = 0x0E10;
 
 /// The longest policy `Show` answers with and `Install` takes: one message's body, with room for
 /// its header.
@@ -159,6 +163,11 @@ pub struct ViewRequest<'a> {
     args: &'a [u8],
     /// The caller's environment, a TSM1 record, opaque here. The broker passes it on.
     pub env: &'a [u8],
+    /// **A `Tty::Token` from the caller's terminal**, if it sent one (the laptop polish's Part
+    /// A). The broker redeems it with the terminal server to learn which terminal the request came
+    /// from — never from the caller — and a password remembered for that terminal can skip the
+    /// prompt.
+    pub token: Option<[u8; TTY_TOKEN_LEN]>,
 }
 
 impl<'a> ViewRequest<'a> {
@@ -206,6 +215,7 @@ pub fn build_request(
     program: &[u8],
     args: &[&[u8]],
     env: &[u8],
+    token: Option<&[u8; TTY_TOKEN_LEN]>,
 ) -> Option<usize> {
     if handles & !REQ_KNOWN != 0 || args.len() > u16::MAX as usize {
         return None;
@@ -240,11 +250,24 @@ pub fn build_request(
     }
     put_u32(out, at, env.len() as u32);
     out[at + 4..at + 4 + env.len()].copy_from_slice(env);
-    Some(at + 4 + env.len())
+    at += 4 + env.len();
+    // **The token is the last field, and absent means absent**: a request with none is the bytes
+    // it was before tokens existed, so a caller that sends none is unchanged.
+    if let Some(t) = token {
+        let end = at + 1 + TTY_TOKEN_LEN;
+        if out.len() < end {
+            return None;
+        }
+        out[at] = TTY_TOKEN_LEN as u8;
+        out[at + 1..end].copy_from_slice(t);
+        at = end;
+    }
+    Some(at)
 }
 
 /// Parse a `Request` body. `None` for an unknown handle bit, any length that runs past the
-/// body, an empty view or program, or bytes left over at the end.
+/// body, an empty view or program, a token field whose length byte is not [`TTY_TOKEN_LEN`] or
+/// whose bytes are not all there, or bytes left over at the end.
 pub fn parse_request(body: &[u8]) -> Option<ViewRequest<'_>> {
     let handles = *body.first()?;
     if handles & !REQ_KNOWN != 0 {
@@ -271,10 +294,16 @@ pub fn parse_request(body: &[u8]) -> Option<ViewRequest<'_>> {
     let args = &body[args_start..at];
     let env_len = get_u32(body.get(at..at + 4)?, 0) as usize;
     let env = body.get(at + 4..at + 4 + env_len)?;
-    if at + 4 + env_len != body.len() {
-        return None;
-    }
-    Some(ViewRequest { handles, view, program, argc, args, env })
+    let token = match &body[at + 4 + env_len..] {
+        [] => None,
+        [len, t @ ..] if *len as usize == TTY_TOKEN_LEN && t.len() == TTY_TOKEN_LEN => {
+            let mut token = [0u8; TTY_TOKEN_LEN];
+            token.copy_from_slice(t);
+            Some(token)
+        }
+        _ => return None,
+    };
+    Some(ViewRequest { handles, view, program, argc, args, env, token })
 }
 
 // --- Sessions ----------------------------------------------------------------
@@ -514,7 +543,7 @@ mod tests {
         let mut buf = [0u8; 256];
         let args: [&[u8]; 2] = [b"--list", b""];
         let handles = REQ_STDOUT | REQ_TERMINAL;
-        let n = build_request(&mut buf, handles, b"admin", b"nxinstall", &args, b"ENV").unwrap();
+        let n = build_request(&mut buf, handles, b"admin", b"nxinstall", &args, b"ENV", None).unwrap();
         let r = parse_request(&buf[..n]).unwrap();
         assert_eq!(r.handles, REQ_STDOUT | REQ_TERMINAL);
         assert_eq!(r.handle_count(), 3, "the namespace plus two");
@@ -528,7 +557,7 @@ mod tests {
     #[test]
     fn a_request_the_writer_could_not_have_made_is_refused() {
         let mut buf = [0u8; 64];
-        let n = build_request(&mut buf, 0, b"admin", b"disk", &[b"a"], b"").unwrap();
+        let n = build_request(&mut buf, 0, b"admin", b"disk", &[b"a"], b"", None).unwrap();
         let good = &buf[..n];
         assert!(parse_request(good).is_some(), "precondition");
 
@@ -548,11 +577,55 @@ mod tests {
         assert!(parse_request(&more).is_none(), "argc past the body");
 
         // An empty view or program names nothing.
-        let n = build_request(&mut buf, 0, b"", b"disk", &[], b"").unwrap();
+        let n = build_request(&mut buf, 0, b"", b"disk", &[], b"", None).unwrap();
         assert!(parse_request(&buf[..n]).is_none(), "empty view");
-        let n = build_request(&mut buf, 0, b"admin", b"", &[], b"").unwrap();
+        let n = build_request(&mut buf, 0, b"admin", b"", &[], b"", None).unwrap();
         assert!(parse_request(&buf[..n]).is_none(), "empty program");
         assert!(parse_request(&[]).is_none());
+    }
+
+    /// **A token rides last, and a request without one is the bytes it always was** (the laptop
+    /// polish's Part A).
+    #[test]
+    fn a_request_carries_a_token_or_none() {
+        let token = [7u8; TTY_TOKEN_LEN];
+        let mut with = [0u8; 128];
+        let n = build_request(&mut with, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", Some(&token))
+            .unwrap();
+        let r = parse_request(&with[..n]).unwrap();
+        assert_eq!(r.token, Some(token));
+        assert_eq!((r.view, r.program, r.env), (&b"admin"[..], &b"disk"[..], &b"E"[..]));
+
+        let mut without = [0u8; 128];
+        let m = build_request(&mut without, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", None).unwrap();
+        assert_eq!(parse_request(&without[..m]).unwrap().token, None);
+        assert_eq!(n, m + 1 + TTY_TOKEN_LEN, "the token is the only difference");
+        assert_eq!(with[..m], without[..m], "and it comes after everything else");
+
+        // Too small a buffer for the token is refused rather than cut short.
+        let short = &mut with[..m + TTY_TOKEN_LEN];
+        assert!(build_request(short, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", Some(&token)).is_none());
+    }
+
+    /// **The token field, as a correct writer never writes it**: every length but sixteen, a short
+    /// token, and a byte after one.
+    #[test]
+    fn a_token_field_the_writer_could_not_have_made_is_refused() {
+        let token = [9u8; TTY_TOKEN_LEN];
+        let mut buf = [0u8; 128];
+        let n = build_request(&mut buf, 0, b"admin", b"disk", &[], b"", Some(&token)).unwrap();
+        let good = &buf[..n];
+        assert!(parse_request(good).is_some(), "precondition");
+        let len_at = n - 1 - TTY_TOKEN_LEN;
+        for wrong in [0u8, 1, 15, 17, 255] {
+            let mut bad = good.to_vec();
+            bad[len_at] = wrong;
+            assert!(parse_request(&bad).is_none(), "a token length of {wrong}");
+        }
+        assert!(parse_request(&good[..n - 1]).is_none(), "a token one byte short");
+        let mut long = good.to_vec();
+        long.push(0);
+        assert!(parse_request(&long).is_none(), "a byte after the token");
     }
 
     #[test]

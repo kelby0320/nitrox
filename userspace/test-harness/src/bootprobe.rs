@@ -1508,6 +1508,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_grant_test(root_ns)
         & auth_admin_test(root_ns)
         & policy_test(root_ns)
+        & grace_test(root_ns)
         & accounts_test(root_ns)
         & restart_test(root_ns)
         & services_test(root_ns)
@@ -1890,7 +1891,7 @@ fn view_broker_test(root_ns: u64) -> bool {
     let kept = kept as u64;
 
     let mut req = [0u8; 256];
-    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"", None) else {
         return fail(b"build a request");
     };
     match views_call(cli, OP_VIEWS_REQUEST, 2, &req[..n], &[copy], &mut exited) {
@@ -1971,7 +1972,7 @@ fn view_broker_test(root_ns: u64) -> bool {
     let copy = copy as u64;
     // SAFETY: a namespace handle this process holds, and a valid path.
     unsafe { syscall4(SYS_NS_UNBIND, copy, blk.as_ptr() as u64, blk.len() as u64, 0) };
-    let Some(n) = build_request(&mut req, REQ_STDOUT, b"admin", b"nxinstall", &[], b"") else {
+    let Some(n) = build_request(&mut req, REQ_STDOUT, b"admin", b"nxinstall", &[], b"", None) else {
         return fail(b"build a request");
     };
     match views_call(cli, OP_VIEWS_REQUEST, 5, &req[..n], &[copy, out_w], &mut exited) {
@@ -2043,7 +2044,7 @@ fn view_broker_test(root_ns: u64) -> bool {
     };
     // SAFETY: a namespace handle this process holds.
     let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
-    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+    let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"", None) else {
         return fail(b"build a request");
     };
     if copy <= 0 || !matches!(views_call(last, OP_VIEWS_REQUEST, 8, &req[..n], &[copy as u64], &mut exited), Some((false, _))) {
@@ -2074,7 +2075,7 @@ fn view_broker_test(root_ns: u64) -> bool {
         if st != 0 || ch == 0 || copy <= 0 {
             return fail(b"a client channel and a copy for the paced pair");
         }
-        let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"") else {
+        let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"", None) else {
             return fail(b"build a request");
         };
         match views_call(ch, OP_VIEWS_REQUEST, 10 + k as u64, &req[..n], &[copy as u64], &mut exited) {
@@ -2119,7 +2120,7 @@ fn view_broker_test(root_ns: u64) -> bool {
     }
     // SAFETY: a namespace handle this process holds.
     let copy2 = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
-    let Some(n) = build_request(&mut req, 0, b"install", b"nxsh", &[], b"") else {
+    let Some(n) = build_request(&mut req, 0, b"install", b"nxsh", &[], b"", None) else {
         return fail(b"build a request");
     };
     match views_call(cli2, OP_VIEWS_REQUEST, 5, &req[..n], &[copy2 as u64], &mut exited) {
@@ -2846,7 +2847,7 @@ fn in_admin_view(
         return None;
     }
     let mut req = [0u8; 256];
-    let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", program, args, b"")?;
+    let n = build_request(&mut req, REQ_STDOUT | REQ_STDERR, b"admin", program, args, b"", None)?;
     let asked = matches!(
         views_call(cli, OP_VIEWS_REQUEST, 1, &req[..n], &[copy as u64, out_w, err_w], exited),
         Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::NeedPassword, _)))
@@ -3006,6 +3007,310 @@ fn storage_grant_test(root_ns: u64) -> bool {
     }
     kprint(b"boot-probe: storage grant: disk --unmount and disk --mount ran in the admin view, each answered its table, the service agreed, and a busy service was named as busy ok\n");
     finish(true)
+}
+
+/// **A remembered password, and everything that must not use it** (the laptop polish's Part A).
+///
+/// A session opened as a supervisor does, a real terminal from `/dev/tty`, and the build's fixture
+/// password open a window for that terminal and `admin`. Then, in order:
+/// - a second real token from the same terminal starts without asking;
+/// - **each of these is asked**: a made-up token (the forgery control — a caller that serves its
+///   own "terminal" and claims another's), a token already redeemed, no token, another view, and a
+///   token from a terminal on a backend of its own, attached as `nxterm` attaches a window's;
+/// - **a real token still starts without asking** — so the window was open while each of those was
+///   asked, and none of them was asked because it had closed;
+/// - after `Forget`, a real token is asked.
+///
+/// None of the requests that are asked is answered: a refused password would forget the window,
+/// and then the refusals after it would prove nothing.
+fn grace_test(root_ns: u64) -> bool {
+    use librsproto::views::*;
+    use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_TOKEN, TTY_TOKEN_LEN};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: grace: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel at /svc/views/session");
+    }
+    let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+        Some((false, body)) => parse_session_id(&body),
+        _ => None,
+    };
+    let Some(session) = session else {
+        close(sup);
+        return fail(b"OpenSession");
+    };
+    let (tst, tty) = ns_lookup(root_ns, b"/dev/tty", chan);
+    if tst != 0 || tty == 0 {
+        close(sup);
+        return fail(b"no terminal at /dev/tty");
+    }
+    // A token from terminal `t`, as `with` asks for one.
+    let token = |t: u64| -> Option<[u8; TTY_TOKEN_LEN]> {
+        if !rs_send(t, OP_TTY_TOKEN, 0x7470, &[], &[]) {
+            return None;
+        }
+        let deadline = clock_ns() + 5_000_000_000;
+        loop {
+            let m = receive(t, deadline)?;
+            if m.op == OP_TTY_TOKEN && m.request_id == 0x7470 {
+                return if m.error { None } else { m.body.as_slice().try_into().ok() };
+            }
+        }
+    };
+    // A request for `program` in `view`, carrying `token`, on a client channel of its own: the
+    // outcome, and the channel, still open.
+    let ask = |view: &[u8], program: &[u8], args: &[&[u8]], token: Option<[u8; TTY_TOKEN_LEN]>,
+               exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>|
+     -> Option<(Outcome, u64)> {
+        let (cst, cli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
+        if cst != 0 || cli == 0 {
+            return None;
+        }
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        if copy <= 0 {
+            close(cli);
+            return None;
+        }
+        let mut req = [0u8; 256];
+        let n = build_request(&mut req, 0, view, program, args, b"", token.as_ref())?;
+        match views_call(cli, OP_VIEWS_REQUEST, 2, &req[..n], &[copy as u64], exited) {
+            Some((false, body)) => parse_outcome(&body).map(|(o, _)| (o, cli)),
+            _ => {
+                close(cli);
+                None
+            }
+        }
+    };
+    let finish = |ok: bool, extra: &[u64]| {
+        let mut id = [0u8; 8];
+        let n = build_session_id(&mut id, session).unwrap_or(0);
+        let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &id[..n], &[], &mut alloc::vec::Vec::new());
+        for &h in extra {
+            close(h);
+        }
+        close(tty);
+        close(sup);
+        ok
+    };
+    let sleep: &[&[u8]] = &[b"0"];
+    // A request that starts: wait for the program to exit, so nothing is left running.
+    let started = |o: Option<(Outcome, u64)>, exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>| -> bool {
+        match o {
+            Some((Outcome::Started, cli)) => {
+                if exited.pop().is_none() {
+                    let _ = views_receive(cli, 0, exited);
+                }
+                close(cli);
+                true
+            }
+            Some((_, cli)) => {
+                close(cli);
+                false
+            }
+            None => false,
+        }
+    };
+    // A request that is asked for a password, and left unanswered.
+    let asked = |o: Option<(Outcome, u64)>| -> bool {
+        match o {
+            Some((Outcome::NeedPassword, cli)) => {
+                close(cli);
+                true
+            }
+            Some((_, cli)) => {
+                close(cli);
+                false
+            }
+            None => false,
+        }
+    };
+
+    // 1. The window: a real token, asked, and the password.
+    let Some(first) = token(tty) else {
+        return finish(fail(b"the terminal gave no token"), &[]);
+    };
+    let opened = match ask(b"admin", b"sleep", sleep, Some(first), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let ok = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 3, DEMO_PASSWORD, &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+            );
+            started(Some((Outcome::Started, cli)), &mut exited) && ok
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    if !opened {
+        return finish(fail(b"a first request with a token was not asked and then started"), &[]);
+    }
+    // 2. A second real token from the same terminal is not asked.
+    let Some(second) = token(tty) else {
+        return finish(fail(b"no second token"), &[]);
+    };
+    if !started(ask(b"admin", b"sleep", sleep, Some(second), &mut exited), &mut exited) {
+        return finish(fail(b"a second request from the same terminal, inside the window, was asked"), &[]);
+    }
+    // 3. **The forgery control**: a token nobody minted.
+    let forged = [0x5a; TTY_TOKEN_LEN];
+    if !asked(ask(b"admin", b"sleep", sleep, Some(forged), &mut exited)) {
+        return finish(fail(b"a made-up token was not asked"), &[]);
+    }
+    // 4. A token already redeemed.
+    if !asked(ask(b"admin", b"sleep", sleep, Some(second), &mut exited)) {
+        return finish(fail(b"a token used twice was not asked"), &[]);
+    }
+    // 5. No token at all.
+    if !asked(ask(b"admin", b"sleep", sleep, None, &mut exited)) {
+        return finish(fail(b"a request with no token was not asked"), &[]);
+    }
+    // 6. Another view: the window is `admin`'s.
+    let Some(other_view) = token(tty) else {
+        return finish(fail(b"no token for the other view"), &[]);
+    };
+    if !asked(ask(b"install", b"nxinstall", &[], Some(other_view), &mut exited)) {
+        return finish(fail(b"another view, from the same terminal, was not asked"), &[]);
+    }
+    // 7. **Another terminal**: one with a backend of its own, as a window has.
+    let (wst, window) = ns_lookup(root_ns, b"/dev/tty", chan);
+    let (mut ours, mut theirs) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let made = unsafe {
+        syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 4, 0)
+    } == 0;
+    if wst != 0 || window == 0 || !made {
+        return finish(fail(b"a second terminal and a backend channel"), &[window, ours, theirs]);
+    }
+    let attached = matches!(
+        rs_send(window, OP_TTY_ATTACH_BACKEND, 0x6174, &[], &[theirs]).then(|| {
+            let deadline = clock_ns() + 5_000_000_000;
+            loop {
+                match receive(window, deadline) {
+                    Some(m) if m.request_id == 0x6174 => break Some(m.error),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            }
+        }),
+        Some(Some(false))
+    );
+    if !attached {
+        return finish(fail(b"the second terminal would not take a backend"), &[window, ours]);
+    }
+    let Some(elsewhere) = token(window) else {
+        return finish(fail(b"no token from the second terminal"), &[window, ours]);
+    };
+    if !asked(ask(b"admin", b"sleep", sleep, Some(elsewhere), &mut exited)) {
+        return finish(fail(b"a token from another terminal was not asked"), &[window, ours]);
+    }
+    // 8. **And the window was open all along**: a real token from the first terminal still starts.
+    let Some(still) = token(tty) else {
+        return finish(fail(b"no token after the refusals"), &[window, ours]);
+    };
+    if !started(ask(b"admin", b"sleep", sleep, Some(still), &mut exited), &mut exited) {
+        return finish(fail(b"the window closed while the refusals were asked, so they prove nothing"), &[window, ours]);
+    }
+    // 8b. **A refused password forgets every window of the session** (PR #351 review): a request
+    //     from the other terminal, which has no window and so is asked, is answered wrong — and
+    //     the first terminal's window is gone with it, so a real token from there is asked too.
+    let Some(other) = token(window) else {
+        return finish(fail(b"no token from the second terminal for the wrong password"), &[window, ours]);
+    };
+    let refused = match ask(b"admin", b"sleep", sleep, Some(other), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let denied = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 6, b"not the password", &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Denied { .. }, _)))
+            );
+            close(cli);
+            denied
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    if !refused {
+        return finish(fail(b"a wrong password at the second terminal was not refused"), &[window, ours]);
+    }
+    let Some(after_wrong) = token(tty) else {
+        return finish(fail(b"no token after the wrong password"), &[window, ours]);
+    };
+    if !asked(ask(b"admin", b"sleep", sleep, Some(after_wrong), &mut exited)) {
+        return finish(fail(b"a refused password at another terminal left this terminal's window open"), &[window, ours]);
+    }
+    // **Opened again**, so that `Forget` below has a window to forget — and shown to be open.
+    let Some(again) = token(tty) else {
+        return finish(fail(b"no token to open the window again"), &[window, ours]);
+    };
+    let reopened = match ask(b"admin", b"sleep", sleep, Some(again), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let ok = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 7, DEMO_PASSWORD, &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+            );
+            started(Some((Outcome::Started, cli)), &mut exited) && ok
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    let Some(open) = token(tty) else {
+        return finish(fail(b"no token to show the window open again"), &[window, ours]);
+    };
+    if !reopened || !started(ask(b"admin", b"sleep", sleep, Some(open), &mut exited), &mut exited) {
+        return finish(fail(b"the window would not open again after the wrong password"), &[window, ours]);
+    }
+    // 9. `Forget`, and a real token is asked again.
+    let (fst, fcli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
+    let forgot = fst == 0 && matches!(views_call(fcli, OP_VIEWS_FORGET, 4, &[], &[], &mut exited), Some((false, _)));
+    close(fcli);
+    if !forgot {
+        return finish(fail(b"Forget"), &[window, ours]);
+    }
+    let Some(after) = token(tty) else {
+        return finish(fail(b"no token after Forget"), &[window, ours]);
+    };
+    if !asked(ask(b"admin", b"sleep", sleep, Some(after), &mut exited)) {
+        return finish(fail(b"a request after Forget was not asked"), &[window, ours]);
+    }
+    // 10. **A refused token names no terminal, so a password typed with one opens no window.** A
+    //     broker that gave every refused token the same terminal — reading a refusal as an id, or
+    //     falling back to a default — would open a window under it here, and the next made-up
+    //     token would use it.
+    let opened_none = match ask(b"admin", b"sleep", sleep, Some([0x11; TTY_TOKEN_LEN]), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let ok = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 5, DEMO_PASSWORD, &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+            );
+            started(Some((Outcome::Started, cli)), &mut exited) && ok
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    if !opened_none {
+        return finish(fail(b"a made-up token answered with the password did not start"), &[window, ours]);
+    }
+    if !asked(ask(b"admin", b"sleep", sleep, Some([0x22; TTY_TOKEN_LEN]), &mut exited)) {
+        return finish(fail(b"a made-up token used a window another made-up token's password opened"), &[window, ours]);
+    }
+    kprint(
+        b"boot-probe: grace: a password remembered for one terminal and view; a made-up token, a reused one, \
+          none, another view and another terminal all asked; the window open throughout; a wrong password \
+          elsewhere closed it; asked again after Forget; and a made-up token's password opened no window ok\n",
+    );
+    finish(true, &[window, ours])
 }
 
 /// **The policy endpoint: `Show` and `Install`, and what an administrator is** (administration
@@ -3652,6 +3957,16 @@ fn logs_test(root_ns: u64) -> bool {
         return fail(b"two read sessions, a third refused, and one at once after one was let go");
     }
     if e3 != KError::WouldBlock.as_i32() || e4 != 0 || again == 0 {
+        // **Which half, by number** (2026-10-01): one failure in five runs since the laptop
+        // polish's Part A, with two mints in the log rather than three, said only that one of the
+        // two did not hold. The statuses say whether the third was granted or the one after the let
+        // go was refused, which is the first thing the next occurrence has to tell us.
+        Line::new()
+            .s(b"boot-probe: logs: third endpoint status ")
+            .i(e3 as i64)
+            .s(b", after the let go ")
+            .i(e4 as i64)
+            .end();
         return fail(b"a third read endpoint refused, and one at once after this probe's was let go");
     }
     kprint(b"boot-probe: logs read a record back, refused two malformed requests, and held sessions and endpoints to two ok\n");

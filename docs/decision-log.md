@@ -32677,3 +32677,204 @@ manager handing driver processes devices), `input-subsystem.md` (USB HID in `inp
 - **The graphical prompt's trigger.** It no longer names ejecting a stick.
 
 Docs only; no ABI hash impact.
+
+## 2026-10-01 — Laptop polish Part A: a password remembered per terminal
+
+`with` now remembers a password that succeeded **for the session, the terminal it was typed at,
+and the view it was for, for five minutes**. A refused password, `with --forget` and the session's
+end forget it. The maintainer's calls, at the part's detail pass:
+- a fixed five minutes;
+- per view;
+- `--forget` forgets the whole session, every terminal's.
+
+**How the broker learns the terminal, without the caller's word for it:**
+- `with` asks its own terminal for a `Tty::Token`: 128 random bits for the terminal's backend, good
+  once and for thirty seconds.
+- `with` sends the token as the request's optional last field.
+- The broker redeems it with `tty-server` over a terminal it resolves itself, and closes that
+  terminal after, since every terminal is a slot in the server's wait set. The call has a
+  two-second deadline, as the broker's other calls to servers it trusts have.
+
+No kernel change.
+
+**What the part found on the way:**
+- **The broker's redeem first read the reply without its flag.** I commented that an error reply's
+  body, read as a backend id, would give every refused token the same terminal. **That premise was
+  wrong**: an error body is twelve bytes and would never read as a four-byte id. The control that
+  tried it passed.
+  - The flag check stays, now commented as making the safety the flag's and not the error format's
+    length.
+  - The control that does fail is a broker that gives every refused token one terminal, by reading
+    a refusal as an id or by falling back to a default. Step 10 below catches that.
+- **The request's token field is strict**: the byte `16` and sixteen bytes, or nothing. The plan
+  said a `0` length would mean no token, but a correct writer never writes one, and the reader's
+  existing test refused a trailing byte.
+
+**Gates:**
+- `boot-probe`, in `test-qemu`, opens a session, takes real tokens from a terminal of its own, and
+  answers with the build's fixture password. Then:
+  - a second real token starts without asking;
+  - a made-up token, a reused one, no token, another view, and a token from a terminal it gave a
+    backend of its own are each asked;
+  - a real token still starts, so the window was open throughout;
+  - after `Forget`, it asks;
+  - **step 10**: a made-up token answered with the password opens no window another made-up token
+    can use.
+- **Controls, each failing at its own step:**
+  - the broker trusting any token (step 3);
+  - a refused token given one terminal (step 10);
+  - the window ignoring the terminal (step 7).
+
+  Host tests carry the view and `forget` controls.
+- `test-interactive` 20b(d2): the second `with admin` in a row on the serial console starts without
+  asking, and after `with --forget` the next asks.
+- `check-login` 9a2: the second request in one desktop terminal is not asked.
+- **Every other gate whose prompt is incidental forgets first**, through one helper per column
+  (`with_admin_asked`, and `check-install`'s). No gate's outcome depends on five minutes passing,
+  or not, under TCG.
+
+**Docs:**
+- `rsproto-tty-ops.md` (`Token`, `Redeem`);
+- `rsproto-views-ops.md` (the token field, the window, `Forget`);
+- `session-and-auth.md`;
+- `deferred-decisions.md` (`view-grace` resolved);
+- the plan.
+
+`TODO(view-grace)` is gone from `with.rs`. No ABI hash impact: the new ops are rsproto, not hash
+inputs.
+
+## 2026-10-01 — Laptop polish Part B: an empty table cell drawn blank
+
+`disk --list` showed a column of `null` for every disk without a filesystem. `display` now draws a
+cell whose value is null **blank**: the header already names what is missing, and a column of
+`null` reads as data.
+
+**Only the cell.** A null nested in a cell's list is still `[null]`, and a bare `null` — the value of
+an expression — is still `null`, since there it is the answer.
+
+**A row ends at its last non-blank cell.** Blank cells at the end would otherwise leave a run of
+padding that wraps a narrow terminal for nothing. Blank cells before it are padded like any other,
+so the columns stay aligned.
+
+**Gates, with controls run in both:**
+- A host test covers blank cells in the middle and at the end, a bare `null` and a nested one.
+- `test-interactive` 20c(a) reads the row for `init`'s root, whose `clean` is null because it is
+  mounted writable.
+- The old rendering fails both: the host test with `blk-0  null     null`, and the gate on the real
+  row.
+
+Docs: `shell-language.md` §11e and the plan. No kernel change; no ABI hash impact.
+
+**Gates, 2026-10-01: 35 of 36 passed (fgb60).** `test-qemu`'s TCG run failed in `boot-probe`'s logs
+test, which Part B does not touch, and passed four reruns and its KVM run. The next entry records
+it.
+
+## 2026-10-01 — An intermittent in `boot-probe`'s logs test, made to say which half
+
+`test-qemu`'s TCG run failed once, in fgb60, at `boot-probe`'s logs test: "a third read endpoint
+refused, and one at once after this probe's was let go".
+
+**What the transcript shows.** The logging service minted two read endpoints, the broker's and the
+probe's, where every passing run mints three: the third is the one minted after the probe lets its
+own go. So the probe's resolve after the let-go was refused, most likely because the service had
+not yet seen that endpoint close.
+
+**What is not known: why.**
+- The service already retires closes before resolves within a wake.
+- A handle's close drops its object at once.
+- `boot-probe`'s lookups close their pending operations.
+
+So something else held the probe's namespace, or its endpoint, past the close, and nothing in the
+transcript says what.
+
+**How often.** It failed once in five TCG runs since the laptop polish's Part A added its grace test
+before this one, and passed every run before that. It passed four reruns and its KVM run.
+
+**Not fixed on a guess.** The failure message now carries both statuses: the third endpoint's, and
+the one asked for after the let-go. The next occurrence will say which half failed. A retry would
+make the gate pass without saying why, and would weaken the claim the test exists for: that a
+closed endpoint is retired, not waited on.
+
+No kernel change; no ABI hash impact.
+
+## 2026-10-01 — Laptop polish Part C: a disk's model and serial in `disk --list`
+
+The storage service's table gains **`description`**, after `kind`: what the device calls itself.
+That is a SATA disk's model and serial, a RAM disk's module, or a partition's name in its table. It
+is the device record's name, the one `nxinstall` already printed, so `disk --list` now names a disk
+the way the installer does. `blk-<n>` stays the column that says *where* a device is. A record that
+names nothing has an empty cell, which Part B draws blank.
+
+**Every reader finds columns by name**: `boot-probe` and `nxinstall`, while `disk` passes the table
+through. So the column could go beside `kind`, where it reads naturally. Only two of the service's own host tests
+indexed `clean` and `by` by position; they find them by name now.
+
+**Gates, with controls:**
+- A host test covers each kind and an unnamed record.
+- `test-interactive` 20c(a) reads `blk-0`'s row and expects `QEMU HARDDISK (QM00001)`, which the
+  typed command does not contain. With the column emptied, the gate times out at that step.
+
+Docs: `storage.md` §9 and its Status, and the plan. No kernel change; no ABI hash impact: a TSM1
+table's columns are not hash inputs.
+
+## 2026-10-01 — Laptop polish Part D: the build's commit on the screen
+
+On 2026-10-01 a stick that had never been rewritten looked like a bug in the installer for an
+afternoon, because nothing on the running system said which build it was. Now two things do:
+- **The kernel's first report line**: `nitrox: built from <commit>`, logged before the handoff
+  lines, so it heads the hardware report's first page.
+- **Every shell's banner**: `nxsh: interactive shell, Nitrox <commit> (…)`.
+
+The commit is `git rev-parse --short=12 HEAD`, with `-dirty` when a tracked file differs, or
+`unknown` outside a repository.
+
+**One place.** `xtask` works it out at start and sets `NITROX_COMMIT` in its own environment, so
+every cargo it runs inherits it, kernel, userspace and host tests alike, and no build path can
+forget to pass it. The kernel and `nxsh` read it with `option_env!`. rustc records that as a
+dependency, so a new commit rebuilds those two crates and nothing else.
+
+**Gates, with controls:**
+- `test-qemu` holds the kernel's line to the commit `xtask` built from, beside the hardware facts.
+  A kernel logging a made-up commit fails it.
+- `check-report` reads the line on the report's **first** page, where a person looks first.
+- `test-interactive` reads the commit in the serial shell's banner. A banner naming a made-up one
+  fails it.
+
+Docs: `boot-flow.md` (step 3, and its Status), `shell-language.md` §11, and the plan. No ABI hash
+impact: a string in a log line and a banner.
+
+## 2026-10-02 — PR #351, reviewed: a token the read never filled
+
+One blocking finding, two worth fixing and two optional, all taken.
+
+**A token minted from an unseeded pool was sixteen zero bytes** (blocking).
+- When the pool has not seeded, `sys_entropy_read` answers with a `PendingOperation`. That PO
+  completing says only that the pool has now seeded, and writes nothing: the caller must read
+  again, as `auth-service` and `account` do.
+- `tty-server` waited on the PO and minted the untouched buffer.
+- So on a machine with no hardware RNG, early in a boot, every terminal froze while the pool
+  seeded, and then a token anybody could name was minted for the window that asked.
+- If that window then opened a grace period, any process in the session could have used it.
+- Fixed by taking an unseeded pool as **no token**, without waiting (`tty_server::tokens::
+  from_read`, host-tested). The requester is asked for its password, which is safe, and no
+  terminal stalls.
+- **The class:** `nxinstall`'s `random_guid` had the same bug, older than this PR. It would have
+  written all-zero partition GUIDs, the one thing its comment says it refuses. It now reads again
+  after the PO, as an installer can afford to wait. The other entropy readers already loop.
+- No gate boots without a hardware RNG, so the host test is what holds it.
+
+**Nothing tested that a refused password forgets the session's windows** (worth fixing). The
+reviewer deleted the call, and every gate passed.
+- `grace_test` gains step 8b: a request from the other terminal, which has no window, is answered
+  wrong, and a real token from the first terminal is then asked.
+- The window is then opened again and shown open, so step 9's `Forget` still has a window to
+  forget.
+- **Control:** the call removed fails step 8b.
+
+**The rest:**
+- The tty spec's role table names `Token` and `Redeem`.
+- `session-and-auth.md` no longer says a desktop application holds no terminal. It holds
+  `/dev/tty`, which lands on the console, and no window's backend.
+- The `views.toml` schema's `auth` row says a password is remembered per view, per terminal.
+
+No kernel change; no ABI hash impact.

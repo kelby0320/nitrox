@@ -209,6 +209,21 @@ pub const OP_TTY_INPUT: u16 = 0x0B08;
 /// `Ctrl-C`. Resolving `/dev/tty` cannot do this, because a resolve mints a terminal on the
 /// *default* backend rather than on a particular window's.
 pub const OP_TTY_OPEN_SIBLING: u16 = 0x0B09;
+/// `Tty::Token` — a **one-time token naming this terminal's backend** (laptop polish Part A).
+/// Empty request body; the reply is 16 bytes, good once, for thirty seconds.
+///
+/// `with` asks for one and sends it with its request, so the view broker can remember a password
+/// per terminal without taking the caller's word for which terminal it is: the broker redeems the
+/// token itself ([`OP_TTY_REDEEM`]), over a channel it opened. Only a process holding a terminal
+/// on a backend can get a token for it.
+pub const OP_TTY_TOKEN: u16 = 0x0B0A;
+/// `Tty::Redeem` — **which backend a token was minted for**, once. Request body: the 16 bytes.
+/// Reply: the backend's id, a little-endian `u32`; or `NotFound` for a token never minted, already
+/// redeemed, or expired. Answered on any terminal: knowing the token is the proof.
+pub const OP_TTY_REDEEM: u16 = 0x0B0B;
+/// Bytes in a `Tty::Token` — 128 bits. One length for the server that mints them and the request
+/// that carries one to the view broker.
+pub const TTY_TOKEN_LEN: usize = 16;
 
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;

@@ -1,7 +1,8 @@
 # Sessions and authentication
 
-**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-09-30,
-when the installer session went and every session became ordinary — administration Part G.3 —
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked 2026-10-01,
+when a password began to be remembered per session, terminal and view — the laptop polish's Part
+A; before that 2026-09-30, when the installer session went and every session became ordinary — administration Part G.3 —
 and the installer began writing an installed machine's user database — Part G.2;
 before that 2026-09-28, when each session gained `/dev/services`, `service-mgr`'s table of services — administration Part
 E.2b; earlier that day, when `service-mgr` began starting and binding `auth-service` — Part E.1a;
@@ -277,6 +278,16 @@ identity rests on it.
 the signal: a program the broker started in a view still binds the session's `/dev/views`, so the
 registration outlives the login. Ids are never reused — the same lingering program still holds the
 old base. A boot without the broker builds sessions without `/dev/views`, and says so.
+
+**A password is remembered per session, terminal and view, for five minutes** (2026-10-01, the
+laptop polish's Part A). Because a serial login and a desktop login are separate sessions, a
+password typed at one is never remembered at the other; because the terminal is part of the key,
+a password typed in one window does not reach another window, or an application the desktop
+launched — which holds `/dev/views` like everything in the session, and `/dev/tty`, but no
+terminal on any window's backend: a resolve of `/dev/tty` lands on the console. The terminal
+is the one `tty-server` names when the broker redeems the token `with` sent, never one the caller
+claims ([`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) § *Request*). `with --forget`, a
+refused password and the session's end forget it.
 
 ### The device manager's tables
 
