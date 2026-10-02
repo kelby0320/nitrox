@@ -690,6 +690,69 @@ pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
     }
 }
 
+// --- Power management -------------------------------------------------------
+//
+// A function a driver finds in D3 answers configuration cycles but not memory ones: its registers
+// read as all ones. The laptop's xHCI was in D3 when Linux's view of it was taken, because Linux
+// suspends an idle controller (Phase 6 Part A); what the firmware leaves it in is not known.
+
+/// Capability ID: PCI Power Management (PCI PM 1.2 §3.2).
+const CAP_ID_PM: u8 = 0x01;
+/// PMCSR, at the capability's `+4`: bits 1:0 are the power state.
+const PMCSR_STATE: u32 = 0b11;
+/// PMCSR bit 3, `No_Soft_Reset`: a transition from D3hot to D0 keeps the function's configuration.
+const PMCSR_NO_SOFT_RESET: u32 = 1 << 3;
+/// PMCSR bit 15, `PME_Status`: write one to clear, so a write that changes the state carries zero.
+const PMCSR_PME_STATUS: u32 = 1 << 15;
+
+/// What [`power_up`] found and did.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Power {
+    /// No power-management capability, so the function is always in D0.
+    NoCapability,
+    /// It was in D0 already.
+    AlreadyD0,
+    /// It was in D`from` and is asked for D0. **The caller waits 10 ms before touching it** (PCI PM
+    /// 1.2 §5.4.1), and when `kept` is false — no `No_Soft_Reset` — restores what the transition
+    /// reset with [`Saved::restore`].
+    Raised { from: u8, kept: bool },
+}
+
+/// The registers a D3hot-to-D0 transition resets on a function without `No_Soft_Reset`.
+pub(crate) struct Saved {
+    command: u32,
+    bars: [u32; 6],
+}
+
+impl Saved {
+    /// Write the BARs back, then the command register, which is what enables decoding them.
+    pub(crate) fn restore<C: Cfg>(&self, cfg: &C) {
+        for (i, &bar) in self.bars.iter().enumerate() {
+            cfg.write32(REG_BAR0 + 4 * i as u16, bar);
+        }
+        write_command(cfg, self.command as u16);
+    }
+}
+
+/// Put the function in D0, having saved what a resetting transition would lose. Configuration
+/// cycles reach a function in D3hot, so the save is of the live values.
+pub(crate) fn power_up<C: Cfg>(cfg: &C) -> (Power, Saved) {
+    let mut saved = Saved { command: cfg.read32(REG_COMMAND), bars: [0; 6] };
+    for (i, bar) in saved.bars.iter_mut().enumerate() {
+        *bar = cfg.read32(REG_BAR0 + 4 * i as u16);
+    }
+    let Some(cap) = find_capability(cfg, CAP_ID_PM) else {
+        return (Power::NoCapability, saved);
+    };
+    let pmcsr = cfg.read32(cap + 4);
+    let from = (pmcsr & PMCSR_STATE) as u8;
+    if from == 0 {
+        return (Power::AlreadyD0, saved);
+    }
+    cfg.write32(cap + 4, pmcsr & !PMCSR_STATE & !PMCSR_PME_STATUS);
+    (Power::Raised { from, kept: pmcsr & PMCSR_NO_SOFT_RESET != 0 }, saved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,5 +1184,56 @@ mod tests {
         let int = read_interrupt(&c);
         assert_eq!(int.pin, 0);
         assert_eq!(int.present, 0);
+    }
+
+    /// A function with one capability, power management at `0x70`, whose PMCSR is `pmcsr`, and a
+    /// 64-bit BAR0 and a command register worth restoring.
+    fn pm_fake(pmcsr: u32) -> FakeCfg {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, (STATUS_CAP_LIST << 16) | 0x0406);
+        c.set(REG_CAP_PTR, 0x70);
+        c.set(0x70, CAP_ID_PM as u32 | 0x0003 << 16); // last in the chain; PM 1.2
+        c.set(0x74, pmcsr);
+        c.set(REG_BAR0, 0xB131_0004);
+        c.set(REG_BAR0 + 4, 0x0000_0001);
+        c
+    }
+
+    #[test]
+    fn a_function_in_d0_is_left_alone() {
+        let c = pm_fake(0x0008);
+        assert_eq!(power_up(&c).0, Power::AlreadyD0);
+        assert_eq!(c.read32(0x74), 0x0008, "nothing written");
+        let mut none = FakeCfg::new();
+        none.set(REG_COMMAND, 0);
+        assert_eq!(power_up(&none).0, Power::NoCapability);
+    }
+
+    /// **The laptop's xHCI as Linux left it**: `Status: D3 NoSoftRst+ PME-Enable+`. Raised to D0,
+    /// with `PME_Enable` kept and a pending `PME_Status` not cleared by the write.
+    #[test]
+    fn d3_is_raised_to_d0_without_clearing_pme_status() {
+        let c = pm_fake(PMCSR_PME_STATUS | 1 << 8 | PMCSR_NO_SOFT_RESET | 0b11);
+        assert_eq!(power_up(&c).0, Power::Raised { from: 3, kept: true });
+        let after = c.read32(0x74);
+        assert_eq!(after & PMCSR_STATE, 0, "D0");
+        assert_eq!(after & PMCSR_PME_STATUS, 0, "a one here would clear PME_Status");
+        assert_ne!(after & (1 << 8), 0, "PME_Enable kept");
+    }
+
+    /// Without `No_Soft_Reset` the transition resets the function; what was saved before it puts
+    /// the BARs and the command register back.
+    #[test]
+    fn a_resetting_transition_is_undone_by_the_save() {
+        let mut c = pm_fake(0b11);
+        let (power, saved) = power_up(&c);
+        assert_eq!(power, Power::Raised { from: 3, kept: false });
+        c.set(REG_BAR0, 0);
+        c.set(REG_BAR0 + 4, 0);
+        c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
+        saved.restore(&c);
+        assert_eq!(c.read32(REG_BAR0), 0xB131_0004);
+        assert_eq!(c.read32(REG_BAR0 + 4), 0x0000_0001);
+        assert_eq!(c.read32(REG_COMMAND) & 0xFFFF, 0x0406);
     }
 }

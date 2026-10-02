@@ -1,13 +1,15 @@
 //! In-kernel **Tier 1** device drivers (compiled into the kernel ELF).
 //!
 //! [`probe`] matches discovered [`DeviceNode`]s against the built-in driver
-//! table and brings up the ones it recognises; Phase 2 has only [`ahci`]. See
-//! `docs/architecture/drivers-and-irps.md` § "Module tiers".
+//! table and brings up the ones it recognises: [`ahci`], and since Phase 6 Part A
+//! the USB host controller, [`xhci`]. See `docs/architecture/drivers-and-irps.md`
+//! § "Module tiers".
 
 pub mod ahci;
 pub mod console;
 pub mod gpt;
 pub mod ps2;
+pub mod xhci;
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
@@ -24,15 +26,19 @@ const PCI_CLASS_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
 /// Match discovered devices against the Tier 1 driver table and bring up the
 /// ones recognised. Boot-time; call after [`crate::device::init`] and the IRQ
 /// router. Snapshots the device table, so it never holds the device lock across
-/// driver allocation.
-pub fn probe() {
+/// driver allocation. `flags` is the command line: `usb=off` leaves the USB host
+/// controller to no driver.
+pub fn probe(flags: &crate::cmdline::Flags) {
     let devices = crate::device::snapshot();
     for node in devices.iter() {
         // SAFETY: each snapshot entry pins a live `DeviceNode`.
         let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
         let id = &dn.descriptor().identity;
-        if (id.class, id.subclass, id.prog_if) == PCI_CLASS_AHCI {
+        let class = (id.class, id.subclass, id.prog_if);
+        if class == PCI_CLASS_AHCI {
             crate::device::record_outcome(dn.descriptor(), ahci::init(node));
+        } else if class == xhci::PCI_CLASS {
+            crate::device::record_outcome(dn.descriptor(), xhci::init(node, flags.usb_off));
         }
     }
 

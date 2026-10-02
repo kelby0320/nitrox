@@ -96,7 +96,10 @@ password prompt would be the password). No line means the keystroke never left y
 headless and adjudicates the whole boot (kernel → init → mount → userspace demos)
 from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
-wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
+wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`. Since Phase 6 Part A it
+boots with an **xHCI controller and four USB devices** — a keyboard at high speed, a mouse at full
+speed, a stick at SuperSpeed and a hub — and asserts the controller's facts on the host; every
+gate's controller is configured as the laptop's, with MSI and no MSI-X (`docs/architecture/usb.md`).
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,

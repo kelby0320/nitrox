@@ -317,7 +317,7 @@ fn kernel_main() {
     // devices (the AHCI controller) and bring up any disks, then read sector 0
     // through the real driver to prove the IRP → controller DMA → IRQ → DPC → PO
     // path against hardware.
-    nitrox_kernel::drivers::probe();
+    nitrox_kernel::drivers::probe(&flags);
     #[cfg(feature = "selftest")]
     boot_selftest::storage();
 
@@ -778,9 +778,15 @@ fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
             Printable(word),
             cmdline::HWREPORT_DEFAULT_SECS
         ),
+        Ignored::BadSwitch(word) => {
+            kprintln!("cmdline: \"{}\" takes on or off — ignoring it", Printable(word))
+        }
     });
     if let Some(secs) = flags.hwreport {
         kprintln!("cmdline: hardware report — each page waits up to {} s for a key", secs);
+    }
+    if flags.usb_off {
+        kprintln!("cmdline: usb=off — no driver takes the USB host controller");
     }
     flags
 }

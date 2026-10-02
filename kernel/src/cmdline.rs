@@ -6,9 +6,12 @@
 //! that may have nothing else to say what went wrong, and a typo there should cost the flag,
 //! not the boot.
 //!
-//! One flag exists: `hwreport[=<seconds>]`, which holds the kernel log on the screen before
-//! userspace starts, a page at a time (see `main.rs`'s report mode). The seconds bound how long
-//! a page waits for a key.
+//! Two flags exist:
+//! - `hwreport[=<seconds>]` holds the kernel log on the screen before userspace starts, a page at
+//!   a time (see `main.rs`'s report mode). The seconds bound how long a page waits for a key.
+//! - `usb=off` leaves the USB host controller alone (Phase 6 Part A): the way past a bring-up that
+//!   hangs on a machine the gates have never seen, typed at the live stick's boot menu. `usb=on`
+//!   is the default, and undoes an earlier `off`.
 
 /// How long a hardware-report page waits for a key when `hwreport` gives no bound.
 pub const HWREPORT_DEFAULT_SECS: u32 = 120;
@@ -19,6 +22,8 @@ pub struct Flags {
     /// `Some(seconds)` when a hardware report was requested: how long a page waits for a key
     /// before the report ends.
     pub hwreport: Option<u32>,
+    /// `usb=off`: no driver takes the USB host controller.
+    pub usb_off: bool,
 }
 
 /// Something on the command line that was ignored, and why.
@@ -28,6 +33,8 @@ pub enum Ignored<'a> {
     Unknown(&'a [u8]),
     /// A known flag whose value could not be read; the flag took its default instead.
     BadValue(&'a [u8]),
+    /// A switch given something other than `on` or `off`; it keeps the value it had.
+    BadSwitch(&'a [u8]),
 }
 
 /// The command line this boot was given, for `/proc/cmdline` to serve.
@@ -72,6 +79,11 @@ pub fn parse<'a>(line: &'a [u8], mut ignored: impl FnMut(Ignored<'a>)) -> Flags 
                     },
                 });
             }
+            b"usb" => match value {
+                Some(b"off") => flags.usb_off = true,
+                Some(b"on") => flags.usb_off = false,
+                _ => ignored(Ignored::BadSwitch(word)),
+            },
             _ => ignored(Ignored::Unknown(word)),
         }
     }
@@ -105,8 +117,9 @@ mod tests {
 
     #[test]
     fn an_empty_line_asks_for_nothing() {
-        assert_eq!(parsed(b""), (Flags { hwreport: None }, vec![]));
-        assert_eq!(parsed(b"  \t "), (Flags { hwreport: None }, vec![]));
+        assert_eq!(parsed(b""), (Flags::default(), vec![]));
+        assert_eq!(parsed(b"  \t "), (Flags::default(), vec![]));
+        assert!(!Flags::default().usb_off, "USB is on unless asked otherwise");
     }
 
     #[test]
@@ -130,6 +143,20 @@ mod tests {
             assert_eq!(flags.hwreport, Some(HWREPORT_DEFAULT_SECS), "{:?}", bad);
             assert_eq!(ignored, vec![Ignored::BadValue(bad)]);
         }
+    }
+
+    #[test]
+    fn usb_off_is_a_switch_and_a_later_word_wins() {
+        assert!(parsed(b"usb=off").0.usb_off);
+        assert!(!parsed(b"usb=off usb=on").0.usb_off);
+        assert!(parsed(b"hwreport usb=off").0.usb_off);
+        for bad in [&b"usb"[..], b"usb=", b"usb=no", b"usb=OFF"] {
+            let (flags, ignored) = parsed(bad);
+            assert!(!flags.usb_off, "{:?}", bad);
+            assert_eq!(ignored, vec![Ignored::BadSwitch(bad)]);
+        }
+        let (flags, _) = parsed(b"usb=off usb=maybe");
+        assert!(flags.usb_off, "a bad value keeps what the switch had");
     }
 
     #[test]

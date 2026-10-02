@@ -33120,3 +33120,56 @@ before their receipt, so the shell always spoke first:
   any list line at all.
 
 `check-login`, TCG and KVM, passes without the probe. The probe is removed.
+
+## 2026-10-02 — Phase 6 Part A.1: the xHCI controller, claimed
+
+`drivers::xhci` brings the controller up in `probe`, polled:
+1. D0, bus mastering;
+2. the firmware's handoff through USB Legacy Support;
+3. halt, then reset, with the 1 ms Intel pause between setting `HCRST` and the first poll;
+4. the context array, scratchpads, command ring and one event-ring segment;
+5. MSI, the controller running, and **a No Op through the command ring**, polled.
+
+Every wait is bounded. A failure declines the function with its reason, and a decline after the
+controller started stops it first. The DPC drains the event ring.
+
+Beside it:
+- `pci::power_up` saves the BARs and command register before raising a function to D0, for one
+  whose transition resets them.
+- `usb=off` joins the command line.
+- `drivers::probe` takes the flags.
+
+**What the first boot corrected:**
+- **QEMU's `qemu-xhci` on q35 defaults to `msi=off`** and offers MSI-X alone (`caps msix pcie`).
+  The plan said both machines have MSI. The driver declined it, as written, and the boot went on.
+  - The laptop's controller has MSI with eight vectors and no MSI-X. So **every gate's controller
+    is configured as the laptop's**, `msi=on,msix=off` (`XHCI_DEVICE` in `xtask`), and the
+    driver keeps the one mechanism that machine has.
+  - Building MSI-X instead would be code neither target needs, tested only on QEMU.
+- **QEMU numbers its USB 3 ports first**: 1–8, then USB 2 on 9–16, with `p2=8,p3=8`. The
+  Supported Protocol capabilities say so, and the driver reads them rather than assume an order.
+- The controller takes MSI vector `0x32`, before AHCI, since it is probed first at `00:03.0`.
+  The vectors in use are within the plan's count.
+
+**Changed from the plan, deliberately:**
+- **The controller runs from `probe`**, not from the hub thread, so a No Op proves the rings,
+  the doorbell and the event ring before anything depends on them.
+- **Each port's state at start is logged by A.2's first round**, after the debounce, when USB 3
+  links have trained. At `probe` a USB 3 port can still be training, and the line would say less
+  than it seems to.
+
+**Gates:**
+- `test-qemu` (TCG and KVM) boots `qemu-xhci,p2=8,p3=8` with a high-speed keyboard, a
+  full-speed mouse, a SuperSpeed stick and a hub.
+- On the host it asserts the controller's PCI line, its facts, the No Op's answer, and the
+  function claimed over MSI.
+- **In-guest control:** with no doorbell write, the No Op goes unanswered, the function is
+  declined with that reason, and the facts fail.
+- **Host tests, each with a control that fails it:**
+  - the producer ring, read back by a model of the controller across three wraps;
+  - the event ring's cycle;
+  - the capability walk and its window and bound;
+  - the PCI power-up, whose write must not clear `PME_Status`;
+  - `usb=off` and `usb=on`.
+
+No ABI hash impact: a driver and a command-line flag.
