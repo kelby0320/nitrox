@@ -12604,6 +12604,152 @@ impl Session {
     }
 }
 
+/// The line the hub thread ends its first round with, after which a device is plugged in.
+const USB_FIRST_ROUND: &str = "usb: first round: ";
+/// The hot-plugged keyboard's arrival: a high-speed boot keyboard, after the first round.
+const HOT_KEYBOARD: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/01, high-speed, \"QEMU USB Keyboard"];
+/// The mouse swapped in for it on the same port: a high-speed boot mouse.
+const HOT_MOUSE: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse"];
+
+/// **USB devices plugged in after boot, swapped, and pulled out** (Phase 6 Part A.2): coldplug is
+/// the first round of hot-plug, and these are the rounds after it.
+/// 1. Once the guest logs its first round, a keyboard is added over QMP.
+/// 2. Once it logs the keyboard's arrival, **the machine is paused**, the keyboard removed and a
+///    mouse added on the same QEMU port, and the machine resumed. The guest then finds a connect
+///    change on a port that still has a device — both changes landed before it looked — which is
+///    a replug it must take as a departure and an arrival. Paused, so the two always land together:
+///    a hub thread that keeps the old device fails it every time (PR #355 review).
+/// 3. Once it logs the mouse's arrival, the mouse is removed, and the QMP connection closed —
+///    QEMU serves one QMP client at a time, and the deadline's dump of the guest needs it.
+///
+/// The lines are asserted after the run by [`check_hot_plug`]. It lands on a root port only because
+/// `test-qemu`'s controller has eight connectors: with QEMU's four, the boot's devices fill them and
+/// the keyboard goes behind the hub, where the driver does not look (PR #353 review).
+#[derive(Default)]
+struct HotPlug {
+    stage: u8,
+    from: usize,
+    qmp: Option<Qmp>,
+    /// Why the hot-plug stopped early, reported after the run rather than ending it unexplained.
+    failed: Option<String>,
+}
+
+impl HotPlug {
+    /// Act on what the guest has said so far. A failure is kept for [`check_hot_plug`], and the
+    /// connection closed.
+    fn step(&mut self, transcript: &[u8], qmp_sock: &Path) {
+        if self.stage >= 3 {
+            return;
+        }
+        if let Err(e) = self.advance(transcript, qmp_sock) {
+            self.failed = Some(e.to_string());
+            self.stage = 3;
+            self.qmp = None;
+        }
+    }
+
+    fn advance(&mut self, transcript: &[u8], qmp_sock: &Path) -> R<()> {
+        let text = String::from_utf8_lossy(transcript);
+        let after = |from: usize, fragments: &[&str]| {
+            text[from..].lines().any(|l| fragments.iter().all(|f| l.contains(f)))
+        };
+        match self.stage {
+            0 => {
+                let Some(at) = text.find(USB_FIRST_ROUND) else { return Ok(()) };
+                let qmp = self.qmp.insert(Qmp::connect(qmp_sock)?);
+                qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"hotkbd","bus":"xhci.0"}}"#)?;
+                self.from = at;
+                self.stage = 1;
+            }
+            1 if after(self.from, HOT_KEYBOARD) => {
+                let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
+                let usb = qmp.hmp("info usb")?;
+                let port = usb
+                    .lines()
+                    .find(|l| l.contains("ID: hotkbd"))
+                    .and_then(|l| l.split("Port ").nth(1))
+                    .and_then(|r| r.split(',').next())
+                    .ok_or_else(|| format!("QEMU's `info usb` does not place hotkbd: {usb:?}"))?
+                    .to_string();
+                qmp.execute(r#"{"execute":"stop"}"#)?;
+                qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotkbd"}}"#)?;
+                qmp.execute(&format!(
+                    r#"{{"execute":"device_add","arguments":{{"driver":"usb-mouse","id":"hotmouse","bus":"xhci.0","port":"{port}"}}}}"#
+                ))?;
+                qmp.execute(r#"{"execute":"cont"}"#)?;
+                self.from = text.len();
+                self.stage = 2;
+            }
+            2 if after(self.from, HOT_MOUSE) => {
+                let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
+                qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotmouse"}}"#)?;
+                self.qmp = None;
+                self.stage = 3;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// **The hot-plug's lines**, in order after the first round, all on one port: the keyboard's
+/// arrival; its departure when the mouse is swapped in; the mouse's arrival; the mouse's departure.
+/// Each departure with its slot disabled. And **the first round before userspace**: the boot waits
+/// for it, which the facts alone cannot show, since its lines would be there either way, later.
+fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
+    if let Some(why) = &hot.failed {
+        return Err(format!("the hot-plug could not be driven over QMP: {why}").into());
+    }
+    let text = String::from_utf8_lossy(transcript);
+    let Some(at) = text.find(USB_FIRST_ROUND) else {
+        return Err("the USB hub thread never finished its first round".into());
+    };
+    match text.find("init: spawned init (pid 1)") {
+        Some(init) if init > at => {}
+        Some(_) => {
+            return Err("userspace started before the USB hub thread's first round ended: the boot did \
+                        not wait for it, so a device present at boot can miss the registry's replay"
+                .into());
+        }
+        None => return Err("the kernel never said it spawned init".into()),
+    }
+    let after = &text[at..];
+    let Some(line) = after.lines().find(|l| HOT_KEYBOARD.iter().all(|f| l.contains(f))) else {
+        return Err("a keyboard plugged in after the first round never arrived: no line enumerating it".into());
+    };
+    let port = line
+        .split("usb: port ")
+        .nth(1)
+        .and_then(|r| r.split(':').next())
+        .ok_or_else(|| format!("no port in {line:?}"))?;
+    let gone = format!("usb: port {port}: disconnected; slot ");
+    let mouse = format!("usb: port {port}: 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse");
+    let mut rest = &after[after.find(line).unwrap_or(0) + line.len()..];
+    for (what, want) in [
+        ("the keyboard's departure when the mouse was swapped in", gone.as_str()),
+        ("the mouse's arrival on the same port", mouse.as_str()),
+        ("the mouse's departure", gone.as_str()),
+    ] {
+        let Some(at) = rest.find(want) else {
+            return Err(format!(
+                "after the keyboard's arrival on port {port}, no line for {what} ({want:?}): a replug \
+                 the hub thread does not take as a departure and an arrival keeps the old device"
+            )
+            .into());
+        };
+        let found = rest[at..].lines().next().unwrap_or("");
+        if want == gone && !found.contains("disabled") {
+            return Err(format!("port {port}'s departure did not disable its slot: {found:?}").into());
+        }
+        rest = &rest[at + want.len()..];
+    }
+    println!(
+        "xtask: a keyboard plugged in after boot, swapped for a mouse while the machine was paused, \
+         and pulled out — each arrival and departure on port {port}, each slot disabled ✓"
+    );
+    Ok(())
+}
+
 /// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). The laptop's
 /// Sunrise Point-LP controller has plain MSI with eight vectors and no MSI-X, and the driver takes
 /// the one interrupt mechanism that machine has, so every gate's controller is given it.
@@ -12616,11 +12762,15 @@ impl Session {
 const XHCI_DEVICE: &str = "nec-usb-xhci,id=xhci,msi=on,msix=off";
 
 /// **The USB devices `test-qemu` boots with** (Phase 6 Part A): an xHCI controller with a device
-/// at each of three speeds and one nothing matches.
+/// at each of three speeds, a hub, and one nothing matches.
 /// - `usb-kbd` attaches at high speed, `usb-mouse` with `usb_version=1` at full speed, and
 ///   `usb-storage` at SuperSpeed (QEMU 11.0.2's `info usb`). No QEMU USB device takes a low-speed
 ///   setting.
-/// - `usb-hub` is the device nothing matches: external hubs are outside Phase 6.
+/// - `usb-hub` matches as a hub, which is listed and left alone: external hubs are outside Phase 6.
+/// - **`usb-ccid`** is the device nothing matches, a smart-card reader, and **the one whose default
+///   endpoint is not its speed's default**: full speed with 64-byte packets, so its enumeration
+///   takes Evaluate Context. The other four keep the default, and QEMU's controller ignores the
+///   packet size anyway, so without it nothing would run that path (Part A.2, read off a boot).
 /// - **`p2=8,p3=8` gives eight connectors.** The defaults give four, which these four fill, and a
 ///   device plugged in later would land behind the hub, where the driver does not look (PR #353
 ///   review).
@@ -12640,7 +12790,9 @@ fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
         .arg("-device")
         .arg("usb-storage,bus=xhci.0,drive=usbstick")
         .arg("-device")
-        .arg("usb-hub,bus=xhci.0");
+        .arg("usb-hub,bus=xhci.0")
+        .arg("-device")
+        .arg("usb-ccid,bus=xhci.0");
     Ok(())
 }
 
@@ -12739,14 +12891,20 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS as u64);
     let mut timed_out = false;
+    let mut hot = HotPlug::default();
     let status = loop {
         match child.try_wait().map_err(|e| format!("wait qemu: {e}"))? {
             Some(st) => break st,
             None => {
+                if let Ok(g) = captured.lock() {
+                    hot.step(&g, &qmp_sock);
+                }
                 if std::time::Instant::now() >= deadline {
                     timed_out = true;
                     // **Interrogate before killing.** This is the whole point of owning the
-                    // deadline; once QEMU is dead the evidence is gone.
+                    // deadline; once QEMU is dead the evidence is gone. The hot-plug's connection
+                    // goes first: QEMU serves one QMP client at a time (PR #355 review).
+                    hot.qmp = None;
                     match Qmp::connect(&qmp_sock) {
                         Ok(mut qmp) => dump_guest_state(&mut qmp),
                         Err(e) => println!("\nxtask: could not reach QMP to dump state: {e}"),
@@ -12793,6 +12951,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_servers_are_service_mgrs(&transcript)?;
             check_system_control(&transcript)?;
             check_hardware_facts(&transcript)?;
+            check_hot_plug(&transcript, &hot)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -12855,6 +13014,19 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["xhci: 00:03.0 up: xHCI 1.0, 16 ports (USB 2: 9-16, USB 3: 1-8), 64 slots, 32-byte contexts, 0 scratchpad(s)"],
     &["xhci: 00:03.0: the command ring answers: a No Op completed"],
     &["drivers: 00:03.0 claimed by xhci, MSI vec "],
+    // **What the hub thread's first round found** (Part A.2): each device by its port, IDs, class,
+    // speed, name and match, without its serial, which QEMU makes from the PCI path. The stick
+    // takes a USB 3 port; the rest, USB 2 ones. The smart-card reader is the one whose default
+    // endpoint is not its speed's, so its enumeration evaluates it.
+    &["xhci: port 3 at start: connected, SuperSpeed, enabled"],
+    &["xhci: 5 of 16 ports connected at start"],
+    &["usb: port 3: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
+    &["usb: port 9: 0627:0001 class 03/01/01, high-speed, \"QEMU USB Keyboard (", "\": HID boot keyboard"],
+    &["usb: port 10: 0627:0001 class 03/01/02, full-speed, \"QEMU USB Mouse (", "\": HID boot mouse"],
+    &["usb: port 12: 0409:55aa class 09/00/00, full-speed, \"QEMU USB Hub (", "\": a hub, not supported"],
+    &["usb: port 13: its default endpoint takes 64-byte packets, not 8; evaluated"],
+    &["usb: port 13: 08e6:4433 class 0b/00/00, full-speed, \"QEMU USB CCID (", "\": nothing this kernel drives"],
+    &["usb: first round: 5 device(s) in "],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.

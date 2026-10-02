@@ -62,6 +62,20 @@ pub fn probe(flags: &crate::cmdline::Flags) {
     crate::device::log_outcomes();
 }
 
+/// **Start what drivers do after boot**: the USB hub thread (Phase 6 Part A.2). After the
+/// scheduler and the APs are up.
+pub fn start() {
+    xhci::start();
+}
+
+/// **Wait, bounded, for what [`start`] began to settle**: the USB hub thread's first round, so the
+/// hardware report lists what is attached and, once USB devices are registered (Phase 6 Part A.3),
+/// the registry holds them before userspace reads it.
+/// Before the report and `init`.
+pub fn settle() {
+    xhci::settle(xhci::FIRST_ROUND_NS);
+}
+
 /// Boot self-test: read sector 0 of the first block device and verify the boot
 /// signature (`0x55AA` at offset 510). Proves the real driver's read path end to
 /// end — `dispatch_block_irp` → controller DMA → completion. Mirrors the IOAPIC
@@ -216,7 +230,7 @@ fn read_boot_signature(buffer: &ObjectRef) -> u16 {
 }
 
 /// Adopt a freshly-created kernel object box into an owning [`ObjectRef`].
-fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
+pub(crate) fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
     // SAFETY: `into_raw` yields the single creation reference of a `ty` object.
     unsafe { ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), ty) }
 }
