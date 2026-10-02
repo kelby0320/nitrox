@@ -3905,6 +3905,16 @@ fn logs_test(root_ns: u64) -> bool {
         return fail(b"two read sessions, a third refused, and one at once after one was let go");
     }
     if e3 != KError::WouldBlock.as_i32() || e4 != 0 || again == 0 {
+        // **Which half, by number** (2026-10-01): one failure in five runs since the laptop
+        // polish's Part A, with two mints in the log rather than three, said only that one of the
+        // two did not hold. The statuses say whether the third was granted or the one after the let
+        // go was refused, which is the first thing the next occurrence has to tell us.
+        Line::new()
+            .s(b"boot-probe: logs: third endpoint status ")
+            .i(e3 as i64)
+            .s(b", after the let go ")
+            .i(e4 as i64)
+            .end();
         return fail(b"a third read endpoint refused, and one at once after this probe's was let go");
     }
     kprint(b"boot-probe: logs read a record back, refused two malformed requests, and held sessions and endpoints to two ok\n");

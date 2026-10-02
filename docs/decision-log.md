@@ -32768,3 +32768,31 @@ Docs: `shell-language.md` §11e and the plan. No kernel change; no ABI hash impa
 **Gates, 2026-10-01: 35 of 36 passed (fgb60).** `test-qemu`'s TCG run failed in `boot-probe`'s logs
 test, which Part B does not touch, and passed four reruns and its KVM run. The next entry records
 it.
+
+## 2026-10-01 — An intermittent in `boot-probe`'s logs test, made to say which half
+
+`test-qemu`'s TCG run failed once, in fgb60, at `boot-probe`'s logs test: "a third read endpoint
+refused, and one at once after this probe's was let go".
+
+**What the transcript shows.** The logging service minted two read endpoints, the broker's and the
+probe's, where every passing run mints three: the third is the one minted after the probe lets its
+own go. So the probe's resolve after the let-go was refused, most likely because the service had
+not yet seen that endpoint close.
+
+**What is not known: why.**
+- The service already retires closes before resolves within a wake.
+- A handle's close drops its object at once.
+- `boot-probe`'s lookups close their pending operations.
+
+So something else held the probe's namespace, or its endpoint, past the close, and nothing in the
+transcript says what.
+
+**How often.** It failed once in five TCG runs since the laptop polish's Part A added its grace test
+before this one, and passed every run before that. It passed four reruns and its KVM run.
+
+**Not fixed on a guess.** The failure message now carries both statuses: the third endpoint's, and
+the one asked for after the let-go. The next occurrence will say which half failed. A retry would
+make the gate pass without saying why, and would weaken the claim the test exists for: that a
+closed endpoint is retired, not waited on.
+
+No kernel change; no ABI hash impact.
