@@ -33250,3 +33250,67 @@ box drops.
 - **Stale wording:** the live gate's comment and `CLAUDE.md` said the kernel has no USB driver,
   and the driver's module doc and `usb.md` named `qemu-xhci` as the gates' controller. The first
   A.1 entry above says `qemu-xhci,p2=8,p3=8`, and the CI entry after it is its correction.
+
+## 2026-10-02 — Phase 6 Part A.2: the hub thread, enumerating
+
+**A kernel thread enumerates USB**, spawned by `drivers::start` after the APs. It is the first
+long-lived kernel thread to block in `sched::wait_on`. The boot waits for its first round in
+`drivers::settle`, bounded at two seconds, before the hardware report and `init`. Per device:
+1. a USB 2 port is reset, or a USB 3 port's link training is waited for;
+2. *Enable Slot*, then *Address Device* at the speed's default packet size;
+3. the first eight bytes, and *Evaluate Context* when the size differs (an exponent at
+   SuperSpeed);
+4. the device and configuration descriptors, then the strings;
+5. the class match, **logged and not acted on**: no `SET_CONFIGURATION`, which the binding class
+   driver will do in Parts B and D.
+
+Every command and transfer has a deadline. Later connects take the same path. A disconnect
+disables the slot; registry departures are Part C's.
+
+**The wait handoff**, the part a review should look at hardest:
+- **The thread records what it awaits before writing the TRB.** A command is named by its
+  address. A transfer is named by its slot and its Status stage's address, and an error on any
+  stage also ends it.
+- **The DPC completes outside its locks.** It takes a matching record out under a leaf lock and
+  completes the operation after releasing it, since completing takes the scheduler's lock.
+- **A timeout takes the record back.** If the DPC already took it, the thread waits for the
+  completion, so no DPC completes an operation the thread dropped.
+- **A command that goes unanswered marks the controller wedged.** Aborting the command ring is not
+  built.
+
+**`test-qemu` gained a fifth device, `usb-ccid`.** The first boot enumerated the plan's four in
+173 ms, and none of them took *Evaluate Context*: each keeps its speed's default packet size. QEMU's
+controller ignores the size anyway, so a skipped evaluation would pass unseen. So:
+- the driver logs an evaluation when it makes one;
+- the reader (full speed, 64-byte packets, class `0b`) gives the gate one to see, and is a truer
+  "nothing matches" than the hub, which matches as a hub. A hand boot with QEMU's other USB
+  devices found it, and `usb-audio` behaves the same.
+
+**The descriptor parser is tested on what QEMU's devices actually sent.** Each device's `pcap=`
+captured the bytes during an enumeration by this driver: the keyboard's, the full-speed mouse's,
+and the reader's, whose 93-byte configuration carries a 54-byte class descriptor. The captures also
+show UEFI's own enumeration before the kernel's.
+
+**One host test did not fail its control at first.** A string read past its own length passed,
+because the test only covered a descriptor claiming to be *longer* than its bytes. The driver hands
+`string_into` a 255-byte buffer with zeros after the descriptor, which would have printed as `?`s.
+The test now covers that, and its control fails it.
+
+**Gates:**
+- `test-qemu` (TCG and KVM) asserts:
+  - each port at start, and each device's line;
+  - the evaluation;
+  - the first round, and that it **ended before `init` was spawned**;
+  - a QMP hot-plug: a keyboard added once the first round is logged, removed once it arrives, and
+    its disconnect with the slot disabled.
+- **In-guest controls**, each failing its own check:
+  - a boot that does not wait;
+  - no evaluation;
+  - a DPC that ignores Transfer Events. Every device then timed out, the boot's wait gave up at
+    two seconds and said so, and the boot went on;
+  - a hub loop that ignores its wake;
+  - a disconnect that does nothing.
+- **Host tests:** contexts at both entry sizes, the control-transfer and command TRBs, and the
+  descriptors. Six controls fail their tests.
+
+No ABI hash impact: a kernel thread and log lines.

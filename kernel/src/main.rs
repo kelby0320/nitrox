@@ -365,6 +365,11 @@ fn kernel_main() {
     // from its own entry, proving it executes kernel code on the AP.
     bring_up_aps();
 
+    // **Drivers' work after boot** (Phase 6 Part A.2): the USB hub thread, which enumerates what is
+    // attached. Here, once every CPU is up, rather than before: AP bring-up is the scheduler's most
+    // delicate moment, and the overlap is worth less than staying out of it.
+    nitrox_kernel::drivers::start();
+
     // Boot self-tests (post-SMP): work distribution across the APs + CPU affinity.
     #[cfg(feature = "selftest")]
     boot_selftest::post_smp();
@@ -375,6 +380,10 @@ fn kernel_main() {
     // screen's drawing, which ran *after* this line — the binding resolved to "no aperture
     // recorded" every time, and the boot still passed because the demo is non-fatal.
     record_framebuffer();
+
+    // **The hub thread's first round, waited for** — bounded — so the report below lists what is
+    // attached, and a device present at boot is in the registry before `device-mgr` replays it.
+    nitrox_kernel::drivers::settle();
 
     // The hardware report, on a boot whose command line asked for one (Phase 5 Part D.3): here,
     // because the drivers have bound, every CPU is up or failed to be, and the framebuffer is

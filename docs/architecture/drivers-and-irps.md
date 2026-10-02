@@ -31,7 +31,7 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > discovery" the same day, when Part D made drivers report what they did with each function.
 > § "Flush" added 2026-09-24, with administration Part C.2. § "Module tiers" corrected 2026-10-02
 > (PR #353 review): its rule still made hot-pluggable drivers Tier 2, which Phase 6's decisions
-> reversed.
+> reversed. § "A kernel thread that waits" added the same day, with Phase 6 Part A.2's hub thread.
 
 ## Three concepts, kept distinct
 
@@ -219,6 +219,28 @@ have one code path regardless of whether the work was sync or async.
 > Adding `PendingOperation` and `InterruptObject` as waitables means adding arms
 > to those three match sites plus a signal path — no new wait infrastructure.
 > (`PendingOperation` lands with `phase-2/pending-operation`.)
+
+### A kernel thread that waits (Phase 6 Part A.2)
+
+A driver whose work is a sequence with waits in it can run it on **a kernel thread** instead of
+as a state machine of DPCs: `sched::spawn` makes the thread, and `sched::wait_on` — the primitive
+under `sys_wait` — blocks it with a deadline on the same waitables. The USB hub thread
+([`usb.md`](usb.md)) is the first long-lived one, and its waits are the pattern:
+- **A `PendingOperation` per operation**, completed by the DPC with
+  `sched::complete_pending_op`. The thread records what it awaits *before* the hardware can
+  answer, so no completion arrives first.
+- **The DPC completes outside its locks.** It takes the matching record out under the driver's
+  leaf lock and completes the operation after releasing it, since completing takes the scheduler's
+  lock.
+- **A timeout takes the record back.** If the DPC already took it, its completion is imminent and
+  is waited for, so a DPC never completes an object the thread has dropped — and a DPC drops none
+  itself, since freeing counts as allocating there.
+- **An `InterruptObject` for events that are not answers**, signalled by the DPC with
+  `sched::signal_interrupt`. It latches, so an event that lands while the thread is busy is
+  counted; a kernel thread consumes one with `sched::interrupt_consume`, which `sys_wait` does for
+  a process.
+- **A wait on nothing with a deadline sleeps**, which is how the thread takes the delays a
+  protocol requires without spinning.
 
 ## Device discovery and enumeration
 

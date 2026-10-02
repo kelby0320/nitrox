@@ -19,25 +19,32 @@
 //! controller started stops it first, since it would otherwise go on writing to memory this
 //! driver frees.
 //!
-//! The interrupt's DPC drains the event ring. What the events start — enumeration, from a hub
-//! thread — is Part A's second piece. See `docs/planning/phase-6-usb.md` § *Part A in detail*.
+//! The interrupt's DPC drains the event ring: a port change wakes [`hub`]'s thread, and a command's
+//! or a transfer's completion ends the wait the thread is in. See `docs/planning/phase-6-usb.md`
+//! § *Part A in detail*.
 
 pub mod caps;
+pub mod context;
+pub mod desc;
+mod hub;
 pub mod ring;
 
+pub use hub::FIRST_ROUND_NS;
+
 use core::fmt;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
+use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec};
 use crate::mm::dma::DmaBuffer;
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
-use crate::object::ObjectRef;
+use crate::object::{InterruptObject, ObjectRef, PendingOperation};
 use ring::{Consumer, Producer, Slots, Trb, code, kind};
 
 /// PCI class, subclass and programming interface of an xHCI controller.
@@ -128,20 +135,57 @@ pub struct Xhci {
     op: u64,
     rt: u64,
     db: u64,
+    /// How many ports it has, numbered from 1.
+    max_ports: u8,
+    /// Where an input context's entries are, for its context size.
+    layout: context::Layout,
     /// The ports' USB versions.
     caps: caps::ExtCaps,
-    /// The device context base array, and the scratchpad buffers and their array, which are the
-    /// controller's from here on.
-    _dcbaa: DmaBuffer,
+    /// The device context base array, whose slot entries the hub thread writes, and the
+    /// scratchpad buffers and their array, which are the controller's from here on.
+    dcbaa: DmaBuffer,
     _scratch: Scratchpads,
-    /// The command ring. A.2's hub thread writes it; probe's No Op is its first TRB.
+    /// The command ring. The hub thread writes it; probe's No Op is its first TRB.
     cmd: IrqSpinLock<CommandRing>,
     /// The event ring and its segment table, which only the DPC reads after bring-up.
     events: IrqSpinLock<EventRing>,
     _erst: DmaBuffer,
-    /// Port Status Change Events seen, which A.2's hub thread acts on.
+    /// Port Status Change Events seen.
     port_changes: AtomicU32,
+    /// **What wakes the hub thread**: the DPC signals it on every port change. Latching, so a
+    /// change that lands while the thread is busy is counted, not lost.
+    hub_wake: ObjectRef,
+    /// Completed by the hub thread when its first round is done, for the boot to wait on.
+    first_round: ObjectRef,
+    /// The one command or transfer the hub thread is waiting for, which the DPC completes.
+    waiting: IrqSpinLock<Option<Waiting>>,
+    /// A command went unanswered: the command ring may be stuck, and nothing more is asked of it.
+    wedged: AtomicBool,
 }
+
+/// What the hub thread is waiting for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Awaited {
+    /// The completion of the command at this address.
+    Command { trb: u64 },
+    /// The default endpoint of `slot`: the Status stage at `status`, or an error on any stage of
+    /// the transfer. A short Data stage is passed over, since its Status stage follows.
+    Transfer { slot: u8, status: u64 },
+}
+
+/// A wait, and the operation that ends it.
+struct Waiting {
+    awaited: Awaited,
+    po: PoPtr,
+}
+
+/// A `PendingOperation`, by address: the waiting thread's reference pins it until the record is
+/// taken back or the operation completes.
+struct PoPtr(*mut ());
+
+// SAFETY: the pointer names a kernel object whose reference count is atomic, and it is only
+// completed through `sched::complete_pending_op`, which serialises on `SCHED`.
+unsafe impl Send for PoPtr {}
 
 /// The command ring's memory and its producer.
 struct CommandRing {
@@ -410,17 +454,26 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     }
     crate::pci::set_intx_disabled(&cfg, true);
 
+    let (Ok(wake), Ok(first)) = (InterruptObject::try_new(), PendingOperation::try_new()) else {
+        return declined(OUT_OF_MEMORY);
+    };
     let x = Xhci {
         op,
         rt,
         db,
+        max_ports,
+        layout: context::Layout::new(hcc1 & HCC_CSZ != 0),
         caps: ext,
-        _dcbaa: dcbaa,
+        dcbaa,
         _scratch: scratch,
         cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: cmd_mem, ring: cmd_ring }),
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: ev_mem, ring: Consumer::new() }),
         _erst: erst,
         port_changes: AtomicU32::new(0),
+        hub_wake: crate::drivers::adopt(wake, KObjectType::InterruptObject),
+        first_round: crate::drivers::adopt(first, KObjectType::PendingOperation),
+        waiting: IrqSpinLock::new(LockRank::Leaf, None),
+        wedged: AtomicBool::new(false),
     };
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. The first
@@ -581,8 +634,10 @@ extern "C" fn isr() {
     crate::dpc::enqueue(&XHCI_DPC);
 }
 
-/// Drain the event ring, then tell the controller where the drain stopped. No allocation, and no
-/// freeing: a DPC may do neither.
+/// Drain the event ring a batch at a time, telling the controller where each drain stopped, and
+/// act on each event **with the ring's lock released**: completing an operation takes the
+/// scheduler's lock, which no leaf lock may be held across. No allocation, and no freeing: a DPC
+/// may do neither.
 fn xhci_dpc(_ctx: *mut ()) {
     let x = XHCI.load(Ordering::Acquire);
     if x.is_null() {
@@ -590,15 +645,101 @@ fn xhci_dpc(_ctx: *mut ()) {
     }
     // SAFETY: as `isr`.
     let x = unsafe { &*x };
-    let mut ev = x.events.lock();
-    let EventRing { mem, ring } = &mut *ev;
-    while let Some(trb) = ring.next(&DmaSlots(mem)) {
-        if trb.kind() == kind::PORT_STATUS_CHANGE {
-            x.port_changes.fetch_add(1, Ordering::Relaxed);
+    const BATCH: usize = 16;
+    loop {
+        let mut batch = [Trb::default(); BATCH];
+        let mut n = 0;
+        {
+            let mut ev = x.events.lock();
+            let EventRing { mem, ring } = &mut *ev;
+            while n < BATCH {
+                let Some(trb) = ring.next(&DmaSlots(mem)) else { break };
+                batch[n] = trb;
+                n += 1;
+            }
+            let at = mem.phys().as_u64() + ring.dequeue() as u64 * 16;
+            write64(x.rt + IR0, ERDP, at | ERDP_EHB);
+        }
+        for trb in &batch[..n] {
+            on_event(x, trb);
+        }
+        if n < BATCH {
+            break;
         }
     }
-    let at = mem.phys().as_u64() + ring.dequeue() as u64 * 16;
-    write64(x.rt + IR0, ERDP, at | ERDP_EHB);
+}
+
+/// One event: a port change wakes the hub thread, and a completion ends the wait it is in.
+fn on_event(x: &Xhci, trb: &Trb) {
+    match trb.kind() {
+        kind::PORT_STATUS_CHANGE => {
+            x.port_changes.fetch_add(1, Ordering::Relaxed);
+            crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+        }
+        kind::COMMAND_COMPLETION => complete_if(
+            x,
+            |a| a == Awaited::Command { trb: trb.pointer() },
+            trb.completion_code(),
+            trb.slot_id() as u64,
+        ),
+        kind::TRANSFER_EVENT => complete_if(
+            x,
+            |a| match a {
+                Awaited::Transfer { slot, status } => {
+                    slot == trb.slot_id()
+                        && trb.endpoint_id() == context::DCI_EP0
+                        && (trb.pointer() == status || !matches!(trb.completion_code(), code::SUCCESS | code::SHORT_PACKET))
+                }
+                Awaited::Command { .. } => false,
+            },
+            trb.completion_code(),
+            trb.residual() as u64,
+        ),
+        _ => {}
+    }
+}
+
+/// **Take the waiting record if `matches` it, then complete its operation** with `code` and
+/// `result`. Taken under the lock, so the thread can tell a record the DPC holds from one it may
+/// take back; completed after it, since that takes the scheduler's lock.
+fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u64) {
+    let taken = {
+        let mut w = x.waiting.lock();
+        if w.as_ref().is_some_and(|w| matches(w.awaited)) { w.take() } else { None }
+    };
+    if let Some(w) = taken {
+        crate::sched::complete_pending_op(w.po.0, code as i32, result);
+    }
+}
+
+/// **Start the hub thread**, if a controller was claimed. After the scheduler and the APs are up.
+pub fn start() {
+    if XHCI.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    if crate::sched::spawn(hub::main, 0).is_err() {
+        crate::kprintln!("xhci: no memory for the hub thread; nothing will be enumerated");
+    }
+}
+
+/// **Wait for the hub thread's first round**, up to `bound_ns`, so the hardware report lists what
+/// is attached and the registry holds it before userspace reads it. A bound that passes is said;
+/// whatever is still enumerating arrives later.
+pub fn settle(bound_ns: u64) {
+    let x = XHCI.load(Ordering::Acquire);
+    if x.is_null() {
+        return;
+    }
+    // SAFETY: published once, never withdrawn.
+    let x = unsafe { &*x };
+    let now = crate::arch::Timer::read_ns();
+    let po = x.first_round.as_ptr();
+    if !matches!(crate::sched::wait_on(&[po as usize], now + bound_ns, now), crate::sched::WaitResult::Signaled(_)) {
+        crate::kprintln!(
+            "usb: the first round was not done in {} ms; what is still enumerating arrives later",
+            bound_ns / 1_000_000
+        );
+    }
 }
 
 /// A function's PCI address, as the log shows it.

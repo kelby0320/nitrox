@@ -1,7 +1,8 @@
 # Boot Flow
 
 **Status:** Current (last checked 2026-10-02, when `drivers::probe` began claiming the USB host
-controller — Phase 6 Part A.1 — and `usb=off` joined the command line; before that 2026-10-01,
+controller — Phase 6 Part A.1 — `usb=off` joined the command line, and the boot began waiting for
+the USB hub thread's first round before the report — Part A.2; before that 2026-10-01,
 when the boot began by naming the commit it was built from — the laptop polish's Part D; before that 2026-09-30, when administration Part G.1 gave the
 install entry
 a third module, `install-root.img`, the pristine root the installer copies, and G.2 had the installer
@@ -248,11 +249,18 @@ each step's rationale is in the source comments:
     failure). Absent an SMP response the system stays single-CPU. **Fatal** since 2026-08-19
     if a CPU we launched fails to come online within 5 s, whether it faulted on the way in or
     never reached our code: the kernel's view of the machine must match the machine, so it
-    stops rather than booting a topology nobody chose. See `docs/decision-log.md`.
+    stops rather than booting a topology nobody chose. See `docs/decision-log.md`. Then
+    **`drivers::start`** spawns the USB hub thread, when a controller was claimed (Phase 6 Part
+    A.2): after the APs, not during their bring-up, the scheduler's most delicate moment.
 12. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
     layout) so `/dev/framebuffer` can serve it. Must precede the first userspace process, which
     binds that path into init's namespace.
-13. **The hardware report**, only on a command line with `hwreport` (`kernel/src/report.rs`). Here
+13. **`drivers::settle`** waits, up to two seconds, for the hub thread's first round, so the
+    report below lists what USB has attached and a device present at boot is in the registry
+    before userspace reads it. On a machine with nothing attached it costs the debounce, 100 ms; a
+    bound that passes is logged, and the boot goes on.
+
+    **The hardware report**, only on a command line with `hwreport` (`kernel/src/report.rs`). Here
     because every fact it shows now exists — drivers bound, CPUs up, the aperture recorded — and no
     userspace does. It copies the kernel log out of the ring, holds the framebuffer console
     (writes still reach the grid and COM1, and none is drawn over the page), and shows the log a

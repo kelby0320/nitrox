@@ -20,8 +20,22 @@ pub struct Trb(pub [u32; 4]);
 
 /// TRB types (xHCI 1.2 Table 6-91), in dword 3's bits 15:10.
 pub mod kind {
+    /// A control transfer's Setup stage.
+    pub const SETUP: u32 = 2;
+    /// A control transfer's Data stage.
+    pub const DATA: u32 = 3;
+    /// A control transfer's Status stage.
+    pub const STATUS: u32 = 4;
     /// Link: the next TRB is at the address this one carries.
     pub const LINK: u32 = 6;
+    /// Enable Slot Command: the completion names a free slot.
+    pub const ENABLE_SLOT: u32 = 9;
+    /// Disable Slot Command.
+    pub const DISABLE_SLOT: u32 = 10;
+    /// Address Device Command.
+    pub const ADDRESS_DEVICE: u32 = 11;
+    /// Evaluate Context Command.
+    pub const EVALUATE_CONTEXT: u32 = 13;
     /// No Op Command: completes with Success and does nothing else.
     pub const NO_OP_COMMAND: u32 = 23;
     /// Transfer Event.
@@ -36,7 +50,21 @@ pub mod kind {
 pub mod code {
     /// The command or transfer did what it was asked.
     pub const SUCCESS: u8 = 1;
+    /// A transfer stalled: the device refused the request.
+    pub const STALL: u8 = 6;
+    /// A transfer ended short: the device sent less than was asked for.
+    pub const SHORT_PACKET: u8 = 13;
 }
+
+/// Dword 3 bit 5: Interrupt On Completion.
+const IOC: u32 = 1 << 5;
+/// A Setup TRB's dword 3 bit 6: its parameter is the setup packet itself.
+const IDT: u32 = 1 << 6;
+/// A Data or Status TRB's dword 3 bit 16: the direction is IN.
+const DIR_IN: u32 = 1 << 16;
+/// A Setup TRB's Transfer Type, in dword 3 bits 17:16: no data stage, or an IN one.
+const TRT_NO_DATA: u32 = 0;
+const TRT_IN: u32 = 3 << 16;
 
 /// Dword 3 bit 0: the cycle bit.
 const CYCLE: u32 = 1;
@@ -90,6 +118,47 @@ impl Trb {
     pub const fn port_id(&self) -> u8 {
         (self.0[0] >> 24) as u8
     }
+
+    /// A Transfer Event's endpoint: its Device Context Index.
+    pub const fn endpoint_id(&self) -> u8 {
+        ((self.0[3] >> 16) & 0x1F) as u8
+    }
+
+    /// A Transfer Event's residual: the bytes of its TRB that were not transferred.
+    pub const fn residual(&self) -> u32 {
+        self.0[2] & 0x00FF_FFFF
+    }
+
+    /// **A Setup stage** carrying its eight-byte request as immediate data, for a transfer with an
+    /// IN data stage when `data_in` and none otherwise.
+    pub const fn setup(request: [u8; 8], data_in: bool) -> Trb {
+        let lo = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+        let hi = u32::from_le_bytes([request[4], request[5], request[6], request[7]]);
+        let trt = if data_in { TRT_IN } else { TRT_NO_DATA };
+        Trb([lo, hi, 8, kind::SETUP << 10 | IDT | trt])
+    }
+
+    /// **An IN Data stage** of `len` bytes into `buffer`.
+    pub const fn data_in(buffer: u64, len: u32) -> Trb {
+        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10 | DIR_IN])
+    }
+
+    /// **The Status stage**, interrupting on completion: OUT after an IN data stage, IN when there
+    /// was none (USB 2.0 §8.5.3).
+    pub const fn status(after_data_in: bool) -> Trb {
+        let dir = if after_data_in { 0 } else { DIR_IN };
+        Trb([0, 0, 0, kind::STATUS << 10 | dir | IOC])
+    }
+
+    /// A command naming a slot: Disable Slot.
+    pub const fn disable_slot(slot: u8) -> Trb {
+        Trb([0, 0, 0, kind::DISABLE_SLOT << 10 | (slot as u32) << 24])
+    }
+
+    /// A command taking an input context at `input` for `slot`: Address Device or Evaluate Context.
+    pub const fn with_input(kind: u32, input: u64, slot: u8) -> Trb {
+        Trb([input as u32, (input >> 32) as u32, 0, kind << 10 | (slot as u32) << 24])
+    }
 }
 
 /// The memory a ring's TRBs are in.
@@ -129,6 +198,12 @@ impl Producer {
     /// endpoint context's dequeue pointer, carries.
     pub fn cycle(&self) -> bool {
         self.cycle
+    }
+
+    /// The slot the next [`push`](Self::push) writes, so a caller can say which TRB it awaits
+    /// **before** the controller can complete it.
+    pub fn next_slot(&self) -> usize {
+        self.enqueue
     }
 
     /// Write `trb` at the enqueue slot with this ring's cycle bit, and return the slot it went in.
@@ -314,6 +389,44 @@ mod tests {
         assert_eq!(got, vec![3, 4], "the wrap, and the second time round written with cycle 0");
         assert_eq!(ev.dequeue(), 1);
         assert_eq!(ev.next(&mem), None, "slot 1 still holds last round's event");
+    }
+
+    /// **A control transfer's three stages**, each field where xHCI 1.2 §6.4.1.2 puts it: a
+    /// GET_DESCRIPTOR(device, 18) as the Setup stage's immediate data, an IN Data stage, and the
+    /// OUT Status stage that follows one, which alone interrupts.
+    #[test]
+    fn a_control_transfers_stages_encode_as_the_specification_lays_them_out() {
+        let get = [0x80, 6, 0, 1, 0, 0, 18, 0];
+        let setup = Trb::setup(get, true);
+        assert_eq!(setup.0, [0x0100_0680, 0x0012_0000, 8, kind::SETUP << 10 | 1 << 6 | 3 << 16]);
+        assert_eq!(Trb::setup(get, false).0[3], kind::SETUP << 10 | 1 << 6, "no data stage: TRT 0");
+        let data = Trb::data_in(0x1_0000_2000, 18);
+        assert_eq!(data.0, [0x2000, 0x1, 18, kind::DATA << 10 | 1 << 16]);
+        assert_eq!(Trb::status(true).0[3], kind::STATUS << 10 | 1 << 5, "OUT after IN data");
+        assert_eq!(Trb::status(false).0[3], kind::STATUS << 10 | 1 << 16 | 1 << 5, "IN with no data");
+        let addr = Trb::with_input(kind::ADDRESS_DEVICE, 0x3000, 7);
+        assert_eq!(addr.0, [0x3000, 0, 0, kind::ADDRESS_DEVICE << 10 | 7 << 24], "BSR clear");
+        assert_eq!(Trb::disable_slot(7).0[3], kind::DISABLE_SLOT << 10 | 7 << 24);
+        assert_eq!(Trb::of_kind(kind::ENABLE_SLOT).0[3], 9 << 10, "slot type 0");
+    }
+
+    /// A Transfer Event's endpoint and residual, from dwords 3 and 2.
+    #[test]
+    fn a_transfer_events_endpoint_and_residual_read_from_their_bits() {
+        let ev = Trb([0x2000, 0, (code::SHORT_PACKET as u32) << 24 | 46, 4 << 24 | 1 << 16 | kind::TRANSFER_EVENT << 10 | 1]);
+        assert_eq!((ev.slot_id(), ev.endpoint_id(), ev.residual()), (4, 1, 46));
+        assert_eq!(ev.completion_code(), code::SHORT_PACKET);
+    }
+
+    /// The producer says where the next TRB goes before it is written, including after a wrap.
+    #[test]
+    fn the_next_slot_is_known_before_the_push() {
+        let mut mem = Mem(vec![Trb::default(); 4]);
+        let mut ring = Producer::new(&mut mem, BASE);
+        for _ in 0..5 {
+            let next = ring.next_slot();
+            assert_eq!(ring.push(&mut mem, numbered(0)), next);
+        }
     }
 
     /// A Command Completion Event as the specification lays it out (xHCI 1.2 §6.4.2.2), read field

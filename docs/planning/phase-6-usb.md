@@ -470,7 +470,11 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
   because its default offers MSI-X alone (decision log).
 - **A.2 The hub thread and enumeration.** `drivers::start`; the first round and the boot's bounded
   wait; the per-device sequence through the strings; the class table; later connects and
-  disconnects.
+  disconnects. **Built 2026-10-02**: the first boot enumerated QEMU's four devices in 173 ms, and
+  the hot-plug worked as planned. `test-qemu` gained a **fifth device, `usb-ccid`**, because none
+  of the four takes Evaluate Context: each keeps its speed's default packet size, and QEMU ignores
+  the size anyway. The reader is full-speed with 64-byte packets, and is also a truer "nothing
+  matches" than the hub, which matches as a hub.
 - **A.3 The records.** `UsbDevice`, `port` and `speed`, names in the table's entries, and
   `device-mgr`'s names.
 - **A.4 Docs.** Below.
