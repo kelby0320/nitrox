@@ -33173,3 +33173,32 @@ Beside it:
   - `usb=off` and `usb=on`.
 
 No ABI hash impact: a driver and a command-line flag.
+
+## 2026-10-02 — PR #354's CI: QEMU 8.2's `qemu-xhci` cannot have MSI
+
+A.1's first CI run failed every boot that attached the controller, with "Property 'qemu-xhci.msi'
+not found". CI runs QEMU 8.2.2, from Ubuntu 24.04; the configuration had been read off QEMU 11.0.2's
+property list. In 8.2, `qemu-xhci`'s instance init sets `msi = OFF` and `msix = AUTO`, with no
+property to change either (`hw/usb/hcd-xhci-pci.c` at `v8.2.2`). So on CI's QEMU that device offers
+MSI-X alone, and the driver, which takes MSI as the laptop's controller has it, would decline it.
+
+**The gates use `nec-usb-xhci`.**
+- It is the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity, `1033:0194`.
+- In 8.2 it takes `msi` and `msix` as properties (`hcd-xhci-nec.c`), as it does in 11. Its
+  SuperSpeed ports come first, by its own default, as `qemu-xhci`'s do.
+- `p2` and `p3` belong to the shared core, aliased onto both models.
+- `XHCI_DEVICE` is `nec-usb-xhci,id=xhci,msi=on,msix=off`.
+
+**Checked under 8.2 before pushing, not by another CI round.** Ubuntu 24.04's QEMU, in a container:
+- It accepts the whole command line, including the smart-card reader A.2 adds.
+  `hw-usb-smartcard.so` ships in `qemu-system-common`, which `qemu-system-x86` depends on.
+- A boot of a fresh test image with `test-qemu`'s devices reports the controller's facts exactly
+  as QEMU 11 does, claims it over MSI, and reaches `boot-probe`'s PASS.
+- An earlier container boot of an image a `test-qemu` run had already used failed one
+  `boot-probe` check: those checks write to the image, so the copy carried the last run's state.
+
+The pinned PCI fact now holds only the identity and `caps msi64`, which both versions report.
+
+**What this cost:** the plan said "both machines have MSI", and A.1's first boot showed QEMU's
+default did not. The fix chose a property that only QEMU 11 has, so the fix was wrong for CI. A
+configuration choice is checked against the QEMU that CI runs.

@@ -4192,7 +4192,7 @@ fn run_installed_boot_steps(session: &mut Session, qmp: &mut Qmp) -> R<()> {
 /// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5
 /// Part C).
 ///
-/// Boots `nitrox-live.img` attached as a **USB stick** (`qemu-xhci` + `usb-storage`) with nothing
+/// Boots `nitrox-live.img` attached as a **USB stick** (an xHCI, [`XHCI_DEVICE`], + `usb-storage`) with nothing
 /// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
 /// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
 ///
@@ -12602,12 +12602,16 @@ impl Session {
     }
 }
 
-/// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). On q35,
-/// `qemu-xhci` defaults to `msi=off` and offers MSI-X alone, which the plan did not know: it said
-/// both machines have MSI. The laptop's Sunrise Point-LP controller has plain MSI with eight
-/// vectors and no MSI-X, and the driver takes the one interrupt mechanism that machine has. So
-/// every gate's controller is given it, and its interrupt path is the laptop's.
-const XHCI_DEVICE: &str = "qemu-xhci,id=xhci,msi=on,msix=off";
+/// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). The laptop's
+/// Sunrise Point-LP controller has plain MSI with eight vectors and no MSI-X, and the driver takes
+/// the one interrupt mechanism that machine has, so every gate's controller is given it.
+///
+/// **`nec-usb-xhci`, not `qemu-xhci`**: the same xHCI core with the NEC µPD720200's identity
+/// (`1033:0194`). `qemu-xhci` offers MSI-X alone on q35, and only QEMU 11 lets that be changed —
+/// QEMU 8.2, which CI runs, hard-codes it, with no `msi` property, so the first version of this
+/// constant failed every CI boot that attached it (PR #354). The NEC model takes `msi` and `msix`
+/// in both, and numbers its SuperSpeed ports first, as `qemu-xhci` does.
+const XHCI_DEVICE: &str = "nec-usb-xhci,id=xhci,msi=on,msix=off";
 
 /// **The USB devices `test-qemu` boots with** (Phase 6 Part A): an xHCI controller with a device
 /// at each of three speeds and one nothing matches.
@@ -12842,8 +12846,10 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // **The xHCI, claimed** (Phase 6 Part A.1), configured as the laptop's is: MSI, no MSI-X
     // ([`XHCI_DEVICE`]). Its facts are QEMU's, read off the first boot: the USB 3 ports first, then
     // the USB 2 ones, as its Supported Protocol capabilities say. And the rings, the doorbell and
-    // the event ring proved by a No Op before the outcome is claimed.
-    &["pci 00:03.0 1b36:000d class 0c.03.30 pin 1 caps msi64 pcie"],
+    // the event ring proved by a No Op before the outcome is claimed. Its PCI line is held to what
+    // QEMU 8.2 and 11 both say — the identity and a 64-bit MSI capability — since CI runs the first
+    // and a workstation may run the second.
+    &["pci 00:03.0 1033:0194 class 0c.03.30 ", "caps msi64"],
     &["xhci: 00:03.0 up: xHCI 1.0, 16 ports (USB 2: 9-16, USB 3: 1-8), 64 slots, 32-byte contexts, 0 scratchpad(s)"],
     &["xhci: 00:03.0: the command ring answers: a No Op completed"],
     &["drivers: 00:03.0 claimed by xhci, MSI vec "],

@@ -44,9 +44,11 @@ driver frees. `usb=off` on the command line declines the controller outright; th
 has no boot menu to type it at, but the live stick's does.
 
 **MSI only.** The laptop's controller has MSI with eight vectors and no MSI-X, and the driver
-takes that. QEMU's `qemu-xhci` defaults to MSI-X alone on q35, so every gate configures it with
-`msi=on,msix=off` (`XHCI_DEVICE` in `tools/xtask/src/main.rs`): the gates' interrupt path is the
-laptop's.
+takes that. **Every gate's controller is QEMU's `nec-usb-xhci` with `msi=on,msix=off`**
+(`XHCI_DEVICE` in `tools/xtask/src/main.rs`), so the gates' interrupt path is the laptop's. It is
+the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity (`1033:0194`). `qemu-xhci`
+offers MSI-X alone on q35, and QEMU 8.2 — CI's — hard-codes that, with no `msi` property; the NEC
+model takes `msi` and `msix` in 8.2 and 11 alike.
 
 **The ports' USB versions come from the Supported Protocol capabilities**, never from an assumed
 order. QEMU's controller numbers its USB 3 ports first: with `p2=8,p3=8`, USB 3 is 1–8 and USB 2
