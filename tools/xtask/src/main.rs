@@ -1404,25 +1404,29 @@ fn cmd_qemu(
 /// branch was dead and four documents said the shell coloured its diagnostics. This is what
 /// would have caught it.
 fn check_diagnostic_colour(transcript: &str) -> R<()> {
-    let open = "\x1b[91m";
-    let Some(at) = transcript.find(open) else {
+    let Some(at) = transcript.find("\x1b[91m") else {
         return Err("no diagnostic was printed in the design's colour: the transcript holds no \
                     `ESC[91m`, although this gate provokes several errors at a real prompt. \
                     Painting a path nothing calls looks exactly like this"
             .into());
     };
-    // **And the reset closes before the line ends.** `tty_write_crlf` makes a chunk of anything
-    // after a `\n`, so a reset on the far side of one is a blank line with `ESC[0m` at the head
-    // of the next. Checked here because the shape only goes wrong on the wire.
-    let rest = &transcript[at + open.len()..];
-    let end = rest.find("\x1b[0m").ok_or("a diagnostic was opened in colour and never reset")?;
-    let body = &rest[..end];
-    if body.contains('\n') || body.contains('\r') {
-        return Err(format!(
-            "a diagnostic's colour spans a line ending ({body:?}): the reset belongs before it, \
-             or `tty_write_crlf` prints a blank line with `ESC[0m` on the next one"
-        )
-        .into());
+    // **And the reset closes before the line ends**, for an error and for a warning, which since
+    // the laptop polish's Part E is painted the same way in a colour of its own (20b(d) requires
+    // one). `tty_write_crlf` makes a chunk of anything after a `\n`, so a reset on the far side of
+    // one is a blank line with `ESC[0m` at the head of the next. Checked here because the shape
+    // only goes wrong on the wire.
+    let warning = transcript.find("\x1b[93m");
+    for at in core::iter::once(at).chain(warning) {
+        let rest = &transcript[at + "\x1b[91m".len()..];
+        let end = rest.find("\x1b[0m").ok_or("a diagnostic was opened in colour and never reset")?;
+        let body = &rest[..end];
+        if body.contains('\n') || body.contains('\r') {
+            return Err(format!(
+                "a diagnostic's colour spans a line ending ({body:?}): the reset belongs before it, \
+                 or `tty_write_crlf` prints a blank line with `ESC[0m` on the next one"
+            )
+            .into());
+        }
     }
     println!("  ok: a diagnostic reached the terminal in colour, reset before its line ended");
     Ok(())
@@ -2110,13 +2114,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          the line above passed while every program `with` ran had none — and on the laptop,
     //          whose kernel log nobody sees once the desktop is up, the installer printed nothing
     //          after the password (2026-09-30). What tells them apart is the shell: it paints each
-    //          diagnostic it drains, and `kprint` paints nothing.
-    if !listing.contains("\x1b[91m/dev/blk/0 (") {
+    //          error and warning it drains, and `kprint` paints nothing. **A warning's colour** since
+    //          the laptop polish's Part E: the disk is not offered, and that is not a failure.
+    if !listing.contains("\x1b[93m/dev/blk/0 (") {
         return Err(format!(
-            "`with admin nxinstall`'s message about /dev/blk/0 did not come through the shell: it \
-             is not in the diagnostic colour, so it reached the console by `kprint` — the program \
-             was given no `stderr`, and on a machine with no serial port nobody would see it: \
-             {listing:?}"
+            "`with admin nxinstall`'s message about /dev/blk/0 is not in the warning colour: \
+             either it reached the console by `kprint` — the program was given no `stderr`, and \
+             on a machine with no serial port nobody would see it — or it was not sent as a \
+             warning: {listing:?}"
         )
         .into());
     }
@@ -2197,6 +2202,22 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("disk --list | filter name == \"blk-0\"")?;
     s.expect("QEMU HARDDISK (QM00001)")?;
     s.expect("/home>")?;
+    //          **And `--help` is an answer, not an error** (the laptop polish's Part E). It was sent
+    //          to `stderr`, which the shell paints as an error; now it is text on `stdout`. Drawn
+    //          plain first — what a person saw — and then counted, which tells `stdout` from a
+    //          plain notice: on `stderr`, a pipeline's `count` sees no rows and says 0. Neither
+    //          typed line holds the usage or the count.
+    let help_from = s.transcript().len();
+    s.send("disk --help")?;
+    s.expect("usage: disk --list")?;
+    s.expect("/home>")?;
+    let help = s.transcript()[help_from..].to_string();
+    if help.contains("\x1b[91m") || help.contains("\x1b[93m") {
+        return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
+    }
+    s.send("format(\"help-rows={}\", (disk --help | count))")?;
+    s.expect("help-rows=13")?;
+    s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
     //          nothing answers, and `disk` names `with`.
@@ -2222,8 +2243,15 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     //      (b) A copy of the policy, to put back at the end.
     admin(s, "with --show ./policy.txt")?;
-    s.expect("with: wrote the policy to a copy")?;
+    //          **And said as a notice** (the laptop polish's Part E): the line on `stderr` names the
+    //          file, where the console's says "a copy", so finding it proves the path — and it is
+    //          drawn plain, where every diagnostic was once drawn as an error. The two arrive in no
+    //          order the guest promises.
+    s.expect_all(&["with: wrote the policy to a copy", "with: wrote the policy to ./policy.txt ("])?;
     s.expect("/home>")?;
+    if s.transcript().contains("\x1b[91mwith: wrote the policy to") {
+        return Err("`with --show FILE`'s notice was drawn in the error colour".into());
+    }
     //      (c) **An edited copy, one view more**, typed as lists of lines — `save` writes a list of
     //          strings a line each, where a single string would be a character per line. **In
     //          parts, each under the console's 256-byte input ring**
@@ -9775,6 +9803,14 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "remove /nothing-here")?;
     session.expect("nxterm: grid> remove: ")?;
     println!("  ok: a stage's diagnostic rendered in the grid, not on the kernel log");
+
+    // **And `nxsh --help` reaches the terminal** (the laptop polish's Part E). A shell running a
+    // script is handed a terminal and set it aside, so its usage went to `kprint`: serial showed
+    // it, and a person at a window saw nothing. The grid is narrated only from what reaches the
+    // terminal, and the typed line does not hold the usage.
+    type_at_terminal(&mut qmp, "nxsh --help")?;
+    session.expect("nxterm: grid> usage: nxsh [SCRIPT.nx | -c SOURCE]")?;
+    println!("  ok: `nxsh --help` rendered in the grid, not on the kernel log");
 
     // **And it follows the shell.** The line above proves the announcement arrives once; this
     // proves it is the shell's *current* answer rather than a value read at startup — which is

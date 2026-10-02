@@ -32878,3 +32878,66 @@ reviewer deleted the call, and every gate passed.
 - The `views.toml` schema's `auth` row says a password is remembered per view, per terminal.
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-02 — Laptop polish Part E: a diagnostic's level, and `--help` on `stdout`
+
+On the laptop, `nxinstall`'s progress, its "done", and every program's `--help` were drawn in the
+error colour. The shell painted every message on `stderr` the same, because a message said nothing
+about what it was. The maintainer first suggested moving progress to `stdout`. It stays on
+`stderr`, because `stdout` is the pipeline's value and the shell shows it only when the pipeline
+ends (2026-10-01).
+
+**A level is one leading byte** (`libstream::diag`): `0x01` a notice, `0x02` a warning.
+- **A message whose first byte is neither is an error, whole.** Every sender that predates this
+  writes such messages, so nothing that was an error stopped being one, and about 250 error lines in
+  the coreutils needed no change.
+- No text starts with either control.
+- The shell strips the byte, and paints an error red (`SGR 91`), a warning bright yellow
+  (`SGR 93`, new; the design had no warning colour), and a notice plain. Through `kprint` the text
+  goes alone.
+
+**`--help` and `--version` are answers, not diagnostics.**
+- `Stage::answer` writes them to `stdout` as a `TEXT_FALLBACK` stream, which the shell prints as
+  lines and a pipeline can take, and sends them as a notice only with no `stdout`. Every coreutil
+  and `with` use it, and `nxinstall` does the same with its own lines.
+- `--version` was not in the plan: it was the same two lines as `--help`, drawn as an error the
+  same way.
+- **`nxsh --help`** writes on the terminal it was handed. In script mode the shell sets its
+  terminal aside, so the usage went to `kprint`, which nobody sees on a machine with no serial port.
+- **`with --show`** with no file writes the policy to `stdout` the same way. As one diagnostic, a
+  policy longer than a message's payload went to the kernel log.
+
+**What became a notice or a warning:**
+- **Notices:**
+  - `nxinstall`'s progress, "done", "nothing was written." and a cancelled question;
+  - a result said in words where there is no `stdout`;
+  - `shutdown`'s "shutting down";
+  - `account`'s "set a new password";
+  - a broker's answer that it did what was asked.
+- **Warnings:**
+  - `nxinstall`'s notes on a withheld disk;
+  - `with`'s "gets no diagnostic channel";
+  - `date`'s clock set for this boot only;
+  - `log`'s dropped records.
+- Everything else stays an error.
+
+**Gates, with controls:**
+- **`test-interactive` 20b(d)** asserts the warning colour on `nxinstall`'s note about `/dev/blk/0`.
+  On serial, colour is still what tells the shell's path from `kprint`.
+  - *Control:* every level painted red fails it.
+- **The `disk --help` check** reads the usage with no diagnostic colour.
+  - *Control:* `--help` sent as an error fails it.
+- **The count:** `disk --help | count` must be 13. A plain notice would pass the colour check, so
+  this is what proves the usage is on `stdout`.
+  - *Control:* `--help` sent as a notice reads nothing.
+- **20d(b)** reads `with --show FILE`'s notice plain. Its `stderr` line names the file, where the
+  console's says "a copy".
+  - *Control:* a notice painted red fails it.
+- The colour reset check covers a warning too.
+- **`check-terminal`** reads `nxsh --help` in the grid.
+  - *Control:* the usage through `kprint` reaches the serial port and not the grid.
+- Host tests cover the framing, a message with no level byte, and the colour for each level.
+
+Docs: `pipeline-stdio.md` (a section on the level), `shell-language.md` §1 and §10f,
+`console-and-tty.md` (and its Status), and the plan, which is now complete. No kernel change, so no
+ABI hash impact.

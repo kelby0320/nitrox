@@ -89,12 +89,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"remove: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     if args.operands.is_empty() {
         stage.die(b"remove: need at least one path (try --help)\n", EXIT_USAGE);

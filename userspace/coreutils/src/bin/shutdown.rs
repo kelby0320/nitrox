@@ -30,6 +30,7 @@ use libkern::debug::Line;
 use libkern::error::KError;
 use libkern::{exit, kprint};
 use librsproto::services::{OP_SERVICES_SHUTDOWN, shutdown_body};
+use libstream::diag::Level;
 
 /// `alloc` backing: the request buffer and the messages allocate.
 #[global_allocator]
@@ -61,12 +62,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"shutdown: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     if !args.operands.is_empty() {
         stage.die(b"shutdown: takes no operands (try --help)\n", EXIT_USAGE);
@@ -77,8 +76,13 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// Say `text` where the person reads it and on the console, where a gate does — and where it is
 /// seen on a machine whose sessions are about to go.
 fn say(stage: &Stage, text: &str) {
+    say_at(stage, Level::Error, text);
+}
+
+/// [`say`], at `level`.
+fn say_at(stage: &Stage, level: Level, text: &str) {
     if stage.streams.stderr.is_some() {
-        stage.diag(text.as_bytes());
+        stage.diag_at(level, text.as_bytes());
     }
     Line::new().untrusted(text.trim_end_matches('\n').as_bytes()).end();
 }
@@ -116,7 +120,7 @@ fn shut_down(stage: &Stage, reboot: bool) -> i64 {
         say(stage, &format!("shutdown: not shutting down: {why}\n"));
         return EXIT_FAILURE;
     }
-    say(stage, if reboot { "shutdown: restarting\n" } else { "shutdown: shutting down\n" });
+    say_at(stage, Level::Notice, if reboot { "shutdown: restarting\n" } else { "shutdown: shutting down\n" });
     EXIT_OK
 }
 

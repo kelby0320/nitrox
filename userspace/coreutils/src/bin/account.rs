@@ -59,6 +59,7 @@ use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit, scrub};
 use librsproto::auth::build_account_request;
 use librsproto::views::*;
 use libstream::channel::{ChannelSink, IpcPort};
+use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -114,12 +115,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"account: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [args.has("list"), args.has("add"), args.has("remove"), args.has("password")];
@@ -140,13 +139,19 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(code)
 }
 
-/// Say `text` where the person reads it, and on the console, escaped, where a gate does.
+/// Say `text` where the person reads it, as an error, and on the console, escaped, where a gate
+/// does.
 fn say(stage: &Stage, text: &str) {
+    say_at(stage, Level::Error, text);
+}
+
+/// [`say`], at `level`.
+fn say_at(stage: &Stage, level: Level, text: &str) {
     if stage.streams.stderr.is_some() {
         let mut line = String::from("account: ");
         line.push_str(text);
         line.push('\n');
-        stage.diag(line.as_bytes());
+        stage.diag_at(level, line.as_bytes());
     }
     Line::new().s(b"account: ").untrusted(text.as_bytes()).end();
 }
@@ -188,7 +193,7 @@ fn ask(stage: &Stage, ch: u64, op: u16, body: &[u8]) -> i64 {
         Some((true, _)) => (Outcome::Denied { retry: false }, String::from("the broker refused the request")),
         None => (Outcome::Denied { retry: false }, String::from("the broker did not answer")),
     };
-    say(stage, &why);
+    say_at(stage, if o == Outcome::Started { Level::Notice } else { Level::Error }, &why);
     if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE }
 }
 
@@ -220,7 +225,7 @@ fn list(stage: &Stage) -> i64 {
     let Some(stdout) = stage.streams.stdout else {
         for (name, home, sessions, administers) in &rows {
             let role = if *administers { ", administers" } else { "" };
-            say(stage, &format!("{name}  {home}  {sessions} session(s){role}"));
+            say_at(stage, Level::Notice, &format!("{name}  {home}  {sessions} session(s){role}"));
         }
         return EXIT_OK;
     };
@@ -416,7 +421,7 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
         say(stage, &format!("{file} could not be written; it is as it was"));
         return EXIT_FAILURE;
     }
-    say(stage, &format!("set a new password for {name} in {file}"));
+    say_at(stage, Level::Notice, &format!("set a new password for {name} in {file}"));
     EXIT_OK
 }
 

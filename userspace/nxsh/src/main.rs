@@ -182,6 +182,9 @@ fn drain_diagnostics(err: u64, tty: u64) {
                 ((&raw const ERR_MSG) as *const u8).add(24),
                 len.min(4096 - 24),
             );
+            // **Its level first** (the laptop polish's Part E): a leading byte says notice or
+            // warning, and a message without one is an error, as every message was before.
+            let (level, text) = libstream::diag::parse(text);
             let Ok(text) = core::str::from_utf8(text) else {
                 continue; // a diagnostic is text; anything else is not ours to render
             };
@@ -190,10 +193,14 @@ fn drain_diagnostics(err: u64, tty: u64) {
             // between every message.
             let text = text.strip_suffix('\n').unwrap_or(text);
             if tty != 0 {
-                // A stage's own diagnostic, in the same colour the shell's are — it is the same
-                // kind of thing to the person reading it. The newline is already off, which is
-                // what makes painting here safe; see `repl::diagnostic`.
-                tty_write_crlf(tty, &nxsh::style::paint(true, nxsh::style::DIAG, text));
+                // A stage's error in the colour the shell's own are — the same kind of thing to the
+                // person reading it — a warning in its own, and a notice plain. The newline is
+                // already off, which is what makes painting here safe; see `repl::diagnostic`.
+                let painted = match nxsh::style::for_level(level) {
+                    Some(sgr) => nxsh::style::paint(true, sgr, text),
+                    None => alloc::string::String::from(text),
+                };
+                tty_write_crlf(tty, &painted);
             } else {
                 kprint(text.as_bytes());
                 kprint(b"\n");
@@ -1030,7 +1037,14 @@ fn run(
             }
         },
         Some("--help") | Some("-h") => {
-            host.out("usage: nxsh [SCRIPT.nx | -c SOURCE]\n");
+            // **On the terminal it was handed** (the laptop polish's Part E): script mode keeps no
+            // terminal for the host, so its output falls through to `kprint`, which on a machine
+            // with no serial port nobody sees. The usage is the answer to what was typed, so it
+            // goes where the person typed it.
+            match terminal {
+                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT.nx | -c SOURCE]"),
+                None => host.out("usage: nxsh [SCRIPT.nx | -c SOURCE]\n"),
+            }
             return EXIT_OK;
         }
         // A script path is the shell's own lookup, so it resolves against `PWD`.

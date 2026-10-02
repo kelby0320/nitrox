@@ -164,6 +164,32 @@ channel's:
 - **Fatal stage failure** — the parent (which spawned every stage) observes
   `ChildExited` on its notification channel; stage lifecycle is not in-band.
 
+## A diagnostic, and its level
+
+**A diagnostic is one message on `stderr`, its payload the text** — a whole line, or several,
+never part of one: the sink is shared between every stage of a pipeline, so a partial line would
+interleave with another stage's. No message on it is `last`, since the sink outlives any one stage.
+
+**A message may begin with a level byte** (the laptop polish's Part E, 2026-10-02), framed and read
+by `libstream::diag`:
+
+| First byte | Level | Means | The shell draws it |
+|---|---|---|---|
+| `0x01` | notice | progress, a result said in words, an answer | plain |
+| `0x02` | warning | something the person may have wanted, and is not getting | bright yellow (`SGR 93`) |
+| anything else | error | something went wrong | bright red (`SGR 91`), as its own errors |
+
+**A message without a level byte is an error, whole**, byte for byte — which is every message a
+sender that predates the levels writes, so nothing that was an error stopped being one. The byte
+is stripped before the text is shown; a stage with no `stderr` writes the text alone to the
+kernel log.
+
+**What was asked for is not a diagnostic.** A program's `--help` and `--version` are its answer:
+the coreutils (`Stage::answer`) and `nxinstall` write them to `stdout` as a `TEXT_FALLBACK` stream
+(`typed-stream-format.md`), which the shell prints as lines and a pipeline can take, and send them
+as a notice only without a `stdout`. **Progress stays on `stderr`**, as notices: `stdout` is the
+pipeline's value, which the shell shows only when the pipeline ends.
+
 ## Not this
 
 - **No kernel stack-resident bootstrap block.** Considered and deferred — its only

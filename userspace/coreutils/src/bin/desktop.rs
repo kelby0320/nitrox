@@ -79,12 +79,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"desktop: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.diag(HELP);
-        exit(EXIT_OK);
+        stage.answer(HELP);
     }
     if args.version() {
-        stage.diag(VERSION);
-        exit(EXIT_OK);
+        stage.answer(VERSION);
     }
 
     // **Every diagnostic here goes to the debug console as well as to the stage.** A command
@@ -165,7 +163,7 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
             if list.truncated {
                 text.push_str("  ... more than this command can show\n");
             }
-            stage.diag(text.as_bytes());
+            stage.note(text.as_bytes());
             b"text"
         }
     };

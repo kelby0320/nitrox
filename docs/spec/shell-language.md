@@ -99,7 +99,7 @@ plan and the full gap analysis this pass produced.
 | Category | Mechanism | Owner |
 |---|---|---|
 | Row-level data error (one record failed, stream continues) | TSM1 `error_tag` record, inline in the body | Each stage decides whether to handle or forward |
-| Diagnostic output (warnings, progress, "skipping X") | `stderr` channel — separate from the pipe entirely | Bypasses the pipe by default, surfaces to display/log |
+| Diagnostic output (warnings, progress, "skipping X") | `stderr` channel — separate from the pipe entirely, each message an error, a warning or a notice ([`pipeline-stdio.md`](pipeline-stdio.md) § *A diagnostic, and its level*) | Bypasses the pipe by default, surfaces to display/log; the shell paints an error red, a warning yellow, and a notice plain |
 | Fatal stage failure (a stage crashes outright) | Process lifecycle notification (`ChildExited` / `PeerClosed`) | The shell, which spawned every stage and already watches these |
 
 **Default for row-level errors:** pass-through. A stage with no specific handling for an
@@ -1314,7 +1314,9 @@ grammar or new shell machinery. (Baked-in-argument user aliases are a different,
 ### 10f. Flag conventions
 
 Adopts actual GNU conventions as baseline, not just the general shape: long-form `--flag`, short
-`-f`, `--` to end option parsing, `--help`/`--version` on every program. One deliberate deviation,
+`-f`, `--` to end option parsing, `--help`/`--version` on every program — **on `stdout`, as text**
+(the laptop polish's Part E): they are the answer to what was typed, not a diagnostic, so they are
+not drawn as one and can be piped. One deliberate deviation,
 flagged so it isn't mistaken for an oversight: GNU's bare `-` argument meaning "read from stdin"
 (`cat -`) has no equivalent here — piping is structural in this design (a stage's input *is* its
 stdin stream, not a flag-selected mode), so that specific idiom doesn't carry over.

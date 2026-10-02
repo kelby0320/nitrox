@@ -175,16 +175,59 @@ impl Stage {
     /// diagnostic never corrupts the typed stream on `stdout`. Until a stage actually has
     /// one wired — Tier 0, or a shell that passed none — this falls back to the kernel
     /// log, which is where such output would otherwise vanish.
+    ///
+    /// **An error**, as every diagnostic was until the laptop polish's Part E: [`Stage::warn`] and
+    /// [`Stage::note`] say otherwise.
     pub fn diag(&self, msg: &[u8]) {
+        self.diag_at(libstream::diag::Level::Error, msg);
+    }
+
+    /// Write `msg` to `stderr` as a **warning**: something the person may have wanted, and is not
+    /// getting. The shell draws it in its own colour, not as an error.
+    pub fn warn(&self, msg: &[u8]) {
+        self.diag_at(libstream::diag::Level::Warning, msg);
+    }
+
+    /// Write `msg` to `stderr` as a **notice**: progress, or a result said in words. The shell
+    /// draws it plain — it is not a failure, and colouring it as one is what this exists to stop.
+    pub fn note(&self, msg: &[u8]) {
+        self.diag_at(libstream::diag::Level::Notice, msg);
+    }
+
+    /// Write `msg` to `stderr` at `level`, framed by `libstream::diag`; through `kprint`, the text
+    /// alone.
+    pub fn diag_at(&self, level: libstream::diag::Level, msg: &[u8]) {
         match self.streams.stderr {
             Some(h) => {
                 let mut port = libstream::channel::IpcPort::new(h);
-                if send_diag(&mut port, msg).is_err() {
+                if send_diag(&mut port, &libstream::diag::frame(level, msg)).is_err() {
                     kprint(msg);
                 }
             }
             None => kprint(msg),
         }
+    }
+
+    /// Write `text` to `stdout` as text — a `TEXT_FALLBACK` stream, which the shell prints as lines,
+    /// and `ChannelSink` splits however long it is. `false` if there is no `stdout`, or it failed.
+    pub fn text_out(&self, text: &[u8]) -> bool {
+        let text = core::str::from_utf8(text).unwrap_or("");
+        self.streams.stdout.is_some_and(|h| {
+            use libstream::channel::{ChannelSink, IpcPort};
+            let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
+            let mut sink = ChannelSink::new(IpcPort::new(h), libkern::abi::IPC_PAYLOAD_SIZE);
+            libstream::table::write_text_fallback(&mut sink, &lines, 0).and_then(|()| sink.finish()).is_ok()
+        })
+    }
+
+    /// **`--help` and `--version`: the text, as what was asked for**, and exit 0 (the laptop
+    /// polish's Part E). It goes to `stdout` ([`Stage::text_out`]), so it is output, can be piped,
+    /// and is not drawn as an error. With no `stdout`, it is a notice.
+    pub fn answer(&self, text: &[u8]) -> ! {
+        if !self.text_out(text) {
+            self.note(text);
+        }
+        exit(0)
     }
 
     /// Report a fatal error on `stderr` and exit with `code`. `-> !`, so a caller can use

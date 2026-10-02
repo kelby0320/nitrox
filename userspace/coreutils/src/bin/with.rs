@@ -47,6 +47,7 @@ use libkern::syscall::{
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit};
 use librsproto::views::*;
 use libstream::channel::{ChannelSink, IpcPort};
+use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::wire::{Value, write_value};
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
@@ -108,11 +109,22 @@ fn broker(stage: &Stage) -> u64 {
     ch
 }
 
+/// Say `what` on `stderr` as an error, behind `with: `.
 fn say(stage: &Stage, what: &str) {
+    say_at(stage, Level::Error, what);
+}
+
+/// Say `what` on `stderr` at `level`, behind `with: `.
+fn say_at(stage: &Stage, level: Level, what: &str) {
     let mut line = String::from("with: ");
     line.push_str(what);
     line.push('\n');
-    stage.diag(line.as_bytes());
+    stage.diag_at(level, line.as_bytes());
+}
+
+/// A broker's answer said in words: a notice when it did what was asked, an error when it did not.
+fn level_of(o: Outcome) -> Level {
+    if o == Outcome::Started { Level::Notice } else { Level::Error }
 }
 
 #[unsafe(no_mangle)]
@@ -120,8 +132,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let stage = Stage::enter(notif, ns, endpoint, arg0);
     let argv: Vec<&str> = stage.argv.iter().skip(1).map(|s| s.as_str()).collect();
     match argv.first().copied() {
-        Some("--help") => stage.die(HELP, EXIT_OK),
-        Some("--version") => stage.die(VERSION, EXIT_OK),
+        Some("--help") => stage.answer(HELP),
+        Some("--version") => stage.answer(VERSION),
         Some("--list") if argv.len() == 1 => list(&stage),
         Some("--forget") if argv.len() == 1 => forget(&stage),
         Some("--check") if argv.len() == 2 => check(&stage, argv[1]),
@@ -180,7 +192,7 @@ fn list(stage: &Stage) -> ! {
                 })
                 .collect();
             for l in &lines {
-                say(stage, l);
+                say_at(stage, Level::Notice, l);
             }
         }
     }
@@ -199,7 +211,7 @@ fn check(stage: &Stage, file: &str) -> ! {
         Some((false, body)) => outcome(&body),
         _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
-    say(stage, &alloc::format!("{file}: {why}"));
+    say_at(stage, level_of(o), &alloc::format!("{file}: {why}"));
     exit(if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE })
 }
 
@@ -236,10 +248,16 @@ fn show(stage: &Stage, file: Option<&str>) -> ! {
                 say(stage, &alloc::format!("cannot write `{f}`"));
                 exit(EXIT_FAILURE);
             }
-            say(stage, &alloc::format!("wrote the policy to {f} ({} bytes)", text.len()));
+            say_at(stage, Level::Notice, &alloc::format!("wrote the policy to {f} ({} bytes)", text.len()));
             libkern::kprint(alloc::format!("with: wrote the policy to a copy ({} bytes)\n", text.len()).as_bytes());
         }
-        None => stage.diag(&text),
+        // On `stdout`, as what was asked for: text, however long — one diagnostic could hold only
+        // a message's worth, and a longer policy went to the kernel log.
+        None => {
+            if !stage.text_out(&text) {
+                stage.note(&text);
+            }
+        }
     }
     exit(EXIT_OK)
 }
@@ -260,7 +278,7 @@ fn install(stage: &Stage, file: &str) -> ! {
         Some((false, body)) => outcome(&body),
         _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
-    say(stage, &alloc::format!("{file}: {why}"));
+    say_at(stage, level_of(o), &alloc::format!("{file}: {why}"));
     // On the console too, since a terminal on a release image renders nothing a gate can read.
     // Escaped: a reason can quote the policy's own text back.
     libkern::debug::Line::new().s(b"with: install: ").untrusted(why.as_bytes()).end();
@@ -289,7 +307,8 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
         // writes to the kernel log, which on a machine with no serial port reaches nobody. Until
         // the shell gave its stages `DUPLICATE` this was every program `with` ran, and the first
         // install from a view printed nothing after the password (2026-09-30).
-        say(stage, &alloc::format!("`{program}` gets no diagnostic channel; its messages go to the kernel log"));
+        let why = alloc::format!("`{program}` gets no diagnostic channel; its messages go to the kernel log");
+        say_at(stage, Level::Warning, &why);
     }
     // **A token from this terminal**, so a password typed here can be remembered for it. The broker
     // redeems it with the terminal server itself; the terminal handle below is not asked which

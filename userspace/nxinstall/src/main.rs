@@ -72,6 +72,7 @@ use libkern::syscall::{
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
+use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -97,7 +98,7 @@ const CHUNK: u64 = 256 * 1024;
 /// named by the table this program writes.
 const SOURCE_LABEL: &[u8] = libgpt::INSTALL_SOURCE_LABEL.as_bytes();
 
-/// **What `--help` prints**, a line per message. Written for the person at the live stick, who
+/// **What `--help` prints**, a line each, on `stdout`. Written for the person at the live stick, who
 /// has the program's name and nothing else: what it does, the two ways to run it, and that the
 /// disks come with the view.
 const HELP: &[&str] = &[
@@ -737,15 +738,17 @@ struct Account {
 /// **Each question logs its receipt**, since nothing reads a desktop terminal's grid: the name's
 /// before it is asked, and each password's once echo is off, so what a gate types next is neither
 /// echoed nor early.
-fn ask_account(term: u64, say: &mut dyn FnMut(&str)) -> Result<Account, nxinstall::Outcome> {
+fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Outcome> {
     use nxinstall::Outcome;
+    let say = |level: Level, line: &str| say_to(stderr, level, line);
     log("asking for the first account");
     let Some(name) = libprompt::ask_line(term, b"the new machine's first account: name: ") else {
-        say("cancelled; nothing was written.");
+        say(Level::Notice, "cancelled; nothing was written.");
         return Err(Outcome::Declined);
     };
     if !libusers::valid_name(&name) {
         say(
+            Level::Error,
             "an account's name is 1 to 32 of a-z, 0-9, `_` and `-`, starting with a letter or `_`. \
              Nothing was written.",
         );
@@ -756,10 +759,11 @@ fn ask_account(term: u64, say: &mut dyn FnMut(&str)) -> Result<Account, nxinstal
     match libprompt::ask_new_password_then(term, b"password: ", asked) {
         Ok(password) => Ok(Account { name, password }),
         Err(why) => {
-            say(&format!("{}; nothing was written.", why.why()));
-            // A cancelled question is the person's no; two passwords that differ, or one the
-            // rules refuse, is an answer that could not be used.
-            Err(if why == libprompt::NewPassword::Cancelled { Outcome::Declined } else { Outcome::NotInstalled })
+            // A cancelled question is the person's no, and said as a notice; two passwords that
+            // differ, or one the rules refuse, is an answer that could not be used.
+            let cancelled = why == libprompt::NewPassword::Cancelled;
+            say(if cancelled { Level::Notice } else { Level::Error }, &format!("{}; nothing was written.", why.why()));
+            Err(if cancelled { Outcome::Declined } else { Outcome::NotInstalled })
         }
     }
 }
@@ -854,22 +858,32 @@ fn log(line: &str) {
     kprint(&bytes);
 }
 
-/// Write one line to `stderr`, or to the kernel log when there is none.
+/// Write one line to `stderr` at `level`, or to the kernel log when there is none.
 ///
 /// Each line is its own message: `stderr` is shared between the stages of a pipeline, so a
-/// partial line left in it would interleave with another stage's.
-fn say_to(stderr: Option<u64>, line: &str) {
+/// partial line left in it would interleave with another stage's. **The level** (the laptop
+/// polish's Part E) is how the shell tells a refusal from progress: only an error is drawn as one.
+fn say_to(stderr: Option<u64>, level: Level, line: &str) {
     let mut bytes = Vec::from(line.as_bytes());
     bytes.push(b'\n');
     match stderr {
         Some(h) => {
             let mut port = IpcPort::new(h);
-            if port.send(&bytes, false).is_err() {
+            if port.send(&libstream::diag::frame(level, &bytes), false).is_err() {
                 kprint(&bytes);
             }
         }
         None => kprint(&bytes),
     }
+}
+
+/// `--help`'s lines on `stdout`, as text — what was asked for, and so not a diagnostic. `false`
+/// with no `stdout`, or when the write failed.
+fn help_out(stdout: Option<u64>) -> bool {
+    stdout.is_some_and(|h| {
+        let mut sink = ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE);
+        libstream::table::write_text_fallback(&mut sink, HELP, 0).and_then(|()| sink.finish()).is_ok()
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -885,13 +899,18 @@ fn run(
     terminal: Option<u64>,
 ) -> nxinstall::Outcome {
     use nxinstall::Outcome;
-    let mut say = |line: &str| say_to(stderr, line);
+    // An error, a warning or a notice (Part E): what stopped it, what it left out, and progress.
+    let say = |line: &str| say_to(stderr, Level::Error, line);
+    let warn = |line: &str| say_to(stderr, Level::Warning, line);
+    let mut note = |line: &str| say_to(stderr, Level::Notice, line);
 
     let operands: Vec<&String> = argv.iter().skip(1).collect();
     // **Before anything is looked up**, so `nxinstall --help` answers without a view.
     if operands.iter().any(|o| o.as_str() == "--help") {
-        for line in HELP {
-            say(line);
+        if !help_out(stdout) {
+            for line in HELP {
+                note(line);
+            }
         }
         return Outcome::Help;
     }
@@ -918,7 +937,7 @@ fn run(
                  `with admin nxinstall`, from the live image's \"install to this machine\" entry.",
             );
             for w in &withheld {
-                say(&w.message());
+                warn(&w.message());
             }
             return Outcome::NotInstalled;
         }
@@ -926,7 +945,7 @@ fn run(
             Some(h) => emit_devices(h, &devs),
             None => {
                 for d in &devs {
-                    say(&format!(
+                    note(&format!(
                         "{} {} {} {}",
                         d.path(),
                         kind_name(d.info.kind()),
@@ -937,7 +956,7 @@ fn run(
             }
         }
         for w in &withheld {
-            say(&w.message());
+            warn(&w.message());
         }
         return Outcome::Listed;
     }
@@ -1056,11 +1075,11 @@ fn run(
     log("asking to go ahead");
     let answer = libprompt::ask_line(term, question.as_bytes());
     if !answer.as_deref().is_some_and(nxinstall::confirmed) {
-        say("nothing was written.");
+        note("nothing was written.");
         log(&format!("not going ahead; nothing was written to {}", target.path()));
         return Outcome::Declined;
     }
-    let mut account = match ask_account(term, &mut say) {
+    let mut account = match ask_account(term, stderr) {
         Ok(account) => account,
         Err(outcome) => {
             if outcome == Outcome::Declined {
@@ -1072,13 +1091,13 @@ fn run(
         }
     };
 
-    say(&format!("installing to {} ({})", target.path(), identity));
-    let installed = install(&io, target, &srcs, &layout, &account, &mut say);
+    note(&format!("installing to {} ({})", target.path(), identity));
+    let installed = install(&io, target, &srcs, &layout, &account, &mut note);
     libkern::scrub(&mut account.password);
     match installed {
         Ok(()) => {
             // The disk flushed its cache before `install` returned, so this is true when said.
-            say("done. Remove the installation medium and restart.");
+            note("done. Remove the installation medium and restart.");
             Outcome::Installed
         }
         Err(e) => {
