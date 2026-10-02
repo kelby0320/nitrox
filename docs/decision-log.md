@@ -32985,3 +32985,63 @@ again.
 **Optional, noted:** no gate sees `nxinstall`'s progress drawn as notices. `check-install` drives
 it in `nxterm`, whose grid drops colour, and `test-interactive` has no disk the installer may
 write. Other senders cover the mechanism, so each of those lines rests on its level choice alone.
+
+## 2026-10-02 — Phase 6 Part A, detailed: xHCI and enumeration
+
+Part A's detail pass, in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part A in detail*.
+Nothing in it needed the maintainer's call. What follows is derived from the spike, and what
+the spike found.
+
+**Bring-up comes in two halves.**
+- **`drivers::probe` runs before the scheduler**, with interrupts masked, so the controller's
+  bring-up goes there, polled, and claims or declines the function as AHCI's does. In order: D0,
+  bus mastering, the BIOS handoff, reset, the rings and contexts, MSI.
+- **Enumeration needs a thread**, because it waits for interrupts and for time. A hub thread is
+  spawned after the APs are up, not before, though starting earlier would overlap its waits with
+  AP bring-up. That is the scheduler's most delicate moment, and the overlap is worth less than
+  keeping out of it.
+- **The boot waits for the first round**, bounded, before the hardware report and `init`. The
+  report then lists what is attached, and a device present at boot is in the registry before
+  `device-mgr` replays it, which Part B needs. It costs about 100 ms on a machine with nothing
+  attached: the USB 2 debounce, taken once for every port.
+
+**Part A matches classes and binds nothing.** No `SET_CONFIGURATION`, and no endpoint but the
+default one: the class driver that binds configures the device, in Parts B and D.
+
+**Later connects take the same path as the first round. A disconnect disables the slot, and its
+record stays** until Part C gives the registry departures: the one place Part A is knowingly
+incomplete.
+
+**The record:**
+- `DeviceKind::UsbDevice`, with the USB IDs in `vendor` and `device`.
+- **`port` and `speed` take two of `DeviceRecord`'s three reserved bytes.** They are zero for
+  every other kind, so no reader changes and `REGISTRY_VERSION` stays 1.
+- The product and serial strings are the name, kept in the table's entry.
+- `device-mgr` names it `usb-<port>`.
+- **One controller**: a second is declined, as AHCI drives one.
+
+**What the spike found:**
+- **QEMU, asked rather than remembered** (11.0.2): `usb-kbd` and `usb-mouse` attach at high
+  speed and `usb-storage` at SuperSpeed, and `usb_version=1` gives full speed. So `test-qemu` can
+  cover three speeds. **No QEMU USB device takes a low-speed setting**, and real mice use it, so
+  only the laptop can test it.
+- **The laptop's xHCI was in D3** in the Linux dump, because Linux suspends an idle controller.
+  So the driver puts it in D0 first, a path QEMU never takes.
+- **The laptop has no USB input built in**, but Linux took about 2,000 xHCI interrupts, so
+  something internal is likely attached. The report will say what.
+- **Two quirks come from Linux's quirk list, unverified:** a pause after an Intel reset, and a
+  missing Cold Attach Status on this controller. They are taken as the laptop shows them; the
+  report prints every port's state at start.
+- **The installed system's `limine.conf` has `timeout: 0`**, so no menu. **`usb=off`** on the
+  command line therefore helps only on the live stick, whose report entry is where a USB build
+  first meets the laptop. Bounded waits that decline the function are the real defence against
+  a hang.
+
+**Two current-behaviour docs still described driver processes as Phase 6's**, a claim PR #350
+removed from `device-manager.md` and `overview.md`. Corrected in the same change:
+- `device-node.md` said the userspace driver manager "is Phase 6's";
+- `drivers-and-irps.md` said `device-mgr`'s handoff was "the shape Phase 6 extends to driver
+  processes".
+
+Docs only; no ABI hash impact. Part A's own kernel work has none either: a kind and two reserved
+bytes are not hash inputs, and `abi-sync-check` guards `libkern::device`.

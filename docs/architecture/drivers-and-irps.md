@@ -238,8 +238,9 @@ the node. The userspace **driver manager** — matching nodes to Tier 2 modules
 and handing a driver process a `Handle<DeviceNode>` — is **deferred** (it needs
 the Tier 2 loader). **Its other half exists** (administration Part B, 2026-09-24): the device
 table is readable at `/dev/registry`, and `device-mgr` hands each node, as a handle, to the service
-that owns its class — the shape Phase 6 extends to driver processes. See
-[`device-manager.md`](device-manager.md).
+that owns its class. Driver processes would extend that shape, if Tier 2 turns out to mean them
+rather than kernel modules — an open question (§ *Module tiers*); Phase 6's USB drivers are
+Tier 1. See [`device-manager.md`](device-manager.md).
 
 **A matched driver reports what it did, and the device table keeps it** (Phase 5 Part D,
 2026-09-14). A driver's bring-up returns a

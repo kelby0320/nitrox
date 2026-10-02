@@ -3,11 +3,11 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
 current status, the full phase list, and the cross-cutting workstreams.
 
-**Status: scoped 2026-10-01; nothing built.** This replaces the sketch written on 2026-09-10,
-before Phase 5 and administration. The scope and the decisions below were agreed with the
-maintainer on 2026-10-01. Each part gets its own detail pass when it is next, as administration's
-parts did; what is here is the phase's shape, the design each part builds to, and the gate that
-closes it. **Nothing below describes current behaviour.**
+**Status: scoped 2026-10-01; Part A detailed 2026-10-02; nothing built.** This replaces the
+sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
+were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
+as administration's parts did; what is here is the phase's shape, the design each part builds to,
+and the gate that closes it. **Nothing below describes current behaviour.**
 
 ## Scope
 
@@ -300,6 +300,210 @@ Ordered by dependency. Each has its detail pass before it is built.
 **Parts A–C give the input half of the Definition of Done, D–G the storage half, and H the
 number.** The order puts the first boot of the laptop with a USB driver as early as it can be:
 Part A's report is the survey of what is attached.
+
+## Part A in detail *(2026-10-02)*
+
+### The spike: what exists, and what is missing
+
+**The kernel:**
+- **Drivers bind before the scheduler runs.** `drivers::probe` runs with interrupts masked, and
+  AHCI's bring-up is polled through it. The scheduler, the APs, the hardware report and `init`
+  follow, in that order (`kernel/src/main.rs`). So the controller's bring-up fits in `probe`, but
+  enumeration does not: it waits for interrupts and for time to pass, so it needs a thread, and a
+  thread needs the scheduler.
+- **A kernel thread can wait on what a DPC signals.** `sched::spawn` makes the thread, and
+  `sched::wait_on` blocks it with a deadline on any of:
+  - a `PendingOperation` the DPC completes with `complete_pending_op`;
+  - an `InterruptObject` the DPC signals with `signal_interrupt`. It is a latching counter, so a
+    port change that lands while the thread is busy is not lost. A kernel caller consumes one with
+    `interrupt_consume`, as `sys_wait` does for a process;
+  - nothing at all, to sleep until the deadline.
+
+  The reaper parks by hand only because what wakes it is a queue inside the scheduler, not an
+  object. A wake on the CPU that took the interrupt is prompt when that CPU is idle: the
+  device-interrupt tail calls `resched_if_idle` (2026-07-23).
+- **The registry only grows, and nothing has added to it after boot.** `device::register*` take a
+  `SpinLock` that allocates while held, so the thread registers, never a DPC. Every reader so far
+  has read a table finished before `init`, and `device-mgr` replays it once.
+- **A record is PCI-shaped.** The table keeps beside each node what the node cannot say about
+  itself: kind, served index, parent, driver. A non-block node's name is a word from its kind
+  (`keyboard`), so a USB device's product name has nowhere to go yet. `DeviceRecord` has three
+  reserved bytes (`_pad`). `device-mgr` matches on `DeviceKind` exhaustively in three places.
+- **What a driver needs exists**: 64-bit BAR sizing (`kernel/src/pci/mod.rs`), `map_mmio`,
+  `DmaBuffer` (page-aligned and a power of two, so no ring segment crosses 64 KiB), `read_msi`
+  and `program_msi`, `enable_bus_master`, and an outcome recorded per function.
+- **The command line has one flag**, `hwreport` (`kernel/src/cmdline.rs`, host-tested). The
+  installed system's `limine.conf` has `timeout: 0`, so it shows no menu and its command line
+  cannot be changed. The live stick's menu can.
+
+**QEMU 11.0.2, asked rather than remembered:**
+- `qemu-xhci` is `1b36:000d`, with a 64-bit BAR0, MSI and MSI-X, and **4 USB 2 and 4 USB 3
+  ports** (`p2`, `p3`).
+- `info usb` puts `usb-kbd` and `usb-mouse` at 480 Mb/s, and `usb-storage` at 5000 Mb/s on a USB
+  3 port. `usb_version=1` attaches a device at 12 Mb/s. So a gate covers high, full and
+  SuperSpeed. **Low speed, which most real mice use, no QEMU USB device takes a setting for**: the
+  laptop is its first test.
+- Every USB device takes `pcap=`, which writes its traffic for Wireshark. That is the tool for a
+  build that disagrees with a device.
+- The live gates already attach `qemu-xhci` and the stick. `test-qemu` attaches no USB, but has a
+  QMP socket.
+
+**The laptop** (the 2026-09-10 dump: `lspci -vv` and `/proc/interrupts` under Linux):
+- `00:14.0`, BAR0 64 KiB and 64-bit, MSI with eight vectors, no MSI-X: as the plan says.
+- **It was in D3 when the dump was taken**, because Linux suspends an idle controller. What the
+  firmware leaves it in at `ExitBootServices` is unknown, and in D3hot its registers read as all
+  ones. So the driver puts it in D0 through its power-management capability before anything else.
+  QEMU never takes this path.
+- **No USB input is built in**: the keyboard is the i8042's and the touchpad is I²C (`ELAN0501`).
+  Linux still took about 2,000 xHCI interrupts, so something internal is probably attached, such
+  as a webcam or Bluetooth. The report will say.
+- **From Linux's `xhci-pci` quirk list, not verified here:**
+  - Intel hosts get a 1 ms pause after a controller reset, against rare hangs.
+  - This controller is listed as missing Cold Attach Status: a USB 3 device attached at boot can
+    leave its port in compliance mode, which a warm reset clears.
+
+  Both are taken as the laptop shows them. The report prints every port's state at start, so it
+  can show either.
+
+### The shape
+
+**Bring-up comes in two halves.**
+- **In `probe`, polled**, in this order:
+  - the controller into D0, and bus mastering on;
+  - the BIOS handoff through the USB Legacy Support capability: OS-owned, a bounded wait for the
+    firmware to let go, and its SMIs off;
+  - halt, then reset, waiting for Controller Not Ready to clear and then 1 ms;
+  - the structures: the device context base array, the scratchpad buffers the controller asks
+    for, the command ring, and one event-ring segment with its table, on interrupter 0;
+  - MSI, and the outcome *claimed*.
+
+  **Every wait is bounded, and a failed one declines the function with its reason.** No USB is a
+  diagnosable failure; a hang on the laptop is not.
+- **After the APs are up**, a new `drivers::start` spawns **the hub thread**. It sets the
+  controller running, reads every port and enumerates. It starts after the APs rather than before
+  them, though that would overlap its waits with theirs: AP bring-up is the scheduler's most
+  delicate moment, and the only cost is the wait below.
+
+**The boot waits for the first round**, bounded, before the report and `init`. That way the
+report lists what is attached, and a device present at boot is in the registry before
+`device-mgr` replays it, which Part B needs. A bound that passes is logged, and whatever is still
+enumerating carries on as a later arrival. **The first round:**
+1. the USB 2 debounce, 100 ms, taken once for every port, which also lets USB 3 links train;
+2. then each port that reports a connection, **one at a time**, since only one device may answer
+   at address 0.
+
+On a machine with nothing attached, the round costs about 100 ms.
+
+**Per device:**
+1. A USB 2 port is reset; a USB 3 port is already enabled by link training.
+2. *Enable Slot*, then *Address Device*.
+3. The device descriptor's first eight bytes, then *Evaluate Context* if `bMaxPacketSize0`
+   differs from the speed's default.
+4. The whole device descriptor, then the configuration descriptor: its nine bytes, then
+   `wTotalLength`.
+5. String descriptor 0, then the product and serial strings.
+6. **The class match, logged and not acted on.** There is no `SET_CONFIGURATION`: the class
+   driver that binds sets the configuration, in Parts B and D.
+
+**Every command and control transfer has a deadline.** A device that misses one is logged, and
+its slot disabled.
+
+**Later port changes take the same path**: coldplug is the first round of hot-plug. A disconnect
+disables the slot and is logged. **Its record stays** until Part C gives the registry departures,
+which is the one place Part A is knowingly incomplete.
+
+**The record:**
+- `DeviceKind::UsbDevice` (8). `vendor` and `device` are `idVendor` and `idProduct`.
+- The class triple is the device descriptor's, or the first interface's when the device's is zero,
+  as most are.
+- `driver` is `xhci`, and `parent` is the controller.
+- The name is the product string and the serial, as a disk's is its model and serial. With no
+  strings, it is the IDs.
+- **`_pad`'s first two bytes become `port` and `speed`.** They are zero for every other kind, so
+  no reader changes and `REGISTRY_VERSION` stays 1.
+- The table keeps the name in the entry, beside the kind.
+- **One controller.** A second is declined, as AHCI drives one.
+
+**`device-mgr`** names a USB device `usb-<port>`, as a PCI function is named by its address. Its
+kind is `usb`, it has no path, its description is the name, IDs and speed, and its parent is the
+controller's function. So `list /dev/devices` shows them.
+
+**The log is the report.** One line per controller fact, one per port at start, one per device,
+and one when the first round ends. Illustratively, with the IDs left for the first boot to read:
+```
+xhci: 00:14.0 up: 16 ports (USB 2: 1-12, USB 3: 13-16), 32 slots, 64-byte contexts, 4 scratchpads
+xhci: port 5 at start: connected, high-speed
+usb: port 5: vvvv:pppp class 03/01/01, high-speed, "QEMU USB Keyboard": HID boot keyboard
+usb: port 6: vvvv:pppp class 09/00/00, high-speed, "QEMU USB Hub": a hub, not supported
+usb: first round: 4 device(s) in 310 ms
+```
+
+**`usb=off`** on the command line declines the controller with that reason. The installed system
+has no menu to pass it, but the first boot of a USB build on the laptop is the live stick's report
+entry, whose menu has an editor. It is the way past a bring-up that hangs anyway.
+
+### Pieces
+
+- **A.1 The controller.** `drivers::xhci`'s bring-up in `probe`; the event ring's interrupt and
+  DPC; the extended capabilities read, with Supported Protocol giving which ports are USB 2 and
+  which USB 3; each port's state at start, logged; `usb=off`.
+- **A.2 The hub thread and enumeration.** `drivers::start`; the first round and the boot's bounded
+  wait; the per-device sequence through the strings; the class table; later connects and
+  disconnects.
+- **A.3 The records.** `UsbDevice`, `port` and `speed`, names in the table's entries, and
+  `device-mgr`'s names.
+- **A.4 Docs.** Below.
+
+### Gates
+
+- **`test-qemu`, TCG and KVM**, attaches `qemu-xhci` with:
+  - `usb-kbd`, at high speed;
+  - `usb-mouse,usb_version=1`, at full speed;
+  - `usb-storage` over a blank image, at SuperSpeed;
+  - `usb-hub`, which nothing matches.
+- **On the host**, `test-qemu` asserts:
+  - the controller claimed over MSI;
+  - each device's line: its port, speed, IDs, class, name and match;
+  - the first round finished within its bound.
+- **`boot-probe`** finds four `UsbDevice` records whose parent is the controller's id, carrying
+  the IDs, class, port and speed the log gave. A log line can be printed for a device the table
+  never got.
+- **A hot-plug, from the host:** once the first round is logged, `device_add usb-kbd` over QMP
+  and its arrival line, then `device_del` and its disconnect line.
+- **`check-report`**: the live stick's line on a report page.
+- **Host tests, in the kernel crate:**
+  - TRBs, and a ring's enqueue across its link TRB with the cycle bit toggled;
+  - the event ring's dequeue by cycle;
+  - the extended-capability walk, with Legacy Support and the Supported Protocol port ranges;
+  - 32- and 64-byte contexts, and the scratchpad array;
+  - descriptor parsing from bytes real devices sent, and from bytes no correct device sends: a
+    short `bLength`, or a `wTotalLength` past the buffer;
+  - the class table, including a hub and a composite device;
+  - a UTF-16 string made printable;
+  - `usb=off` on the command line.
+- **The laptop:** the live stick's report entry, with its USB lines photographed. That is the
+  survey this plan lacks. It is a step for the maintainer, not a gate.
+
+Adding a PCI function to `test-qemu` shifts every registry id after it. `boot-probe` finds
+records by kind and name, but that is to be checked when it is built.
+
+### Not in Part A
+
+- Binding a class driver (Parts B and D), and with it `SET_CONFIGURATION` and every endpoint but
+  the default one.
+- Departure records (Part C).
+- External hubs, a second controller, and MSI-X or INTx: both machines have MSI, and a controller
+  without it is declined.
+- Link power management, and suspend.
+
+### Docs Part A owes
+
+- **`docs/architecture/usb.md`**, new. <!-- check-docs: allow-missing -->
+- **`device-node.md`**: the kind, `port` and `speed`, and a sixth group in the registry's order,
+  published by a thread after boot.
+- **`drivers-and-irps.md`**: the hub thread's waits.
+- **`device-manager.md`**: the `usb-<port>` names.
+- **The root `CLAUDE.md`**: `test-qemu`'s USB devices.
 
 ## Definition of Done
 
