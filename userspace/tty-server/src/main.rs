@@ -217,7 +217,8 @@ fn now_ns() -> u64 {
 
 /// A token's 128 bits, from the kernel CSPRNG — **or none**: a token made up when the pool will
 /// not answer is a token someone else could make up too, and without one the caller is asked for
-/// its password, which is safe.
+/// its password, which is safe. **An unseeded pool is none too**, without waiting for it
+/// (`tty_server::tokens::from_read`): the PO it answers with fills nothing.
 fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
     // SAFETY: register-only syscall.
     let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
@@ -228,11 +229,13 @@ fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
     let mut buf = [0u8; tty_server::tokens::LEN];
     // SAFETY: a valid writable buffer of `LEN` bytes.
     let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, buf.len() as u64, 0) };
-    // A positive return is a PO: the pool is not seeded yet, so wait for the fill.
-    let ok = r == 0 || (r > 0 && po_wait(r as u64).0 == 0);
+    if r > 0 {
+        // SAFETY: closing the pending operation the read answered with, which this process owns.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, r as u64) };
+    }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    ok.then_some(buf)
+    tty_server::tokens::from_read(r, buf)
 }
 
 /// A connected channel pair, or `None`.

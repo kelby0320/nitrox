@@ -3217,6 +3217,58 @@ fn grace_test(root_ns: u64) -> bool {
     if !started(ask(b"admin", b"sleep", sleep, Some(still), &mut exited), &mut exited) {
         return finish(fail(b"the window closed while the refusals were asked, so they prove nothing"), &[window, ours]);
     }
+    // 8b. **A refused password forgets every window of the session** (PR #351 review): a request
+    //     from the other terminal, which has no window and so is asked, is answered wrong — and
+    //     the first terminal's window is gone with it, so a real token from there is asked too.
+    let Some(other) = token(window) else {
+        return finish(fail(b"no token from the second terminal for the wrong password"), &[window, ours]);
+    };
+    let refused = match ask(b"admin", b"sleep", sleep, Some(other), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let denied = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 6, b"not the password", &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Denied { .. }, _)))
+            );
+            close(cli);
+            denied
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    if !refused {
+        return finish(fail(b"a wrong password at the second terminal was not refused"), &[window, ours]);
+    }
+    let Some(after_wrong) = token(tty) else {
+        return finish(fail(b"no token after the wrong password"), &[window, ours]);
+    };
+    if !asked(ask(b"admin", b"sleep", sleep, Some(after_wrong), &mut exited)) {
+        return finish(fail(b"a refused password at another terminal left this terminal's window open"), &[window, ours]);
+    }
+    // **Opened again**, so that `Forget` below has a window to forget — and shown to be open.
+    let Some(again) = token(tty) else {
+        return finish(fail(b"no token to open the window again"), &[window, ours]);
+    };
+    let reopened = match ask(b"admin", b"sleep", sleep, Some(again), &mut exited) {
+        Some((Outcome::NeedPassword, cli)) => {
+            let ok = matches!(
+                views_call(cli, OP_VIEWS_PASSWORD, 7, DEMO_PASSWORD, &[], &mut exited),
+                Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
+            );
+            started(Some((Outcome::Started, cli)), &mut exited) && ok
+        }
+        other => {
+            let _ = asked(other);
+            false
+        }
+    };
+    let Some(open) = token(tty) else {
+        return finish(fail(b"no token to show the window open again"), &[window, ours]);
+    };
+    if !reopened || !started(ask(b"admin", b"sleep", sleep, Some(open), &mut exited), &mut exited) {
+        return finish(fail(b"the window would not open again after the wrong password"), &[window, ours]);
+    }
     // 9. `Forget`, and a real token is asked again.
     let (fst, fcli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
     let forgot = fst == 0 && matches!(views_call(fcli, OP_VIEWS_FORGET, 4, &[], &[], &mut exited), Some((false, _)));
@@ -3255,8 +3307,8 @@ fn grace_test(root_ns: u64) -> bool {
     }
     kprint(
         b"boot-probe: grace: a password remembered for one terminal and view; a made-up token, a reused one, \
-          none, another view and another terminal all asked; the window open throughout; asked again after \
-          Forget; and a made-up token's password opened no window ok\n",
+          none, another view and another terminal all asked; the window open throughout; a wrong password \
+          elsewhere closed it; asked again after Forget; and a made-up token's password opened no window ok\n",
     );
     finish(true, &[window, ours])
 }

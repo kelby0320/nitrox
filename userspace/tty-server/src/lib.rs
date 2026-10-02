@@ -801,6 +801,18 @@ pub mod tokens {
         live: Vec<Entry>,
     }
 
+    /// **A token from what `sys_entropy_read` answered** — `r`, and the buffer it was asked to fill
+    /// — or none.
+    ///
+    /// **Only `0` filled the buffer.** A positive answer is a `PendingOperation`: the pool is not
+    /// seeded, and the PO completing says only that it now is, writing nothing — the caller would
+    /// have to read again (PR #351 review). This server does not wait for that: its one serve
+    /// loop would hold every terminal still while it did, and a token that is not there costs its
+    /// requester a password prompt, which is safe. So a PO is no token, as an error is.
+    pub fn from_read(r: i64, buf: [u8; LEN]) -> Option<[u8; LEN]> {
+        (r == 0).then_some(buf)
+    }
+
     /// Equal bytes, compared without stopping at the first difference.
     fn same(a: &[u8; LEN], b: &[u8]) -> bool {
         b.len() == LEN && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -849,6 +861,15 @@ pub mod tokens {
 
         fn token(n: u8) -> [u8; LEN] {
             [n; LEN]
+        }
+
+        /// **The buffer is a token only when the read filled it** — never after a
+        /// `PendingOperation`, which leaves it as it was: all zeros, a token anyone can name.
+        #[test]
+        fn only_a_completed_read_is_a_token() {
+            assert_eq!(from_read(0, token(9)), Some(token(9)));
+            assert_eq!(from_read(5, [0; LEN]), None, "a PO: unseeded, nothing written");
+            assert_eq!(from_read(-1, [0; LEN]), None, "an error");
         }
 
         #[test]

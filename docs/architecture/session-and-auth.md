@@ -283,7 +283,8 @@ old base. A boot without the broker builds sessions without `/dev/views`, and sa
 laptop polish's Part A). Because a serial login and a desktop login are separate sessions, a
 password typed at one is never remembered at the other; because the terminal is part of the key,
 a password typed in one window does not reach another window, or an application the desktop
-launched — which holds `/dev/views` like everything in the session, and no terminal. The terminal
+launched — which holds `/dev/views` like everything in the session, and `/dev/tty`, but no
+terminal on any window's backend: a resolve of `/dev/tty` lands on the console. The terminal
 is the one `tty-server` names when the broker redeems the token `with` sent, never one the caller
 claims ([`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) § *Request*). `with --forget`, a
 refused password and the session's end forget it.

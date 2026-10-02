@@ -32842,3 +32842,39 @@ dependency, so a new commit rebuilds those two crates and nothing else.
 
 Docs: `boot-flow.md` (step 3, and its Status), `shell-language.md` §11, and the plan. No ABI hash
 impact: a string in a log line and a banner.
+
+## 2026-10-02 — PR #351, reviewed: a token the read never filled
+
+One blocking finding, two worth fixing and two optional, all taken.
+
+**A token minted from an unseeded pool was sixteen zero bytes** (blocking).
+- When the pool has not seeded, `sys_entropy_read` answers with a `PendingOperation`. That PO
+  completing says only that the pool has now seeded, and writes nothing: the caller must read
+  again, as `auth-service` and `account` do.
+- `tty-server` waited on the PO and minted the untouched buffer.
+- So on a machine with no hardware RNG, early in a boot, every terminal froze while the pool
+  seeded, and then a token anybody could name was minted for the window that asked.
+- If that window then opened a grace period, any process in the session could have used it.
+- Fixed by taking an unseeded pool as **no token**, without waiting (`tty_server::tokens::
+  from_read`, host-tested). The requester is asked for its password, which is safe, and no
+  terminal stalls.
+- **The class:** `nxinstall`'s `random_guid` had the same bug, older than this PR. It would have
+  written all-zero partition GUIDs, the one thing its comment says it refuses. It now reads again
+  after the PO, as an installer can afford to wait. The other entropy readers already loop.
+- No gate boots without a hardware RNG, so the host test is what holds it.
+
+**Nothing tested that a refused password forgets the session's windows** (worth fixing). The
+reviewer deleted the call, and every gate passed.
+- `grace_test` gains step 8b: a request from the other terminal, which has no window, is answered
+  wrong, and a real token from the first terminal is then asked.
+- The window is then opened again and shown open, so step 9's `Forget` still has a window to
+  forget.
+- **Control:** the call removed fails step 8b.
+
+**The rest:**
+- The tty spec's role table names `Token` and `Redeem`.
+- `session-and-auth.md` no longer says a desktop application holds no terminal. It holds
+  `/dev/tty`, which lands on the console, and no window's backend.
+- The `views.toml` schema's `auth` row says a password is remembered per view, per terminal.
+
+No kernel change; no ABI hash impact.

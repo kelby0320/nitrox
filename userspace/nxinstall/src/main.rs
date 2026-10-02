@@ -217,15 +217,18 @@ fn random_guid() -> Option<[u8; 16]> {
     }
     let h = h as u64;
     let mut buf = [0u8; 16];
-    // SAFETY: a valid writable 16-byte buffer.
-    let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, 16, 0) };
-    // A positive return is a PO: the pool is not seeded yet, so wait for the fill.
-    let ok = if r == 0 {
-        true
-    } else if r > 0 {
-        po_wait(r as u64).0 == 0
-    } else {
-        false
+    // **Read again after an unseeded pool's PO** (PR #351 review): the PO completing says only that
+    // the pool is now seeded, and writes nothing, so a GUID taken from the buffer then would be
+    // sixteen zeros — the GUID every such install would share. An installer can wait.
+    let ok = loop {
+        // SAFETY: a valid writable 16-byte buffer.
+        let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, 16, 0) };
+        if r == 0 {
+            break true;
+        }
+        if r < 0 || po_wait(r as u64).0 != 0 {
+            break false;
+        }
     };
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };

@@ -24,7 +24,7 @@ Since Part C there is a third role, the **backend channel**, held by a terminal 
 | Role | Speaks | Who holds it |
 |---|---|---|
 | forwarding endpoint | `Namespace::Resolve` | `/dev/tty`, bound by service-mgr; by session-mgr in each session |
-| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` | the program using the terminal |
+| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` / `Token` / `Redeem` | the program using the terminal; `Redeem` the view broker, on a terminal it resolves itself |
 | backend channel | `Output` (server→emulator), `Input` (emulator→server) | a terminal emulator |
 
 **A terminal is per resolver, not per session.** Each program that resolves `/dev/tty` gets its
@@ -160,8 +160,10 @@ stage without a terminal, which is what every stage had before this op.
 
 Request: empty. Reply: **16 bytes**, a token naming the backend of the terminal it is sent on —
 the serial console, or one window, shared by every sibling. 128 random bits from the kernel's
-CSPRNG, good **once**, for **thirty seconds**. `KernelError` if the CSPRNG will not answer: a token
-made up instead would be one anybody could make up.
+CSPRNG, good **once**, for **thirty seconds**. `KernelError` if the CSPRNG will not answer, **or has
+not seeded yet**: a token made up instead — or a buffer the read never filled — would be one anybody
+could make up. The server does not wait for the pool, which would hold every terminal still; the
+caller is asked for its password instead (PR #351 review).
 
 **Why it exists.** The view broker remembers a password per session, terminal and view (the
 laptop polish's Part A), and must not take a caller's word for which terminal it is at: a
