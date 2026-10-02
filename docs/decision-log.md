@@ -33088,3 +33088,35 @@ host test reads a SuperSpeed descriptor's 9 as 512.
 - **`drivers-and-irps.md`'s Module tiers rule** still made hot-pluggable drivers Tier 2. The
   file this PR already edits now states the rule the 2026-10-01 decisions made.
 - `device-mgr` matches `DeviceKind` exhaustively in four places, not three.
+
+## 2026-10-02 — PR #353's CI: three `check-login` steps waited in an order nothing promised
+
+`check-login --kvm` failed on PR #353, a docs-only change: the guest was main's.
+- The gate pressed Ctrl+W on the editor's second window and waited for `nxedit: closed a window`,
+  then for the shell's window list.
+- The shell's list came first, so the first wait scanned past it, and the second waited for a
+  line already consumed. The transcript had both.
+- It is the class `expect_all` was built for (2026-08-31), in places it had not reached.
+
+**Proven with a probe before it was trusted.** `nxedit` and `nxterm` each waited half a second
+before their receipt, so the shell always spoke first:
+- **The old gate failed at once**, at the first maximise: `nxterm` logs its window-state request
+  after the compositor answers it, and the compositor answers after forwarding it to the shell.
+- **With the window-state steps fixed**, it failed exactly where CI had.
+- **With that fixed**, it failed at the editor's discard: `nxedit` destroys its window *before* it
+  logs `closing`, though the step's comment assumed the window went at exit.
+- **With all three fixed**, the gate passed under the probe. So did `check-logout`, unchanged.
+
+**The fixes:**
+- **The five window-state steps** wait for `nxterm`'s request and the shell's answer in one
+  `expect_all`. At the second maximise that also takes in the shell's move line, which can come
+  before the request.
+- **`Session::line_since`** finds the first whole line, since an offset taken before the action,
+  that holds a pattern and satisfies a predicate, whether or not an `expect` already scanned past
+  it. `expect_all` could not serve here, because an older list line of the same shape was still
+  unread.
+- **The two `nxedit` closes** use `line_since`. The second-window check is stronger for it: a
+  list after the key, without the closed window and still with the first, where it used to accept
+  any list line at all.
+
+`check-login`, TCG and KVM, passes without the probe. The probe is removed.
