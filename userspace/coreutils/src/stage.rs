@@ -210,8 +210,13 @@ impl Stage {
 
     /// Write `text` to `stdout` as text — a `TEXT_FALLBACK` stream, which the shell prints as lines,
     /// and `ChannelSink` splits however long it is. `false` if there is no `stdout`, or it failed.
+    ///
+    /// **Bytes that are not UTF-8 are shown replaced, not dropped**: a row is a `String`, and an
+    /// empty one in place of a body that did not decode would print a blank line and call it the
+    /// answer (PR #352 review).
     pub fn text_out(&self, text: &[u8]) -> bool {
-        let text = core::str::from_utf8(text).unwrap_or("");
+        let text = String::from_utf8_lossy(text);
+        let text: &str = &text;
         self.streams.stdout.is_some_and(|h| {
             use libstream::channel::{ChannelSink, IpcPort};
             let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();

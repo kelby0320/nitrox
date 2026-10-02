@@ -328,7 +328,8 @@ could not be — it went to the kernel log.
 - `test-interactive` reads `disk --help` **not** in the error colour — and, since a notice is
   drawn plain too, counts it: `disk --help | count` is 13 only if the usage is on `stdout`.
 - `test-interactive` 20d(b) reads `with --show FILE`'s notice plain. The `stderr` line names the
-  file where the console's says "a copy", so finding it proves the path.
+  file where the console's says "a copy", so finding it proves the path. And `with --show` with no
+  file counts as many rows as that saved copy, which only `stdout` can give (PR #352 review).
 - The reset-before-the-line-ends check covers a warning as well as an error.
 - `check-terminal` reads `nxsh --help` in the grid, which only a terminal writes to: `kprint`
   never reaches it.
@@ -341,4 +342,5 @@ could not be — it went to the kernel log.
   - `--help` sent as an error: the `disk --help` colour check;
   - `--help` sent as a notice: the count, which reads nothing;
   - `nxsh --help` through `kprint`: `check-terminal`, with the usage on the serial port and not
-    in the grid.
+    in the grid;
+  - `with --show` back to one diagnostic: the row count, which reads nothing.

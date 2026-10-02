@@ -2252,6 +2252,33 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     if s.transcript().contains("\x1b[91mwith: wrote the policy to") {
         return Err("`with --show FILE`'s notice was drawn in the error colour".into());
     }
+    //          **And with no file, on `stdout`** (PR #352 review): the policy as text a pipeline can
+    //          take, where it was one diagnostic and a policy longer than a message went to the
+    //          kernel log. Counted against the copy just written, so the rows are the policy's own
+    //          rather than any at all: on `stderr`, `count` sees none. Asked for its password, as
+    //          every step here is, rather than leaning on (b)'s window lasting under TCG.
+    s.send("with --forget")?;
+    s.expect(&format!("view: {DEMO_USER} — remembered passwords forgotten"))?;
+    s.send("format(\"shown={} saved={}\", (with admin with --show | count), (open ./policy.txt | count))")?;
+    s.expect("[with admin] password (1 of 3): ")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("shown=")?;
+    let counts = s.rest_of_line()?;
+    let read = |label: &str| {
+        counts.split_whitespace().find_map(|w| w.strip_prefix(label)).and_then(|n| n.parse::<u64>().ok())
+    };
+    match (read(""), read("saved=")) {
+        (Some(shown), Some(saved)) if shown == saved && shown > 0 => {
+            println!("  ok: `with --show` wrote the policy to `stdout`, {shown} lines as its saved copy");
+        }
+        _ => {
+            return Err(format!(
+                "`with --show` did not write the policy to `stdout` as its saved copy's rows: shown={counts}"
+            )
+            .into());
+        }
+    }
+    s.expect("/home>")?;
     //      (c) **An edited copy, one view more**, typed as lists of lines — `save` writes a list of
     //          strings a line each, where a single string would be a character per line. **In
     //          parts, each under the console's 256-byte input ring**

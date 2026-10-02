@@ -32960,3 +32960,28 @@ more of the line.
 **Proven before it was fixed.** A probe made `storage-service` emit that line in two pieces, half
 a second apart. The old code then failed every time, at `nitrox-roo` as in CI, in both gates. The
 new code passed both. The probe is removed.
+
+## 2026-10-02 — PR #352, reviewed: the shell is the exception
+
+One blocking finding and one worth fixing, both taken. The third, optional, is noted.
+
+**The spec said every program answers `--help` on `stdout`, and `nxsh` does not** (blocking).
+- `nxsh` keeps none of its streams, so `nxsh --help` writes on the terminal it was handed, and
+  cannot be piped.
+- `shell-language.md` §10f and `pipeline-stdio.md` now say the coreutils answer on `stdout`, and
+  name `nxsh` as the exception.
+- `pipeline-stdio.md` no longer says `nxinstall` has a `--version`. It answers `--help` only.
+
+**Nothing ran `with --show` without a file** (worth fixing). Putting back the old arm, one
+diagnostic, failed no gate. A policy longer than one message would have gone to the kernel log
+again.
+- 20d now runs `with admin with --show | count` against `open ./policy.txt | count`, the copy
+  20d(b) just saved. The two must be equal and above zero, which only `stdout` can give.
+- *Control:* the old arm back. The policy is drawn red on `stderr`, `count` gets nothing, and the
+  step fails.
+- **And a body that is not UTF-8** became one empty row: a blank line, and exit 0. `Stage::text_out`
+  now shows such bytes replaced, not dropped.
+
+**Optional, noted:** no gate sees `nxinstall`'s progress drawn as notices. `check-install` drives
+it in `nxterm`, whose grid drops colour, and `test-interactive` has no disk the installer may
+write. Other senders cover the mechanism, so each of those lines rests on its level choice alone.
