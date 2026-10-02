@@ -1321,6 +1321,10 @@ stdin stream, not a flag-selected mode), so that specific idiom doesn't carry ov
 
 ## 11. REPL / interactive shell behavior
 
+**The banner names the build** (2026-10-01, the laptop polish's Part D): `nxsh: interactive shell,
+Nitrox <commit> (Ctrl-D or `exit` to leave)`, the commit the system was built from, so a terminal
+says which system it is.
+
 ### 11a. Prompt
 
 Shows the current namespace position (the `cd`-tracked equivalent of cwd) plus a status glyph

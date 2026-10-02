@@ -32816,3 +32816,29 @@ indexed `clean` and `by` by position; they find them by name now.
 
 Docs: `storage.md` §9 and its Status, and the plan. No kernel change; no ABI hash impact: a TSM1
 table's columns are not hash inputs.
+
+## 2026-10-01 — Laptop polish Part D: the build's commit on the screen
+
+On 2026-10-01 a stick that had never been rewritten looked like a bug in the installer for an
+afternoon, because nothing on the running system said which build it was. Now two things do:
+- **The kernel's first report line**: `nitrox: built from <commit>`, logged before the handoff
+  lines, so it heads the hardware report's first page.
+- **Every shell's banner**: `nxsh: interactive shell, Nitrox <commit> (…)`.
+
+The commit is `git rev-parse --short=12 HEAD`, with `-dirty` when a tracked file differs, or
+`unknown` outside a repository.
+
+**One place.** `xtask` works it out at start and sets `NITROX_COMMIT` in its own environment, so
+every cargo it runs inherits it, kernel, userspace and host tests alike, and no build path can
+forget to pass it. The kernel and `nxsh` read it with `option_env!`. rustc records that as a
+dependency, so a new commit rebuilds those two crates and nothing else.
+
+**Gates, with controls:**
+- `test-qemu` holds the kernel's line to the commit `xtask` built from, beside the hardware facts.
+  A kernel logging a made-up commit fails it.
+- `check-report` reads the line on the report's **first** page, where a person looks first.
+- `test-interactive` reads the commit in the serial shell's banner. A banner naming a made-up one
+  fails it.
+
+Docs: `boot-flow.md` (step 3, and its Status), `shell-language.md` §11, and the plan. No ABI hash
+impact: a string in a log line and a banner.

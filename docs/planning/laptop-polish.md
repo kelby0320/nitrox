@@ -3,7 +3,7 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md). Scheduled after
 [administration](administration.md), which is complete, and before [Phase 6](phase-6-usb.md).
 
-**Status: Parts A–C built (2026-10-01); D and E scoped.** Parts A and E were shaped with the maintainer
+**Status: Parts A–D built (2026-10-01); E scoped.** Parts A and E were shaped with the maintainer
 on 2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
 behaviour** — Part A's is in [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) and
 [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md).
@@ -231,6 +231,19 @@ the hardware report's first page, and **`nxsh`'s banner** says it, so it is in e
 `check-report` reads it off the report's first page; `test-interactive` reads it in the banner.
 
 **Docs:** [`boot-flow.md`](../architecture/boot-flow.md), and the hardware report's description.
+
+### Part D in detail *(2026-10-01)*
+
+- [x] **Built.** `xtask` works the commit out once, at start (`build_commit`), and sets
+  `NITROX_COMMIT` in its own environment, so every cargo it runs inherits it and no build path can
+  forget it. The kernel and `nxsh` read it with `option_env!`, which rustc records as a dependency,
+  so a new commit rebuilds those two crates and nothing else.
+  - **The kernel** logs `nitrox: built from <commit>` before the handoff lines, on the report's
+    first page. **`nxsh`'s banner** reads `nxsh: interactive shell, Nitrox <commit> (…)`.
+  - **Gates**: `test-qemu` holds the kernel's line to the commit `xtask` built from, beside the
+    hardware facts; `check-report` reads it on the report's **first** page; `test-interactive`
+    reads it in the serial shell's banner. **Controls**: a kernel logging a made-up commit fails
+    `test-qemu`, and a banner naming one fails `test-interactive`.
 
 ## Part E — which output is a diagnostic
 

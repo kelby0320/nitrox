@@ -174,6 +174,9 @@ fn kernel_main() {
     // What was handed over and what this processor is (Phase 5 Part D.1), before anything that
     // can fail on an unfamiliar machine: a boot that stops at the next step has already said
     // what it stopped on. Both only read — Limine's responses, and CPUID.
+    // **Which build this is** (the laptop polish's Part D): the first thing to know about a machine
+    // that misbehaves, and so the first line of the hardware report's first page.
+    kprintln!("nitrox: built from {}", BUILD_COMMIT);
     let cmdline = log_handoff();
     arch::Cpu::log_identity();
     let flags = parse_cmdline(cmdline);
@@ -655,6 +658,13 @@ fn bring_up_aps() {
     }
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
 }
+
+/// **The commit this kernel was built from**, as `xtask` set it: `git rev-parse --short=12 HEAD`,
+/// with `-dirty` for a tree with changes. `unknown` when built some other way.
+const BUILD_COMMIT: &str = match option_env!("NITROX_COMMIT") {
+    Some(c) => c,
+    None => "unknown",
+};
 
 /// Log what Limine handed over, in three lines: the bootloader, its firmware and the base
 /// revision it loaded the kernel under; the HHDM offset, the firmware's date and the boot

@@ -331,7 +331,43 @@ impl BuildMode {
     }
 }
 
+/// **The commit this tree was built from**, as the running system shows it (the laptop polish's
+/// Part D): `git rev-parse --short=12 HEAD`, with `-dirty` when a tracked file differs from it, or
+/// `unknown` outside a repository. On 2026-10-01 a stick that had never been rewritten looked for an
+/// afternoon like a bug in the installer; a line on the screen naming the build would have said so
+/// at once.
+fn build_commit() -> String {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_root())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(head) = git(&["rev-parse", "--short=12", "HEAD"]).filter(|h| !h.is_empty()) else {
+        return String::from("unknown");
+    };
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    if dirty { format!("{head}-dirty") } else { head }
+}
+
+/// The line the kernel logs first on every boot, naming the commit this process built it from.
+fn built_from_line() -> String {
+    format!("nitrox: built from {}", env::var(COMMIT_ENV).unwrap_or_else(|_| String::from("unknown")))
+}
+
+/// The environment variable [`build_commit`]'s answer reaches every build through: the kernel's
+/// and `nxsh`'s `option_env!`, which rustc records as a dependency, so a new commit rebuilds the
+/// two crates that show it and nothing else.
+const COMMIT_ENV: &str = "NITROX_COMMIT";
+
 fn main() -> ExitCode {
+    // **Set once, for every child**: each cargo this process runs inherits it, so no build path —
+    // kernel, userspace, host tests — can forget to pass it. Before any thread exists.
+    // SAFETY: single-threaded at this point; nothing reads the environment concurrently.
+    unsafe { env::set_var(COMMIT_ENV, build_commit()) };
     let mut args = env::args().skip(1);
     let cmd = args.next();
     let rest: Vec<String> = args.collect();
@@ -1552,6 +1588,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         return Err(format!("the serial session was built without /storage: ({built}").into());
     }
     s.expect("libsession: nxsh spawned into the session namespace")?;
+    // **The banner names the build** (the laptop polish's Part D): the commit this process built
+    // from, which every terminal now says before its first prompt.
+    let commit = env::var(COMMIT_ENV).unwrap_or_default();
+    s.expect(&format!("nxsh: interactive shell, Nitrox {commit} "))?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -5386,6 +5426,13 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
         return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
     }
     println!("  ok: the pages say what this machine is — a declined AHCI controller, the module disk, no COM1");
+    // **And the first page says which build** (the laptop polish's Part D): the line a person
+    // checks first on a machine that misbehaves, before anything else on the report.
+    let built_from = built_from_line();
+    if !pages.first().is_some_and(|p| p.iter().any(|l| l.contains(&built_from))) {
+        return Err(format!("the report's first page does not say `{built_from}`").into());
+    }
+    println!("  ok: the first page names the build — {built_from}");
 
     // 4. The boot goes on, and the console hands the screen over.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -12673,9 +12720,12 @@ fn check_hardware_facts(transcript: &[u8]) -> R<()> {
         LIMINE_VERSION.trim_start_matches('v')
     );
     let bootloader: &[&str] = &[&limine];
+    // **The build it is** (the laptop polish's Part D): the commit this process built from.
+    let built_from = built_from_line();
+    let commit: &[&str] = &[&built_from];
     let missing = missing_facts(
         &lines,
-        EMULATED_MACHINE_FACTS.iter().chain(TEST_QEMU_FACTS).copied().chain([bootloader]),
+        EMULATED_MACHINE_FACTS.iter().chain(TEST_QEMU_FACTS).copied().chain([bootloader, commit]),
     );
     if !missing.is_empty() {
         return Err(format!(
