@@ -4498,12 +4498,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     //    what the storage service calls it, read off the line that reports it.
     let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
     s.expect(&reported)?;
-    let line = s
-        .transcript()
-        .lines()
-        .find(|l| l.contains(&reported))
-        .map(str::to_string)
-        .ok_or("the report line went missing from the transcript")?;
+    let line = s.matched_line()?;
     let name = line
         .split_whitespace()
         .find(|w| w.starts_with("blk-"))
@@ -5164,12 +5159,7 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     //    off the line the storage service reports it on.
     let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
     s.expect(&reported)?;
-    let line = s
-        .transcript()
-        .lines()
-        .find(|l| l.contains(&reported))
-        .map(str::to_string)
-        .ok_or("the report line went missing from the transcript")?;
+    let line = s.matched_line()?;
     let name = line
         .split_whitespace()
         .find(|w| w.starts_with("blk-"))
@@ -12197,6 +12187,22 @@ impl Session {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// The **whole** line the last [`expect`](Self::expect) matched on, once it has ended — for a
+    /// line whose values sit on both sides of the pattern, such as a device's `blk-<n>` before it
+    /// and its mount after.
+    ///
+    /// **Waited for, as [`rest_of_line`](Self::rest_of_line) is**, and for the same reason. Two
+    /// gates took the line straight from the transcript the moment its prefix matched, and on KVM
+    /// `check-storage` read `… mounted at /storage/nitrox-r` and failed with nothing wrong in the
+    /// guest (PR #352's CI).
+    fn matched_line(&self) -> R<String> {
+        self.rest_of_line()?;
+        let g = self.out.lock().map_err(|_| "transcript lock")?;
+        let start = g[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+        let end = g[self.cursor..].find('\n').map_or(g.len(), |i| self.cursor + i);
+        Ok(g[start..end].trim().to_string())
     }
 
     /// Wait up to `timeout` for `pat`, answering **whether it arrived** rather than failing.

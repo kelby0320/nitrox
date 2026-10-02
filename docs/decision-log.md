@@ -32941,3 +32941,22 @@ ends (2026-10-01).
 Docs: `pipeline-stdio.md` (a section on the level), `shell-language.md` §1 and §10f,
 `console-and-tty.md` (and its Status), and the plan, which is now complete. No kernel change, so no
 ABI hash impact.
+
+## 2026-10-02 — PR #352's CI: a gate read a line still arriving
+
+`check-storage --kvm` failed in CI on the report line for the disk's root, read as
+`… mounted at /storage/nitrox-r`. The guest was right: the transcript dumped a moment later had
+more of the line.
+
+- **The gate was wrong, and has been since 2026-09-25.** It matched the line's prefix with
+  `expect`, then took the line straight from the transcript. `expect` returns as soon as the
+  prefix arrives, and the rest of a serial line comes in whatever chunks the host reads. KVM is
+  fast enough to read between them.
+- **`check-recovery` has the same code** and the same bug.
+- **`rest_of_line` already waits for the newline**, for this reason (PR #223's review), but only
+  covers the text after the match. Both gates also need the `blk-<n>` before it. The new
+  `Session::matched_line` waits the same way and returns the whole line, and both gates use it.
+
+**Proven before it was fixed.** A probe made `storage-service` emit that line in two pieces, half
+a second apart. The old code then failed every time, at `nitrox-roo` as in CI, in both gates. The
+new code passed both. The probe is removed.
