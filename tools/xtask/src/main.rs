@@ -4194,7 +4194,9 @@ fn run_installed_boot_steps(session: &mut Session, qmp: &mut Qmp) -> R<()> {
 ///
 /// Boots `nitrox-live.img` attached as a **USB stick** (an xHCI, [`XHCI_DEVICE`], + `usb-storage`) with nothing
 /// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
-/// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
+/// and the kernel, which has no USB storage driver, never reads it again — it claims and resets the
+/// controller (Phase 6 Part A) but nothing binds the stick until mass storage. Asserts over serial,
+/// in order:
 ///
 /// 1. no SATA disk — no storage driver carried the boot;
 /// 2. the second Limine module became a block device, and the GPT pass found a partition labelled

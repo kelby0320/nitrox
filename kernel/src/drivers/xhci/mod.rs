@@ -1,5 +1,6 @@
-//! **The xHCI USB host controller** (Phase 6 Part A): one Tier 1 driver for QEMU's `qemu-xhci` and
-//! the laptop's Sunrise Point-LP controller, matched by PCI class `0C/03/30`.
+//! **The xHCI USB host controller** (Phase 6 Part A): one Tier 1 driver for QEMU's xHCI — the gates
+//! attach `nec-usb-xhci` — and the laptop's Sunrise Point-LP controller, matched by PCI class
+//! `0C/03/30`.
 //!
 //! Bring-up is in [`init`], from `drivers::probe`, polled, before the scheduler runs:
 //! 1. the function into D0, and bus mastering on;
@@ -333,6 +334,14 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         }
     }
 
+    // **Not before it is ready** (xHCI 1.2 §4.2): no operational register may be written while
+    // Controller Not Ready is set, which a function just raised from D3 by a resetting transition
+    // can be — a reset written then would land on nothing, and the poll after it pass at once.
+    // Linux waits the same way before its handoff's halt (PR #354 review).
+    if !wait_for(RESET_NS, || read32(op, USBSTS) & STS_CNR == 0) {
+        return declined("it stayed not ready after power-up");
+    }
+
     // **Halt, then reset.** The pause comes between setting HCRST and the first read, which is the
     // read it guards: no bound on a loop can stand in for it.
     if read32(op, USBSTS) & STS_HCH == 0 {
@@ -413,15 +422,23 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         _erst: erst,
         port_changes: AtomicU32::new(0),
     };
+    // **Boxed before the controller runs**, so no failure after it starts can free what it writes
+    // to while it writes: a box that cannot be had is declined here, with nothing running. The first
+    // version boxed after the No Op, and a failed allocation dropped the rings inside `try_new`
+    // with the controller still running (PR #354 review).
+    let Ok(boxed) = KBox::try_new(x) else {
+        return declined(OUT_OF_MEMORY);
+    };
 
     // **Run, and prove the rings with a No Op**, polled: interrupts are masked here, and the
     // interrupter is not on yet. Any port's change event that lands first is counted and passed.
+    // A decline from here stops the controller **before** the box drops.
     write32(op, USBCMD, CMD_RUN);
     if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH == 0) {
         stop(op);
         return declined("it did not start running");
     }
-    let answer = no_op(&x);
+    let answer = no_op(&boxed);
     let Some(code) = answer else {
         stop(op);
         return declined("its command ring did not answer a No Op");
@@ -432,18 +449,21 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         return declined("a No Op did not complete with Success");
     }
 
-    let Ok(boxed) = KBox::try_new(x) else {
-        stop(op);
-        return declined(OUT_OF_MEMORY);
-    };
     let x = KBox::into_raw(boxed).as_ptr();
     XHCI.store(x, Ordering::Release);
     // SAFETY: just published, and nothing else holds it yet.
     let x = unsafe { &*x };
 
-    // The interrupter on, then the controller's interrupts.
-    write32(ir, IMAN, IMAN_IP | IMAN_IE);
+    // **The interrupter on, without touching Interrupt Pending**, then the controller's interrupts,
+    // then **one more drain**. An event posted after the No Op's drain set IP and Event Handler Busy
+    // with the interrupter off, and raised nothing. Writing IP as one here — it is write-one-to-clear
+    // — threw that interrupt away, and with EHB still set the interrupter raised nothing again for
+    // the rest of the boot, since only a DPC clears EHB and only an interrupt runs the DPC (PR #354
+    // review, demonstrated with a port reset in the window). Now the pending interrupt is kept, and
+    // the drain consumes whatever landed and clears EHB, so the next event interrupts either way.
+    write32(ir, IMAN, IMAN_IE);
     write32(op, USBCMD, read32(op, USBCMD) | CMD_INTE);
+    drain_counting(x);
 
     crate::kprintln!(
         "xhci: {at} up: xHCI {}.{}, {} ports ({}), {} slots, {}-byte contexts, {} scratchpad(s)",
@@ -516,22 +536,36 @@ fn no_op(x: &Xhci) -> Option<u8> {
     // Doorbell 0 is the command ring's, and its target is zero.
     write32(x.db, 0, 0);
     let mut answer = None;
-    let mut ev = x.events.lock();
     let done = wait_for(NO_OP_NS, || {
-        let EventRing { mem, ring } = &mut *ev;
-        while let Some(trb) = ring.next(&DmaSlots(mem)) {
-            match trb.kind() {
-                kind::COMMAND_COMPLETION if trb.pointer() == sent => answer = Some(trb.completion_code()),
-                kind::PORT_STATUS_CHANGE => {
-                    x.port_changes.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
+        drain(x, |trb| {
+            if trb.kind() == kind::COMMAND_COMPLETION && trb.pointer() == sent {
+                answer = Some(trb.completion_code());
             }
-        }
+        });
         answer.is_some()
     });
-    write64(x.rt + IR0, ERDP, ev.mem.phys().as_u64() + ev.ring.dequeue() as u64 * 16 | ERDP_EHB);
     if done { answer } else { None }
+}
+
+/// **Drain the event ring at bring-up**, counting port changes and passing everything else, then
+/// tell the controller where it stopped, clearing Event Handler Busy. Polled, before the scheduler
+/// runs: nothing here may wake a thread.
+fn drain_counting(x: &Xhci) {
+    drain(x, |_| {});
+}
+
+/// Drain the event ring, handing each event to `seen` after counting port changes, and write the
+/// dequeue pointer back with Event Handler Busy cleared.
+fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
+    let mut ev = x.events.lock();
+    let EventRing { mem, ring } = &mut *ev;
+    while let Some(trb) = ring.next(&DmaSlots(mem)) {
+        if trb.kind() == kind::PORT_STATUS_CHANGE {
+            x.port_changes.fetch_add(1, Ordering::Relaxed);
+        }
+        seen(&trb);
+    }
+    write64(x.rt + IR0, ERDP, mem.phys().as_u64() + ring.dequeue() as u64 * 16 | ERDP_EHB);
 }
 
 /// The interrupt: acknowledge it, and leave the event ring to the DPC.

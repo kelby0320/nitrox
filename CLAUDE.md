@@ -178,7 +178,7 @@ in CI's QEMU job.
 Part C) — the release kernel and initramfs with the release root filesystem riding along as a
 second Limine module, which the kernel publishes as a RAM disk — attached as a **USB stick** with
 the AHCI controller empty, so no storage driver is involved: the laptop's first boot, before there
-is a USB driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
+is a USB storage driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
 timer tick instead of its own interrupt takes 3 s or more), that a serial login writes under
 `/home`, and that the session reaches no disk — none does on any entry since administration Part

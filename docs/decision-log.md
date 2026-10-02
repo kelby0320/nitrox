@@ -33202,3 +33202,51 @@ The pinned PCI fact now holds only the identity and `caps msi64`, which both ver
 **What this cost:** the plan said "both machines have MSI", and A.1's first boot showed QEMU's
 default did not. The fix chose a property that only QEMU 11 has, so the fix was wrong for CI. A
 configuration choice is checked against the QEMU that CI runs.
+
+## 2026-10-02 — PR #354, reviewed: an interrupt thrown away while enabling
+
+One blocking finding, two worth fixing and two optional, all taken.
+
+**Enabling the interrupter could wedge the event ring for the rest of the boot** (blocking). The
+controller runs from `probe`, for the polled No Op, and the interrupter was enabled after it by
+writing `IMAN` with Interrupt Pending set. IP is write-one-to-clear. The failing sequence:
+1. An event posted after the No Op's last drain set IP and Event Handler Busy, with the
+   interrupter off, and raised nothing.
+2. The enable cleared that IP.
+3. EHB stayed set, and an interrupter with EHB set raises nothing more. Only the DPC clears EHB,
+   and only an interrupt runs the DPC.
+- The reviewer showed it in QEMU with port resets forced into the window: the DPC never ran for
+  the whole boot, and `test-qemu` passed.
+- **Reproduced here before the fix:** a port reset in the window and one after, with the DPC
+  logging after its drain. The log line never appeared, and the gate passed.
+- **The fix:** `IMAN` is written with Interrupt Enable alone, so a pending interrupt is kept. After
+  `INTE`, one more polled drain consumes whatever landed and writes the dequeue pointer with EHB
+  cleared. The drain only counts port changes, since the scheduler does not exist yet.
+- **The same experiment against the fix:** the event in the window is consumed by the final drain,
+  and the one after the enable sequence interrupts. The DPC ran, with two port changes counted.
+- **A false start, kept for the method.** The first experiment against the fix panicked: its log
+  line was printed inside the DPC while the event ring's leaf lock was held, and taking the serial
+  lock under it is a lock-order violation. That panic was itself the proof the DPC had run. The
+  probe was moved after the lock's release, and the unfixed code was rerun with the same probe to
+  compare like with like.
+
+**No A.1 gate takes an xHCI interrupt** (worth fixing). That is why the race passed CI. QEMU posts
+port events only while a controller runs, and `test-qemu`'s devices are attached before the reset.
+`usb.md` said the gates' "interrupt path is the laptop's"; it now says the gates' controller
+*signals* the way the laptop's does, and that the path is first exercised by A.2's enumeration.
+Every command A.2 sends completes through the interrupt, so its gate holds the path. A permanent
+gate for an event inside a microsecond window would need test-only code in the driver; the
+experiment above is the record instead.
+
+**A failed allocation freed the rings with the controller running** (worth fixing). `KBox::try_new`
+takes its value and drops it on failure, which happened after the controller was started. The state
+is now boxed before the controller runs. A decline after that point stops the controller before the
+box drops.
+
+**Optional, both taken:**
+- **Controller Not Ready is waited out before the first operational write** (xHCI 1.2 §4.2), as
+  Linux does before its halt. A function just raised from D3 by a resetting transition could
+  otherwise take the reset while not ready. Neither machine here would show it.
+- **Stale wording:** the live gate's comment and `CLAUDE.md` said the kernel has no USB driver,
+  and the driver's module doc and `usb.md` named `qemu-xhci` as the gates' controller. The first
+  A.1 entry above says `qemu-xhci,p2=8,p3=8`, and the CI entry after it is its correction.

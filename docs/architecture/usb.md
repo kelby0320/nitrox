@@ -9,9 +9,9 @@ is counted, and nothing acts on it until Part A.2's hub thread. There are no USB
 ## The controller
 
 **One Tier 1 driver, `drivers::xhci`** (`kernel/src/drivers/xhci/`), matched by PCI class
-`0C/03/30`, serves QEMU's `qemu-xhci` and the laptop's Sunrise Point-LP controller (`8086:9d2f`)
-alike, as one AHCI driver serves both machines' disks. It takes **one controller**; a second is
-declined.
+`0C/03/30`, serves QEMU's xHCI (the gates attach `nec-usb-xhci`) and the laptop's Sunrise Point-LP
+controller (`8086:9d2f`) alike, as one AHCI driver serves both machines' disks. It takes **one
+controller**; a second is declined.
 
 **Bring-up is in `drivers::probe`**, polled, with interrupts masked and before the scheduler runs:
 1. **Power.** `pci::power_up` puts the function in D0 through its power-management capability,
@@ -22,8 +22,10 @@ declined.
 3. **The firmware's handoff**, through the USB Legacy Support extended capability: OS-owned set,
    up to a second for the firmware to clear BIOS-owned — then it is taken anyway, as Linux takes
    it — and the firmware's SMIs turned off.
-4. **Halt, then reset.** `HCRST` is set, then **1 ms passes before any register is read**, then
-   `HCRST` and Controller Not Ready are waited out. Linux pauses on every Intel host, against a
+4. **Ready, then halt, then reset.** Controller Not Ready is waited out before any operational
+   register is written (xHCI 1.2 §4.2), since a function just raised from D3 can still be setting
+   up. Then `HCRST` is set, **1 ms passes before any register is read**, and `HCRST` and Controller
+   Not Ready are waited out. Linux pauses on every Intel host, against a
    rare hang on that read; a bound on the loop cannot stand in for it.
 5. **What the controller needs from memory**: the device context base array, the scratchpad
    buffers it asks for, a one-page command ring with a Link TRB back to its start, and one
@@ -33,7 +35,13 @@ declined.
 7. **Running, and a No Op through the command ring**, polled on the event ring. It proves the
    ring, the doorbell and the event ring before anything depends on them, and the function is
    claimed only if it completes with Success.
-8. **The interrupter on.** The interrupt acknowledges and queues a DPC; the DPC drains the event
+8. **The interrupter on — without writing Interrupt Pending — then one more drain.** An event
+   posted after the No Op's drain sets IP and Event Handler Busy with the interrupter still off,
+   and raises nothing. IP is write-one-to-clear, so enabling with IP written as one threw that
+   interrupt away, and with EHB still set the interrupter raised nothing again: only the DPC clears
+   EHB, and only an interrupt runs the DPC. Enabling without IP keeps the pending interrupt, and
+   the drain after consumes whatever landed and clears EHB, so the next event interrupts either
+   way. The interrupt acknowledges and queues a DPC; the DPC drains the event
    ring and writes the dequeue pointer back. It counts Port Status Change Events, which no one
    acts on yet.
 
@@ -45,10 +53,18 @@ has no boot menu to type it at, but the live stick's does.
 
 **MSI only.** The laptop's controller has MSI with eight vectors and no MSI-X, and the driver
 takes that. **Every gate's controller is QEMU's `nec-usb-xhci` with `msi=on,msix=off`**
-(`XHCI_DEVICE` in `tools/xtask/src/main.rs`), so the gates' interrupt path is the laptop's. It is
-the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity (`1033:0194`). `qemu-xhci`
-offers MSI-X alone on q35, and QEMU 8.2 — CI's — hard-codes that, with no `msi` property; the NEC
-model takes `msi` and `msix` in 8.2 and 11 alike.
+(`XHCI_DEVICE` in `tools/xtask/src/main.rs`), so the gates' controller signals the way the laptop's
+does. It is the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity (`1033:0194`).
+`qemu-xhci` offers MSI-X alone on q35, and QEMU 8.2 — CI's — hard-codes that, with no `msi`
+property; the NEC model takes `msi` and `msix` in 8.2 and 11 alike.
+
+**No A.1 gate takes an xHCI interrupt.** QEMU posts port events only while a controller runs, and
+`test-qemu`'s devices are attached before the reset, so nothing posts one after the controller
+starts: the gates prove the MSI is programmed and the controller claimed over it, not that an
+event interrupts. **A.2's enumeration is the first exercise of the path** — every command it sends
+completes through the interrupt and the DPC — and its gate is the one that holds it. The race
+below was found by a reviewer with port resets forced into the window, and its fix is held the same
+way, by that experiment, recorded in the decision log.
 
 **The ports' USB versions come from the Supported Protocol capabilities**, never from an assumed
 order. QEMU's controller numbers its USB 3 ports first: with `p2=8,p3=8`, USB 3 is 1–8 and USB 2
