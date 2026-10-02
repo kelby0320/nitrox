@@ -2151,6 +2151,12 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     if row.contains("null") {
         return Err(format!("`disk --list` drew an empty cell as `null`: {row:?}").into());
     }
+    //          **And a disk is named as the installer names it** (the laptop polish's Part C): the
+    //          `description` column carries the model and serial the SATA disk reports, which the
+    //          typed command does not contain.
+    s.send("disk --list | filter name == \"blk-0\"")?;
+    s.expect("QEMU HARDDISK (QM00001)")?;
+    s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
     //          nothing answers, and `disk` names `with`.

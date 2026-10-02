@@ -323,6 +323,7 @@ pub mod table {
         Schema::new()
             .field("name", TypeTag::String, TypeModifiers::NONE)
             .field("kind", TypeTag::String, TypeModifiers::NONE)
+            .field("description", TypeTag::String, nullable)
             .field("size", TypeTag::Int, nullable)
             .field("filesystem", TypeTag::String, nullable)
             .field("label", TypeTag::String, nullable)
@@ -343,9 +344,15 @@ pub mod table {
             (Found::Ext4 { clean: Some(c), .. }, _) => Value::Bool(*c),
             _ => Value::Null,
         };
+        // **What the device calls itself** (the laptop polish's Part C): the model and serial a
+        // SATA disk reports, a RAM disk's module, a partition's name in its table — what `nxinstall`
+        // shows, so `disk --list` names a disk the way the installer does. `blk-<n>` is where it
+        // is, and this is what it is.
+        let described = String::from_utf8_lossy(r.name()).into_owned();
         vec![
             Value::Str(name(r)),
             Value::Str(String::from(kind_word(r.kind()))),
+            if described.is_empty() { Value::Null } else { Value::Str(described) },
             size.unwrap_or(Value::Null),
             text(d.found.filesystem()),
             text(d.found.label()),

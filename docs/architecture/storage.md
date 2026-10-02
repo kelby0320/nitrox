@@ -3,7 +3,7 @@
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
 since Part E.1b; its shutdown unmount built with Part E.4a; the installer's source passed over
-since Part G.1; last checked 2026-09-30.**
+since Part G.1; a `description` column since the laptop polish's Part C; last checked 2026-10-01.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -237,6 +237,7 @@ block device in registry order, then one `<name>.tsm` per device. **A name is `/
 |---|---|---|
 | `name` | string | `blk-<n>` |
 | `kind` | string | `disk`, `partition` or `ramdisk` |
+| `description` | string, nullable | what the device calls itself: a SATA disk's model and serial, a RAM disk's module, a partition's name in its table (2026-10-01) |
 | `size` | int, nullable | bytes |
 | `filesystem` | string, nullable | `ext4` or `fat` |
 | `label` | string, nullable | the filesystem's own label |

@@ -3,7 +3,7 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md). Scheduled after
 [administration](administration.md), which is complete, and before [Phase 6](phase-6-usb.md).
 
-**Status: Parts A and B built (2026-10-01); C–E scoped.** Parts A and E were shaped with the maintainer
+**Status: Parts A–C built (2026-10-01); D and E scoped.** Parts A and E were shaped with the maintainer
 on 2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
 behaviour** — Part A's is in [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) and
 [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md).
@@ -205,6 +205,18 @@ everything that filters the table by name or mount keeps working.
 service's host tests cover each kind.
 
 **Docs:** [`storage.md`](../architecture/storage.md) §9.
+
+### Part C in detail *(2026-10-01)*
+
+- [x] **Built.** `description`, after `kind`, is the device record's name: `QEMU HARDDISK (QM00001)`
+  for the release disk, `module 3 (/boot/install-root.img)` for a RAM disk, `nitrox-root` for a
+  partition. A record that names nothing has an empty cell, so it draws blank (Part B).
+  - **Host test**: each kind, and an unnamed record. Two older tests indexed `clean` and `by` by
+    position, which the new column would have moved; they find them by name now, as every reader
+    of the table already did.
+  - **Gate**: `test-interactive` 20c(a) reads `blk-0`'s row and expects the model and serial, which
+    the typed command does not contain. **Control**: with the column emptied, the gate times out
+    at that step.
 
 ## Part D — the build's commit on the screen
 

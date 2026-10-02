@@ -32796,3 +32796,23 @@ make the gate pass without saying why, and would weaken the claim the test exist
 closed endpoint is retired, not waited on.
 
 No kernel change; no ABI hash impact.
+
+## 2026-10-01 — Laptop polish Part C: a disk's model and serial in `disk --list`
+
+The storage service's table gains **`description`**, after `kind`: what the device calls itself.
+That is a SATA disk's model and serial, a RAM disk's module, or a partition's name in its table. It
+is the device record's name, the one `nxinstall` already printed, so `disk --list` now names a disk
+the way the installer does. `blk-<n>` stays the column that says *where* a device is. A record that
+names nothing has an empty cell, which Part B draws blank.
+
+**Every reader finds columns by name**: `boot-probe` and `nxinstall`, while `disk` passes the table
+through. So the column could go beside `kind`, where it reads naturally. Only two of the service's own host tests
+indexed `clean` and `by` by position; they find them by name now.
+
+**Gates, with controls:**
+- A host test covers each kind and an unnamed record.
+- `test-interactive` 20c(a) reads `blk-0`'s row and expects `QEMU HARDDISK (QM00001)`, which the
+  typed command does not contain. With the column emptied, the gate times out at that step.
+
+Docs: `storage.md` §9 and its Status, and the plan. No kernel change; no ABI hash impact: a TSM1
+table's columns are not hash inputs.

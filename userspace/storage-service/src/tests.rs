@@ -315,6 +315,14 @@ fn all_tsm_has_a_row_per_device() {
     let names: Vec<&Value> = (0..t.rows.len()).map(|i| column(&t, i, "name")).collect();
     assert_eq!(names, [&s("blk-0"), &s("blk-1"), &s("blk-2"), &s("blk-3"), &s("blk-4")]);
     assert_eq!(column(&t, 0, "kind"), &s("disk"));
+    // **What each kind calls itself** (the laptop polish's Part C).
+    assert_eq!(column(&t, 0, "description"), &s("QEMU HARDDISK"), "a disk's model and serial");
+    assert_eq!(column(&t, 1, "description"), &s("root.img"), "a RAM disk's module");
+    assert_eq!(column(&t, 3, "description"), &s("nitrox-root"), "a partition's name in its table");
+    // A device that names nothing has an empty cell, not an empty string.
+    let unnamed = Device { record: rec(9, DeviceKind::Disk, 5, NO_PARENT, "", 8), found: Found::Nothing };
+    let i = table::schema().fields.iter().position(|f| f.name == "description").unwrap();
+    assert_eq!(table::row(&unnamed, None)[i], Value::Null);
     assert_eq!(column(&t, 0, "size"), &Value::Int(262_144 * 512));
     assert_eq!(column(&t, 0, "filesystem"), &Value::Null, "a disk holding a table holds no filesystem");
     assert_eq!(column(&t, 2, "filesystem"), &s("fat"));
@@ -334,12 +342,14 @@ fn all_tsm_has_a_row_per_device() {
 fn clean_is_null_while_mounted_writable() {
     let ds = devices();
     let at = |mode| Mounted { device: 7, at: String::from("/x"), by: By::Storage, mode };
-    let clean = |m: Option<&Mounted>| table::row(&ds[3], m)[8].clone();
+    // By name, not position: a column added in front of these would otherwise move them.
+    let col = |name: &str| table::schema().fields.iter().position(|f| f.name == name).unwrap();
+    let clean = |m: Option<&Mounted>| table::row(&ds[3], m)[col("clean")].clone();
     assert_eq!(clean(Some(&at(Mode::Rw))), Value::Null);
     assert_eq!(clean(Some(&at(Mode::Ro))), Value::Bool(false));
     assert_eq!(clean(None), Value::Bool(false));
-    assert_eq!(table::row(&ds[4], None)[8], Value::Bool(true));
-    assert_eq!(table::row(&ds[3], Some(&at(Mode::Ro)))[6], s("storage"));
+    assert_eq!(table::row(&ds[4], None)[col("clean")], Value::Bool(true));
+    assert_eq!(table::row(&ds[3], Some(&at(Mode::Ro)))[col("by")], s("storage"));
 }
 
 #[test]
