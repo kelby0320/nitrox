@@ -2140,9 +2140,17 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // 20c. **`disk`, with and without the grant** (administration Part C.7).
     //      (a) `--list` is the storage service's table, from any session: the row mounted at `/`
     //          is `init`'s root, matched on words the command does not contain.
+    let row_from = s.transcript().len();
     s.send("disk --list | filter mounted == \"/\"")?;
     s.expect_all(&["blk-2", "init"])?;
     s.expect("/home>")?;
+    //          **And its empty cell is blank** (the laptop polish's Part B): `init`'s root is mounted
+    //          writable, so its `clean` is null, and the shell drew that as `null` until the table
+    //          drew an empty cell blank. The typed command holds no `null`, so any here is the row's.
+    let row = s.transcript()[row_from..].to_string();
+    if row.contains("null") {
+        return Err(format!("`disk --list` drew an empty cell as `null`: {row:?}").into());
+    }
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
     //          nothing answers, and `disk` names `with`.

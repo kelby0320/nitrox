@@ -3,7 +3,7 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md). Scheduled after
 [administration](administration.md), which is complete, and before [Phase 6](phase-6-usb.md).
 
-**Status: Part A built (2026-10-01); B–E scoped.** Parts A and E were shaped with the maintainer
+**Status: Parts A and B built (2026-10-01); C–E scoped.** Parts A and E were shaped with the maintainer
 on 2026-10-01; each part has its detail pass before it is built. **Nothing below describes current
 behaviour** — Part A's is in [`rsproto-views-ops.md`](../spec/rsproto-views-ops.md) and
 [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md).
@@ -177,6 +177,19 @@ is still `null`, since there it is the answer.
 storage step reads a blank cell where `disk --list` has a null.
 
 **Docs:** [`shell-language.md`](../spec/shell-language.md), where values are rendered.
+
+### Part B in detail *(2026-10-01)*
+
+- [x] **Built.** `display` (`userspace/nxsh/src/ops.rs`) draws a cell whose value is null blank.
+  - Only the cell itself: a null inside a list in a cell is still `[null]`, and a bare `null` is
+    still `null`.
+  - **A row ends at its last non-blank cell**, so blank cells at the end leave no run of padding
+    for a narrow terminal to wrap. Blank cells before it are padded, so the columns stay aligned.
+  - **Host test**: a table with blank cells in the middle and at the end, a bare `null`, and a
+    nested one. **Control**: the old rendering fails it with `blk-0  null     null`.
+  - **Gate**: `test-interactive` 20c(a). The row for `init`'s root has a null `clean`, since it is
+    mounted writable, and must not draw `null`. **Control**: the old rendering fails it there, on
+    the real row.
 
 ## Part C — the disk's model and serial in `disk --list`
 

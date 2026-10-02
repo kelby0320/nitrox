@@ -32742,3 +32742,29 @@ No kernel change.
 
 `TODO(view-grace)` is gone from `with.rs`. No ABI hash impact: the new ops are rsproto, not hash
 inputs.
+
+## 2026-10-01 — Laptop polish Part B: an empty table cell drawn blank
+
+`disk --list` showed a column of `null` for every disk without a filesystem. `display` now draws a
+cell whose value is null **blank**: the header already names what is missing, and a column of
+`null` reads as data.
+
+**Only the cell.** A null nested in a cell's list is still `[null]`, and a bare `null` — the value of
+an expression — is still `null`, since there it is the answer.
+
+**A row ends at its last non-blank cell.** Blank cells at the end would otherwise leave a run of
+padding that wraps a narrow terminal for nothing. Blank cells before it are padded like any other,
+so the columns stay aligned.
+
+**Gates, with controls run in both:**
+- A host test covers blank cells in the middle and at the end, a bare `null` and a nested one.
+- `test-interactive` 20c(a) reads the row for `init`'s root, whose `clean` is null because it is
+  mounted writable.
+- The old rendering fails both: the host test with `blk-0  null     null`, and the gate on the real
+  row.
+
+Docs: `shell-language.md` §11e and the plan. No kernel change; no ABI hash impact.
+
+**Gates, 2026-10-01: 35 of 36 passed (fgb60).** `test-qemu`'s TCG run failed in `boot-probe`'s logs
+test, which Part B does not touch, and passed four reruns and its KVM run. The next entry records
+it.

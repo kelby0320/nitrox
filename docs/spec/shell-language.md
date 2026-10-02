@@ -1399,6 +1399,12 @@ original rule.
 a terminal generic operator implicitly gets `| display` appended — standard REPL ergonomics
 (Python, nushell, PowerShell all do some version of this).
 
+**How `display` draws a table** (2026-10-01, the laptop polish's Part B): its columns aligned
+under a header row, and **a cell whose value is `null` drawn blank** — the header already says
+what is missing, and a column of `null` reads as data. Only the cell: a `null` nested in a cell's
+list is still `[null]`, and a bare `null` is still displayed as `null`, since there it is the
+answer. A row ends at its last non-blank cell.
+
 **Script:** the opposite default — an unassigned bare expression statement evaluates and its
 result is silently discarded, not auto-displayed. A script with many bare invocations for side
 effects (`remove`, `move`) would otherwise flood output unpredictably. Consistent with the
