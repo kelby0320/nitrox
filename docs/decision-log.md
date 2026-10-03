@@ -33504,3 +33504,57 @@ as they are, since a USB node's descriptor is the zero one.
 - **Two `UsbFacts` fields lacked doc comments.**
 
 No ABI hash impact: docs, a gate, and a test.
+
+## 2026-10-03 — Phase 6 Part B, detailed: HID boot keyboard and mouse
+
+`docs/planning/phase-6-usb.md` § *Part B in detail*. Docs only.
+
+**What the check of the code found:**
+- **The input path above the kernel needs nothing new.** `input-server` takes up to eight devices
+  of any origin, and the compositor repeats a held key in software, so a USB keyboard, which
+  sends no typematic repeat, repeats as a PS/2 one does.
+- **What a raw input node is lives inside the PS/2 driver**: the ring, the parked read, the DPC's
+  hand-off and the reclaim. That hand-off was a use-after-free once (PR #178 review), so Part B
+  moves it into a shared `drivers::input` rather than copying it.
+- **Part A left a USB-keyboard-only machine with no keyboard.** Taking the controller from the
+  firmware ended its PS/2 emulation. The laptop's keyboard is a real i8042, so nothing has hit it,
+  but a desktop would have.
+- **Nothing drives a keyboard LED and nothing holds a lock state**: Caps Lock is not a lock. The
+  scoping's open question about LEDs answers itself: out, for both keyboards alike.
+- **The hardware report counts only PS/2 key presses.** Part B counts every keyboard's, and
+  `check-report --usb` holds it.
+
+**Checked rather than assumed:**
+- **The spike.** The release image boots on `-machine i8042=off` with `usb-kbd` and `usb-mouse`:
+  - the FADT says the 8042 is absent;
+  - the PS/2 driver publishes nothing;
+  - both devices enumerate;
+  - `input-server` serves with no devices;
+  - the greeter comes up.
+
+  QEMU 8.2 takes `i8042=off` too.
+- **QEMU's HID model**, from its 8.2.2 source:
+  - an IN token with nothing to report is NAKed;
+  - `SET_PROTOCOL` and `SET_IDLE` are accepted;
+  - the mouse clamps each axis to ±127 and keeps the remainder, so `check-input`'s motion sum
+    stays exact;
+  - its fourth byte is the wheel whatever the protocol, which Part B does not read;
+  - more than six keys gives `ErrorRollOver`;
+  - both devices' endpoint 1 IN encodes to 8 ms at either speed.
+
+**Calls made without the maintainer**, each in the plan:
+- every boot interface is bound, not only the first;
+- the input node is extracted from PS/2, not copied;
+- the served index is the next free one, so an i8042-less machine's first USB keyboard is
+  `input-0`;
+- no LEDs;
+- no wheel;
+- `SET_IDLE` to keyboards only;
+- the report counts USB key presses.
+
+**The gate set grows from 36 to 42:** `check-input --usb`, `check-login --usb` and
+`check-report --usb`, each under TCG and KVM. Each boots a machine with no i8042, so a key that
+arrives came through USB.
+
+No ABI hash impact: docs only. Part B's kernel work has none either: a driver, a table, and
+records of existing kinds.
