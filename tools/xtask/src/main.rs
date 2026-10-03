@@ -4826,7 +4826,9 @@ fn cmd_check_shutdown(accel: Accel, size: DisplaySize) -> R<()> {
 /// Wait for `boot-probe`'s verdict, then log in on serial as `DEMO_USER`.
 fn shutdown_login(s: &mut Session) -> R<()> {
     s.expect("boot-probe: test-harness verdict")?;
-    if !s.transcript().contains("boot-probe: test-harness verdict PASS") {
+    // **The whole line, waited for** (PR #356's CI): the prefix can arrive before the word after
+    // it, and on KVM this read `… verdict P` from the transcript and refused a passing image.
+    if !s.matched_line()?.contains("boot-probe: test-harness verdict PASS") {
         return Err("boot-probe's verdict was not PASS, so the image is not one to shut down".into());
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);

@@ -33445,3 +33445,20 @@ planned:
 
 No ABI hash impact: a kind and two reserved bytes are not hash inputs. `abi-sync-check` agrees on
 186 values between the kernel's `libkern::device` and userspace's.
+
+## 2026-10-03 — PR #356's CI: `check-shutdown` read half its verdict line
+
+`check-shutdown --kvm` failed with "boot-probe's verdict was not PASS" on a boot whose transcript
+ended `boot-probe: test-harness verdict P`. Nothing was wrong in the guest.
+- **The cause:** `shutdown_login` expected the line's prefix, then searched the transcript for the
+  whole line. The prefix can reach the host before the word after it.
+- **The same shape as PR #352's `check-storage` race**, which gave `Session` `matched_line`, which
+  waits for the newline. The verdict is now read with it.
+- **The sweep for siblings:** every other transcript read in `xtask` either polls until its text is
+  there, takes text after a later `expect`, or reads a line whose wanted part precedes what is
+  still arriving. This was the last `expect`-then-`contains` on one line.
+
+Not A.3's doing: the line has been read this way since administration Part E.4d. A boot's timing
+decides whether the last word has arrived.
+
+Tools only; no ABI hash impact.
