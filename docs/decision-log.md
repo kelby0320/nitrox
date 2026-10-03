@@ -33519,8 +33519,12 @@ No ABI hash impact: docs, a gate, and a test.
 - **Part A left a USB-keyboard-only machine with no keyboard.** Taking the controller from the
   firmware ended its PS/2 emulation. The laptop's keyboard is a real i8042, so nothing has hit it,
   but a desktop would have.
-- **Nothing drives a keyboard LED and nothing holds a lock state**: Caps Lock is not a lock. The
-  scoping's open question about LEDs answers itself: out, for both keyboards alike.
+- **Caps Lock and Num Lock do nothing, and the keypad types nothing.** The keymap was written in M3
+  Part C2 as the least a terminal needed, and the keypad was left out without a record. Keypad Enter
+  was patched into `libterm` alone (PR #191), so the code that checks for `KEY_ENTER` elsewhere
+  never sees it. Nothing drives a keyboard light.
+- **The compositor compares `modifiers` exactly** (`h.mods == modifiers`), so a lock carried as a
+  modifier bit would break every chord while Num Lock was on. `KeyEvent` has a spare `u16`.
 - **The hardware report counts only PS/2 key presses.** Part B counts every keyboard's, and
   `check-report --usb` holds it.
 
@@ -33538,23 +33542,37 @@ No ABI hash impact: docs, a gate, and a test.
   - `SET_PROTOCOL` and `SET_IDLE` are accepted;
   - the mouse clamps each axis to ±127 and keeps the remainder, so `check-input`'s motion sum
     stays exact;
-  - its fourth byte is the wheel whatever the protocol, which Part B does not read;
+  - its fourth byte is the wheel whatever the protocol, and its report descriptor says so;
   - more than six keys gives `ErrorRollOver`;
   - both devices' endpoint 1 IN encodes to 8 ms at either speed.
+
+**The maintainer's calls**, after the first draft:
+- **the mouse wheel is in**, if not much more work: a mouse's report descriptor is read and the
+  mouse run in report protocol, with boot protocol as the fallback;
+- **Caps Lock's light is in**, and with it Caps Lock and Num Lock as locks and the keypad mapped,
+  since the laptop's keyboard has a numpad. Scroll Lock is dropped;
+- **two-finger scrolling on the trackpad is later**, with its native I²C-HID interface, of which
+  the report-descriptor parser is the first piece.
 
 **Calls made without the maintainer**, each in the plan:
 - every boot interface is bound, not only the first;
 - the input node is extracted from PS/2, not copied;
 - the served index is the next free one, so an i8042-less machine's first USB keyboard is
   `input-0`;
-- no LEDs;
-- no wheel;
+- the wheel comes from the descriptor, not a fourth byte, and a horizontal wheel and extra buttons
+  are found and not emitted, since nothing above the kernel carries them;
 - `SET_IDLE` to keyboards only;
-- the report counts USB key presses.
+- the report counts USB key presses;
+- locks travel in `KeyEvent`'s spare field, not as modifier bits;
+- Num Lock is on at boot;
+- keypad Enter is delivered as Enter, and with Num Lock off the keypad's navigation keys as the
+  keys they stand for;
+- a light's toggle is gated on PS/2 only, through QEMU's `ps2_set_ledstate` trace, since QEMU
+  traces no USB keyboard's lights.
 
 **The gate set grows from 36 to 42:** `check-input --usb`, `check-login --usb` and
 `check-report --usb`, each under TCG and KVM. Each boots a machine with no i8042, so a key that
-arrives came through USB.
+arrives came through USB. The lock keys add steps to `check-terminal` and `check-input --usb`.
 
-No ABI hash impact: docs only. Part B's kernel work has none either: a driver, a table, and
-records of existing kinds.
+No ABI hash impact: docs only. Part B's kernel work has none either: a driver, a table, records of
+existing kinds, and a write to a char node through the existing `IoOpcode::Write`.

@@ -15,7 +15,7 @@ behaviour.**
 | | |
 |---|---|
 | **In** | **An xHCI host-controller driver**, one for both machines. **USB enumeration** at boot and after it, with devices that **arrive and depart**. **HID keyboards and mice** in boot protocol. **USB mass storage** as block devices, with **MBR** partition tables and whole-disk filesystems beside GPT. **`fs-server-fat`**, read-write. **Removable media** a session can use and eject. **Formatting and partitioning** (`disk --format`, `disk --partition`). **Copy throughput**, measured on the laptop and then fixed where it is worst. |
-| **Out** | **Kernel modules** (Tier 2), and with them module matching. I²C-HID. USB tablets and other absolute pointers. HID report descriptors. USB 3 streams and UAS. Isochronous transfers (audio, webcams). External hubs. USB device mode. exFAT. |
+| **Out** | **Kernel modules** (Tier 2), and with them module matching. I²C-HID. USB tablets and other absolute pointers. HID report descriptors beyond a mouse's (revised 2026-10-03, Part B). USB 3 streams and UAS. Isochronous transfers (audio, webcams). External hubs. USB device mode. exFAT. |
 | **Before it** | Five small items from the laptop install, in [their own plan](laptop-polish.md), the grace period for `with` among them. |
 
 ## Decisions, 2026-10-01
@@ -44,7 +44,8 @@ The maintainer's calls, after a discussion of the sketch and a check of it again
   fixed boot-protocol reports into the `InputEvent` records the PS/2 driver emits, as PS/2 turns
   scancodes into keycodes in the kernel ([`input-subsystem.md`](../architecture/input-subsystem.md)
   §4). `input-server` gains only real arrivals and departures. **Report descriptors are deferred**
-  until a device needs them.
+  until a device needs them. *(Revised 2026-10-03 at the maintainer's request: a mouse's is read,
+  for its wheel — § Part B in detail.)*
 - **A USB tablet is deferred.** It would give QEMU an absolute pointer and end the `--grab` dance,
   but it needs report descriptors and the deferred `EV_ABS` screen mapping, so it is its own work.
 - **A removable stick is the session's.** One the storage service auto-mounted is **writable, on a
@@ -206,11 +207,13 @@ table beside the scancode table — and a mouse's report becomes button events, 
 each stamped at the interrupt. They are served at `/dev/input/raw/<n>`, like the i8042's two, and
 reach `input-server` through the manager. The keyboard's Caps Lock and Num Lock lights are a
 `SET_REPORT`, sent when the compositor's modifier state changes; whether that is in scope is Part
-B's detail pass.
+B's detail pass. *(It is, with Caps Lock and Num Lock made locks and the keypad mapped, for both
+keyboards — § Part B in detail.)*
 
 **Boot protocol has no wheel.** HID 1.11 defines a boot mouse's report as buttons, X and Y, and
 anything after them is the device's own. The wheel needs report descriptors, so it is a cost of the
-boot-protocol call, deferred with them (PR #350 review).
+boot-protocol call, deferred with them (PR #350 review). *(Revised 2026-10-03: a mouse's report
+descriptor is read and the mouse run in report protocol, with boot protocol as the fallback.)*
 
 ### Mass storage
 
@@ -276,7 +279,8 @@ the number the Definition of Done then holds.
 |---|---|---|
 | The hub thread: the first long-lived kernel thread blocking in `wait_on` | enumeration; partition scans after boot | no |
 | The xHCI driver, USB enumeration, the class table | Parts A–D | no |
-| HID boot keyboard and mouse | Part B | no |
+| HID boot keyboard and mouse, a mouse's report descriptor | Part B | no |
+| A one-byte write to a raw input node: a keyboard's lights | Part B | no — `IoOpcode::Write` exists, and a char node now takes it |
 | `DeviceKind::UsbDevice`; a departed flag and a generation in the registry | Parts A and C | no — not a hash input; `abi-sync-check` guards `libkern::device` |
 | A registry-changed notification kind | Part C | **yes** — a notification kind is ABI |
 | Bulk-only transport and SCSI as a block device | Part D | no |
@@ -563,8 +567,14 @@ records by kind and name, but that is to be checked when it is built.
   use-after-free once (PR #178 review). A second producer must share it, not copy it.
 - **Served indices are the i8042's own**: the keyboard 0 and the mouse 1. On a machine without an
   i8042 there are no input nodes at all.
-- **No keyboard LED is driven**, PS/2 or otherwise, and nothing holds a lock state: Caps Lock is
-  not a lock in `libinput` or the compositor.
+- **Caps Lock and Num Lock do nothing, and the keypad types nothing.** `libinput` knows Shift, Ctrl,
+  Alt and Meta. Its US keymap was written in M3 Part C2 as the least a terminal needed, and the
+  keypad was left out without a record. Keypad Enter was patched into `libterm`'s encoder alone (PR
+  #191), so it is Enter in `nxterm` and nowhere else: about seventy references to `KEY_ENTER` across
+  `libui`, the shell, the greeter and the applications never see it. No keyboard light is driven,
+  and a char node takes reads only — `sys_io_submit` refuses a write to one.
+- **`modifiers` is compared exactly.** The compositor matches a hotkey with `h.mods == modifiers`,
+  so a lock carried as a modifier bit would break every chord whenever Num Lock was on.
 - **The hardware report turns its pages on the PS/2 driver's key count** (`kernel/src/report.rs`).
   A USB keyboard does not reach it.
 - **Taking the controller from the firmware ended the firmware's PS/2 emulation of a USB
@@ -596,16 +606,21 @@ descriptors, deferred with the wheel. In order:
    - The Device Context Index is twice the endpoint number, plus one for IN.
 2. **`SET_CONFIGURATION`** with the descriptor's `bConfigurationValue`, after Configure Endpoint,
    which is Linux's order: the controller has accepted the bandwidth before the device is told.
-3. **`SET_PROTOCOL` to boot** (`0`) for each bound interface. A device in report protocol sends
-   reports this driver cannot read; a boot device must accept it.
-4. **`SET_IDLE` (`0`) to keyboards**, so a held key sends no reports until something changes.
+3. **A mouse's report descriptor** (B.3): `GET_DESCRIPTOR` of type Report to the interface, for
+   the length its HID descriptor gives, and parsed (below).
+4. **`SET_PROTOCOL`**: boot (`0`) for a keyboard, and for a mouse whose descriptor does not describe
+   a plain mouse; report (`1`) for one whose does. A keyboard that refuses boot protocol is not
+   bound, since its report-protocol reports may be anything. A mouse that refuses report protocol
+   is already in it — a device's state after a reset — so that refusal is passed over.
+5. **`SET_IDLE` (`0`) to keyboards**, so a held key sends no reports until something changes.
    Harmless if refused: an unchanged report decodes to nothing. A stall is recovered and passed
    over, as a string's is.
-5. **One Normal TRB per endpoint**, for the endpoint's maximum packet, Interrupt On Completion and
+6. **One Normal TRB per endpoint**, for the endpoint's maximum packet, Interrupt On Completion and
    Interrupt on Short Packet, into a report buffer, and the endpoint's doorbell.
 
-A failure in any step ends the device's binding, logged: the device stays enumerated and
-registered, with no input node, and its slot stays. The new control request is the first with no
+A mouse whose report descriptor cannot be read falls back to boot protocol, and the refusals above
+are passed over. Any other failure ends the device's binding, logged: the device stays enumerated
+and registered, with no input node, and its slot stays. The new control request is the first with no
 data stage, so the hub thread gains `control_out` beside `control_in`.
 
 **Polling is the DPC's.** A Transfer Event for an endpoint other than the default one goes to a
@@ -634,12 +649,23 @@ unseen.
   state: decoding it would release every held key. A usage is translated by **a 256-entry table
   beside the scancode table**, to evdev keycodes — Linux's `hid_keyboard[]` is the reference, and
   a usage with no keycode is dropped.
-- **A mouse's first three bytes** are buttons, X and Y, signed. Buttons 1–3 become `BTN_LEFT`,
-  `BTN_RIGHT` and `BTN_MIDDLE` on change, then `REL_X` and `REL_Y` when non-zero, then
-  `SYN_REPORT`. HID's Y is positive downward, as `REL_Y` is. **Bytes after the third are not
-  read**: they are the device's own in boot protocol. QEMU's `usb-mouse` puts its wheel there,
-  whatever the protocol (`hw/input/hid.c` ignores it), and reading it would be a wheel for one
-  emulated mouse and garbage for some real ones.
+- **A mouse in report protocol** (B.3) is read by what its report descriptor says. A small parser
+  — short items only, bounded by the descriptor's length — walks the first application collection
+  whose usage is *Mouse* or *Pointer*, and finds in one input report the buttons, X and Y
+  (relative), and the wheel (Generic Desktop `0x38`) if there is one: each field's bit offset, size
+  and sign, and the report ID that prefixes the report when the descriptor uses IDs. Buttons 1–3
+  become `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE` on change, then `REL_X`, `REL_Y` and `REL_WHEEL`
+  when non-zero, then `SYN_REPORT`. **Axes of 12 and 16 bits**, common on modern mice in report
+  protocol, decode as what they are. HID's Y is positive downward and its wheel positive away from
+  the user, as `REL_Y` and `REL_WHEEL` are.
+- **A mouse whose descriptor does not parse, or describes something else**, runs in boot protocol:
+  its first three bytes are buttons, X and Y, decoded as above with no wheel, and what follows them
+  is the device's own. Which a mouse got is logged, so the laptop's report says.
+- **Buttons past the third, and a horizontal wheel** (Consumer *AC Pan*), are found and not
+  emitted: nothing above the kernel carries them yet.
+- **QEMU's `usb-mouse`** describes five buttons, then X, Y and the wheel as 8-bit relative fields,
+  with no report ID (`qemu_mouse_hid_report_descriptor` in `hw/usb/dev-hid.c`), and sends those four
+  bytes whatever the protocol (`hw/input/hid.c`). So its wheel arrives through the parser.
 
 **The node.** The ring, the parked read, the DPC's hand-off and the reclaim move out of the PS/2
 driver into **`drivers::input`**, which both producers use. PS/2 keeps one lock over its two nodes,
@@ -669,6 +695,48 @@ memory, so a slot that does not disable keeps them, as it keeps the rest.
 compositor's modifier state is the merged stream's: Shift on the laptop's keyboard shifts a key on
 a USB one, as it would on Linux.
 
+**The lock keys and the keypad** (B.5), for both keyboards:
+- **Caps Lock and Num Lock are locks.** A press toggles one in `libinput`'s interpreter (a repeat
+  does not), and the compositor holds the state. **It reaches a client in `KeyEvent`'s reserved
+  field, renamed `locks`**, not in `modifiers`: the field is spare, the layout does not change, and
+  every exact comparison of `modifiers` keeps working. Caps Lock gives a letter its other case,
+  which Shift then reverses, and touches nothing else.
+- **Num Lock is on at boot**, so the keypad types digits from the start.
+- **The keypad**, in `libinput`'s keymap and its interpreter:
+  - with Num Lock on, its digits and `.` are text, as the main keys' are;
+  - with it off, the interpreter delivers 7, 8, 9, 4, 6, 1, 2, 3, 0 and `.` as Home, Up, Page Up,
+    Left, Right, End, Down, Page Down, Insert and Delete, so every client that acts on those
+    keycodes takes them unchanged; 5 delivers nothing;
+  - `/`, `*`, `-` and `+` are text whatever Num Lock says;
+  - **keypad Enter is delivered as Enter**, always, which every check for `KEY_ENTER` then sees.
+    `libterm`'s special case goes, and with it its test that the keymap has no keypad Enter;
+  - **a release is the press's keycode**, so a key held while Num Lock changes releases what it
+    pressed.
+- **The lights.** Each change sends the lock state to `input-server` as a new request on the
+  compositor's consumer channel, **`Lights` (`0x0A01`)**. The server writes it to every keyboard it
+  holds, and to each that arrives, so a keyboard plugged in later shows the state at once.
+  - **A raw input node takes a one-byte write**: the lights in HID's order, bit 0 Num Lock, bit 1
+    Caps Lock and bit 2 Scroll Lock, which is never set. It goes through a new `submit_write`
+    beside `CharBackend`'s `submit_read`, and completes when the keyboard has acknowledged it.
+  - **PS/2** sends `0xED` and the mask in the i8042's order, each answered by `0xFA` through the
+    same byte stream as keys. The decoder is told a command is in flight and takes the
+    acknowledgements as the command's. Taken as keys, they would be the phantom-key failure the
+    driver's header warns of, so the exchange is host-tested byte by byte, with scancodes arriving
+    around it. A keyboard that does not answer within a bound fails the write, logged. On the
+    laptop the embedded controller lights the key.
+  - **USB** sends `SET_REPORT`, a one-byte output report to the keyboard's interface, from the hub
+    thread, which owns the default endpoint: the write leaves the mask and wakes it. Writes faster
+    than the thread are coalesced to the latest mask.
+- **Scroll Lock is not a lock**, and its light stays off.
+
+### The maintainer's calls, 2026-10-03
+
+- **The mouse wheel is in**, if it is not much more work: a mouse's report descriptor, with boot
+  protocol as the fallback.
+- **Caps Lock's light is in**, and with it Caps Lock and Num Lock as locks and the keypad mapped:
+  the laptop's keyboard has a numpad. Scroll Lock is dropped.
+- **Two-finger scrolling on the trackpad is later**, with the trackpad's native interface.
+
 ### Calls made in this pass, without the maintainer
 
 - **Every boot interface is bound**, not only the first, so a combined receiver gives both a
@@ -677,14 +745,21 @@ a USB one, as it would on Linux.
   was a use-after-free once.
 - **The served index is the next free one**, so an i8042-less machine's first USB keyboard is
   `input-0`.
-- **No LEDs.** Nothing holds a lock state for one to show, and the raw nodes are read-only: a
-  write path from the compositor to a device does not exist for PS/2 either. Recorded under *Not
-  in Part B*.
-- **No wheel**, as the scoping said, and QEMU's fourth byte is ignored rather than read for one
-  emulated mouse.
+- **The wheel comes from the descriptor**, not from a fourth byte, which boot protocol does not
+  define and real mice fill differently.
+- **No horizontal wheel or extra buttons**: the parser finds them, and nothing above the kernel
+  carries them.
 - **`SET_IDLE (0)` to keyboards only.** Mice report on change anyway, and some stall it.
 - **The hardware report counts USB key presses**, since a desktop whose only keyboard is USB
   would otherwise be unable to turn its pages.
+- **Locks travel in `KeyEvent`'s spare field**, not as modifier bits, since the compositor compares
+  modifiers exactly.
+- **Num Lock is on at boot.**
+- **Keypad Enter is delivered as Enter**, and with Num Lock off the keypad's navigation keys as the
+  keys they stand for, so no client has to learn the keypad.
+- **A light's toggle is gated on PS/2 only.** QEMU traces a PS/2 keyboard's lights and not a USB
+  one's, so a USB keyboard is held to acknowledging the lights it is given at start — the request a
+  toggle sends.
 
 ### Pieces
 
@@ -694,20 +769,25 @@ a USB one, as it would on Linux.
   `check-login` hold PS/2 as they do today.
 - **B.2 Endpoints and the binding.** Configure Endpoint and Normal TRBs; the endpoint and
   companion descriptors; `control_out`; the binding steps; the DPC's endpoint table and the
-  re-queue; the halt recovery; the report decoders and the usage table; the nodes, their served
-  indices and records; departure removing endpoints first; the hardware report's key count.
-- **B.3 The gates.** `check-input --usb`, `check-login --usb` and `check-report --usb`, below, and
+  re-queue; the halt recovery; the boot report decoders and the usage table; the nodes, their
+  served indices and records; departure removing endpoints first; the hardware report's key count.
+- **B.3 The wheel.** `GET_DESCRIPTOR` of a report descriptor, the parser, report protocol for a
+  mouse it describes, the decoder by its fields, and the boot fallback.
+- **B.4 The gates.** `check-input --usb`, `check-login --usb` and `check-report --usb`, below, and
   CI's jobs for them.
-- **B.4 Docs.** Below.
+- **B.5 Lock keys and the keypad.** The interpreter's locks and keypad; `KeyEvent.locks`; the
+  keymap's keypad and Caps Lock; `Lights` and `input-server`'s fan-out; `submit_write`; PS/2's
+  `0xED` exchange and USB's `SET_REPORT`; `libterm`'s special case removed.
+- **B.6 Docs.** Below.
 
 ### Gates
 
 - **`check-input --usb`** boots the self-test image on `-machine q35,i8042=off`, with the gates'
   controller, `usb-kbd` and `usb-mouse` — **no PS/2, so a key reaching the client came through USB
-  or not at all**. It asserts what `check-input` asserts, with two changes:
-  - **no wheel step**, since boot protocol has none;
-  - **no `ps2-hold-gate` walk**: that holds the i8042's drain, and QEMU queues a USB device's
-    input itself.
+  or not at all**. It asserts what `check-input` asserts, **the wheel included**, which comes
+  through the report descriptor (B.3), less one step: there is **no `ps2-hold-gate` walk**, which
+  holds the i8042's drain, since QEMU queues a USB device's input itself. With B.5 it also asserts
+  that the USB keyboard acknowledged the lights it was given at start, Num Lock's.
 
   The motion sum across a stalled consumer stays: QEMU clamps each report's axes to ±127 and keeps
   the remainder for the next (`hid_pointer_poll`), so the sum is still exact. CI runs it under KVM
@@ -719,6 +799,13 @@ a USB one, as it would on Linux.
 - **`check-report --usb`**: the live image on the same machine, with the stick as today. Its pages
   turn on USB key presses. Without B.2's count a page waits out its 120 s for a key, and the gate,
   which allows 60 s for the next page, fails.
+- **`check-terminal`**, on the i8042 as today, gains B.5's steps:
+  - Caps Lock, then `ab` shows `AB` in the grid; Caps Lock again;
+  - keypad `1` and `2` show `12`, since Num Lock is on, and keypad Enter submits the line;
+  - Num Lock off, then keypad 4 moves the cursor left: `xy`, keypad 4, `z` shows `xzy`;
+  - **QEMU's `ps2_set_ledstate` trace**, written to a file, shows the keyboard told Num Lock at
+    start, then Caps Lock and Num Lock, then Num Lock, then nothing. Both QEMU versions have the
+    event.
 - **`test-qemu`** keeps the i8042 on beside its USB keyboard and mouse:
   - each device's binding line, with its node: `usb: port 9: keyboard at /dev/input/raw/2`;
   - `input-server` given **four** devices;
@@ -731,8 +818,18 @@ a USB one, as it would on Linux.
   - the usage table, including that no usage maps to a keycode outside evdev's range;
   - a keyboard report against its predecessor: a press, a release, both at once, a modifier
     alone, the same report twice, a key moving slots, and `ErrorRollOver`;
-  - a mouse report: each button, both axes signed, a fourth byte ignored, and a report that
+  - a boot mouse report: each button, both axes signed, a fourth byte ignored, and a report that
     changes nothing;
+  - the report-descriptor parser, on QEMU's descriptor, on one with report IDs, on 12- and 16-bit
+    axes, on one with no wheel, on one with no X, and on one that runs past its length — each to
+    its field layout or to the boot fallback — and a report decoded by a layout at each width;
+  - the interpreter's locks: a press toggles and a repeat does not; Caps Lock against Shift; the
+    keypad with Num Lock on and off; a release after Num Lock changed mid-press; keypad Enter as
+    Enter;
+  - `KeyEvent`'s `locks` written and read back;
+  - the PS/2 decoder with `0xFA` around a command, scancodes interleaved, and an acknowledgement
+    that never comes;
+  - `SET_REPORT`'s setup bytes, and `input-server`'s fan-out reaching keyboards only;
   - the endpoint and companion descriptors, with a HID descriptor between, from bytes QEMU's
     devices sent, and from bytes that run past the configuration;
   - the interval encoding at each speed, at both ends of its clamp;
@@ -742,16 +839,22 @@ a USB one, as it would on Linux.
 - **The laptop:** a USB mouse and keyboard on the live stick's session. A step for the maintainer,
   not a gate.
 
-The gate set grows from 36 to **42**: each new gate under TCG and KVM.
+The gate set grows from 36 to **42**: each new gate under TCG and KVM. B.5 adds steps to two
+gates, and no gate.
 
 ### Not in Part B
 
 - **A device plugged in after the manager's read reaching `input-server`** (Part C). Part B binds
   it and registers its node, and nothing hands the node over.
-- **Keyboard LEDs**, for PS/2 and USB alike: no lock state exists to show, and no write path
-  reaches a device. When Caps Lock becomes a lock, both drivers want the same request.
-- **Report protocol and report descriptors**: the wheel, extra buttons, consumer keys, and any HID
-  device that is not a boot device.
+- **Scroll Lock**, as a lock or a light.
+- **Report descriptors for anything but a mouse**: consumer keys, a keyboard's report protocol,
+  and any HID device that is not a boot device.
+- **A horizontal wheel and buttons past the third**: the parser finds them, and nothing above the
+  kernel carries them.
+- **Two-finger scrolling on the laptop's trackpad.** It is an ELAN0501 on I²C, which the firmware
+  presents on the i8042 as a relative mouse, so no finger reaches the system. Scrolling with two
+  fingers needs its native interface — the Designware I²C controller, I²C-HID and HID multitouch —
+  and B.3's parser is the first piece of that. Later, as its own item.
 - **Absolute pointers**: `usb-tablet`, and the CLAUDE.md note that the guest has a relative pointer
   only stays true.
 - **Remote wakeup, suspend, and selective suspend.**
@@ -759,13 +862,16 @@ The gate set grows from 36 to **42**: each new gate under TCG and KVM.
 ### Docs Part B owes
 
 - **`input-subsystem.md`**: the second producer in §2's diagram and table, the usage table beside
-  the scancode table in §4, `drivers::input`, and the served index.
+  the scancode table in §4, `drivers::input`, the served index, the locks and the keypad, and the
+  lights' write path.
+- **`rsproto-input-ops.md`**: `Lights`. **`rsproto-surface-ops.md`**: `KeyEvent.locks`.
 - **`usb.md`**: the binding, the endpoints, the DPC's polling, the halt recovery, and departure
   removing endpoints first.
 - **`device-node.md`**: the sixth group's keyboards and mice, and the served index rule.
 - **`drivers-and-irps.md`**: the DPC's second kind of transfer completion, if it says what the DPC
   completes.
-- **The root `CLAUDE.md`**: the three `--usb` gates, and `test-qemu`'s bound devices.
+- **The root `CLAUDE.md`**: the three `--usb` gates, `check-terminal`'s lock steps, and
+  `test-qemu`'s bound devices.
 
 ## Definition of Done
 
@@ -779,9 +885,11 @@ On the laptop and in the gates:
 ## What Phase 6 does not do
 
 - **Kernel modules**, and matching devices to modules (the decision above).
-- **I²C-HID**: the trackpad already works through the i8042.
-- **Absolute pointers and HID report descriptors**: a tablet, a touchscreen, extra keys, and a
-  mouse's wheel, which boot protocol does not carry.
+- **I²C-HID**: the trackpad already works through the i8042. Its native interface is what
+  two-finger scrolling needs, and Part B's report-descriptor parser is the first piece of it: later,
+  as its own item.
+- **Absolute pointers, and report descriptors beyond a mouse's**: a tablet, a touchscreen, extra
+  keys, and a horizontal wheel.
 - **USB 3 streams and UAS**: one bulk-only command at a time.
 - **Isochronous transfers**: audio, webcams.
 - **External hubs**: devices on the controller's own ports only.
