@@ -49,8 +49,9 @@ struct Entry {
 /// record instead.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct UsbFacts {
-    /// `idVendor` and `idProduct`.
+    /// `idVendor`.
     pub vendor: u16,
+    /// `idProduct`.
     pub product: u16,
     /// Its class triple: the device descriptor's, or its first interface's when that is zero.
     pub class: (u8, u8, u8),
@@ -58,8 +59,9 @@ pub struct UsbFacts {
     pub port: u8,
     /// Its speed, as the xHCI's default speed IDs number them.
     pub speed: u8,
-    /// Its product and serial strings, printable; `name_len` bytes of it are meaningful.
+    /// Its product and serial strings, printable, or `vvvv:pppp` when it has none.
     pub name: [u8; MAX_DEVICE_NAME],
+    /// How many bytes of [`name`](Self::name) are meaningful.
     pub name_len: usize,
 }
 

@@ -368,6 +368,15 @@ read-ahead: after demand-paged program text lands**, when what remains is genuin
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
 scheduling rather than a trigger.
 
+**A departed USB device keeps its node and record — `TODO(usb-departed-records)`.** Phase 6 Part
+A registers a node and a record for every arrival, and a departure frees neither: the device table
+only grows, and a record's id is its place, which `/dev/registry/<id>` and `device-mgr`'s
+`usb-<id>` both index by. So every arrival costs a table entry for the rest of the boot, and a
+connector whose contact bounces — a departure, then an arrival, since PR #355 — adds one each time.
+Removing a record would shift every later id. **Part C retires a record in place instead**: its
+plan has a snapshot mark departed records rather than omit them, so an id keeps naming one device.
+Trigger: Phase 6 Part C, which is scheduled.
+
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 
 **Network booting (PXE) by the kernel.** Limine handles PXE before the kernel runs. The kernel itself doesn't need network for PXE. Network-mounted root filesystems can use the same userspace fs-server architecture as local mounts; this is gated on the netstack being implemented.

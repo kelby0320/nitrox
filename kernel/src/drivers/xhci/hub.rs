@@ -208,7 +208,8 @@ fn arrive(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) -> bool {
     }
 }
 
-/// The device at `port` left: disable its slot, then free what the controller had of it.
+/// The device at `port` left: disable its slot, then free what the controller had of it. Its node
+/// and record stay in the device table until Part C retires them (`TODO(usb-departed-records)`).
 fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     let Some(dev) = attached[port as usize].take() else {
         return;

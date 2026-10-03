@@ -33462,3 +33462,45 @@ Not A.3's doing: the line has been read this way since administration Part E.4d.
 decides whether the last word has arrived.
 
 Tools only; no ABI hash impact.
+
+## 2026-10-03 — PR #356, reviewed: a manager that listed no USB device passed
+
+One blocking finding, one worth fixing and three optional, all taken. The reviewer found the kernel
+side, the naming and the `check-shutdown` fix sound, and every host test it broke failed.
+
+**`boot-probe`'s devices check passed when `device-mgr` listed no USB device** (blocking).
+- **Why it passed:** USB records are the table's last group. A manager that dropped every one
+  looks, to the prefix rule, exactly like one that read before any registered. The reviewer
+  filtered `UsbDevice` out of the manager's records, and `test-qemu` passed.
+- **The host knows what `boot-probe` cannot.** The first round ends before `init`, which
+  `check_hot_plug` asserts, so the manager read at least that round's devices.
+  `check_usb_listed` requires the devices line's count of `usb-<id>.tsm` files to be at least
+  the first round's. A host test holds it to the three real outcomes and to none, and to one
+  short.
+- **And a file is its table.** `boot-probe` now opens one listed `usb-<id>.tsm` and requires one
+  row, named so, of kind `usb`, driven by `xhci`. The listing alone said only that a name was made.
+- **Controls, under KVM:**
+  - the reviewer's (no USB records in the manager) fails on the host: "lists 0 … the first round
+    found 5";
+  - a manager that lists the file but will not serve it fails in `boot-probe`.
+
+**`DeviceRecord`'s docs still said a vendor other than `0xFFFF` is a PCI function** (worth fixing).
+In both libkern copies:
+- the ID and class fields now say which IDs they hold by kind;
+- the bus address fields are zero for a node that is not a PCI function;
+- `parent` and `name` name the USB case.
+
+`DeviceClass::Other`'s doc says a USB device too. The node descriptor's own `0xFFFF` docs stay
+as they are, since a USB node's descriptor is the zero one.
+
+**Optional, taken:**
+- **The table grows on every arrival until Part C**, so a bouncing connector adds a record each
+  time. It is now `TODO(usb-departed-records)`, with an entry. On the reviewer's question
+  whether `usb-<id>` survives Part C: the Part C plan already has a snapshot mark departed records
+  rather than omit them, so ids stay places. The entry says that removing one would shift them.
+- **The spec's ordering said the first round is before `init`.** The wait is bounded at two
+  seconds, and a device still enumerating then registers after. The spec now says so, and so do
+  `device-manager.md` §3 and `device-mgr`'s module doc, which made the same claim.
+- **Two `UsbFacts` fields lacked doc comments.**
+
+No ABI hash impact: docs, a gate, and a test.

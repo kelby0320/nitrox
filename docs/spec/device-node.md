@@ -227,9 +227,10 @@ The whole device table, read from userspace — every `DeviceNode` the kernel ha
 4. every block device's partitions, from that pass, in table order — a RAM disk's own partitions
    come after it, and after every disk's;
 5. the console, the keyboard and the mouse;
-6. the USB devices, as the hub thread enumerates them (Phase 6 Part A.3): the first round's before
-   `init` starts, since the boot waits for that round, and each later arrival when it comes.
-   **These are the only records added after the boot.** A device that leaves keeps its record
+6. the USB devices, as the hub thread enumerates them (Phase 6 Part A.3), and each later arrival
+   when it comes. The boot waits for the first round before `init` starts, **for two seconds at
+   most**: a device still enumerating when the bound passes registers after `init`, as an arrival
+   does. **These are the only records added after the boot.** A device that leaves keeps its record
    until Phase 6 Part C gives the registry departures.
 
 So on a live USB boot of a machine with Nitrox installed, `/dev/blk/0` is the internal disk and

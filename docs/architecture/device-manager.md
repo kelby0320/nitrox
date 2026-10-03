@@ -61,10 +61,11 @@ are Tier 1. Matching a device to a driver module, and handing a driver process a
    before it ([`device-node.md`](../spec/device-node.md) § *The registry* has the order whole).
 2. **`service-mgr` spawns `device-mgr`**, after the view broker and before the display arm (`init`
    did until administration Part E.1a). The manager reads `/dev/registry` once. Every node present
-   at boot registers before userspace starts, so one read is complete coldplug. A USB device plugged
-   in later registers after it, unseen (§9). It then takes each class device's node from
-   `/dev/registry/<id>` and answers `Meta::Ready`. A manager with no registry to read refuses
-   instead, and `service-mgr` prints its reason.
+   at boot registers before userspace starts, so one read is complete coldplug — but for a USB
+   device still enumerating when the boot's two-second wait for the hub thread's first round runs
+   out. Such a device, like one plugged in later, registers after the read, unseen (§9). It then
+   takes each class device's node from `/dev/registry/<id>` and answers `Meta::Ready`. A manager
+   with no registry to read refuses instead, and `service-mgr` prints its reason.
 3. **`service-mgr` binds `/svc/devices`** — the manager's endpoint in its registry, the root path
    to the manager's route — then resolves `info-endpoint` in the registry, binds what it gets there
    too, and hands the sessions a route to it (§5).

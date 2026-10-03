@@ -173,11 +173,11 @@ impl ResourceDescriptor {
 ///
 /// `#[repr(u32)]`. A `Block` node accepts block read/write through the I/O core; a `Char` node
 /// a byte-stream read — the console and the i8042's devices; `Other` is a PCI function, claimed
-/// or not. `Net` and the rest arrive with their first driver.
+/// or not, or a USB device (Phase 6 Part A.3). `Net` and the rest arrive with their first driver.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceClass {
-    /// Discovered but unclaimed / no Nitrox driver.
+    /// A node that accepts no I/O of its own: a PCI function, claimed or not, or a USB device.
     Other = 0,
     /// A block device: accepts block `Read`/`Write` I/O operations.
     Block = 1,

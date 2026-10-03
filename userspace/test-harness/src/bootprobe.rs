@@ -2463,6 +2463,26 @@ fn devices_test(root_ns: u64) -> bool {
     if usb_named != registry[..read].iter().filter(|r| usb(r)).count() {
         return fail(b"a USB device the manager read is not listed as usb-<id>.tsm");
     }
+    // **And a listed USB device's file is its table** (PR #356 review): one row, named `usb-<id>`,
+    // of kind `usb`, driven by `xhci`. The listing alone says only that a name was made.
+    if let Some(r) = registry[..read].iter().find(|r| usb(r)) {
+        let name = alloc::format!("usb-{}", r.id);
+        let path = alloc::format!("/svc/devices/info/{name}.tsm");
+        let (st, h) = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        let row = bytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).and_then(|mut t| {
+            (t.rows.len() == 1).then(|| t.rows.remove(0))
+        });
+        let says = |i: usize, want: &str| {
+            row.as_ref().and_then(|r| r.get(i)) == Some(&libstream::wire::Value::Str(alloc::string::String::from(want)))
+        };
+        // Columns: name, kind, path, size, description, parent, driver.
+        if !(says(0, &name) && says(1, "usb") && says(6, "xhci")) {
+            Line::new().s(b"boot-probe: devices: ").s(path.as_bytes()).s(b" is not that device's row").end();
+            return fail(b"a USB device's file is not its table");
+        }
+    }
     let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
     let tbytes = if st == 0 { read_all(table) } else { None };
     close(table);
