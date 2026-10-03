@@ -161,6 +161,9 @@ pub struct Xhci {
     waiting: IrqSpinLock<Option<Waiting>>,
     /// A command went unanswered: the command ring may be stuck, and nothing more is asked of it.
     wedged: AtomicBool,
+    /// The controller's own descriptor, whose address finds its function in the device table: the
+    /// parent of every device it enumerates.
+    pci: ResourceDescriptor,
 }
 
 /// What the hub thread is waiting for.
@@ -474,6 +477,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         first_round: crate::drivers::adopt(first, KObjectType::PendingOperation),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
+        pci: desc,
     };
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. The first
@@ -723,9 +727,8 @@ pub fn start() {
 }
 
 /// **Wait for the hub thread's first round**, up to `bound_ns`, so the hardware report lists what
-/// is attached and, once the devices are registered (Part A.3), the registry holds it before
-/// userspace reads it. A bound that passes is said;
-/// whatever is still enumerating arrives later.
+/// is attached and the registry holds it before userspace reads it (Part A.3). A bound that passes
+/// is said; whatever is still enumerating arrives later.
 pub fn settle(bound_ns: u64) {
     let x = XHCI.load(Ordering::Acquire);
     if x.is_null() {

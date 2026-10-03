@@ -221,6 +221,18 @@ pub fn string_into(b: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// **`vvvv:pppp`**, a device's name when it gives no string (Phase 6 Part A.3), into `out`, which
+/// holds at least nine bytes. The length written.
+pub fn ids_into(vendor: u16, product: u16, out: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, shift) in [12u16, 8, 4, 0].into_iter().enumerate() {
+        out[i] = HEX[(vendor >> shift & 0xF) as usize];
+        out[5 + i] = HEX[(product >> shift & 0xF) as usize];
+    }
+    out[4] = b':';
+    9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +454,17 @@ mod tests {
         assert_eq!(&out[..n], b"QEMU", "the padding a device sends is dropped");
         assert_eq!(first_language(&[4, 3, 0x09, 0x04]), Some(0x0409));
         assert_eq!(first_language(&[2, 3]), None, "no language listed");
+    }
+
+    /// **A device with no strings is named by its IDs**, four hex digits each, lower case as the
+    /// log prints them, with the leading zeros a vendor like `0627` needs.
+    #[test]
+    fn a_nameless_device_is_named_by_its_ids() {
+        let mut out = [0xAAu8; 12];
+        assert_eq!(ids_into(0x0627, 0x0001, &mut out), 9);
+        assert_eq!(&out[..9], b"0627:0001");
+        assert_eq!(ids_into(0xABCD, 0xF00D, &mut out), 9);
+        assert_eq!(&out[..9], b"abcd:f00d");
+        assert_eq!(out[9], 0xAA, "nothing past its nine bytes");
     }
 }

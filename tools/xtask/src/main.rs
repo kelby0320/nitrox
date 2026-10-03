@@ -5310,10 +5310,13 @@ fn run_recovered_boot_steps(s: &mut Session) -> R<()> {
 
 /// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape — a USB
 /// stick, an **empty** AHCI controller that is therefore declined, and no UART — and the command
-/// line the menu entry passed.
+/// line the menu entry passed. **And the stick itself, enumerated** (Phase 6 Part A): the line a
+/// person photographs off the laptop's report to say what its controller found.
 const REPORT_FACTS: &[&[&str]] = &[
     &["boot: HHDM ", ", cmdline \"hwreport\""],
     &["drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"],
+    &["usb: port 1: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
+    &["usb: first round: 1 device(s) in "],
     &["ramdisk: module 1 (/boot/root.img)"],
     &["label \"nitrox-live\" -> block node"],
     &["console: no UART at COM1"],
@@ -5472,7 +5475,10 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
             pages.iter().enumerate().map(|(i, p)| format!("--- page {} ---\n{}", i + 1, p.join("\n"))).collect();
         return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
     }
-    println!("  ok: the pages say what this machine is — a declined AHCI controller, the module disk, no COM1");
+    println!(
+        "  ok: the pages say what this machine is — a declined AHCI controller, the module disk, the stick \
+         enumerated, no COM1"
+    );
     // **And the first page says which build** (the laptop polish's Part D): the line a person
     // checks first on a machine that misbehaves, before anything else on the report.
     let built_from = built_from_line();
@@ -13027,6 +13033,15 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["usb: port 13: its default endpoint takes 64-byte packets, not 8; evaluated"],
     &["usb: port 13: 08e6:4433 class 0b/00/00, full-speed, \"QEMU USB CCID (", "\": nothing this kernel drives"],
     &["usb: first round: 5 device(s) in "],
+    // **And the table got each** (Part A.3): `boot-probe`'s line per `UsbDevice` record, read
+    // through `/dev/registry` — under the controller's function, with the IDs, class, port, speed
+    // (as xHCI numbers them: 1 full, 3 high, 4 SuperSpeed) and name the hub thread logged. The
+    // lines above say a device was enumerated; only these say the registry has it.
+    &["boot-probe: registry: usb port 3, 46f4:0001 class 08/06/50, speed 4, under 00:03.0, \"QEMU USB HARDDRIVE ("],
+    &["boot-probe: registry: usb port 9, 0627:0001 class 03/01/01, speed 3, under 00:03.0, \"QEMU USB Keyboard ("],
+    &["boot-probe: registry: usb port 10, 0627:0001 class 03/01/02, speed 1, under 00:03.0, \"QEMU USB Mouse ("],
+    &["boot-probe: registry: usb port 12, 0409:55aa class 09/00/00, speed 1, under 00:03.0, \"QEMU USB Hub ("],
+    &["boot-probe: registry: usb port 13, 08e6:4433 class 0b/00/00, speed 1, under 00:03.0, \"QEMU USB CCID ("],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.

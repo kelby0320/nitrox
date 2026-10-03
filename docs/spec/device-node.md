@@ -9,6 +9,8 @@ Design context: [`drivers-and-irps.md`](../architecture/drivers-and-irps.md)
 **Status:** Pre-stabilization. Introduced with the storage slice (Phase 2
 slice 5). PCI(e) is the only discovery source in Phase 2; partitions became
 DeviceNodes in slice 6, and `Char` nodes arrived with the console and the i8042.
+USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, and a record's
+`port` and `speed`.
 
 ## The DeviceNode object
 
@@ -37,7 +39,7 @@ in-kernel Tier 1 drivers read the descriptor directly.
 ```rust
 #[repr(u32)]
 pub enum DeviceClass {
-    Other = 0,    // a PCI function, claimed or not
+    Other = 0,    // a PCI function, claimed or not; a USB device
     Block = 1,    // accepts block Read/Write IoOps via sys_io_submit
     Char = 2,     // accepts byte-stream Read IoOps: the console, the i8042's devices
 }
@@ -46,9 +48,10 @@ pub enum DeviceClass {
 A **block-class** node is the resource a block `sys_io_submit` targets (see
 § "Block devices"). A driver publishes its own node with its class — AHCI a `Block` node per
 disk, the console and the i8042 a `Char` node each — and a PCI function stays `Other` whether a
-driver claims it or not. `Net` and others arrive with their first driver. The class is coarse:
-the console, the keyboard and the mouse are all `Char`, which is why the registry adds a
-**kind** (§ "The registry").
+driver claims it or not. A USB device is `Other` too, with the zero descriptor: what it is lives
+in the device table beside it, and reaches userspace in its record (§ "The registry"). `Net` and
+others arrive with their first driver. The class is coarse: the console, the keyboard and the
+mouse are all `Char`, which is why the registry adds a **kind** (§ "The registry").
 
 ## Resource descriptor
 
@@ -223,7 +226,11 @@ The whole device table, read from userspace — every `DeviceNode` the kernel ha
 3. the RAM disks — published *before* the GPT pass, so it scans them as it scans a disk;
 4. every block device's partitions, from that pass, in table order — a RAM disk's own partitions
    come after it, and after every disk's;
-5. the console, the keyboard and the mouse.
+5. the console, the keyboard and the mouse;
+6. the USB devices, as the hub thread enumerates them (Phase 6 Part A.3): the first round's before
+   `init` starts, since the boot waits for that round, and each later arrival when it comes.
+   **These are the only records added after the boot.** A device that leaves keeps its record
+   until Phase 6 Part C gives the registry departures.
 
 So on a live USB boot of a machine with Nitrox installed, `/dev/blk/0` is the internal disk and
 `/dev/blk/1` the RAM disk, and the partitions start at 2. `KernelServerId::Registry`, bound by the
@@ -250,21 +257,44 @@ pub struct DeviceRecord {     // 144 bytes, align 8
     pub class: u32,           // DeviceClass
     pub kind: u32,            // DeviceKind, below
     pub served: u32,          // the <n> of /dev/blk/<n> or /dev/input/raw/<n>, else NOT_SERVED
-    pub parent: u32,          // the id it belongs to — a partition's disk, a disk's controller — else NO_PARENT
+    pub parent: u32,          // the id it belongs to — a partition's disk, the controller of a
+                              // disk or a USB device — else NO_PARENT
     pub outcome: u32,         // for a PCI function: OUTCOME_NONE / _CLAIMED / _DECLINED
-    pub vendor: u16, pub device: u16,                       // 0xFFFF vendor: not a PCI function
+    pub vendor: u16, pub device: u16,                       // PCI or USB IDs; 0xFFFF: neither
     pub pci_class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
-    pub seg: u16, pub bus: u8, pub dev: u8, pub func: u8, pub _pad: [u8; 3],
+    pub seg: u16, pub bus: u8, pub dev: u8, pub func: u8,
+    pub port: u8, pub speed: u8,                            // a USB device's; else 0
+    pub _pad: u8,
     pub logical_block_size: u32,                            // block devices; else 0
     pub name_len: u32,
     pub block_count: u64,                                   // block devices; else 0
     pub driver: [u8; 16],                                   // the publishing or claiming driver
-    pub name: [u8; 72],                                     // model and serial, label, module path, or "keyboard"
+    pub name: [u8; 72],       // model and serial, label, module path, USB product and serial,
+                              // or "keyboard"
 }
 ```
 
 `DeviceKind`: `Unknown` 0, `PciFunction` 1, `Disk` 2, `Partition` 3, `RamDisk` 4, `Keyboard` 5,
-`Mouse` 6, `Console` 7. A value a reader does not name reads as `Unknown`.
+`Mouse` 6, `Console` 7, `UsbDevice` 8. A value a reader does not name reads as `Unknown`.
+
+**A `UsbDevice` record** (Phase 6 Part A.3) is a device on one of the xHCI controller's root
+ports:
+- `vendor` and `device` are its `idVendor` and `idProduct`, where a PCI function's IDs go. So the
+  two fields mean a PCI function's IDs or a USB device's, by `kind`, and a vendor of `0xFFFF`
+  still means neither.
+- The class triple is the device descriptor's, or its first interface's when the device's is zero,
+  as most are. `revision` is 0.
+- `port` is its root port, numbered from 1 as the controller numbers them, and `speed` the speed
+  the port reports, as xHCI's default speed IDs number them: 1 full, 2 low, 3 high, 4
+  SuperSpeed, 5 SuperSpeedPlus. **Both were `_pad`'s first two bytes**, zero for every other
+  kind, so no reader changed and `REGISTRY_VERSION` stayed 1.
+- `name` is its product string, then its serial in parentheses if it fits — as a disk's is its
+  model and serial — or `vvvv:pppp` when it gives no string.
+- `driver` is `xhci`, `parent` is the controller's PCI function, and it is served at no index.
+- **Its node's own descriptor is the zero one**, vendor `0xFFFF`, as for every node that is not a
+  PCI function: the kernel finds a node's PCI parent by its address, and a USB device's zero
+  address would find the host bridge. Its bus address and IDs are therefore in the record only,
+  not on the node `/dev/registry/<id>` gives.
 
 **The count is the length, not the object's size.** The object is page-rounded, so its tail is
 zeros, which a reader dividing the size would take for records of class `Other` and kind
@@ -276,7 +306,8 @@ whose served index is `n`, and `/dev/input/raw/<n>` the keyboard or mouse whose 
 `n` — the keyboard 0 and the mouse 1, the i8042 driver's own numbering, **not** a count within
 `Char`, where the console registered first. The console and PCI functions are served at no index.
 
-**Ids are stable for the life of a boot** and never reused, because the table only grows.
+**Ids are stable for the life of a boot** and never reused, because the table only grows — a USB
+device that leaves included, whose record stays (Phase 6 Part A).
 
 ## Discovery and driver matching (Phase 2)
 

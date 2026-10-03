@@ -3,11 +3,11 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
 current status, the full phase list, and the cross-cutting workstreams.
 
-**Status: scoped 2026-10-01; Part A detailed 2026-10-02; nothing built.** This replaces the
-sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
-were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
-as administration's parts did; what is here is the phase's shape, the design each part builds to,
-and the gate that closes it. **Nothing below describes current behaviour.**
+**Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Parts B–H not built.** This
+replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
+decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
+when it is next, as administration's parts did; what is here is the phase's shape, the design each
+part builds to, and the gate that closes it. **Nothing below describes current behaviour.**
 
 ## Scope
 
@@ -476,8 +476,12 @@ entry, whose menu has an editor. It is the way past a bring-up that hangs anyway
   the size anyway. The reader is full-speed with 64-byte packets, and is also a truer "nothing
   matches" than the hub, which matches as a hub.
 - **A.3 The records.** `UsbDevice`, `port` and `speed`, names in the table's entries, and
-  `device-mgr`'s names.
-- **A.4 Docs.** Below.
+  `device-mgr`'s names. **Built 2026-10-02.** `boot-probe` finds five records, not four, with
+  A.2's reader. **The hot-plug races `device-mgr`'s one read** of the registry: under KVM the
+  manager read 19 records and `boot-probe` 21. So `boot-probe` holds the manager to the registry's
+  first records, with every record after them a USB device, rather than to the whole table. That
+  is the gap Part C closes, made visible (decision log).
+- **A.4 Docs.** Below. **Done 2026-10-02**, with A.1–A.3, each part's in its own change.
 
 ### Gates
 

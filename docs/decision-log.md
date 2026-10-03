@@ -33366,3 +33366,82 @@ Disable Slot failed freed them too.
 
   Each fails its control.
 - **Three places said a boot device is already in the registry**, which is A.3's to make true.
+
+## 2026-10-02 — Phase 6 Part A.3: USB devices in the registry, and Part A complete
+
+**Each device the hub thread enumerates is a `UsbDevice` record** (kind 8), as the detail pass
+planned:
+- **The node is a bare `Other` with the zero descriptor.** What the record carries lives in the
+  device table's entry beside it: IDs, class triple, port, speed and name. The kernel finds a PCI
+  parent by address, and a USB node's zero address would find the host bridge.
+- **The parent is the controller's function**, found by the controller's own descriptor, which
+  `Xhci` now keeps.
+- **`port` and `speed` are `_pad`'s first two bytes.** They are zero for every other kind, so
+  `REGISTRY_VERSION` stays 1.
+- **A device with no strings is named `vvvv:pppp`**, as the plan said. A host test pins the
+  leading zeros, which a vendor like `0627` needs.
+- **Registered by the hub thread, never the DPC**, since the table allocates under its lock. A
+  device the table cannot take stays attached, and the log says it is missing from the registry.
+- **`device-mgr` names it `usb-<id>`.** Its kind is `usb` and it has no path. Its description is
+  its name, IDs, class, port and speed.
+
+**The hot-plug races `device-mgr`'s one read of the registry**, which A.3 made visible:
+- **Before A.3 nothing registered after the boot**, so `boot-probe`'s check held: the manager's
+  directory had exactly one file per record. With A.3 a hot-plugged device is a record.
+- **The manager reads the table once, at its start.** The hot-plug starts when the first round is
+  logged, and the transcripts so far put the manager's read anywhere relative to it:
+  - after the mouse arrived, under TCG;
+  - between the keyboard's departure and the mouse's arrival, in A.2's TCG run;
+  - before the keyboard, under KVM. In that run the manager read 19 records and `boot-probe` 21,
+    so the old check would have failed.
+- **`boot-probe` now holds the manager to the registry's first records**, and requires every record
+  after them to be a USB device, the only kind registered after the boot. Each USB device the
+  manager read must be listed as `usb-<id>.tsm`. All three placements ran:
+  - 21 rows, 0 USB devices since (TCG);
+  - 19 rows, 2 since (KVM);
+  - 20 rows, 1 since (both, in the full gate run).
+
+  So the placement is the race's, not the accelerator's.
+- **This is the gap Part C closes, not a gate problem.** Until the kernel tells the manager, a
+  device plugged in after its read is in `/dev/registry` and not in `/dev/devices`.
+  `device-manager.md` §9 says so.
+- **Moving the hot-plug after the read was rejected.** The only deterministic point after both
+  reads is `boot-probe`'s devices line. Starting there would make the hot-plug race the guest's
+  exit instead.
+
+**Gates:**
+- **`boot-probe`** checks each `UsbDevice` record:
+  - its parent is a claimed `0c/03/30` function whose driver is `xhci`;
+  - it has a port, a speed, a name and its driver, at no served index.
+
+  It prints a line for each. **`test-qemu`'s host asserts the five lines**: port, IDs, class,
+  speed and name.
+- **`check-report`** asserts the live stick's enumeration line on a report page: port 1,
+  SuperSpeed, mass storage, and the first round's count of one. The line was guessed from the
+  topology, and the first run confirmed it.
+- **The first `test-qemu` run failed in `boot-probe`'s own new check.** The probe parsed
+  `usb-<id>` where the manager lists `usb-<id>.tsm`. That run also showed the check can fire: it
+  found none of five.
+
+**Controls**, each failing:
+- **Host tests:**
+  - records that ignore the entry's USB facts;
+  - a parent looked up by the node's own descriptor;
+  - `vvvv:pppp` with the vendor written twice.
+- **Boots:**
+  - **a hub thread that registers nothing.** `boot-probe` passes, since it checks only the records
+    it finds; the host's facts fail. This is the detail pass's "a log line can be printed for a
+    device the table never got", and it is why the host asserts the lines;
+  - a record registered under the zero descriptor, which `boot-probe` refuses as not under a
+    claimed xHCI;
+  - `check-report` expecting port 2.
+
+**Part A is complete.** Docs:
+- `device-node.md` gains the kind, the fields, a sixth group in the registry's order, and what
+  `vendor` and `device` mean now;
+- `device-manager.md` gains the names and the unseen arrivals;
+- `usb.md` gains the record;
+- three places that said a boot device "will be" in the registry now say it is.
+
+No ABI hash impact: a kind and two reserved bytes are not hash inputs. `abi-sync-check` agrees on
+186 values between the kernel's `libkern::device` and userspace's.

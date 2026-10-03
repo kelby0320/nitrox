@@ -29,11 +29,13 @@ use super::desc;
 use super::ring::{Producer, Trb, code, kind};
 use super::{Awaited, CommandRing, DmaSlots, PoPtr, Waiting, Xhci, XHCI, read32, write32};
 use crate::arch::timer::ArchTimer;
+use crate::device::UsbFacts;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::KVec;
 use crate::libkern::block::MAX_DEVICE_NAME;
 use crate::libkern::printable::Printable;
 use crate::mm::dma::DmaBuffer;
+use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::{ObjectRef, PendingOperation};
 
 /// How long the boot waits for the first round.
@@ -276,7 +278,10 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
     };
     set_slot_context(x, slot, mem.output.phys().as_u64());
     match address_and_read(x, port, slot, speed_id, &mut mem) {
-        Ok(()) => Ok(Attached { slot, _mem: mem }),
+        Ok(facts) => {
+            record(x, port, facts);
+            Ok(Attached { slot, _mem: mem })
+        }
         Err((step, e)) => {
             crate::kprintln!("usb: port {port}: {step} failed: {e}");
             if let Released::Kept(why) = release(x, slot, mem) {
@@ -285,6 +290,17 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
             Err(())
         }
     }
+}
+
+/// **Put the device in the registry** (Phase 6 Part A.3): a bare `Other` node, with what it is kept
+/// beside it in the table, under the controller's function. A device the table cannot take is still
+/// attached — it is only missing from `/dev/registry`, which is said.
+fn record(x: &Xhci, port: u8, facts: UsbFacts) {
+    let Ok(node) = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO) else {
+        crate::kprintln!("usb: port {port}: no memory for its node; it is not in the registry");
+        return;
+    };
+    crate::device::register_usb(crate::drivers::adopt(node, KObjectType::DeviceNode), &x.pci, "xhci", facts);
 }
 
 /// A device's memory, or `None` when there is not enough.
@@ -297,10 +313,15 @@ fn device_mem() -> Option<DeviceMem> {
     Some(DeviceMem { input, output, ep0, ring, data })
 }
 
-/// Address the device in `slot` and read what it is, in `mem`. The step that failed, and why, if
-/// one did.
-fn address_and_read(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceMem) -> Result<(), (&'static str, Failed)> {
-
+/// Address the device in `slot` and read what it is, in `mem`: what its record carries, or the step
+/// that failed and why.
+fn address_and_read(
+    x: &Xhci,
+    port: u8,
+    slot: u8,
+    speed_id: u8,
+    mem: &mut DeviceMem,
+) -> Result<UsbFacts, (&'static str, Failed)> {
     let default = speed::default_max_packet0(speed_id);
     let ring_at = mem.ep0.phys().as_u64();
     let cycle = mem.ring.cycle();
@@ -347,7 +368,8 @@ fn address_and_read(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut Device
     let config = &config[..config_len];
 
     // **Its name**: the product string, and the serial beside it, as a disk's is its model and
-    // serial. A device with no strings is named by its IDs in the log.
+    // serial. A device with no strings is named by its IDs: in the log, which prints them anyway,
+    // as "no name", and in its record as `vvvv:pppp`.
     let mut name = [0u8; MAX_DEVICE_NAME];
     let name_len = name_of(x, port, slot, mem, &dev, &mut name)?;
     let matched = desc::class_match(&dev, config);
@@ -378,7 +400,8 @@ fn address_and_read(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut Device
             matched.says()
         );
     }
-    Ok(())
+    let name_len = if name_len > 0 { name_len } else { desc::ids_into(dev.vendor, dev.product, &mut name) };
+    Ok(UsbFacts { vendor: dev.vendor, product: dev.product, class, port, speed: speed_id, name, name_len })
 }
 
 /// The product string, then ` (serial)` if it fits, into `out`. The length written; zero when the

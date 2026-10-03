@@ -38,6 +38,10 @@ pub enum DeviceKind {
     Mouse = 6,
     /// The serial console.
     Console = 7,
+    /// A USB device on a root port of the xHCI controller, its parent (Phase 6 Part A.3). Its
+    /// record's `vendor` and `device` are its USB IDs, its class fields its class triple, and its
+    /// `port` and `speed` say where and how fast it is attached.
+    UsbDevice = 8,
 }
 
 impl DeviceKind {
@@ -56,6 +60,7 @@ impl DeviceKind {
             5 => Self::Keyboard,
             6 => Self::Mouse,
             7 => Self::Console,
+            8 => Self::UsbDevice,
             _ => Self::Unknown,
         }
     }
@@ -138,8 +143,14 @@ pub struct DeviceRecord {
     pub dev: u8,
     /// PCI function.
     pub func: u8,
+    /// For a USB device, the root port it is on, numbered from 1; zero for every other kind
+    /// (Phase 6 Part A.3, from bytes that were reserved — the layout and the version are unchanged).
+    pub port: u8,
+    /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
+    /// xHCI's default speed IDs); zero for every other kind.
+    pub speed: u8,
     /// Reserved; zero.
-    pub _pad: [u8; 3],
+    pub _pad: u8,
     /// Bytes per logical block, for a block device.
     pub logical_block_size: u32,
     /// Bytes of [`name`](Self::name) that are meaningful.
@@ -158,6 +169,8 @@ const _: () = assert!(offset_of!(DeviceRecord, served) == 12);
 const _: () = assert!(offset_of!(DeviceRecord, parent) == 16);
 const _: () = assert!(offset_of!(DeviceRecord, vendor) == 24);
 const _: () = assert!(offset_of!(DeviceRecord, seg) == 32);
+const _: () = assert!(offset_of!(DeviceRecord, port) == 37);
+const _: () = assert!(offset_of!(DeviceRecord, speed) == 38);
 const _: () = assert!(offset_of!(DeviceRecord, logical_block_size) == 40);
 const _: () = assert!(offset_of!(DeviceRecord, block_count) == 48);
 const _: () = assert!(offset_of!(DeviceRecord, driver) == 56);
