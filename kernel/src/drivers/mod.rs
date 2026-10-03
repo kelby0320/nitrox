@@ -69,9 +69,8 @@ pub fn start() {
 }
 
 /// **Wait, bounded, for what [`start`] began to settle**: the USB hub thread's first round, so the
-/// hardware report lists what is attached and, once USB devices are registered (Phase 6 Part A.3),
-/// the registry holds them before userspace reads it.
-/// Before the report and `init`.
+/// hardware report lists what is attached and the registry holds it before userspace reads it
+/// (Phase 6 Part A.3). Before the report and `init`.
 pub fn settle() {
     xhci::settle(xhci::FIRST_ROUND_NS);
 }

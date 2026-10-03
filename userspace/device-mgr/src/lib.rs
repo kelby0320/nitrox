@@ -35,6 +35,10 @@ pub mod names {
             DeviceKind::Console => String::from("console"),
             DeviceKind::PciFunction if r.seg == 0 => format!("pci-{:02x}.{:02x}.{}", r.bus, r.dev, r.func),
             DeviceKind::PciFunction => format!("pci-{:04x}.{:02x}.{:02x}.{}", r.seg, r.bus, r.dev, r.func),
+            // **After its id, never its port** (PR #353 review): a port is reused when one device
+            // leaves and another arrives, while the first's record stays; a connector even has two
+            // port numbers. The id is never reused, as `blk-<served>`'s index is not.
+            DeviceKind::UsbDevice => format!("usb-{}", r.id),
             DeviceKind::Unknown => format!("dev-{}", r.id),
         }
     }
@@ -45,7 +49,7 @@ pub mod names {
             DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => Some(format!("/dev/blk/{}", r.served)),
             DeviceKind::Keyboard | DeviceKind::Mouse => Some(format!("/dev/input/raw/{}", r.served)),
             DeviceKind::Console => Some(String::from("/dev/console")),
-            DeviceKind::PciFunction | DeviceKind::Unknown => None,
+            DeviceKind::PciFunction | DeviceKind::UsbDevice | DeviceKind::Unknown => None,
         }
     }
 
@@ -60,6 +64,7 @@ pub mod names {
             DeviceKind::Keyboard => "keyboard",
             DeviceKind::Mouse => "mouse",
             DeviceKind::Console => "console",
+            DeviceKind::UsbDevice => "usb",
         }
     }
 }
@@ -93,7 +98,9 @@ pub mod classes {
             match kind {
                 DeviceKind::Keyboard | DeviceKind::Mouse => Some(Class::Input),
                 DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => Some(Class::Block),
-                DeviceKind::Console | DeviceKind::PciFunction | DeviceKind::Unknown => None,
+                // A USB device is no class's until a driver binds an interface of it (Phase 6 Parts
+                // B and D): what is handed out then is the keyboard or the disk, not the device.
+                DeviceKind::Console | DeviceKind::PciFunction | DeviceKind::UsbDevice | DeviceKind::Unknown => None,
             }
         }
 
@@ -180,7 +187,8 @@ pub mod table {
     //! `open` decodes a `.tsm` path into a `Table`.
     //!
     //! Columns: `name`, `kind`, `path`, `size` (bytes, a block device's), `description` (a disk's
-    //! model and serial, a partition's label, a RAM disk's module and path, a PCI function's ids),
+    //! model and serial, a partition's label, a RAM disk's module and path, a PCI function's ids, a
+    //! USB device's name, ids, class, port and speed),
     //! `parent` (the name of the device it belongs to) and `driver`. What a device does not have is
     //! `Null`, not zero or empty: a keyboard has no size, which is different from a size of nothing.
 
@@ -220,6 +228,27 @@ pub mod table {
                 "{:04x}:{:04x} class {:02x}.{:02x}.{:02x}",
                 r.vendor, r.device, r.pci_class, r.subclass, r.prog_if
             )))
+        } else if r.kind() == DeviceKind::UsbDevice {
+            // Its name, then where and what it is: the ids and the class a driver will match on,
+            // and the port and speed a person can see from the outside of the machine. A device
+            // with no strings is named by its ids, which this says once.
+            let ids = format!("{:04x}:{:04x}", r.vendor, r.device);
+            let mut d = String::from_utf8_lossy(r.name()).into_owned();
+            if d == ids {
+                d.clear();
+            }
+            if !d.is_empty() {
+                d.push_str(", ");
+            }
+            d.push_str(&format!(
+                "{ids} class {:02x}/{:02x}/{:02x}, port {}, {}",
+                r.pci_class,
+                r.subclass,
+                r.prog_if,
+                r.port,
+                usb_speed(r.speed)
+            ));
+            Some(Value::Str(d))
         } else if matches!(r.kind(), DeviceKind::Keyboard | DeviceKind::Mouse | DeviceKind::Console) {
             // The name *is* the kind for these; a description repeating it says nothing.
             None
@@ -243,6 +272,18 @@ pub mod table {
             or_null(parent),
             or_null(driver),
         ]
+    }
+
+    /// A USB device's speed, by the xHCI's default speed IDs, as the record carries it.
+    pub fn usb_speed(id: u8) -> &'static str {
+        match id {
+            1 => "full-speed",
+            2 => "low-speed",
+            3 => "high-speed",
+            4 => "SuperSpeed",
+            5 => "SuperSpeedPlus",
+            _ => "an unknown speed",
+        }
     }
 
     fn encode(rows: Vec<Vec<Value>>) -> Vec<u8> {
@@ -362,7 +403,9 @@ mod tests {
             bus: 0,
             dev: 0,
             func: 0,
-            _pad: [0; 3],
+            port: 0,
+            speed: 0,
+            _pad: 0,
             logical_block_size: 0,
             name_len: name.len() as u32,
             block_count: 0,
@@ -416,6 +459,42 @@ mod tests {
         let mut far = b[0];
         far.seg = 1;
         assert_eq!(name(&far), "pci-0001.00.1f.2", "a second segment is named");
+    }
+
+    /// **A USB device** (Phase 6 Part A.3): named by its id, never its port; no path; the kind
+    /// `usb`; no class's until a driver binds an interface of it; and described by its name, ids,
+    /// class, port and speed, with the controller as its parent.
+    #[test]
+    fn a_usb_device_is_named_by_its_id_and_described_by_where_it_is() {
+        let b = boot();
+        let mut kbd = rec(8, DeviceKind::UsbDevice, NOT_SERVED, 1, "QEMU USB Keyboard (42)");
+        (kbd.vendor, kbd.device) = (0x0627, 0x0001);
+        (kbd.pci_class, kbd.subclass, kbd.prog_if) = (3, 1, 1);
+        (kbd.port, kbd.speed) = (9, 3);
+        assert_eq!(name(&kbd), "usb-8");
+        let mut moved = kbd;
+        moved.port = 14;
+        assert_eq!(name(&moved), "usb-8", "the name does not follow the port");
+        assert_eq!(path(&kbd), None);
+        assert_eq!(crate::names::kind_word(DeviceKind::UsbDevice), "usb");
+        assert_eq!(Class::of(DeviceKind::UsbDevice), None);
+        let mut all = b.to_vec();
+        all.push(kbd);
+        let row = table::row(&kbd, &all);
+        assert_eq!(
+            row[4],
+            Value::Str(String::from("QEMU USB Keyboard (42), 0627:0001 class 03/01/01, port 9, high-speed"))
+        );
+        assert_eq!(row[5], Value::Str(name(&b[1])), "the controller is its parent");
+        // The kernel names a device with no strings by its ids, `vvvv:pppp`.
+        let unnamed = rec(8, DeviceKind::UsbDevice, NOT_SERVED, 1, "0627:0001");
+        let unnamed = DeviceRecord { vendor: kbd.vendor, device: kbd.device, port: 9, speed: 3, ..unnamed };
+        let unnamed = DeviceRecord { pci_class: 3, subclass: 1, prog_if: 1, ..unnamed };
+        assert_eq!(
+            table::row(&unnamed, &all)[4],
+            Value::Str(String::from("0627:0001 class 03/01/01, port 9, high-speed")),
+            "a device with no strings is described by its ids, once"
+        );
     }
 
     /// **The replay is the class, in table order** — and the console, a `Char` device like the

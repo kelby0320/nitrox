@@ -4826,7 +4826,9 @@ fn cmd_check_shutdown(accel: Accel, size: DisplaySize) -> R<()> {
 /// Wait for `boot-probe`'s verdict, then log in on serial as `DEMO_USER`.
 fn shutdown_login(s: &mut Session) -> R<()> {
     s.expect("boot-probe: test-harness verdict")?;
-    if !s.transcript().contains("boot-probe: test-harness verdict PASS") {
+    // **The whole line, waited for** (PR #356's CI): the prefix can arrive before the word after
+    // it, and on KVM this read `… verdict P` from the transcript and refused a passing image.
+    if !s.matched_line()?.contains("boot-probe: test-harness verdict PASS") {
         return Err("boot-probe's verdict was not PASS, so the image is not one to shut down".into());
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
@@ -5310,10 +5312,13 @@ fn run_recovered_boot_steps(s: &mut Session) -> R<()> {
 
 /// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape — a USB
 /// stick, an **empty** AHCI controller that is therefore declined, and no UART — and the command
-/// line the menu entry passed.
+/// line the menu entry passed. **And the stick itself, enumerated** (Phase 6 Part A): the line a
+/// person photographs off the laptop's report to say what its controller found.
 const REPORT_FACTS: &[&[&str]] = &[
     &["boot: HHDM ", ", cmdline \"hwreport\""],
     &["drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"],
+    &["usb: port 1: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
+    &["usb: first round: 1 device(s) in "],
     &["ramdisk: module 1 (/boot/root.img)"],
     &["label \"nitrox-live\" -> block node"],
     &["console: no UART at COM1"],
@@ -5472,7 +5477,10 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
             pages.iter().enumerate().map(|(i, p)| format!("--- page {} ---\n{}", i + 1, p.join("\n"))).collect();
         return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
     }
-    println!("  ok: the pages say what this machine is — a declined AHCI controller, the module disk, no COM1");
+    println!(
+        "  ok: the pages say what this machine is — a declined AHCI controller, the module disk, the stick \
+         enumerated, no COM1"
+    );
     // **And the first page says which build** (the laptop polish's Part D): the line a person
     // checks first on a machine that misbehaves, before anything else on the report.
     let built_from = built_from_line();
@@ -12750,6 +12758,37 @@ fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
     Ok(())
 }
 
+/// The devices line's count of USB devices `device-mgr` lists, the part before it.
+const DEVICES_USB_LISTED: &str = " of them usb-<id>, and ";
+
+/// **`device-mgr` lists every device the first round found** (Phase 6 Part A.3; PR #356 review).
+/// `boot-probe` can hold the manager only to the registry's first records, since the hot-plug may
+/// land on either side of the manager's one read — and a manager that dropped every USB record
+/// looks, to it, like one that read before any registered. The host knows better: the first round
+/// ended before `init` ([`check_hot_plug`] asserts it), so the manager read at least that round's
+/// devices, and its count of `usb-<id>.tsm` files must be at least the round's.
+fn check_usb_listed(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    let round = text
+        .lines()
+        .find_map(|l| l.split(USB_FIRST_ROUND).nth(1)?.split(' ').next()?.parse::<usize>().ok())
+        .ok_or("no first round's count of USB devices")?;
+    let listed = text
+        .lines()
+        .filter(|l| l.contains("boot-probe: devices: "))
+        .find_map(|l| l.split(DEVICES_USB_LISTED).next()?.rsplit(' ').next()?.parse::<usize>().ok())
+        .ok_or("no boot-probe devices line counting the USB devices the manager lists")?;
+    if listed < round {
+        return Err(format!(
+            "device-mgr lists {listed} USB device(s) as usb-<id>.tsm, but the first round found {round} \
+             before init: the manager read the registry after them, so it dropped some"
+        )
+        .into());
+    }
+    println!("xtask: device-mgr lists {listed} USB device(s) as usb-<id>.tsm, the first round's {round} among them ✓");
+    Ok(())
+}
+
 /// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). The laptop's
 /// Sunrise Point-LP controller has plain MSI with eight vectors and no MSI-X, and the driver takes
 /// the one interrupt mechanism that machine has, so every gate's controller is given it.
@@ -12952,6 +12991,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_system_control(&transcript)?;
             check_hardware_facts(&transcript)?;
             check_hot_plug(&transcript, &hot)?;
+            check_usb_listed(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -13027,6 +13067,15 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["usb: port 13: its default endpoint takes 64-byte packets, not 8; evaluated"],
     &["usb: port 13: 08e6:4433 class 0b/00/00, full-speed, \"QEMU USB CCID (", "\": nothing this kernel drives"],
     &["usb: first round: 5 device(s) in "],
+    // **And the table got each** (Part A.3): `boot-probe`'s line per `UsbDevice` record, read
+    // through `/dev/registry` — under the controller's function, with the IDs, class, port, speed
+    // (as xHCI numbers them: 1 full, 3 high, 4 SuperSpeed) and name the hub thread logged. The
+    // lines above say a device was enumerated; only these say the registry has it.
+    &["boot-probe: registry: usb port 3, 46f4:0001 class 08/06/50, speed 4, under 00:03.0, \"QEMU USB HARDDRIVE ("],
+    &["boot-probe: registry: usb port 9, 0627:0001 class 03/01/01, speed 3, under 00:03.0, \"QEMU USB Keyboard ("],
+    &["boot-probe: registry: usb port 10, 0627:0001 class 03/01/02, speed 1, under 00:03.0, \"QEMU USB Mouse ("],
+    &["boot-probe: registry: usb port 12, 0409:55aa class 09/00/00, speed 1, under 00:03.0, \"QEMU USB Hub ("],
+    &["boot-probe: registry: usb port 13, 08e6:4433 class 0b/00/00, speed 1, under 00:03.0, \"QEMU USB CCID ("],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.
@@ -17631,6 +17680,27 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The manager lists at least the first round's devices** (PR #356 review): the lines the
+    /// three runs of fgb68 and before gave pass, and the reviewer's control — a manager that
+    /// dropped every USB record, which `boot-probe` passed — fails, as does one short by one.
+    #[test]
+    fn device_mgr_must_list_the_first_rounds_usb_devices() {
+        let boot = |listed: usize, since: usize| {
+            format!(
+                "usb: first round: 5 device(s) in 287 ms\ninit: spawned init (pid 1)\nboot-probe: devices: \
+                 block held by the storage service, all.tsm has 20 rows, {listed} of them usb-<id>, and \
+                 {since} USB devices since ok\n"
+            )
+        };
+        for (listed, since) in [(5, 2), (6, 1), (7, 0)] {
+            assert!(check_usb_listed(boot(listed, since).as_bytes()).is_ok(), "{listed} listed");
+        }
+        assert!(check_usb_listed(boot(0, 7).as_bytes()).is_err(), "none listed: the reviewer's control");
+        assert!(check_usb_listed(boot(4, 3).as_bytes()).is_err(), "one short");
+        let no_round = boot(5, 2).replace("usb: first round: 5 device(s)", "usb: no round");
+        assert!(check_usb_listed(no_round.as_bytes()).is_err(), "no first round to hold it to");
+    }
 
     #[test]
     fn a_settled_receipt_is_the_last_whole_one() {

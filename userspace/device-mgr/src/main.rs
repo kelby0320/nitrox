@@ -5,7 +5,10 @@
 //! ## Shape
 //!
 //! 1. Read `/dev/registry` once: every node's record, then each class device's node by id. Every
-//!    node registers before userspace starts, so one read is complete coldplug.
+//!    node present at boot registers before userspace starts — the boot waits for the USB hub
+//!    thread's first round, for two seconds at most — so one read is complete coldplug. A USB
+//!    device plugged in later, or still enumerating when that bound passed, is in the registry and
+//!    not here, until Phase 6 Part C tells the manager.
 //! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/devices`.
 //! 3. Serve. `<class>` makes the resolver that class's owner and replays its devices; `info` is a

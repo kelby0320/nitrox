@@ -256,9 +256,9 @@ each step's rationale is in the source comments:
     layout) so `/dev/framebuffer` can serve it. Must precede the first userspace process, which
     binds that path into init's namespace.
 13. **`drivers::settle`** waits, up to two seconds, for the hub thread's first round, so the report
-    below lists what USB has attached and — once USB devices are registered, Part A.3 — a device
-    present at boot is in the registry before userspace reads it. On a machine with nothing attached
-    it costs the debounce, 100 ms; a bound that passes is logged, and the boot goes on.
+    below lists what USB has attached and a device present at boot is in the registry before
+    userspace reads it (Phase 6 Part A.3). On a machine with nothing attached it costs the
+    debounce, 100 ms; a bound that passes is logged, and the boot goes on.
 
     **The hardware report**, only on a command line with `hwreport` (`kernel/src/report.rs`). Here
     because every fact it shows now exists — drivers bound, CPUs up, the aperture recorded — and no

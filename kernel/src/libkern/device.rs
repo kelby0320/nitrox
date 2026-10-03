@@ -42,6 +42,10 @@ pub enum DeviceKind {
     Mouse = 6,
     /// The serial console.
     Console = 7,
+    /// A USB device on a root port of the xHCI controller, its parent (Phase 6 Part A.3). Its
+    /// record's `vendor` and `device` are its USB IDs, its class fields its class triple, and its
+    /// `port` and `speed` say where and how fast it is attached.
+    UsbDevice = 8,
 }
 
 impl DeviceKind {
@@ -61,6 +65,7 @@ impl DeviceKind {
             5 => Self::Keyboard,
             6 => Self::Mouse,
             7 => Self::Console,
+            8 => Self::UsbDevice,
             _ => Self::Unknown,
         }
     }
@@ -119,34 +124,43 @@ pub struct DeviceRecord {
     /// — or [`NOT_SERVED`]. The same field those servers resolve through, so it cannot disagree
     /// with them.
     pub served: u32,
-    /// The `id` of the node it belongs to — a partition's disk, a disk's controller — or
-    /// [`NO_PARENT`].
+    /// The `id` of the node it belongs to — a partition's disk, a disk's or a USB device's
+    /// controller — or [`NO_PARENT`].
     pub parent: u32,
     /// For a PCI function, what its driver did with it: [`OUTCOME_NONE`], [`OUTCOME_CLAIMED`]
     /// or [`OUTCOME_DECLINED`].
     pub outcome: u32,
-    /// PCI vendor id; `0xFFFF` for a node that is not a PCI function.
+    /// **Which IDs these are depends on [`kind`](Self::kind)**: a PCI function's vendor id, a USB
+    /// device's `idVendor` (Phase 6 Part A.3), or `0xFFFF` for a node that is neither. A vendor
+    /// other than `0xFFFF` does not mean a PCI function — read the kind.
     pub vendor: u16,
-    /// PCI device id.
+    /// A PCI function's device id, or a USB device's `idProduct`.
     pub device: u16,
-    /// PCI base class.
+    /// A PCI function's base class, or a USB device's class (its first interface's when its own
+    /// is zero).
     pub pci_class: u8,
-    /// PCI subclass.
+    /// The subclass, as for [`pci_class`](Self::pci_class).
     pub subclass: u8,
-    /// PCI programming interface.
+    /// A PCI function's programming interface, or a USB device's protocol.
     pub prog_if: u8,
-    /// PCI revision.
+    /// A PCI function's revision; zero for a USB device.
     pub revision: u8,
-    /// PCIe segment group.
+    /// PCIe segment group; zero for a node that is not a PCI function.
     pub seg: u16,
-    /// PCI bus.
+    /// PCI bus; zero for a node that is not a PCI function.
     pub bus: u8,
-    /// PCI device.
+    /// PCI device; zero for a node that is not a PCI function.
     pub dev: u8,
-    /// PCI function.
+    /// PCI function; zero for a node that is not a PCI function.
     pub func: u8,
+    /// For a USB device, the root port it is on, numbered from 1; zero for every other kind
+    /// (Phase 6 Part A.3, from bytes that were reserved — the layout and the version are unchanged).
+    pub port: u8,
+    /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
+    /// xHCI's default speed IDs); zero for every other kind.
+    pub speed: u8,
     /// Reserved; zero.
-    pub _pad: [u8; 3],
+    pub _pad: u8,
     /// Bytes per logical block, for a block device; zero otherwise.
     pub logical_block_size: u32,
     /// Bytes of [`name`](Self::name) that are meaningful.
@@ -155,7 +169,8 @@ pub struct DeviceRecord {
     pub block_count: u64,
     /// The driver that published the node or took the function, NUL-padded.
     pub driver: [u8; MAX_DRIVER_NAME],
-    /// What to call it: a disk's model and serial, a partition's label, a module's path.
+    /// What to call it: a disk's model and serial, a partition's label, a module's path, a USB
+    /// device's product and serial (or `vvvv:pppp` when it has no strings).
     pub name: [u8; MAX_DEVICE_NAME],
 }
 
@@ -173,6 +188,8 @@ const _: () = assert!(offset_of!(DeviceRecord, pci_class) == 28);
 const _: () = assert!(offset_of!(DeviceRecord, seg) == 32);
 const _: () = assert!(offset_of!(DeviceRecord, bus) == 34);
 const _: () = assert!(offset_of!(DeviceRecord, func) == 36);
+const _: () = assert!(offset_of!(DeviceRecord, port) == 37);
+const _: () = assert!(offset_of!(DeviceRecord, speed) == 38);
 const _: () = assert!(offset_of!(DeviceRecord, logical_block_size) == 40);
 const _: () = assert!(offset_of!(DeviceRecord, name_len) == 44);
 const _: () = assert!(offset_of!(DeviceRecord, block_count) == 48);
@@ -198,7 +215,9 @@ impl Default for DeviceRecord {
             bus: 0,
             dev: 0,
             func: 0,
-            _pad: [0; 3],
+            port: 0,
+            speed: 0,
+            _pad: 0,
             logical_block_size: 0,
             name_len: 0,
             block_count: 0,

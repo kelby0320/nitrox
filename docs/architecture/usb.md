@@ -1,11 +1,12 @@
 # USB
 
-**Status: Phase 6 Parts A.1 and A.2 built (2026-10-02)** — the xHCI host controller is claimed and
-its rings proved (A.1), and **a hub thread enumerates what is attached**, at boot and after it,
-logging each device and matching it against the class table (A.2). **A device is not yet in the
-registry** (A.3), nothing binds a class driver (Parts B and D), and a departure frees its slot but
-reaches nothing else (Part C). The design ahead is [`phase-6-usb.md`](../planning/phase-6-usb.md);
-this document grows with each part.
+**Status: Phase 6 Part A built (2026-10-02)** — the xHCI host controller is claimed and its rings
+proved (A.1); **a hub thread enumerates what is attached**, at boot and after it, logging each
+device and matching it against the class table (A.2); and **each device is a `UsbDevice` record in
+the registry**, which `device-mgr` names `usb-<id>` (A.3). Nothing binds a class driver (Parts B and
+D). A departure frees the device's slot and leaves its record, and nothing tells `device-mgr` of a
+device plugged in after it read the registry (Part C). The design ahead is
+[`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
 
 ## The controller
 
@@ -101,7 +102,7 @@ every port (100 ms, which also lets USB 3 links train), logs each connected port
 enumerates the connected ports one at a time — only one device may answer at address 0 — and
 completes the operation **the boot waits on**: `drivers::settle`, before the hardware report and
 `init`, bounded at two seconds. So the report lists what is attached, and a device present at boot
-will be in the registry before `device-mgr` replays it. A bound that passes is logged, and the rest
+is in the registry before `device-mgr` reads it. A bound that passes is logged, and the rest
 arrive later. Then the thread sleeps until a port changes: a connection is debounced and
 enumerated; a disconnection disables the device's slot and frees its memory.
 
@@ -141,6 +142,28 @@ there: a device pulled and another plugged in while the thread was busy — or a
 and `usb: port 14: disconnected; slot 6 disabled`. The names are each device's product and serial
 strings, printable ASCII, the serial in brackets as a disk's is.
 
+## The record
+
+**Each device enumerated is put in the registry** (A.3), by the hub thread once its class match is
+logged — not by the DPC, since the table allocates under its lock. Its node is a bare `Other` with
+the zero descriptor, and what it is lives in the device table's entry beside the node, filling its
+`UsbDevice` record:
+- its IDs, in the fields a PCI function's go in;
+- its class triple: the device's, or its first interface's when that is zero, as most are;
+- its root port and its speed, in two bytes that were padding;
+- its product and serial as its name, or `vvvv:pppp` when it has no strings;
+- `xhci` as its driver, and **the controller's PCI function as its parent**, found by the
+  controller's address. The node's own zero address would find the host bridge.
+
+[`device-node.md`](../spec/device-node.md) § *The registry* has the fields.
+
+**A departure leaves the record**, and an id is never reused, which is why `device-mgr` names a USB
+device `usb-<id>` and not by its port ([`device-manager.md`](device-manager.md) §5). The port goes
+to the next device when this one leaves, and a connector has two port numbers. Until Part C the
+manager reads the registry once, at its start. A device plugged in after that is in `/dev/registry`
+and not in `/dev/devices`. A device the table cannot take — no memory for its node, or the table
+full — stays attached, and the log says it is missing from the registry.
+
 ## The code, and what tests it
 
 - **`drivers::xhci::ring`** — TRBs, the producer ring (the command ring; transfer rings from A.2)
@@ -149,12 +172,15 @@ strings, printable ASCII, the serial in brackets as a disk's is.
 - **`drivers::xhci::caps`** — the extended-capability walk, bounded by the register window and an
   entry count. Host tests on register images.
 - **`drivers::xhci::context`** — input and device contexts at both entry sizes, and the speeds.
-- **`drivers::xhci::desc`** — descriptors read from bytes, the class match, and strings made
-  printable. Host tests on bytes QEMU's devices sent during an enumeration (captured with `pcap=`),
-  and on bytes no correct device sends: lengths that run past the buffer, a zero length, a string
-  longer than its own length says.
+- **`drivers::xhci::desc`** — descriptors read from bytes, the class match, strings made printable,
+  and the `vvvv:pppp` name of a device with none. Host tests on bytes QEMU's devices sent during an
+  enumeration (captured with `pcap=`), and on bytes no correct device sends: lengths that run past
+  the buffer, a zero length, a string longer than its own length says.
 - **`pci::power_up`** — host tests on a synthetic configuration space, including that the write
   raising the function does not clear `PME_Status`.
+- **`device::Registry`** — a host test that a USB record carries its entry's IDs, class, port,
+  speed, name and driver, under the controller found by its address, and no parent when the table
+  has no function there.
 - **`test-qemu`** boots the controller with a keyboard at high speed, a mouse at full speed, a
   stick at SuperSpeed, a hub, and a smart-card reader — the device nothing matches, and the one
   whose default endpoint is not its speed's, so its enumeration evaluates it. On the host it
@@ -170,3 +196,17 @@ strings, printable ASCII, the serial in brackets as a disk's is.
   reaches are held by experiments recorded in the decision log: that QEMU's *Disable Slot* writes
   the output context, which is why memory outlives the slot, and that a stalled request leaves the
   endpoint answering nothing until it is recovered.
+- **The records, in `test-qemu`** (A.3): `boot-probe` prints a line per `UsbDevice` record it reads
+  through `/dev/registry`, after checking it is under a claimed `0c/03/30` function and carries a
+  port, a speed, a name and its driver. The host holds each of the five to its port, IDs, class,
+  speed and name. `boot-probe` also holds `device-mgr` to the registry: the manager's devices are
+  the registry's first records, every record after them is a USB device, and each USB device the
+  manager read is listed as `usb-<id>.tsm`. Where the hot-plug lands against the manager's read
+  varies from run to run, under TCG and KVM alike — before either device, between them, and after
+  both have all been seen — and the check holds wherever it lands. Controls each fail it:
+  - a hub thread that registers nothing fails on the host. `boot-probe` checks only the records it
+    finds and passes, which is why the host asserts the lines;
+  - a record whose parent is looked up by the node's own descriptor fails in `boot-probe`.
+- **`check-report`** reads the live stick's enumeration line off a report page: port 1,
+  SuperSpeed, mass storage. It is the line a photograph of the laptop's report will be compared
+  with.

@@ -2194,7 +2194,11 @@ fn view_broker_test(root_ns: u64) -> bool {
 ///   record's name;
 /// - **the keyboard is served at 0 and the mouse at 1**, each resolving under `/dev/input/raw`;
 /// - every record's `/dev/registry/<id>` is a device node, **and its id is its place** — which a
-///   phantom record read past the count, all zeros, cannot be.
+///   phantom record read past the count, all zeros, cannot be;
+/// - **a USB device is under the controller that enumerated it** (Phase 6 Part A.3): its parent a
+///   PCI function of class `0c/03/30` claimed by `xhci`, with a port, a speed and a name, which no
+///   other kind carries. Each is printed, for `test-qemu` to hold to what QEMU attached: the
+///   kernel's own line says a device was enumerated, and only this says the table got it.
 ///
 /// The paths and the records read one field in the kernel, so a disagreement here would be a new
 /// path that stopped reading it.
@@ -2264,6 +2268,26 @@ fn registry_test(root_ns: u64) -> bool {
                     mouse = true;
                 }
             }
+            DeviceKind::UsbDevice => {
+                let Some(c) = all.get(r.parent as usize).filter(|c| {
+                    c.kind() == DeviceKind::PciFunction
+                        && (c.pci_class, c.subclass, c.prog_if) == (0x0c, 0x03, 0x30)
+                        && c.outcome == libkern::device::OUTCOME_CLAIMED
+                        && c.driver() == b"xhci"
+                }) else {
+                    return fail(b"a USB device is not under a claimed xHCI controller");
+                };
+                let bare = r.class == 0 && r.served == libkern::device::NOT_SERVED;
+                if r.port == 0 || r.speed == 0 || r.name().is_empty() || r.driver() != b"xhci" || !bare {
+                    return fail(b"a USB record lacks its port, speed, name or driver, or is served");
+                }
+                let at = alloc::format!(
+                    "boot-probe: registry: usb port {}, {:04x}:{:04x} class {:02x}/{:02x}/{:02x}, speed {}, \
+                     under {:02x}:{:02x}.{}, \"",
+                    r.port, r.vendor, r.device, r.pci_class, r.subclass, r.prog_if, r.speed, c.bus, c.dev, c.func
+                );
+                Line::new().s(at.as_bytes()).untrusted(r.name()).s(b"\"").end();
+            }
             _ => {}
         }
     }
@@ -2303,7 +2327,11 @@ fn registry_test(root_ns: u64) -> bool {
 /// - **a second subscription is refused while the first is held**, and taken once it is closed —
 ///   one owner per class, the kernel's one reader per device kept at the manager;
 /// - **`info` lists `all.tsm` and a file per device, and `all.tsm` is a table** with a row per
-///   device the registry has;
+///   device the registry had when the manager read it. **That is the registry's first records, and
+///   every record after them is a USB device** (Phase 6 Part A.3): the manager reads the table once,
+///   and a device plugged in after that — `test-qemu`'s hot-plug, which may land on either side of
+///   the read — is in the table and not the manager until Part C tells it. A USB device it did
+///   read is listed as `usb-<id>.tsm`;
 /// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
 ///   sees that the input server took its devices from the manager rather than from the raw paths.
 ///   Were it not held, this resolve would take the class for a moment and give it back;
@@ -2404,10 +2432,18 @@ fn devices_test(root_ns: u64) -> bool {
     };
     let mut names = 0usize;
     let mut has_all = false;
+    let mut usb_named = 0usize;
     let listed = dir.read_dir(|e| {
         if e.name != b"." && e.name != b".." {
             names += 1;
             has_all |= e.name == b"all.tsm";
+            let id = e
+                .name
+                .strip_prefix(b"usb-")
+                .and_then(|n| n.strip_suffix(b".tsm"))
+                .and_then(|n| core::str::from_utf8(n).ok()?.parse::<usize>().ok());
+            let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
+            usb_named += id.is_some_and(|id| registry.get(id).is_some_and(usb)) as usize;
         }
         true
     });
@@ -2415,9 +2451,37 @@ fn devices_test(root_ns: u64) -> bool {
     if listed.is_err() {
         return fail(b"the directory would not list");
     }
-    if !has_all || names != registry.len() + 1 {
+    // The records the manager read: the registry's first `read`, since a record is never removed
+    // until Part C, and nothing but a USB device is added after the boot.
+    let read = names.saturating_sub(1);
+    let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
+    let later_all_usb = registry.get(read..).is_some_and(|later| later.iter().all(usb));
+    if !has_all || !later_all_usb {
         Line::new().s(b"boot-probe: devices: ").u(names as u64).s(b" entries for ").u(registry.len() as u64).s(b" devices").end();
-        return fail(b"the directory is not all.tsm and a file per device");
+        return fail(b"the directory is not all.tsm and a file per device the manager read");
+    }
+    if usb_named != registry[..read].iter().filter(|r| usb(r)).count() {
+        return fail(b"a USB device the manager read is not listed as usb-<id>.tsm");
+    }
+    // **And a listed USB device's file is its table** (PR #356 review): one row, named `usb-<id>`,
+    // of kind `usb`, driven by `xhci`. The listing alone says only that a name was made.
+    if let Some(r) = registry[..read].iter().find(|r| usb(r)) {
+        let name = alloc::format!("usb-{}", r.id);
+        let path = alloc::format!("/svc/devices/info/{name}.tsm");
+        let (st, h) = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        let row = bytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).and_then(|mut t| {
+            (t.rows.len() == 1).then(|| t.rows.remove(0))
+        });
+        let says = |i: usize, want: &str| {
+            row.as_ref().and_then(|r| r.get(i)) == Some(&libstream::wire::Value::Str(alloc::string::String::from(want)))
+        };
+        // Columns: name, kind, path, size, description, parent, driver.
+        if !(says(0, &name) && says(1, "usb") && says(6, "xhci")) {
+            Line::new().s(b"boot-probe: devices: ").s(path.as_bytes()).s(b" is not that device's row").end();
+            return fail(b"a USB device's file is not its table");
+        }
     }
     let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
     let tbytes = if st == 0 { read_all(table) } else { None };
@@ -2430,13 +2494,17 @@ fn devices_test(root_ns: u64) -> bool {
         Ok(t) => t.rows.len(),
         Err(_) => return fail(b"all.tsm is not a TSM1 table"),
     };
-    if rows != registry.len() {
-        return fail(b"all.tsm has not a row per device");
+    if rows != read {
+        return fail(b"all.tsm has not a row per device the manager read");
     }
     Line::new()
         .s(b"boot-probe: devices: block held by the storage service, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
         .u(rows as u64)
-        .s(b" rows ok")
+        .s(b" rows, ")
+        .u(usb_named as u64)
+        .s(b" of them usb-<id>, and ")
+        .u((registry.len() - read) as u64)
+        .s(b" USB devices since ok")
         .end();
     true
 }

@@ -2,14 +2,17 @@
 //!
 //! Architecture-independent: the table is seeded by PCI(e) enumeration ([`crate::pci`]) — on
 //! aarch64 it would be a Device Tree Blob — and drivers append what they publish after it: disks,
-//! the partitions found on them, the RAM disk, the console, and the i8042's keyboard and mouse.
-//! Each entry is an owning reference, so a registered node lives for the kernel's lifetime.
+//! the partitions found on them, the RAM disk, the console, the i8042's keyboard and mouse, and
+//! the USB devices the hub thread enumerates. Each entry is an owning reference, so a registered
+//! node lives for the kernel's lifetime — a USB device that leaves included, until Part C of
+//! Phase 6 gives the table departures.
 //!
 //! **What the table knows that a node does not** is kept beside it: the node's kind, which its
 //! `DeviceClass` is too coarse to say (the console and both i8042 nodes are all `Char`), **the
 //! index its path serves it at**, and the node it belongs to. `/dev/blk` and `/dev/input/raw`
 //! resolve through that served index, and `/dev/registry` reports it, so the two cannot disagree
-//! (administration Part B).
+//! (administration Part B). A USB device's IDs, class, port, speed and name are kept there too,
+//! since its node is a bare `Other` (Phase 6 Part A.3).
 //!
 //! [`DeviceNode`]: crate::object::DeviceNode
 
@@ -20,7 +23,7 @@ use crate::libkern::device::{
     DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
     OUTCOME_DECLINED, OUTCOME_NONE, REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
 };
-use crate::libkern::block::BlockKind;
+use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KVec, SpinLock};
 use crate::object::ObjectRef;
@@ -36,6 +39,30 @@ struct Entry {
     parent: u32,
     /// The driver that published it; empty for a PCI function, whose driver is its outcome's.
     driver: &'static str,
+    /// For a USB device, what its record carries that its node cannot say (Phase 6 Part A.3).
+    usb: Option<UsbFacts>,
+}
+
+/// **What a USB device's record carries** that its node does not (Phase 6 Part A.3). The node is a
+/// plain `Other` with the zero descriptor — vendor `0xFFFF`, which the table reads as "not a PCI
+/// function", where a USB device's zero address would find the host bridge — and these fill its
+/// record instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UsbFacts {
+    /// `idVendor`.
+    pub vendor: u16,
+    /// `idProduct`.
+    pub product: u16,
+    /// Its class triple: the device descriptor's, or its first interface's when that is zero.
+    pub class: (u8, u8, u8),
+    /// The root port, numbered from 1.
+    pub port: u8,
+    /// Its speed, as the xHCI's default speed IDs number them.
+    pub speed: u8,
+    /// Its product and serial strings, printable, or `vvvv:pppp` when it has none.
+    pub name: [u8; MAX_DEVICE_NAME],
+    /// How many bytes of [`name`](Self::name) are meaningful.
+    pub name_len: usize,
 }
 
 /// The table as a value, so a host test can build one without the kernel's.
@@ -85,6 +112,7 @@ impl Registry {
             served: NOT_SERVED,
             parent: NO_PARENT,
             driver: "",
+            usb: None,
         })
     }
 
@@ -116,7 +144,7 @@ impl Registry {
             BlockKind::RamDisk => DeviceKind::RamDisk,
             BlockKind::Unknown => DeviceKind::Unknown,
         };
-        self.push(Entry { node, kind, served, parent, driver })
+        self.push(Entry { node, kind, served, parent, driver, usb: None })
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
@@ -127,7 +155,22 @@ impl Registry {
         served: u32,
         driver: &'static str,
     ) -> bool {
-        self.push(Entry { node, kind, served, parent: NO_PARENT, driver })
+        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None })
+    }
+
+    /// Append a USB device under the PCI function at `controller`'s address, carrying `facts`. Its
+    /// id, which is its place, or `None` when the table could not take it.
+    pub fn add_usb(
+        &mut self,
+        node: ObjectRef,
+        controller: &ResourceDescriptor,
+        driver: &'static str,
+        facts: UsbFacts,
+    ) -> Option<u32> {
+        let parent = self.pci_parent(controller);
+        let id = self.entries.len() as u32;
+        let usb = Some(facts);
+        self.push(Entry { node, kind: DeviceKind::UsbDevice, served: NOT_SERVED, parent, driver, usb }).then_some(id)
     }
 
     /// The index of the PCI function at `desc`'s address, if `desc` names one.
@@ -215,7 +258,15 @@ impl Registry {
             let dn = driver.as_bytes();
             let dl = dn.len().min(MAX_DRIVER_NAME);
             r.driver[..dl].copy_from_slice(&dn[..dl]);
-            if n.class() == DeviceClass::Block {
+            if let Some(u) = &e.usb {
+                r.vendor = u.vendor;
+                r.device = u.product;
+                (r.pci_class, r.subclass, r.prog_if) = u.class;
+                r.port = u.port;
+                r.speed = u.speed;
+                r.name[..u.name_len].copy_from_slice(&u.name[..u.name_len]);
+                r.name_len = u.name_len as u32;
+            } else if n.class() == DeviceClass::Block {
                 let info = n.block_info();
                 r.logical_block_size = info.logical_block_size;
                 r.block_count = info.block_count;
@@ -327,6 +378,23 @@ pub fn register_char(node: ObjectRef, kind: DeviceKind, served: u32, driver: &'s
     if !DEVICES.lock().add_char(node, kind, served, driver) {
         crate::kprintln!("device: table full; dropping a registered {:?}", kind);
     }
+}
+
+/// Append a USB device under the PCI function at `controller`'s address, carrying `facts`. The
+/// table takes ownership of `node`. Its id — the `<id>` of `/dev/registry/<id>` and of
+/// `device-mgr`'s `usb-<id>` — or `None` when the table could not take it. From the hub thread
+/// (Phase 6 Part A.3), never a DPC: the table allocates while locked.
+pub fn register_usb(
+    node: ObjectRef,
+    controller: &ResourceDescriptor,
+    driver: &'static str,
+    facts: UsbFacts,
+) -> Option<u32> {
+    let id = DEVICES.lock().add_usb(node, controller, driver, facts);
+    if id.is_none() {
+        crate::kprintln!("device: table full; dropping a USB device");
+    }
+    id
 }
 
 /// The node `/dev/blk/<index>` serves, as a cloned owning reference (the table keeps its own).
@@ -606,6 +674,44 @@ mod tests {
         assert_eq!(text(&recs[2].driver, 4), "nvme", "the driver that declined it");
         assert_eq!(recs[0].outcome, OUTCOME_NONE);
         assert_eq!(recs[0].driver[0], 0, "no driver, no name");
+    }
+
+    /// **A USB device's record is filled from its entry**, its node being a bare `Other` with the
+    /// zero descriptor (Phase 6 Part A.3): the USB IDs where a PCI function's go, its class triple,
+    /// its port and speed, its name and its driver — and **its parent is the controller's function,
+    /// found by the controller's address**, not the host bridge its own zero address would match.
+    /// A controller the table does not hold gives no parent.
+    #[test]
+    fn a_usb_record_carries_its_ids_port_speed_and_name_under_its_controller() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        let at3 = pci_at(0, 3, 0);
+        let xhci = ResourceDescriptor {
+            identity: DeviceIdentity { class: 0x0c, subclass: 0x03, prog_if: 0x30, ..at3.identity },
+            ..at3
+        };
+        assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
+        let usb =
+            || adopt(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
+        let mut name = [0u8; MAX_DEVICE_NAME];
+        name[..18].copy_from_slice(b"QEMU USB Keyboard ");
+        let kbd = UsbFacts { vendor: 0x0627, product: 0x0001, class: (3, 1, 1), port: 9, speed: 3, name, name_len: 17 };
+        assert_eq!(r.add_usb(usb(), &xhci, "xhci", kbd), Some(10), "its id is its place");
+        let elsewhere = UsbFacts { port: 2, ..kbd };
+        assert_eq!(r.add_usb(usb(), &pci_at(0, 9, 0), "xhci", elsewhere), Some(11));
+
+        let recs = r.records(|_| None).unwrap();
+        let k = &recs[10];
+        assert_eq!(DeviceKind::from_u32(k.kind), DeviceKind::UsbDevice);
+        assert_eq!((k.class, k.served, k.parent), (DeviceClass::Other as u32, NOT_SERVED, 9));
+        assert_eq!((k.vendor, k.device), (0x0627, 0x0001));
+        assert_eq!((k.pci_class, k.subclass, k.prog_if), (3, 1, 1));
+        assert_eq!((k.port, k.speed), (9, 3));
+        assert_eq!(text(&k.name, k.name_len), "QEMU USB Keyboard");
+        assert_eq!(text(&k.driver, 4), "xhci");
+        assert_eq!(k.outcome, OUTCOME_NONE, "an outcome is a PCI function's");
+        assert_eq!(recs[11].parent, NO_PARENT, "no controller at 00:09.0");
+        assert_eq!((recs[8].port, recs[8].speed), (0, 0), "zero for every other kind");
     }
 
     /// **The header's count is the number of records**, and the bytes are exactly the header and

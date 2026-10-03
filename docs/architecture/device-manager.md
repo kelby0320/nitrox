@@ -3,7 +3,7 @@
 **Status: built — administration Part B, B.1–B.5, 2026-09-24; `block` owned by the storage service
 since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a, the info-only
 endpoint reached through its route since E.1b; the installer session's rebinding gone since Part
-G.3; last checked 2026-09-30.** What exists:
+G.3; USB devices named since Phase 6 Part A.3, 2026-10-02; last checked 2026-10-02.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -12,8 +12,9 @@ G.3; last checked 2026-09-30.** What exists:
 - every enumeration of block devices reading the registry or its namespace's own bindings (B.5);
 - `storage-service` as the owner of `block` ([`storage.md`](storage.md), administration Part C.5a).
 
-What does not exist yet: **anything that sends a later `Arrived` or a `Departed`.** Phase 6's USB
-driver is the first event source.
+What does not exist yet: **anything that sends a later `Arrived` or a `Departed`.** Since Phase 6
+Part A.3 the kernel registers a USB device plugged in after the boot, and nothing tells the manager
+(§9). Phase 6 Part C is the event source.
 
 The design, and why each piece is shaped as it is, is
 [`administration.md`](../planning/administration.md) § *Part B in detail*. The contracts are
@@ -55,14 +56,16 @@ are Tier 1. Matching a device to a driver module, and handing a driver process a
 1. **The drivers register their nodes.** The PCI functions come first, then each controller's
    disks, then the RAM disks, then every block device's partitions — the GPT pass runs after the
    RAM disks are published, so it scans them too — then the console and the i8042's keyboard and
-   mouse. The table is append-only, and a block node's served index is the number of block nodes
+   mouse, then the USB devices of the hub thread's first round, which the boot waits for. The table
+   is append-only, and a block node's served index is the number of block nodes
    before it ([`device-node.md`](../spec/device-node.md) § *The registry* has the order whole).
-2. **`service-mgr` spawns `device-mgr`**, after the view broker and before the display arm
-   (`init` did until administration Part E.1a). The manager
-   reads `/dev/registry` once. Every node registers before userspace starts, so one read is
-   complete coldplug. It then takes each class device's node from `/dev/registry/<id>` and answers
-   `Meta::Ready`. A manager with no registry to read refuses instead, and `service-mgr` prints its
-   reason.
+2. **`service-mgr` spawns `device-mgr`**, after the view broker and before the display arm (`init`
+   did until administration Part E.1a). The manager reads `/dev/registry` once. Every node present
+   at boot registers before userspace starts, so one read is complete coldplug — but for a USB
+   device still enumerating when the boot's two-second wait for the hub thread's first round runs
+   out. Such a device, like one plugged in later, registers after the read, unseen (§9). It then
+   takes each class device's node from `/dev/registry/<id>` and answers `Meta::Ready`. A manager
+   with no registry to read refuses instead, and `service-mgr` prints its reason.
 3. **`service-mgr` binds `/svc/devices`** — the manager's endpoint in its registry, the root path
    to the manager's route — then resolves `info-endpoint` in the registry, binds what it gets there
    too, and hands the sessions a route to it (§5).
@@ -86,7 +89,9 @@ calls the console, the keyboard and the mouse all `Char`:
 | `input` | keyboard, mouse | `input-server`, from boot on |
 | `block` | disk, partition, RAM disk | `storage-service`, from boot on (Part C.5a) |
 
-A console or a PCI function is in no class, and is only ever information.
+A console, a PCI function or a USB device is in no class, and is only ever information. (A USB
+keyboard, mouse or disk is to be a record of its own, under its device, when Phase 6's class drivers
+bind.)
 
 **A class has one owner at a time.** While an owner's channel is open, a second subscription is
 refused with `AlreadyExists`, and the class is free once the channel closes. This is the kernel's
@@ -116,10 +121,15 @@ reach it:
 - disks, partitions and RAM disks are `blk-<n>` for `/dev/blk/<n>`;
 - keyboards and mice are `input-<n>` for `/dev/input/raw/<n>`;
 - the console is `console`;
-- a PCI function is `pci-<bus>.<dev>.<fn>`.
+- a PCI function is `pci-<bus>.<dev>.<fn>`;
+- a USB device is `usb-<id>`, after its registry id (Phase 6 Part A.3). It has no path, and **not
+  its port**: a port goes to the next device when one leaves, while the record stays, and a
+  connector has two port numbers, a USB 2 one and a USB 3 one. The id is never reused.
 
 The `<n>` is the record's served index, never a count within a class: the console registers first,
-so counting within `Char` would have called the keyboard `input-1`.
+so counting within `Char` would have called the keyboard `input-1`. A USB device's description is
+its name, IDs, class, port and speed — `QEMU USB Keyboard (…), 0627:0001 class 03/01/01, port 9,
+high-speed` — and its parent is the controller's `pci-` name.
 
 The columns are `name`, `kind`, `path`, `size`, `description`, `parent` and `driver`. **What a
 device does not have is `Null`, not zero**, because a keyboard has no size, which is different from
@@ -178,7 +188,7 @@ counter. `libfs::ns_children` still reports a kernel server's subtree as one bin
 
 | Gate | What it asserts |
 |---|---|
-| `test-qemu` (`boot-probe`) | The registry decodes, and its ids, sizes, names and served indices match the paths that serve them. `block` and `input` are held, by the storage service and `input-server`. The storage service's `all.tsm` has a row per block record, which is the replay reaching its owner whole. An info-only endpoint refuses `block`. `all.tsm` has a row per record. A view's `nxinstall` finds its granted disks. Until Part C.5a the probe took `block` itself, to see it settle before its resolve completed, a second owner refused, and the class taken again once closed; those are the host tests' now, since taking the class would take the disks from their owner |
+| `test-qemu` (`boot-probe`) | The registry decodes, and its ids, sizes, names and served indices match the paths that serve them. `block` and `input` are held, by the storage service and `input-server`. The storage service's `all.tsm` has a row per block record, which is the replay reaching its owner whole. An info-only endpoint refuses `block`. `all.tsm` has a row per record the manager read, which is the registry's first records — every one after them a USB device plugged in since — and each USB device it read is `usb-<id>.tsm`. A `UsbDevice` record is under the claimed xHCI function, with the port, IDs, class, speed and name the kernel logged. A view's `nxinstall` finds its granted disks. Until Part C.5a the probe took `block` itself, to see it settle before its resolve completed, a second owner refused, and the class taken again once closed; those are the host tests' now, since taking the class would take the disks from their owner |
 | `test-interactive` | The manager mints the info-only endpoint before the first login. In a serial session, `list /dev/devices` names the disk and both input devices, a `filter kind == "disk"` prints the disk's model, and `/dev/devices/block` and `/dev/registry` open nothing |
 | `check-login` | The graphical session has `/dev/devices`, and each application namespace the shell builds reaches it |
 | `check-live` | `/dev/devices` lists the live image's module as a `ramdisk`, the one RAM disk any gate has |
@@ -190,9 +200,12 @@ one-off boot of a release disk whose root would not mount.
 
 ## 9. Not built, and what that costs
 
-- **An event source.** The kernel registers every node before userspace, and nothing registers one
-  later. `Arrived` after `Settled` and `Departed` are specified and handled, `input-server`'s side
-  in host tests, and sent by nothing until Phase 6.
+- **An event source.** Since Phase 6 Part A.3 the kernel registers a node after the boot — a USB
+  device plugged in later — and nothing tells the manager, which read the table once. Such a device
+  is in `/dev/registry` and not in `/dev/devices`; `test-qemu`'s hot-plug lands on either side of
+  the read, and `boot-probe` holds the manager to the records before it. `Arrived` after `Settled`
+  and `Departed` are specified and handled, `input-server`'s side in host tests, and sent by
+  nothing until Phase 6 Part C.
 - **Supervision.** `service-mgr` keeps the manager's process handle, and nothing restarts it: its
   policy is `never`, and it is `essential`, so `service --stop` refuses it. If it exited, an owner
   would keep the devices it holds (`input-server` logs that the manager has gone and keeps
