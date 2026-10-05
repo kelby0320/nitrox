@@ -33919,3 +33919,65 @@ the spec's general rule for `length` says. The lights section now says so, and t
 **5. A resend restarting the answer's clock** is tested: the byte sent again has the whole bound.
 
 No ABI hash impact.
+
+## 2026-10-05 — Phase 6 Part C, detailed: arrivals and departures
+
+Part C makes the registry say that a device went, and makes the device manager follow it, so a
+device plugged in after boot reaches the owner of its class and one unplugged leaves it. The detail
+pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part C in detail*. Its shape:
+- **A departure is a state of a record, not its removal**, since an id is its place. The record's
+  spare byte becomes `flags`, with `DEPARTED`. Its children depart with it, its paths answer
+  `NotFound`, and its served index is never reissued.
+- **The table has a generation**, carried in a version 2 snapshot header.
+- **A departed keyboard's held keys are released** by the driver, which decodes its last report
+  against an empty one. The driver is the only place that knows them per device.
+- **A USB node's static slot is given back**, guarded by an epoch.
+- **`device-mgr` diffs each new snapshot** against the records it holds.
+- **`input-server` takes a `PeerClosed` read as its device leaving.**
+
+**The event source departs from the scoping, and the maintainer agreed.** The scoping planned a
+notification kind, and **the kernel cannot name the device manager** to send one to: a notification
+goes to a process the kernel already has a reason to tell. Telling the manager would need it to
+register first, which is a watch by another name, and a notification kind is ABI. The pass
+recommends a node to read instead: `/dev/registry/changes`, whose `Read` waits until the
+generation is past the read's `offset`. That is `sys_io_submit`, a `PendingOperation` and
+`sys_wait`, the model the system already has, and no change can be missed when the manager waits
+past the generation of the snapshot it holds.
+
+**Checked against QEMU's source** (8.2.2 and 11.0), so the gate is buildable: a USB keyboard takes
+injected keys when it is plugged in, and nothing is sent for a key held when its device is
+unplugged. So `check-input --usb` can unplug the boot keyboard, plug another in and type on it, then
+hold a key and unplug that keyboard, and see the release. That proves the release came from the
+guest.
+
+**Departed records stay for the boot**, the maintainer's second call: dropping one would break "an
+id is its place", and a replug costs a record per node — two for a keyboard or a mouse, its device
+and its input node — in every later snapshot. `usb-departed-records` keeps the snapshot's size as
+the trigger.
+
+No code; no ABI hash impact.
+
+## 2026-10-05 — PR #360, reviewed: what Part C's gates can see
+
+No blocking findings; four worth fixing and four optional, all taken into the detail pass. Each was
+read against the source, as the reviewer had:
+- **`test-qemu`'s hot-plug happens before `init`**, so the hot keyboard can come and go before the
+  manager's first read, and is then rightly told to no one. Moving the hot-plug later would race
+  `boot-probe`'s verdict, which ends the run. So `test-qemu` holds what is true wherever it lands:
+  the manager agrees with the registry's present records once caught up, and departed paths
+  answer `NotFound`. The hot keyboard's `Arrived` and `Departed` are `check-input --usb`'s.
+- **The step meant to catch `input-server` arming a departed node could not see it.** A read that
+  *completes* `PeerClosed` logs one line and is armed again in a spin, while only a *refused*
+  submit logs `read submit FAILED`. Now a read on a retired, drained node is refused at submission,
+  and the gate requires one `left` line per departure and neither failure line.
+- **A char node's `Read` never sees its `offset`**, which the change node needs. `submit_read`
+  gains it, a signature change in three backends.
+- **`boot-probe`'s registry test reads `served` directly**, not through `block_index`, so a departed
+  record would fail it. It holds a departed record's paths to `NotFound` instead.
+- Optional:
+  - `Departed` now retires a slot only after its node answers `PeerClosed`, so releases still in
+    the ring are not lost;
+  - a mouse's buttons are released from its decoder's state, since an empty report carries no
+    report ID;
+  - the scoping's notification is marked revised;
+  - a replug costs two records for an input device, not one.
