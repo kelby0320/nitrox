@@ -33504,3 +33504,130 @@ as they are, since a USB node's descriptor is the zero one.
 - **Two `UsbFacts` fields lacked doc comments.**
 
 No ABI hash impact: docs, a gate, and a test.
+
+## 2026-10-03 — Phase 6 Part B, detailed: HID boot keyboard and mouse
+
+`docs/planning/phase-6-usb.md` § *Part B in detail*. Docs only.
+
+**What the check of the code found:**
+- **The input path above the kernel needs nothing new.** `input-server` takes up to eight devices
+  of any origin, and the compositor repeats a held key in software, so a USB keyboard, which
+  sends no typematic repeat, repeats as a PS/2 one does.
+- **What a raw input node is lives inside the PS/2 driver**: the ring, the parked read, the DPC's
+  hand-off and the reclaim. That hand-off was a use-after-free once (PR #178 review), so Part B
+  moves it into a shared `drivers::input` rather than copying it.
+- **Part A left a USB-keyboard-only machine with no keyboard.** Taking the controller from the
+  firmware ended its PS/2 emulation. The laptop's keyboard is a real i8042, so nothing has hit it,
+  but a desktop would have.
+- **Caps Lock and Num Lock do nothing, and the keypad types nothing.** The keymap was written in M3
+  Part C2 as the least a terminal needed, and the keypad was left out without a record. Keypad Enter
+  was patched into `libterm` alone (PR #191), so the code that checks for `KEY_ENTER` elsewhere
+  never sees it. Nothing drives a keyboard light.
+- **The compositor compares `modifiers` exactly** (`h.mods == modifiers`), so a lock carried as a
+  modifier bit would break every chord while Num Lock was on. `KeyEvent` has a spare `u16`.
+- **The hardware report counts only PS/2 key presses.** Part B counts every keyboard's, and
+  `check-report --usb` holds it.
+
+**Checked rather than assumed:**
+- **The spike.** The release image boots on `-machine i8042=off` with `usb-kbd` and `usb-mouse`:
+  - the FADT says the 8042 is absent;
+  - the PS/2 driver publishes nothing;
+  - both devices enumerate;
+  - `input-server` serves with no devices;
+  - the greeter comes up.
+
+  QEMU 8.2 takes `i8042=off` too.
+- **QEMU's HID model**, from its 8.2.2 source:
+  - an IN token with nothing to report is NAKed;
+  - `SET_PROTOCOL` and `SET_IDLE` are accepted;
+  - the mouse clamps each axis to ±127 and keeps the remainder, so `check-input`'s motion sum
+    stays exact;
+  - its fourth byte is the wheel whatever the protocol, and its report descriptor says so;
+  - more than six keys gives `ErrorRollOver`;
+  - both devices' endpoint 1 IN encodes to 8 ms at either speed.
+
+**The maintainer's calls**, after the first draft:
+- **the mouse wheel is in**, if not much more work: a mouse's report descriptor is read and the
+  mouse run in report protocol, with boot protocol as the fallback;
+- **Caps Lock's light is in**, and with it Caps Lock and Num Lock as locks and the keypad mapped,
+  since the laptop's keyboard has a numpad. Scroll Lock is dropped;
+- **two-finger scrolling on the trackpad is later**, with its native I²C-HID interface, of which
+  the report-descriptor parser is the first piece.
+
+**Calls made without the maintainer**, each in the plan:
+- every boot interface is bound, not only the first;
+- the input node is extracted from PS/2, not copied;
+- the served index is the next free one, so an i8042-less machine's first USB keyboard is
+  `input-0`;
+- the wheel comes from the descriptor, not a fourth byte, and a horizontal wheel and extra buttons
+  are found and not emitted, since nothing above the kernel carries them;
+- `SET_IDLE` to keyboards only;
+- the report counts USB key presses;
+- locks travel in `KeyEvent`'s spare field, not as modifier bits;
+- Num Lock is on at boot;
+- keypad Enter is delivered as Enter, and with Num Lock off the keypad's navigation keys as the
+  keys they stand for;
+- a light's toggle is gated on PS/2 only, through QEMU's `ps2_set_ledstate` trace, since QEMU
+  traces no USB keyboard's lights.
+
+**The gate set grows from 36 to 42:** `check-input --usb`, `check-login --usb` and
+`check-report --usb`, each under TCG and KVM. Each boots a machine with no i8042, so a key that
+arrives came through USB. The lock keys add steps to `check-terminal` and `check-input --usb`.
+
+No ABI hash impact: docs only. Part B's kernel work has none either: a driver, a table, records of
+existing kinds, and a write to a char node through the existing `IoOpcode::Write`.
+
+## 2026-10-05 — PR #357, reviewed: an acknowledgement inside an `E0` sequence
+
+No blocking findings; six worth fixing and four optional, all taken into the plan. The reviewer
+booted the live image on `i8042=off`, read QEMU 8.2.2's source, and probed today's decoder and
+interpreter with two throwaway host tests. Each finding below was checked against the code before
+it was taken.
+
+**Worth fixing:**
+- **The `0xED` exchange guarded against the wrong failure.** Today's decoder already turns `0xFA`
+  into silence between sequences. The hazard is an acknowledgement between an `E0` prefix and its
+  code: `E0 FA 48`, Up, decodes as keypad 8 pressed and never released, which with B.5's keypad
+  and Num Lock would repeat `8`. The plan now takes `0xFA` and `0xFE` ahead of the decoder's state
+  machine while a command is in flight, resends on `0xFE`, and puts `E0 FA 48` in the host test.
+- **A held Caps Lock would flip at the repeat rate on PS/2.** Typematic repeats arrive as presses
+  with no release between, and the interpreter tracks held keys for the eight modifiers only. A
+  lock key is now tracked as down until its release, and the test feeds press, press, release
+  rather than a `KEY_REPEAT` no driver sends.
+- **The hardware report holds no page without an i8042 keyboard.** It returns at
+  `ps2::keyboard_present`, which the reviewer saw on a boot ("not holding"). The plan said the
+  page would time out. B.2 now changes the check to "a keyboard node exists".
+- **The wheel's sign was stated backwards.** This system's `REL_WHEEL` is positive toward the
+  user, deliberately not Linux's, and HID's is positive away. So the USB decoder negates where PS/2
+  passes through, and the host test pins it.
+- **`SYN_DROPPED` after a halt recovery would lose held modifiers.** The interpreter forgets them,
+  and a key held across the recovery sends nothing new. A HID report is state, so the first report
+  after a recovery, decoded against the last before it, already delivers what changed. No
+  `SYN_DROPPED` is pushed, and a `SYN_DROPPED` from anywhere clears no lock.
+- **Five current-behaviour documents that Part B makes false** are added to its docs list:
+  `io-operation.md`, `device-node.md`, `console-and-tty.md`, `boot-flow.md` and
+  `qemu-integration-tests.md`.
+
+**Optional, taken:**
+- **What ends a binding**, now split. Configure Endpoint and `SET_CONFIGURATION` are the device's,
+  and a failure there ends the whole binding. The descriptor read, `SET_PROTOCOL`, `SET_IDLE` and
+  the first TRB are an interface's, so a receiver whose mouse refuses keeps its keyboard.
+- **A lights write to a departed node** completes at once with `PeerClosed`.
+- **A `SET_REPORT` that stalls** recovers the default endpoint. **One that times out** leaves the
+  device taking no more lights, with its keys still arriving.
+- **The interrupt endpoint's Max ESIT Payload and Average TRB Length** are named, to be checked
+  against the specification when built. QEMU reads neither, so only the laptop would show a wrong
+  one.
+- **The gates' light checks:**
+  - the USB data byte is pinned in the host tests, since QEMU accepts any byte and traces none;
+  - the PS/2 trace is matched after the kernel's own reset of the keyboard, since a boot with no
+    lights code already traces `ledstate 0`.
+- **Smaller fixes:**
+  - report protocol's stated reason;
+  - the host tests' crates;
+  - an `unverified` note that Num Lock on at boot may turn letters into digits on a laptop with an
+    embedded keypad overlay;
+  - the reviewer's finding that Limine's menu takes `usb-kbd` on `i8042=off`, which
+    `check-report --usb` depends on.
+
+Docs only; no ABI hash impact.
