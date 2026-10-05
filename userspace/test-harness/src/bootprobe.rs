@@ -2233,6 +2233,31 @@ fn registry_test(root_ns: u64) -> bool {
             return fail(b"the records are not the table in order");
         }
         let path = alloc::format!("/dev/registry/{}", r.id);
+        // **A departed device's paths answer `NotFound`** (Phase 6 Part C) — its id, and its served
+        // index on its own path — and nothing else about it is checked: the record is a history, not
+        // a device. `test-qemu`'s hot-plug leaves one or two in most boots.
+        if r.is_departed() {
+            let served = match r.kind() {
+                DeviceKind::Keyboard | DeviceKind::Mouse => Some(alloc::format!("/dev/input/raw/{}", r.served)),
+                k if k.is_block() => Some(alloc::format!("/dev/blk/{}", r.served)),
+                _ => None,
+            };
+            for p in core::iter::once(path.clone()).chain(served) {
+                let (st, h) = ns_lookup(root_ns, p.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
+                close(h);
+                if st != libkern::KError::NotFound.as_i32() {
+                    Line::new()
+                        .s(b"boot-probe: registry: departed ")
+                        .s(p.as_bytes())
+                        .s(b" answered ")
+                        .i(st as i64)
+                        .end();
+                    return fail(b"a departed device's path still resolves");
+                }
+            }
+            Line::new().s(b"boot-probe: registry: record ").u(r.id as u64).s(b" departed, its paths refused").end();
+            continue;
+        }
         let (st, node) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
         let kind_ok = st == 0 && stat(node).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
         close(node);

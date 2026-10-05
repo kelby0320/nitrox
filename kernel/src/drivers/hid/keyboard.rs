@@ -90,6 +90,14 @@ pub fn decode(
     Some(n)
 }
 
+/// **What a keyboard held, let go** (Phase 6 Part C): every key in `prev` released, then every
+/// modifier, then `SYN_REPORT` — `prev` decoded against an empty report, as if the keyboard had
+/// sent one. What its driver delivers when it departs, so that no key stays down and no repeat runs
+/// on. Nothing when nothing was held.
+pub fn release_all(prev: &[u8; REPORT_LEN], time_ns: u64, out: &mut [InputEvent; EVENTS_MAX]) -> usize {
+    decode(prev, &[0; REPORT_LEN], time_ns, out).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +233,22 @@ mod tests {
         assert_eq!(run(before, after).unwrap().len(), EVENTS_MAX, "six keys and eight modifiers released, six pressed, SYN");
         let mods_on = [0xFF, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(run(after, mods_on).unwrap().len(), 6 + 8 + 1);
+    }
+
+    /// **A departing keyboard lets go of everything** (Phase 6 Part C): its keys, then its
+    /// modifiers, then `SYN_REPORT`, so a key held when it is unplugged is released, Shift last, and
+    /// nothing at all when nothing was held.
+    #[test]
+    fn a_departing_keyboard_releases_its_keys_then_its_modifiers() {
+        let held = [0x02, 0, 0x04, 0x05, 0, 0, 0, 0]; // Left Shift, `a` and `b`
+        let mut out = [InputEvent::default(); EVENTS_MAX];
+        let n = release_all(&held, 5, &mut out);
+        let got: Vec<(u16, u16, i32)> = out[..n].iter().map(|e| (e.kind, e.code, e.value)).collect();
+        assert_eq!(
+            got,
+            // `a` is 30 and `b` 48, evdev's numbering.
+            vec![(EV_KEY, 30, KEY_RELEASE), (EV_KEY, 48, KEY_RELEASE), (EV_KEY, KEY_LEFTSHIFT, KEY_RELEASE), SYN]
+        );
+        assert_eq!(release_all(&NONE, 5, &mut out), 0, "nothing held, nothing sent");
     }
 }

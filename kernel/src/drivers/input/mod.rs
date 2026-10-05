@@ -65,6 +65,10 @@ pub enum ReadNow {
     Empty,
     /// Another read is already parked. One reader per device.
     Busy,
+    /// **The device has gone and its ring is drained** (Phase 6 Part C): the read is refused at
+    /// submission, `PeerClosed`, with no operation to wait on — so a reader cannot spin on reads that
+    /// each complete with an error.
+    Gone,
 }
 
 /// **One node's reader side**: its ring, the read parked on it, and a finished read owed to
@@ -75,19 +79,23 @@ pub struct Reader {
     parked: Option<ParkedRead>,
     /// A read the DPC has finished with, awaiting a thread-context drop.
     to_drop: Option<ParkedRead>,
+    /// The device has gone (Phase 6 Part C): what the ring holds is still read, and then nothing.
+    retired: bool,
 }
 
 impl Reader {
     /// An empty reader.
     pub const fn new() -> Reader {
-        Reader { ring: EventRing::new(), parked: None, to_drop: None }
+        Reader { ring: EventRing::new(), parked: None, to_drop: None, retired: false }
     }
 
     /// **A read arriving**: drain up to `out`'s length of whole records into it if the ring has
-    /// any, or say whether the caller may park.
+    /// any, or say whether the caller may park — never, once the device has gone.
     pub fn read_now(&mut self, out: &mut [u8], now_ns: u64) -> ReadNow {
         if !self.ring.is_empty() {
             ReadNow::Drained(self.ring.drain_into(out, now_ns))
+        } else if self.retired {
+            ReadNow::Gone
         } else if self.parked.is_some() {
             ReadNow::Busy
         } else {
@@ -134,6 +142,15 @@ impl Reader {
     pub fn take_owed(&mut self) -> Option<ParkedRead> {
         self.to_drop.take()
     }
+
+    /// **The device has gone** (Phase 6 Part C). What the ring holds is still read, and a read after
+    /// that is [`ReadNow::Gone`]. A read parked on an empty ring is handed back, for the caller to
+    /// [`refuse`] outside the lock; the caller takes a read the ring can answer with
+    /// [`take_ready`](Self::take_ready) first, so the releases a departure pushed reach it.
+    pub fn retire(&mut self) -> Option<ParkedRead> {
+        self.retired = true;
+        if self.ring.is_empty() { self.parked.take() } else { None }
+    }
 }
 
 impl Default for Reader {
@@ -159,6 +176,12 @@ pub fn deliver(read: &ParkedRead, bytes: &[u8]) {
     // for the duration.
     unsafe { copy_into_memobj(read.buffer.as_ptr(), read.buf_offset, bytes) };
     crate::sched::complete_pending_op(read.po.as_ptr(), 0, bytes.len() as u64);
+}
+
+/// **Complete a parked read with `err`** and no bytes: a read waiting on a device that has gone
+/// (Phase 6 Part C). No lock held.
+pub fn refuse(read: &ParkedRead, err: KError) {
+    crate::sched::complete_pending_op(read.po.as_ptr(), err as i32, 0);
 }
 
 /// Copy `bytes` into `buffer` at `buf_offset` and complete `po`: a read satisfied at once, from
@@ -257,6 +280,27 @@ mod tests {
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Busy, "a second reader while one is parked");
         r.ring.push(key(30));
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(INPUT_EVENT_LEN), "events are taken at once");
+    }
+
+    /// **A retired reader is read until its ring is empty, and then refuses** (Phase 6 Part C): the
+    /// releases a departure pushes still reach whoever reads next, and after them a read is `Gone`,
+    /// never parked. A read parked on an empty ring when the device goes is handed back to refuse.
+    #[test]
+    fn a_retired_reader_drains_then_refuses() {
+        init_global_heap();
+        let mut r = Reader::new();
+        let mut out = [0u8; DRAIN_MAX];
+        r.ring.push(key(30));
+        assert!(r.retire().is_none(), "nothing parked");
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(INPUT_EVENT_LEN), "its events still read");
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Gone);
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Gone, "and stays gone");
+
+        let mut parked = Reader::new();
+        parked.park(read(INPUT_EVENT_LEN));
+        assert!(parked.retire().is_some(), "a read waiting on an empty ring is handed back");
+        assert!(!parked.has_parked());
+        assert_eq!(parked.read_now(&mut out, 0), ReadNow::Gone);
     }
 
     /// **The DPC's half takes the parked read only when there is something for it**, drains no more

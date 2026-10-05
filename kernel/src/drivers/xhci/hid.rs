@@ -3,17 +3,18 @@
 //!
 //! `docs/planning/phase-6-usb.md` § *Part B in detail*. The hub thread binds during enumeration
 //! ([`bind`]); from then on the DPC owns the endpoint's polling ([`on_transfer`]), and the hub
-//! thread comes back only to reset an endpoint that halted ([`recover`]) or to take a departing
-//! device's endpoints away before its slot is disabled ([`unbind`]).
+//! thread comes back only to reset an endpoint that halted ([`recover`]) or to let a departing
+//! device's keyboards and mice go before its slot is disabled ([`depart`]).
 //!
 //! **What a report means is `drivers::hid`'s**: this module fetches reports and hands them over.
 //!
-//! **An input node is one of [`MAX_NODES`] statics**, its `CharBackend` context the index, as the
-//! PS/2 driver's two are: the node lives as long as the device table, which never drops one, and a
-//! static is what lives that long without leaking a box. An index is never reused — the served
-//! index above it is not either — until Part C retires nodes.
+//! **An input node's state is one of [`MAX_NODES`] static slots**, its `CharBackend` context the
+//! slot and the slot's epoch: a static is what lives as long as the device table, which never drops
+//! a node, without leaking a box. **A departed device's slot is given back** (Phase 6 Part C) once
+//! its node has retired, and its epoch bumped then, so a handle to the old node is refused rather
+//! than served the next device's ring. The served index above it is never reissued.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use super::context;
 use super::hub::{self, DeviceMem, Failed};
@@ -41,15 +42,53 @@ pub(super) const MAX_BOUND: usize = 16;
 /// A third halt in a device's life leaves its endpoint stopped.
 const HALTS_MAX: u8 = 3;
 
-/// **Each USB input node's reader side**, by node index: the node's `CharBackend` context.
+/// **Each USB input node's reader side**, by slot: the node's `CharBackend` context names the slot,
+/// with the slot's epoch.
 static NODES: [IrqSpinLock<Reader>; MAX_NODES] =
     [const { IrqSpinLock::new(LockRank::Leaf, Reader::new()) }; MAX_NODES];
 
-/// Which nodes are keyboards, one bit each: what the hardware report drains.
+/// Which slots hold keyboards, one bit each: what the hardware report drains.
 static KEYBOARDS: AtomicU32 = AtomicU32::new(0);
 
-/// The next node index never handed out.
-static NEXT_NODE: AtomicUsize = AtomicUsize::new(0);
+/// A slot no node has had.
+const FREE: u8 = 0;
+/// A slot whose node is bound to a device.
+const BOUND: u8 = 1;
+/// A slot whose device has departed (Phase 6 Part C): its node reads what its ring holds and then
+/// refuses, and the slot may be given to the next device.
+const RETIRED: u8 = 2;
+
+/// Each slot's state: [`FREE`], [`BOUND`] or [`RETIRED`]. Changed by the hub thread alone.
+static SLOTS: [AtomicU8; MAX_NODES] = [const { AtomicU8::new(FREE) }; MAX_NODES];
+
+/// **Each slot's epoch**, bumped when a retired slot is given to another device (Phase 6 Part C). A
+/// node carries the epoch it was made in, so a handle to a node retired from a slot since reused is
+/// refused `PeerClosed`, rather than served the next device's ring.
+static EPOCHS: [AtomicU32; MAX_NODES] = [const { AtomicU32::new(0) }; MAX_NODES];
+
+/// A node's `CharBackend` context: its slot, and the slot's epoch when the node was made.
+fn context(slot: usize, epoch: u32) -> *mut () {
+    ((epoch as usize) << 8 | slot) as *mut ()
+}
+
+/// The slot and the epoch a context names.
+fn slot_of(ctx: *mut ()) -> (usize, u32) {
+    let c = ctx as usize;
+    (c & 0xFF, (c >> 8) as u32)
+}
+
+/// **Whether a context's node is still its slot's**: its epoch the slot's now, so the slot has not
+/// been given to another device since it was made (Phase 6 Part C).
+fn current(ctx: *mut ()) -> bool {
+    let (index, epoch) = slot_of(ctx);
+    EPOCHS.get(index).is_some_and(|e| e.load(Ordering::Acquire) == epoch)
+}
+
+/// **The slot to give a new node**: one no node has had, else one whose device has departed — the
+/// first of either — or `None` when every slot is bound.
+fn choose(states: &[u8; MAX_NODES]) -> Option<usize> {
+    states.iter().position(|&s| s == FREE).or_else(|| states.iter().position(|&s| s == RETIRED))
+}
 
 /// What a bound endpoint's reports are.
 #[derive(Copy, Clone, Debug)]
@@ -61,7 +100,7 @@ pub(super) enum Decoder {
 }
 
 /// **An endpoint the DPC polls.** Its ring and report buffer are the device's memory, which the hub
-/// thread holds; this keeps where they are. [`unbind`] takes the entry out before that memory can
+/// thread holds; this keeps where they are. [`depart`] takes the entry out before that memory can
 /// go.
 pub(super) struct Bound {
     slot: u8,
@@ -381,21 +420,51 @@ fn interface_request(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) 
     }
 }
 
-/// **A node for a USB keyboard or mouse**, registered under `parent`: its index here, and the index
-/// `/dev/input/raw` serves it at. `None` when every node is taken or the table cannot hold it.
+/// **A node for a USB keyboard or mouse**, registered under `parent`: its slot here, and the index
+/// `/dev/input/raw` serves it at. `None` when every slot is bound or the table cannot hold it.
 fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32)> {
-    let index = NEXT_NODE.fetch_add(1, Ordering::Relaxed);
-    if index >= MAX_NODES {
-        return None;
-    }
-    let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut () };
-    let node = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok()?;
-    let node = crate::drivers::adopt(node, KObjectType::DeviceNode);
-    let served = crate::device::register_input(node, kind, parent, "usb-hid")?;
+    let index = take_slot()?;
+    let bit = 1u32 << index;
+    // Said before the node can be reached: the hardware report drains what this marks.
     if kind == DeviceKind::Keyboard {
-        KEYBOARDS.fetch_or(1 << index, Ordering::Relaxed);
+        KEYBOARDS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        KEYBOARDS.fetch_and(!bit, Ordering::Relaxed);
     }
-    Some((index, served))
+    LIGHTS_TAKEN.fetch_and(!bit, Ordering::Relaxed);
+    let ctx = context(index, EPOCHS[index].load(Ordering::Acquire));
+    let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx };
+    let served = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok().and_then(|node| {
+        let node = crate::drivers::adopt(node, KObjectType::DeviceNode);
+        crate::device::register_input(node, kind, parent, "usb-hid")
+    });
+    if served.is_none() {
+        // No node reached anyone: the slot is the next device's.
+        SLOTS[index].store(RETIRED, Ordering::Release);
+    }
+    Some((index, served?))
+}
+
+/// **Take a slot for a new node** (Phase 6 Part C): a free one, else a retired one, reset — its epoch
+/// first, so a stale handle's next read finds it changed under the node's lock, then its reader and
+/// any lights write still waiting on it. From the hub thread.
+fn take_slot() -> Option<usize> {
+    let states: [u8; MAX_NODES] = core::array::from_fn(|i| SLOTS[i].load(Ordering::Acquire));
+    let index = choose(&states)?;
+    if states[index] == RETIRED {
+        EPOCHS[index].fetch_add(1, Ordering::AcqRel);
+        reclaim_completed();
+        let old = core::mem::replace(&mut *NODES[index].lock(), Reader::new());
+        // Its references dropped here, with the lock let go.
+        drop(old);
+        let waiting = LIGHTS.lock()[index].take();
+        if let Some((po, _)) = waiting {
+            crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0);
+            drop(po);
+        }
+    }
+    SLOTS[index].store(BOUND, Ordering::Release);
+    Some(index)
 }
 
 /// Put `bound` in the table and queue its first TRB. Whether there was room.
@@ -540,7 +609,7 @@ pub(super) fn recover(x: &Xhci) {
             .and_then(|_| hub::command(x, Trb::set_dequeue(at, cycle, slot, dci)));
         let restarted = {
             let mut t = x.hid.lock();
-            // Gone meanwhile: its device departed, and `unbind` took it.
+            // Gone meanwhile: its device departed, and `depart` took it.
             let Some(b) = t.entries[i].as_mut().filter(|b| b.slot == slot && b.dci == dci) else {
                 continue;
             };
@@ -556,15 +625,74 @@ pub(super) fn recover(x: &Xhci) {
     }
 }
 
-/// **Take a departing device's endpoints out of the DPC's table**, before its slot is disabled and
-/// its memory freed: from here the DPC cannot touch a buffer that is about to go.
-pub(super) fn unbind(x: &Xhci, slot: u8) {
-    let mut t = x.hid.lock();
-    for e in t.entries.iter_mut() {
-        if e.as_ref().is_some_and(|b| b.slot == slot) {
-            *e = None;
+/// **A departing device's keyboards and mice, let go** (Phase 6 Part C), before its slot is
+/// disabled and its memory freed. In this order:
+/// 1. **what each holds is released**: a keyboard's last report decoded against an empty one, a
+///    mouse's held buttons from its decoder's state;
+/// 2. **its endpoints leave the DPC's table**, so the DPC cannot touch a buffer about to go;
+/// 3. **each node retires**: the releases reach a read waiting on it, or the next read; after them a
+///    read is refused, `PeerClosed`; a lights write still waiting is completed `PeerClosed`.
+///
+/// From the hub thread. The records depart after this, as one change.
+pub(super) fn depart(x: &Xhci, slot: u8) {
+    let now = crate::arch::Timer::read_ns();
+    // `bind` binds at most four interfaces a device.
+    let mut gone: [Option<(usize, [InputEvent; keyboard::EVENTS_MAX], usize)>; 4] = [const { None }; 4];
+    {
+        let mut t = x.hid.lock();
+        let mut k = 0;
+        for e in t.entries.iter_mut() {
+            let Some(b) = e.take_if(|b| b.slot == slot) else {
+                continue;
+            };
+            let mut events = [InputEvent::default(); keyboard::EVENTS_MAX];
+            let n = match &b.decoder {
+                Decoder::Keyboard { prev } => keyboard::release_all(prev, now, &mut events),
+                Decoder::Mouse { buttons, .. } => {
+                    let mut released = [InputEvent::default(); mouse::EVENTS_MAX];
+                    let n = mouse::release_all(*buttons, now, &mut released);
+                    events[..n].copy_from_slice(&released[..n]);
+                    n
+                }
+            };
+            if let Some(g) = gone.get_mut(k) {
+                *g = Some((b.node, events, n));
+                k += 1;
+            }
         }
     }
+    for (node, events, n) in gone.into_iter().flatten() {
+        retire(node, &events[..n], now);
+    }
+}
+
+/// **Retire slot `index`'s node**, its device gone: push `releases`, answer a waiting read with them,
+/// or refuse it if there are none, and complete a waiting lights write `PeerClosed`. Thread context,
+/// with no lock held: completing takes the scheduler's lock, and a drop may reach the allocator.
+fn retire(index: usize, releases: &[InputEvent], now: u64) {
+    let mut scratch = [0u8; DRAIN_MAX];
+    let (ready, refused) = {
+        let mut r = NODES[index].lock();
+        if !releases.is_empty() {
+            r.ring.push_group(releases);
+        }
+        let ready = r.take_ready(&mut scratch, now);
+        (ready, r.retire())
+    };
+    if let Some((read, n)) = ready {
+        input::deliver(&read, &scratch[..n]);
+        drop(read);
+    }
+    if let Some(read) = refused {
+        input::refuse(&read, KError::PeerClosed);
+        drop(read);
+    }
+    let waiting = LIGHTS.lock()[index].take();
+    if let Some((po, _)) = waiting {
+        crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0);
+        drop(po);
+    }
+    SLOTS[index].store(RETIRED, Ordering::Release);
 }
 
 /// [`CharBackend::submit_read`] for a USB input node, as PS/2's is.
@@ -576,7 +704,7 @@ fn submit_read(
     max_len: u64,
     ctx: *mut (),
 ) -> Result<(), KError> {
-    let index = ctx as usize;
+    let (index, _) = slot_of(ctx);
     if index >= MAX_NODES {
         return Err(KError::InvalidArgument);
     }
@@ -586,16 +714,23 @@ fn submit_read(
     let mut tmp = [0u8; DRAIN_MAX];
     let found = {
         let mut r = NODES[index].lock();
-        let found = r.read_now(&mut tmp[..max_len], now);
-        if found == ReadNow::Empty {
-            r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
+        // **Under the node's lock**, against which a reused slot's reset is ordered (Phase 6 Part C):
+        // a node from an earlier epoch reads none of the next device's ring.
+        if !current(ctx) {
+            ReadNow::Gone
+        } else {
+            let found = r.read_now(&mut tmp[..max_len], now);
+            if found == ReadNow::Empty {
+                r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
+            }
+            found
         }
-        found
     };
     match found {
         ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
         ReadNow::Empty => {}
         ReadNow::Busy => return Err(KError::WouldBlock),
+        ReadNow::Gone => return Err(KError::PeerClosed),
     }
     Ok(())
 }
@@ -614,8 +749,15 @@ static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// lights, `IoError`; one that comes while another waits replaces it, which is completed as done,
 /// its lights being older than the ones that will be set.
 fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
-    let index = ctx as usize;
-    if index >= MAX_NODES || KEYBOARDS.load(Ordering::Relaxed) & (1 << index) == 0 {
+    let (index, _) = slot_of(ctx);
+    if index >= MAX_NODES {
+        return Err(KError::Unsupported);
+    }
+    // A node from an earlier epoch is gone, whatever its slot holds now (Phase 6 Part C).
+    if !current(ctx) {
+        return Err(KError::PeerClosed);
+    }
+    if KEYBOARDS.load(Ordering::Relaxed) & (1 << index) == 0 {
         return Err(KError::Unsupported);
     }
     let lights = input::lights_from(buffer, buf_offset, len)?;
@@ -688,8 +830,10 @@ pub(super) const fn set_lights_request(interface: u8) -> [u8; 8] {
 /// Drop every read the DPC has finished with. **Thread context only**: from `sched::reap_pending`,
 /// and before a read parks.
 pub fn reclaim_completed() {
-    let used = NEXT_NODE.load(Ordering::Relaxed).min(MAX_NODES);
-    for node in NODES.iter().take(used) {
+    for (i, node) in NODES.iter().enumerate() {
+        if SLOTS[i].load(Ordering::Acquire) == FREE {
+            continue;
+        }
         let owed = node.lock().take_owed();
         drop(owed);
     }
@@ -739,5 +883,43 @@ mod tests {
         assert_eq!(w_value & 0xFF, 0, "no report ID: a boot keyboard has none");
         assert_eq!(u16::from_le_bytes([r[4], r[5]]), 3, "the interface");
         assert_eq!(u16::from_le_bytes([r[6], r[7]]), 1, "one byte");
+    }
+
+    /// **A new node takes a slot no node has had, then one whose device has departed** (Phase 6 Part
+    /// C), and none while every slot is bound: sixteen bound devices, not sixteen ever attached.
+    #[test]
+    fn a_new_node_takes_a_free_slot_then_a_retired_one() {
+        let mut states = [BOUND; MAX_NODES];
+        assert_eq!(choose(&states), None, "every slot bound");
+        states[5] = RETIRED;
+        assert_eq!(choose(&states), Some(5), "a departed device's slot");
+        states[9] = FREE;
+        assert_eq!(choose(&states), Some(9), "a free one first");
+        assert_eq!(choose(&[FREE; MAX_NODES]), Some(0));
+    }
+
+    /// **A context names its slot and the epoch it was made in** (Phase 6 Part C), so a node made
+    /// before its slot was reused is told apart from the one after: same slot, another epoch.
+    #[test]
+    fn a_context_carries_its_slot_and_epoch() {
+        assert_eq!(slot_of(context(7, 0)), (7, 0));
+        assert_eq!(slot_of(context(15, 3)), (15, 3));
+        let (old, new) = (context(4, 1), context(4, 2));
+        assert_ne!(old, new, "a reused slot's node is another");
+        assert_eq!(slot_of(old).0, slot_of(new).0);
+    }
+
+    /// **A node made before its slot was reused is no longer current** (Phase 6 Part C): what keeps a
+    /// stale handle from reading the next device's ring. No boot reaches it — a slot is reused only
+    /// once all sixteen have been bound — so this test is its guard. Slot 15 alone, which no other
+    /// test touches.
+    #[test]
+    fn a_node_from_before_its_slot_was_reused_is_not_current() {
+        let made = context(15, EPOCHS[15].load(Ordering::Acquire));
+        assert!(current(made));
+        EPOCHS[15].fetch_add(1, Ordering::AcqRel);
+        assert!(!current(made), "the slot was given to another device");
+        assert!(current(context(15, EPOCHS[15].load(Ordering::Acquire))), "the new node is");
+        assert!(!current(context(MAX_NODES + 1, 0)), "no such slot");
     }
 }

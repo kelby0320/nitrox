@@ -147,6 +147,25 @@ pub fn decode(
     Some((n, held))
 }
 
+/// **What a mouse held, let go** (Phase 6 Part C): a release for each button `buttons` holds —
+/// left, right, middle — then `SYN_REPORT`. What its driver delivers when it departs, ending a drag.
+/// **From the decoder's held state, not by decoding an empty report**, which for a layout with a
+/// report ID would carry no ID and decode to nothing. Nothing when no button was held.
+pub fn release_all(buttons: u8, time_ns: u64, out: &mut [InputEvent; EVENTS_MAX]) -> usize {
+    let mut n = 0;
+    for (i, code) in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE].into_iter().enumerate() {
+        if buttons & (1 << i) != 0 {
+            out[n] = InputEvent::key(code, KEY_RELEASE, time_ns);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        out[n] = InputEvent::syn(time_ns);
+        n += 1;
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +239,19 @@ mod tests {
         assert_eq!(x16.read(&[0, 0x00, 0x80]), Some(-32768));
         assert_eq!(Field { offset: 8, size: 16, signed: false }.read(&[0, 0x00, 0x80]), Some(32768));
         assert_eq!(x16.read(&[0, 0x00]), None, "past the report");
+    }
+
+    /// **A departing mouse lets go of its buttons** (Phase 6 Part C), from the held state, so it
+    /// works for a layout whose reports carry an ID — where an empty report, having no ID, decodes
+    /// to nothing at all. Nothing when no button was held.
+    #[test]
+    fn a_departing_mouse_releases_its_held_buttons_whatever_its_layout() {
+        let numbered = Layout { report_id: Some(2), ..Layout::BOOT };
+        assert_eq!(run(&numbered, 0b101, &[0, 0, 0, 0]), None, "an empty report is no report of this layout");
+        let mut out = [InputEvent::default(); EVENTS_MAX];
+        let n = release_all(0b101, 9, &mut out);
+        let got: Vec<(u16, u16, i32)> = out[..n].iter().map(|e| (e.kind, e.code, e.value)).collect();
+        assert_eq!(got, vec![(EV_KEY, BTN_LEFT, KEY_RELEASE), (EV_KEY, BTN_MIDDLE, KEY_RELEASE), SYN]);
+        assert_eq!(release_all(0, 9, &mut out), 0);
     }
 }

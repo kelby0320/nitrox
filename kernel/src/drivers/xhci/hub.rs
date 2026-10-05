@@ -98,6 +98,9 @@ impl core::fmt::Display for Failed {
 /// A device on a port: its slot, and the memory the controller reads and writes for it.
 struct Attached {
     slot: u8,
+    /// Its `UsbDevice` record's id, which departs with it (Phase 6 Part C); `None` when the table
+    /// could not take it.
+    record: Option<u32>,
     _mem: DeviceMem,
 }
 
@@ -222,9 +225,15 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     let Some(dev) = attached[port as usize].take() else {
         return;
     };
-    // **Its endpoints out of the DPC's table first**, so nothing touches a report buffer that the
-    // release below is about to free.
-    super::hid::unbind(x, dev.slot);
+    // **Its keyboards and mice let go first** (Phase 6 Part C): what they held released, their
+    // endpoints out of the DPC's table — so nothing touches a report buffer the release below is
+    // about to free — and their nodes retired.
+    super::hid::depart(x, dev.slot);
+    // **Then its records depart**, the device and its keyboards and mice as one change, and the
+    // device manager, waiting on `/dev/registry/changes`, is answered.
+    if let Some(id) = dev.record {
+        crate::device::depart(id);
+    }
     match release(x, dev.slot, dev._mem) {
         Released::Freed => crate::kprintln!("usb: port {port}: disconnected; slot {} disabled", dev.slot),
         Released::Kept(why) => {
@@ -295,7 +304,7 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
             let id = record(x, port, facts);
             // **Then its HID interfaces bound** (Phase 6 Part B.2), under the record just made.
             super::hid::bind(x, port, slot, speed_id, &mut mem, &config[..config_len], id);
-            Ok(Attached { slot, _mem: mem })
+            Ok(Attached { slot, record: id, _mem: mem })
         }
         Err((step, e)) => {
             crate::kprintln!("usb: port {port}: {step} failed: {e}");

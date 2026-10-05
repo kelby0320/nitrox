@@ -270,6 +270,8 @@ fn submit_read(
         ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
         ReadNow::Empty => {}
         ReadNow::Busy => return Err(KError::WouldBlock),
+        // The i8042's devices never depart.
+        ReadNow::Gone => return Err(KError::PeerClosed),
     }
     Ok(())
 }
