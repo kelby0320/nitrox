@@ -145,6 +145,10 @@ Since the desktop refresh's Part K it also holds the **shell-to-terminal** direc
 writes its working directory as `OSC 7`, `libterm` reads it and `nxterm` shows it beside the
 window's name — three crates whose host tests cannot see each other, so a boot is what makes them
 agree on the bytes.
+Since Phase 6 Part B.5 it holds the **locks and the keyboard's lights**: it types under Caps Lock
+and on the keypad with Num Lock on and off, and reads what the PS/2 keyboard's lights were set to
+from QEMU's own trace of them (`-trace ps2_set_ledstate`), exactly, step by step — the one place a
+gate learns a device's state from the emulator rather than from the guest.
 
 `cargo xtask check-login` is the **graphical login gate**, on the release image as
 `test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection

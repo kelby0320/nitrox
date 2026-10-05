@@ -269,7 +269,7 @@ pub fn init() {
     }
 
     // 2. Publish the console as a char DeviceNode (leaked `'static`).
-    let backend = CharBackend { submit_read, ctx: core::ptr::null_mut() };
+    let backend = CharBackend { submit_read, submit_write: None, ctx: core::ptr::null_mut() };
     match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
         Ok(node) => {
             // Leak the creation reference: the console lives for the kernel's

@@ -827,6 +827,26 @@ a USB one, as it would on Linux.
   keymap's keypad and Caps Lock; `Lights` and `input-server`'s fan-out; `submit_write`; PS/2's
   `0xED` exchange, its answers taken ahead of the decoder; USB's `SET_REPORT`; `libterm`'s special
   case removed.
+- **B.5 built 2026-10-05.** Calls on the way:
+  - **`check-terminal`'s Num Lock step is keypad 8, not keypad 4.** `tty-server`'s line discipline
+    recognises Left and drops it, so `xy`, Left, `z` shows `xyz` and the step could never pass.
+    Keypad 8 with Num Lock off is Up, which the discipline answers by recalling the line before —
+    something a digit could not do. The keypad step types `12 + 3` and keypad Enter, and the shell's
+    `15` is the proof the Enter was one; the Caps Lock step types a quote with Caps Lock on and a
+    shifted letter, so a Caps Lock that touched more than letters fails;
+  - **the trace is read exactly**, each step the whole sequence since the kernel's reset, which is
+    found by tracing `ps2_reset_keyboard` beside the lights. Num Lock's light is asserted **before
+    anything is injected**: the compositor also sends after every input pass whose locks changed,
+    so a compositor that skipped its first send passes the same check made after any typing;
+  - **the PS/2 exchange ends inside the driver's leaf lock, and is completed and logged outside
+    it** — completing takes the scheduler's lock and logging the serial port's, both ranked above
+    a leaf. The DPC marks a write *completing* while it does so, so thread context cannot drop it
+    first. Caught reading the code, before a boot ran it;
+  - `input-server`'s keyboard filter is one comparison in `main.rs`, not a host test: a mouse's
+    node refuses the write anyway, `Unsupported`. The request's parse is the lib's, tested;
+  - the `SET_REPORT`'s data byte is the node's, unchanged, since HID's order is the wire's — so
+    its tests are the lights' (`libinput`) and the node's (`drivers::input`), and the setup bytes
+    have their own.
 - **B.6 Docs.** Below.
 
 ### Gates

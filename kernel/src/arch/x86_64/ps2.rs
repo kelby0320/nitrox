@@ -162,6 +162,13 @@ fn write_data(byte: u8) -> bool {
     true
 }
 
+/// **Send `byte` to the keyboard** (Phase 6 Part B.5): a device command or its operand, whose answer
+/// arrives through [`read_byte`] as a [`Port::Keyboard`] byte. `false` if the controller did not take
+/// it within the bound. From the driver's lock, in thread context or its interrupt.
+pub fn send_keyboard(byte: u8) -> bool {
+    write_data(byte)
+}
+
 /// Read [`DATA`], waiting for a byte. `None` on timeout.
 fn read_data() -> Option<u8> {
     if !wait_readable() {

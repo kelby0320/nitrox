@@ -1599,7 +1599,7 @@ impl App {
                 libkern::abi::KEY_UP => self.step_selection(-1),
                 _ => {
                     if let Some(f) = self.search.as_mut() {
-                        f.apply(k.keycode, k.modifiers);
+                        f.apply(k.keycode, k.modifiers, k.locks);
                     }
                 }
             }
@@ -1615,7 +1615,7 @@ impl App {
                 libkern::abi::KEY_ENTER => self.update(Msg::LocationGo),
                 code => {
                     if let Some(f) = self.location.as_mut() {
-                        f.apply(code, k.modifiers);
+                        f.apply(code, k.modifiers, k.locks);
                     }
                 }
             }
@@ -1634,7 +1634,7 @@ impl App {
                 libkern::abi::KEY_ENTER => self.confirm_prompt(),
                 code => {
                     if let Some((_, _, f)) = self.prompt.as_mut() {
-                        f.apply(code, k.modifiers);
+                        f.apply(code, k.modifiers, k.locks);
                     }
                 }
             }

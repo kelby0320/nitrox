@@ -488,7 +488,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 }
                 if k.keycode == KEY_ENTER {
                     submit = true;
-                } else if greeter.key(k.keycode, k.modifiers) {
+                } else if greeter.key(k.keycode, k.modifiers, k.locks) {
                     dirty = true;
                 }
             }

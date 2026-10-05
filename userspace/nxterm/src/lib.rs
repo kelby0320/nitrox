@@ -1103,7 +1103,7 @@ impl App {
                 libkern::abi::KEY_ENTER => self.find_next(),
                 code => {
                     if let Some(f) = self.find.as_mut() {
-                        f.apply(code, k.modifiers);
+                        f.apply(code, k.modifiers, k.locks);
                     }
                 }
             }
@@ -1119,7 +1119,7 @@ impl App {
             self.tab_mut().view_moved = true;
         }
         let mut out = [0u8; libterm::encode::MAX_ENCODED];
-        let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
+        let n = libterm::encode::encode(k.keycode, k.modifiers, k.locks, &mut out);
         self.send(&out[..n]);
     }
 

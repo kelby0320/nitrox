@@ -196,6 +196,27 @@ unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
     }
 }
 
+/// **The lights a write to a keyboard's node carries** (Phase 6 Part B.5): exactly one byte at
+/// `buf_offset` in `buffer`, of `LIGHT_NUM`, `LIGHT_CAPS` and `LIGHT_SCROLL` alone. The byte, or
+/// `InvalidArgument` for another length or another bit. Thread context, from `sys_io_submit`.
+pub fn lights_from(buffer: &ObjectRef, buf_offset: u64, len: u64) -> Result<u8, KError> {
+    use crate::libkern::input::{LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL};
+    if len != 1 {
+        return Err(KError::InvalidArgument);
+    }
+    // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
+    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+    let (page, intra) = (buf_offset as usize / PAGE_SIZE, buf_offset as usize % PAGE_SIZE);
+    let frame = *mo.frames().get(page).ok_or(KError::InvalidArgument)?;
+    // SAFETY: within an owned, HHDM-mapped frame of the buffer (bounds checked by `sys_io_submit`
+    // and by `get` above).
+    let byte = unsafe { *((frame.as_u64() + heap::hhdm_offset()) as *const u8).add(intra) };
+    if byte as u16 & !(LIGHT_NUM | LIGHT_CAPS | LIGHT_SCROLL) != 0 {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(byte)
+}
+
 /// Key presses decoded since boot, by every keyboard.
 static KEY_PRESSES: AtomicU64 = AtomicU64::new(0);
 
@@ -288,6 +309,22 @@ mod tests {
         assert!(r.take_owed().is_none(), "once");
         drop(owed);
         assert_eq!(test_probe::pending_op_destroys(), 1, "dropped by the reclaimer");
+    }
+
+    /// **A lights write is one byte of the three lights** (Phase 6 Part B.5): another length or
+    /// another bit is refused, before any driver sees it.
+    #[test]
+    fn a_lights_write_is_one_byte_of_three_bits() {
+        init_global_heap();
+        let mo = MemoryObject::try_new_filled(&[0x02, 0x08, 0x07]).unwrap();
+        let buf = adopt(mo, KObjectType::MemoryObject);
+        assert_eq!(lights_from(&buf, 0, 1), Ok(0x02), "Caps Lock");
+        assert_eq!(lights_from(&buf, 2, 1), Ok(0x07), "all three");
+        assert_eq!(lights_from(&buf, 1, 1), Err(KError::InvalidArgument), "bit 3 is no light");
+        assert_eq!(lights_from(&buf, 0, 2), Err(KError::InvalidArgument), "two bytes");
+        // **Held for the function's sake**: `sys_io_submit` answers a zero-length request itself,
+        // before any driver, so no write reaches this with none (PR #359 review).
+        assert_eq!(lights_from(&buf, 0, 0), Err(KError::InvalidArgument), "none");
     }
 
     /// **A read takes whole records**: floored to the record and to the scratch, and refused below

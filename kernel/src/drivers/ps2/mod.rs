@@ -22,6 +22,7 @@
 //! node's ring, the read parked on it and its hand-off to thread context are
 //! [`crate::drivers::input`]'s, shared with USB HID since Phase 6 Part B.1.
 
+pub mod lights;
 pub mod mouse;
 pub mod scancode;
 
@@ -58,6 +59,46 @@ struct Inner {
     devices: [Reader; DEV_COUNT],
     keys: scancode::Decoder,
     mouse: mouse::Decoder,
+    /// **The lights exchange in flight** (Phase 6 Part B.5), and the write it serves.
+    lights: Option<lights::Exchange>,
+    lights_po: Option<ObjectRef>,
+    /// The latest write that came while one was in flight: started when that one ends.
+    lights_next: Option<(ObjectRef, u8)>,
+    /// Finished writes and their status, for the DPC to complete and thread context to drop, as a
+    /// read's are. A write whose slot is not yet free waits in `lights_po` with its status here.
+    lights_done: [Option<LightsDone>; 4],
+    lights_unreported: Option<i32>,
+    /// What the DPC is to log about the exchange that ended, outside this lock: the serial port's
+    /// lock ranks above it.
+    lights_say: Option<Say>,
+}
+
+/// A finished lights write: its operation, its status, and how far the DPC has got with it.
+struct LightsDone {
+    po: ObjectRef,
+    status: i32,
+    state: Completion,
+}
+
+/// How far a finished lights write has got.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Completion {
+    /// Waiting for the DPC.
+    Waiting,
+    /// The DPC took it and is completing it **outside this lock** — completing takes the
+    /// scheduler's, which ranks above it — so thread context must not drop it yet.
+    Completing,
+    /// Completed: thread context drops it.
+    Completed,
+}
+
+/// What the log says about an exchange.
+#[derive(Copy, Clone)]
+enum Say {
+    /// The keyboard took its lights, for the first time.
+    Acknowledged,
+    /// The keyboard did not take them.
+    Refused(lights::Failure),
 }
 
 impl Inner {
@@ -66,9 +107,98 @@ impl Inner {
             devices: [Reader::new(), Reader::new()],
             keys: scancode::Decoder::new(),
             mouse: mouse::Decoder::new(),
+            lights: None,
+            lights_po: None,
+            lights_next: None,
+            lights_done: [const { None }; 4],
+            lights_unreported: None,
+            lights_say: None,
+        }
+    }
+
+    /// **A byte from the keyboard port**: the lights exchange's answer while one is in flight —
+    /// taken here, *ahead of* the decoder, so an answer between an `E0` prefix and its code cannot
+    /// become a key (PR #357 review) — or what the decoder makes of it.
+    fn keyboard_byte(&mut self, byte: u8, now: u64) -> KeyboardByte {
+        if let Some(x) = self.lights.as_mut()
+            && let Some(action) = x.on_byte(byte, now)
+        {
+            return KeyboardByte::Answer(action);
+        }
+        KeyboardByte::Key(self.keys.feed(byte))
+    }
+
+    /// **Act on the exchange's `action`**: send what it says, or end it — reporting the write, and
+    /// starting the one that waited. Whether a write is now there for the DPC to complete.
+    fn lights_action(&mut self, action: lights::Action, now: u64) -> bool {
+        match action {
+            lights::Action::Send(byte) => {
+                if crate::arch::ps2::send_keyboard(byte) {
+                    return false;
+                }
+                self.lights_end(Err(KError::IoError), now)
+            }
+            lights::Action::Done(Ok(())) => self.lights_end(Ok(()), now),
+            lights::Action::Done(Err(why)) => {
+                self.lights_say = Some(Say::Refused(why));
+                self.lights_end(Err(KError::TimedOut), now)
+            }
+        }
+    }
+
+    /// End the exchange in flight with `result`, and start the next write if one waited.
+    fn lights_end(&mut self, result: Result<(), KError>, now: u64) -> bool {
+        self.lights = None;
+        LIGHTS_IN_FLIGHT.store(false, Ordering::Release);
+        if result.is_ok() && !LIGHTS_TAKEN.swap(true, Ordering::Relaxed) {
+            self.lights_say = Some(Say::Acknowledged);
+        }
+        self.lights_unreported = Some(result.err().map_or(0, |e| e as i32));
+        self.report_lights();
+        if self.lights_unreported.is_none()
+            && let Some((po, lights)) = self.lights_next.take()
+        {
+            self.lights_start(po, lights, now);
+        }
+        true
+    }
+
+    /// Move a finished write into a free slot for the DPC.
+    fn report_lights(&mut self) {
+        let Some(status) = self.lights_unreported else { return };
+        let Some(slot) = self.lights_done.iter_mut().find(|d| d.is_none()) else { return };
+        if let Some(po) = self.lights_po.take() {
+            *slot = Some(LightsDone { po, status, state: Completion::Waiting });
+        }
+        self.lights_unreported = None;
+    }
+
+    /// Begin an exchange for `po` with `lights`. A keyboard the controller would not send to ends it
+    /// at once, failed.
+    fn lights_start(&mut self, po: ObjectRef, lights: u8, now: u64) {
+        let (exchange, first) = lights::Exchange::start(lights, now);
+        self.lights_po = Some(po);
+        if crate::arch::ps2::send_keyboard(first) {
+            self.lights = Some(exchange);
+            LIGHTS_IN_FLIGHT.store(true, Ordering::Release);
+        } else {
+            self.lights_end(Err(KError::IoError), now);
         }
     }
 }
+
+/// What a byte from the keyboard port was.
+enum KeyboardByte {
+    /// The lights exchange's answer.
+    Answer(lights::Action),
+    /// What the scancode decoder made of it.
+    Key(scancode::Decoded),
+}
+
+/// An exchange is in flight: what the tick checks before taking the lock for its bound.
+static LIGHTS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// The keyboard took lights once: what the log says, the first time.
+static LIGHTS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 static PS2: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
 
@@ -156,6 +286,38 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
             PS2.lock().devices[index].owe(read);
         }
     }
+    // **Finished lights writes**, completed here and dropped in thread context, as reads are: the
+    // operation is completed by pointer, and the reference stays in its slot until reclaimed.
+    // **Taken under the lock and completed outside it**, as a read is delivered: completing takes
+    // the scheduler's lock, which ranks above this leaf. The slot says `Completing` meanwhile, so
+    // thread context cannot drop the operation before it is completed.
+    let mut taken: [Option<(usize, *mut (), i32)>; 4] = [None; 4];
+    let say = {
+        let mut g = PS2.lock();
+        for (i, d) in g.lights_done.iter_mut().enumerate() {
+            if let Some(d) = d.as_mut().filter(|d| d.state == Completion::Waiting) {
+                d.state = Completion::Completing;
+                taken[i] = Some((i, d.po.as_ptr(), d.status));
+            }
+        }
+        g.lights_say.take()
+    };
+    for &(_, po, status) in taken.iter().flatten() {
+        crate::sched::complete_pending_op(po, status, (status == 0) as u64);
+    }
+    if taken.iter().any(Option::is_some) {
+        let mut g = PS2.lock();
+        for &(i, _, _) in taken.iter().flatten() {
+            if let Some(d) = g.lights_done[i].as_mut() {
+                d.state = Completion::Completed;
+            }
+        }
+    }
+    match say {
+        Some(Say::Acknowledged) => crate::kprintln!("ps2: keyboard lights acknowledged"),
+        Some(Say::Refused(why)) => crate::kprintln!("ps2: the keyboard did not take its lights ({:?})", why),
+        None => {}
+    }
 }
 
 /// Drop any read the DPC has finished with. **Thread context only.**
@@ -172,6 +334,59 @@ pub fn reclaim_completed() {
         let owed = PS2.lock().devices[index].take_owed();
         drop(owed);
     }
+    // And the lights writes the DPC completed; then a write that waited for a slot, and the
+    // write that waited behind it.
+    let mut done: [Option<LightsDone>; 4] = [const { None }; 4];
+    let started = {
+        let mut g = PS2.lock();
+        for (slot, out) in g.lights_done.iter_mut().zip(done.iter_mut()) {
+            if slot.as_ref().is_some_and(|d| d.state == Completion::Completed) {
+                *out = slot.take();
+            }
+        }
+        let waited = g.lights_unreported.is_some();
+        g.report_lights();
+        if waited && g.lights_unreported.is_none() && g.lights.is_none()
+            && let Some((po, lights)) = g.lights_next.take()
+        {
+            let now = crate::arch::Timer::read_ns();
+            g.lights_start(po, lights, now);
+        }
+        waited
+    };
+    drop(done);
+    if started {
+        crate::dpc::enqueue(&PS2_DPC);
+    }
+}
+
+/// [`CharBackend::submit_write`] for the keyboard's node: **its lights** (Phase 6 Part B.5), one
+/// byte in HID's order. Completed when the keyboard has acknowledged them, or failed. A write that
+/// comes while another is in flight waits for it, and replaces one already waiting, which is then
+/// completed as done: the lights it would have set are older than the ones that will be.
+fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
+    if ctx as usize != DEV_KEYBOARD {
+        return Err(KError::Unsupported);
+    }
+    let lights = input::lights_from(buffer, buf_offset, len)?;
+    reclaim_completed();
+    let now = crate::arch::Timer::read_ns();
+    let superseded = {
+        let mut g = PS2.lock();
+        if g.lights.is_none() && g.lights_po.is_none() {
+            g.lights_start(po.clone(), lights, now);
+            None
+        } else {
+            g.lights_next.replace((po.clone(), lights))
+        }
+    };
+    if let Some((old, _)) = superseded {
+        crate::sched::complete_pending_op(old.as_ptr(), 0, 1);
+        drop(old);
+    }
+    // A start that failed at once has a write for the DPC to complete.
+    crate::dpc::enqueue(&PS2_DPC);
+    Ok(())
 }
 
 /// The key the `fbcon-gate` feature panics on: F10, the tenth of the consecutive function keys.
@@ -201,6 +416,7 @@ fn drain_controller() -> bool {
     // stays full forever. That sentence cost three investigations; the tick-driven sweep is
     // what actually recovers the byte.
     let mut budget = MAX_DRAIN_PER_IRQ;
+    let mut lights_finished = false;
     // A `ps2-hold-gate` hold reads nothing at all, so everything injected meanwhile queues in
     // the host's device — the condition that gate exists to build.
     while budget > 0
@@ -210,7 +426,14 @@ fn drain_controller() -> bool {
         budget -= 1;
         match port {
             Port::Keyboard => {
-                if let scancode::Decoded::Key { code, pressed } = g.keys.feed(byte) {
+                let decoded = match g.keyboard_byte(byte, now) {
+                    KeyboardByte::Answer(action) => {
+                        lights_finished |= g.lights_action(action, now);
+                        continue;
+                    }
+                    KeyboardByte::Key(d) => d,
+                };
+                if let scancode::Decoded::Key { code, pressed } = decoded {
                     #[cfg(feature = "fbcon-gate")]
                     if pressed && code == CRASH_KEY {
                         // **With this leaf lock held, deliberately**: a driver that panics
@@ -251,7 +474,7 @@ fn drain_controller() -> bool {
             }
         }
     }
-    g.devices.iter().any(|d| d.has_parked())
+    lights_finished || g.devices.iter().any(|d| d.has_parked())
 }
 
 /// Collect anything the interrupt path missed. Called from the timer IRQ dispatcher, ahead of
@@ -284,6 +507,21 @@ pub fn poll() {
     // "reports both absent and the boot continues"; this is what keeps that true.
     if !PRESENT.load(Ordering::Acquire) {
         return;
+    }
+    // **A lights exchange the keyboard has not answered** fails on the tick after its bound.
+    if LIGHTS_IN_FLIGHT.load(Ordering::Acquire) {
+        let now = crate::arch::Timer::read_ns();
+        // The DPC is queued after the lock is let go: its queue's lock is a leaf too.
+        let ended = {
+            let mut g = PS2.lock();
+            match g.lights.as_ref().and_then(|x| x.on_tick(now)) {
+                Some(action) => g.lights_action(action, now),
+                None => false,
+            }
+        };
+        if ended {
+            crate::dpc::enqueue(&PS2_DPC);
+        }
     }
     if !crate::arch::ps2::output_pending() {
         return;
@@ -360,7 +598,7 @@ pub fn init() {
         if !present {
             continue;
         }
-        let backend = CharBackend { submit_read, ctx: index as *mut () };
+        let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut () };
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
                 // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through:
@@ -404,4 +642,46 @@ pub fn init() {
         kbd_vec,
         aux_vec
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::libkern::input::{KEY_UP, LIGHT_CAPS};
+
+    fn decoded(b: KeyboardByte) -> Option<scancode::Decoded> {
+        match b {
+            KeyboardByte::Key(d) => Some(d),
+            KeyboardByte::Answer(_) => None,
+        }
+    }
+
+    /// **An acknowledgement between an `E0` prefix and its code is the exchange's, not a key**
+    /// (Phase 6 Part B.5; PR #357 review). Taken by the decoder, `E0 FA 48` — Up with an answer in
+    /// the middle — is keypad 8 pressed and never released, which is what the second half shows
+    /// the decoder alone still does.
+    #[test]
+    fn an_answer_between_e0_and_its_code_is_the_exchanges() {
+        let mut g = Inner::new();
+        g.lights = Some(lights::Exchange::start(LIGHT_CAPS as u8, 0).0);
+        assert_eq!(decoded(g.keyboard_byte(0xE0, 1)), Some(scancode::Decoded::Consumed), "the prefix");
+        assert!(
+            matches!(g.keyboard_byte(lights::ACK, 1), KeyboardByte::Answer(lights::Action::Send(0b100))),
+            "the answer, sending the mask"
+        );
+        assert_eq!(
+            decoded(g.keyboard_byte(0x48, 1)),
+            Some(scancode::Decoded::Key { code: KEY_UP, pressed: true }),
+            "Up, as it was pressed"
+        );
+
+        let mut alone = Inner::new();
+        alone.keyboard_byte(0xE0, 1);
+        alone.keyboard_byte(lights::ACK, 1);
+        assert_eq!(
+            decoded(alone.keyboard_byte(0x48, 1)),
+            Some(scancode::Decoded::Key { code: 72, pressed: true }),
+            "with no exchange in flight the decoder sees the answer, and Up becomes keypad 8"
+        );
+    }
 }

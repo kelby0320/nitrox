@@ -7,7 +7,7 @@
 //!
 //! ## It delegates rather than reimplements
 //!
-//! `libinput::keymap::to_char` already maps a keycode and modifiers to a byte, **including the
+//! `libinput::keymap::text` already maps a keycode, modifiers and locks to a byte, **including the
 //! control fold** — `Ctrl-C` is `0x03` there, and its doc says why. What it cannot express is a
 //! key whose encoding is a *sequence* rather than a character, which is every cursor and
 //! editing key. So this adds those, plus two overrides where a terminal disagrees with a plain
@@ -27,8 +27,8 @@
 
 use libinput::keymap;
 use libkern::abi::{
-    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_INSERT,
-    KEY_KPENTER, KEY_LEFT, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_UP,
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_INSERT, KEY_LEFT,
+    KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_UP,
 };
 use librsproto::surface::MOD_ALT;
 
@@ -60,12 +60,10 @@ const fn sequence(keycode: u16) -> Option<&'static [u8]> {
         KEY_PAGEDOWN => b"\x1b[6~",
         // Not a sequence, but not what the keymap says either — see the module docs.
         //
-        // **The keypad's Enter is the same key.** The PS/2 driver emits `KEY_KPENTER` for it
-        // and `libinput`'s table has no entry, so it encoded to nothing at all: on a full-size
-        // keyboard, finishing a command on the keypad did nothing and said nothing (PR #191
-        // review, finding 4). The rest of the keypad is a gap in `libinput`'s table rather than
-        // this encoder's, and is left there.
-        KEY_ENTER | KEY_KPENTER => b"\r",
+        // **The keypad's Enter arrives as this key.** `libinput` delivers it as `KEY_ENTER`, to
+        // every client (Phase 6 Part B.5). It once arrived as `KEY_KPENTER` and was special-cased
+        // here alone (PR #191 review, finding 4), so it was Enter in a terminal and nowhere else.
+        KEY_ENTER => b"\r",
         KEY_BACKSPACE => b"\x7f",
         KEY_ESC => b"\x1b",
         _ => return None,
@@ -86,7 +84,7 @@ const fn sequence(keycode: u16) -> Option<&'static [u8]> {
 /// xterm encodes them as `ESC [ 1 ; 5 D`, which is additive: nothing in this system reads
 /// them, and inventing a form no consumer parses would be a guess. See the plan for the one
 /// consequence that is not merely missing — `Shift-Enter`.
-pub fn encode(keycode: u16, modifiers: u16, out: &mut [u8]) -> usize {
+pub fn encode(keycode: u16, modifiers: u16, locks: u16, out: &mut [u8]) -> usize {
     let alt = modifiers & MOD_ALT != 0;
     let mut n = 0;
 
@@ -107,7 +105,9 @@ pub fn encode(keycode: u16, modifiers: u16, out: &mut [u8]) -> usize {
         return n + seq.len();
     }
 
-    let Some(b) = keymap::to_char(keycode, modifiers) else {
+    // **The locks as the key carried them** (Phase 6 Part B.5): Caps Lock's case, and the keypad's
+    // digits under Num Lock.
+    let Some(b) = keymap::text(keycode, modifiers, locks) else {
         return 0;
     };
     if alt {
@@ -121,13 +121,13 @@ pub fn encode(keycode: u16, modifiers: u16, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libkern::abi::{KEY_KPENTER, KEY_LEFTSHIFT, KEY_SPACE, KEY_TAB};
-    use librsproto::surface::{MOD_CTRL, MOD_SHIFT};
+    use libkern::abi::{KEY_LEFTSHIFT, KEY_SPACE, KEY_TAB};
+    use librsproto::surface::{LOCK_CAPS, LOCK_NUM, MOD_CTRL, MOD_SHIFT};
 
     /// Encode and return the bytes.
     fn enc(keycode: u16, modifiers: u16) -> alloc::vec::Vec<u8> {
         let mut out = [0u8; MAX_ENCODED];
-        let n = encode(keycode, modifiers, &mut out);
+        let n = encode(keycode, modifiers, 0, &mut out);
         out[..n].into()
     }
 
@@ -223,14 +223,20 @@ mod tests {
         assert_eq!(enc(KEY_BACKSPACE, MOD_ALT), alloc::vec![0x1b, 0x7f]);
     }
 
+    /// **The locks a key carries** (Phase 6 Part B.5): Caps Lock's case, Shift reversing it, and the
+    /// keypad's digits under Num Lock. Keypad Enter is not here: `libinput` delivers it as Enter.
     #[test]
-    fn the_keypad_enter_is_the_same_key_as_the_main_one() {
-        // The PS/2 driver emits `KEY_KPENTER` and `libinput`'s table has no entry, so this
-        // encoded to nothing: on a full-size keyboard, finishing a command on the keypad did
-        // nothing and gave no sign the key existed.
-        assert_eq!(keymap::to_char(KEY_KPENTER, 0), None, "the keymap grew a keypad enter");
-        assert_eq!(enc(KEY_KPENTER, 0), alloc::vec![b'\r']);
-        assert_eq!(enc(KEY_KPENTER, 0), enc(KEY_ENTER, 0));
+    fn a_keys_locks_reach_its_bytes() {
+        let mut out = [0u8; MAX_ENCODED];
+        let mut e = |code: u16, mods: u16, locks: u16| {
+            let n = encode(code, mods, locks, &mut out);
+            out[..n].to_vec()
+        };
+        assert_eq!(e(30, 0, LOCK_CAPS), alloc::vec![b'A']);
+        assert_eq!(e(30, MOD_SHIFT, LOCK_CAPS), alloc::vec![b'a']);
+        assert_eq!(e(79, 0, LOCK_NUM), alloc::vec![b'1'], "keypad 1");
+        assert_eq!(e(79, 0, 0), alloc::vec![], "keypad 1 with Num Lock off reaches here as End");
+        assert_eq!(e(78, MOD_ALT, 0), alloc::vec![0x1b, b'+'], "a keypad operator, Alt-prefixed");
     }
 
     #[test]
@@ -241,7 +247,7 @@ mod tests {
         for code in 0u16..=0xFF {
             for mods in [0, MOD_ALT, MOD_SHIFT, MOD_CTRL, MOD_ALT | MOD_CTRL | MOD_SHIFT] {
                 let mut out = [0u8; MAX_ENCODED];
-                let n = encode(code, mods, &mut out);
+                let n = encode(code, mods, 0, &mut out);
                 assert!(n <= MAX_ENCODED, "keycode {code} mods {mods:#x} wrote {n} bytes");
             }
         }

@@ -5,7 +5,8 @@ loss reworked so relative motion survives a slow consumer (2026-08-26), a key-pr
 hardware report (Phase 5 Part D, 2026-09-14), input routed only after the requests sent before
 it (2026-09-22), the input server's devices handed over by the device manager (administration
 Part B.3, 2026-09-24), each node's ring and read hand-off shared in `drivers::input` (Phase 6 Part
-B.1, 2026-10-05), and USB keyboards and mice beside the i8042's (Phase 6 Parts B.2–B.4,
+B.1, 2026-10-05), USB keyboards and mice beside the i8042's (Phase 6 Parts B.2–B.4,
+2026-10-05), and Caps Lock, Num Lock, the keypad and the keyboards' lights (Phase 6 Part B.5,
 2026-10-05) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
@@ -18,8 +19,9 @@ arriving in a widget runs on every boot:
 | Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
 | Each keyboard and mouse handed to the input server | `userspace/device-mgr/` |
 | The merged stream at `/dev/input/new` | `userspace/input-server/` |
-| Device stream → logical events, and the keymap | `userspace/libinput/` |
+| Device stream → logical events, the locks, and the keymap | `userspace/libinput/` |
 | Focus, hit-testing, implicit grab, key repeat | `userspace/compositor/src/input.rs` |
+| The keyboards' lights: the compositor's locks, written to each keyboard's node (§4c) | `userspace/compositor/`, `userspace/input-server/`, `kernel/src/drivers/ps2/lights.rs`, `kernel/src/drivers/xhci/hub.rs` |
 | Delivery to a widget | `userspace/libui/src/route.rs` |
 
 `cargo xtask check-input` injects a keystroke, a click and a **wheel** over QMP and asserts each
@@ -28,10 +30,13 @@ M14 Part I, 2026-09-09: the mouse is asked at bring-up whether it has one — th
 knock — and answers by sending four-byte packets from then on.) `cargo xtask check-login` adds the
 property that paced injection cannot test: a burst of motion delivered *while* the compositor is
 recomposing the whole screen must still put the cursor exactly where the arithmetic says (§7).
+`cargo xtask check-terminal` types under Caps Lock and on the keypad, with Num Lock on and off, and
+reads the PS/2 keyboard's lights back from QEMU's trace of them; `check-input --usb` asserts a USB
+keyboard acknowledged its lights (§4c).
 
-**What is specified here and not built:** USB HID (§1 — the seams are placed for it and
-nothing is written), and anything above one keyboard and one mouse — touchpads, gestures,
-absolute-coordinate devices. `SYN_DROPPED` is produced by the driver and honoured by
+**What is specified here and not built:** touchpads, gestures and absolute-coordinate devices; and
+a USB keyboard or mouse plugged in after the device manager's one read of the registry reaching
+the input server, which is Phase 6 Part C. `SYN_DROPPED` is produced by the driver and honoured by
 `libinput`, but the Surface protocol has **no loss marker**, so a client is not told when the
 *compositor's* outbox overflows (§5, and `../rationale/deferred-decisions.md`).
 
@@ -253,6 +258,8 @@ wire break.
 | Merging device streams; taking devices as they arrive and depart; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
 | Keycode + modifiers → text (layouts, dead keys, compose) | `libinput` | Policy and data; a layout must not be a rebuild of anything |
+| Caps Lock and Num Lock; the keypad as digits or as the keys under them | `libinput`'s interpreter | Lock state is modifier state's sibling, and the interpreter is where that is kept (§4c) |
+| Setting a keyboard's lights | the compositor says, `input-server` writes each keyboard's node, the driver speaks its protocol | Each holds one piece: the locks, the keyboards, the wire (§4c) |
 | Focus, hit-testing, routing to a window | compositor | It owns stacking; routing anywhere else needs a second copy of that state |
 | Delivering input events to a window's event queue | `libsurface` | It arrives on the Surface session channel, alongside `Release` — that is already `libsurface`'s job |
 
@@ -296,6 +303,47 @@ The bridge is `libinput`'s modifier tracking: the compositor accumulates modifie
 the device stream and stamps it onto the Surface-layer event it forwards. Modifier policy
 (which key is Meta, what Caps Lock does) then sits next to keymap policy instead of two
 layers away.
+
+### 4c. The locks and the lights
+
+*(Phase 6 Part B.5, 2026-10-05.)* **Caps Lock and Num Lock are state of `libinput`'s interpreter**,
+kept beside the modifiers and stamped onto every `KeyEvent` in a field of their own, `locks`
+([`rsproto-surface-ops.md`](../spec/rsproto-surface-ops.md) § `KeyEvent`). Not in `modifiers`,
+because hotkeys compare that mask with `==`, and a lock bit in it would disarm every chord while the
+lock was on. A lock key toggles on its press — once, however long it is held, since the keyboard
+repeats it — and `SYN_DROPPED` clears no lock: a lock is not a key that is down. **Num Lock is on
+from the start**, which is what a PC keyboard's user expects of the keypad.
+
+**The keymap reads the locks; the interpreter reads Num Lock for the keypad.** `keymap::text`
+upper-cases a letter under Caps Lock and lower-cases a shifted one, and leaves every other key as
+Shift alone would have it; it types the keypad's digits and `.` only under Num Lock, and its
+operators always. With Num Lock off the interpreter delivers the keypad as the keys printed under
+its digits — Home, Up, Page Up, Left, Right, End, Down, Page Down, Insert, Delete — and keypad 5 as
+nothing, deciding when a key goes down and keeping that meaning to its release, so a release never
+names a key that was never pressed. Keypad Enter is delivered as Enter always. So a client sees an
+arrow or a digit, never a keypad key it must interpret.
+
+**The lights follow the locks, through three processes that each hold one piece.** The compositor
+holds the locks and sends `Input::Lights` to the input server when it connects and whenever an input
+pass changed them ([`rsproto-input-ops.md`](../spec/rsproto-input-ops.md)); the input server holds
+the keyboards and writes the byte to each, and to each that arrives later; the driver speaks the
+keyboard's protocol ([`io-operation.md`](../spec/io-operation.md) § Keyboard lights). The byte is in
+HID's order — Num Lock in bit 0, Caps Lock in bit 1, Scroll Lock in bit 2 — which a USB keyboard
+takes as it is, as a one-byte Output report (`SET_REPORT`, sent by the hub thread, which owns the
+default endpoint), and the i8042 driver reorders for the PS/2 keyboard's `0xED` command, whose mask
+has Scroll Lock in bit 0.
+
+**The i8042 keyboard answers through the byte stream its keys arrive on**, so while an exchange is
+in flight its answers — `0xFA`, `0xFE` — are taken *ahead of* the scancode decoder: an answer
+between an `E0` prefix and its code would otherwise become the code, turning Up into keypad 8 held
+down for good. Each byte has 100 ms to be answered and three resends; then the write fails,
+`TimedOut`. A USB keyboard that stalls the request costs that write; one that does not answer it
+leaves the request in doubt on the default endpoint, so that keyboard is sent no more lights and its
+keys go on arriving on their own endpoint. **A write that comes while one is in flight waits behind
+it and replaces one already waiting** — the lights are a level, not a sequence of events, so only
+the newest matters.
+
+Scroll Lock is not a lock here, so its light stays off.
 
 ## 5. Namespace and authority
 
@@ -353,15 +401,16 @@ sandboxed compositor a construction rather than a feature.
 - **USB HID — scheduled, in the kernel** (2026-10-01, Phase 6 Parts B and C). The USB stack is a
   Tier 1 kernel driver, so its keyboard and mouse decode boot-protocol reports into this record
   format in the kernel, as the PS/2 driver decodes scancodes; decoding in `input-server` would have
-  put a second format before it. HID report descriptors — a tablet, extra keys, a mouse's wheel —
-  stay deferred.
+  put a second format before it. A mouse's report descriptor is read for its wheel since Part
+  B.2; a tablet and extra keys stay deferred.
 - **Multitouch slots, gesture recognition.** Land in the `input-server` or `libinput` when there is
   hardware to justify them. Neither requires a kernel change, which is the point of the
   arrangement.
 - **A hotplug event source.** The input server already takes devices as they arrive and depart
   — up to eight, each `Departed` retiring its slot — because the device manager's replay is how
-  it gets even the i8042's two. What is missing is anything that *produces* a later arrival or a
-  departure, which is Phase 6's USB driver.
+  it gets even the i8042's two. The USB driver now registers a keyboard or mouse plugged in later;
+  what is missing is the device manager hearing of it, since it reads the registry once, which is
+  Phase 6 Part C.
 - **Key repeat.** ~~Belongs in `libinput`~~ — **decided 2026-08-10: the compositor generates
   it** (M4 Part C, [`widget-toolkit.md`](widget-toolkit.md) §9.2). It cannot live in
   `libinput`: that crate is pure and issues no syscalls, so it has nowhere to put a timer.

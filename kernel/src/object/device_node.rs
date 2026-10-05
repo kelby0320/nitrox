@@ -210,9 +210,16 @@ pub struct CharBackend {
     /// Submit a stream read against the device.
     pub submit_read:
         fn(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, max_len: u64, ctx: *mut ()) -> Result<(), KError>,
-    /// Device context passed back to `submit_read` (e.g. the console state).
+    /// **Submit a write to the device**, if it takes one (Phase 6 Part B.5): a keyboard's lights,
+    /// one byte. `None` refuses a write as `Unsupported`, which is every char device before then.
+    pub submit_write: Option<CharWrite>,
+    /// Device context passed back to `submit_read` and `submit_write` (e.g. the console state).
     pub ctx: *mut (),
 }
+
+/// A char device's write: `len` bytes from `buffer` at `buf_offset`, completing `po`.
+pub type CharWrite =
+    fn(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError>;
 
 // SAFETY: identical reasoning to `BlockBackend` — `ctx` points at a device
 // structure that lives for the kernel's lifetime, touched only on the CPU

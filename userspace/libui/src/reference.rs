@@ -240,13 +240,13 @@ fn reference_list(theme: &Theme) -> Element<Msg> {
 /// one thing rather than a gallery.
 fn reference_area(theme: &Theme) -> Element<Msg> {
     let mut a = TextAreaState::with_text("select me\nand me");
-    a.apply(libkern::abi::KEY_RIGHT, 0);
-    a.apply(libkern::abi::KEY_RIGHT, 0);
-    a.apply(libkern::abi::KEY_RIGHT, 0);
+    a.apply(libkern::abi::KEY_RIGHT, 0, 0);
+    a.apply(libkern::abi::KEY_RIGHT, 0, 0);
+    a.apply(libkern::abi::KEY_RIGHT, 0, 0);
     for _ in 0..4 {
-        a.apply(libkern::abi::KEY_RIGHT, librsproto::surface::MOD_SHIFT);
+        a.apply(libkern::abi::KEY_RIGHT, librsproto::surface::MOD_SHIFT, 0);
     }
-    a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT);
+    a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT, 0);
     // **One coloured run, so the picture contains ink that is not the theme's foreground**
     // (M14 Part G). `check-display` compares this render against the guest's own, so a guest
     // that dropped `Node::Ink` — compiled it out, took the wrong branch, read a different theme

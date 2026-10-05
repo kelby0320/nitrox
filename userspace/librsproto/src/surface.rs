@@ -764,8 +764,14 @@ pub struct KeyEvent {
     pub pressed: u16,
     /// Modifiers held **at this transition** — see the `MOD_*` constants.
     pub modifiers: u16,
-    /// Reserved; zero.
-    pub _pad: u16,
+    /// **The locks on at this transition** — [`LOCK_CAPS`], [`LOCK_NUM`] (Phase 6 Part B.5). What
+    /// `libinput::keymap::text` reads to give a letter its case and the keypad its digits.
+    ///
+    /// **A field of its own, not modifier bits**: the compositor matches a chord with
+    /// `modifiers == hotkey`, so a lock in `modifiers` would break every chord while Num Lock was
+    /// on, which is from boot. It was a reserved `u16`, zero, so the layout is unchanged and a
+    /// reader that ignores it reads every key as it did.
+    pub locks: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<KeyEvent>() == 12);
@@ -789,6 +795,12 @@ pub const MOD_CTRL: u16 = 1 << 1;
 pub const MOD_ALT: u16 = 1 << 2;
 /// Either meta/"super" key.
 pub const MOD_META: u16 = 1 << 3;
+
+/// Lock bits, carried by [`KeyEvent::locks`] (Phase 6 Part B.5): Caps Lock gives a letter its other
+/// case.
+pub const LOCK_CAPS: u16 = 1 << 0;
+/// Num Lock: the keypad's digits and point are text. On from boot.
+pub const LOCK_NUM: u16 = 1 << 1;
 
 /// What a [`PointerEvent`] reports.
 pub const POINTER_MOTION: u16 = 0;
@@ -2304,7 +2316,12 @@ impl KeyEvent {
     /// **A constructor, so the next field costs no call sites.** Widening this record for the
     /// window id broke every literal in the tree; the one after it will not.
     pub const fn new(window: u32, keycode: u16, pressed: u16, modifiers: u16) -> Self {
-        Self { window, keycode, pressed, modifiers, _pad: 0 }
+        Self { window, keycode, pressed, modifiers, locks: 0 }
+    }
+
+    /// This record with `locks` on (Phase 6 Part B.5).
+    pub const fn with_locks(self, locks: u16) -> Self {
+        Self { locks, ..self }
     }
 
     /// Serialise into exactly 12 little-endian bytes.
@@ -2316,7 +2333,7 @@ impl KeyEvent {
         out[4..6].copy_from_slice(&self.keycode.to_le_bytes());
         out[6..8].copy_from_slice(&self.pressed.to_le_bytes());
         out[8..10].copy_from_slice(&self.modifiers.to_le_bytes());
-        out[10..12].copy_from_slice(&0u16.to_le_bytes());
+        out[10..12].copy_from_slice(&self.locks.to_le_bytes());
         Some(12)
     }
 
@@ -2330,7 +2347,7 @@ impl KeyEvent {
             keycode: u16::from_le_bytes([b[4], b[5]]),
             pressed: u16::from_le_bytes([b[6], b[7]]),
             modifiers: u16::from_le_bytes([b[8], b[9]]),
-            _pad: 0,
+            locks: u16::from_le_bytes([b[10], b[11]]),
         })
     }
 }
@@ -2716,10 +2733,16 @@ mod tests {
         assert_eq!(&b[4..6], &0x1112u16.to_le_bytes(), "keycode @4");
         assert_eq!(&b[6..8], &1u16.to_le_bytes(), "pressed @6");
         assert_eq!(&b[8..10], &0x3132u16.to_le_bytes(), "modifiers @8");
-        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "reserved @10, zero");
+        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "locks @10, none");
         assert_eq!(KeyEvent::read(&b), Some(e));
         // A short body is refused rather than read from whatever follows it.
         assert!(KeyEvent::read(&b[..11]).is_none(), "11 bytes is not a key record");
+        // **The locks, in the bytes that were reserved** (Phase 6 Part B.5), read back.
+        let locked = e.with_locks(LOCK_CAPS | LOCK_NUM);
+        locked.write(&mut b).unwrap();
+        assert_eq!(&b[10..12], &3u16.to_le_bytes(), "locks @10");
+        assert_eq!(KeyEvent::read(&b), Some(locked));
+        assert_eq!(&b[8..10], &0x3132u16.to_le_bytes(), "the modifiers untouched by them");
     }
 
     #[test]

@@ -1,12 +1,12 @@
 # USB
 
-**Status: Phase 6 Part A built (2026-10-02), and Part B's keyboards and mice (B.1–B.4, 2026-10-05)**
+**Status: Phase 6 Part A built (2026-10-02), and Part B's keyboards and mice (B.1–B.5, 2026-10-05)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
 `usb-<id>` (A.3); and **a boot keyboard or mouse is bound**, polled by the DPC, and served at
 `/dev/input/raw/<n>` like the i8042's, a mouse's wheel read through its report descriptor (B.2,
-B.3). The lock keys and their lights are B.5's, not built. No class driver binds anything else
+B.3), a keyboard's lights set by a `SET_REPORT` (B.5). No class driver binds anything else
 (Part D). A departure frees the device's slot and leaves its records, and nothing tells
 `device-mgr` of a device plugged in after it read the registry (Part C). The design ahead is
 [`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
@@ -268,6 +268,24 @@ Slot**, so the DPC cannot touch a report buffer the release is about to free. Ri
 are the device's memory, freed only after its slot is disabled. The node stays, with no producer,
 until Part C retires it.
 
+**A keyboard's lights** (B.5) are a write to its node — one byte, in HID's order
+([`io-operation.md`](../spec/io-operation.md) § Keyboard lights) — which the node's `submit_write`
+leaves for the hub thread, since the default endpoint is the thread's: a request is one control
+transfer at a time, waited for. The write waits in a slot per node, a later one replacing it, and
+the thread is woken. It sends a **`SET_REPORT`** to the keyboard's interface — an Output report,
+type 2, with no report ID — with the byte as its one-byte Data stage, OUT, then an IN Status stage,
+and completes the write with how that went:
+- acknowledged: done, and the first time per keyboard a line, `usb: port 9: keyboard lights
+  acknowledged`;
+- a stall: the default endpoint is recovered and the write fails, `IoError`;
+- no answer: the request may still be on the endpoint, so **that keyboard is sent no more lights**
+  and the write fails, `IoError`. Its keys are on their own endpoint and go on arriving;
+- a keyboard that has left: `PeerClosed`.
+
+**Nor are lights sent to a keyboard whose binding left its default endpoint in doubt** (see *What
+ends a binding*): a write to one is refused at once, `IoError`, as it is to one whose lights
+request went unanswered.
+
 **The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, boot
 protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a wheel`.
 
@@ -327,14 +345,17 @@ protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a
     with each refusal.
 - **`drivers::xhci::{ring, context, desc}`** — the Normal TRB and Configure Endpoint, the interval
   at each speed and both ends of its clamp, the input context at both entry sizes, and the HID
-  interfaces of QEMU's devices and of a combined receiver.
+  interfaces of QEMU's devices and of a combined receiver. The OUT Setup and Data TRBs a lights
+  request is made of, and the request's fields read back as a device reads them (B.5) — which no
+  gate can check, since QEMU's keyboard takes any `SET_REPORT` as its lights.
 - **`device`** — the served index beside the i8042's two, without them, and where the i8042 has only
   a mouse.
 - **The `--usb` gates** (B.4) boot q35 with `i8042=off`, the gates' controller, `usb-kbd` and
   `usb-mouse`, so a key or click that arrives came through USB:
   - `check-input --usb` asserts what `check-input` does — the stalled-consumer motion sum, a key, a
     click, the wheel in both directions, the chords and the routing — less the i8042's
-    held-release step;
+    held-release step; and that the keyboard acknowledged its lights (B.5), which an
+    `input-server` that writes none fails;
   - `check-login --usb` logs in at the greeter and runs the session;
   - `check-report --usb` turns the report's pages on USB key presses.
 - **`test-qemu`** asserts each bound interface's line and `boot-probe`'s record of it, and that

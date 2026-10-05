@@ -169,6 +169,8 @@ pub struct Xhci {
     /// thread to reset.
     hid: IrqSpinLock<hid::Table>,
     hid_halted: AtomicBool,
+    /// A keyboard's lights are waiting for the hub thread (Phase 6 Part B.5).
+    hid_lights: AtomicBool,
 }
 
 /// What the hub thread is waiting for.
@@ -485,6 +487,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         pci: desc,
         hid: IrqSpinLock::new(LockRank::Leaf, hid::Table::new()),
         hid_halted: AtomicBool::new(false),
+        hid_lights: AtomicBool::new(false),
     };
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. The first

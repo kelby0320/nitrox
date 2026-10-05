@@ -33813,3 +33813,109 @@ not checked, and every collection read as the mouse's.
 - the ring's sizing comment corrected: a USB mouse polled every millisecond fills it in about 32 ms.
 
 No ABI hash impact.
+
+## 2026-10-05 — Phase 6 Part B.5: the lock keys, the keypad and the lights
+
+**Caps Lock and Num Lock are locks**, kept in `libinput`'s interpreter beside the modifiers. Num Lock
+is on from the start. A held lock key toggles once, and `SYN_DROPPED` clears no lock. Every
+`KeyEvent` carries them in `locks`, the field that was reserved, so `modifiers` stays exact for
+hotkeys. `keymap::text` reads them:
+- Caps Lock upper-cases a letter, and a shifted one goes back to lower case;
+- the keypad's digits and `.` are text only under Num Lock;
+- its operators are text always.
+
+With Num Lock off the interpreter delivers the keypad as Home, Up, Page Up and the rest, and keypad
+5 as nothing. A key keeps the meaning it had when it went down. Keypad Enter is Enter always, so
+`libterm`'s special case for it is gone. Every caller of the keymap passes the key's locks.
+
+**The lights follow the locks**:
+- The compositor sends `Input::Lights` (`0x0A01`), the first message a consumer sends. It sends it
+  when it connects and after any input pass that changed the locks.
+- `input-server` writes the byte to every keyboard's node, and to each keyboard that arrives
+  later.
+- A char node takes a write where its driver gives `CharBackend` a `submit_write`: one byte, in
+  HID's order.
+- The PS/2 driver runs the `0xED` exchange, with its answers taken ahead of the scancode decoder.
+- The USB driver leaves the byte for the hub thread, which sends it as a `SET_REPORT`.
+
+**On PR #358's review fixes.** That review made `bind` stop asking a default endpoint anything
+once a request on it may still be in flight. A lights request goes on that endpoint too, so the
+device's keyboards take no lights after such a failure, and a write to one is refused at once,
+`IoError`. A write to a keyboard that takes no more lights used to complete `PeerClosed`, which is
+the error for a keyboard that has left; it is `IoError` now, at submission.
+
+**Gates.** `check-terminal` types under Caps Lock and on the keypad with Num Lock on and off. It
+reads the PS/2 keyboard's lights from QEMU's `ps2_set_ledstate` trace, exactly, at each step:
+`[0, 2]`, `[0, 2, 6]`, `[0, 2, 6, 2]`, `[0, 2, 6, 2, 0]`, `[0, 2, 6, 2, 0, 2]`. `check-input
+--usb` asserts the USB keyboard acknowledged its lights.
+
+**Found on the way:**
+- **The plan's Num Lock step could never have passed.** It typed `xy`, keypad 4 as Left, then `z`,
+  expecting `xzy`. But `tty-server`'s line discipline recognises Left and drops it. Keypad 8 is Up
+  instead, and the discipline answers it by recalling the line before, which a digit cannot do.
+- **The first boot read no lights from a trace that held them.** The event's own name contains
+  `ledstate`, so splitting at that word found the device's address. A host test now holds the real
+  trace.
+- **`nxterm` reports a row with its trailing blanks trimmed**, so a typed space is waited for as
+  the row before it, reported again.
+- **The start check proved nothing where it first stood.** It ran after the gate had typed, and the
+  compositor also sends after any input pass whose locks differ from what it sent last. So a
+  compositor that skipped its first send would have passed. The check now runs before anything is
+  injected, and that control fails it.
+- **The PS/2 exchange completed its write and logged under the driver's leaf lock.** Completing
+  takes the scheduler's lock, and logging the serial port's, both ranked above a leaf. A debug
+  kernel's lock tracker panics on that. It was caught reading the code, before any boot ran it.
+  The end is now recorded under the lock and acted on outside it. The DPC marks a write
+  *completing* while it completes it, so thread context cannot drop it first.
+- **`abi-sync-check` compares only constants whose values are literals.** A `u16` written `1 << n`
+  does not parse, and is skipped on both sides without a word. No pair is written that way today.
+  The lights are hex literals so the check holds them, and it now counts 189.
+- **Statements B.2 left false**, fixed here:
+  - `input-subsystem.md` still listed USB HID as not built, and the wheel's report descriptor as
+    deferred;
+  - it said nothing produced a later arrival;
+  - `rsproto-input-ops.md` named `input-testclient` as the only consumer and the i8042's two as the
+    only devices.
+
+**Controls**, each failing:
+- **Boots:**
+  - no lights sent when the compositor connects: `check-terminal` sees `[0]` before any input;
+  - the keypad left as digits with Num Lock off: the recall step times out on an `8`;
+  - `input-server` writing no lights: `check-input --usb` sees no acknowledgement.
+- **Host:**
+  - Caps Lock inverting Shift for every key;
+  - the keypad's digits ignoring Num Lock;
+  - Caps Lock lighting the wrong bit;
+  - any byte taken as a lights request;
+  - `SET_REPORT`'s `wValue` bytes swapped, which QEMU would accept;
+  - a lock key arming the compositor's repeat.
+
+No ABI hash impact. `IoOp`'s layout and `IoOpcode`'s values are unchanged, and `CharBackend` is the
+kernel's own. `KeyEvent` changes no layout: two reserved bytes gain a meaning.
+
+## 2026-10-05 — PR #359, reviewed: two repeats that cancel
+
+One blocking finding, three worth fixing and one optional, with no correctness bug found. All are
+fixed, and each new test fails the mutation the review found surviving, run here (seven).
+
+**1. `a_held_lock_key_toggles_its_lock_once` passed an interpreter that toggled on every press.**
+It asserted only after two repeats, and two toggles cancel. It now checks after each one. No gate
+sends a repeat, since a QMP key is a press and a release, so this test is the only guard on the
+typematic toggle PR #357's review raised.
+
+**2. Nothing held a repeat to the locks its key went down with.** Every repeat test passed none, and
+`fire_repeat` built its event in `main.rs`, where no host test reaches. `Repeat::event` builds it
+now, and a test arms a run under Caps Lock and Num Lock and reads the event back. The router's own
+`KeyEvent` was held only by `check-terminal`'s Caps Lock step; a host test holds it too.
+
+**3. Nothing held a text field or a text area to the locks.** Every `apply` in their suites passed
+none, and no gate types into either under a lock. Each now has a test.
+
+**4. The spec said a keyboard's node refuses any length but 1, and every other char node refuses
+any `Write`.** `sys_io_submit` answers a zero-length request itself, before the class dispatch, as
+the spec's general rule for `length` says. The lights section now says so, and the test of
+`lights_from` with no bytes says it holds the function rather than a path the syscall takes.
+
+**5. A resend restarting the answer's clock** is tested: the byte sent again has the whole bound.
+
+No ABI hash impact.

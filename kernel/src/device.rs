@@ -608,7 +608,7 @@ mod tests {
     }
 
     fn char_node() -> ObjectRef {
-        let backend = CharBackend { submit_read: no_read, ctx: core::ptr::null_mut() };
+        let backend = CharBackend { submit_read: no_read, submit_write: None, ctx: core::ptr::null_mut() };
         adopt(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
     }
 

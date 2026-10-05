@@ -467,7 +467,7 @@ impl InputRouter {
         }
 
         match *ev {
-            Logical::Key { keycode, pressed, modifiers, .. } => {
+            Logical::Key { keycode, pressed, modifiers, locks, .. } => {
                 // **Before focus routing, and consuming rather than copying.** A chord that
                 // also reached the focused window would type into it — `Super+2` would switch
                 // desktops *and* put a `2` in the terminal.
@@ -490,7 +490,7 @@ impl InputRouter {
                 // them — but it is the same unbalanced-press shape the chord rules above exist
                 // to prevent, reached by a different route.
                 out.push(Outbound::Key {
-                    event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers),
+                    event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers).with_locks(locks),
                 });
                 Routed { resized: ended, outline: outline_gone, ..Routed::default() }
             }
@@ -1497,12 +1497,13 @@ mod tests {
     }
 
     fn key(keycode: u16, pressed: bool) -> Logical {
-        Logical::Key { keycode, pressed, modifiers: 0, time_ns: T }
+        Logical::Key { keycode, pressed, modifiers: 0, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
-    /// A key transition with modifiers held — what a chord looks like on the wire.
+    /// A key transition with modifiers held — what a chord looks like on the wire. **With Num Lock
+    /// on**, as every key is from boot (Phase 6 Part B.5): a chord matches on modifiers alone.
     fn chord(keycode: u16, pressed: bool, modifiers: u16) -> Logical {
-        Logical::Key { keycode, pressed, modifiers, time_ns: T }
+        Logical::Key { keycode, pressed, modifiers, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
     /// The "Super" key is `MOD_SUPER` on the wire — the name the modifier bitmask uses.
@@ -1941,6 +1942,22 @@ mod tests {
         let out = go(&mut r, &mut s, key(30, true));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].window(), top, "the key went to the focused window");
+    }
+
+    /// **A key carries its locks to the window** (Phase 6 Part B.5; PR #359 review): the event the
+    /// router builds has the transition's locks, which only `check-terminal`'s Caps Lock step saw.
+    #[test]
+    fn a_key_carries_its_locks_to_the_window() {
+        use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        let caps = Logical::Key { keycode: 30, pressed: true, modifiers: 0, locks: LOCK_CAPS | LOCK_NUM, time_ns: T };
+        let out = go(&mut r, &mut s, caps);
+        match out.as_slice() {
+            [Outbound::Key { event }] => assert_eq!((event.window, event.locks), (w, LOCK_CAPS | LOCK_NUM)),
+            other => panic!("not one key: {other:?}"),
+        }
     }
 
     /// A window whose first `Configure` is still held takes neither the keyboard nor a click.

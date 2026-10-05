@@ -786,6 +786,15 @@ pub const BTN_RIGHT: u16 = 0x111;
 /// Wheel click.
 pub const BTN_MIDDLE: u16 = 0x112;
 
+/// **A keyboard's lights**, the one byte a write to its raw node carries (Phase 6 Part B.5), in HID's
+/// order: Num Lock in bit 0. Typed `u16` with the codes above so the two copies are held together;
+/// the byte is their low eight bits.
+pub const LIGHT_NUM: u16 = 0x01;
+/// Caps Lock's light.
+pub const LIGHT_CAPS: u16 = 0x02;
+/// Scroll Lock's light, which nothing sets: Scroll Lock is not a lock here.
+pub const LIGHT_SCROLL: u16 = 0x04;
+
 impl InputEvent {
     /// Parse from exactly [`INPUT_EVENT_LEN`] little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
