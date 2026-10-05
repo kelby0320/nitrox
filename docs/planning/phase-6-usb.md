@@ -199,6 +199,10 @@ the snapshot, compares generations and records, and sends `Arrived` and `Departe
 owner. No new channel from the kernel; one new notification kind. The manager stays the one reader
 of the registry and the one place that hands devices out.
 
+*(Revised 2026-10-05, in Part C's detail pass, with the maintainer: a node to read,
+`/dev/registry/changes`, in place of the notification. The kernel cannot name the manager to send
+it one — § Part C in detail.)*
+
 ### HID, boot protocol
 
 The driver sets each HID interface to boot protocol and polls its interrupt-IN endpoint. A
@@ -295,7 +299,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 |---|---|---|
 | **A** | **xHCI and enumeration, reported.** The hub thread; the xHCI driver; enumeration at boot and on later port changes; `UsbDevice` records; the hardware report's USB page. | `test-qemu` boots with `usb-kbd`, `usb-mouse` and `usb-storage` attached and asserts each enumerated with its IDs and class. `check-report` asserts the live stick listed. On the laptop, the report's USB page is the survey this plan lacks. |
 | **B** | **HID keyboard and mouse, at boot.** Boot protocol, the usage table, the nodes, `input-server` taking them from the manager's replay. | A gate on a machine with **`i8042=off`**: a key and a click from USB reach a window, and a login at the greeter goes through. `test-interactive` and the other release gates unchanged with the i8042 on. |
-| **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the notification, the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
+| **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the change node (a notification until Part C's detail pass), the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
 | **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. |
 | **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. |
 | **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. |
@@ -990,6 +994,9 @@ unplugged leaves it:
   context is the index.
 - **A node's reader** (`drivers::input::Reader`) holds one parked read, and has no state for a
   device that has gone.
+- **A char node's `Read` never sees its `offset`** (PR #360 review). `sys_io_submit` passes a char
+  backend's `submit_read` the buffer, its offset, the length and the context, and drops `offset`
+  (`kernel/src/syscall/table.rs`); `io-operation.md` says a stream ignores it.
 - **A departed keyboard's held keys are never released.** The last report decoded holds them
   down, and no report follows it. The compositor repeats a held key until something else stops
   the run.
@@ -999,14 +1006,24 @@ unplugged leaves it:
   class device's node by id. It encodes `Departed` and sends none.
 - **`input-server` takes arrivals after `Settled`, and retires a slot on `Departed`.** Both are
   host-tested and neither has run.
-- **A read that completes with an error is logged and armed again**
-  (`userspace/input-server/src/main.rs`): `harvest`, then `arm`. A node answering `PeerClosed`
-  would log `read submit FAILED` and leave the wait set, its slot held, until a `Departed` came.
-- **Every reader finds block devices through `DeviceRecord::block_index`**
-  (`userspace/libkern/src/device.rs`): `libsession`, `eshell`'s `lsblk`, `boot-probe` and the test
-  harness all do. A departed record that answers `None` there is right for each of them at once.
+- **A read that fails is logged and armed again** (`userspace/input-server/src/main.rs`), and
+  which line it logs depends on how it fails (PR #360 review). A read that *completes* with an
+  error logs `read completed with an error; events lost` in `harvest` and is armed again at the
+  top of the loop, so a node whose every read completed `PeerClosed` would be read in a spin. A
+  submit *refused* logs `read submit FAILED -- device may stall` and leaves the device out of the
+  wait set, and the next pass refuses it again and logs it again.
+- **`input-server` closes a node at once on `Departed`**, whatever its ring still holds.
+- **Most readers find block devices through `DeviceRecord::block_index`**
+  (`userspace/libkern/src/device.rs`): `libsession`, `eshell`'s `lsblk`, the test harness and some
+  of `boot-probe`. A departed record that answers `None` there is right for each of those at once.
+  **`boot-probe`'s registry test does not** (PR #360 review): it resolves `/dev/registry/<id>`
+  for every record, and `/dev/blk` and `/dev/input/raw` at each record's `served`, which a departed
+  record would fail on every boot `test-qemu`'s hot-plug leaves one in.
 - **`boot-probe` holds the manager to a prefix of the registry** (Part A.3), because the manager
   missed whatever arrived after its one read.
+- **`test-qemu`'s hot-plug begins at the first round's line**, before `init` (Part A.2), so the
+  keyboard arrives, is swapped for the mouse, and the mouse arrives while userspace is still
+  starting: on either side of the manager's first read, as `check_usb_listed` records.
 
 **QEMU** — `hw/input/hid.c`, `hw/usb/dev-hid.c` and `ui/input.c`, read at 8.2.2 and 11.0:
 - **A USB keyboard becomes the target of injected keys when it is plugged in.** `hid_init`
@@ -1039,6 +1056,11 @@ which is the one place to change; version 1 is refused, as a mismatched version 
 **The event source is a node to read, not a notification.** `/dev/registry/changes` is a char node.
 A `Read` on it **waits until the generation is past the read's `offset`**, then completes with the
 current generation, eight bytes. A reader that is behind is answered at once.
+- **The offset has to reach it.** A char backend's `submit_read` gains the `offset` (PR #360
+  review), which the console, the i8042's nodes and USB's ignore: it is a signature change in
+  three backends, and the change node is the first to read the field. Without it the node could
+  only mean "the next change", and a keyboard plugged in between the manager's snapshot and its
+  read would wait for some other change to be handed over.
 - **No change can be missed**: the manager reads a snapshot, then waits past the snapshot's
   generation. A change in between answers the wait at once.
 - **It is the model the system already has**: `sys_io_submit`, a `PendingOperation`, and `sys_wait`
@@ -1056,13 +1078,17 @@ change was weighed too: no kernel server can leave a lookup pending today, and t
 new path through `sys_ns_lookup`. **The maintainer agreed to the node**, below.
 
 **A USB device departs in the hub thread**, in this order:
-1. **Each bound HID endpoint's last report is decoded against an empty one**, as if every key and
-   button had been let go, and the events are pushed to its node: releases, then `SYN_REPORT`.
-   A departed keyboard's held keys are released, and so is a mouse's button, ending a drag.
+1. **What each bound HID endpoint holds is released**, and the events pushed to its node, then
+   `SYN_REPORT`. **A keyboard's last report is decoded against an empty one**: its keys, then its
+   modifiers. **A mouse's held buttons are released from its decoder's `buttons`**, not by decoding
+   an empty report, which for a layout with a report ID would not carry the ID and decode to
+   nothing (PR #360 review). A drag in progress ends.
 2. **Its endpoints leave the DPC's table**, as `unbind` does now.
-3. **Its nodes retire.** A read already parked is answered with the releases. A read that finds
-   the ring drained completes at once, `PeerClosed`. A lights write still waiting is completed
-   `PeerClosed`, as a new one is refused.
+3. **Its nodes retire.** A read already parked is answered with the releases, or `PeerClosed` if
+   there were none to send. **A read submitted after that drains what the ring holds, and once it
+   is empty is refused at submission, `PeerClosed`**, with no `PendingOperation`: a reader learns
+   the device has gone at once, and cannot spin on reads that each complete with an error. A
+   lights write still waiting is completed `PeerClosed`, as a new one is refused.
 4. **Its records depart**: the device, its keyboards and its mice, as one generation. The reads
    waiting on `/dev/registry/changes` are answered.
 5. **Its slot is disabled and its memory freed**, as now.
@@ -1087,8 +1113,14 @@ index, so a handle to a node retired from a slot that has since been reused is r
 The diff is a function of two lists of records, and host-tested as one.
 
 **`input-server`:**
-- **a read that completes `PeerClosed` is its device leaving.** The slot is not armed again, and the
-  line is logged once, until the `Departed` that follows retires it;
+- **`PeerClosed` is its device leaving**, whether a read completes with it or a submit is refused
+  with it. The device is not armed again, and `<kind> <id> left` is logged once — not `read
+  completed with an error` and not `read submit FAILED`;
+- **`Departed` retires a slot only once its node has answered `PeerClosed`.** Until then the slot
+  keeps being read, so the releases still in its ring are delivered whatever order the manager's
+  message and the node's reads arrive in (PR #360 review: a mouse unplugged mid-drag, more than a
+  harvest's thirty-two events behind, would otherwise lose its button's release). A slot whose
+  node has already answered retires at once. A small state machine, host-tested in the library;
 - a device arriving after `Settled` takes a free slot and is written the lights (Part B.5).
 
 **Nothing changes in the compositor**: the releases are ordinary events, and a held key's release
@@ -1099,9 +1131,10 @@ stops its repeat as any release does.
 - **The event source is the node**, `/dev/registry/changes`, not the notification the scoping
   planned. The node changes no ABI; the notification would have changed the hash, and needed a
   registration as well.
-- **Departed records stay for the boot.** A replug costs a record, 144 bytes in every snapshot
-  after it, and dropping records would break "an id is its place". Recorded under
-  `usb-departed-records`, with the snapshot's size as the trigger.
+- **Departed records stay for the boot.** A replug costs a record per node — two for a keyboard or
+  a mouse, its device and its input node — at 144 bytes each in every snapshot after it, and
+  dropping records would break "an id is its place". Recorded under `usb-departed-records`, with
+  the snapshot's size as the trigger.
 
 ### Calls made in this pass, without the maintainer
 
@@ -1120,20 +1153,29 @@ stops its repeat as any release does.
 
 - **C.1 The registry.** `flags` and `DEPARTED`; the generation and the version 2 header; a
   departure with its children; departed paths answering `NotFound`; `block_index` and
-  `input_index`; `/dev/registry/changes`. Host tests: a departure marks every descendant and only
-  them; a departed served index is never reissued; the snapshot marks rather than omits; each
-  path refuses a departed device; the generation counts every change; a waiting read is
-  answered by the next change and not before, and at once when behind.
+  `input_index`; `/dev/registry/changes`, and the `offset` reaching a char backend's
+  `submit_read`. Host tests: a departure marks every descendant and only them; a departed served
+  index is never reissued; the snapshot marks rather than omits; each path refuses a departed
+  device; the generation counts every change; a waiting read is answered by the change past its
+  offset and not before, and at once when behind.
 - **C.2 USB departure.** The releases, the nodes retired, the records departed, the slots
   recycled with epochs. Host tests:
-  - a keyboard's last report against an empty one releases every key and then every modifier,
-    and a mouse's releases every button;
-  - a retired reader is answered with what its ring holds, then `PeerClosed`;
+  - a keyboard's last report against an empty one releases every key and then every modifier;
+  - a mouse's held buttons are released from its decoder's state, **with a layout that has a report
+    ID** — QEMU's mouse has none, so no gate holds that case;
+  - a retired reader is answered with what its ring holds, and a read after that is refused at
+    submission, `PeerClosed`;
   - a handle whose epoch is stale is refused.
 - **C.3 The manager follows.** The waiting read, the diff, the owners and the tables. Host tests on
   the diff: an arrival, a departure, both in one read, a record that came and went unseen, and a
   departure for a class with no owner.
-- **C.4 `input-server`.** `PeerClosed` as a departure.
+- **C.4 `input-server`.** `PeerClosed` as a departure, whether a read completes with it or a
+  submit is refused with it; `Departed` retiring a slot only once its node has answered. The
+  slot's states are the library's, host-tested: a `Departed` before the node's `PeerClosed`, and
+  after it.
+- **`boot-probe`** (with C.1): its registry test holds a present record as now, and a departed
+  one to its paths answering `NotFound` — `/dev/registry/<id>`, and `/dev/input/raw` or
+  `/dev/blk` at its served index.
 - **C.5 The gates.** Below.
 - **C.6 Docs.** Below.
 
@@ -1147,18 +1189,27 @@ stops its repeat as any release does.
      client's window.
   3. **A key held down on it** — `input-send-event`, down only — is seen pressed by the window; the
      keyboard is unplugged; and **the window sees the release.** The slot is retired.
-  4. `input-server` logged no failed submit.
+  4. **`input-server` logged one `left` line for each keyboard unplugged, and neither `read
+     completed with an error` nor `read submit FAILED`.** Today's `input-server` prints the first
+     for a read that completes `PeerClosed` and the second at each pass for a refused submit, so a
+     regression to arming a departed node again prints one of them (PR #360 review: asserting on
+     the failed submit alone could not see the spin).
 
   The order matters: the boot keyboard leaving first makes every key in step 2 the new
   keyboard's, since there is no other.
-- **`test-qemu`**: the hot-plugged keyboard, and the mouse swapped in for it, are each handed to
-  `input-server` and departed from it, on the port the transcript names. **`boot-probe` holds the
-  manager to the whole registry** — waiting, within a bound, until the manager has caught up —
-  where it held it to a prefix.
+- **`test-qemu`'s hot-plug stays where it is**, before `init`: it is Part A's enumeration test, and
+  moving it after `input-server` settles would race `boot-probe`'s verdict, which ends the run. So
+  it lands on either side of the manager's first read, and a keyboard swapped out before that read
+  is rightly told to no one (PR #360 review). What `test-qemu` holds is what holds wherever it
+  lands: **`boot-probe` holds the manager to the registry's present records** — waiting, within a
+  bound, until the manager has caught up — where it held it to a prefix; and a departed record's
+  paths answer `NotFound`. A hot-plugged keyboard's `Arrived` and `Departed` are `check-input
+  --usb`'s to hold, where the gate decides the order.
 - **Controls**, planned:
   - a departure that does not bump the generation: step 1 times out;
   - no releases: step 3's release never arrives;
-  - `input-server` arming a `PeerClosed` node again: step 4 fails;
+  - `input-server` arming a `PeerClosed` node again: step 4 fails, on `read submit FAILED`;
+  - `Departed` retiring a slot before its node has answered: its host test fails;
   - an `Arrived` sent for a departed record, and the epoch check removed: their host tests fail.
 
 The gate set stays at 42: these are steps in gates that exist.
@@ -1174,8 +1225,11 @@ The gate set stays at 42: these are steps in gates that exist.
 ### Docs Part C owes
 
 - **`device-node.md`**: `flags` and `DEPARTED`, the generation and the version 2 header, departed
-  paths, `/dev/registry/changes`, and served indices never reused.
-- **`io-operation.md`**: the change node's `Read`, and what its `offset` means.
+  paths, `/dev/registry/changes`, served indices never reused, and the `offset` a char backend's
+  `submit_read` now takes.
+- **`io-operation.md`**: the change node's `Read`, and what its `offset` means — the one char node
+  that reads the field.
+- **`namespace-and-resource-servers.md`**: the registry server's leaves, which gain `changes`.
 - **`device-manager.md`**: the manager following the table and the diff, and §9's gap closed.
 - **`rsproto-devices-ops.md`**: its Status — `Departed` is sent, and so are later arrivals.
 - **`input-subsystem.md`**: the hotplug source exists, a departure releases what was held, and
@@ -1185,7 +1239,6 @@ The gate set stays at 42: these are steps in gates that exist.
   given back, and the table's growth what remains.
 - **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-input --usb`'s new steps and
   `test-qemu`'s.
-- **The kernel work table above**: its notification row, which the first call settled.
 
 ## Definition of Done
 

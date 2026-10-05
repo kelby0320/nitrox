@@ -33951,7 +33951,33 @@ hold a key and unplug that keyboard, and see the release. That proves the releas
 guest.
 
 **Departed records stay for the boot**, the maintainer's second call: dropping one would break "an
-id is its place", and a replug costs a record in every later snapshot. `usb-departed-records`
-keeps the snapshot's size as the trigger.
+id is its place", and a replug costs a record per node — two for a keyboard or a mouse, its device
+and its input node — in every later snapshot. `usb-departed-records` keeps the snapshot's size as
+the trigger.
 
 No code; no ABI hash impact.
+
+## 2026-10-05 — PR #360, reviewed: what Part C's gates can see
+
+No blocking findings; four worth fixing and four optional, all taken into the detail pass. Each was
+read against the source, as the reviewer had:
+- **`test-qemu`'s hot-plug happens before `init`**, so the hot keyboard can come and go before the
+  manager's first read, and is then rightly told to no one. Moving the hot-plug later would race
+  `boot-probe`'s verdict, which ends the run. So `test-qemu` holds what is true wherever it lands:
+  the manager agrees with the registry's present records once caught up, and departed paths
+  answer `NotFound`. The hot keyboard's `Arrived` and `Departed` are `check-input --usb`'s.
+- **The step meant to catch `input-server` arming a departed node could not see it.** A read that
+  *completes* `PeerClosed` logs one line and is armed again in a spin, while only a *refused*
+  submit logs `read submit FAILED`. Now a read on a retired, drained node is refused at submission,
+  and the gate requires one `left` line per departure and neither failure line.
+- **A char node's `Read` never sees its `offset`**, which the change node needs. `submit_read`
+  gains it, a signature change in three backends.
+- **`boot-probe`'s registry test reads `served` directly**, not through `block_index`, so a departed
+  record would fail it. It holds a departed record's paths to `NotFound` instead.
+- Optional:
+  - `Departed` now retires a slot only after its node answers `PeerClosed`, so releases still in
+    the ring are not lost;
+  - a mouse's buttons are released from its decoder's state, since an empty report carries no
+    report ID;
+  - the scoping's notification is marked revised;
+  - a replug costs two records for an input device, not one.
