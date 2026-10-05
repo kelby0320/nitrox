@@ -3,12 +3,12 @@
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
 current status, the full phase list, and the cross-cutting workstreams.
 
-**Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03; Parts
-B–H not built.** This replaces the sketch written on 2026-09-10, before Phase 5 and administration.
-The scope and the decisions below were agreed with the maintainer on 2026-10-01. Each part gets its
-own detail pass when it is next, as administration's parts did; what is here is the phase's shape,
-the design each part builds to, and the gate that closes it. **Nothing below describes current
-behaviour.**
+**Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
+built 2026-10-05; Part C detailed 2026-10-05; Parts C–H not built.** This replaces the sketch
+written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below were
+agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next, as
+administration's parts did; what is here is the phase's shape, the design each part builds to, and
+the gate that closes it. **Nothing below describes current behaviour.**
 
 ## Scope
 
@@ -282,7 +282,7 @@ the number the Definition of Done then holds.
 | HID boot keyboard and mouse, a mouse's report descriptor | Part B | no |
 | A one-byte write to a raw input node: a keyboard's lights | Part B | no — `IoOpcode::Write` exists, and a char node now takes it |
 | `DeviceKind::UsbDevice`; a departed flag and a generation in the registry | Parts A and C | no — not a hash input; `abi-sync-check` guards `libkern::device` |
-| A registry-changed notification kind | Part C | **yes** — a notification kind is ABI |
+| `/dev/registry/changes`, a node to read, in place of the registry-changed notification the scoping planned (Part C's detail pass, the maintainer's call) | Part C | no — a node and a path, where a notification kind would have been ABI |
 | Bulk-only transport and SCSI as a block device | Part D | no |
 | MBR partition tables, whole-disk filesystems, partition scans at runtime | Part D | no |
 | Limine's file media fields | Part D | no |
@@ -957,6 +957,235 @@ gates, and no gate.
   - `qemu-integration-tests.md`: the `--usb` variants, and which gates carry the hold-gate walk.
 - **The root `CLAUDE.md`**: the three `--usb` gates, `check-terminal`'s lock steps, and
   `test-qemu`'s bound devices.
+
+## Part C in detail *(2026-10-05)*
+
+**Arrivals and departures.** A device plugged in after boot reaches the owner of its class, and one
+unplugged leaves it:
+- the registry says a device went;
+- the manager follows the registry rather than reading it once;
+- the input server takes a device and lets it go;
+- a departed keyboard's held keys are released.
+
+### What exists, and what is missing (checked 2026-10-05)
+
+**The kernel:**
+- **The table only grows, and never says a device left** (`kernel/src/device.rs`). Each entry is
+  an owning reference kept for the boot. A disconnected USB device's record stays and looks
+  present, and its paths — `/dev/input/raw/<n>`, `/dev/registry/<id>` — go on resolving to it.
+- **Served indices are already never reused.** An input node takes the index after every input
+  node's (Part B.2), and a departed one would keep its own.
+- **The snapshot has no generation, and its header no room for one.** `RegistryHeader` is magic,
+  version, count and record size: sixteen bytes. **A record has one spare byte**, `_pad` at
+  offset 39.
+- **Nothing tells anyone that the table changed.** The notification queue has no kind for it, and
+  **the kernel has no way to name the device manager** to queue one for: a notification goes to a
+  process the kernel already has a reason to tell, as a parent is told `ChildExited`. Nor can a
+  kernel server leave a lookup waiting: `OpStatus::Pending` belongs to the forwarding arm of
+  `sys_ns_lookup` (`kernel/src/syscall/table.rs`) alone.
+- **The hub thread's departure** (`depart`, `kernel/src/drivers/xhci/hub.rs`) takes the device's
+  HID endpoints out of the DPC's table and disables its slot. It touches no record and no node.
+- **A USB input node's state is one of sixteen statics** (`NODES` in
+  `kernel/src/drivers/xhci/hid.rs`), taken in order and never given back. Its `CharBackend`
+  context is the index.
+- **A node's reader** (`drivers::input::Reader`) holds one parked read, and has no state for a
+  device that has gone.
+- **A departed keyboard's held keys are never released.** The last report decoded holds them
+  down, and no report follows it. The compositor repeats a held key until something else stops
+  the run.
+
+**Userspace:**
+- **`device-mgr` reads the registry once** (`userspace/device-mgr/src/main.rs`), and keeps each
+  class device's node by id. It encodes `Departed` and sends none.
+- **`input-server` takes arrivals after `Settled`, and retires a slot on `Departed`.** Both are
+  host-tested and neither has run.
+- **A read that completes with an error is logged and armed again**
+  (`userspace/input-server/src/main.rs`): `harvest`, then `arm`. A node answering `PeerClosed`
+  would log `read submit FAILED` and leave the wait set, its slot held, until a `Departed` came.
+- **Every reader finds block devices through `DeviceRecord::block_index`**
+  (`userspace/libkern/src/device.rs`): `libsession`, `eshell`'s `lsblk`, `boot-probe` and the test
+  harness all do. A departed record that answers `None` there is right for each of them at once.
+- **`boot-probe` holds the manager to a prefix of the registry** (Part A.3), because the manager
+  missed whatever arrived after its one read.
+
+**QEMU** — `hw/input/hid.c`, `hw/usb/dev-hid.c` and `ui/input.c`, read at 8.2.2 and 11.0:
+- **A USB keyboard becomes the target of injected keys when it is plugged in.** `hid_init`
+  activates its handler, which moves it to the head of the list `input-send-event` searches.
+  Unplugged, the next keyboard is the target again.
+- **A USB mouse becomes the target of injected motion on its first poll**: `hid_pointer_activate`,
+  from its interrupt IN, once.
+- **Nothing is sent for a key held when its device goes.** QEMU unregisters the handler, and the
+  guest is left with the last report.
+
+### The shape
+
+**A departure is a state of a record, not its removal.** An id is a record's place, and
+`/dev/registry/<id>`, `device-mgr`'s `usb-<id>` and an owner's `Departed` all name a device by it.
+- **A departed record keeps its fields, its id and its served index**, which no later device takes.
+- **It says so.** The spare byte becomes `flags`, and `DEPARTED` (`0x01`) is its first bit. The
+  layout is unchanged.
+- **Its children depart with it**: every record whose parent chain reaches it. That is a USB
+  device's keyboard and mouse, and in Part D a stick's disk and that disk's partitions.
+- **Its paths stop resolving.** `/dev/input/raw/<n>`, `/dev/blk/<n>` and `/dev/registry/<id>`
+  answer `NotFound`. A handle already held stays valid, and what it does is its driver's (below).
+- **`DeviceRecord::block_index` answers `None` for a departed record**, and a new `input_index`
+  beside it does the same. A reader that asks either is right without knowing departures exist.
+
+**The table has a generation**, bumped once per change: a registration, or a departure with its
+children. **The snapshot carries it.** `REGISTRY_VERSION` becomes 2, and the header 24 bytes, with
+`generation: u64` after `record_size`. Every reader parses through `libkern::device::records`,
+which is the one place to change; version 1 is refused, as a mismatched version is today.
+
+**The event source is a node to read, not a notification.** `/dev/registry/changes` is a char node.
+A `Read` on it **waits until the generation is past the read's `offset`**, then completes with the
+current generation, eight bytes. A reader that is behind is answered at once.
+- **No change can be missed**: the manager reads a snapshot, then waits past the snapshot's
+  generation. A change in between answers the wait at once.
+- **It is the model the system already has**: `sys_io_submit`, a `PendingOperation`, and `sys_wait`
+  beside whatever else the reader waits on — as `input-server` waits on its devices.
+- **Authority is the binding**, as for `/dev/registry`: the root namespace, and nothing else.
+- **Four reads may wait at once** — the manager's and `boot-probe`'s with room to spare — and a
+  fifth is refused, `WouldBlock`.
+- **They are answered from the thread that changed the table**, after its lock is let go:
+  completing takes the scheduler's lock.
+
+**Why not the notification the scoping planned** (§ *The event source*): the kernel cannot name the
+manager. Telling it would need the manager to register — "notify me" — which is a watch by
+another name, and a notification kind besides, which is ABI. A lookup left waiting until the next
+change was weighed too: no kernel server can leave a lookup pending today, and the node needs no
+new path through `sys_ns_lookup`. **The maintainer agreed to the node**, below.
+
+**A USB device departs in the hub thread**, in this order:
+1. **Each bound HID endpoint's last report is decoded against an empty one**, as if every key and
+   button had been let go, and the events are pushed to its node: releases, then `SYN_REPORT`.
+   A departed keyboard's held keys are released, and so is a mouse's button, ending a drag.
+2. **Its endpoints leave the DPC's table**, as `unbind` does now.
+3. **Its nodes retire.** A read already parked is answered with the releases. A read that finds
+   the ring drained completes at once, `PeerClosed`. A lights write still waiting is completed
+   `PeerClosed`, as a new one is refused.
+4. **Its records depart**: the device, its keyboards and its mice, as one generation. The reads
+   waiting on `/dev/registry/changes` are answered.
+5. **Its slot is disabled and its memory freed**, as now.
+
+**A USB node's static slot is given back** once its node has retired and its last read has been
+dropped in thread context. **A slot carries an epoch**, in its `CharBackend` context beside the
+index, so a handle to a node retired from a slot that has since been reused is refused
+`PeerClosed`, rather than served the next device's ring. The sixteen then bound the devices
+*attached*, not every device ever attached.
+
+**`device-mgr` follows the table:**
+- after its first read it keeps a read waiting on `/dev/registry/changes`, at the snapshot's
+  generation;
+- when that completes, it reads the snapshot again and **diffs it against the records it holds**.
+  A record that is new and present is an `Arrived` to its class's owner, carrying a duplicate of
+  its node. A record that was present and has departed is a `Departed`, and the manager closes its
+  own handle to the node. **A record that arrived and departed between two reads is told to no
+  one**;
+- a class with no owner yet keeps its arrivals for the replay, which leaves departed records out;
+- `/dev/devices` lists present devices, and a departed device's `usb-<id>.tsm` is gone.
+
+The diff is a function of two lists of records, and host-tested as one.
+
+**`input-server`:**
+- **a read that completes `PeerClosed` is its device leaving.** The slot is not armed again, and the
+  line is logged once, until the `Departed` that follows retires it;
+- a device arriving after `Settled` takes a free slot and is written the lights (Part B.5).
+
+**Nothing changes in the compositor**: the releases are ordinary events, and a held key's release
+stops its repeat as any release does.
+
+### The maintainer's calls, 2026-10-05
+
+- **The event source is the node**, `/dev/registry/changes`, not the notification the scoping
+  planned. The node changes no ABI; the notification would have changed the hash, and needed a
+  registration as well.
+- **Departed records stay for the boot.** A replug costs a record, 144 bytes in every snapshot
+  after it, and dropping records would break "an id is its place". Recorded under
+  `usb-departed-records`, with the snapshot's size as the trigger.
+
+### Calls made in this pass, without the maintainer
+
+- **A departed path answers `NotFound`**, not a node that fails every request: the path names
+  something that is no longer there, and a holder of the old handle learns it from the handle.
+- **The releases come from the driver.** The driver holds the last report, which is the only place
+  a device's held keys are known. `input-server` merges the devices into one stream, and the
+  compositor's interpreter sees only that stream, so neither can tell which keys were the
+  departed device's.
+- **Slots are recycled, with an epoch**, rather than allocated per binding: the DPC stays free of
+  allocation, and a stale handle cannot reach a new device.
+- **The generation goes in the snapshot, not only in the change node's answer**, so a snapshot says
+  which state of the table it is.
+
+### Pieces
+
+- **C.1 The registry.** `flags` and `DEPARTED`; the generation and the version 2 header; a
+  departure with its children; departed paths answering `NotFound`; `block_index` and
+  `input_index`; `/dev/registry/changes`. Host tests: a departure marks every descendant and only
+  them; a departed served index is never reissued; the snapshot marks rather than omits; each
+  path refuses a departed device; the generation counts every change; a waiting read is
+  answered by the next change and not before, and at once when behind.
+- **C.2 USB departure.** The releases, the nodes retired, the records departed, the slots
+  recycled with epochs. Host tests:
+  - a keyboard's last report against an empty one releases every key and then every modifier,
+    and a mouse's releases every button;
+  - a retired reader is answered with what its ring holds, then `PeerClosed`;
+  - a handle whose epoch is stale is refused.
+- **C.3 The manager follows.** The waiting read, the diff, the owners and the tables. Host tests on
+  the diff: an arrival, a departure, both in one read, a record that came and went unseen, and a
+  departure for a class with no owner.
+- **C.4 `input-server`.** `PeerClosed` as a departure.
+- **C.5 The gates.** Below.
+- **C.6 Docs.** Below.
+
+### Gates
+
+- **`check-input --usb` gains its last steps**:
+  1. **The boot keyboard unplugged** over QMP: the manager sends `Departed`, and `input-server`
+     retires its slot.
+  2. **A keyboard plugged in**, which is then the only one: the manager sends `Arrived`,
+     `input-server` reads it, its lights are acknowledged, and a key typed on it reaches the test
+     client's window.
+  3. **A key held down on it** — `input-send-event`, down only — is seen pressed by the window; the
+     keyboard is unplugged; and **the window sees the release.** The slot is retired.
+  4. `input-server` logged no failed submit.
+
+  The order matters: the boot keyboard leaving first makes every key in step 2 the new
+  keyboard's, since there is no other.
+- **`test-qemu`**: the hot-plugged keyboard, and the mouse swapped in for it, are each handed to
+  `input-server` and departed from it, on the port the transcript names. **`boot-probe` holds the
+  manager to the whole registry** — waiting, within a bound, until the manager has caught up —
+  where it held it to a prefix.
+- **Controls**, planned:
+  - a departure that does not bump the generation: step 1 times out;
+  - no releases: step 3's release never arrives;
+  - `input-server` arming a `PeerClosed` node again: step 4 fails;
+  - an `Arrived` sent for a departed record, and the epoch check removed: their host tests fail.
+
+The gate set stays at 42: these are steps in gates that exist.
+
+### Not in Part C
+
+- **Disks arriving and departing** (Part D). The registry's departure carries them, and what the
+  storage service does with one is Part D's.
+- **Compacting the table**, which the second call above declines.
+- **External hubs**, out of the phase.
+- **Suspend and resume.**
+
+### Docs Part C owes
+
+- **`device-node.md`**: `flags` and `DEPARTED`, the generation and the version 2 header, departed
+  paths, `/dev/registry/changes`, and served indices never reused.
+- **`io-operation.md`**: the change node's `Read`, and what its `offset` means.
+- **`device-manager.md`**: the manager following the table and the diff, and §9's gap closed.
+- **`rsproto-devices-ops.md`**: its Status — `Departed` is sent, and so are later arrivals.
+- **`input-subsystem.md`**: the hotplug source exists, a departure releases what was held, and
+  `input-server` takes `PeerClosed` as a departure.
+- **`usb.md`**: a departure's order, a node retiring, slots given back.
+- **`deferred-decisions.md`**: `usb-departed-records`, with records retired in place and nodes
+  given back, and the table's growth what remains.
+- **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-input --usb`'s new steps and
+  `test-qemu`'s.
+- **The kernel work table above**: its notification row, which the first call settled.
 
 ## Definition of Done
 
