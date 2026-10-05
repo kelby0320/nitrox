@@ -14,6 +14,11 @@ on:
     branches: [main]
     paths: &input_paths
       - 'kernel/src/drivers/ps2/**'
+      # Each raw input node's ring, parked read and hand-off, PS/2's until Phase 6 Part B.1.
+      - 'kernel/src/drivers/input/**'
+      # USB HID (Phase 6 Part B): the reports' meaning, and the xHCI binding that fetches them.
+      - 'kernel/src/drivers/hid/**'
+      - 'kernel/src/drivers/xhci/**'
       - 'kernel/src/arch/x86_64/ps2.rs'
       - 'kernel/src/libkern/input.rs'
       # The device nodes are published by the driver, **owned by the device table** in
@@ -129,3 +134,10 @@ jobs:
       # written off as gate flakiness.
       - name: cargo xtask check-input --no-ps2-irq
         run: cargo xtask check-input --no-ps2-irq --kvm
+
+      # **A machine with no i8042** (Phase 6 Part B): the same assertions with the only keyboard
+      # and mouse a USB one, so every key, click and wheel turn came through the xHCI driver's HID
+      # binding or not at all — the wheel through the mouse's report descriptor. The PS/2-only
+      # held-release step is skipped.
+      - name: cargo xtask check-input --usb
+        run: cargo xtask check-input --usb --kvm

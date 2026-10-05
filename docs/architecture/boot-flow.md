@@ -264,10 +264,11 @@ each step's rationale is in the source comments:
     because every fact it shows now exists — drivers bound, CPUs up, the aperture recorded — and no
     userspace does. It copies the kernel log out of the ring, holds the framebuffer console
     (writes still reach the grid and COM1, and none is drawn over the page), and shows the log a
-    page at a time, each with a `— page 2/3 — any key —` prompt, turning on an i8042 key press. No
+    page at a time, each with a `— page 2/3 — any key —` prompt, turning on a key press from any
+    keyboard — the i8042's, or a USB one the hub thread's first round bound (Phase 6 Part B.2). No
     key within the bound (120 s, or `hwreport=<seconds>`) ends the whole report rather than the
     page; no keyboard, or no console on the screen, and nothing is held. The keys that turned the
-    pages are drained from the keyboard's ring before the next step.
+    pages are drained from every keyboard's ring before the next step.
 14. **The first userspace process**, then the boot thread retires. (A boot banner was drawn
     here until Phase 5 Part B, clearing the screen with nothing ordering it against the first
     client's frame.)

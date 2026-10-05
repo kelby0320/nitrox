@@ -2192,7 +2192,10 @@ fn view_broker_test(root_ns: u64) -> bool {
 /// - **its block records are exactly what probing `/dev/blk` finds** — the same number, and each
 ///   record's served index resolving to a device of the record's size, whose `info` gives the
 ///   record's name;
-/// - **the keyboard is served at 0 and the mouse at 1**, each resolving under `/dev/input/raw`;
+/// - **the i8042's keyboard is served at 0 and its mouse at 1**, each resolving under
+///   `/dev/input/raw`; a USB keyboard or mouse (Phase 6 Part B.2) resolves there too, at an index
+///   after every i8042 record's — from 0 on a machine with no i8042 — under its `UsbDevice` record,
+///   driven by `usb-hid`; and there is a keyboard and a mouse, from either;
 /// - every record's `/dev/registry/<id>` is a device node, **and its id is its place** — which a
 ///   phantom record read past the count, all zeros, cannot be;
 /// - **a USB device is under the controller that enumerated it** (Phase 6 Part A.3): its parent a
@@ -2216,6 +2219,14 @@ fn registry_test(root_ns: u64) -> bool {
     let total = all.len();
     let mut blocks = 0u32;
     let (mut keyboard, mut mouse) = (false, false);
+    // **Where a USB input record may be served from: after every i8042 record**, which on a machine
+    // with no i8042 is 0. A fixed 2 failed every USB record on that machine (PR #358 review).
+    let usb_from = all
+        .iter()
+        .filter(|r| matches!(r.kind(), DeviceKind::Keyboard | DeviceKind::Mouse) && r.driver() != b"usb-hid")
+        .map(|r| r.served.saturating_add(1))
+        .max()
+        .unwrap_or(0);
     for (place, r) in all.iter().enumerate() {
         if r.id as usize != place {
             Line::new().s(b"boot-probe: registry: record ").u(place as u64).s(b" says it is ").u(r.id as u64).end();
@@ -2255,12 +2266,36 @@ fn registry_test(root_ns: u64) -> bool {
                 }
             }
             DeviceKind::Keyboard | DeviceKind::Mouse => {
-                let want = if r.kind() == DeviceKind::Keyboard { 0 } else { 1 };
                 let raw = alloc::format!("/dev/input/raw/{}", r.served);
                 let (st, h) = ns_lookup(root_ns, raw.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
                 close(h);
-                if r.served != want || st != 0 {
+                if st != 0 {
                     return fail(b"an input record is not at its raw index");
+                }
+                if r.driver() == b"usb-hid" {
+                    let under_usb = all.get(r.parent as usize).is_some_and(|p| p.kind() == DeviceKind::UsbDevice);
+                    if !under_usb || r.served < usb_from {
+                        return fail(b"a USB input record is not under its USB device, after the i8042's");
+                    }
+                    if r.kind() == DeviceKind::Keyboard {
+                        keyboard = true;
+                    } else {
+                        mouse = true;
+                    }
+                    let what = if r.kind() == DeviceKind::Keyboard { b"keyboard".as_slice() } else { b"mouse" };
+                    Line::new()
+                        .s(b"boot-probe: registry: usb ")
+                        .s(what)
+                        .s(b" at /dev/input/raw/")
+                        .u(r.served as u64)
+                        .s(b", under usb-")
+                        .u(r.parent as u64)
+                        .end();
+                    continue;
+                }
+                let want = if r.kind() == DeviceKind::Keyboard { 0 } else { 1 };
+                if r.served != want {
+                    return fail(b"an i8042 input record is not at its raw index");
                 }
                 if r.kind() == DeviceKind::Keyboard {
                     keyboard = true;
@@ -2452,10 +2487,14 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"the directory would not list");
     }
     // The records the manager read: the registry's first `read`, since a record is never removed
-    // until Part C, and nothing but a USB device is added after the boot.
+    // until Part C, and nothing but a USB device — or a keyboard or mouse one provides (Part B.2) —
+    // is added after the boot.
     let read = names.saturating_sub(1);
     let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
-    let later_all_usb = registry.get(read..).is_some_and(|later| later.iter().all(usb));
+    let usb_or_its_input = |r: &libkern::device::DeviceRecord| {
+        usb(r) || (r.driver() == b"usb-hid" && registry.get(r.parent as usize).is_some_and(usb))
+    };
+    let later_all_usb = registry.get(read..).is_some_and(|later| later.iter().all(usb_or_its_input));
     if !has_all || !later_all_usb {
         Line::new().s(b"boot-probe: devices: ").u(names as u64).s(b" entries for ").u(registry.len() as u64).s(b" devices").end();
         return fail(b"the directory is not all.tsm and a file per device the manager read");
@@ -2504,7 +2543,7 @@ fn devices_test(root_ns: u64) -> bool {
         .u(usb_named as u64)
         .s(b" of them usb-<id>, and ")
         .u((registry.len() - read) as u64)
-        .s(b" USB devices since ok")
+        .s(b" USB records since ok")
         .end();
     true
 }

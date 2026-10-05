@@ -3354,6 +3354,7 @@ pub fn reap_pending() {
     // thread-context drop (decision log, 2026-08-06).
     crate::drivers::console::reclaim_completed();
     crate::drivers::ps2::reclaim_completed();
+    crate::drivers::xhci::hid::reclaim_completed();
     loop {
         let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
             [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];

@@ -241,6 +241,10 @@ under `sys_wait` — blocks it with a deadline on the same waitables. The USB hu
   a process.
 - **A wait on nothing with a deadline sleeps**, which is how the thread takes the delays a
   protocol requires without spinning.
+- **What needs no wait stays in the DPC** (Phase 6 Part B.2): a HID report is decoded, delivered
+  and its transfer queued again there, since none of that waits on the device. The thread comes
+  back only for what needs a command and its answer — a halted endpoint's reset — signalled through
+  the same `InterruptObject`.
 
 ## Device discovery and enumeration
 

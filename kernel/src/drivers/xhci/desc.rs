@@ -15,6 +15,14 @@ pub mod kind {
     pub const STRING: u8 = 3;
     /// An interface descriptor.
     pub const INTERFACE: u8 = 4;
+    /// An endpoint descriptor.
+    pub const ENDPOINT: u8 = 5;
+    /// A HID descriptor, between a HID interface and its endpoints.
+    pub const HID: u8 = 0x21;
+    /// A HID report descriptor, as a HID descriptor names it.
+    pub const REPORT: u8 = 0x22;
+    /// A SuperSpeed endpoint's companion, after the endpoint.
+    pub const SS_COMPANION: u8 = 0x30;
 }
 
 /// A device descriptor's fields.
@@ -129,6 +137,129 @@ pub fn interfaces(b: &[u8]) -> impl Iterator<Item = Interface> + '_ {
         }
         None
     })
+}
+
+/// A configuration's `bConfigurationValue`, what `SET_CONFIGURATION` names it by, or `None` if `b`
+/// is not one.
+pub fn configuration_value(b: &[u8]) -> Option<u8> {
+    configuration_total(b)?;
+    Some(b[5])
+}
+
+/// **The descriptors inside a configuration**, after the configuration's own, each as its bytes: the
+/// same walk as [`interfaces`], by each descriptor's own length within `wTotalLength`, ending at a
+/// length that is too short or runs past the bytes.
+fn descriptors(b: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
+    let total = configuration_total(b).map_or(0, |t| (t as usize).min(b.len()));
+    let mut at = if total > 0 { b[0] as usize } else { total };
+    core::iter::from_fn(move || {
+        if at + 2 > total {
+            return None;
+        }
+        let len = b[at] as usize;
+        if len < 2 || at + len > total {
+            at = total;
+            return None;
+        }
+        let here = at;
+        at += len;
+        Some(&b[here..here + len])
+    })
+}
+
+/// **An endpoint** (USB 2.0 §9.6.6): its address, its maximum packet and burst, and its interval as
+/// the descriptor gives it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    /// `bEndpointAddress`: the number in bits 3:0, IN in bit 7.
+    pub address: u8,
+    /// `wMaxPacketSize` bits 10:0.
+    pub max_packet: u16,
+    /// Further packets per interval: a high-speed periodic endpoint's `wMaxPacketSize` bits 12:11,
+    /// or a SuperSpeed one's companion `bMaxBurst`; 0 otherwise.
+    pub burst: u8,
+    /// `bInterval`, as the descriptor says it; `context::interval` encodes it.
+    pub interval: u8,
+}
+
+impl Endpoint {
+    /// Its Device Context Index: twice its number, plus one for IN.
+    pub fn dci(&self) -> u8 {
+        (self.address & 0xF) * 2 + (self.address >> 7)
+    }
+}
+
+/// **A HID interface** (Phase 6 Part B.2): its number and class triple, its first interrupt-IN
+/// endpoint if it has one, and the length of the report descriptor its HID descriptor names.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HidInterface {
+    pub number: u8,
+    pub class: (u8, u8, u8),
+    pub endpoint: Option<Endpoint>,
+    /// The report descriptor's `wDescriptorLength`; 0 when there is no HID descriptor.
+    pub report_len: u16,
+}
+
+/// **The HID interfaces a configuration describes**, alternate setting 0 only, each with what
+/// follows it up to the next interface: its HID descriptor, its first interrupt-IN endpoint, and that
+/// endpoint's SuperSpeed companion. At most four; a configuration with more has them ignored.
+pub fn hid_interfaces(b: &[u8]) -> impl Iterator<Item = HidInterface> {
+    let mut found: [Option<HidInterface>; 4] = [None; 4];
+    let mut n = 0;
+    let mut current: Option<HidInterface> = None;
+    // Whether the last descriptor was the current interface's chosen endpoint, so a companion after
+    // it is that endpoint's.
+    let mut after_endpoint = false;
+    for d in descriptors(b) {
+        match d[1] {
+            kind::INTERFACE if d.len() >= 9 => {
+                if let Some(h) = current.take()
+                    && n < found.len()
+                {
+                    found[n] = Some(h);
+                    n += 1;
+                }
+                if d[3] == 0 && d[5] == 0x03 {
+                    current = Some(HidInterface { number: d[2], class: (d[5], d[6], d[7]), endpoint: None, report_len: 0 });
+                }
+                after_endpoint = false;
+            }
+            kind::HID if d.len() >= 9 => {
+                if let Some(h) = current.as_mut()
+                    && d[6] == kind::REPORT
+                {
+                    h.report_len = u16::from_le_bytes([d[7], d[8]]);
+                }
+                after_endpoint = false;
+            }
+            kind::ENDPOINT if d.len() >= 7 => {
+                after_endpoint = false;
+                let Some(h) = current.as_mut() else { continue };
+                let interrupt_in = d[3] & 0x3 == 0x3 && d[2] & 0x80 != 0;
+                if h.endpoint.is_none() && interrupt_in {
+                    let w = u16::from_le_bytes([d[4], d[5]]);
+                    let burst = ((w >> 11) & 0x3) as u8;
+                    h.endpoint = Some(Endpoint { address: d[2], max_packet: w & 0x7FF, burst, interval: d[6] });
+                    after_endpoint = true;
+                }
+            }
+            kind::SS_COMPANION if d.len() >= 6 => {
+                if after_endpoint
+                    && let Some(e) = current.as_mut().and_then(|h| h.endpoint.as_mut())
+                {
+                    e.burst = d[2];
+                }
+                after_endpoint = false;
+            }
+            _ => after_endpoint = false,
+        }
+    }
+    if let Some(h) = current
+        && n < found.len()
+    {
+        found[n] = Some(h);
+    }
+    found.into_iter().flatten()
 }
 
 /// What this kernel has, or will have, a driver for.
@@ -418,6 +549,89 @@ mod tests {
         let iad = device(&iad).unwrap();
         assert_eq!(class_match(&iad, &keyboard_config()), Match::BootKeyboard);
         assert_eq!(record_class(&iad, &keyboard_config()), (0xEF, 0x02, 0x01), "the record keeps the device's");
+    }
+
+    /// **QEMU's keyboard and mouse, as HID interfaces** (Phase 6 Part B.2), from the bytes they sent:
+    /// each one interface with its interrupt-IN endpoint 1 and its report descriptor's length, and
+    /// the reader none. Endpoint 1 IN is Device Context Index 3.
+    #[test]
+    fn qemus_hid_interfaces_read_with_their_endpoints() {
+        let kbd = hex("09022200010108a032090400000103010100092111010001223f0007058103080007");
+        let found: Vec<HidInterface> = hid_interfaces(&kbd).collect();
+        let ep = Endpoint { address: 0x81, max_packet: 8, burst: 0, interval: 7 };
+        assert_eq!(found, vec![HidInterface { number: 0, class: (3, 1, 1), endpoint: Some(ep), report_len: 63 }]);
+        assert_eq!(ep.dci(), 3);
+        assert_eq!(configuration_value(&kbd), Some(1));
+        let mouse = hex("09022200010106a0320904000001030102000921010000012234000705810304000a");
+        let m: Vec<HidInterface> = hid_interfaces(&mouse).collect();
+        assert_eq!(m[0].endpoint, Some(Endpoint { address: 0x81, max_packet: 4, burst: 0, interval: 10 }));
+        assert_eq!((m[0].class, m[0].report_len), ((3, 1, 2), 52));
+        let ccid = hex(concat!(
+            "09025d00010100e03209040000030b00000436211001000701000000a00f000000000100008025000000",
+            "c2010000fe0000000000000000000000fe04010012000100ffff000001010705810340",
+            "00ff0705820240000007050302400000"
+        ));
+        assert_eq!(hid_interfaces(&ccid).count(), 0, "a smart-card reader is not HID");
+    }
+
+    /// **A receiver with a keyboard, a mouse and a vendor interface** gives two HID interfaces, each
+    /// with its own endpoint; an OUT endpoint and an alternate setting's are passed over; a
+    /// high-speed endpoint's extra transactions and a SuperSpeed companion's burst are read.
+    #[test]
+    fn each_hid_interface_takes_its_own_interrupt_in_endpoint() {
+        let mut c = vec![9, 2, 0, 0, 3, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 2, 3, 1, 1, 0]); // keyboard, alt 0
+        c.extend_from_slice(&[9, 0x21, 0x11, 0x01, 0, 1, 0x22, 65, 0]);
+        c.extend_from_slice(&[7, 5, 0x01, 3, 8, 0, 10]); // an OUT interrupt endpoint: not this one
+        c.extend_from_slice(&[7, 5, 0x81, 3, 8, 0x10, 4]); // IN, 8 bytes, bits 12:11 = 2
+        c.extend_from_slice(&[9, 4, 0, 1, 1, 3, 1, 1, 0]); // the keyboard's alternate setting
+        c.extend_from_slice(&[7, 5, 0x83, 3, 64, 0, 1]); // its endpoint: not alt 0's
+        c.extend_from_slice(&[9, 4, 1, 0, 1, 3, 1, 2, 0]); // mouse
+        c.extend_from_slice(&[7, 5, 0x82, 3, 4, 0, 10]);
+        c.extend_from_slice(&[6, 0x30, 3, 0, 4, 0]); // SuperSpeed companion: burst 3
+        c.extend_from_slice(&[9, 4, 2, 0, 1, 0xFF, 0, 0, 0]); // vendor
+        c.extend_from_slice(&[7, 5, 0x84, 3, 64, 0, 1]);
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        let found: Vec<HidInterface> = hid_interfaces(&c).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].endpoint, Some(Endpoint { address: 0x81, max_packet: 8, burst: 2, interval: 4 }));
+        assert_eq!(found[0].report_len, 65);
+        assert_eq!(found[1].number, 1);
+        assert_eq!(found[1].endpoint, Some(Endpoint { address: 0x82, max_packet: 4, burst: 3, interval: 10 }));
+        assert_eq!(found[1].endpoint.unwrap().dci(), 5);
+        assert_eq!(found[1].report_len, 0, "no HID descriptor");
+    }
+
+    /// **A companion is its own endpoint's** (PR #358 review): one after an endpoint that is not the
+    /// chosen one — here an OUT endpoint after the chosen IN — leaves the chosen one's burst alone.
+    #[test]
+    fn a_companion_after_another_endpoint_is_not_the_chosen_ones() {
+        let mut c = vec![9, 2, 0, 0, 1, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 2, 3, 1, 2, 0]); // a mouse
+        c.extend_from_slice(&[7, 5, 0x81, 3, 4, 0, 10]); // IN: the chosen one
+        c.extend_from_slice(&[6, 0x30, 1, 0, 4, 0]); // its companion: burst 1
+        c.extend_from_slice(&[7, 5, 0x02, 3, 4, 0, 10]); // OUT
+        c.extend_from_slice(&[6, 0x30, 7, 0, 4, 0]); // the OUT endpoint's: burst 7
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        let found: Vec<HidInterface> = hid_interfaces(&c).collect();
+        assert_eq!(found[0].endpoint.map(|e| e.burst), Some(1));
+    }
+
+    /// **An endpoint that runs past the configuration is not read**: the interface is still there,
+    /// with no endpoint to bind.
+    #[test]
+    fn a_hid_endpoint_past_the_configuration_is_not_read() {
+        let mut c = vec![9, 2, 0, 0, 1, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 1, 3, 1, 1, 0]);
+        c.extend_from_slice(&[7, 5, 0x81, 3, 8, 0]); // one byte short
+        let total = c.len() as u16 + 1; // says one more byte than there is
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        let found: Vec<HidInterface> = hid_interfaces(&c).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].endpoint, None);
+        assert_eq!(configuration_value(&[9, 2]), None);
     }
 
     /// **A string, made printable**: UTF-16LE, anything outside printable ASCII as `?`, padding

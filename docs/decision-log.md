@@ -33631,3 +33631,185 @@ it was taken.
     `check-report --usb` depends on.
 
 Docs only; no ABI hash impact.
+
+## 2026-10-05 — Phase 6 Part B.1: the shared input node
+
+What a raw input node is moved out of the PS/2 driver into **`drivers::input`**, for USB HID to
+use in B.2. The pieces that moved:
+- the event ring (`ring.rs`, moved with `git mv` and its tests);
+- the parked read;
+- the DPC's hand-off of a finished read;
+- its reclaim in thread context;
+- the key count the hardware report turns its pages on.
+
+**It moved rather than being copied.** The hand-off was a use-after-free once (PR #178 review,
+blocking 1), and the reasoning that keeps it fixed now has one home.
+
+**The shape is a `Reader` per node, kept under its driver's lock.** PS/2 keeps one lock over its
+two nodes, since they share a controller. Each method is one step of the hand-off:
+- a read finds events, a parked reader, or room to park;
+- the DPC takes a ready read out (`take_ready`), delivers it with no lock held, and hands it back
+  (`owe`);
+- thread context takes it (`take_owed`) and drops it.
+
+The DPC never drops one, as before.
+
+**The hand-off now has host tests**, which it had none of while it was the PS/2 driver's (the
+2026-08 kernel audit noted `ps2/mod.rs` had no `#[test]`):
+- a read drains, parks, or is refused;
+- the DPC takes a parked read once, with the length it asked for;
+- a delivered read is destroyed only when its reclaimer drops it, counted by the destroy probe;
+- a read's length is floored to whole records.
+
+Three controls each fail one: an `owe` that drops, a take that ignores the read's length, and a read
+that ignores a parked reader.
+
+**`input.yml`'s path filter gains `kernel/src/drivers/input/**`.** The ring left `drivers/ps2/**`,
+so a change to it would otherwise run no input gate.
+
+No behaviour changes. No ABI hash impact: a module boundary inside the kernel.
+
+## 2026-10-05 — Phase 6 Parts B.2–B.4: USB keyboards and mice
+
+Built together: B.4's gates were what showed B.2 and B.3 working, and each control below needs one
+of them.
+
+**B.2, the binding and polling.**
+- The hub thread binds every boot keyboard and boot mouse interface as a step of enumeration:
+  1. Configure Endpoint for their interrupt-IN endpoints;
+  2. `SET_CONFIGURATION`;
+  3. `SET_PROTOCOL`;
+  4. `SET_IDLE (0)` to keyboards;
+  5. a node, and one Normal TRB.
+- The DPC routes every Transfer Event but the default endpoint's to a table of bound endpoints. It
+  decodes the report against the last, queues the TRB again, and delivers through B.1's
+  `drivers::input`. A halt is reset by the hub thread, with no `SYN_DROPPED` after it.
+- Nodes are one of sixteen statics, and the served index is the next after every input node's.
+  The records are `Keyboard`/`Mouse` under their `UsbDevice`, with driver `usb-hid`.
+- A departure takes the device's endpoints out of the DPC's table before Disable Slot.
+- The hardware report holds when any keyboard node exists, counts any keyboard's presses, and
+  drains them all.
+
+**B.3, the wheel.** A small report-descriptor parser finds a mouse's buttons, X, Y and wheel, with
+report IDs and fields at any width. A mouse it describes runs in report protocol, and any other in
+boot protocol. The decoding is bus-neutral, in `drivers::hid`, and the mouse decoder takes a layout,
+boot protocol's being one. The wheel is negated to this system's sign.
+
+**B.4, the gates.** `check-input`, `check-login` and `check-report` take `--usb`: q35 with
+`i8042=off`, the gates' controller, `usb-kbd` and `usb-mouse`. CI runs all three under KVM.
+
+**What the first boots said:**
+- `test-qemu` bound its keyboard at `/dev/input/raw/2` and its mouse at `/3`.
+  - The hot-plugged keyboard was bound at `/4` and taken away when it left.
+  - The mouse swapped in for it was bound at `/5`.
+  - No endpoint halted.
+- **`check-input --usb` passed everything up to the wheel before B.3**, and everything after it:
+  the stalled-consumer motion sum, keys, chords, routing and the late key. It stopped exactly where
+  B.3 was missing, so that boot was B.3's negative control before B.3 existed.
+- `check-login --usb` passed a whole session typed and clicked on USB.
+- `check-report --usb` turned its pages on USB key presses.
+
+**Found on the way:**
+- **`input-server`'s device count is not a fixed fact.** Under TCG the manager read the registry
+  after the hot-plugged keyboard was bound, and handed over five devices where KVM handed four: the
+  Part A.3 race, now reaching input. The host asserts a bound instead: the i8042's two and the
+  first round's bindings, at least.
+- **The parser took a device's report sizes on trust.** A count and size whose product overflows
+  would have panicked a debug kernel, and a huge count would have looped two billion times at boot.
+  Found reading it back before any review. Checked arithmetic and a one-page limit end the walk
+  instead. A host test holds both: one overflows, one is bounded to a second. Each guard fails its
+  control: a panic, and 9.7 s. **Neither guard sees fields of no bits**, whose product is zero: the
+  review found that hole (the entry below).
+- **Two doc comments orphaned again**, by inserting an item where another's doc comment ended, in
+  `ring.rs` and `xtask`. The sweep caught both.
+- **`check-login --usb` under TCG failed on an ordering the gate had assumed.** When a file is
+  dragged out of `nxfiles`, it says so after asking the compositor to start the drag, and the
+  compositor says so on receipt: two processes answering one gesture, ordered by nothing. With USB
+  timing the compositor's line came first, and the gate's first `expect` scanned past it — the
+  transcript shows both lines, reversed. Both are now expected in either order. So is `nxterm`'s
+  title-bar drag and the compositor's receipt of it, which has the same shape. The drop on the
+  editor does not: the compositor logs before it delivers, so `nxedit` always speaks second.
+
+**Controls**, each failing:
+- **Boots:**
+  - a DPC that does not re-queue: only the first motion arrives (7, 3 of 210, 90);
+  - the report's presence check asking the i8042 alone: the report holds no page;
+  - no USB key count: page 2 never comes;
+  - the wheel not negated, and the descriptor ignored: the wheel step fails.
+- **Host:** `ErrorRollOver` decoded, the served index counted, and the interval encoded as high
+  speed's.
+
+No ABI hash impact: a driver, a table, records of existing kinds, and a gate flag.
+
+## 2026-10-05 — PR #358, reviewed: two lock-order panics on a halt, and fields of no bits
+
+Two blocking findings, three worth fixing and three optional. All are fixed.
+
+**1. A halted HID endpoint panicked the kernel, at two sites.** The DPC woke the hub thread while
+holding the bound endpoints' table, which is a leaf lock; waking takes the scheduler's lock. Then
+`recover` printed under the same lock, and printing takes the serial port's. The lock-order tracker
+is in every kernel this project builds, the laptop's included. Now:
+- the DPC wakes after letting the lock go;
+- `recover` settles each endpoint's outcome under the lock and prints after it.
+
+The rest of the xHCI driver was swept for the class, and lets its locks go first.
+
+Two more faults on the same path, found by reading it:
+- **A halt was counted on every `recover` pass that found the endpoint still marked**, not once per
+  halt. An endpoint whose reset failed was counted again each time another endpoint halted. Each
+  halt is now counted once, when the DPC sees it.
+- **A failed reset left the endpoint marked halted**, retried only when something else halted.
+  Now it leaves the endpoint stopped, like a third halt.
+
+**The reviewer's probe**, the fifth HID Transfer Event read as a stall, was run on both paths:
+- **Before the fix** it panicked under `check-input --usb --kvm`: `lock-order violation: acquiring
+  Sched (rank 10) while holding Leaf (rank 90)`.
+- **After it**, no panic. `recover` ran, and QEMU answered Reset Endpoint with completion code 19,
+  Context State Error, since a stall simulated in the driver is not a halt in the controller. The
+  endpoint was left stopped, logged, and the gate failed downstream on the motion it carried.
+
+A successful reset cannot be seen on QEMU at all: its HID devices never stall an interrupt endpoint.
+
+**2. Report Size 0 passed both of the parser's guards.** The product of size and count is zero, so
+no count was too large, and the field loop ran for as long as the count: 19 s for one item. An item
+whose fields have no bits is now passed over. With a bit or more per field, the cumulative one-page
+limit bounds every report's fields, and so the walk. The guard test holds the reviewer's
+descriptor to under a second; without the guard it fails at 19.4 s.
+
+**3. `boot-probe` failed its registry test on the `--usb` machine, and the gate passed.** It wanted
+every USB input record at index 2 or above, and its keyboard and mouse from the i8042. Both are
+wrong on a machine with no i8042. A USB record now comes after every i8042 record (from 0 when there
+is none), and a keyboard and a mouse may come from either.
+
+**Why no gate saw it:** only `test-qemu` exits on the probe's verdict. **`check-input` and
+`check-display` now wait for `boot-probe: test-harness verdict PASS`**. `check-terminal` already
+failed on a failing probe, through the exit code `service-mgr` reports. Each half of the probe fix
+fails `check-input --usb` when reverted, at the verdict.
+
+**4. `bind` kept using the default endpoint after a failure that may have left a request on it.**
+Any failure but a stall now ends the binding at that interface. Nothing more is asked of that
+endpoint, the interface and those after it are not bound, and those before stay bound. A keyboard
+whose `SET_IDLE` fails so is past its last request, and is bound, the last. This is
+`hub::control_in`'s rule, which enumeration keeps by ending the device. No gate reaches it, since
+QEMU's devices answer every request; a host test pins which failures leave the endpoint in doubt.
+
+**And the gate run found the race it had been hiding.** `test-qemu`'s hot-plug swapped the keyboard
+for a mouse, then pulled the mouse, as soon as each one's *arrival* line appeared. Binding was still
+asking the device for its protocol and idle rate at that moment, and the request to a device taken
+away timed out. Under the rule above that leaves the device unbound, and the gate wants it bound.
+- **It passed before only because a failed report-protocol `SET_PROTOCOL` was ignored**, so the
+  mouse was "bound" after it had left.
+- It failed once, under host load. The driver now waits for each binding line before taking the
+  device away; two runs under TCG and one under KVM passed after that.
+
+**5. Nothing tested the parser's collection scoping.** A joystick collection with relative X and Y
+before the mouse's now does. Each of the reviewer's two mutations fails it: the collection's usage
+not checked, and every collection read as the mouse's.
+
+**Optional:**
+- tests for Max ESIT Payload's high byte and for a companion after another endpoint, each failing its
+  mutation;
+- the node cap, sixteen for the boot, noted under `usb-departed-records`;
+- the ring's sizing comment corrected: a USB mouse polled every millisecond fills it in about 32 ms.
+
+No ABI hash impact.

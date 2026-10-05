@@ -71,7 +71,7 @@ const PORT_KEEP: u32 = (1 << 0) | (1 << 3) | (0xF << 10) | (1 << 30) | (0xF << 5
 
 /// Why a device was not enumerated, or a step did not complete.
 #[derive(Copy, Clone, Debug)]
-enum Failed {
+pub(super) enum Failed {
     /// The controller completed it with this code.
     Code(u8),
     /// No answer within its bound.
@@ -99,14 +99,16 @@ struct Attached {
     _mem: DeviceMem,
 }
 
-/// One device's input and output contexts, its default endpoint's ring, and a page for what its
-/// control transfers read.
-struct DeviceMem {
-    input: DmaBuffer,
+/// One device's input and output contexts, its default endpoint's ring, a page for what its
+/// control transfers read, and **its bound HID endpoints' rings and report buffers** (Phase 6 Part
+/// B.2), which are freed with the rest, only after its slot is disabled.
+pub(super) struct DeviceMem {
+    pub(super) input: DmaBuffer,
     output: DmaBuffer,
     ep0: DmaBuffer,
     ring: Producer,
     data: DmaBuffer,
+    pub(super) hid: KVec<DmaBuffer>,
 }
 
 /// The thread.
@@ -166,6 +168,8 @@ pub(super) extern "C" fn main(_arg: usize) {
         } else {
             sleep(1_000_000);
         }
+        // A HID endpoint that halted is reset before anything else: its device is still typing.
+        super::hid::recover(x);
         for port in 1..=x.max_ports {
             let s = portsc(x, port);
             if s & PORT_CSC == 0 {
@@ -214,6 +218,9 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     let Some(dev) = attached[port as usize].take() else {
         return;
     };
+    // **Its endpoints out of the DPC's table first**, so nothing touches a report buffer that the
+    // release below is about to free.
+    super::hid::unbind(x, dev.slot);
     match release(x, dev.slot, dev._mem) {
         Released::Freed => crate::kprintln!("usb: port {port}: disconnected; slot {} disabled", dev.slot),
         Released::Kept(why) => {
@@ -278,9 +285,12 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
         }
     };
     set_slot_context(x, slot, mem.output.phys().as_u64());
-    match address_and_read(x, port, slot, speed_id, &mut mem) {
-        Ok(facts) => {
-            record(x, port, facts);
+    let mut config = [0u8; CONFIG_MAX];
+    match address_and_read(x, port, slot, speed_id, &mut mem, &mut config) {
+        Ok((facts, config_len)) => {
+            let id = record(x, port, facts);
+            // **Then its HID interfaces bound** (Phase 6 Part B.2), under the record just made.
+            super::hid::bind(x, port, slot, speed_id, &mut mem, &config[..config_len], id);
             Ok(Attached { slot, _mem: mem })
         }
         Err((step, e)) => {
@@ -296,13 +306,17 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
 /// **Put the device in the registry** (Phase 6 Part A.3): a bare `Other` node, with what it is kept
 /// beside it in the table, under the controller's function. A device the table cannot take is still
 /// attached — it is only missing from `/dev/registry`, which is said.
-fn record(x: &Xhci, port: u8, facts: UsbFacts) {
+fn record(x: &Xhci, port: u8, facts: UsbFacts) -> Option<u32> {
     let Ok(node) = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO) else {
         crate::kprintln!("usb: port {port}: no memory for its node; it is not in the registry");
-        return;
+        return None;
     };
-    crate::device::register_usb(crate::drivers::adopt(node, KObjectType::DeviceNode), &x.pci, "xhci", facts);
+    crate::device::register_usb(crate::drivers::adopt(node, KObjectType::DeviceNode), &x.pci, "xhci", facts)
 }
+
+/// The longest configuration descriptor kept for the class drivers: QEMU's devices' are 34 to 93
+/// bytes, and a composite keyboard's a few hundred.
+const CONFIG_MAX: usize = 512;
 
 /// A device's memory, or `None` when there is not enough.
 fn device_mem() -> Option<DeviceMem> {
@@ -311,18 +325,19 @@ fn device_mem() -> Option<DeviceMem> {
     let ep0 = DmaBuffer::alloc(super::RING_TRBS * 16).ok()?;
     let data = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
     let ring = Producer::new(&mut DmaSlots(&ep0), ep0.phys().as_u64());
-    Some(DeviceMem { input, output, ep0, ring, data })
+    Some(DeviceMem { input, output, ep0, ring, data, hid: KVec::new() })
 }
 
-/// Address the device in `slot` and read what it is, in `mem`: what its record carries, or the step
-/// that failed and why.
+/// Address the device in `slot` and read what it is, in `mem`: what its record carries and how much
+/// of its configuration descriptor is in `config`, or the step that failed and why.
 fn address_and_read(
     x: &Xhci,
     port: u8,
     slot: u8,
     speed_id: u8,
     mem: &mut DeviceMem,
-) -> Result<UsbFacts, (&'static str, Failed)> {
+    config: &mut [u8; CONFIG_MAX],
+) -> Result<(UsbFacts, usize), (&'static str, Failed)> {
     let default = speed::default_max_packet0(speed_id);
     let ring_at = mem.ep0.phys().as_u64();
     let cycle = mem.ring.cycle();
@@ -358,7 +373,6 @@ fn address_and_read(
         .and_then(|b| desc::configuration_total(b).ok_or(Failed::Device("its configuration does not read")))
         .map_err(|e| ("reading its configuration", e))?;
     let len = (total as usize).min(crate::mm::PAGE_SIZE) as u16;
-    let mut config = [0u8; 512];
     let config_len = {
         let b = read_descriptor(x, slot, mem, desc::kind::CONFIGURATION, 0, 0, len)
             .map_err(|e| ("reading its configuration", e))?;
@@ -402,7 +416,7 @@ fn address_and_read(
         );
     }
     let name_len = if name_len > 0 { name_len } else { desc::ids_into(dev.vendor, dev.product, &mut name) };
-    Ok(UsbFacts { vendor: dev.vendor, product: dev.product, class, port, speed: speed_id, name, name_len })
+    Ok((UsbFacts { vendor: dev.vendor, product: dev.product, class, port, speed: speed_id, name, name_len }, config_len))
 }
 
 /// The product string, then ` (serial)` if it fits, into `out`. The length written; zero when the
@@ -462,7 +476,7 @@ fn string<'m>(x: &Xhci, port: u8, slot: u8, mem: &'m mut DeviceMem, index: u8, l
 /// **Recover a halted default endpoint** (xHCI 1.2 §4.6.8, §4.6.10): Reset Endpoint takes it from
 /// Halted to Stopped, and Set TR Dequeue Pointer moves it to the ring's enqueue point — past what is
 /// left of the stalled transfer — with the ring's cycle state. The next doorbell starts it there.
-fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem) -> Result<(), Failed> {
+pub(super) fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem) -> Result<(), Failed> {
     command(x, Trb::endpoint_command(kind::RESET_ENDPOINT, slot, DCI_EP0))?;
     let at = mem.ep0.phys().as_u64() + mem.ring.next_slot() as u64 * 16;
     command(x, Trb::set_dequeue(at, mem.ring.cycle(), slot, DCI_EP0))?;
@@ -474,6 +488,21 @@ fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem) -> Result<(), Failed> {
 /// left the rest zero, and the descriptor's own lengths say how much is real.
 fn read_descriptor<'m>(x: &Xhci, slot: u8, mem: &'m mut DeviceMem, kind: u8, index: u8, lang: u16, len: u16) -> Result<&'m [u8], Failed> {
     control_in(x, slot, mem, get_descriptor(kind, index, lang, len), len)?;
+    Ok(data_bytes(mem, len))
+}
+
+/// **A GET_DESCRIPTOR to interface `iface`** (Phase 6 Part B.3): a HID report descriptor, up to `len`
+/// bytes and a page. The bytes, as [`read_descriptor`]'s are.
+pub(super) fn read_interface_descriptor<'m>(
+    x: &Xhci,
+    slot: u8,
+    mem: &'m mut DeviceMem,
+    kind: u8,
+    iface: u8,
+    len: u16,
+) -> Result<&'m [u8], Failed> {
+    let len = len.min(crate::mm::PAGE_SIZE as u16);
+    control_in(x, slot, mem, [0x81, 6, 0, kind, iface, 0, len as u8, (len >> 8) as u8], len)?;
     Ok(data_bytes(mem, len))
 }
 
@@ -521,9 +550,31 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
     }
 }
 
+/// **A control transfer with no data stage** (Phase 6 Part B.2): Setup, then an IN Status stage,
+/// and a wait for the Status stage's completion or an error on either stage.
+pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) -> Result<(), Failed> {
+    let base = mem.ep0.phys().as_u64();
+    let po = new_operation()?;
+    // **Registered before the TRBs are written**, as `control_in`'s: the Status stage is one slot on.
+    let next = mem.ring.next_slot();
+    let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
+    let status_at = base + status_slot as u64 * 16;
+    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Transfer { slot, status: status_at }, po: PoPtr(po.as_ptr()) });
+    let mut slots = DmaSlots(&mem.ep0);
+    mem.ring.push(&mut slots, Trb::setup(request, false));
+    let at = mem.ring.push(&mut slots, Trb::status(false));
+    debug_assert_eq!(base + at as u64 * 16, status_at);
+    write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
+    match wait(x, &po, TRANSFER_NS) {
+        Some((code::SUCCESS, _)) => Ok(()),
+        Some((c, _)) => Err(Failed::Code(c)),
+        None => Err(Failed::Timeout),
+    }
+}
+
 /// **A command, and its completion**: the slot it names. A command left unanswered marks the
 /// controller wedged.
-fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
+pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
     let po = new_operation()?;
     let sent = {
         let c = x.cmd.lock();
@@ -629,7 +680,7 @@ fn set_slot_context(x: &Xhci, slot: u8, output: u64) {
 }
 
 /// The input context's bytes, cleared for a new command.
-fn input_bytes<'a>(input: &'a mut DmaBuffer, x: &Xhci) -> &'a mut [u8] {
+pub(super) fn input_bytes<'a>(input: &'a mut DmaBuffer, x: &Xhci) -> &'a mut [u8] {
     let len = x.layout.input_len();
     let bytes = &mut input.as_mut_slice()[..len];
     bytes.fill(0);

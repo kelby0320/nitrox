@@ -158,6 +158,32 @@ impl Registry {
         self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None })
     }
 
+    /// Append a keyboard or mouse a USB device provides (Phase 6 Part B.2), under `parent`, the
+    /// device's record. **Its served index is the next after every input node's**: the i8042 keeps
+    /// 0 and 1, and a machine without one starts at 0. A count of input nodes would collide where
+    /// the i8042 has a mouse and no keyboard. The index, or `None` when the table could not take it.
+    pub fn add_input(
+        &mut self,
+        node: ObjectRef,
+        kind: DeviceKind,
+        parent: Option<u32>,
+        driver: &'static str,
+    ) -> Option<u32> {
+        let served = self.next_input_index();
+        let parent = parent.unwrap_or(NO_PARENT);
+        self.push(Entry { node, kind, served, parent, driver, usb: None }).then_some(served)
+    }
+
+    /// The index after every input node's: the next `/dev/input/raw/<n>`.
+    fn next_input_index(&self) -> u32 {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.kind, DeviceKind::Keyboard | DeviceKind::Mouse))
+            .map(|e| e.served + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Append a USB device under the PCI function at `controller`'s address, carrying `facts`. Its
     /// id, which is its place, or `None` when the table could not take it.
     pub fn add_usb(
@@ -395,6 +421,17 @@ pub fn register_usb(
         crate::kprintln!("device: table full; dropping a USB device");
     }
     id
+}
+
+/// Append a keyboard or mouse a USB device provides, under its device's record `parent`, at the next
+/// `/dev/input/raw/<n>`. The table takes ownership of `node`. The `<n>`, or `None` when the table
+/// could not take it. From the hub thread (Phase 6 Part B.2).
+pub fn register_input(node: ObjectRef, kind: DeviceKind, parent: Option<u32>, driver: &'static str) -> Option<u32> {
+    let served = DEVICES.lock().add_input(node, kind, parent, driver);
+    if served.is_none() {
+        crate::kprintln!("device: table full; dropping a {:?}", kind);
+    }
+    served
 }
 
 /// The node `/dev/blk/<index>` serves, as a cloned owning reference (the table keeps its own).
@@ -636,6 +673,30 @@ mod tests {
         assert_eq!(text(&recs[5].driver, 3), "gpt");
         assert_eq!(text(&recs[7].name, recs[7].name_len), "keyboard");
         assert_eq!(recs[4].vendor, 0xFFFF, "the RAM disk is no PCI device");
+    }
+
+    /// **A USB keyboard or mouse takes the next index after every input node's** (Phase 6 Part
+    /// B.2): 2 and 3 beside the i8042's two, 0 and 1 on a machine without one, and 2 where the
+    /// i8042 has a mouse and no keyboard — where counting input nodes would give the mouse's 1.
+    #[test]
+    fn a_usb_input_node_takes_the_next_index_after_every_input_nodes() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        assert_eq!(r.add_input(char_node(), DeviceKind::Keyboard, Some(3), "usb-hid"), Some(2));
+        assert_eq!(r.add_input(char_node(), DeviceKind::Mouse, None, "usb-hid"), Some(3));
+        let recs = r.records(|_| None).unwrap();
+        let k = &recs[9];
+        assert_eq!((DeviceKind::from_u32(k.kind), k.served, k.parent), (DeviceKind::Keyboard, 2, 3));
+        assert_eq!(text(&k.driver, 7), "usb-hid");
+        assert_eq!(text(&k.name, k.name_len), "keyboard", "the kind word, as the i8042's");
+        assert_eq!(recs[10].parent, NO_PARENT);
+        assert_eq!(r.input(3).unwrap().as_ptr(), r.node(10).unwrap().as_ptr(), "/dev/input/raw/3 is the mouse");
+
+        let mut bare = Registry::new();
+        assert_eq!(bare.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(0), "no i8042");
+        let mut mouse_only = Registry::new();
+        assert!(mouse_only.add_char(char_node(), DeviceKind::Mouse, 1, "i8042"));
+        assert_eq!(mouse_only.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(2));
     }
 
     /// **The paths resolve through the same served index the records report.**
