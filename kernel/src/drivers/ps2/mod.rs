@@ -18,28 +18,27 @@
 //! neutrally because "ISA" is x86 jargon, and "a fixed legacy platform device wires its own
 //! interrupt inside the arch layer". The i8042 is exactly that class of device.
 //!
-//! This module owns what is portable: the scancode table, the mouse packet framing, and the
-//! event rings.
+//! This module owns what is portable: the scancode table and the mouse packet framing. Each
+//! node's ring, the read parked on it and its hand-off to thread context are
+//! [`crate::drivers::input`]'s, shared with USB HID since Phase 6 Part B.1.
 
 pub mod mouse;
-pub mod ring;
 pub mod scancode;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
+use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader};
 use crate::libkern::IrqSpinLock;
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
-use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
+use crate::libkern::input::InputEvent;
 use crate::libkern::lockrank::LockRank;
-use crate::mm::{PAGE_SIZE, heap};
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
-use crate::object::{DeviceNode, MemoryObject, ObjectRef};
+use crate::object::{DeviceNode, ObjectRef};
 use crate::syscall::error::KError;
-use ring::EventRing;
 
 /// The two devices this controller publishes, and their `/dev/input/raw/<n>` indices.
 pub const DEV_KEYBOARD: usize = 0;
@@ -48,46 +47,15 @@ pub const DEV_MOUSE: usize = 1;
 /// How many raw nodes exist.
 pub const DEV_COUNT: usize = 2;
 
-/// A parked `sys_io_submit(Read)` waiting for events on one device.
-struct ParkedRead {
-    po: ObjectRef,
-    buffer: ObjectRef,
-    buf_offset: u64,
-    max_len: usize,
-}
-
-/// Per-device state: its ring and the single reader waiting on it.
-struct Device {
-    ring: EventRing,
-    parked: Option<ParkedRead>,
-    /// A satisfied `ParkedRead` the DPC has finished with, awaiting a thread-context drop.
-    ///
-    /// **The DPC takes the entry out of `parked` and owns it for the whole time it uses its
-    /// pointers**, then publishes it here at the end. That exclusive ownership is what makes
-    /// the hand-off sound, and the obvious alternative is not: an earlier version left the
-    /// entry in `parked` and merely flagged it reclaimable *before* the copy, so another
-    /// CPU running `reap_pending` could take it and drop the last reference while this DPC
-    /// was still dereferencing the `MemoryObject` — a use-after-free rather than the
-    /// deadlock it was avoiding (PR #178 review, blocking 1).
-    ///
-    /// The DPC still never *drops* it: a last-reference drop reaches `SlabCache::free`,
-    /// whose plain `SpinLock` is the same-CPU deadlock fixed for `io::block`.
-    to_drop: Option<ParkedRead>,
-}
-
-impl Device {
-    const fn new() -> Self {
-        Self { ring: EventRing::new(), parked: None, to_drop: None }
-    }
-}
-
 /// Everything the driver owns, behind one lock.
 ///
 /// **One lock for both devices, deliberately.** They share the controller: a single status
 /// read decides which port a byte came from, so the two ISRs cannot be made independent
 /// anyway, and two locks would only add an ordering rule to get wrong.
 struct Inner {
-    devices: [Device; DEV_COUNT],
+    /// Each node's reader side, by its index. The DPC owns a read it takes out of one until it
+    /// hands it back, and never drops it: see [`crate::drivers::input`].
+    devices: [Reader; DEV_COUNT],
     keys: scancode::Decoder,
     mouse: mouse::Decoder,
 }
@@ -95,7 +63,7 @@ struct Inner {
 impl Inner {
     const fn new() -> Self {
         Self {
-            devices: [Device::new(), Device::new()],
+            devices: [Reader::new(), Reader::new()],
             keys: scancode::Decoder::new(),
             mouse: mouse::Decoder::new(),
         }
@@ -113,7 +81,7 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// `ps2-hold-gate` only: nothing is drained from the controller before this monotonic time.
 #[cfg(feature = "ps2-hold-gate")]
-static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+static HOLD_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// How long an F9 press holds the drain, in a `ps2-hold-gate` kernel: long enough for the host to
 /// inject a walk and a click into it, short enough that a gate spends little time waiting.
@@ -133,41 +101,6 @@ fn holding(now: u64) -> bool {
     }
 }
 
-/// Key presses decoded since boot; a held key counts each typematic repeat, as the keyboard sends
-/// each as a press. What the hardware report waits on (Phase 5 Part D.3): it needs to know *that*
-/// a key went down and nothing about which, so no keystroke is kept where a log could show it.
-static KEY_PRESSES: AtomicU64 = AtomicU64::new(0);
-
-/// Copy `src` into `buffer`'s frames starting at byte `buf_offset`, via the HHDM. The
-/// caller has bounds-checked the range (`sys_io_submit` does). Runs outside the lock.
-///
-/// # Safety
-///
-/// `buffer` must point at a live `MemoryObject` — held alive by an `ObjectRef` the caller
-/// keeps for the duration. The DPC passes a *borrowed* pointer precisely so it never owns a
-/// reference it would then have to drop.
-unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
-    // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
-    let frames = mo.frames();
-    let hhdm = heap::hhdm_offset();
-    let mut pos = buf_offset as usize;
-    for &b in src {
-        let page = pos / PAGE_SIZE;
-        let intra = pos % PAGE_SIZE;
-        if page >= frames.len() {
-            break;
-        }
-        let dst = (frames[page].as_u64() + hhdm) as *mut u8;
-        // SAFETY: within an owned, HHDM-mapped buffer frame (bounds pre-checked).
-        unsafe { *dst.add(intra) = b };
-        pos += 1;
-    }
-}
-
-/// Scratch for one drain. Sized to the ring so a large read is satisfied in one pass.
-const DRAIN_MAX: usize = ring::RING_EVENTS * INPUT_EVENT_LEN;
-
 /// Bytes one interrupt may take from the controller before yielding.
 ///
 /// Generous for a burst — a held key repeats at ~30 Hz and a mouse reports at 100 Hz, so
@@ -175,11 +108,8 @@ const DRAIN_MAX: usize = ring::RING_EVENTS * INPUT_EVENT_LEN;
 const MAX_DRAIN_PER_IRQ: u32 = 64;
 
 /// [`CharBackend::submit_read`] for a raw input node: satisfy immediately if the ring has
-/// anything, else park until the next interrupt.
-///
-/// **`max_len` is floored to a whole number of records.** A reader asking for 24 bytes gets
-/// one 16-byte event, not one and a half — the record has no sync word, so a partial tail
-/// would misalign everything after it (`input-subsystem.md` §3a).
+/// anything, else park until the next interrupt. `max_len` is floored to whole records
+/// ([`input::read_len`]).
 fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
@@ -191,37 +121,24 @@ fn submit_read(
     if index >= DEV_COUNT {
         return Err(KError::InvalidArgument);
     }
-    let max_len = ((max_len as usize) / INPUT_EVENT_LEN * INPUT_EVENT_LEN).min(DRAIN_MAX);
-    if max_len == 0 {
-        // Too small for even one record. Completing with zero would look like end-of-stream
-        // to a reader that simply passed a short buffer.
-        return Err(KError::InvalidArgument);
-    }
+    let max_len = input::read_len(max_len)?;
     // Thread context: release anything a previous completion left owed before parking.
     reclaim_completed();
     let now = crate::arch::Timer::read_ns();
     let mut tmp = [0u8; DRAIN_MAX];
-    let drained = {
+    let found = {
         let mut g = PS2.lock();
         let dev = &mut g.devices[index];
-        if !dev.ring.is_empty() {
-            Some(dev.ring.drain_into(&mut tmp[..max_len], now))
-        } else if dev.parked.is_some() {
-            return Err(KError::WouldBlock); // single reader per device
-        } else {
-            dev.parked = Some(ParkedRead {
-                po: po.clone(),
-                buffer: buffer.clone(),
-                buf_offset,
-                max_len,
-            });
-            None
+        let found = dev.read_now(&mut tmp[..max_len], now);
+        if found == ReadNow::Empty {
+            dev.park(ParkedRead::new(po, buffer, buf_offset, max_len));
         }
+        found
     };
-    if let Some(n) = drained {
-        // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
-        unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
-        crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
+    match found {
+        ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
+        ReadNow::Empty => {}
+        ReadNow::Busy => return Err(KError::WouldBlock),
     }
     Ok(())
 }
@@ -231,54 +148,28 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
     let now = crate::arch::Timer::read_ns();
     for index in 0..DEV_COUNT {
         let mut tmp = [0u8; DRAIN_MAX];
-        // **Take exclusive ownership for the duration.** Once the entry is out of
-        // `dev.parked` no other CPU can see it, so nothing can drop the objects while this
-        // DPC is using them — and because the DPC hands the entry on rather than dropping
-        // it, it still never calls the allocator.
-        let completed = {
-            let mut g = PS2.lock();
-            let dev = &mut g.devices[index];
-            if dev.parked.is_some() && !dev.ring.is_empty() {
-                let pr = dev.parked.take().expect("checked is_some");
-                let n = dev.ring.drain_into(&mut tmp[..pr.max_len.min(DRAIN_MAX)], now);
-                Some((pr, n))
-            } else {
-                None
-            }
-        };
-        if let Some((pr, n)) = completed {
-            // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a
-            // local — unreachable from any other CPU until it is published below.
-            unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
-            crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64);
-            // Publish for thread-context reclamation. Last, so the entry is never reachable
-            // while its pointers are still in use.
-            let mut g = PS2.lock();
-            debug_assert!(
-                g.devices[index].to_drop.is_none(),
-                "a second completion before a reclaim: submit_read drains first, so a new \
-                 read cannot be parked while one is owed"
-            );
-            g.devices[index].to_drop = Some(pr);
+        // **Take exclusive ownership for the duration**, and hand it back after: see
+        // `drivers::input`.
+        let ready = PS2.lock().devices[index].take_ready(&mut tmp, now);
+        if let Some((read, n)) = ready {
+            input::deliver(&read, &tmp[..n]);
+            PS2.lock().devices[index].owe(read);
         }
     }
 }
 
-/// Drop any `ParkedRead` the DPC has finished with. **Thread context only.**
+/// Drop any read the DPC has finished with. **Thread context only.**
 ///
 /// This is where the two `ObjectRef`s a completed read pinned are actually released — the
 /// frees that `ps2_intr_dpc` must not do. Called from `sched::reap_pending` (so any CPU
 /// going idle reclaims) and from [`submit_read`] before parking a new read.
 ///
 /// Safe to run concurrently with a DPC on another CPU: the DPC owns its entry outright until
-/// it publishes it in `to_drop`, so there is nothing here to race with.
+/// it publishes it, so there is nothing here to race with.
 pub fn reclaim_completed() {
     for index in 0..DEV_COUNT {
         // Take under the lock, drop outside it: a drop reaches the allocator.
-        let owed = {
-            let mut g = PS2.lock();
-            g.devices[index].to_drop.take()
-        };
+        let owed = PS2.lock().devices[index].take_owed();
         drop(owed);
     }
 }
@@ -332,7 +223,7 @@ fn drain_controller() -> bool {
                         panic!("fbcon-gate: F10 pressed, and this kernel was built to stop on it");
                     }
                     if pressed {
-                        KEY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                        input::note_key_press();
                     }
                     // F9, the ninth of the consecutive function keys; F10 is `fbcon-gate`'s.
                     #[cfg(feature = "ps2-hold-gate")]
@@ -360,7 +251,7 @@ fn drain_controller() -> bool {
             }
         }
     }
-    g.devices.iter().any(|d| d.parked.is_some())
+    g.devices.iter().any(|d| d.has_parked())
 }
 
 /// Collect anything the interrupt path missed. Called from the timer IRQ dispatcher, ahead of
@@ -402,14 +293,8 @@ pub fn poll() {
     }
 }
 
-/// Key presses decoded since boot. Compare two readings to learn whether a key went down between
-/// them; the count says nothing about which key.
-pub fn key_presses() -> u64 {
-    KEY_PRESSES.load(Ordering::Relaxed)
-}
-
-/// `true` once a keyboard has answered and its interrupt is armed — the only case in which
-/// [`key_presses`] can ever move.
+/// `true` once a keyboard has answered and its interrupt is armed — the only case in which this
+/// driver can move [`input::key_presses`].
 pub fn keyboard_present() -> bool {
     PRESENT.load(Ordering::Acquire) && crate::device::has(crate::libkern::device::DeviceKind::Keyboard)
 }

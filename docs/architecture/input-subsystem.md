@@ -4,13 +4,14 @@
 loss reworked so relative motion survives a slow consumer (2026-08-26), a key-press count for the
 hardware report (Phase 5 Part D, 2026-09-14), input routed only after the requests sent before
 it (2026-09-22), the input server's devices handed over by the device manager (administration
-Part B.3, 2026-09-24) — and this document describes what exists.** The whole path from an interrupt to a keystroke
+Part B.3, 2026-09-24), each node's ring and read hand-off shared in `drivers::input` (Phase 6 Part
+B.1, 2026-10-05) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
 |---|---|
 | i8042 controller, keyboard + mouse, one driver | `kernel/src/drivers/ps2/` |
-| Per-device lossy ring with a `SYN_DROPPED` marker | `kernel/src/drivers/ps2/ring.rs` |
+| Per-device lossy ring with a `SYN_DROPPED` marker, the parked read and its hand-off — shared by every input driver since Phase 6 Part B.1 | `kernel/src/drivers/input/` |
 | The `InputEvent` record crossing the kernel boundary | `kernel/src/libkern/input.rs` |
 | Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
 | Each keyboard and mouse handed to the input server | `userspace/device-mgr/` |
@@ -117,11 +118,11 @@ read per tick, a drain only when the buffer is full. The ISR is the fast path; t
 what makes the fast path's loss recoverable rather than fatal (2026-08-13; see the decision
 log).
 
-**Before userspace, the driver has one consumer of its own** (Phase 5 Part D): the hardware
-report turns its pages on a key press. It needs to know only *that* a key went down, so the driver
-keeps a count of presses and nothing else (`drivers::ps2::key_presses`), and the report drains the
-keyboard's ring before userspace starts (`drain_keyboard`), so the keys that turned pages reach no
-program.
+**Before userspace, the driver has one consumer of its own** (Phase 5 Part D): the hardware report
+turns its pages on a key press. It needs to know only *that* a key went down, so the driver keeps a
+count of presses and nothing else (`drivers::input::key_presses`, any keyboard's since Phase 6 Part
+B.1), and the report drains the keyboard's ring before userspace starts (`drain_keyboard`), so the
+keys that turned pages reach no program.
 
 The lesson generalises past this controller: **a driver for a shared-buffer device with an
 edge-derived interrupt needs a recovery path that does not depend on that interrupt.** A USB

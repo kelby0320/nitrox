@@ -33631,3 +33631,40 @@ it was taken.
     `check-report --usb` depends on.
 
 Docs only; no ABI hash impact.
+
+## 2026-10-05 — Phase 6 Part B.1: the shared input node
+
+What a raw input node is moved out of the PS/2 driver into **`drivers::input`**, for USB HID to
+use in B.2. The pieces that moved:
+- the event ring (`ring.rs`, moved with `git mv` and its tests);
+- the parked read;
+- the DPC's hand-off of a finished read;
+- its reclaim in thread context;
+- the key count the hardware report turns its pages on.
+
+**It moved rather than being copied.** The hand-off was a use-after-free once (PR #178 review,
+blocking 1), and the reasoning that keeps it fixed now has one home.
+
+**The shape is a `Reader` per node, kept under its driver's lock.** PS/2 keeps one lock over its
+two nodes, since they share a controller. Each method is one step of the hand-off:
+- a read finds events, a parked reader, or room to park;
+- the DPC takes a ready read out (`take_ready`), delivers it with no lock held, and hands it back
+  (`owe`);
+- thread context takes it (`take_owed`) and drops it.
+
+The DPC never drops one, as before.
+
+**The hand-off now has host tests**, which it had none of while it was the PS/2 driver's (the
+2026-08 kernel audit noted `ps2/mod.rs` had no `#[test]`):
+- a read drains, parks, or is refused;
+- the DPC takes a parked read once, with the length it asked for;
+- a delivered read is destroyed only when its reclaimer drops it, counted by the destroy probe;
+- a read's length is floored to whole records.
+
+Three controls each fail one: an `owe` that drops, a take that ignores the read's length, and a read
+that ignores a parked reader.
+
+**`input.yml`'s path filter gains `kernel/src/drivers/input/**`.** The ring left `drivers/ps2/**`,
+so a change to it would otherwise run no input gate.
+
+No behaviour changes. No ABI hash impact: a module boundary inside the kernel.

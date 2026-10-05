@@ -14,6 +14,8 @@ on:
     branches: [main]
     paths: &input_paths
       - 'kernel/src/drivers/ps2/**'
+      # Each raw input node's ring, parked read and hand-off, PS/2's until Phase 6 Part B.1.
+      - 'kernel/src/drivers/input/**'
       - 'kernel/src/arch/x86_64/ps2.rs'
       - 'kernel/src/libkern/input.rs'
       # The device nodes are published by the driver, **owned by the device table** in

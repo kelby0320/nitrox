@@ -803,7 +803,9 @@ a USB one, as it would on Linux.
 - **B.1 The shared input node.** `drivers::input`: the ring, the parked read, the hand-off, the
   reclaim and the key count, moved out of `drivers::ps2` with their tests. No behaviour changes:
   `check-input`, with and without `--no-ps2-irq`, and `check-fbcon`, `check-report` and
-  `check-login` hold PS/2 as they do today.
+  `check-login` hold PS/2 as they do today. **Built 2026-10-05.** The hand-off, which had no host
+  test while it was PS/2's, has four now, each failing its control; `input.yml`'s path filter gained
+  `drivers/input/**` with it, since the ring left `drivers/ps2/**`.
 - **B.2 Endpoints and the binding.** Configure Endpoint and Normal TRBs; the endpoint and
   companion descriptors; `control_out`; the binding steps; the DPC's endpoint table and the
   re-queue; the halt recovery; the boot report decoders and the usage table; the nodes, their

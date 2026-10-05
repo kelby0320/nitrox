@@ -101,10 +101,10 @@ pub fn run(page_wait_secs: u32) {
 /// Halts between looks rather than spinning: every CPU's periodic tick wakes it within a tick,
 /// and so does the keyboard's own interrupt when it lands on this CPU.
 fn wait_for_key(wait_ns: u64) -> bool {
-    let before = ps2::key_presses();
+    let before = crate::drivers::input::key_presses();
     let deadline = crate::arch::Timer::read_ns().saturating_add(wait_ns);
     loop {
-        if ps2::key_presses() != before {
+        if crate::drivers::input::key_presses() != before {
             return true;
         }
         if crate::arch::Timer::read_ns() >= deadline {
