@@ -277,6 +277,21 @@ mod tests {
         }
     }
 
+    /// **A Max ESIT Payload past sixteen bits takes the high byte** of the endpoint's first word,
+    /// bits 31:24 (xHCI 1.2 §6.2.3). No interrupt endpoint a descriptor describes reaches it — 2047
+    /// bytes sixteen times is under 32 KiB — so this pins the field's encoding, which the other
+    /// test's eight bytes cannot (PR #358 review).
+    #[test]
+    fn a_max_esit_payload_past_sixteen_bits_takes_the_high_byte() {
+        let l = Layout::new(false);
+        let mut ctx = vec![0u8; l.input_len()];
+        let big = Interrupt { dci: 3, max_packet: 0xFFFF, burst: 15, interval: 0, ring: 0, cycle: false };
+        configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big]);
+        let payload = 0xFFFF * 16;
+        assert_eq!(dword(&ctx, 4 * 32) >> 24, payload >> 16, "Max ESIT Payload Hi");
+        assert_eq!(dword(&ctx, 4 * 32 + 16) >> 16, payload & 0xFFFF, "Max ESIT Payload Lo");
+    }
+
     #[test]
     fn each_speed_has_its_default_packet_and_its_name() {
         assert_eq!(speed::default_max_packet0(speed::LOW), 8);

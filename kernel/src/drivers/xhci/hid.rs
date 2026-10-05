@@ -77,6 +77,7 @@ pub(super) struct Bound {
     len: u16,
     /// Halted, and the hub thread asked to reset it.
     halted: bool,
+    /// Times it has halted, counted when the DPC sees each: the third leaves it stopped.
     halts: u8,
 }
 
@@ -198,7 +199,10 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         return;
     }
 
-    // **Each interface's steps**: a failure ends that interface alone.
+    // **Each interface's steps**: a stall ends that interface alone, and the others go on. **Any
+    // other failure on the default endpoint ends the binding there** (PR #358 review): the request
+    // may still be on the endpoint's ring, so nothing more is asked of it. That interface is not
+    // bound, nor any after it, and those before it stay bound, on endpoints of their own.
     for p in prepared.into_iter().flatten() {
         let c = &p.c;
         let what = if c.is_keyboard { "keyboard" } else { "mouse" };
@@ -210,23 +214,47 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
             match report_layout(x, slot, mem, c) {
                 Ok(l) => l,
                 Err(e) => {
-                    crate::kprintln!("usb: port {port}: its {what}'s report descriptor did not read ({e}); not bound");
-                    continue;
+                    crate::kprintln!(
+                        "usb: port {port}: its {what}'s report descriptor did not read ({e}); \
+                         not bound, nor anything after it"
+                    );
+                    break;
                 }
             }
         };
         if layout.is_some() {
-            // A refusal is passed over: a device is in report protocol after a reset anyway.
-            let _ = interface_request(x, slot, mem, [0x21, 0x0B, 1, 0, c.interface, 0, 0, 0]);
+            // A stall is passed over: a device is in report protocol after a reset anyway.
+            if let Err(e) = interface_request(x, slot, mem, [0x21, 0x0B, 1, 0, c.interface, 0, 0, 0])
+                && in_doubt(&e)
+            {
+                crate::kprintln!(
+                    "usb: port {port}: its {what}'s SET_PROTOCOL failed ({e}); not bound, nor anything after it"
+                );
+                break;
+            }
         } else if let Err(e) = interface_request(x, slot, mem, [0x21, 0x0B, 0, 0, c.interface, 0, 0, 0]) {
+            if in_doubt(&e) {
+                crate::kprintln!(
+                    "usb: port {port}: its {what}'s SET_PROTOCOL failed ({e}); not bound, nor anything after it"
+                );
+                break;
+            }
             crate::kprintln!("usb: port {port}: its {what} refused boot protocol ({e}); not bound");
             continue;
         }
+        // A keyboard whose SET_IDLE leaves the endpoint in doubt is bound, being past its last
+        // request, and is the last bound.
+        let mut last = false;
         if c.is_keyboard
             && let Err(e) = interface_request(x, slot, mem, [0x21, 0x0A, 0, 0, c.interface, 0, 0, 0])
         {
-            // Harmless: an unchanged report decodes to nothing.
-            crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); bound anyway");
+            if in_doubt(&e) {
+                crate::kprintln!("usb: port {port}: its keyboard's SET_IDLE failed ({e}); bound, and nothing after it");
+                last = true;
+            } else {
+                // Harmless: an unchanged report decodes to nothing.
+                crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); bound anyway");
+            }
         }
         let decoder = if c.is_keyboard {
             Decoder::Keyboard { prev: [0; keyboard::REPORT_LEN] }
@@ -236,6 +264,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         let kind = if c.is_keyboard { DeviceKind::Keyboard } else { DeviceKind::Mouse };
         let Some((node, served)) = publish(kind, parent) else {
             crate::kprintln!("usb: port {port}: no input node for its {what}; not bound");
+            if last {
+                break;
+            }
             continue;
         };
         let bound = Bound {
@@ -254,6 +285,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         };
         if !start(x, bound) {
             crate::kprintln!("usb: port {port}: no room to poll its {what}; not bound");
+            if last {
+                break;
+            }
             continue;
         }
         let how = match layout {
@@ -263,7 +297,18 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
             None => ", boot protocol: its report descriptor does not describe a plain mouse",
         };
         crate::kprintln!("usb: port {port}: {what} at /dev/input/raw/{served}{how}");
+        if last {
+            break;
+        }
     }
+}
+
+/// **Whether a failure on the default endpoint leaves it in doubt**: any failure but a stall may
+/// leave its request on the ring, to complete into the device's data page whenever it does, so
+/// nothing more may be asked of that endpoint — `hub::control_in`'s rule, which enumeration keeps by
+/// ending the device. A stall is the request's answer, and the endpoint is recovered after it.
+fn in_doubt(e: &Failed) -> bool {
+    !matches!(e, Failed::Code(code::STALL))
 }
 
 /// **A mouse's layout from its report descriptor** (Part B.3): `None` when it has none, or one that
@@ -359,6 +404,7 @@ fn queue(x: &Xhci, b: &mut Bound) {
 pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     let now = crate::arch::Timer::read_ns();
     let mut events = [InputEvent::default(); keyboard::EVENTS_MAX];
+    let mut halted = false;
     let (node, n) = {
         let mut t = x.hid.lock();
         let Some(b) = t.entries.iter_mut().flatten().find(|b| b.slot == trb.slot_id() && b.dci == trb.endpoint_id()) else {
@@ -381,13 +427,20 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
             _ => {
                 if !b.halted {
                     b.halted = true;
-                    x.hid_halted.store(true, Ordering::Release);
-                    crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+                    b.halts = b.halts.saturating_add(1);
+                    halted = true;
                 }
-                return;
+                (b.node, 0)
             }
         }
     };
+    // **The hub thread is woken with the table's lock let go**: waking takes the scheduler's
+    // lock, which ranks above this leaf, and the lock-order tracker in every kernel this
+    // project builds panics on the other order (PR #358 review, probed with a halt simulated).
+    if halted {
+        x.hid_halted.store(true, Ordering::Release);
+        crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+    }
     if n == 0 {
         return;
     }
@@ -438,7 +491,12 @@ fn decode(decoder: &mut Decoder, report: &[u8], now: u64, out: &mut [InputEvent;
 
 /// **Reset every halted endpoint**, from the hub thread: Reset Endpoint, then Set TR Dequeue Pointer
 /// to its enqueue point, then its TRB again. No `SYN_DROPPED`: the next report, decoded against the
-/// last, says what changed (PR #357 review). A third halt leaves it stopped.
+/// last, says what changed (PR #357 review). A third halt leaves it stopped, as does a reset that
+/// fails; either is the hub thread's for good, so a later pass, woken by another endpoint's halt,
+/// passes it over.
+///
+/// **Nothing is printed with the table's lock held**: the serial port's lock ranks above this leaf
+/// (PR #358 review). Each entry's outcome is settled under the lock and said after it.
 pub(super) fn recover(x: &Xhci) {
     if !x.hid_halted.swap(false, Ordering::AcqRel) {
         return;
@@ -448,7 +506,8 @@ pub(super) fn recover(x: &Xhci) {
             let mut t = x.hid.lock();
             match t.entries[i].as_mut() {
                 Some(b) if b.halted => {
-                    b.halts += 1;
+                    // Taken: the DPC will not see it halt again, since nothing is queued on it.
+                    b.halted = false;
                     Some((b.slot, b.dci, b.halts, b.ring_phys + b.ring.next_slot() as u64 * 16, b.ring.cycle()))
                 }
                 _ => None,
@@ -463,18 +522,20 @@ pub(super) fn recover(x: &Xhci) {
         }
         let reset = hub::command(x, Trb::endpoint_command(kind::RESET_ENDPOINT, slot, dci))
             .and_then(|_| hub::command(x, Trb::set_dequeue(at, cycle, slot, dci)));
-        let mut t = x.hid.lock();
-        // Gone meanwhile: its device departed, and `unbind` took it.
-        let Some(b) = t.entries[i].as_mut().filter(|b| b.slot == slot && b.dci == dci) else {
-            continue;
-        };
-        match reset {
-            Ok(_) => {
-                b.halted = false;
+        let restarted = {
+            let mut t = x.hid.lock();
+            // Gone meanwhile: its device departed, and `unbind` took it.
+            let Some(b) = t.entries[i].as_mut().filter(|b| b.slot == slot && b.dci == dci) else {
+                continue;
+            };
+            if reset.is_ok() {
                 queue(x, b);
-                crate::kprintln!("usb: slot {slot}: endpoint {dci} halted and was reset");
             }
-            Err(e) => crate::kprintln!("usb: slot {slot}: endpoint {dci} halted and did not reset: {e}"),
+            reset
+        };
+        match restarted {
+            Ok(_) => crate::kprintln!("usb: slot {slot}: endpoint {dci} halted and was reset"),
+            Err(e) => crate::kprintln!("usb: slot {slot}: endpoint {dci} halted and did not reset: {e}; left stopped"),
         }
     }
 }
@@ -540,3 +601,20 @@ pub fn drain_keyboards() {
 }
 
 const _: () = assert!(MAX_NODES <= 32, "KEYBOARDS has a bit per node");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Only a stall leaves the default endpoint to be asked again** (PR #358 review): a stall is
+    /// the request's answer, and every other failure may have left the request on the ring — a
+    /// transaction error (4) and babble (3) halt the endpoint mid-transfer, and a timeout says
+    /// nothing at all.
+    #[test]
+    fn only_a_stall_leaves_the_default_endpoint_to_ask_again() {
+        assert!(!in_doubt(&Failed::Code(code::STALL)));
+        for e in [Failed::Timeout, Failed::Code(4), Failed::Code(3), Failed::NoMemory, Failed::Device("short")] {
+            assert!(in_doubt(&e), "{e}");
+        }
+    }
+}

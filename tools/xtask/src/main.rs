@@ -3042,6 +3042,10 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
         println!("  ok: click_at's flush delivered the release QEMU held");
     }
 
+    // **And `boot-probe` passed on this machine** (PR #358 review): on the `--usb` one it failed
+    // its registry test, and this gate passed.
+    expect_probe_pass(&session)?;
+    println!("  ok: boot-probe's verdict is PASS");
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
 
@@ -9589,6 +9593,31 @@ fn press(qmp: &mut Qmp, qcode: &str) -> R<()> {
     Ok(())
 }
 
+/// **`boot-probe`'s verdict, `PASS`**, waited for up to a minute: what a gate booting the test
+/// image owes the machine it boots (PR #358 review). Only `test-qemu` exits on the verdict, so a
+/// gate that never read it passed while the probe failed — `check-input --usb` did, on the one
+/// machine with no i8042. Read from the transcript rather than with `expect`, which would consume
+/// whatever the gate waits for next, and as a whole line: the verdict's word can arrive after its
+/// prefix.
+fn expect_probe_pass(s: &Session) -> R<()> {
+    const VERDICT: &str = "boot-probe: test-harness verdict ";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let t = s.transcript();
+        if t.lines().any(|l| l.contains("boot-probe: test-harness verdict PASS")) {
+            return Ok(());
+        }
+        if t.lines().any(|l| l.contains("boot-probe: test-harness verdict FAIL")) {
+            let failed: Vec<&str> = t.lines().filter(|l| l.contains("boot-probe:") && l.contains("FAIL")).collect();
+            return Err(format!("boot-probe failed on this machine: {}", failed.join(" | ")).into());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("no `{VERDICT}…` line within a minute of the gate's end").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The QMP key code for `c`, and whether it needs shift held.
 ///
 /// Refuses what it does not know rather than skipping it: a character silently dropped from a
@@ -11414,6 +11443,9 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         }
     }
 
+    // **And `boot-probe` passed on this machine** (PR #358 review): read now, judged after the
+    // screen, so a probe that failed cannot hide a mismatch.
+    let probe = expect_probe_pass(&session);
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 
@@ -11465,6 +11497,8 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         )
         .into());
     }
+    probe?;
+    println!("  ok: boot-probe's verdict is PASS");
     println!(
         "\nxtask: display gate PASSED — {} pixels of the {sw}x{sh} scene, {term_compared} of the \
          {tw}x{th} terminal and {ui_compared} of the {uw}x{uh} toolkit window match libdraw, \
@@ -12661,13 +12695,21 @@ const HOT_MOUSE: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/02, high-spe
 /// **USB devices plugged in after boot, swapped, and pulled out** (Phase 6 Part A.2): coldplug is
 /// the first round of hot-plug, and these are the rounds after it.
 /// 1. Once the guest logs its first round, a keyboard is added over QMP.
-/// 2. Once it logs the keyboard's arrival, **the machine is paused**, the keyboard removed and a
+/// 2. Once it logs the keyboard's arrival **and its binding**, **the machine is paused**, the
+///    keyboard removed and a
 ///    mouse added on the same QEMU port, and the machine resumed. The guest then finds a connect
 ///    change on a port that still has a device — both changes landed before it looked — which is
 ///    a replug it must take as a departure and an arrival. Paused, so the two always land together:
 ///    a hub thread that keeps the old device fails it every time (PR #355 review).
-/// 3. Once it logs the mouse's arrival, the mouse is removed, and the QMP connection closed —
-///    QEMU serves one QMP client at a time, and the deadline's dump of the guest needs it.
+/// 3. Once it logs the mouse's arrival and its binding, the mouse is removed, and the QMP
+///    connection closed — QEMU serves one QMP client at a time, and the deadline's dump of the
+///    guest needs it.
+///
+/// **Bound, not only enumerated, before each is taken away** (PR #358's gate run). Binding asks the
+/// device for its protocol and idle rate after the arrival line, and a device taken away meanwhile
+/// leaves that request unanswered: the default endpoint is in doubt, and the device is rightly not
+/// bound. Acting on the arrival line made that a race with the guest's speed, which a binding that
+/// ignored a failed `SET_PROTOCOL` used to hide.
 ///
 /// The lines are asserted after the run by [`check_hot_plug`]. It lands on a root port only because
 /// `test-qemu`'s controller has eight connectors: with QEMU's four, the boot's devices fill them and
@@ -12697,8 +12739,15 @@ impl HotPlug {
 
     fn advance(&mut self, transcript: &[u8], qmp_sock: &Path) -> R<()> {
         let text = String::from_utf8_lossy(transcript);
-        let after = |from: usize, fragments: &[&str]| {
-            text[from..].lines().any(|l| fragments.iter().all(|f| l.contains(f)))
+        // Whether the device `fragments` names has arrived after `from`, and been bound as `what`.
+        let bound = |from: usize, fragments: &[&str], what: &str| {
+            let rest = &text[from..];
+            let Some(line) = rest.lines().find(|l| fragments.iter().all(|f| l.contains(f))) else {
+                return false;
+            };
+            let port = line.split("usb: port ").nth(1).and_then(|r| r.split(':').next()).unwrap_or("");
+            let at = rest.find(line).unwrap_or(0) + line.len();
+            rest[at..].contains(&format!("usb: port {port}: {what} at /dev/input/raw/"))
         };
         match self.stage {
             0 => {
@@ -12708,7 +12757,7 @@ impl HotPlug {
                 self.from = at;
                 self.stage = 1;
             }
-            1 if after(self.from, HOT_KEYBOARD) => {
+            1 if bound(self.from, HOT_KEYBOARD, "keyboard") => {
                 let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
                 let usb = qmp.hmp("info usb")?;
                 let port = usb
@@ -12727,7 +12776,7 @@ impl HotPlug {
                 self.from = text.len();
                 self.stage = 2;
             }
-            2 if after(self.from, HOT_MOUSE) => {
+            2 if bound(self.from, HOT_MOUSE, "mouse") => {
                 let qmp = self.qmp.as_mut().ok_or("no QMP connection")?;
                 qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotmouse"}}"#)?;
                 self.qmp = None;

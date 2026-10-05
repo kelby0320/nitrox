@@ -27,10 +27,13 @@ use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
 
 /// Events held per device.
 ///
-/// Sized against a burst, not a backlog: 128 events is roughly a second of vigorous mouse
-/// movement (a PS/2 mouse reports at 100 Hz, up to three events per report) or far more
-/// typing than anyone produces between two scheduler quanta. A consumer that falls further
-/// behind than this is not slow, it is broken, and `SYN_DROPPED` is how it finds out.
+/// Sized against a burst, not a backlog: 128 events is roughly a second of a PS/2 mouse — 100
+/// reports a second, up to three events each — or far more typing than anyone produces between
+/// two scheduler quanta. **A USB mouse polled every millisecond fills it in about 32 ms**, at up to
+/// four events a report (Phase 6 Part B.2; QEMU's polls every 10 ms). Its reader is woken by every
+/// report, so that is still many wakeups' worth. A consumer that falls further behind than this
+/// is not slow, it is broken, and `SYN_DROPPED` is how it finds out — though for relative motion
+/// what it learns of is a loss: this ring does not carry motion forward as `input-server` does.
 pub const RING_EVENTS: usize = 128;
 
 /// A fixed-capacity ring of whole [`InputEvent`]s with loss announcement.

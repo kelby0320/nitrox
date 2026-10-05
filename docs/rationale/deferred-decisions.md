@@ -375,6 +375,10 @@ only grows, and a record's id is its place, which `/dev/registry/<id>` and `devi
 connector whose contact bounces — a departure, then an arrival, since PR #355 — adds one each time.
 Removing a record would shift every later id. **Part C retires a record in place instead**: its
 plan has a snapshot mark departed records rather than omit them, so an id keeps naming one device.
+**A bound keyboard or mouse also keeps its input node** (Part B.2): there are sixteen, and each
+binding takes the next for the rest of the boot, so a seventeenth binding — a receiver unplugged
+and replugged eight times — is not bound. Nothing a person sees changes until Part C hands a
+hot-plugged device to `input-server`, and Part C is where a node is retired (PR #358 review).
 Trigger: Phase 6 Part C, which is scheduled.
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.

@@ -33718,7 +33718,8 @@ boot protocol's being one. The wheel is negated to this system's sign.
   would have panicked a debug kernel, and a huge count would have looped two billion times at boot.
   Found reading it back before any review. Checked arithmetic and a one-page limit end the walk
   instead. A host test holds both: one overflows, one is bounded to a second. Each guard fails its
-  control: a panic, and 9.7 s.
+  control: a panic, and 9.7 s. **Neither guard sees fields of no bits**, whose product is zero: the
+  review found that hole (the entry below).
 - **Two doc comments orphaned again**, by inserting an item where another's doc comment ended, in
   `ring.rs` and `xtask`. The sweep caught both.
 - **`check-login --usb` under TCG failed on an ordering the gate had assumed.** When a file is
@@ -33739,3 +33740,76 @@ boot protocol's being one. The wheel is negated to this system's sign.
   speed's.
 
 No ABI hash impact: a driver, a table, records of existing kinds, and a gate flag.
+
+## 2026-10-05 — PR #358, reviewed: two lock-order panics on a halt, and fields of no bits
+
+Two blocking findings, three worth fixing and three optional. All are fixed.
+
+**1. A halted HID endpoint panicked the kernel, at two sites.** The DPC woke the hub thread while
+holding the bound endpoints' table, which is a leaf lock; waking takes the scheduler's lock. Then
+`recover` printed under the same lock, and printing takes the serial port's. The lock-order tracker
+is in every kernel this project builds, the laptop's included. Now:
+- the DPC wakes after letting the lock go;
+- `recover` settles each endpoint's outcome under the lock and prints after it.
+
+The rest of the xHCI driver was swept for the class, and lets its locks go first.
+
+Two more faults on the same path, found by reading it:
+- **A halt was counted on every `recover` pass that found the endpoint still marked**, not once per
+  halt. An endpoint whose reset failed was counted again each time another endpoint halted. Each
+  halt is now counted once, when the DPC sees it.
+- **A failed reset left the endpoint marked halted**, retried only when something else halted.
+  Now it leaves the endpoint stopped, like a third halt.
+
+**The reviewer's probe**, the fifth HID Transfer Event read as a stall, was run on both paths:
+- **Before the fix** it panicked under `check-input --usb --kvm`: `lock-order violation: acquiring
+  Sched (rank 10) while holding Leaf (rank 90)`.
+- **After it**, no panic. `recover` ran, and QEMU answered Reset Endpoint with completion code 19,
+  Context State Error, since a stall simulated in the driver is not a halt in the controller. The
+  endpoint was left stopped, logged, and the gate failed downstream on the motion it carried.
+
+A successful reset cannot be seen on QEMU at all: its HID devices never stall an interrupt endpoint.
+
+**2. Report Size 0 passed both of the parser's guards.** The product of size and count is zero, so
+no count was too large, and the field loop ran for as long as the count: 19 s for one item. An item
+whose fields have no bits is now passed over. With a bit or more per field, the cumulative one-page
+limit bounds every report's fields, and so the walk. The guard test holds the reviewer's
+descriptor to under a second; without the guard it fails at 19.4 s.
+
+**3. `boot-probe` failed its registry test on the `--usb` machine, and the gate passed.** It wanted
+every USB input record at index 2 or above, and its keyboard and mouse from the i8042. Both are
+wrong on a machine with no i8042. A USB record now comes after every i8042 record (from 0 when there
+is none), and a keyboard and a mouse may come from either.
+
+**Why no gate saw it:** only `test-qemu` exits on the probe's verdict. **`check-input` and
+`check-display` now wait for `boot-probe: test-harness verdict PASS`**. `check-terminal` already
+failed on a failing probe, through the exit code `service-mgr` reports. Each half of the probe fix
+fails `check-input --usb` when reverted, at the verdict.
+
+**4. `bind` kept using the default endpoint after a failure that may have left a request on it.**
+Any failure but a stall now ends the binding at that interface. Nothing more is asked of that
+endpoint, the interface and those after it are not bound, and those before stay bound. A keyboard
+whose `SET_IDLE` fails so is past its last request, and is bound, the last. This is
+`hub::control_in`'s rule, which enumeration keeps by ending the device. No gate reaches it, since
+QEMU's devices answer every request; a host test pins which failures leave the endpoint in doubt.
+
+**And the gate run found the race it had been hiding.** `test-qemu`'s hot-plug swapped the keyboard
+for a mouse, then pulled the mouse, as soon as each one's *arrival* line appeared. Binding was still
+asking the device for its protocol and idle rate at that moment, and the request to a device taken
+away timed out. Under the rule above that leaves the device unbound, and the gate wants it bound.
+- **It passed before only because a failed report-protocol `SET_PROTOCOL` was ignored**, so the
+  mouse was "bound" after it had left.
+- It failed once, under host load. The driver now waits for each binding line before taking the
+  device away; two runs under TCG and one under KVM passed after that.
+
+**5. Nothing tested the parser's collection scoping.** A joystick collection with relative X and Y
+before the mouse's now does. Each of the reviewer's two mutations fails it: the collection's usage
+not checked, and every collection read as the mouse's.
+
+**Optional:**
+- tests for Max ESIT Payload's high byte and for a companion after another endpoint, each failing its
+  mutation;
+- the node cap, sixteen for the boot, noted under `usb-departed-records`;
+- the ring's sizing comment corrected: a USB mouse polled every millisecond fills it in about 32 ms.
+
+No ABI hash impact.

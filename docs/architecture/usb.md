@@ -197,9 +197,16 @@ interface becomes an input node. In order:
 6. **A node**, registered under the device's record, and **one Normal TRB** queued, for the
    endpoint's maximum packet, interrupting on completion and on a short packet.
 
-**What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. A
-failure in steps 3 to 6 is that interface's: its endpoint stays configured and is never polled,
-and the others go on. A stalled report descriptor runs the mouse in boot protocol.
+**What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. In
+steps 3 to 6:
+- **a stall is that interface's**: its endpoint stays configured and is never polled, and the
+  others go on. A stalled report descriptor runs the mouse in boot protocol;
+- **any other failure on the default endpoint ends the binding there**, since the request may still
+  be on the endpoint's ring (`control_in`'s rule, which enumeration keeps by ending the device). So
+  nothing more is asked of it: that interface is not bound, nor any after it, and those before it
+  stay bound, on their own endpoints. A keyboard whose `SET_IDLE` fails so is past its last request,
+  and is bound, the last (PR #358 review);
+- running out of nodes or table room is that interface's alone.
 
 **Polling is the DPC's.** A Transfer Event for any endpoint but the default one goes to the table
 of bound endpoints, by slot and Device Context Index. On success or a short packet:
@@ -213,11 +220,14 @@ QEMU's device NAKs an IN token with nothing to report, so its controller complet
 there is input; a real device answers on its interval. Re-queueing on every completion serves both.
 
 **Any other completion halts the endpoint**, and the DPC cannot issue a command and wait, so it
-marks the endpoint and wakes the hub thread. The thread resets it — Reset Endpoint, then Set TR
-Dequeue Pointer to the ring's enqueue point — and queues its TRB again. A third halt leaves it
-stopped, logged. **No `SYN_DROPPED` follows a recovery**: a HID report is the device's whole
-state, so the first report after it, decoded against the last before, delivers what changed. A
-`SYN_DROPPED` would make the input layer forget every held modifier (PR #357 review).
+marks the endpoint and wakes the hub thread, **after letting the table's lock go**: waking takes the
+scheduler's lock, which ranks above it (PR #358 review). The thread resets it — Reset Endpoint, then
+Set TR Dequeue Pointer to the ring's enqueue point — and queues its TRB again, saying so once the
+lock is let go. A third halt leaves it stopped, logged, and so does a reset that fails. Each halt
+is counted once, when the DPC sees it. **No `SYN_DROPPED` follows a recovery**: a HID report is
+the device's whole state, so the first report after it, decoded against the last before, delivers
+what changed. A `SYN_DROPPED` would make the input layer forget every held modifier (PR #357
+review).
 
 **The reports** (`drivers::hid`, which knows nothing of USB):
 - **A keyboard's** eight bytes, against the last report: releases first, keys then modifiers, then

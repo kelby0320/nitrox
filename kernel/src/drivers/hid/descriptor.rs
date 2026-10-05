@@ -149,7 +149,16 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
                             return None;
                         }
                         let in_mouse = mouse_at.is_some();
-                        if in_mouse && unsigned & INPUT_CONSTANT == 0 && unsigned & INPUT_VARIABLE != 0 {
+                        // **A field of no bits reads nothing**, so an item of them is passed over
+                        // whatever its count says. Its product above is zero, so no count is too
+                        // large for either guard, and walking its fields was a loop as long as the
+                        // count: 19 s for one item (PR #358 review). With a bit or more per field,
+                        // the limit above bounds every report's fields, and so the walk.
+                        if in_mouse
+                            && g.size > 0
+                            && unsigned & INPUT_CONSTANT == 0
+                            && unsigned & INPUT_VARIABLE != 0
+                        {
                             for f in 0..g.count {
                                 let usage = if let Some(min) = usage_min {
                                     min.saturating_add(f)
@@ -399,8 +408,9 @@ mod tests {
 
     /// **A device's sizes are untrusted** (Phase 6 Part B.3): a count and size whose product
     /// overflows ends the walk with no layout rather than overflowing, which panics in a debug
-    /// kernel; and a report longer than a page ends it at once, where the field loop would otherwise
-    /// run two billion times at boot, held here to a second.
+    /// kernel; a report longer than a page ends it at once, where the field loop would otherwise
+    /// run two billion times at boot, held here to a second; and so does an item whose fields have
+    /// no bits, however many it says it has.
     #[test]
     fn sizes_that_overflow_or_run_long_give_no_layout() {
         // The axes' Report Size and Count as four-byte items: their product overflows.
@@ -413,6 +423,30 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(mouse_layout(&d), None, "a report longer than a page");
         assert!(start.elapsed() < std::time::Duration::from_secs(1), "the walk ended at once");
+        // Fields of no bits, as many as a count can say: their product is zero, so neither guard
+        // sees them (PR #358 review). Walked, it took 19 s.
+        let mut d = QEMU_MOUSE[..44].to_vec();
+        d.extend_from_slice(&[0x75, 0x00, 0x97, 0xFF, 0xFF, 0xFF, 0xFF, 0x81, 0x06, 0xC0, 0xC0]);
+        let start = std::time::Instant::now();
+        assert_eq!(mouse_layout(&d), None, "axes of no bits are no axes");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "the item was passed over at once");
+    }
+
+    /// **Only the mouse's collection is read** (PR #358 review). A report may hold another
+    /// collection's fields first — here a joystick's, with relative X and Y of its own — and they push
+    /// the mouse's fields along, since one report is every input item with its ID; but they are not
+    /// the mouse's axes.
+    #[test]
+    fn axes_outside_the_mouse_collection_are_not_its() {
+        let mut d = vec![
+            0x05, 0x01, 0x09, 0x04, 0xA1, 0x01, // Generic Desktop, Joystick, Application
+            0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, // X, Y
+            0xC0,
+        ];
+        d.extend_from_slice(&QEMU_MOUSE);
+        let l = mouse_layout(&d).expect("the mouse after the joystick");
+        assert_eq!(l.buttons, [Some(Field::bit(16)), Some(Field::bit(17)), Some(Field::bit(18))]);
+        assert_eq!((l.x, l.y, l.wheel), (signed(24, 8), signed(32, 8), Some(signed(40, 8))));
     }
 
     /// **A descriptor that runs past its bytes is read no further**, and a Pop with nothing pushed

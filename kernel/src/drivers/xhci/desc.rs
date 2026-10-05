@@ -603,6 +603,22 @@ mod tests {
         assert_eq!(found[1].report_len, 0, "no HID descriptor");
     }
 
+    /// **A companion is its own endpoint's** (PR #358 review): one after an endpoint that is not the
+    /// chosen one — here an OUT endpoint after the chosen IN — leaves the chosen one's burst alone.
+    #[test]
+    fn a_companion_after_another_endpoint_is_not_the_chosen_ones() {
+        let mut c = vec![9, 2, 0, 0, 1, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 2, 3, 1, 2, 0]); // a mouse
+        c.extend_from_slice(&[7, 5, 0x81, 3, 4, 0, 10]); // IN: the chosen one
+        c.extend_from_slice(&[6, 0x30, 1, 0, 4, 0]); // its companion: burst 1
+        c.extend_from_slice(&[7, 5, 0x02, 3, 4, 0, 10]); // OUT
+        c.extend_from_slice(&[6, 0x30, 7, 0, 4, 0]); // the OUT endpoint's: burst 7
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        let found: Vec<HidInterface> = hid_interfaces(&c).collect();
+        assert_eq!(found[0].endpoint.map(|e| e.burst), Some(1));
+    }
+
     /// **An endpoint that runs past the configuration is not read**: the interface is still there,
     /// with no endpoint to bind.
     #[test]
