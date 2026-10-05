@@ -322,6 +322,8 @@ mod tests {
         assert_eq!(lights_from(&buf, 2, 1), Ok(0x07), "all three");
         assert_eq!(lights_from(&buf, 1, 1), Err(KError::InvalidArgument), "bit 3 is no light");
         assert_eq!(lights_from(&buf, 0, 2), Err(KError::InvalidArgument), "two bytes");
+        // **Held for the function's sake**: `sys_io_submit` answers a zero-length request itself,
+        // before any driver, so no write reaches this with none (PR #359 review).
         assert_eq!(lights_from(&buf, 0, 0), Err(KError::InvalidArgument), "none");
     }
 

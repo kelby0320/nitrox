@@ -879,9 +879,12 @@ mod tests {
         let (out, n) = group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
         assert_eq!(n, 1);
         assert!(matches!(out[0], Logical::Key { keycode: KEY_CAPSLOCK, locks, .. } if locks == LOCK_NUM | LOCK_CAPS));
+        // **Checked after each repeat**, since two toggles cancel: asserted only after the second,
+        // an interpreter that toggled on every press passed this (PR #359 review).
         group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "a repeat toggled nothing");
         group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
-        assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "the repeats toggled nothing");
+        assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "nor did a second");
         group(&mut i, &[key(KEY_CAPSLOCK, false), syn()]);
         group(&mut i, &[key(KEY_CAPSLOCK, true), syn(), key(KEY_CAPSLOCK, false), syn()]);
         assert_eq!(i.locks(), LOCK_NUM, "pressed again after its release, it toggles back");

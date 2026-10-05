@@ -33892,3 +33892,30 @@ reads the PS/2 keyboard's lights from QEMU's `ps2_set_ledstate` trace, exactly, 
 
 No ABI hash impact. `IoOp`'s layout and `IoOpcode`'s values are unchanged, and `CharBackend` is the
 kernel's own. `KeyEvent` changes no layout: two reserved bytes gain a meaning.
+
+## 2026-10-05 — PR #359, reviewed: two repeats that cancel
+
+One blocking finding, three worth fixing and one optional, with no correctness bug found. All are
+fixed, and each new test fails the mutation the review found surviving, run here (seven).
+
+**1. `a_held_lock_key_toggles_its_lock_once` passed an interpreter that toggled on every press.**
+It asserted only after two repeats, and two toggles cancel. It now checks after each one. No gate
+sends a repeat, since a QMP key is a press and a release, so this test is the only guard on the
+typematic toggle PR #357's review raised.
+
+**2. Nothing held a repeat to the locks its key went down with.** Every repeat test passed none, and
+`fire_repeat` built its event in `main.rs`, where no host test reaches. `Repeat::event` builds it
+now, and a test arms a run under Caps Lock and Num Lock and reads the event back. The router's own
+`KeyEvent` was held only by `check-terminal`'s Caps Lock step; a host test holds it too.
+
+**3. Nothing held a text field or a text area to the locks.** Every `apply` in their suites passed
+none, and no gate types into either under a lock. Each now has a test.
+
+**4. The spec said a keyboard's node refuses any length but 1, and every other char node refuses
+any `Write`.** `sys_io_submit` answers a zero-length request itself, before the class dispatch, as
+the spec's general rule for `length` says. The lights section now says so, and the test of
+`lights_from` with no bytes says it holds the function rather than a path the syscall takes.
+
+**5. A resend restarting the answer's clock** is tested: the byte sent again has the whole bound.
+
+No ABI hash impact.

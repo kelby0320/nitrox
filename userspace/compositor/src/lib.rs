@@ -563,6 +563,13 @@ impl Repeat {
         Self { keycode, modifiers, locks, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
     }
 
+    /// **The `KeyEvent` each repeat sends**: the key, `KEY_REPEAT`, and the modifiers and locks it
+    /// went down with.
+    pub fn event(&self) -> librsproto::surface::KeyEvent {
+        librsproto::surface::KeyEvent::new(self.window, self.keycode, librsproto::surface::KEY_REPEAT, self.modifiers)
+            .with_locks(self.locks)
+    }
+
     /// Whether a repeat is due at `now`; advances to the next one if so.
     ///
     /// **Advances by adding an interval to the deadline, not to `now`.** Adding to `now`
@@ -2997,6 +3004,22 @@ mod tests {
             assert_eq!(Repeat::after_key(Some(run), lock, true, 0, 0, Some(7), 50), Some(run), "{lock} took the run");
             assert_eq!(Repeat::after_key(Some(run), lock, false, 0, 0, Some(7), 90), Some(run), "{lock}'s release");
         }
+    }
+
+    /// **A repeat carries the locks its key went down with** (Phase 6 Part B.5; PR #359 review): a
+    /// held keypad 1 under Num Lock repeats `1`, and a held `a` under Caps Lock repeats `A` — however
+    /// the locks change during the run. Every other repeat test passes no lock, so nothing held this.
+    #[test]
+    fn a_repeat_carries_the_locks_it_went_down_with() {
+        use librsproto::surface::{KEY_REPEAT, LOCK_CAPS, LOCK_NUM, MOD_SHIFT};
+        let run = Repeat::after_key(None, KEY_A, true, MOD_SHIFT, LOCK_CAPS | LOCK_NUM, Some(7), 0).expect("armed");
+        assert_eq!(run.locks, LOCK_CAPS | LOCK_NUM, "armed with the press's locks");
+        let e = run.event();
+        assert_eq!((e.window, e.keycode, e.pressed), (7, KEY_A, KEY_REPEAT));
+        assert_eq!((e.modifiers, e.locks), (MOD_SHIFT, LOCK_CAPS | LOCK_NUM), "the press's, sent with each repeat");
+        // Caps Lock pressed mid-run changes nothing the run sends.
+        let after = Repeat::after_key(Some(run), KEY_CAPSLOCK, true, MOD_SHIFT, LOCK_NUM, Some(7), 50);
+        assert_eq!(after.map(|r| r.event().locks), Some(LOCK_CAPS | LOCK_NUM));
     }
 
     #[test]

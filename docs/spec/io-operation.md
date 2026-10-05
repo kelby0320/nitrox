@@ -138,7 +138,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   **A char device takes a `Write` only where its driver does** — today a keyboard's raw node,
   for its lights ([Keyboard lights](#keyboard-lights)). Every other char node refuses one,
   `Unsupported`, synchronously and with no PO: the console's output stays on the kernel log
-  path, and a mouse has nothing to set.
+  path, and a mouse has nothing to set. **A zero-length `Write` is the exception**, to this and
+  to everything below: like every zero-length request it completes at once, `result` `0`,
+  before any device's rule is asked (`length` above).
 
   Today's char nodes are the serial console at `/dev/console` and the raw input
   devices at `/dev/input/raw/<n>`.
@@ -148,9 +150,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 *(Phase 6 Part B.5.)* A `Write` to a keyboard's raw node sets its lights. `length` must be
 **exactly 1**, and the byte at `buf_offset` is the lights in HID's order — `LIGHT_NUM` (`0x01`),
 `LIGHT_CAPS` (`0x02`) and `LIGHT_SCROLL` (`0x04`), mirrored in `kernel/src/libkern/input.rs` and
-`userspace/libkern/src/abi.rs`. Another length or another bit is refused synchronously,
-`InvalidArgument`. The byte is read when the write is submitted, so the caller may reuse its
-buffer at once.
+`userspace/libkern/src/abi.rs`. Another nonzero length or another bit is refused synchronously,
+`InvalidArgument`; a zero-length write completes at once, as every zero-length request does. The
+byte is read when the write is submitted, so the caller may reuse its buffer at once.
 
 The PO completes once the keyboard has taken the lights — `status` `0`, `result` `1` — or failed
 to:

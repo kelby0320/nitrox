@@ -4079,6 +4079,20 @@ mod text_field_tests {
         assert_eq!(f.text(), "c");
     }
 
+    /// **A field types under the key's locks** (Phase 6 Part B.5; PR #359 review): Caps Lock
+    /// upper-cases a letter and Num Lock makes keypad 1 a digit, each only if the lock reaches the
+    /// keymap. No gate types into a field under a lock.
+    #[test]
+    fn a_field_types_under_the_keys_locks() {
+        use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
+        const KEY_A: u16 = 30;
+        const KEY_KP1: u16 = 79;
+        let mut f = TextFieldState::new();
+        assert!(f.apply(KEY_A, 0, LOCK_CAPS));
+        assert!(f.apply(KEY_KP1, 0, LOCK_NUM));
+        assert_eq!(f.text(), "A1");
+    }
+
     /// The caret is a byte offset that must never land inside a character. Every mutation
     /// keeps it on a boundary, and slicing at it is what would panic if one did not.
     #[test]
@@ -4659,6 +4673,16 @@ mod tests {
                 a.insert(c);
             }
         }
+    }
+
+    /// **An area types under the key's locks** (Phase 6 Part B.5; PR #359 review), as a field does.
+    #[test]
+    fn an_area_types_under_the_keys_locks() {
+        use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
+        let mut a = TextAreaState::with_text("");
+        assert!(a.apply(30, 0, LOCK_CAPS), "a, under Caps Lock");
+        assert!(a.apply(79, 0, LOCK_NUM), "keypad 1, under Num Lock");
+        assert_eq!(a.text(), "A1");
     }
 
     // ---- paste and its range (M12 Part E) ----

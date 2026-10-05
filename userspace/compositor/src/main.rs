@@ -653,15 +653,7 @@ fn fire_repeat(srv: &mut Server) {
         srv.repeat = None;
         return;
     };
-    let rec = Outbound::Key {
-        event: KeyEvent::new(
-            r.window,
-            r.keycode,
-            librsproto::surface::KEY_REPEAT,
-            r.modifiers,
-        )
-        .with_locks(r.locks),
-    };
+    let rec = Outbound::Key { event: r.event() };
     log_route(&rec);
     enqueue(srv, slot, rec);
 }

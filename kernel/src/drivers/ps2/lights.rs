@@ -151,6 +151,17 @@ mod tests {
         assert_eq!(x.on_byte(RESEND, 5), Some(Action::Done(Err(Failure::Resends))), "a fourth");
     }
 
+    /// **A resend restarts the answer's clock** (PR #359 review): the byte sent again has the whole
+    /// bound, not what was left of the first's.
+    #[test]
+    fn a_resend_restarts_the_answers_clock() {
+        let (mut x, _) = Exchange::start(0, 0);
+        let late = ANSWER_NS - 1;
+        assert_eq!(x.on_byte(RESEND, late), Some(Action::Send(SET_LEDS)));
+        assert_eq!(x.on_tick(late + ANSWER_NS), None, "the byte sent again has its whole bound");
+        assert_eq!(x.on_tick(late + ANSWER_NS + 1), Some(Action::Done(Err(Failure::NoAnswer))));
+    }
+
     /// **An answer that never comes** fails the exchange on the tick after its bound, and not before.
     #[test]
     fn no_answer_fails_on_the_tick_after_its_bound() {

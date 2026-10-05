@@ -1944,6 +1944,22 @@ mod tests {
         assert_eq!(out[0].window(), top, "the key went to the focused window");
     }
 
+    /// **A key carries its locks to the window** (Phase 6 Part B.5; PR #359 review): the event the
+    /// router builds has the transition's locks, which only `check-terminal`'s Caps Lock step saw.
+    #[test]
+    fn a_key_carries_its_locks_to_the_window() {
+        use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        let caps = Logical::Key { keycode: 30, pressed: true, modifiers: 0, locks: LOCK_CAPS | LOCK_NUM, time_ns: T };
+        let out = go(&mut r, &mut s, caps);
+        match out.as_slice() {
+            [Outbound::Key { event }] => assert_eq!((event.window, event.locks), (w, LOCK_CAPS | LOCK_NUM)),
+            other => panic!("not one key: {other:?}"),
+        }
+    }
+
     /// A window whose first `Configure` is still held takes neither the keyboard nor a click.
     ///
     /// It is on top of the stack and occupies its rectangle there, but the compositor has
