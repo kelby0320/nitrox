@@ -236,6 +236,24 @@ impl MemoryObject {
         &self.frames
     }
 
+    /// **Copy `src` into the object at byte `offset`**, through the HHDM, stopping at its last
+    /// frame. What a char device does to answer a read: the console, an input node, and the
+    /// registry's change node (Phase 6 Part C) each did it with a copy of their own. The caller has
+    /// bounds-checked the range, as `sys_io_submit` does; a range past the end is cut short.
+    pub fn copy_in(&self, offset: usize, src: &[u8]) {
+        let hhdm = heap::hhdm_offset();
+        for (i, &b) in src.iter().enumerate() {
+            let pos = offset + i;
+            let Some(frame) = self.frames.get(pos / PAGE_SIZE) else {
+                break;
+            };
+            let dst = (frame.as_u64() + hhdm) as *mut u8;
+            // SAFETY: within one of this object's frames, which the HHDM maps and the object
+            // owns or borrows for as long as `self` is alive.
+            unsafe { *dst.add(pos % PAGE_SIZE) = b };
+        }
+    }
+
     /// Copy the object's contents into a fresh contiguous heap buffer (page-rounded
     /// [`size`](Self::size) bytes; the tail past the real data stays zero). The reverse
     /// of [`try_new_filled`](Self::try_new_filled): `sys_process_spawn` uses it to hand a

@@ -244,6 +244,7 @@ fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
     buf_offset: u64,
+    _offset: u64,
     max_len: u64,
     ctx: *mut (),
 ) -> Result<(), KError> {

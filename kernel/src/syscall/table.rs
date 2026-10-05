@@ -2223,6 +2223,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
                 &buf_ok.object,
                 &po_ref,
                 op.buf_offset,
+                op.offset,
                 op.length,
                 backend.ctx,
             ),

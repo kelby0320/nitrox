@@ -353,7 +353,11 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 ///   of records, then that many `DeviceRecord`s (`crate::libkern::device`), then zero padding to
 ///   the page. The count is the length: the object's size is page-rounded.
 /// - `"<id>"` → node `id` itself, a [`DeviceNode`](crate::object::DeviceNode) handle, so the
-///   device manager can hand a class owner the device it read a record of.
+///   device manager can hand a class owner the device it read a record of. **`NotFound` for a
+///   departed device** (Phase 6 Part C): its record stays, and its node is no longer handed out.
+/// - `"changes"` → the change node (Phase 6 Part C): a `Read` on it waits until the table's
+///   generation is past the read's `offset`, then answers with the generation. How the device
+///   manager follows the table.
 ///
 /// **Authority is the binding**, which the kernel makes in the root namespace only: `<id>` is
 /// every raw device there is. `requested` is ignored — the binding's rights cap what the caller
@@ -367,6 +371,12 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return match MemoryObject::try_new_filled(&bytes) {
             Ok(obj) => complete_with_memobj(obj),
             Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+        };
+    }
+    if suffix == b"changes" {
+        return match crate::device::changes_node() {
+            Some(node) => OpStatus::Completed(node),
+            None => OpStatus::Rejected(KError::NotFound),
         };
     }
     let Some(id) = parse_index(suffix) else {

@@ -405,7 +405,7 @@ mod tests {
             func: 0,
             port: 0,
             speed: 0,
-            _pad: 0,
+            flags: 0,
             logical_block_size: 0,
             name_len: name.len() as u32,
             block_count: 0,

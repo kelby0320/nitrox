@@ -568,7 +568,14 @@ pub(super) fn unbind(x: &Xhci, slot: u8) {
 }
 
 /// [`CharBackend::submit_read`] for a USB input node, as PS/2's is.
-fn submit_read(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, max_len: u64, ctx: *mut ()) -> Result<(), KError> {
+fn submit_read(
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    _offset: u64,
+    max_len: u64,
+    ctx: *mut (),
+) -> Result<(), KError> {
     let index = ctx as usize;
     if index >= MAX_NODES {
         return Err(KError::InvalidArgument);

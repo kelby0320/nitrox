@@ -32,7 +32,6 @@ use crate::dpc::Dpc;
 use crate::libkern::KBox;
 use crate::libkern::IrqSpinLock;
 use crate::libkern::handle::KObjectType;
-use crate::mm::{PAGE_SIZE, heap};
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
@@ -113,21 +112,7 @@ static CONSOLE_NODE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
     // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
     let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
-    let frames = mo.frames();
-    let hhdm = heap::hhdm_offset();
-    let mut pos = buf_offset as usize;
-    for &b in src {
-        let page = pos / PAGE_SIZE;
-        let intra = pos % PAGE_SIZE;
-        if page >= frames.len() {
-            break;
-        }
-        let dst = (frames[page].as_u64() + hhdm) as *mut u8;
-        // SAFETY: `dst.add(intra)` is within an owned, HHDM-mapped buffer frame
-        // (bounds pre-checked by the caller).
-        unsafe { *dst.add(intra) = b };
-        pos += 1;
-    }
+    mo.copy_in(buf_offset as usize, src);
 }
 
 /// [`CharBackend::submit_read`] for the console: satisfy the read immediately from
@@ -138,6 +123,7 @@ fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
     buf_offset: u64,
+    _offset: u64,
     max_len: u64,
     _ctx: *mut (),
 ) -> Result<(), KError> {

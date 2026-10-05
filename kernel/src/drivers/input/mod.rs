@@ -180,20 +180,7 @@ pub fn deliver_now(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, bytes: &
 unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
     // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
     let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
-    let frames = mo.frames();
-    let hhdm = heap::hhdm_offset();
-    let mut pos = buf_offset as usize;
-    for &b in src {
-        let page = pos / PAGE_SIZE;
-        let intra = pos % PAGE_SIZE;
-        if page >= frames.len() {
-            break;
-        }
-        let dst = (frames[page].as_u64() + hhdm) as *mut u8;
-        // SAFETY: within an owned, HHDM-mapped buffer frame (bounds pre-checked).
-        unsafe { *dst.add(intra) = b };
-        pos += 1;
-    }
+    mo.copy_in(buf_offset as usize, src);
 }
 
 /// **The lights a write to a keyboard's node carries** (Phase 6 Part B.5): exactly one byte at

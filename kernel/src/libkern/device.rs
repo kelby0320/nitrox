@@ -73,8 +73,9 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this kernel writes.
-pub const REGISTRY_VERSION: u32 = 1;
+/// The snapshot layout this kernel writes: 2 since Phase 6 Part C, whose header carries the table's
+/// generation.
+pub const REGISTRY_VERSION: u32 = 2;
 /// [`DeviceRecord::served`] for a node no indexed path serves (a PCI function, the console).
 pub const NOT_SERVED: u32 = 0xFFFF_FFFF;
 /// [`DeviceRecord::parent`] for a node that belongs to nothing else.
@@ -87,6 +88,10 @@ pub const OUTCOME_CLAIMED: u32 = 1;
 pub const OUTCOME_DECLINED: u32 = 2;
 /// Longest driver name served, in bytes.
 pub const MAX_DRIVER_NAME: usize = 16;
+/// [`DeviceRecord::flags`]: **the device has departed** (Phase 6 Part C). Its record keeps its id,
+/// its fields and its served index, which no later device takes; its paths answer `NotFound`. A
+/// departed device's children — a USB device's keyboard, a disk's partitions — are departed too.
+pub const DEPARTED: u8 = 0x01;
 
 /// The start of a snapshot: then `count` [`DeviceRecord`]s, then zero padding to the page.
 #[repr(C)]
@@ -101,14 +106,19 @@ pub struct RegistryHeader {
     /// `size_of::<DeviceRecord>()` as the kernel wrote it, so a reader built against another
     /// layout refuses rather than misreads.
     pub record_size: u32,
+    /// **The table's generation** (Phase 6 Part C): bumped once by every change — a device
+    /// registered, or one departed with its children — so two snapshots with the same generation
+    /// say the same thing. `/dev/registry/changes` answers in the same terms.
+    pub generation: u64,
 }
 
-const _: () = assert!(size_of::<RegistryHeader>() == 16);
-const _: () = assert!(align_of::<RegistryHeader>() == 4);
+const _: () = assert!(size_of::<RegistryHeader>() == 24);
+const _: () = assert!(align_of::<RegistryHeader>() == 8);
 const _: () = assert!(offset_of!(RegistryHeader, magic) == 0);
 const _: () = assert!(offset_of!(RegistryHeader, version) == 4);
 const _: () = assert!(offset_of!(RegistryHeader, count) == 8);
 const _: () = assert!(offset_of!(RegistryHeader, record_size) == 12);
+const _: () = assert!(offset_of!(RegistryHeader, generation) == 16);
 
 /// One node of the device table.
 #[repr(C)]
@@ -159,8 +169,9 @@ pub struct DeviceRecord {
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// Reserved; zero.
-    pub _pad: u8,
+    /// What has happened to it: [`DEPARTED`] (Phase 6 Part C, from the byte that was reserved — the
+    /// layout is unchanged).
+    pub flags: u8,
     /// Bytes per logical block, for a block device; zero otherwise.
     pub logical_block_size: u32,
     /// Bytes of [`name`](Self::name) that are meaningful.
@@ -217,7 +228,7 @@ impl Default for DeviceRecord {
             func: 0,
             port: 0,
             speed: 0,
-            _pad: 0,
+            flags: 0,
             logical_block_size: 0,
             name_len: 0,
             block_count: 0,
@@ -230,7 +241,8 @@ impl Default for DeviceRecord {
 impl RegistryHeader {
     /// The header's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `RegistryHeader` is `repr(C)`, four `u32`s with no padding, fully initialised.
+        // SAFETY: `RegistryHeader` is `repr(C)`, four `u32`s then a `u64` at offset 16, so no
+        // padding, fully initialised.
         unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
     }
 }
@@ -238,7 +250,7 @@ impl RegistryHeader {
 impl DeviceRecord {
     /// The record's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `DeviceRecord` is `repr(C)` and its explicit `_pad` leaves no implicit padding
+        // SAFETY: `DeviceRecord` is `repr(C)` and its `flags` byte leaves no implicit padding
         // (the offset asserts above account for every byte), so every byte is initialised.
         unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
     }
