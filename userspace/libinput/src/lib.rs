@@ -26,11 +26,13 @@
 #![deny(missing_docs)]
 
 use libkern::abi::{
-    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, InputEvent, KEY_LEFTALT, KEY_LEFTCTRL,
-    KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
-    REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, InputEvent, KEY_CAPSLOCK, KEY_DELETE,
+    KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_INSERT, KEY_KPENTER, KEY_LEFT, KEY_LEFTALT,
+    KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_NUMLOCK, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT,
+    KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_UP, LIGHT_CAPS, LIGHT_NUM, REL_WHEEL,
+    REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
 };
-use librsproto::surface::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
+use librsproto::surface::{LOCK_CAPS, LOCK_NUM, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
 pub mod keymap;
 
@@ -78,6 +80,9 @@ pub enum Logical {
         pressed: bool,
         /// Modifiers held **at this transition**.
         modifiers: u16,
+        /// The locks on **at this transition**, a lock key's own press included: `LOCK_CAPS`,
+        /// `LOCK_NUM` (Phase 6 Part B.5).
+        locks: u16,
         /// Kernel monotonic time at the interrupt. See the type's own docs.
         time_ns: u64,
     },
@@ -184,6 +189,49 @@ pub fn is_modifier(keycode: u16) -> bool {
     modifier_slot(keycode).is_some()
 }
 
+/// **The keypad's navigation keys** (Phase 6 Part B.5), as `(keypad keycode, the key it stands for
+/// with Num Lock off)`: 7 Home, 8 Up, 9 Page Up, 4 Left, 6 Right, 1 End, 2 Down, 3 Page Down,
+/// 0 Insert, `.` Delete. Delivered as those keys, every client that acts on them takes the keypad
+/// unchanged.
+const KEYPAD_NAV: [(u16, u16); 10] = [
+    (71, KEY_HOME),
+    (72, KEY_UP),
+    (73, KEY_PAGEUP),
+    (75, KEY_LEFT),
+    (77, KEY_RIGHT),
+    (79, KEY_END),
+    (80, KEY_DOWN),
+    (81, KEY_PAGEDOWN),
+    (82, KEY_INSERT),
+    (83, KEY_DELETE),
+];
+
+/// Keypad 5, which stands for nothing with Num Lock off and is delivered as nothing.
+const KEY_KP5: u16 = 76;
+
+/// The lock keys, and the bit each toggles.
+const LOCK_KEYS: [(u16, u16); 2] = [(KEY_CAPSLOCK, LOCK_CAPS), (KEY_NUMLOCK, LOCK_NUM)];
+
+/// **Whether `keycode` is a lock key** — Caps Lock or Num Lock (Phase 6 Part B.5). Like a
+/// modifier, it changes how other keys read rather than being one to repeat.
+pub fn is_lock_key(keycode: u16) -> bool {
+    LOCK_KEYS.iter().any(|&(k, _)| k == keycode)
+}
+
+/// **The keyboard lights `locks` call for** (Phase 6 Part B.5): the byte a keyboard's node takes,
+/// `LIGHT_NUM` for Num Lock and `LIGHT_CAPS` for Caps Lock. Scroll Lock is not a lock here, so
+/// its light stays off.
+pub fn lights(locks: u16) -> u8 {
+    let mut l = 0;
+    if locks & LOCK_NUM != 0 {
+        l |= LIGHT_NUM;
+    }
+    if locks & LOCK_CAPS != 0 {
+        l |= LIGHT_CAPS;
+    }
+    l as u8
+}
+
 /// Which bit of the held-button mask a `BTN_*` code occupies.
 fn button_bit(code: u16) -> Option<u16> {
     match code {
@@ -199,7 +247,7 @@ fn button_bit(code: u16) -> Option<u16> {
 /// Feed it every record; it emits when a group's `SYN_REPORT` arrives, because that is when a
 /// logical event is complete. A diagonal move is `REL_X`, `REL_Y`, `SYN` and must become
 /// **one** motion, not two.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Interpreter {
     /// Which modifier **keys** are down, one bit per entry of [`MOD_KEYS`].
     ///
@@ -218,10 +266,31 @@ pub struct Interpreter {
     /// Key/button transitions seen in the current group, awaiting its `SYN`.
     pending: [Option<Logical>; MAX_LOGICAL],
     pending_n: usize,
+    /// **The locks on** (Phase 6 Part B.5): `LOCK_CAPS`, `LOCK_NUM`. Num Lock is on from the start.
+    locks: u16,
+    /// Which lock keys are down, one bit per entry of [`LOCK_KEYS`]: **a held lock key toggles
+    /// once**. A PS/2 keyboard's typematic repeat arrives as further presses with no release
+    /// between, so a lock that toggled on every press would flip at the repeat rate while held
+    /// (PR #357 review).
+    lock_keys_down: u8,
+    /// Which keypad keys are down, one bit per entry of [`KEYPAD_NAV`] and bit 10 for keypad 5,
+    /// and which of them went down as navigation keys: **a release is its press's keycode**, so a
+    /// key held while Num Lock changes releases what it pressed, and its repeats keep the first
+    /// press's meaning.
+    keypad_down: u16,
+    keypad_as_nav: u16,
+}
+
+impl Default for Interpreter {
+    /// [`Interpreter::new`]: nothing held, and Num Lock on.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Interpreter {
-    /// An interpreter with nothing held.
+    /// An interpreter with nothing held, and **Num Lock on**, so the keypad types digits from the
+    /// start (Phase 6 Part B.5).
     pub const fn new() -> Self {
         Self {
             held_mods: 0,
@@ -231,6 +300,64 @@ impl Interpreter {
             dz: 0,
             pending: [None; MAX_LOGICAL],
             pending_n: 0,
+            locks: LOCK_NUM,
+            lock_keys_down: 0,
+            keypad_down: 0,
+            keypad_as_nav: 0,
+        }
+    }
+
+    /// **The locks on**: `LOCK_CAPS`, `LOCK_NUM` (Phase 6 Part B.5). What a key carries to a client,
+    /// and what the keyboards' lights show.
+    pub fn locks(&self) -> u16 {
+        self.locks
+    }
+
+    /// **A lock key's transition**: a first press toggles its lock, a release lets it toggle again.
+    fn lock_key(&mut self, code: u16, pressed: bool) {
+        let Some(i) = LOCK_KEYS.iter().position(|&(k, _)| k == code) else {
+            return;
+        };
+        if pressed {
+            if self.lock_keys_down & (1 << i) == 0 {
+                self.locks ^= LOCK_KEYS[i].1;
+            }
+            self.lock_keys_down |= 1 << i;
+        } else {
+            self.lock_keys_down &= !(1 << i);
+        }
+    }
+
+    /// **The keycode a key is delivered as**, or `None` for none (Phase 6 Part B.5): keypad Enter
+    /// as Enter always, and with Num Lock off — as it was when the key first went down — the
+    /// keypad's navigation keys as the keys they stand for, and keypad 5 as nothing.
+    fn translate(&mut self, code: u16, pressed: bool) -> Option<u16> {
+        if code == KEY_KPENTER {
+            return Some(KEY_ENTER);
+        }
+        let i = match KEYPAD_NAV.iter().position(|&(k, _)| k == code) {
+            Some(i) => i,
+            None if code == KEY_KP5 => KEYPAD_NAV.len(),
+            None => return Some(code),
+        };
+        let bit = 1u16 << i;
+        if pressed && self.keypad_down & bit == 0 {
+            self.keypad_down |= bit;
+            if self.locks & LOCK_NUM == 0 {
+                self.keypad_as_nav |= bit;
+            } else {
+                self.keypad_as_nav &= !bit;
+            }
+        }
+        let as_nav = self.keypad_as_nav & bit != 0;
+        if !pressed {
+            self.keypad_down &= !bit;
+            self.keypad_as_nav &= !bit;
+        }
+        match (as_nav, KEYPAD_NAV.get(i)) {
+            (false, _) => Some(code),
+            (true, Some(&(_, nav))) => Some(nav),
+            (true, None) => None,
         }
     }
 
@@ -273,6 +400,7 @@ impl Interpreter {
                     }
                 }
                 let modifiers = self.modifiers();
+                self.lock_key(e.code, pressed);
                 if let Some(bit) = button_bit(e.code) {
                     if pressed {
                         self.buttons |= bit;
@@ -286,11 +414,12 @@ impl Interpreter {
                         modifiers,
                         time_ns: e.time_ns,
                     });
-                } else {
+                } else if let Some(keycode) = self.translate(e.code, pressed) {
                     self.push(Logical::Key {
-                        keycode: e.code,
+                        keycode,
                         pressed,
                         modifiers,
+                        locks: self.locks,
                         time_ns: e.time_ns,
                     });
                 }
@@ -310,6 +439,11 @@ impl Interpreter {
                 // keeps its held-key set across a gap is the phantom-modifier bug.
                 self.held_mods = 0;
                 self.buttons = 0;
+                // **But not the locks**: a lock is not a held key, and its light goes on showing it
+                // (PR #357 review). Which lock and keypad keys are down is a guess like the rest.
+                self.lock_keys_down = 0;
+                self.keypad_down = 0;
+                self.keypad_as_nav = 0;
                 self.dx = 0;
                 self.dy = 0;
                 self.dz = 0;
@@ -466,7 +600,10 @@ mod tests {
         group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         let (out, n) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(n, 1);
-        assert_eq!(out[0], Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, time_ns: T });
+        assert_eq!(
+            out[0],
+            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, locks: LOCK_NUM, time_ns: T }
+        );
     }
 
     #[test]
@@ -477,7 +614,7 @@ mod tests {
         let (out, _) = group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         assert_eq!(
             out[0],
-            Logical::Key { keycode: KEY_LEFTSHIFT, pressed: true, modifiers: MOD_SHIFT, time_ns: T }
+            Logical::Key { keycode: KEY_LEFTSHIFT, pressed: true, modifiers: MOD_SHIFT, locks: LOCK_NUM, time_ns: T }
         );
     }
 
@@ -487,7 +624,10 @@ mod tests {
         group(&mut i, &[key(KEY_LEFTCTRL, true), syn()]);
         assert_eq!(i.modifiers(), MOD_CTRL);
         let (out, _) = group(&mut i, &[key(KEY_LEFTCTRL, false), syn()]);
-        assert_eq!(out[0], Logical::Key { keycode: KEY_LEFTCTRL, pressed: false, modifiers: 0, time_ns: T });
+        assert_eq!(
+            out[0],
+            Logical::Key { keycode: KEY_LEFTCTRL, pressed: false, modifiers: 0, locks: LOCK_NUM, time_ns: T }
+        );
         assert_eq!(i.modifiers(), 0);
     }
 
@@ -508,7 +648,7 @@ mod tests {
         let (out, _) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(
             out[0],
-            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, time_ns: T },
+            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, locks: LOCK_NUM, time_ns: T },
             "so a key typed now is still shifted"
         );
 
@@ -583,7 +723,7 @@ mod tests {
         assert_eq!(i.buttons(), 1);
 
         let mut out =
-            [Logical::Key { keycode: 0, pressed: false, modifiers: 0, time_ns: T }; MAX_PER_GROUP];
+            [Logical::Key { keycode: 0, pressed: false, modifiers: 0, locks: 0, time_ns: T }; MAX_PER_GROUP];
         assert_eq!(i.feed(dropped(), &mut out), 1);
         assert_eq!(out[0], Logical::Dropped { time_ns: T });
         assert_eq!(i.modifiers(), 0, "held keys across a gap are a guess");
@@ -683,7 +823,7 @@ mod tests {
         i.feed(dropped(), &mut out);
         let (out2, n) = group(&mut i, &[key(31, true), syn()]);
         assert_eq!(n, 1, "only the new group's key");
-        assert_eq!(out2[0], Logical::Key { keycode: 31, pressed: true, modifiers: 0, time_ns: T });
+        assert_eq!(out2[0], Logical::Key { keycode: 31, pressed: true, modifiers: 0, locks: LOCK_NUM, time_ns: T });
     }
 
     #[test]
@@ -726,5 +866,95 @@ mod tests {
         // And a loss is a moment as well — the compositor stamps what it synthesises with it.
         assert_eq!(i.feed(at(dropped(), 400), &mut out), 1);
         assert_eq!(out[0], Logical::Dropped { time_ns: 400 });
+    }
+
+    /// **A lock key's first press toggles its lock, and a held one toggles once** (Phase 6 Part
+    /// B.5; PR #357 review): a PS/2 keyboard's typematic repeat is press, press, release, with no
+    /// release between. Num Lock is on from the start, and a key carries the locks on at its
+    /// transition, the lock key's own press included.
+    #[test]
+    fn a_held_lock_key_toggles_its_lock_once() {
+        let mut i = Interpreter::new();
+        assert_eq!(i.locks(), LOCK_NUM, "Num Lock on from the start");
+        let (out, n) = group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        assert_eq!(n, 1);
+        assert!(matches!(out[0], Logical::Key { keycode: KEY_CAPSLOCK, locks, .. } if locks == LOCK_NUM | LOCK_CAPS));
+        group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "the repeats toggled nothing");
+        group(&mut i, &[key(KEY_CAPSLOCK, false), syn()]);
+        group(&mut i, &[key(KEY_CAPSLOCK, true), syn(), key(KEY_CAPSLOCK, false), syn()]);
+        assert_eq!(i.locks(), LOCK_NUM, "pressed again after its release, it toggles back");
+        group(&mut i, &[key(KEY_NUMLOCK, true), syn(), key(KEY_NUMLOCK, false), syn()]);
+        assert_eq!(i.locks(), 0);
+    }
+
+    /// **`SYN_DROPPED` clears no lock**: a lock is not a held key. A lock key held across the gap
+    /// can toggle again on its next press.
+    #[test]
+    fn a_drop_keeps_the_locks() {
+        let mut i = Interpreter::new();
+        group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
+        i.feed(dropped(), &mut out);
+        assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "both locks survive");
+        group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
+        assert_eq!(i.locks(), LOCK_NUM, "a press after the gap toggles");
+    }
+
+    /// **Each lock lights its own light, in HID's order** — the order the kernel's drivers read.
+    #[test]
+    fn the_locks_light_their_own_lights() {
+        assert_eq!(lights(0), 0);
+        assert_eq!(lights(LOCK_NUM), 0x01);
+        assert_eq!(lights(LOCK_CAPS), 0x02);
+        assert_eq!(lights(LOCK_NUM | LOCK_CAPS), 0x03);
+        assert_eq!(lights(Interpreter::new().locks()), 0x01, "Num Lock's light is on from the start");
+    }
+
+    fn keycodes(i: &mut Interpreter, events: &[InputEvent]) -> Vec<(u16, bool)> {
+        let (out, n) = group(i, events);
+        out[..n]
+            .iter()
+            .map(|l| match *l {
+                Logical::Key { keycode, pressed, .. } => (keycode, pressed),
+                other => panic!("not a key: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// **The keypad**: its digits as themselves with Num Lock on, as the keys they stand for with
+    /// it off, keypad 5 as nothing, and keypad Enter as Enter either way.
+    #[test]
+    fn the_keypad_is_navigation_with_num_lock_off() {
+        let mut i = Interpreter::new();
+        assert_eq!(keycodes(&mut i, &[key(75, true), syn()]), vec![(75, true)], "keypad 4, Num Lock on");
+        assert_eq!(keycodes(&mut i, &[key(75, false), syn()]), vec![(75, false)]);
+        group(&mut i, &[key(KEY_NUMLOCK, true), syn(), key(KEY_NUMLOCK, false), syn()]);
+        assert_eq!(keycodes(&mut i, &[key(75, true), syn()]), vec![(KEY_LEFT, true)], "keypad 4 is Left");
+        assert_eq!(keycodes(&mut i, &[key(75, false), syn()]), vec![(KEY_LEFT, false)]);
+        for (kp, nav) in KEYPAD_NAV {
+            assert_eq!(keycodes(&mut i, &[key(kp, true), syn()]), vec![(nav, true)], "keypad {kp}");
+            keycodes(&mut i, &[key(kp, false), syn()]);
+        }
+        assert_eq!(group(&mut i, &[key(KEY_KP5, true), syn()]).1, 0, "keypad 5 is nothing");
+        assert_eq!(group(&mut i, &[key(KEY_KP5, false), syn()]).1, 0);
+        assert_eq!(keycodes(&mut i, &[key(KEY_KPENTER, true), syn()]), vec![(KEY_ENTER, true)]);
+        group(&mut i, &[key(KEY_NUMLOCK, true), syn(), key(KEY_NUMLOCK, false), syn()]);
+        assert_eq!(keycodes(&mut i, &[key(KEY_KPENTER, false), syn()]), vec![(KEY_ENTER, false)], "either way");
+    }
+
+    /// **A release is its press's keycode**: keypad 4 pressed as Left releases as Left after Num
+    /// Lock came on in between, and its repeats stay Left.
+    #[test]
+    fn a_keypad_key_keeps_its_first_press_meaning() {
+        let mut i = Interpreter::new();
+        group(&mut i, &[key(KEY_NUMLOCK, true), syn(), key(KEY_NUMLOCK, false), syn()]);
+        assert_eq!(keycodes(&mut i, &[key(75, true), syn()]), vec![(KEY_LEFT, true)]);
+        group(&mut i, &[key(KEY_NUMLOCK, true), syn(), key(KEY_NUMLOCK, false), syn()]);
+        assert_eq!(i.locks(), LOCK_NUM);
+        assert_eq!(keycodes(&mut i, &[key(75, true), syn()]), vec![(KEY_LEFT, true)], "a repeat");
+        assert_eq!(keycodes(&mut i, &[key(75, false), syn()]), vec![(KEY_LEFT, false)], "its release");
+        assert_eq!(keycodes(&mut i, &[key(75, true), syn()]), vec![(75, true)], "a new press, Num Lock on");
     }
 }

@@ -178,7 +178,7 @@ impl Greeter {
     /// **Tab and Enter are handled here, not by the field**, which is the split
     /// `Element::on_key`'s `Option` return exists for: a field that swallowed Tab could never
     /// be left, and one that swallowed Enter could never submit.
-    pub fn key(&mut self, keycode: u16, modifiers: u16) -> bool {
+    pub fn key(&mut self, keycode: u16, modifiers: u16, locks: u16) -> bool {
         match keycode {
             KEY_TAB => {
                 self.focus = match self.focus {
@@ -190,7 +190,7 @@ impl Greeter {
             _ => {
                 // Any edit clears a previous refusal: a "login incorrect" that outlives the
                 // typing that answers it reads as a second failure.
-                let changed = self.active_field().apply(keycode, modifiers);
+                let changed = self.active_field().apply(keycode, modifiers, locks);
                 if changed && self.denied {
                     self.denied = false;
                 }
@@ -266,13 +266,13 @@ mod tests {
     fn tab_moves_the_caret_between_the_fields() {
         let mut g = Greeter::new();
         assert_eq!(g.focus, Focus::User, "the caret starts where the typing does");
-        assert!(g.key(KEY_TAB, 0), "Tab changed something, so the greeter must redraw");
+        assert!(g.key(KEY_TAB, 0, 0), "Tab changed something, so the greeter must redraw");
         assert_eq!(g.focus, Focus::Password);
-        assert!(g.key(KEY_TAB, 0));
+        assert!(g.key(KEY_TAB, 0, 0));
         assert_eq!(g.focus, Focus::User, "and Tab cycles rather than stopping at the end");
         // A letter goes to the field, not to the focus.
         let before = g.focus;
-        assert!(g.key(KEY_A, 0));
+        assert!(g.key(KEY_A, 0, 0));
         assert_eq!(g.focus, before, "typing does not move the caret between fields");
         assert_eq!(g.user.text(), "a", "…it goes into the field the caret is in");
         assert_eq!(g.password.text(), "", "and only that one");
@@ -288,17 +288,17 @@ mod tests {
     fn an_edit_clears_a_refusal_and_reset_clears_the_greeter() {
         let mut g = Greeter::new();
         g.denied = true;
-        assert!(g.key(KEY_A, 0), "the edit landed");
+        assert!(g.key(KEY_A, 0, 0), "the edit landed");
         assert!(!g.denied, "and it took the refusal with it");
         // A key that edits nothing leaves the refusal up: Tab is not an answer to it.
         g.denied = true;
-        assert!(g.key(KEY_TAB, 0));
+        assert!(g.key(KEY_TAB, 0, 0));
         assert!(g.denied, "moving the caret is not an edit");
         // `reset` empties both fields and returns the caret. The caret is in the password field
         // here — the Tab above moved it — so one keystroke fills that one, and `user` already
         // holds the letter typed at the top of this test.
         assert_eq!(g.focus, Focus::Password);
-        assert!(g.key(KEY_A, 0));
+        assert!(g.key(KEY_A, 0, 0));
         assert_eq!((g.user.text(), g.password.text()), ("a", "a"), "both fields hold something");
         g.reset();
         assert_eq!((g.user.text(), g.password.text()), ("", ""), "nothing typed is left behind");

@@ -37,21 +37,23 @@
 #![no_main]
 
 use input_server::devices::{Arrival, Notice, Table, notice};
-use input_server::{BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, merge};
+use input_server::{
+    BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, lights_request, merge,
+};
 use libkern::abi::{CTRL_OP_SHUTDOWN, INPUT_EVENT_LEN, InputEvent};
 use libkern::control::Control;
 use libkern::debug::Line;
 use libkern::device::DeviceKind;
 use libkern::error::KError;
 use libkern::{
-    CLOCK_MONOTONIC, IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV,
+    CLOCK_MONOTONIC, IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV,
     RIGHT_SEND, RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
     SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
     syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
-use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use librsproto::{OP_INPUT_LIGHTS, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// `alloc` backing. Nothing here allocates on the event path; the heap exists because
 /// `librsproto` and the panic path expect one.
@@ -154,9 +156,11 @@ fn close(h: u64) {
     }
 }
 
-/// One device: its node, its read buffer, and the read currently outstanding on it.
+/// One device: its node, its kind, its read buffer, and the read currently outstanding on it.
 struct Device {
     node: u64,
+    /// What the manager said it is — which decides whether it is written the lights.
+    kind: DeviceKind,
     buf_h: u64,
     buf_addr: u64,
     /// The in-flight read's `PendingOperation`, or `0` when none is outstanding.
@@ -166,7 +170,7 @@ struct Device {
 impl Device {
     /// Take `node` — the handle an `Arrived` carried — and map a read buffer for it. `None`, with
     /// the node closed, if the buffer cannot be had.
-    fn adopt(node: u64) -> Option<Self> {
+    fn adopt(node: u64, kind: DeviceKind) -> Option<Self> {
         // SAFETY: register-only syscall.
         let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
         if buf_h <= 0 {
@@ -182,7 +186,7 @@ impl Device {
             close(node);
             return None;
         }
-        Some(Self { node, buf_h: buf_h as u64, buf_addr: addr as u64, po: 0 })
+        Some(Self { node, kind, buf_h: buf_h as u64, buf_addr: addr as u64, po: 0 })
     }
 
     /// Let the device go: its read, its buffer and its node.
@@ -490,6 +494,82 @@ struct Server {
     /// The control channel, for `service --stop` (administration Part E.2); `0` once its
     /// supervisor has gone, when it would stay signalled for good.
     control: u64,
+    /// The lights a consumer last asked for, or `None` before any has (Phase 6 Part B.5): until
+    /// one does, a keyboard keeps whatever its driver set.
+    lights: Option<u8>,
+    /// The page a lights write is read from — `(handle, address)`, made by the first request.
+    lights_buf: Option<(u64, u64)>,
+}
+
+/// The page [`write_lights`] reads its byte from, made the first time it is needed.
+fn lights_buffer(srv: &mut Server) -> Option<(u64, u64)> {
+    if srv.lights_buf.is_none() {
+        // SAFETY: register-only syscall.
+        let h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+        if h <= 0 {
+            return None;
+        }
+        // SAFETY: a fresh `MemoryObject` handle with full MAP rights.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, h as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+        if addr <= 0 {
+            close(h as u64);
+            return None;
+        }
+        srv.lights_buf = Some((h as u64, addr as u64));
+    }
+    srv.lights_buf
+}
+
+/// **Write `lights` to `d`** if it is a keyboard (Phase 6 Part B.5): one byte, through its node.
+///
+/// **Fire and forget.** The driver reads the byte when the write is submitted — so one page serves
+/// every keyboard and every request — and completes the write once the keyboard has answered;
+/// nothing here waits on that, so the operation's handle is closed at once. A keyboard that does
+/// not answer costs a line in the kernel's log, not a stalled input stream.
+fn write_lights(srv: &mut Server, d: &Device, lights: u8) {
+    if d.kind != DeviceKind::Keyboard {
+        return;
+    }
+    let Some((buf_h, buf_addr)) = lights_buffer(srv) else {
+        kprint(b"input-server: no page for the lights; not written\n");
+        return;
+    };
+    // SAFETY: the first byte of this process's own mapped lights page.
+    unsafe { (buf_addr as *mut u8).write_volatile(lights) };
+    let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: buf_h, buf_offset: 0, offset: 0, length: 1 };
+    // SAFETY: a char `DeviceNode` with WRITE, and a valid `IoOp`.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, d.node, (&op as *const IoOp) as u64) };
+    if po > 0 {
+        close(po as u64);
+    } else {
+        Line::new().s(b"input-server: a keyboard refused its lights: ").i(po).end();
+    }
+}
+
+/// **Set every keyboard's lights to `lights`**, and remember them for keyboards still to come.
+fn set_lights(srv: &mut Server, lights: u8) {
+    srv.lights = Some(lights);
+    for slot in 0..MAX_DEVICES {
+        if let Some(d) = srv.devices[slot].take() {
+            write_lights(srv, &d, lights);
+            srv.devices[slot] = Some(d);
+        }
+    }
+}
+
+/// The lights a consumer's message, just received into `RECV_MSG`, asks for — or `None` if it is
+/// not an `Input::Lights` with a valid body.
+fn consumer_lights() -> Option<u8> {
+    // SAFETY: a bounded read of the payload the kernel just wrote.
+    let payload = unsafe {
+        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        core::slice::from_raw_parts((&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8, len.min(MSG_LEN - PAYLOAD_OFF))
+    };
+    let m = decode(payload).ok()?;
+    if m.op != OP_INPUT_LIGHTS || m.flags & (RS_FLAG_REPLY | RS_FLAG_ERROR) != 0 {
+        return None;
+    }
+    lights_request(m.body)
 }
 
 /// Mint a consumer channel and answer the resolve with it.
@@ -599,8 +679,13 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
     match n {
         // `notice` classifies an arrival as one only with exactly one handle: its node.
         Notice::Arrived { id, kind } => match srv.table.arrive(id) {
-            Arrival::Slot(slot) => match Device::adopt(handles[0]) {
+            Arrival::Slot(slot) => match Device::adopt(handles[0], kind) {
                 Some(d) => {
+                    // **A keyboard that arrives is told the lights already on**, or plugging one
+                    // in beside a keyboard with Caps Lock on would show it off.
+                    if let Some(l) = srv.lights {
+                        write_lights(srv, &d, l);
+                    }
                     srv.devices[slot] = Some(d);
                     Line::new()
                         .s(b"input-server: reading ")
@@ -912,10 +997,13 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                     // flush deadline over it forever.
                     srv.consumers[slot] = Consumer::new();
                 } else if rr == 0 {
-                    // A message from a consumer. This category has no consumer→server op
-                    // yet, so drain and ignore rather than guess — but say so, because a
-                    // client sending into silence is worth one line in the log.
-                    kprint(b"input-server: ignoring an unexpected message from a consumer\n");
+                    // A message from a consumer: the lights it wants (Phase 6 Part B.5), and
+                    // nothing else — anything else is drained and ignored rather than guessed at,
+                    // with a line, because a client sending into silence is worth one in the log.
+                    match consumer_lights() {
+                        Some(l) => set_lights(srv, l),
+                        None => kprint(b"input-server: ignoring an unexpected message from a consumer\n"),
+                    }
                 }
             }
         }
@@ -969,6 +1057,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         channels: [0; MAX_CONSUMERS],
         consumers: [Consumer::new(); MAX_CONSUMERS],
         control: ctrl,
+        lights: None,
+        lights_buf: None,
     };
     // **Devices come from the manager, and there is no fallback to the raw paths**
     // (administration Part B): a second path that runs only when the first is broken is a path

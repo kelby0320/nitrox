@@ -118,6 +118,13 @@ pub const OP_FILE_FORGET: u16 = 0x0607;
 /// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch
 /// never splits a `SYN` group. See `docs/spec/rsproto-input-ops.md`.
 pub const OP_INPUT_EVENTS: u16 = 0x0A00;
+/// `Input::Lights` — the keyboard lights a consumer wants on, from it to the `input-server`
+/// (Phase 6 Part B.5).
+///
+/// Consumer→server, no reply. The body is one byte, `LIGHT_NUM`, `LIGHT_CAPS` and
+/// `LIGHT_SCROLL` from `libkern::abi`; the server writes it to every keyboard it reads, and to
+/// each that arrives later. See `docs/spec/rsproto-input-ops.md`.
+pub const OP_INPUT_LIGHTS: u16 = 0x0A01;
 
 // The `Tty` category is `0x0Bxx`. It occupied `0x09xx` from 2026-08-03 without registering
 // itself in `rsproto-wire-format.md`, and `Surface` was assigned that range on 2026-08-05 —

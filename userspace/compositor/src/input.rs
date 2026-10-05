@@ -467,7 +467,7 @@ impl InputRouter {
         }
 
         match *ev {
-            Logical::Key { keycode, pressed, modifiers, .. } => {
+            Logical::Key { keycode, pressed, modifiers, locks, .. } => {
                 // **Before focus routing, and consuming rather than copying.** A chord that
                 // also reached the focused window would type into it — `Super+2` would switch
                 // desktops *and* put a `2` in the terminal.
@@ -490,7 +490,7 @@ impl InputRouter {
                 // them — but it is the same unbalanced-press shape the chord rules above exist
                 // to prevent, reached by a different route.
                 out.push(Outbound::Key {
-                    event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers),
+                    event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers).with_locks(locks),
                 });
                 Routed { resized: ended, outline: outline_gone, ..Routed::default() }
             }
@@ -1497,12 +1497,13 @@ mod tests {
     }
 
     fn key(keycode: u16, pressed: bool) -> Logical {
-        Logical::Key { keycode, pressed, modifiers: 0, time_ns: T }
+        Logical::Key { keycode, pressed, modifiers: 0, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
-    /// A key transition with modifiers held — what a chord looks like on the wire.
+    /// A key transition with modifiers held — what a chord looks like on the wire. **With Num Lock
+    /// on**, as every key is from boot (Phase 6 Part B.5): a chord matches on modifiers alone.
     fn chord(keycode: u16, pressed: bool, modifiers: u16) -> Logical {
-        Logical::Key { keycode, pressed, modifiers, time_ns: T }
+        Logical::Key { keycode, pressed, modifiers, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
     /// The "Super" key is `MOD_SUPER` on the wire — the name the modifier bitmask uses.

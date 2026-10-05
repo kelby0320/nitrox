@@ -125,19 +125,49 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 
 - **Block** devices (disks, partitions) follow the rules above: `offset`/`length`
   are logical-block multiples, translated into an [`Irp`](#relationship-to-the-irp).
-- **Char/stream** devices accept a `Read` only (input). The block-alignment rules
+- **Char/stream** devices accept a `Read` (input). The block-alignment rules
   **do not apply**: `offset` is ignored (a stream has no addressable position), and
   `length` is the **maximum** bytes to read — the PO completes with `result` = the
   bytes actually delivered (≥ 1, ≤ `length`), which arrive when the device's RX
   interrupt fires (or immediately, if bytes are already buffered). The bytes land in
-  `buffer` exactly as for a block read. `Write` to a char device is `Unsupported` in
-  Phase 2 (output stays on the kernel log path; symmetric console write is deferred).
+  `buffer` exactly as for a block read.
   The `buffer` is still a `MemoryObject` with `MAP_WRITE`, and
   `buf_offset + length <= buffer.size()` still holds. The completion is delivered
   through the same `PendingOperation`; no device-specific syscall exists.
 
+  **A char device takes a `Write` only where its driver does** — today a keyboard's raw node,
+  for its lights ([Keyboard lights](#keyboard-lights)). Every other char node refuses one,
+  `Unsupported`, synchronously and with no PO: the console's output stays on the kernel log
+  path, and a mouse has nothing to set.
+
   Today's char nodes are the serial console at `/dev/console` and the raw input
   devices at `/dev/input/raw/<n>`.
+
+### Keyboard lights
+
+*(Phase 6 Part B.5.)* A `Write` to a keyboard's raw node sets its lights. `length` must be
+**exactly 1**, and the byte at `buf_offset` is the lights in HID's order — `LIGHT_NUM` (`0x01`),
+`LIGHT_CAPS` (`0x02`) and `LIGHT_SCROLL` (`0x04`), mirrored in `kernel/src/libkern/input.rs` and
+`userspace/libkern/src/abi.rs`. Another length or another bit is refused synchronously,
+`InvalidArgument`. The byte is read when the write is submitted, so the caller may reuse its
+buffer at once.
+
+The PO completes once the keyboard has taken the lights — `status` `0`, `result` `1` — or failed
+to:
+- **an i8042 keyboard**: `TimedOut` when it did not answer, or kept asking for a byte again, and
+  `IoError` when the controller would not take a byte for it;
+- **a USB keyboard**: `IoError` when it refused or did not answer its `SET_REPORT`, and
+  `PeerClosed` when it left while the write waited.
+
+A write to a USB keyboard that has left is refused at once, `PeerClosed`; and to one that takes no
+more lights, `IoError` — one whose default endpoint may still hold a request that never finished,
+during its binding or a lights request before. **A write that arrives while another is in flight
+waits behind it, and replaces one already waiting**, which is completed as done: the lights it
+would have set are older than the ones that will be. A mouse's node refuses a write,
+`Unsupported`.
+
+The input server is the one writer — `input-subsystem.md` §4c has why — and the `WRITE` right it
+needs comes with the nodes the device manager hands it.
 
 ### Byte-stream and record-stream char devices
 

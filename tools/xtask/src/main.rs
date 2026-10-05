@@ -3068,6 +3068,20 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
     }
     println!("  ok: Super+F1 fired the manager's chord and reached no window");
 
+    // **The USB keyboard took its lights** (Phase 6 Part B.5): the compositor's Num Lock, through
+    // `input-server` to the keyboard's node, sent by the hub thread as a `SET_REPORT` the device
+    // acknowledged. QEMU's USB keyboard traces nothing of its lights, unlike its PS/2 one, whose
+    // values `check-terminal` reads; so here the acknowledgement is what can be seen, and the
+    // request's fields are `the_lights_request_is_an_output_report_to_its_interface`'s.
+    if usb {
+        if !transcript.lines().any(|l| l.starts_with("usb: port ") && l.contains(": keyboard lights acknowledged")) {
+            return Err("input gate FAILED: no USB keyboard acknowledged its lights — the compositor sends \
+                        Num Lock's when it connects, so every boot's keyboard is set once"
+                .into());
+        }
+        println!("  ok: the USB keyboard acknowledged its lights");
+    }
+
     println!("\nxtask: input gate PASSED — an injected key and click reached userspace ✓");
     Ok(())
 }
@@ -9618,6 +9632,78 @@ fn expect_probe_pass(s: &Session) -> R<()> {
     }
 }
 
+/// **The PS/2 keyboard's lights since the kernel reset it** (Phase 6 Part B.5), read from QEMU's
+/// `ps2_set_ledstate` trace: each value the keyboard was set to, in PS/2's order — Scroll Lock in
+/// bit 0, Num Lock in bit 1, Caps Lock in bit 2 — starting with the reset's own zero.
+///
+/// **Only what follows the last reset is the system's**: the firmware resets the keyboard and sets
+/// its lights before the kernel does, and the kernel's reset is the last.
+fn ps2_lights(log: &Path) -> Vec<u8> {
+    ps2_lights_in(&fs::read_to_string(log).unwrap_or_default())
+}
+
+/// [`ps2_lights`] of the trace's text. **The value is the line's last word**: the event's own name
+/// holds `ledstate` too — `ps2_set_ledstate 0x… ledstate 2` — so splitting at the word finds the
+/// device's address first.
+fn ps2_lights_in(text: &str) -> Vec<u8> {
+    let mut lights = Vec::new();
+    for line in text.lines() {
+        if line.contains("ps2_reset_keyboard") {
+            lights.clear();
+        } else if line.contains("ps2_set_ledstate")
+            && let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse().ok())
+        {
+            lights.push(v);
+        }
+    }
+    lights
+}
+
+/// Wait until the keyboard's lights since its reset are **exactly** `want` — not merely ending
+/// with it, so a write too many fails here rather than passing as the next step's value.
+fn wait_ps2_lights(log: &Path, want: &[u8], what: &str) -> R<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let got = ps2_lights(log);
+        if got == want {
+            println!("  ok: {what}: the keyboard's lights went {want:?}");
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "{what}: the PS/2 keyboard's lights since the kernel reset it are {got:?}, not \
+                 {want:?} (PS/2's order: 2 is Num Lock, 4 Caps Lock)"
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// **Press `qcode` at a terminal**, with Shift if `shift`, and wait for its grid to show `line`
+/// followed by `shows` — which `line` then is. The echo is the pacing, as in `check-terminal`'s
+/// first typing. **A row is reported with its trailing blanks trimmed**, so a space is waited for
+/// as the row before it, reported again.
+fn key_echoed(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    line: &mut String,
+    qcode: &str,
+    shift: bool,
+    shows: &str,
+) -> R<()> {
+    if shift {
+        qmp.send_key("shift", true)?;
+    }
+    press(qmp, qcode)?;
+    if shift {
+        qmp.send_key("shift", false)?;
+    }
+    line.push_str(shows);
+    session.expect(&format!("nxterm: grid> {}", line.trim_end()))?;
+    Ok(())
+}
+
 /// The QMP key code for `c`, and whether it needs shift held.
 ///
 /// Refuses what it does not know rather than skipping it: a character silently dropped from a
@@ -9738,6 +9824,9 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     fs::create_dir_all(&work).ok();
     let qmp_sock = work.join("qmp-terminal.sock");
     let _ = fs::remove_file(&qmp_sock);
+    // QEMU's trace of the PS/2 keyboard's lights (Phase 6 Part B.5) — see [`ps2_lights`].
+    let led_log = work.join("terminal-leds.log");
+    let _ = fs::remove_file(&led_log);
 
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
@@ -9754,6 +9843,12 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
         .arg("-smp")
         .arg("4")
         .arg("-no-reboot")
+        .arg("-trace")
+        .arg("ps2_set_ledstate")
+        .arg("-trace")
+        .arg("ps2_reset_keyboard")
+        .arg("-D")
+        .arg(&led_log)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -9803,6 +9898,13 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // The shell is up in the window: its banner reached the grid, which means the whole
     // output direction already works before a key is injected.
     session.expect("nxterm: grid> nxsh: interactive shell")?;
+
+    // **Num Lock's light is on before anything is injected** (Phase 6 Part B.5): the compositor
+    // sends the lights when it connects, and Num Lock is on from the start. Asserted here, ahead of
+    // the first key and the first motion, because the compositor also sends after every input pass
+    // whose locks differ from what it last sent — so a compositor that skipped the first send would
+    // pass the same assertion made after any typing. The reset's own zero comes first.
+    wait_ps2_lights(&led_log, &[0, 2], "the compositor's start")?;
 
     // **And the shell told the window where it is** (desktop refresh, Part K). `nxsh` writes
     // `OSC 7` beside every prompt, `libterm::parse` reads it and `nxterm` puts it in the title
@@ -9939,6 +10041,56 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "cd /home")?;
     session.expect("nxterm: shell is at /home")?;
     println!("  ok: the terminal followed the shell into another directory");
+
+    // **The locks, the keypad and the lights** (Phase 6 Part B.5). Nothing typed so far has
+    // changed a lock, so nothing typed has set the lights again.
+    wait_ps2_lights(&led_log, &[0, 2], "the typing so far")?;
+    // One key at a time, each waited for as the loop above does, building the line it should show.
+    let mut line = String::from("/home> ");
+    let key = key_echoed;
+    // **Caps Lock inverts Shift for letters, and for letters alone.** The quote is typed with it
+    // on: a Caps Lock that inverted Shift for every key would type an apostrophe there. And a
+    // shifted letter under it is lower case.
+    press(&mut qmp, "caps_lock")?;
+    wait_ps2_lights(&led_log, &[0, 2, 6], "Caps Lock on")?;
+    key(&mut qmp, &mut session, &mut line, "apostrophe", true, "\"")?;
+    key(&mut qmp, &mut session, &mut line, "a", false, "A")?;
+    key(&mut qmp, &mut session, &mut line, "b", false, "B")?;
+    key(&mut qmp, &mut session, &mut line, "a", true, "a")?;
+    press(&mut qmp, "caps_lock")?;
+    wait_ps2_lights(&led_log, &[0, 2, 6, 2], "Caps Lock off")?;
+    key(&mut qmp, &mut session, &mut line, "c", false, "c")?;
+    key(&mut qmp, &mut session, &mut line, "apostrophe", true, "\"")?;
+    press(&mut qmp, "ret")?;
+    // A string at the top level is shown bare, so this line is the shell's answer and cannot be
+    // the typed line, which begins with the prompt.
+    session.expect("nxterm: grid> ABac")?;
+    println!("  ok: Caps Lock upper-cased the letters it was on for, and only the letters");
+    // **The keypad, under Num Lock**: digits, an operator, and its own Enter — which the shell
+    // takes as Enter, or there would be no answer.
+    session.expect("nxterm: grid> /home>")?;
+    line = String::from("/home> ");
+    key(&mut qmp, &mut session, &mut line, "kp_1", false, "1")?;
+    key(&mut qmp, &mut session, &mut line, "kp_2", false, "2")?;
+    key(&mut qmp, &mut session, &mut line, "spc", false, " ")?;
+    key(&mut qmp, &mut session, &mut line, "kp_add", false, "+")?;
+    key(&mut qmp, &mut session, &mut line, "spc", false, " ")?;
+    key(&mut qmp, &mut session, &mut line, "kp_3", false, "3")?;
+    press(&mut qmp, "kp_enter")?;
+    session.expect("nxterm: grid> 15")?;
+    println!("  ok: the keypad typed digits and an operator, and its Enter ran the line");
+    // **And with Num Lock off, the keypad is the keys printed under its digits**: 8 is Up, which
+    // the line discipline answers by recalling the line before — under Num Lock it would be an 8.
+    session.expect("nxterm: grid> /home>")?;
+    press(&mut qmp, "num_lock")?;
+    wait_ps2_lights(&led_log, &[0, 2, 6, 2, 0], "Num Lock off")?;
+    press(&mut qmp, "kp_8")?;
+    session.expect("nxterm: grid> /home> 12 + 3")?;
+    println!("  ok: with Num Lock off, keypad 8 was Up and recalled the line before");
+    press(&mut qmp, "num_lock")?;
+    wait_ps2_lights(&led_log, &[0, 2, 6, 2, 0, 2], "Num Lock on again")?;
+    press(&mut qmp, "kp_enter")?;
+    session.expect("nxterm: grid> 15")?;
 
     // **The menu is a window now (M6 C3).** It was a `Stack` layer over the terminal, which
     // worked only because it happened to fit inside it; as a `popup` it is parented to the
@@ -17874,6 +18026,22 @@ mod tests {
         // Nothing complete, nothing read.
         assert_eq!(last_receipt("nxterm: menu hov", "nxterm: menu hover "), (None, 0));
         assert_eq!(last_receipt("heartbeat\n", "nxterm: menu hover "), (None, 10));
+    }
+
+    /// **The lights after the last reset, read from a real trace** (Phase 6 Part B.5): the firmware's
+    /// reset and its lights, then the kernel's reset, its zero and the compositor's Num Lock. The
+    /// first version split at the word `ledstate`, which the event's name holds too, and read
+    /// nothing from every line — the gate's first run said `[]` with this trace on disk.
+    #[test]
+    fn the_lights_are_read_after_the_last_reset() {
+        let trace = "ps2_reset_keyboard 0x5fe490c46268\n\
+                     ps2_set_ledstate 0x5fe490c46268 ledstate 0\n\
+                     ps2_set_ledstate 0x5fe490c46268 ledstate 4\n\
+                     ps2_reset_keyboard 0x5fe490c46268\n\
+                     ps2_set_ledstate 0x5fe490c46268 ledstate 0\n\
+                     ps2_set_ledstate 0x5fe490c46268 ledstate 2\n";
+        assert_eq!(super::ps2_lights_in(trace), [0, 2]);
+        assert_eq!(super::ps2_lights_in(""), [0u8; 0], "no trace, no lights");
     }
 
     #[test]

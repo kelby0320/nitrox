@@ -208,6 +208,17 @@ controller, a `usb-kbd` and a `usb-mouse`, so a key or a click that arrives came
 at all. `check-input`, `check-login` and `check-report` take it, each asserting what it does on the
 i8042 less what is the i8042's own: `check-input` the held-release step, and `check-report` the
 FADT's 8042 and the first round's count, for which it asserts the machine's instead.
+`check-input --usb` adds one thing of USB's own: that the keyboard acknowledged its lights (Phase 6
+Part B.5).
+
+**QEMU's trace is a gate's window onto a device the guest cannot report on** (Phase 6 Part B.5).
+`check-terminal` boots with `-trace ps2_set_ledstate -trace ps2_reset_keyboard -D <file>` and reads
+the PS/2 keyboard's lights from that file as it types: Num Lock's alone before anything is injected,
+then Caps Lock's added and taken away, then Num Lock off and on — each step the *exact* sequence
+since the kernel's reset, so a write too many fails as surely as one missing. The trace is QEMU's
+log backend, written as it happens, and the same flags work on CI's 8.2. Only what follows the last
+`ps2_reset_keyboard` is the system's: the firmware resets and sets the keyboard first. QEMU's USB
+keyboard traces nothing of its lights, which is why `--usb` asserts the acknowledgement instead.
 
 ## Running it
 

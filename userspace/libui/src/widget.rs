@@ -1507,10 +1507,11 @@ impl TextFieldState {
     /// Escape belong to whatever is above the field — traversal, submission and dismissal are
     /// not a text field's business — so this answers `false` and lets them bubble.
     ///
-    /// ASCII only, because [`libinput::keymap::to_char`] is: the US layout is what the input
+    /// ASCII only, because [`libinput::keymap::text`] is: the US layout is what the input
     /// stack maps today, and a field that invented its own mapping would disagree with the
-    /// terminal about what a key means.
-    pub fn apply(&mut self, keycode: u16, modifiers: u16) -> bool {
+    /// terminal about what a key means. `locks` are the key's own (`KeyEvent::locks`): Caps Lock's
+    /// case, and the keypad's digits under Num Lock (Phase 6 Part B.5).
+    pub fn apply(&mut self, keycode: u16, modifiers: u16, locks: u16) -> bool {
         match keycode {
             KEY_BACKSPACE => self.backspace(),
             KEY_DELETE => self.delete(),
@@ -1518,7 +1519,7 @@ impl TextFieldState {
             KEY_RIGHT => self.right(),
             KEY_HOME => self.home(),
             KEY_END => self.end(),
-            _ => match libinput::keymap::to_char(keycode, modifiers) {
+            _ => match libinput::keymap::text(keycode, modifiers, locks) {
                 // Control characters are not text. Ctrl-C folds to 0x03 in the keymap because
                 // a terminal needs it to; a field that inserted it would put an unprintable
                 // byte in a password.
@@ -2392,7 +2393,7 @@ impl TextAreaState {
     /// **Enter is claimed here and Tab is not.** A text area is the one widget for which Enter
     /// is text rather than submission — that is what multi-line means — while Tab remains
     /// traversal's, because a buffer that swallowed it would trap the keyboard in itself.
-    pub fn apply(&mut self, keycode: u16, modifiers: u16) -> bool {
+    pub fn apply(&mut self, keycode: u16, modifiers: u16, locks: u16) -> bool {
         let extend = modifiers & MOD_SHIFT != 0;
         match keycode {
             KEY_BACKSPACE => self.backspace(),
@@ -2407,7 +2408,7 @@ impl TextAreaState {
                 self.newline();
                 true
             }
-            _ => match libinput::keymap::to_char(keycode, modifiers) {
+            _ => match libinput::keymap::text(keycode, modifiers, locks) {
                 // Printable ASCII only, the same range a text field takes and for the same
                 // reason: `to_char` folds Ctrl-C to 0x03 because a terminal needs it to, and an
                 // editor that inserted that would put an unprintable byte in somebody's file.
@@ -3542,7 +3543,7 @@ mod list_view_tests {
         assert_eq!(a.offset(), 6, "the repaint dragged the document back to its caret");
 
         // Typing moves the caret, and the view follows it again.
-        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_DOWN, 0, 0);
         a.ensure_visible(3);
         assert_eq!(a.offset(), 1, "the caret moved to line 1 and the view did not follow it");
     }
@@ -4050,7 +4051,7 @@ mod text_field_tests {
         const KEY_ESC: u16 = 1;
         for key in [KEY_TAB, KEY_ENTER, KEY_ESC] {
             let mut f = TextFieldState::with_text("abc");
-            assert!(!f.apply(key, 0), "keycode {key} was claimed by the field");
+            assert!(!f.apply(key, 0, 0), "keycode {key} was claimed by the field");
             assert_eq!(f.text(), "abc", "keycode {key} changed the text");
         }
     }
@@ -4061,7 +4062,7 @@ mod text_field_tests {
     fn claims_the_keys_it_handles() {
         const KEY_A: u16 = 30;
         let mut f = TextFieldState::new();
-        assert!(f.apply(KEY_A, 0), "a letter was not claimed");
+        assert!(f.apply(KEY_A, 0, 0), "a letter was not claimed");
         assert_eq!(f.text(), "a");
     }
 
@@ -4071,10 +4072,10 @@ mod text_field_tests {
     fn control_characters_are_not_text() {
         const KEY_C: u16 = 46;
         let mut f = TextFieldState::new();
-        assert!(!f.apply(KEY_C, librsproto::surface::MOD_CTRL), "Ctrl-C was treated as text");
+        assert!(!f.apply(KEY_C, librsproto::surface::MOD_CTRL, 0), "Ctrl-C was treated as text");
         assert_eq!(f.text(), "");
         // Negative control: the same key without Ctrl *is* text.
-        assert!(f.apply(KEY_C, 0));
+        assert!(f.apply(KEY_C, 0, 0));
         assert_eq!(f.text(), "c");
     }
 
@@ -4669,7 +4670,7 @@ mod tests {
         // and deriving it at the call site from the cursor and the text's shape would be the
         // same arithmetic done somewhere with less to check it against.
         let mut a = area();
-        a.apply(KEY_RIGHT, 0); // between `a` and `bc`
+        a.apply(KEY_RIGHT, 0, 0); // between `a` and `bc`
         let (from, to) = a.insert_text("XY");
         assert_eq!(a.text(), "aXYbc\nde\nfghi");
         assert_eq!(from, (0, 1));
@@ -4982,10 +4983,10 @@ two");
     fn typing_inserts_and_enter_splits_the_line() {
         let mut a = TextAreaState::new();
         for k in [KEY_A, KEY_A] {
-            a.apply(k, 0);
+            a.apply(k, 0, 0);
         }
-        a.apply(KEY_ENTER, 0);
-        a.apply(KEY_X, 0);
+        a.apply(KEY_ENTER, 0, 0);
+        a.apply(KEY_X, 0, 0);
         assert_eq!(a.text(), "aa\nx");
         assert_eq!(a.cursor(), (1, 1));
     }
@@ -4996,9 +4997,9 @@ two");
         // which is where the text the person was deleting towards now is — not at the start of
         // the merged line.
         let mut a = area();
-        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_DOWN, 0, 0);
         assert_eq!(a.cursor(), (1, 0));
-        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert!(a.apply(KEY_BACKSPACE, 0, 0));
         assert_eq!(a.text(), "abcde\nfghi");
         assert_eq!(a.cursor(), (0, 3), "at the join, not at the start of the line");
     }
@@ -5006,8 +5007,8 @@ two");
     #[test]
     fn delete_at_the_end_of_a_line_pulls_the_next_one_up() {
         let mut a = area();
-        a.apply(KEY_END, 0);
-        assert!(a.apply(KEY_DELETE, 0));
+        a.apply(KEY_END, 0, 0);
+        assert!(a.apply(KEY_DELETE, 0, 0));
         assert_eq!(a.text(), "abcde\nfghi");
         assert_eq!(a.cursor(), (0, 3));
     }
@@ -5015,13 +5016,13 @@ two");
     #[test]
     fn backspace_at_the_very_start_and_delete_at_the_very_end_do_nothing() {
         let mut a = area();
-        assert!(!a.apply(KEY_BACKSPACE, 0));
+        assert!(!a.apply(KEY_BACKSPACE, 0, 0));
         let mut a = area();
         for _ in 0..2 {
-            a.apply(KEY_DOWN, 0);
+            a.apply(KEY_DOWN, 0, 0);
         }
-        a.apply(KEY_END, 0);
-        assert!(!a.apply(KEY_DELETE, 0));
+        a.apply(KEY_END, 0, 0);
+        assert!(!a.apply(KEY_DELETE, 0, 0));
         assert_eq!(a.text(), "abc\nde\nfghi", "and neither changed the buffer");
     }
 
@@ -5031,14 +5032,14 @@ two");
         // and coming back up must return to 3, not stay at 2. Without it a person who pressed
         // only Down and Up has had their column moved for them.
         let mut a = area();
-        a.apply(KEY_END, 0);
+        a.apply(KEY_END, 0, 0);
         assert_eq!(a.cursor(), (0, 3));
-        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_DOWN, 0, 0);
         assert_eq!(a.cursor(), (1, 2), "clamped to the short line's end");
-        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_DOWN, 0, 0);
         assert_eq!(a.cursor(), (2, 3), "and back out to the goal on a line long enough");
-        a.apply(KEY_UP, 0);
-        a.apply(KEY_UP, 0);
+        a.apply(KEY_UP, 0, 0);
+        a.apply(KEY_UP, 0, 0);
         assert_eq!(a.cursor(), (0, 3), "all the way back to where it started");
     }
 
@@ -5047,11 +5048,11 @@ two");
         // Otherwise the goal outlives the intent that set it: press Down, Left, Down, and the
         // second Down would jump back out to a column the person just moved away from.
         let mut a = area();
-        a.apply(KEY_END, 0);
-        a.apply(KEY_DOWN, 0);
-        a.apply(KEY_LEFT, 0);
+        a.apply(KEY_END, 0, 0);
+        a.apply(KEY_DOWN, 0, 0);
+        a.apply(KEY_LEFT, 0, 0);
         assert_eq!(a.cursor(), (1, 1));
-        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_DOWN, 0, 0);
         assert_eq!(a.cursor(), (2, 1), "the new column, not the old goal");
     }
 
@@ -5059,12 +5060,12 @@ two");
     fn shift_extends_a_selection_and_an_unshifted_move_drops_it() {
         let mut a = area();
         for _ in 0..2 {
-            a.apply(KEY_RIGHT, MOD_SHIFT);
+            a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
         assert_eq!(a.selection(), Some(((0, 0), (0, 2))));
         assert_eq!(a.selected_text().as_deref(), Some("ab"));
 
-        a.apply(KEY_RIGHT, 0);
+        a.apply(KEY_RIGHT, 0, 0);
         assert_eq!(a.selection(), None, "an unshifted move drops it");
     }
 
@@ -5072,9 +5073,9 @@ two");
     fn a_selection_reads_the_same_whichever_way_it_was_made() {
         // The anchor may be before or after the cursor; every consumer wants document order.
         let mut a = area();
-        a.apply(KEY_END, 0);
+        a.apply(KEY_END, 0, 0);
         for _ in 0..2 {
-            a.apply(KEY_LEFT, MOD_SHIFT);
+            a.apply(KEY_LEFT, MOD_SHIFT, 0);
         }
         assert_eq!(a.selection(), Some(((0, 1), (0, 3))));
         assert_eq!(a.selected_text().as_deref(), Some("bc"));
@@ -5083,9 +5084,9 @@ two");
     #[test]
     fn a_selection_spanning_lines_reads_the_newlines_back() {
         let mut a = area();
-        a.apply(KEY_RIGHT, 0);
-        a.apply(KEY_DOWN, MOD_SHIFT);
-        a.apply(KEY_DOWN, MOD_SHIFT);
+        a.apply(KEY_RIGHT, 0, 0);
+        a.apply(KEY_DOWN, MOD_SHIFT, 0);
+        a.apply(KEY_DOWN, MOD_SHIFT, 0);
         assert_eq!(a.selected_text().as_deref(), Some("bc\nde\nf"));
     }
 
@@ -5094,10 +5095,10 @@ two");
         // **The rule that makes a selection worth having.** An editor where typing appends
         // beside a highlighted run rather than replacing it is one nobody can use.
         let mut a = area();
-        a.apply(KEY_DOWN, MOD_SHIFT);
-        a.apply(KEY_END, MOD_SHIFT);
+        a.apply(KEY_DOWN, MOD_SHIFT, 0);
+        a.apply(KEY_END, MOD_SHIFT, 0);
         assert_eq!(a.selected_text().as_deref(), Some("abc\nde"));
-        a.apply(KEY_X, 0);
+        a.apply(KEY_X, 0, 0);
         assert_eq!(a.text(), "x\nfghi");
         assert_eq!(a.selection(), None);
         assert_eq!(a.cursor(), (0, 1));
@@ -5107,9 +5108,9 @@ two");
     fn backspace_over_a_selection_deletes_the_selection_and_not_a_character() {
         let mut a = area();
         for _ in 0..2 {
-            a.apply(KEY_RIGHT, MOD_SHIFT);
+            a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
-        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert!(a.apply(KEY_BACKSPACE, 0, 0));
         assert_eq!(a.text(), "c\nde\nfghi", "the two selected characters, not three");
     }
 
@@ -5124,13 +5125,13 @@ two");
         assert_eq!(a.offset(), 0);
 
         for _ in 0..5 {
-            a.apply(KEY_DOWN, 0);
+            a.apply(KEY_DOWN, 0, 0);
         }
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 3, "line 5 is visible in a three-line window");
 
         for _ in 0..5 {
-            a.apply(KEY_UP, 0);
+            a.apply(KEY_UP, 0, 0);
         }
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
@@ -5145,36 +5146,36 @@ two");
         let start = a.revision();
 
         for k in [KEY_RIGHT, KEY_DOWN, KEY_END, KEY_HOME, KEY_UP, KEY_LEFT] {
-            a.apply(k, 0);
+            a.apply(k, 0, 0);
         }
         assert_eq!(a.revision(), start, "moving is not editing");
 
         // **Typed with nothing selected, and that is not incidental.** The first version made a
         // selection first and then typed, so the insert's own bump was covered by the deletion
         // of the selection — the assertion passed with `insert` not counting at all.
-        a.apply(KEY_X, 0);
+        a.apply(KEY_X, 0, 0);
         assert!(a.revision() > start, "typing is");
 
         let mut sel = area();
         let quiet = sel.revision();
         for _ in 0..2 {
-            sel.apply(KEY_RIGHT, MOD_SHIFT);
+            sel.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
         assert_eq!(sel.revision(), quiet, "nor is selecting");
 
         // The case a length comparison cannot see: one character selected, one typed.
         let mut b = TextAreaState::with_text("abc");
-        b.apply(KEY_RIGHT, MOD_SHIFT);
+        b.apply(KEY_RIGHT, MOD_SHIFT, 0);
         let before = b.revision();
         let len = b.text().len();
-        b.apply(KEY_X, 0);
+        b.apply(KEY_X, 0, 0);
         assert_eq!(b.text().len(), len, "the fixture must keep its length, or it proves nothing");
         assert!(b.revision() > before, "replacing a selection is an edit");
 
         // And an edit that does nothing is not one.
         let mut c = TextAreaState::with_text("abc");
         let quiet = c.revision();
-        assert!(!c.apply(KEY_BACKSPACE, 0), "backspace at the start of the buffer does nothing");
+        assert!(!c.apply(KEY_BACKSPACE, 0, 0), "backspace at the start of the buffer does nothing");
         assert_eq!(c.revision(), quiet, "so it is not an edit");
     }
 
@@ -5197,20 +5198,20 @@ two");
         // A selection, deleted by each of the two keys that delete one.
         let select_two = |a: &mut TextAreaState| {
             for _ in 0..2 {
-                a.apply(KEY_RIGHT, MOD_SHIFT);
+                a.apply(KEY_RIGHT, MOD_SHIFT, 0);
             }
         };
         assert!(
             bumps(&|a| {
                 select_two(a);
-                assert!(a.apply(KEY_BACKSPACE, 0));
+                assert!(a.apply(KEY_BACKSPACE, 0, 0));
             }) > 0,
             "backspace over a selection"
         );
         assert!(
             bumps(&|a| {
                 select_two(a);
-                assert!(a.apply(KEY_DELETE, 0));
+                assert!(a.apply(KEY_DELETE, 0, 0));
             }) > 0,
             "delete over a selection"
         );
@@ -5220,26 +5221,26 @@ two");
         // Backspace's two paths: a character, and the join at the start of a line.
         assert!(
             bumps(&|a| {
-                a.apply(KEY_RIGHT, 0);
-                assert!(a.apply(KEY_BACKSPACE, 0));
+                a.apply(KEY_RIGHT, 0, 0);
+                assert!(a.apply(KEY_BACKSPACE, 0, 0));
             }) > 0,
             "backspace over a character"
         );
         assert!(
             bumps(&|a| {
-                a.apply(KEY_DOWN, 0);
-                a.apply(KEY_HOME, 0);
-                assert!(a.apply(KEY_BACKSPACE, 0));
+                a.apply(KEY_DOWN, 0, 0);
+                a.apply(KEY_HOME, 0, 0);
+                assert!(a.apply(KEY_BACKSPACE, 0, 0));
             }) > 0,
             "backspace joining two lines"
         );
 
         // Delete's two, the same shape from the other side.
-        assert!(bumps(&|a| assert!(a.apply(KEY_DELETE, 0))) > 0, "delete over a character");
+        assert!(bumps(&|a| assert!(a.apply(KEY_DELETE, 0, 0))) > 0, "delete over a character");
         assert!(
             bumps(&|a| {
-                a.apply(KEY_END, 0);
-                assert!(a.apply(KEY_DELETE, 0));
+                a.apply(KEY_END, 0, 0);
+                assert!(a.apply(KEY_DELETE, 0, 0));
             }) > 0,
             "delete joining two lines"
         );
@@ -5247,9 +5248,9 @@ two");
         // And the two that change nothing still count nothing, so "an edit" means an edit.
         let mut ends = TextAreaState::with_text("a");
         let quiet = ends.revision();
-        assert!(!ends.apply(KEY_BACKSPACE, 0), "backspace at the buffer's start");
-        ends.apply(KEY_END, 0);
-        assert!(!ends.apply(KEY_DELETE, 0), "delete at its end");
+        assert!(!ends.apply(KEY_BACKSPACE, 0, 0), "backspace at the buffer's start");
+        ends.apply(KEY_END, 0, 0);
+        assert!(!ends.apply(KEY_DELETE, 0, 0), "delete at its end");
         assert_eq!(ends.revision(), quiet);
     }
 
@@ -5266,29 +5267,29 @@ two");
         };
 
         let mut a = area();
-        a.apply(KEY_END, 0);
+        a.apply(KEY_END, 0, 0);
         assert_eq!(draw(&mut a), 1, "no selection at all");
 
         let mut a = area();
         for _ in 0..2 {
-            a.apply(KEY_RIGHT, MOD_SHIFT);
+            a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
         assert_eq!(draw(&mut a), 1, "forward: the cursor is at the highlight's end");
 
         let mut a = area();
-        a.apply(KEY_END, 0);
+        a.apply(KEY_END, 0, 0);
         for _ in 0..2 {
-            a.apply(KEY_LEFT, MOD_SHIFT);
+            a.apply(KEY_LEFT, MOD_SHIFT, 0);
         }
         assert_eq!(draw(&mut a), 1, "backward: the cursor is at the highlight's start");
 
         let mut a = area();
-        a.apply(KEY_DOWN, 0);
-        a.apply(KEY_UP, MOD_SHIFT);
+        a.apply(KEY_DOWN, 0, 0);
+        a.apply(KEY_UP, MOD_SHIFT, 0);
         assert_eq!(draw(&mut a), 1, "backward across a line break");
 
         let mut a = area();
-        a.apply(KEY_END, 0);
+        a.apply(KEY_END, 0, 0);
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], None, &p);
         assert_eq!(fills(&e, p.accent), 0, "and none at all when the widget is not active");
     }
@@ -5411,7 +5412,7 @@ two");
         let p = Theme::default();
         let mut a = TextAreaState::with_text("abcdef");
         for _ in 0..2 {
-            a.apply(KEY_RIGHT, 0);
+            a.apply(KEY_RIGHT, 0, 0);
         }
         assert_eq!(a.cursor(), (0, 2), "precondition: mid-line, with no selection");
         let e: Element<()> = text_area(&mut a, 16, 16, true, &[], None, &p);
@@ -5429,7 +5430,7 @@ two");
         let p = Theme::default();
         let mut a = TextAreaState::with_text("let x = 1");
         for _ in 0..3 {
-            a.apply(KEY_RIGHT, MOD_SHIFT);
+            a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
         let e: Element<()> = text_area(
             &mut a,
@@ -5506,8 +5507,8 @@ two");
         // multi-line selection is one highlight per row, not one rectangle.
         let p = Theme::default();
         let mut a = area();
-        a.apply(KEY_RIGHT, 0);
-        a.apply(KEY_DOWN, MOD_SHIFT);
+        a.apply(KEY_RIGHT, 0, 0);
+        a.apply(KEY_DOWN, MOD_SHIFT, 0);
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.selection()), 2, "the tail of line 0 and the head of line 1");
 
@@ -5522,11 +5523,11 @@ two");
         // the cursor back onto its own anchor leaves no *selection* but does leave an anchor,
         // and the next edit shortens the text it names (PR #258 review, blocking 1).
         let mut a = area();
-        a.apply(KEY_END, 0);
-        a.apply(KEY_LEFT, MOD_SHIFT);
-        a.apply(KEY_RIGHT, MOD_SHIFT);
+        a.apply(KEY_END, 0, 0);
+        a.apply(KEY_LEFT, MOD_SHIFT, 0);
+        a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         assert_eq!(a.selection(), None, "the cursor is back on its anchor");
-        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert!(a.apply(KEY_BACKSPACE, 0, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
@@ -5537,8 +5538,8 @@ two");
         // The quieter symptom of the same defect: typing instead of deleting used to leave a
         // selection over the character just typed, which the next keystroke would replace.
         let mut a = area();
-        a.apply(KEY_RIGHT, MOD_SHIFT);
-        a.apply(KEY_LEFT, MOD_SHIFT);
+        a.apply(KEY_RIGHT, MOD_SHIFT, 0);
+        a.apply(KEY_LEFT, MOD_SHIFT, 0);
         a.insert('x');
         assert_eq!(a.text(), "xabc\nde\nfghi");
         assert_eq!(a.selection(), None, "typing selects nothing");
@@ -5547,7 +5548,7 @@ two");
         let mut a = area();
         a.place(0, 3);
         a.extend_to(0, 3);
-        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert!(a.apply(KEY_BACKSPACE, 0, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
     }
@@ -5584,9 +5585,9 @@ two");
         // keyboard inside itself with no way out.
         const KEY_TAB: u16 = 15;
         let mut a = TextAreaState::new();
-        assert!(a.apply(KEY_ENTER, 0));
+        assert!(a.apply(KEY_ENTER, 0, 0));
         assert_eq!(a.lines().len(), 2);
-        assert!(!a.apply(KEY_TAB, 0), "Tab is not claimed");
+        assert!(!a.apply(KEY_TAB, 0, 0), "Tab is not claimed");
         assert_eq!(a.text(), "\n", "and it inserted nothing");
     }
 
@@ -5596,7 +5597,7 @@ two");
         // inserted that would put an unprintable byte in somebody's file.
         const KEY_C: u16 = 46;
         let mut a = TextAreaState::new();
-        assert!(!a.apply(KEY_C, librsproto::surface::MOD_CTRL));
+        assert!(!a.apply(KEY_C, librsproto::surface::MOD_CTRL, 0));
         assert_eq!(a.text(), "");
     }
 

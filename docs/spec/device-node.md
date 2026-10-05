@@ -41,7 +41,7 @@ in-kernel Tier 1 drivers read the descriptor directly.
 pub enum DeviceClass {
     Other = 0,    // a PCI function, claimed or not; a USB device
     Block = 1,    // accepts block Read/Write IoOps via sys_io_submit
-    Char = 2,     // accepts byte-stream Read IoOps: the console, the i8042's devices
+    Char = 2,     // stream Read IoOps, and a keyboard's lights as a Write: console, input
 }
 ```
 

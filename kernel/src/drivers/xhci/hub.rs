@@ -26,6 +26,7 @@ use core::sync::atomic::Ordering;
 
 use super::context::{self, DCI_EP0, speed};
 use super::desc;
+use super::hid::LightsTo;
 use super::ring::{Producer, Trb, code, kind};
 use super::{Awaited, CommandRing, DmaSlots, PoPtr, Waiting, Xhci, XHCI, read32, write32};
 use crate::arch::timer::ArchTimer;
@@ -37,6 +38,7 @@ use crate::libkern::printable::Printable;
 use crate::mm::dma::DmaBuffer;
 use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::{ObjectRef, PendingOperation};
+use crate::syscall::error::KError;
 
 /// How long the boot waits for the first round.
 pub const FIRST_ROUND_NS: u64 = 2_000_000_000;
@@ -170,6 +172,8 @@ pub(super) extern "C" fn main(_arg: usize) {
         }
         // A HID endpoint that halted is reset before anything else: its device is still typing.
         super::hid::recover(x);
+        // Then a keyboard's lights (Phase 6 Part B.5).
+        lights_round(x, &mut attached);
         for port in 1..=x.max_ports {
             let s = portsc(x, port);
             if s & PORT_CSC == 0 {
@@ -569,6 +573,94 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
+    }
+}
+
+/// **A control transfer writing `data`** (Phase 6 Part B.5): Setup, an OUT Data stage from the
+/// device's data page, and an IN Status stage, waited for as `control_in`'s are. A keyboard's
+/// lights, as a `SET_REPORT`.
+pub(super) fn control_out_data(
+    x: &Xhci,
+    slot: u8,
+    mem: &mut DeviceMem,
+    request: [u8; 8],
+    data: &[u8],
+) -> Result<(), Failed> {
+    let len = data.len().min(crate::mm::PAGE_SIZE);
+    // SAFETY: `data` is a page no transfer is using: the default endpoint runs one at a time, and
+    // every failure that could leave one live ends the device or its lights.
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), mem.data.virt(), len) };
+    let base = mem.ep0.phys().as_u64();
+    let po = new_operation()?;
+    let status_at = {
+        let mut probe = mem.ring.next_slot();
+        for _ in 0..2 {
+            probe = if probe + 1 == super::RING_TRBS - 1 { 0 } else { probe + 1 };
+        }
+        base + probe as u64 * 16
+    };
+    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Transfer { slot, status: status_at }, po: PoPtr(po.as_ptr()) });
+    let mut slots = DmaSlots(&mem.ep0);
+    mem.ring.push(&mut slots, Trb::setup_out(request));
+    mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
+    let at = mem.ring.push(&mut slots, Trb::status(false));
+    debug_assert_eq!(base + at as u64 * 16, status_at);
+    write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
+    match wait(x, &po, TRANSFER_NS) {
+        Some((code::SUCCESS, _)) => Ok(()),
+        Some((c, _)) => Err(Failed::Code(c)),
+        None => Err(Failed::Timeout),
+    }
+}
+
+/// **Send the keyboards' lights that wait** (Phase 6 Part B.5): each as a `SET_REPORT` of one byte
+/// to its interface, and its write completed with how that went. A stall recovers the default
+/// endpoint; a timeout leaves the request in doubt on it, so the device takes no more lights.
+fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
+    if !super::hid::lights_waiting(x) {
+        return;
+    }
+    for node in 0..super::hid::MAX_NODES {
+        let Some((po, lights, to)) = super::hid::take_lights(x, node) else {
+            continue;
+        };
+        let device = match to {
+            LightsTo::Send { slot, interface } => attached
+                .iter_mut()
+                .enumerate()
+                .find_map(|(port, a)| a.as_mut().filter(|a| a.slot == slot).map(|dev| (port, slot, interface, dev)))
+                .ok_or(KError::PeerClosed),
+            LightsTo::Dead => Err(KError::IoError),
+            LightsTo::Gone => Err(KError::PeerClosed),
+        };
+        let status = match device {
+            Err(e) => e as i32,
+            Ok((port, slot, iface, dev)) => {
+                let request = super::hid::set_lights_request(iface);
+                match control_out_data(x, slot, &mut dev._mem, request, &[lights]) {
+                    Ok(()) => {
+                        if super::hid::lights_taken(node) {
+                            crate::kprintln!("usb: port {port}: keyboard lights acknowledged");
+                        }
+                        0
+                    }
+                    Err(Failed::Code(code::STALL)) => {
+                        crate::kprintln!("usb: port {port}: its keyboard refused its lights");
+                        if recover_ep0(x, slot, &dev._mem).is_err() {
+                            super::hid::lights_dead(x, slot);
+                        }
+                        KError::IoError as i32
+                    }
+                    Err(e) => {
+                        crate::kprintln!("usb: port {port}: its keyboard's lights failed: {e}; it takes no more");
+                        super::hid::lights_dead(x, slot);
+                        KError::IoError as i32
+                    }
+                }
+            }
+        };
+        crate::sched::complete_pending_op(po.as_ptr(), status, (status == 0) as u64);
+        drop(po);
     }
 }
 

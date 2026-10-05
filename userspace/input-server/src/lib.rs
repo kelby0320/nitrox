@@ -12,7 +12,10 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
-use libkern::abi::{EV_REL, EV_SYN, InputEvent, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT};
+use libkern::abi::{
+    EV_REL, EV_SYN, InputEvent, LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED,
+    SYN_REPORT,
+};
 
 /// Events buffered from one device per wakeup.
 ///
@@ -304,6 +307,16 @@ impl Consumer {
         }
         out[n..n + batch.len()].copy_from_slice(batch);
         Some(n + batch.len())
+    }
+}
+
+/// **The lights an `Input::Lights` asks for** (Phase 6 Part B.5): its one byte, or `None` for a
+/// body of another length or with a bit that is not a light. A refused request writes nothing, so
+/// a malformed byte never reaches a keyboard's node, which would refuse it anyway.
+pub fn lights_request(body: &[u8]) -> Option<u8> {
+    match *body {
+        [b] if b as u16 & !(LIGHT_NUM | LIGHT_CAPS | LIGHT_SCROLL) == 0 => Some(b),
+        _ => None,
     }
 }
 
@@ -852,5 +865,19 @@ mod tests {
         let batch = [InputEvent::default(); BATCH_MAX];
         let mut out = [InputEvent::default(); FRAME_MAX];
         assert_eq!(c.frame(&batch, 99, &mut out), Some(FRAME_MAX));
+    }
+
+    /// **One byte of lights, and nothing else**: each light alone and together, then the
+    /// neighbours of a valid request — a fourth bit, no byte, two bytes.
+    #[test]
+    fn a_lights_request_is_one_byte_of_lights() {
+        assert_eq!(lights_request(&[0]), Some(0));
+        assert_eq!(lights_request(&[LIGHT_NUM as u8]), Some(0x01));
+        assert_eq!(lights_request(&[LIGHT_CAPS as u8]), Some(0x02));
+        assert_eq!(lights_request(&[0x07]), Some(0x07));
+        assert_eq!(lights_request(&[0x08]), None, "a bit that is not a light");
+        assert_eq!(lights_request(&[0x80]), None);
+        assert_eq!(lights_request(&[]), None);
+        assert_eq!(lights_request(&[0x01, 0x00]), None);
     }
 }

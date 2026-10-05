@@ -286,6 +286,9 @@ struct Server {
     outbox: alloc::vec::Vec<Outbox>,
     /// Events owed to the manager, if one is attached. See [`MgrOutbox`].
     mgr_outbox: MgrOutbox,
+    /// The keyboard lights the input server was last told, or `None` before it has been told any
+    /// (Phase 6 Part B.5). See [`send_lights`].
+    lights_sent: Option<u8>,
 }
 
 impl Server {
@@ -479,6 +482,40 @@ fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
     reply_on_session(session, op, 0, body)
 }
 
+/// **Tell the input server the lights the locks call for**, if they are not what it was last told
+/// (Phase 6 Part B.5): an `Input::Lights` on the consumer channel, which the server writes to every
+/// keyboard. The locks live here, in the interpreter, so this is the one process that knows them.
+///
+/// **A send that fails is tried again after the next input pass**: `lights_sent` moves only when
+/// one goes, so a full channel delays the lights rather than losing them.
+fn send_lights(srv: &mut Server) {
+    let lights = libinput::lights(srv.interp.locks());
+    if srv.input_ch == 0 || srv.lights_sent == Some(lights) {
+        return;
+    }
+    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
+    let sent = unsafe {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_INPUT_LIGHTS, 0, 0, &[lights], 0) {
+            Some(rs_len) => {
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 0;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    srv.input_ch,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    0,
+                    SENDMODE_NOBLOCK,
+                ) == 0
+            }
+            None => false,
+        }
+    };
+    if sent {
+        srv.lights_sent = Some(lights);
+    }
+}
+
 /// Log a routed record, up to [`MAX_LOGGED_ROUTES`] of them.
 fn log_route(rec: &Outbound) {
     // **A drop is not part of the stream this cap exists for.** The cap bounds *input* —
@@ -622,7 +659,8 @@ fn fire_repeat(srv: &mut Server) {
             r.keycode,
             librsproto::surface::KEY_REPEAT,
             r.modifiers,
-        ),
+        )
+        .with_locks(r.locks),
     };
     log_route(&rec);
     enqueue(srv, slot, rec);
@@ -1070,7 +1108,7 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     // SAFETY: `/dev/input/new` resolves to a channel endpoint — the input server mints one
     // consumer per resolve, exactly as `/dev/draw/new` mints one session.
     let ch = block_on(unsafe {
-        ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::WAIT)
+        ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT)
     })
     .ok()?;
     Some(ch.into_raw().0)
@@ -1209,6 +1247,7 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
         let now = now_ns();
         route_one_batch(srv, &mut out, &mut damage, batch, now);
     }
+    send_lights(srv);
 
     deliver(srv, &out);
     // **What routing did to the stack, told to the manager.** Input is the third path that
@@ -1434,7 +1473,7 @@ fn route_one_batch(
                 // second after that — bypassing the router entirely, since `fire_repeat` enqueues
                 // straight to the focused session. Holding `Super+1` while already on desktop 1
                 // filled the terminal with `1`s (PR #241 review, blocking 1).
-                if let libinput::Logical::Key { keycode, pressed, modifiers, .. } = *l
+                if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
                     && !routed.consumed
                 {
                     srv.repeat = compositor::Repeat::after_key(
@@ -1442,6 +1481,7 @@ fn route_one_batch(
                         keycode,
                         pressed,
                         modifiers,
+                        locks,
                         srv.stack.focus_candidate(),
                         now,
                     );
@@ -3117,11 +3157,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         // screen this compositor actually acquired — not a constant that happens to match.
         router: InputRouter::new(screen_bounds),
         input_ch: 0,
+        lights_sent: None,
     };
     match connect_input(root_ns) {
         Some(ch) => {
             srv.input_ch = ch;
             kprint(b"compositor: input connected\n");
+            // Num Lock is on from the start, so its light is too.
+            send_lights(&mut srv);
         }
         None => kprint(b"compositor: no /dev/input/new -- display only\n"),
     }

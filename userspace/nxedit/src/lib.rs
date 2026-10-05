@@ -1575,7 +1575,7 @@ impl App {
                 }
                 code => {
                     if let Some((_, f)) = self.field.as_mut() {
-                        f.apply(code, k.modifiers);
+                        f.apply(code, k.modifiers, k.locks);
                     }
                 }
             }
@@ -1606,7 +1606,7 @@ impl App {
             // fall-through and it needs no arms.
             return;
         }
-        self.buf_mut().text.apply(k.keycode, k.modifiers);
+        self.buf_mut().text.apply(k.keycode, k.modifiers, k.locks);
     }
 
     /// Record where each bar word sits, so an open menu knows where to hang from.
@@ -1904,7 +1904,7 @@ impl App {
                     // a dialog holds the keyboard, so a character that fell through would reach
                     // nothing at all rather than the buffer behind it.
                     _ if c.mode == chooser::Mode::Save => {
-                        c.state.name.apply(code, k.modifiers);
+                        c.state.name.apply(code, k.modifiers, k.locks);
                     }
                     _ => {}
                 }

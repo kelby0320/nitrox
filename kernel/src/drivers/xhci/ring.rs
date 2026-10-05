@@ -73,6 +73,8 @@ const DIR_IN: u32 = 1 << 16;
 /// A Setup TRB's Transfer Type, in dword 3 bits 17:16: no data stage, or an IN one.
 const TRT_NO_DATA: u32 = 0;
 const TRT_IN: u32 = 3 << 16;
+/// A Setup TRB's Transfer Type for an OUT data stage (Phase 6 Part B.5).
+const TRT_OUT: u32 = 2 << 16;
 
 /// Dword 3 bit 0: the cycle bit.
 const CYCLE: u32 = 1;
@@ -148,13 +150,25 @@ impl Trb {
         Trb([lo, hi, 8, kind::SETUP << 10 | IDT | trt])
     }
 
+    /// **A Setup stage for an OUT data stage** (Phase 6 Part B.5): a `SET_REPORT`'s.
+    pub const fn setup_out(request: [u8; 8]) -> Trb {
+        let lo = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+        let hi = u32::from_le_bytes([request[4], request[5], request[6], request[7]]);
+        Trb([lo, hi, 8, kind::SETUP << 10 | IDT | TRT_OUT])
+    }
+
+    /// **An OUT Data stage** of `len` bytes from `buffer` (Phase 6 Part B.5).
+    pub const fn data_out(buffer: u64, len: u32) -> Trb {
+        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10])
+    }
+
     /// **An IN Data stage** of `len` bytes into `buffer`.
     pub const fn data_in(buffer: u64, len: u32) -> Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10 | DIR_IN])
     }
 
-    /// **The Status stage**, interrupting on completion: OUT after an IN data stage, IN when there
-    /// was none (USB 2.0 §8.5.3).
+    /// **The Status stage**, interrupting on completion: OUT after an IN data stage, IN after an OUT
+    /// one or when there was none (USB 2.0 §8.5.3).
     pub const fn status(after_data_in: bool) -> Trb {
         let dir = if after_data_in { 0 } else { DIR_IN };
         Trb([0, 0, 0, kind::STATUS << 10 | dir | IOC])
@@ -447,6 +461,10 @@ mod tests {
         assert_eq!(normal.0, [0x4000, 0x1, 8, 1 << 10 | 1 << 5 | 1 << 2], "Normal, IOC and ISP");
         let configure = Trb::with_input(kind::CONFIGURE_ENDPOINT, 0x3000, 7);
         assert_eq!(configure.0, [0x3000, 0, 0, 12 << 10 | 7 << 24], "DC clear");
+        // Part B.5: a SET_REPORT's OUT stages, its Status then IN.
+        let set_report = [0x21, 9, 0, 2, 0, 0, 1, 0];
+        assert_eq!(Trb::setup_out(set_report).0[3], kind::SETUP << 10 | 1 << 6 | 2 << 16, "TRT 2: OUT");
+        assert_eq!(Trb::data_out(0x5000, 1).0, [0x5000, 0, 1, kind::DATA << 10], "DIR clear: OUT");
     }
 
     /// A Transfer Event's endpoint and residual, from dwords 3 and 2.

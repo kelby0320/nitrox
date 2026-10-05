@@ -32,8 +32,10 @@ driver (`drivers::console`): COM1 RX IRQ → ring → a parked `sys_io_submit(Re
 that has the handle can read; one that does not, cannot. The driver delivers **raw bytes** and
 says so — "echo and line editing live in userspace".
 
-**Output is not — at the console.** There is no write path there at all: `CharBackend` has only
-`submit_read`, and `SYS_DEBUG_KPRINT` is an ambient debug syscall that takes no handle.
+**Output is not — at the console.** There is no write path there at all: the console's
+`CharBackend` has no `submit_write` — the hook exists since Phase 6 Part B.5, for a keyboard's
+lights, and the console leaves it empty — and `SYS_DEBUG_KPRINT` is an ambient debug syscall that
+takes no handle.
 
 **What reaches a person now travels a handle, and that changed in two steps.** A shell hosted in
 a terminal writes its prompt, its results and its errors to the **tty** it was handed

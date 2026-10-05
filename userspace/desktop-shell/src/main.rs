@@ -2651,7 +2651,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         KeyOutcome::Ignored => {
                             if bar.state.open() == Some(panel::APPS)
                                 && k.pressed != 0
-                                && bar.query.apply(k.keycode, k.modifiers)
+                                && bar.query.apply(k.keycode, k.modifiers, k.locks)
                             {
                                 let table = bar.table(&theme);
                                 // **The top match is lit**, so Enter launches what the person can
@@ -2855,7 +2855,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             &mut current_desktop,
                             &mut next_desktop_id,
                         );
-                    } else if name.apply(k.keycode, k.modifiers) {
+                    } else if name.apply(k.keycode, k.modifiers, k.locks) {
                         // **A receipt per character.** Injection is relative and unacknowledged,
                         // so a dropped PS/2 batch silently eats a keystroke — a desktop named
                         // `wok` instead of `work`, which is a gate failure that looks like a

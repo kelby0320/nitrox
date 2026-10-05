@@ -548,6 +548,9 @@ pub struct Repeat {
     /// Frozen at the press rather than re-read: a repeat is that press continuing, so
     /// releasing shift mid-repeat must not turn `A` into `a` halfway through a run.
     pub modifiers: u16,
+    /// The locks on when it went down (Phase 6 Part B.5), frozen for the same reason: a run of `A`
+    /// under Caps Lock stays `A` whatever happens to the lock mid-run.
+    pub locks: u16,
     /// The window it is going to.
     pub window: u32,
     /// When the next repeat is due.
@@ -556,8 +559,8 @@ pub struct Repeat {
 
 impl Repeat {
     /// Start repeating `keycode` for `window`, first repeat one delay from `now`.
-    pub fn armed(keycode: u16, modifiers: u16, window: u32, now: u64) -> Self {
-        Self { keycode, modifiers, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
+    pub fn armed(keycode: u16, modifiers: u16, locks: u16, window: u32, now: u64) -> Self {
+        Self { keycode, modifiers, locks, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
     }
 
     /// Whether a repeat is due at `now`; advances to the next one if so.
@@ -601,14 +604,17 @@ impl Repeat {
         keycode: u16,
         pressed: bool,
         modifiers: u16,
+        locks: u16,
         focus: Option<u32>,
         now: u64,
     ) -> Option<Repeat> {
-        if libinput::is_modifier(keycode) {
+        // **A lock key neither**: Caps Lock held is not a key to type 25 times a second (Phase 6
+        // Part B.5).
+        if libinput::is_modifier(keycode) || libinput::is_lock_key(keycode) {
             return current;
         }
         match (pressed, focus) {
-            (true, Some(window)) => Some(Repeat::armed(keycode, modifiers, window, now)),
+            (true, Some(window)) => Some(Repeat::armed(keycode, modifiers, locks, window, now)),
             (true, None) => None,
             (false, _) if current.is_some_and(|r| r.keycode == keycode) => None,
             (false, _) => current,
@@ -1617,8 +1623,8 @@ fn copy_damage<F: Framebuffer + ?Sized>(
 mod tests {
     use super::*;
     use libkern::abi::{
-        KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL,
-        KEY_RIGHTMETA, KEY_RIGHTSHIFT,
+        KEY_CAPSLOCK, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_NUMLOCK, KEY_RIGHTALT,
+        KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
     };
 
     /// Two ordinary (non-modifier) keycodes — `a` and `b` in the Linux table `libkern::abi`
@@ -1780,7 +1786,7 @@ mod tests {
 
     #[test]
     fn a_repeat_waits_the_delay_and_then_runs_at_the_interval() {
-        let mut r = Repeat::armed(30, 0, 1, 1_000);
+        let mut r = Repeat::armed(30, 0, 0, 1, 1_000);
         assert!(!r.due(1_000), "not immediately");
         assert!(!r.due(1_000 + REPEAT_DELAY_NS - 1), "not a nanosecond early");
         assert!(r.due(1_000 + REPEAT_DELAY_NS), "and then it fires");
@@ -1794,7 +1800,7 @@ mod tests {
         // wake-up push the next repeat further out, so a busy compositor repeats slower and
         // slower. The tick that wakes this is 10 ms, so late is the normal case.
         let start = 1_000;
-        let mut r = Repeat::armed(30, 0, 1, start);
+        let mut r = Repeat::armed(30, 0, 0, 1, start);
         let first = start + REPEAT_DELAY_NS;
         assert!(r.due(first + REPEAT_INTERVAL_NS / 2), "fired half an interval late");
         assert_eq!(
@@ -1808,7 +1814,7 @@ mod tests {
     fn a_very_late_wakeup_does_not_fire_a_burst() {
         // A stalled compositor coming back must not deliver every repeat it missed. One
         // repeat, then back on cadence from now.
-        let mut r = Repeat::armed(30, 0, 1, 0);
+        let mut r = Repeat::armed(30, 0, 0, 1, 0);
         let much_later = REPEAT_DELAY_NS + REPEAT_INTERVAL_NS * 1_000;
         assert!(r.due(much_later));
         assert!(!r.due(much_later), "and only one");
@@ -1819,7 +1825,7 @@ mod tests {
     fn modifiers_are_frozen_at_the_press() {
         // A repeat is that press continuing. Re-reading modifiers would turn `A` into `a`
         // halfway through a held run if the user let go of shift.
-        let r = Repeat::armed(30, 0x0001, 7, 0);
+        let r = Repeat::armed(30, 0x0001, 0, 7, 0);
         assert_eq!(r.modifiers, 0x0001);
         assert_eq!(r.keycode, 30);
         assert_eq!(r.window, 7);
@@ -2921,15 +2927,15 @@ mod tests {
 
         // Holding a modifier with nothing repeating starts nothing.
         assert_eq!(
-            Repeat::after_key(None, KEY_LEFTCTRL, true, 0, Some(7), now),
+            Repeat::after_key(None, KEY_LEFTCTRL, true, 0, 0, Some(7), now),
             None,
             "a modifier armed a repeat"
         );
 
         // Pressing a modifier while `a` repeats leaves `a`'s run exactly as it was...
-        let run = Repeat::armed(KEY_A, 0, 7, now);
+        let run = Repeat::armed(KEY_A, 0, 0, 7, now);
         let after_shift_down =
-            Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, Some(7), now + 50);
+            Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, 0, Some(7), now + 50);
         assert_eq!(after_shift_down, Some(run), "a modifier press hijacked the repeat");
 
         // ...and releasing it leaves the run alone too, which is the half that was already
@@ -2939,6 +2945,7 @@ mod tests {
             KEY_LEFTSHIFT,
             false,
             0,
+            0,
             Some(7),
             now + 90,
         );
@@ -2946,7 +2953,7 @@ mod tests {
 
         // The held key's own release still stops it.
         assert_eq!(
-            Repeat::after_key(after_shift_up, KEY_A, false, 0, Some(7), now + 120),
+            Repeat::after_key(after_shift_up, KEY_A, false, 0, 0, Some(7), now + 120),
             None,
             "the repeating key's release must disarm"
         );
@@ -2967,16 +2974,29 @@ mod tests {
             KEY_RIGHTMETA,
         ] {
             assert_eq!(
-                Repeat::after_key(None, code, true, 0, Some(1), 0),
+                Repeat::after_key(None, code, true, 0, 0, Some(1), 0),
                 None,
                 "keycode {code} armed a repeat"
             );
         }
         // And an ordinary key still does, or the exclusion is too wide.
         assert!(
-            Repeat::after_key(None, KEY_A, true, 0, Some(1), 0).is_some(),
+            Repeat::after_key(None, KEY_A, true, 0, 0, Some(1), 0).is_some(),
             "an ordinary key stopped repeating"
         );
+    }
+
+    /// **A lock key neither repeats nor takes a run** (Phase 6 Part B.5): Caps Lock held is not a key
+    /// to send at the repeat rate, and pressing it while `a` repeats leaves `a` repeating — with the
+    /// locks it went down with, which `modifiers_are_frozen_at_the_press` holds for modifiers.
+    #[test]
+    fn a_lock_key_neither_repeats_nor_takes_a_run() {
+        for lock in [KEY_CAPSLOCK, KEY_NUMLOCK] {
+            assert_eq!(Repeat::after_key(None, lock, true, 0, 0, Some(7), 0), None, "{lock} armed a repeat");
+            let run = Repeat::armed(KEY_A, 0, 0, 7, 0);
+            assert_eq!(Repeat::after_key(Some(run), lock, true, 0, 0, Some(7), 50), Some(run), "{lock} took the run");
+            assert_eq!(Repeat::after_key(Some(run), lock, false, 0, 0, Some(7), 90), Some(run), "{lock}'s release");
+        }
     }
 
     #[test]
@@ -2984,8 +3004,8 @@ mod tests {
         // The window a repeat targets is captured at the press. A press while nothing can
         // take focus must not leave the *previous* key repeating into a window that is no
         // longer the focus candidate.
-        let run = Repeat::armed(KEY_A, 0, 7, 0);
-        assert_eq!(Repeat::after_key(Some(run), KEY_B, true, 0, None, 100), None);
+        let run = Repeat::armed(KEY_A, 0, 0, 7, 0);
+        assert_eq!(Repeat::after_key(Some(run), KEY_B, true, 0, 0, None, 100), None);
     }
 
     #[test]

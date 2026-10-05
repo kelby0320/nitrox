@@ -2,20 +2,20 @@
 
 The `Input` category (`op = 0x0Axx`) of the resource-server protocol
 ([rsproto-wire-format.md](rsproto-wire-format.md)). This is how merged input reaches a
-privileged consumer. **Today's only consumer is `input-testclient`**, in test-harness builds;
-the compositor becomes one in Milestone 3 Part C, when focus and routing land, and a hotkey
-daemon or VT switcher could later.
+privileged consumer. **The compositor is the consumer**; in test-harness builds `input-testclient`
+is a second, and a hotkey daemon or VT switcher could be one later.
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 3 Part B
-(`docs/planning/display-arm-plan.md`). `Events` is defined; hotkey registration and device
-enumeration are later milestones and will extend this category. The design is
+(`docs/planning/display-arm-plan.md`). `Events` is defined, and `Lights` since Phase 6 Part B.5 —
+the first message a consumer sends. Hotkey registration and device enumeration would extend this
+category; neither is scheduled. The design is
 [`input-subsystem.md`](../architecture/input-subsystem.md).
 
 ## Where it sits
 
 The `input-server` is a **userspace resource server bound at `/dev/input/new`**. It reads
-every keyboard and mouse — the kernel's i8042 driver's two today, up to eight — **as the
-input class's one owner**: it subscribes to `/svc/devices/input`, and the device manager hands
+every keyboard and mouse — the i8042's two and every USB keyboard and mouse, up to eight — **as
+the input class's one owner**: it subscribes to `/svc/devices/input`, and the device manager hands
 it each device's node ([rsproto-devices-ops.md](rsproto-devices-ops.md)), refusing a second
 subscriber while it holds them. It merges their streams and forwards the result.
 
@@ -25,7 +25,7 @@ subscriber while it holds them. It merges their streams and forwards the result.
 |---|---|---|
 | `/dev/input/raw/<n>` | the root namespace, and nothing on the input path resolves it | reading one device unfiltered |
 | `/svc/devices/input` | the `input-server`, the class's one owner | being handed every keyboard and mouse as a node |
-| `/dev/input/new` | the compositor, once M3 Part C lands routing; `input-testclient` today | receiving merged input for the whole machine |
+| `/dev/input/new` | the compositor, and `input-testclient` in test-harness builds | receiving merged input for the whole machine, and setting every keyboard's lights |
 | *(nothing)* | ordinary clients | input arrives only via their Surface session |
 
 That the raw nodes and the subscription reach nothing but the server is a **constraint on the
@@ -101,6 +101,35 @@ never has to carry state across messages.
 mouse always fit one — plus, when one is owed, the loss marker and recovered motion group of
 [Loss](#loss) in front of them. A wakeup that harvested more, from more devices, is forwarded as
 consecutive messages, in order, each ending on a group boundary.
+
+### `Lights` (`0x0A01`)
+
+**Consumer → server. No reply.** Phase 6 Part B.5. The body is one byte, the keyboard lights the
+consumer wants on, in HID's order — the byte a write to a keyboard's raw node carries
+([io-operation.md](io-operation.md)):
+
+| Bit | Constant | Light |
+|---|---|---|
+| 0 | `LIGHT_NUM` (`0x01`) | Num Lock |
+| 1 | `LIGHT_CAPS` (`0x02`) | Caps Lock |
+| 2 | `LIGHT_SCROLL` (`0x04`) | Scroll Lock — which nothing sets, Scroll Lock not being a lock here |
+
+Mirrored in `kernel/src/libkern/input.rs` and `userspace/libkern/src/abi.rs`, and compared by
+`abi-sync-check`.
+
+The server writes the byte to **every keyboard it reads, and to each that arrives later**; until a
+consumer has sent one, a keyboard keeps whatever its driver set. A body of another length or with
+another bit is ignored, as is any other message from a consumer, each with a line in the log. The
+write is fire-and-forget: the server waits for no keyboard's answer, so one that never answers
+costs a line in the kernel's log rather than a stalled input stream.
+
+**The consumer says it because the consumer holds the locks.** Caps Lock and Num Lock are state of
+`libinput`'s interpreter, which runs in the compositor; the server holds no key state at all, and
+the kernel decodes a key without knowing what it does. The compositor sends the lights when it
+connects — Num Lock is on from the start — and after any input pass that changed its locks.
+
+**One consumer should send it.** Two would each set every keyboard to their own locks, and the
+lights would follow whichever spoke last. The compositor is the only one that does.
 
 ## Ordering
 

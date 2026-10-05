@@ -66,6 +66,8 @@ pub(super) enum Decoder {
 pub(super) struct Bound {
     slot: u8,
     dci: u8,
+    /// The interface it is, which a keyboard's lights are addressed to.
+    interface: u8,
     node: usize,
     decoder: Decoder,
     ring: Producer,
@@ -79,6 +81,9 @@ pub(super) struct Bound {
     halted: bool,
     /// Times it has halted, counted when the DPC sees each: the third leaves it stopped.
     halts: u8,
+    /// A lights request timed out on the device's default endpoint, which may still hold it: no
+    /// more lights are sent to this keyboard. Its keys go on arriving, on their own endpoint.
+    lights_dead: bool,
 }
 
 /// The bound endpoints, for the DPC.
@@ -202,7 +207,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
     // **Each interface's steps**: a stall ends that interface alone, and the others go on. **Any
     // other failure on the default endpoint ends the binding there** (PR #358 review): the request
     // may still be on the endpoint's ring, so nothing more is asked of it. That interface is not
-    // bound, nor any after it, and those before it stay bound, on endpoints of their own.
+    // bound, nor any after it, and those before it stay bound, on endpoints of their own — **and
+    // take no lights** (Part B.5), since a lights request is the default endpoint's too.
+    let mut in_doubt_at = false;
     for p in prepared.into_iter().flatten() {
         let c = &p.c;
         let what = if c.is_keyboard { "keyboard" } else { "mouse" };
@@ -218,6 +225,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
                         "usb: port {port}: its {what}'s report descriptor did not read ({e}); \
                          not bound, nor anything after it"
                     );
+                    in_doubt_at = true;
                     break;
                 }
             }
@@ -230,6 +238,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
                 crate::kprintln!(
                     "usb: port {port}: its {what}'s SET_PROTOCOL failed ({e}); not bound, nor anything after it"
                 );
+                in_doubt_at = true;
                 break;
             }
         } else if let Err(e) = interface_request(x, slot, mem, [0x21, 0x0B, 0, 0, c.interface, 0, 0, 0]) {
@@ -237,6 +246,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
                 crate::kprintln!(
                     "usb: port {port}: its {what}'s SET_PROTOCOL failed ({e}); not bound, nor anything after it"
                 );
+                in_doubt_at = true;
                 break;
             }
             crate::kprintln!("usb: port {port}: its {what} refused boot protocol ({e}); not bound");
@@ -251,6 +261,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
             if in_doubt(&e) {
                 crate::kprintln!("usb: port {port}: its keyboard's SET_IDLE failed ({e}); bound, and nothing after it");
                 last = true;
+                in_doubt_at = true;
             } else {
                 // Harmless: an unchanged report decodes to nothing.
                 crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); bound anyway");
@@ -272,6 +283,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         let bound = Bound {
             slot,
             dci: c.endpoint.dci(),
+            interface: c.interface,
             node,
             decoder,
             ring: p.producer,
@@ -282,6 +294,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
             len: c.endpoint.max_packet.max(layout.map_or(0, |l| report_bytes(&l))).min(REPORT_MAX as u16),
             halted: false,
             halts: 0,
+            lights_dead: false,
         };
         if !start(x, bound) {
             crate::kprintln!("usb: port {port}: no room to poll its {what}; not bound");
@@ -300,6 +313,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         if last {
             break;
         }
+    }
+    if in_doubt_at {
+        lights_dead(x, slot);
     }
 }
 
@@ -372,7 +388,7 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32)> {
     if index >= MAX_NODES {
         return None;
     }
-    let backend = CharBackend { submit_read, ctx: index as *mut () };
+    let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut () };
     let node = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok()?;
     let node = crate::drivers::adopt(node, KObjectType::DeviceNode);
     let served = crate::device::register_input(node, kind, parent, "usb-hid")?;
@@ -577,6 +593,91 @@ fn submit_read(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, max_len: u64
     Ok(())
 }
 
+/// **A lights write waiting for the hub thread**, by node (Phase 6 Part B.5): its operation and the
+/// lights.
+static LIGHTS: IrqSpinLock<[Option<(ObjectRef, u8)>; MAX_NODES]> =
+    IrqSpinLock::new(LockRank::Leaf, [const { None }; MAX_NODES]);
+
+/// Which keyboards have taken lights once: what the log says, the first time.
+static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
+
+/// [`CharBackend::submit_write`] for a USB keyboard's node: **its lights** (Phase 6 Part B.5), one
+/// byte in HID's order, sent by the hub thread as a `SET_REPORT`, which owns the default endpoint. A
+/// write to a keyboard that has left is refused at once, `PeerClosed`, and to one that takes no more
+/// lights, `IoError`; one that comes while another waits replaces it, which is completed as done,
+/// its lights being older than the ones that will be set.
+fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
+    let index = ctx as usize;
+    if index >= MAX_NODES || KEYBOARDS.load(Ordering::Relaxed) & (1 << index) == 0 {
+        return Err(KError::Unsupported);
+    }
+    let lights = input::lights_from(buffer, buf_offset, len)?;
+    let x = super::XHCI.load(Ordering::Acquire);
+    if x.is_null() {
+        return Err(KError::PeerClosed);
+    }
+    // SAFETY: published once, never withdrawn.
+    let x: &Xhci = unsafe { &*x };
+    match x.hid.lock().entries.iter().flatten().find(|b| b.node == index).map(|b| b.lights_dead) {
+        None => return Err(KError::PeerClosed),
+        Some(true) => return Err(KError::IoError),
+        Some(false) => {}
+    }
+    let superseded = LIGHTS.lock()[index].replace((po.clone(), lights));
+    if let Some((old, _)) = superseded {
+        crate::sched::complete_pending_op(old.as_ptr(), 0, 1);
+        drop(old);
+    }
+    x.hid_lights.store(true, Ordering::Release);
+    crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+    Ok(())
+}
+
+/// Where a keyboard's waiting lights go.
+pub(super) enum LightsTo {
+    /// To its slot's default endpoint, addressed to its interface.
+    Send { slot: u8, interface: u8 },
+    /// Nowhere: a request on its default endpoint is in doubt, so it takes no more lights.
+    Dead,
+    /// Nowhere: it has left.
+    Gone,
+}
+
+/// **The lights waiting for node `node`**, and where they go. From the hub thread.
+pub(super) fn take_lights(x: &Xhci, node: usize) -> Option<(ObjectRef, u8, LightsTo)> {
+    let (po, lights) = LIGHTS.lock()[node].take()?;
+    let to = match x.hid.lock().entries.iter().flatten().find(|b| b.node == node) {
+        None => LightsTo::Gone,
+        Some(b) if b.lights_dead => LightsTo::Dead,
+        Some(b) => LightsTo::Send { slot: b.slot, interface: b.interface },
+    };
+    Some((po, lights, to))
+}
+
+/// Whether the hub thread has lights to send, clearing the flag.
+pub(super) fn lights_waiting(x: &Xhci) -> bool {
+    x.hid_lights.swap(false, Ordering::AcqRel)
+}
+
+/// **A lights request that timed out** on `slot`'s default endpoint: its keyboards take no more.
+pub(super) fn lights_dead(x: &Xhci, slot: u8) {
+    for b in x.hid.lock().entries.iter_mut().flatten().filter(|b| b.slot == slot) {
+        b.lights_dead = true;
+    }
+}
+
+/// Say the first time keyboard `node` took its lights.
+pub(super) fn lights_taken(node: usize) -> bool {
+    LIGHTS_TAKEN.fetch_or(1 << node, Ordering::Relaxed) & (1 << node) == 0
+}
+
+/// **The `SET_REPORT` that sets a keyboard's lights** (HID 1.11 §7.2.2): a class request to
+/// `interface`, for an Output report — type 2, in `wValue`'s high byte — with no report ID, one
+/// byte long. The byte is the node's as written: HID's order is the wire format's.
+pub(super) const fn set_lights_request(interface: u8) -> [u8; 8] {
+    [0x21, 0x09, 0x00, 0x02, interface, 0, 1, 0]
+}
+
 /// Drop every read the DPC has finished with. **Thread context only**: from `sched::reap_pending`,
 /// and before a read parks.
 pub fn reclaim_completed() {
@@ -616,5 +717,20 @@ mod tests {
         for e in [Failed::Timeout, Failed::Code(4), Failed::Code(3), Failed::NoMemory, Failed::Device("short")] {
             assert!(in_doubt(&e), "{e}");
         }
+    }
+
+    /// **Each field where HID puts it** (HID 1.11 §7.2, USB 2.0 §9.3), read back as a device would.
+    /// QEMU's keyboard reads none of them — it takes any `SET_REPORT` as its lights — so a swapped
+    /// `wValue` would pass every gate and reach a real keyboard as an Input report with ID 2.
+    #[test]
+    fn the_lights_request_is_an_output_report_to_its_interface() {
+        let r = set_lights_request(3);
+        assert_eq!(r[0], 0b0_01_00001, "host to device, class, to an interface");
+        assert_eq!(r[1], 0x09, "SET_REPORT");
+        let w_value = u16::from_le_bytes([r[2], r[3]]);
+        assert_eq!(w_value >> 8, 2, "an Output report");
+        assert_eq!(w_value & 0xFF, 0, "no report ID: a boot keyboard has none");
+        assert_eq!(u16::from_le_bytes([r[4], r[5]]), 3, "the interface");
+        assert_eq!(u16::from_le_bytes([r[6], r[7]]), 1, "one byte");
     }
 }

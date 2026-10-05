@@ -2210,7 +2210,14 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
             op.buf_offset,
             op.length,
         ),
-        // The console: stream Read only (input). Write/Other are not supported yet.
+        // A char device: a stream Read (input), or a Write where its backend takes one — a
+        // keyboard's lights (Phase 6 Part B.5).
+        DeviceClass::Char if opcode == IoOpcode::Write => {
+            match dn.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
+                Some((write, ctx)) => write(&buf_ok.object, &po_ref, op.buf_offset, op.length, ctx),
+                None => Err(KError::Unsupported),
+            }
+        }
         DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
             Some(backend) => (backend.submit_read)(
                 &buf_ok.object,
