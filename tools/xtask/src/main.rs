@@ -383,6 +383,9 @@ fn main() -> ExitCode {
     // `--no-ps2-irq` (check-input only) boots a kernel whose i8042 never asserts its IRQs, so
     // the tick-driven recovery sweep is the only path input can take. See `cmd_check_input`.
     let no_ps2_irq = rest.iter().any(|a| a == "--no-ps2-irq");
+    // `--usb` (Phase 6 Part B) boots a machine with no i8042 and a USB keyboard and mouse, so a key
+    // that arrives came through USB or not at all. See `usb_input_args`.
+    let usb = rest.iter().any(|a| a == "--usb");
     // `--grab` (interactive `qemu` only) makes the QEMU window take the host's pointer and
     // keyboard. See `cmd_qemu`: without a grab the guest cursor and the host pointer are two
     // different cursors, and the host desktop keeps `Super` for itself.
@@ -461,6 +464,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if usb && !matches!(cmd.as_deref(), Some("check-input") | Some("check-login") | Some("check-report")) {
+        eprintln!(
+            "xtask: `--usb` is only meaningful for `check-input`, `check-login` and `check-report` — \
+             it boots a machine whose only keyboard and mouse are USB"
+        );
+        return ExitCode::FAILURE;
+    }
     let accel = if rest.iter().any(|a| a == "--kvm") {
         Accel::Kvm
     } else {
@@ -473,6 +483,7 @@ fn main() -> ExitCode {
             *a != "--selftest"
                 && *a != "--kvm"
                 && *a != "--no-ps2-irq"
+                && *a != "--usb"
                 && *a != "--grab"
                 && *a != "--live"
                 && Some(i) != size_flag
@@ -517,7 +528,7 @@ fn main() -> ExitCode {
         ),
         Some("check-display") => cmd_check_display(accel, gate_size),
         Some("check-terminal") => cmd_check_terminal(accel, gate_size),
-        Some("check-login") => cmd_check_login(accel, gate_size),
+        Some("check-login") => cmd_check_login(accel, usb, gate_size),
         Some("check-logout") => cmd_check_logout(accel, gate_size),
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
@@ -525,10 +536,10 @@ fn main() -> ExitCode {
         Some("check-shutdown") => cmd_check_shutdown(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
         Some("check-recovery") => cmd_check_recovery(accel, gate_size),
-        Some("check-report") => cmd_check_report(accel, gate_size),
+        Some("check-report") => cmd_check_report(accel, usb, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
-        Some("check-input") => cmd_check_input(accel, no_ps2_irq, gate_size),
+        Some("check-input") => cmd_check_input(accel, no_ps2_irq, usb, gate_size),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -575,6 +586,8 @@ fn print_help() {
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
+           \x20                `--usb` (here, `check-login`, `check-report`): no i8042, and a\n  \
+           \x20                USB keyboard and mouse, so every key and click is USB's\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
            preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
@@ -2572,7 +2585,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 /// an event produced before the consumer channel exists is one the server has nowhere to
 /// send, so injecting on a timer would make this flaky in exactly the way a test of a rare
 /// path must not be.
-fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
+fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     // **`--no-ps2-irq` boots the same image with the i8042's interrupt generation left off**,
     // so every byte has to be recovered by the tick-driven `ps2::poll` sweep rather than
@@ -2615,6 +2628,9 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    if usb {
+        usb_input_args(&mut cmd, true);
+    }
 
     println!("xtask: input gate — booting and injecting…\n");
     let mut session = Session::spawn(cmd, "check-input")?;
@@ -2967,8 +2983,8 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
     // deliver, and the unpaced walk back arrives packed with the press — which is why that
     // variant's own steps pace their injection. The guard is about the gate's flush, not the
     // interrupt path, so the variant that exists for the interrupt path does not run it.
-    if no_ps2_irq {
-        println!("  note: the held-release guard runs only with the i8042's interrupts on");
+    if no_ps2_irq || usb {
+        println!("  note: the held-release guard runs only on the i8042, with its interrupts on");
     } else {
         let hold = |qmp: &mut Qmp| -> R<()> {
             qmp.send_key("f9", true)?;
@@ -5339,7 +5355,7 @@ const REPORT_FACTS: &[&[&str]] = &[
 /// 4. **The boot goes on**: the console hands the screen to the compositor.
 ///
 /// Between them, this and `test-qemu` cover a claimed and a declined function, and COM1 both ways.
-fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
+fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
 
@@ -5370,6 +5386,11 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    // **`--usb`: the same machine with no i8042** (Phase 6 Part B), so every page turns on a USB
+    // key press: the report counts any keyboard's, and holds its pages for one.
+    if usb {
+        usb_input_args(&mut cmd, false);
+    }
     println!("xtask: hardware report gate — choosing the live image's report entry, with no serial port…\n");
     let _session = Session::spawn(cmd, "check-report")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
@@ -5468,9 +5489,14 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
     let framebuffer =
         format!("framebuffer: {}x{} pitch {} padding 0 bpp 32", size.w, size.h, size.w * 4);
     let framebuffer: &[&str] = &[&framebuffer];
+    // Under `--usb` the machine has no i8042 and a keyboard and mouse beside the stick, so the
+    // FADT's fact and the first round's count are the other ones.
+    let replaced =
+        |f: &&&[&str]| !usb || !f.iter().any(|frag| frag.contains("8042 present") || frag.contains("first round: 1 "));
+    let usb_facts: &[&[&str]] = if usb { USB_INPUT_FACTS } else { &[] };
     let missing = missing_facts(
         &lines,
-        EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).copied().chain([framebuffer]),
+        EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).filter(replaced).chain(usb_facts).copied().chain([framebuffer]),
     );
     if !missing.is_empty() {
         let read: Vec<String> =
@@ -5725,7 +5751,7 @@ fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     fs::create_dir_all(&work).ok();
     let qmp_sock = work.join("qmp-logout.sock");
     println!("xtask: logout gate — booting the release image…\n");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "check-logout", &qmp_sock, size, true)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-logout", &qmp_sock, size, true, false)?;
     const APPS_CLICK: (i32, i32) = (60, 12);
     let power_click = (size.w as i32 - chrome::POWER_FROM_RIGHT, 12);
 
@@ -6252,7 +6278,7 @@ impl Frame {
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
 /// `check-terminal` types one character at a time to stay behind. Waiting for the redraw is
 /// the same discipline against a different receipt.
-fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
+fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
 
@@ -6261,7 +6287,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     let qmp_sock = work.join("qmp-login.sock");
 
     println!("xtask: graphical login gate — booting the release image…\n");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock, size, false)?;
+    // **`--usb`: a machine with no i8042** (Phase 6 Part B), so every key at the greeter is typed on
+    // a USB keyboard: the Definition of Done's "types at the greeter".
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock, size, false, usb)?;
 
     // 0. **The AHCI controller took the MSI path in a *release* image.** `test-qemu` already
     //    adjudicates this (`check_ahci_msi_path`), but only for the selftest build — and the
@@ -7449,8 +7477,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // a terminal that had snapped on the pass-through above sits at the work area's origin, so
     // this press lands on its *grid* — inside the window, and no drag at all. Without this line
     // the control's failure surfaces two steps later as a drag that never began.
-    session.expect("nxterm: dragging its own title bar")?;
-    session.expect("compositor: interactive move of window ")?;
+    // In either order: a client's request and the compositor's receipt of it, as the file drag's
+    // two lines are (Phase 6 Part B).
+    session.expect_all(&["nxterm: dragging its own title bar", "compositor: interactive move of window "])?;
     // **Paced, and the reason is worth keeping.** The first version injected thirty-six motions
     // as fast as QMP would take them; the consumer ring overran, `input-server` announced the
     // gap, and `libinput` turned it into a `Logical::Dropped` — which ends a gesture *without*
@@ -8114,8 +8143,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **Asserted directly, not retried.** Like the menu click below, this was flaky for exactly
     // one reason — a repaint between the press and the release re-identified the row under the
     // pointer and `libui` dropped the gesture — and the retry that hid it is gone with the bug.
-    session.expect("nxfiles: dragging other.txt")?;
-    session.expect("compositor: drag from window ")?;
+    // **In either order** (Phase 6 Part B's `check-login --usb`, under TCG): `nxfiles` says it is
+    // dragging after it asks the compositor to start the drag, and the compositor says so when the
+    // request arrives — two processes answering one gesture, ordered by nothing. Expected in turn,
+    // the compositor's line came first once and the first `expect` scanned past it.
+    session.expect_all(&["nxfiles: dragging other.txt", "compositor: drag from window "])?;
     // Into the editor's document area — below its title bar and status strip, and well inside
     // the half of the screen it now occupies.
     let onto = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
@@ -10555,7 +10587,7 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     fs::create_dir_all(&work).ok();
     let dump = work.join("shot.ppm");
     let qmp_sock = work.join("qmp-shot.sock");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock, size, false)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock, size, false, false)?;
 
     // A closure would borrow both halves for the rest of the function, so the capture is a
     // statement each time — four lines, and no plumbing to read past.
@@ -10742,12 +10774,16 @@ fn placed_window(session: &mut Session) -> R<(i32, i32, u32, u32)> {
 /// **`reboot` lets a reset reboot the guest** rather than end QEMU: `check-logout` restarts the
 /// machine twice and goes on in the boots that follow (administration Part F.3). Everything else
 /// keeps `-no-reboot`, so a guest that resets by accident ends the run rather than booting again.
+///
+/// **`usb` boots a machine whose only keyboard and mouse are USB** ([`usb_input_args`]):
+/// `check-login --usb` (Phase 6 Part B).
 fn spawn_release_guest(
     accel: Accel,
     gate: &'static str,
     qmp_sock: &Path,
     size: DisplaySize,
     reboot: bool,
+    usb: bool,
 ) -> R<(Session, Qmp)> {
     let ovmf = locate_ovmf()?;
     // Removed rather than reused: a socket left by a killed run is a file `Qmp::connect` will
@@ -10774,6 +10810,9 @@ fn spawn_release_guest(
         .stderr(std::process::Stdio::null());
     if !reboot {
         cmd.arg("-no-reboot");
+    }
+    if usb {
+        usb_input_args(&mut cmd, true);
     }
 
     let session = Session::spawn(cmd, gate)?;
@@ -12732,18 +12771,25 @@ fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
         .ok_or_else(|| format!("no port in {line:?}"))?;
     let gone = format!("usb: port {port}: disconnected; slot ");
     let mouse = format!("usb: port {port}: 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse");
+    // **Each bound as it arrives** (Part B.2), and unbound when it leaves, which the departure's
+    // slot being disabled follows.
+    let kbd_bound = format!("usb: port {port}: keyboard at /dev/input/raw/");
+    let mouse_bound = format!("usb: port {port}: mouse at /dev/input/raw/");
     let mut rest = &after[after.find(line).unwrap_or(0) + line.len()..];
     for (what, want) in [
+        ("the keyboard bound", kbd_bound.as_str()),
         ("the keyboard's departure when the mouse was swapped in", gone.as_str()),
         ("the mouse's arrival on the same port", mouse.as_str()),
+        ("the mouse bound", mouse_bound.as_str()),
         ("the mouse's departure", gone.as_str()),
     ] {
         let Some(at) = rest.find(want) else {
-            return Err(format!(
-                "after the keyboard's arrival on port {port}, no line for {what} ({want:?}): a replug \
-                 the hub thread does not take as a departure and an arrival keeps the old device"
-            )
-            .into());
+            let why = if want.contains("/dev/input/raw/") {
+                "a HID device enumerated after boot that was not bound"
+            } else {
+                "a replug the hub thread does not take as a departure and an arrival keeps the old device"
+            };
+            return Err(format!("after the keyboard's arrival on port {port}, no line for {what} ({want:?}): {why}").into());
         };
         let found = rest[at..].lines().next().unwrap_or("");
         if want == gone && !found.contains("disabled") {
@@ -12753,7 +12799,7 @@ fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
     }
     println!(
         "xtask: a keyboard plugged in after boot, swapped for a mouse while the machine was paused, \
-         and pulled out — each arrival and departure on port {port}, each slot disabled ✓"
+         and pulled out — each arrival, binding and departure on port {port}, each slot disabled ✓"
     );
     Ok(())
 }
@@ -12786,6 +12832,28 @@ fn check_usb_listed(transcript: &[u8]) -> R<()> {
         .into());
     }
     println!("xtask: device-mgr lists {listed} USB device(s) as usb-<id>.tsm, the first round's {round} among them ✓");
+    // **And `input-server` was handed the keyboards and mice the first round bound** (Part B.2),
+    // beside the i8042's two, which `test-qemu`'s machine has. At least: a hot-plugged keyboard bound
+    // before the manager's read is handed over too.
+    let at_round = text.find(USB_FIRST_ROUND).unwrap_or(0);
+    let bound = text[..at_round].lines().filter(|l| l.starts_with("usb: port ") && l.contains(" at /dev/input/raw/")).count();
+    let handed = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("input-server: ")?.split(" device(s) from the device manager").next()?.parse::<usize>().ok()
+        })
+        .ok_or("no input-server line counting the devices it was handed")?;
+    if handed < 2 + bound {
+        return Err(format!(
+            "input-server was handed {handed} device(s), fewer than the i8042's two and the {bound} the \
+             first round bound"
+        )
+        .into());
+    }
+    println!(
+        "xtask: input-server was handed {handed} input device(s), the i8042's two and the first round's {bound} \
+         among them ✓"
+    );
     Ok(())
 }
 
@@ -12799,6 +12867,32 @@ fn check_usb_listed(transcript: &[u8]) -> R<()> {
 /// constant failed every CI boot that attached it (PR #354). The NEC model takes `msi` and `msix`
 /// in both, and numbers its SuperSpeed ports first, as `qemu-xhci` does.
 const XHCI_DEVICE: &str = "nec-usb-xhci,id=xhci,msi=on,msix=off";
+
+/// **A machine whose only keyboard and mouse are USB** (Phase 6 Part B): q35 with its i8042 off —
+/// the FADT then says the 8042 is absent, and the PS/2 driver publishes nothing — and a `usb-kbd`
+/// and a `usb-mouse` on the gates' controller, which is added here unless the gate has one
+/// already (`check-report`'s stick is on it). QMP's input reaches them because nothing else takes
+/// it. A second `-machine` merges with `qemu_base_args`'s, as QEMU 8.2 and 11 both do.
+fn usb_input_args(cmd: &mut Command, add_controller: bool) {
+    cmd.arg("-machine").arg("i8042=off");
+    if add_controller {
+        cmd.arg("-device").arg(XHCI_DEVICE);
+    }
+    cmd.arg("-device").arg("usb-kbd,bus=xhci.0").arg("-device").arg("usb-mouse,bus=xhci.0");
+}
+
+/// What `check-report --usb`'s report says beside [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]
+/// (Phase 6 Part B): the FADT's 8042 absent, where the first has it present; the keyboard and mouse
+/// bound at `/dev/input/raw/0` and `/1`, since no i8042 took them, on the USB 2 ports after the
+/// stick's (read off the first run); and a first round of three devices, where the second has the
+/// stick's one.
+const USB_INPUT_FACTS: &[&[&str]] = &[
+    &["fadt: boot arch 0x0; 8042 absent"],
+    &["ps2: no i8042 devices answered"],
+    &["usb: port 6: keyboard at /dev/input/raw/0"],
+    &["usb: port 7: mouse at /dev/input/raw/1"],
+    &["usb: first round: 3 device(s) in "],
+];
 
 /// **The USB devices `test-qemu` boots with** (Phase 6 Part A): an xHCI controller with a device
 /// at each of three speeds, a hub, and one nothing matches.
@@ -13076,6 +13170,13 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["boot-probe: registry: usb port 10, 0627:0001 class 03/01/02, speed 1, under 00:03.0, \"QEMU USB Mouse ("],
     &["boot-probe: registry: usb port 12, 0409:55aa class 09/00/00, speed 1, under 00:03.0, \"QEMU USB Hub ("],
     &["boot-probe: registry: usb port 13, 08e6:4433 class 0b/00/00, speed 1, under 00:03.0, \"QEMU USB CCID ("],
+    // **The keyboard and mouse bound** (Part B.2), each at the index after the i8042's two, and in
+    // the registry under its device. That `input-server` was given them is `check_usb_listed`'s:
+    // how many it was given depends on where the hot-plug lands.
+    &["usb: port 9: keyboard at /dev/input/raw/2"],
+    &["usb: port 10: mouse at /dev/input/raw/3"],
+    &["boot-probe: registry: usb keyboard at /dev/input/raw/2, under usb-"],
+    &["boot-probe: registry: usb mouse at /dev/input/raw/3, under usb-"],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.
@@ -17686,13 +17787,16 @@ mod tests {
     /// dropped every USB record, which `boot-probe` passed — fails, as does one short by one.
     #[test]
     fn device_mgr_must_list_the_first_rounds_usb_devices() {
-        let boot = |listed: usize, since: usize| {
+        let boot_with = |listed: usize, since: usize, handed: usize| {
             format!(
-                "usb: first round: 5 device(s) in 287 ms\ninit: spawned init (pid 1)\nboot-probe: devices: \
+                "usb: port 9: keyboard at /dev/input/raw/2\nusb: port 10: mouse at /dev/input/raw/3\n\
+                 usb: first round: 5 device(s) in 287 ms\ninit: spawned init (pid 1)\n\
+                 input-server: {handed} device(s) from the device manager\nboot-probe: devices: \
                  block held by the storage service, all.tsm has 20 rows, {listed} of them usb-<id>, and \
-                 {since} USB devices since ok\n"
+                 {since} USB records since ok\n"
             )
         };
+        let boot = |listed: usize, since: usize| boot_with(listed, since, 4);
         for (listed, since) in [(5, 2), (6, 1), (7, 0)] {
             assert!(check_usb_listed(boot(listed, since).as_bytes()).is_ok(), "{listed} listed");
         }
@@ -17700,6 +17804,11 @@ mod tests {
         assert!(check_usb_listed(boot(4, 3).as_bytes()).is_err(), "one short");
         let no_round = boot(5, 2).replace("usb: first round: 5 device(s)", "usb: no round");
         assert!(check_usb_listed(no_round.as_bytes()).is_err(), "no first round to hold it to");
+        // **`input-server` handed the first round's keyboard and mouse** beside the i8042's two
+        // (Part B.2): five when a hot-plugged keyboard was bound before the manager's read, and
+        // three is one short.
+        assert!(check_usb_listed(boot_with(5, 2, 5).as_bytes()).is_ok(), "a hot-plugged keyboard too");
+        assert!(check_usb_listed(boot_with(5, 2, 3).as_bytes()).is_err(), "one input device short");
     }
 
     #[test]

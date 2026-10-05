@@ -8,6 +8,7 @@
 pub mod ahci;
 pub mod console;
 pub mod gpt;
+pub mod hid;
 pub mod input;
 pub mod ps2;
 pub mod xhci;

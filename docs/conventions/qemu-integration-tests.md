@@ -201,6 +201,13 @@ room for, until the next injected event — and to prove that the gates' flush d
 (`expect_after_pointer` in `tools/xtask`). Nothing else presses F9, and a kernel without the
 feature has no hold at all. `check-input --no-ps2-irq` does not run that step: with only the tick
 reading the controller, a click from an unknown position is not reliable enough to build on.
+`check-input --usb` does not either: it holds the i8042's drain, and that machine has no i8042.
+
+**`--usb` boots a machine with no i8042** (Phase 6 Part B): q35 with `i8042=off`, the gates' xHCI
+controller, a `usb-kbd` and a `usb-mouse`, so a key or a click that arrives came through USB or not
+at all. `check-input`, `check-login` and `check-report` take it, each asserting what it does on the
+i8042 less what is the i8042's own: `check-input` the held-release step, and `check-report` the
+FADT's 8042 and the first round's count, for which it asserts the machine's instead.
 
 ## Running it
 

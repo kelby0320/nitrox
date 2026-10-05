@@ -1,11 +1,14 @@
 # USB
 
-**Status: Phase 6 Part A built (2026-10-02)** — the xHCI host controller is claimed and its rings
-proved (A.1); **a hub thread enumerates what is attached**, at boot and after it, logging each
-device and matching it against the class table (A.2); and **each device is a `UsbDevice` record in
-the registry**, which `device-mgr` names `usb-<id>` (A.3). Nothing binds a class driver (Parts B and
-D). A departure frees the device's slot and leaves its record, and nothing tells `device-mgr` of a
-device plugged in after it read the registry (Part C). The design ahead is
+**Status: Phase 6 Part A built (2026-10-02), and Part B's keyboards and mice (B.1–B.4, 2026-10-05)**
+— the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
+is attached**, at boot and after it, logging each device and matching it against the class table
+(A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
+`usb-<id>` (A.3); and **a boot keyboard or mouse is bound**, polled by the DPC, and served at
+`/dev/input/raw/<n>` like the i8042's, a mouse's wheel read through its report descriptor (B.2,
+B.3). The lock keys and their lights are B.5's, not built. No class driver binds anything else
+(Part D). A departure frees the device's slot and leaves its records, and nothing tells
+`device-mgr` of a device plugged in after it read the registry (Part C). The design ahead is
 [`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
 
 ## The controller
@@ -164,6 +167,100 @@ manager reads the registry once, at its start. A device plugged in after that is
 and not in `/dev/devices`. A device the table cannot take — no memory for its node, or the table
 full — stays attached, and the log says it is missing from the registry.
 
+## Keyboards and mice: HID (Part B)
+
+**Binding is a step of enumeration** (`kernel/src/drivers/xhci/hid.rs`). After a device's record
+is made, the hub thread binds every interface whose class triple is a boot keyboard (`03/01/01`) or
+a boot mouse (`03/01/02`) — not only the first, so a receiver with both gives both. Each bound
+interface becomes an input node. In order:
+1. **Configure Endpoint** adds every bound interface's interrupt-IN endpoint in one command. Each
+   is read from the configuration descriptor after its interface: a HID descriptor sits between,
+   and a SuperSpeed companion after it, giving the burst. Its context holds:
+   - its maximum packet and burst, and three retries;
+   - its interval, as an exponent of 125 µs: three more than ⌊log₂ `bInterval`⌋ at full and low
+     speed, where `bInterval` is in milliseconds, and `bInterval` − 1 above;
+   - its Max ESIT Payload, and an Average TRB Length of the TRB it is given;
+   - its transfer ring.
+
+   The slot's context entries are raised to the highest Device Context Index (twice the endpoint
+   number, plus one for IN).
+2. **`SET_CONFIGURATION`**, after Configure Endpoint, which is Linux's order: the controller has
+   the bandwidth before the device is told. It is the first request with no data stage, which
+   `control_out` sends.
+3. **A mouse's report descriptor** (B.3), from the interface, for the length its HID descriptor
+   gives.
+4. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse; boot
+   protocol for every keyboard and any other mouse. A keyboard that refuses boot protocol is not
+   bound. A mouse that refuses report protocol is in it already, a device's state after a reset.
+5. **`SET_IDLE (0)`** to a keyboard, so it reports a change and not a held state. A refusal is
+   passed over: an unchanged report decodes to nothing.
+6. **A node**, registered under the device's record, and **one Normal TRB** queued, for the
+   endpoint's maximum packet, interrupting on completion and on a short packet.
+
+**What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. A
+failure in steps 3 to 6 is that interface's: its endpoint stays configured and is never polled,
+and the others go on. A stalled report descriptor runs the mouse in boot protocol.
+
+**Polling is the DPC's.** A Transfer Event for any endpoint but the default one goes to the table
+of bound endpoints, by slot and Device Context Index. On success or a short packet:
+- the report — the TRB's length less the residual — is copied out of its buffer;
+- it is decoded against the endpoint's last report (`kernel/src/drivers/hid/`), and the events go
+  to the node's ring, stamped at the MSI's interrupt tail;
+- the same TRB is queued again with a doorbell;
+- a read parked on the node is completed, as the PS/2 driver's are, through `drivers::input`.
+
+QEMU's device NAKs an IN token with nothing to report, so its controller completes a TRB only when
+there is input; a real device answers on its interval. Re-queueing on every completion serves both.
+
+**Any other completion halts the endpoint**, and the DPC cannot issue a command and wait, so it
+marks the endpoint and wakes the hub thread. The thread resets it — Reset Endpoint, then Set TR
+Dequeue Pointer to the ring's enqueue point — and queues its TRB again. A third halt leaves it
+stopped, logged. **No `SYN_DROPPED` follows a recovery**: a HID report is the device's whole
+state, so the first report after it, decoded against the last before, delivers what changed. A
+`SYN_DROPPED` would make the input layer forget every held modifier (PR #357 review).
+
+**The reports** (`drivers::hid`, which knows nothing of USB):
+- **A keyboard's** eight bytes, against the last report: releases first, keys then modifiers, then
+  presses, modifiers then keys, then `SYN_REPORT`. Usages become keycodes through a table beside
+  the PS/2 driver's scancode table, evdev's numbering; a usage with no keycode is dropped. A report
+  of `ErrorRollOver` is not kept, since decoding it would release every held key.
+- **A mouse's**, by its layout: where its buttons, X, Y and wheel are. Button changes, then
+  `REL_X`, `REL_Y` and `REL_WHEEL` when non-zero, then `SYN_REPORT` — the PS/2 driver's shape. In
+  boot protocol the layout is fixed: three buttons, then X and Y as signed bytes, and no wheel. **In
+  report protocol it is the report descriptor's** (B.3), read by a small parser:
+  - it reads short items only, within the descriptor's length, and finds the first application
+    collection whose usage is *Mouse* or *Pointer*;
+  - in one input report it finds the buttons, relative X and Y, and the wheel, with the report
+    ID that prefixes the report when the device numbers them;
+  - fields are read at their own width and sign, so a 12- or 16-bit axis decodes as what it is;
+  - a descriptor that describes anything else, or does not parse, leaves boot protocol.
+- **The wheel is negated.** HID's is positive away from the user, and `REL_WHEEL` here is positive
+  toward the user, the screen's direction (`kernel/src/libkern/input.rs`).
+- **Not carried**: buttons past the third and a horizontal wheel, which the parser finds and
+  nothing above the kernel carries, and a fourth byte in boot protocol, which is the device's own.
+
+**The node** is one of sixteen statics, its `CharBackend` context the index, as the PS/2 driver's
+two are. Its ring, its parked read and the hand-off of a finished read are `drivers::input`'s,
+shared with PS/2 (B.1). **Its served index is the next after every input node's**:
+- beside the i8042's keyboard and mouse, at 0 and 1, a USB keyboard and mouse are 2 and 3;
+- on a machine without an i8042 they are 0 and 1;
+- an index is never reused.
+
+It is a `Keyboard` or `Mouse` record under its `UsbDevice`, with driver `usb-hid` and the kind word
+as its name, and `device-mgr` hands it to `input-server` as it hands the i8042's.
+
+**The hardware report counts any keyboard's presses**, and holds its pages when any keyboard node
+exists. It asked the i8042 alone until B.2, and on a machine without one it held no page. It drains
+every keyboard's ring when it ends.
+
+**Departure**: the hub thread takes the device's endpoints out of the DPC's table **before Disable
+Slot**, so the DPC cannot touch a report buffer the release is about to free. Rings and buffers
+are the device's memory, freed only after its slot is disabled. The node stays, with no producer,
+until Part C retires it.
+
+**The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, boot
+protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a wheel`.
+
 ## The code, and what tests it
 
 - **`drivers::xhci::ring`** — TRBs, the producer ring (the command ring; transfer rings from A.2)
@@ -210,3 +307,32 @@ full — stays attached, and the log says it is missing from the registry.
 - **`check-report`** reads the live stick's enumeration line off a report page: port 1,
   SuperSpeed, mass storage. It is the line a photograph of the laptop's report will be compared
   with.
+- **`drivers::hid`** — host tests:
+  - the usage table against the system's keycodes, with nothing outside evdev's key range;
+  - a keyboard report against its predecessor: a press, a release, a key moving slots, modifiers
+    pressed first and released last, `ErrorRollOver`, six keys, a short report, and the worst case;
+  - a mouse report by a layout: each button, signed axes, a report ID, 12- and 16-bit fields, a
+    boot report's fourth byte unread, and the wheel's sign;
+  - the report-descriptor parser on QEMU's mouse and keyboard and on three shapes real mice have,
+    with each refusal.
+- **`drivers::xhci::{ring, context, desc}`** — the Normal TRB and Configure Endpoint, the interval
+  at each speed and both ends of its clamp, the input context at both entry sizes, and the HID
+  interfaces of QEMU's devices and of a combined receiver.
+- **`device`** — the served index beside the i8042's two, without them, and where the i8042 has only
+  a mouse.
+- **The `--usb` gates** (B.4) boot q35 with `i8042=off`, the gates' controller, `usb-kbd` and
+  `usb-mouse`, so a key or click that arrives came through USB:
+  - `check-input --usb` asserts what `check-input` does — the stalled-consumer motion sum, a key, a
+    click, the wheel in both directions, the chords and the routing — less the i8042's
+    held-release step;
+  - `check-login --usb` logs in at the greeter and runs the session;
+  - `check-report --usb` turns the report's pages on USB key presses.
+- **`test-qemu`** asserts each bound interface's line and `boot-probe`'s record of it, and that
+  `input-server` was handed the first round's keyboard and mouse beside the i8042's. Its hot-plug
+  asserts each arrival bound.
+- **Controls**, each failing its gate:
+  - a DPC that does not re-queue;
+  - the report's presence check asking the i8042 alone;
+  - no USB key count;
+  - the wheel not negated;
+  - the descriptor ignored.

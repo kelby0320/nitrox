@@ -130,6 +130,65 @@ fn endpoint0(ctx: &mut [u8], l: Layout, ring: u64, cycle: bool, max_packet: u16)
     put(ctx, ep + 16, CONTROL_AVERAGE_TRB);
 }
 
+/// Endpoint type 7, Interrupt IN, in dword 1 bits 5:3.
+const EP_TYPE_INTERRUPT_IN: u32 = 7 << 3;
+
+/// **An interrupt-IN endpoint to configure** (Phase 6 Part B.2): its Device Context Index, maximum
+/// packet and burst, interval exponent ([`interval`]), and transfer ring with its cycle state.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interrupt {
+    pub dci: u8,
+    pub max_packet: u16,
+    /// Further packets per interval: a high-speed endpoint's `wMaxPacketSize` bits 12:11, or a
+    /// SuperSpeed one's companion `bMaxBurst`.
+    pub burst: u8,
+    pub interval: u8,
+    pub ring: u64,
+    pub cycle: bool,
+}
+
+impl Interrupt {
+    /// **Max ESIT Payload**: the bytes it may move in one interval, its maximum packet times the
+    /// burst plus one.
+    pub fn max_esit_payload(&self) -> u32 {
+        self.max_packet as u32 * (self.burst as u32 + 1)
+    }
+}
+
+/// **The endpoint context's Interval for `b_interval`**, an exponent of 125 µs. At full and low speed
+/// `bInterval` is in milliseconds, so the exponent is three more than ⌊log₂ `bInterval`⌋, clamped to
+/// 3–10; at high speed and above it is `bInterval` − 1, with `bInterval` 1–16.
+pub fn interval(speed_id: u8, b_interval: u8) -> u8 {
+    match speed_id {
+        speed::FULL | speed::LOW => (b_interval.max(1).ilog2() as u8 + 3).clamp(3, 10),
+        _ => b_interval.clamp(1, 16) - 1,
+    }
+}
+
+/// **The input context for Configure Endpoint** (Phase 6 Part B.2): the slot — its speed, its root
+/// port, and its context entries raised to the highest endpoint's index — and each endpoint in
+/// `endpoints` added as *Interrupt IN*, with three retries, its maximum packet and burst, its
+/// interval, its ring, its Max ESIT Payload, and an Average TRB Length of the TRB each is given,
+/// its maximum packet. `ctx` must be `input_len` bytes, zeroed.
+pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, endpoints: &[Interrupt]) {
+    let mut add = ADD_SLOT;
+    let mut entries = 1u32;
+    for e in endpoints {
+        add |= 1 << e.dci;
+        entries = entries.max(e.dci as u32);
+        let ep = l.endpoint(e.dci);
+        let esit = e.max_esit_payload();
+        put(ctx, ep, (e.interval as u32) << 16 | (esit >> 16) << 24);
+        put(ctx, ep + 4, CERR_3 | EP_TYPE_INTERRUPT_IN | (e.burst as u32) << 8 | (e.max_packet as u32) << 16);
+        put(ctx, ep + 8, (e.ring as u32 & !0xF) | e.cycle as u32);
+        put(ctx, ep + 12, (e.ring >> 32) as u32);
+        put(ctx, ep + 16, e.max_packet as u32 | (esit & 0xFFFF) << 16);
+    }
+    put(ctx, 4, add);
+    put(ctx, l.slot(), (speed_id as u32) << 20 | entries << 27);
+    put(ctx, l.slot() + 4, (port as u32) << 16);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +230,51 @@ mod tests {
         assert!(ctx[32..64].iter().all(|&b| b == 0), "the slot context is not written");
         assert_eq!(dword(&ctx, 64 + 4), 8 << 16 | 4 << 3 | 3 << 1);
         assert_eq!(dword(&ctx, 64 + 8), 0x8000, "cycle state 0");
+    }
+
+    /// **The interval at each speed**, at both ends of its clamp: QEMU's 10 ms at full speed and its
+    /// `bInterval` 7 at high speed are both 8 ms, exponent 6.
+    #[test]
+    fn the_interval_is_encoded_by_speed() {
+        assert_eq!(interval(speed::FULL, 10), 6, "10 ms rounds down to 8 ms");
+        assert_eq!(interval(speed::HIGH, 7), 6, "2^(7-1) microframes");
+        assert_eq!(interval(speed::FULL, 1), 3, "1 ms");
+        assert_eq!(interval(speed::LOW, 0), 3, "zero is read as the shortest");
+        assert_eq!(interval(speed::FULL, 255), 10, "255 ms is 128 ms, the longest");
+        assert_eq!(interval(speed::FULL, 128), 10);
+        assert_eq!(interval(speed::FULL, 127), 9);
+        assert_eq!(interval(speed::HIGH, 1), 0);
+        assert_eq!(interval(speed::HIGH, 16), 15);
+        assert_eq!(interval(speed::HIGH, 0), 0, "below the range");
+        assert_eq!(interval(speed::SUPER, 200), 15, "above it");
+    }
+
+    /// **Configure Endpoint at both entry sizes**: the slot with its entries raised to the highest
+    /// endpoint, and each endpoint where its index puts it, *Interrupt IN* with its fields.
+    #[test]
+    fn configure_endpoints_adds_each_interrupt_endpoint() {
+        for (csz, entry) in [(false, 32), (true, 64)] {
+            let l = Layout::new(csz);
+            let mut ctx = vec![0u8; l.input_len()];
+            let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x1_0000_5000, cycle: true };
+            let mouse = Interrupt { dci: 5, max_packet: 4, burst: 1, interval: 3, ring: 0x6000, cycle: false };
+            configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse]);
+            assert_eq!(dword(&ctx, 0), 0, "nothing dropped");
+            assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 5, "A0, A3 and A5");
+            assert_eq!(dword(&ctx, entry), 3 << 20 | 5 << 27, "high speed, entries to DCI 5");
+            assert_eq!(dword(&ctx, entry + 4), 9 << 16, "root port 9");
+            let k = 4 * entry; // the input context's entry for DCI 3: control, slot, EP0, DCI 2, DCI 3
+            assert_eq!(dword(&ctx, k), 6 << 16, "interval 6");
+            assert_eq!(dword(&ctx, k + 4), 8 << 16 | 7 << 3 | 3 << 1, "Interrupt IN, CErr 3, 8 bytes");
+            assert_eq!(dword(&ctx, k + 8), 0x5001, "the ring with DCS");
+            assert_eq!(dword(&ctx, k + 12), 1);
+            assert_eq!(dword(&ctx, k + 16), 8 | 8 << 16, "average TRB 8, Max ESIT Payload 8");
+            let m = 6 * entry;
+            assert_eq!(dword(&ctx, m + 4), 4 << 16 | 1 << 8 | 7 << 3 | 3 << 1, "burst 1");
+            assert_eq!(dword(&ctx, m + 16), 4 | 8 << 16, "Max ESIT Payload: 4 bytes, twice");
+            assert!(ctx[5 * entry..6 * entry].iter().all(|&b| b == 0), "DCI 4 untouched");
+            assert!(ctx[2 * entry..3 * entry].iter().all(|&b| b == 0), "the default endpoint untouched");
+        }
     }
 
     #[test]

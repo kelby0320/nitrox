@@ -815,6 +815,14 @@ a USB one, as it would on Linux.
   mouse it describes, the decoder by its fields, and the boot fallback.
 - **B.4 The gates.** `check-input --usb`, `check-login --usb` and `check-report --usb`, below, and
   CI's jobs for them.
+- **B.2–B.4 built 2026-10-05**, together, since B.4's gates were what showed B.2 and B.3 working.
+  Calls on the way:
+  - **Report decoding is `drivers::hid`, bus-neutral**, so the trackpad's I²C-HID could use it;
+  - the mouse decoder takes a **layout**, boot protocol's being one, so B.3 adds only the parser;
+  - **`input-server`'s device count is asserted as a bound, not a value**: under TCG the manager
+    read the registry after the hot-plugged keyboard was bound, and was handed five, not four;
+  - `check-report --usb` asserts the FADT's 8042 absent and a first round of three, where the
+    i8042 run asserts present and one.
 - **B.5 Lock keys and the keypad.** The interpreter's locks and keypad; `KeyEvent.locks`; the
   keymap's keypad and Caps Lock; `Lights` and `input-server`'s fan-out; `submit_write`; PS/2's
   `0xED` exchange, its answers taken ahead of the decoder; USB's `SET_REPORT`; `libterm`'s special

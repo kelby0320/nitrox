@@ -34,7 +34,10 @@ use crate::libkern::KVec;
 /// key. Boot-time, from the boot thread, with interrupts enabled (the key and the clock both
 /// arrive by interrupt) and before any userspace exists.
 pub fn run(page_wait_secs: u32) {
-    if !ps2::keyboard_present() {
+    // **Any keyboard**: the i8042's, or a USB one the hub thread's first round bound (Phase 6 Part
+    // B.2), since this runs after `drivers::settle`. It asked the i8042 alone until then, and a
+    // machine without one held no page (PR #357 review).
+    if !crate::device::has(crate::libkern::device::DeviceKind::Keyboard) {
         crate::kprintln!("report: no keyboard answered, so nothing can turn a page — not holding");
         return;
     }
@@ -89,6 +92,7 @@ pub fn run(page_wait_secs: u32) {
 
     fbcon::end_report();
     ps2::drain_keyboard();
+    crate::drivers::xhci::hid::drain_keyboards();
     crate::kprintln!(
         "report: done, {} of {} page(s) shown; the keys that turned them were discarded",
         shown,

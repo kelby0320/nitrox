@@ -59,13 +59,16 @@ cargo xtask shot           # boot the release image and photograph the whole des
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
+cargo xtask check-input --usb # …on a machine with no i8042: a USB keyboard and mouse only
 cargo xtask check-images   # test vs release initramfs and root: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
+cargo xtask check-login --usb # …typed and clicked on USB, with no i8042
 cargo xtask check-logout   # the power menu: log out past the editor's question; restart; shut down
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
+cargo xtask check-report --usb # …its pages turned on a USB keyboard, with no i8042
 cargo xtask check-install  # install to a blank disk from the live menu, then boot that disk
 cargo xtask check-recovery # reset a password on an installed disk from the live image, then boot it
 cargo xtask image --live --selftest # the test live image: the live stick with the test packages
@@ -100,7 +103,9 @@ wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`. Since Phas
 boots with an **xHCI controller and five USB devices** — a keyboard at high speed, a mouse at full
 speed, a stick at SuperSpeed, a hub, and a smart-card reader nothing matches — asserts on the host
 what the controller and the hub thread's first round report, that the round ended before `init`,
-that `boot-probe` finds each device's `UsbDevice` record under the controller (Part A.3),
+that `boot-probe` finds each device's `UsbDevice` record under the controller (Part A.3), that
+the keyboard and mouse are bound and served after the i8042's two and handed to `input-server`
+(Part B.2),
 and **over QMP plugs a keyboard in, swaps it for a mouse on the same port while the machine is
 paused, and pulls that out**; every gate's controller is configured as the
 laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot give `qemu-xhci` MSI
@@ -145,7 +150,9 @@ agree on the bytes.
 `test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection
 `check-input` and `check-terminal` use — a wrong password, then a right one, then a session — and it
 and `check-logout` are the gates where the display arm exists for a person rather than for a test:
-every other display gate boots `--selftest`. It runs unconditionally in CI's QEMU job. Landed with
+every other display gate boots `--selftest`. It runs unconditionally in CI's QEMU job, and so does
+**`check-login --usb`**, the same login on a machine with no i8042, typed and clicked on a USB
+keyboard and mouse (Phase 6 Part B). Landed with
 M7 Part D, deliberately *before* the shell it will eventually show, so Parts E and F land against a
 gate that exists.
 
@@ -264,7 +271,9 @@ detector of its own, chooses the report, reads every page with the console's dec
 the facts that machine has: an AHCI controller **declined** for having no disk, the module disk,
 and `console: no UART at COM1`. `test-qemu` asserts the other half on its own boot — the controller
 **claimed** over MSI, COM1 present — so between them both outcomes and both kinds of COM1 are
-gated. It runs in CI's QEMU job.
+gated. It runs in CI's QEMU job, and so does **`check-report --usb`**, on a machine with no i8042
+whose pages turn on a USB keyboard (Phase 6 Part B). **`check-input --usb`** is the input gate's
+on that machine, in `input.yml` beside `--no-ps2-irq`.
 
 **Every gate that boots a screen boots 1360×768** (Phase 5 Part E) — the laptop's 1366×768 as near
 as QEMU can show it, since its VGA shears any width that is not a multiple of 8 — while `test-qemu`

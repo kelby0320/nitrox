@@ -247,6 +247,11 @@ jobs:
       - name: cargo xtask check-login --kvm
         run: cargo xtask check-login --kvm
 
+      # **The same login with no i8042** (Phase 6 Part B): every key at the greeter and every click
+      # after it on a USB keyboard and mouse. The Definition of Done's "types at the greeter".
+      - name: cargo xtask check-login --usb --kvm
+        run: cargo xtask check-login --usb --kvm
+
       # **Ending a session from the desktop** (administration Part F.2), on the release image as
       # `check-login` is: the power menu's Log out asks every window to close, waits on the
       # editor's question with the shell's dialog naming it, is cancelled, and then ends when the
@@ -283,6 +288,12 @@ jobs:
       # gate that drives the boot menu, and the only one that sees the report at all.
       - name: cargo xtask check-report --kvm
         run: cargo xtask check-report --kvm
+
+      # **The report on a machine with no i8042** (Phase 6 Part B): its pages turn on USB key
+      # presses, which the kernel counts from any keyboard, and it holds them for a USB keyboard
+      # — where it once held none without an i8042.
+      - name: cargo xtask check-report --usb --kvm
+        run: cargo xtask check-report --usb --kvm
 
       # **The storage chain, with the host holding the result** (administration Part C.8): the
       # test live image as a USB stick beside a copy of the release disk on the AHCI controller.

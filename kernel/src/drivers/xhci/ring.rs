@@ -20,6 +20,8 @@ pub struct Trb(pub [u32; 4]);
 
 /// TRB types (xHCI 1.2 Table 6-91), in dword 3's bits 15:10.
 pub mod kind {
+    /// A Normal transfer: an interrupt or bulk endpoint's data.
+    pub const NORMAL: u32 = 1;
     /// A control transfer's Setup stage.
     pub const SETUP: u32 = 2;
     /// A control transfer's Data stage.
@@ -34,6 +36,8 @@ pub mod kind {
     pub const DISABLE_SLOT: u32 = 10;
     /// Address Device Command.
     pub const ADDRESS_DEVICE: u32 = 11;
+    /// Configure Endpoint Command: add or drop the endpoints an input context names.
+    pub const CONFIGURE_ENDPOINT: u32 = 12;
     /// Evaluate Context Command.
     pub const EVALUATE_CONTEXT: u32 = 13;
     /// Reset Endpoint Command: a halted endpoint to Stopped.
@@ -72,6 +76,8 @@ const TRT_IN: u32 = 3 << 16;
 
 /// Dword 3 bit 0: the cycle bit.
 const CYCLE: u32 = 1;
+/// A Normal TRB's dword 3 bit 2: Interrupt on Short Packet.
+const ISP: u32 = 1 << 2;
 /// A Link TRB's dword 3 bit 1: the reader flips its cycle state on following it.
 const TOGGLE_CYCLE: u32 = 1 << 1;
 
@@ -152,6 +158,12 @@ impl Trb {
     pub const fn status(after_data_in: bool) -> Trb {
         let dir = if after_data_in { 0 } else { DIR_IN };
         Trb([0, 0, 0, kind::STATUS << 10 | dir | IOC])
+    }
+
+    /// **A Normal TRB** of `len` bytes into `buffer`, interrupting on completion and on a short
+    /// packet (dword 3 bit 2), so a report shorter than asked for still ends it.
+    pub const fn normal(buffer: u64, len: u32) -> Trb {
+        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::NORMAL << 10 | ISP | IOC])
     }
 
     /// A command naming a slot: Disable Slot.
@@ -430,6 +442,11 @@ mod tests {
         let deq = Trb::set_dequeue(0x1_0000_2030, true, 7, 1);
         assert_eq!(deq.0, [0x2031, 0x1, 0, 16 << 10 | 1 << 16 | 7 << 24], "the address with DCS, SCT 0");
         assert_eq!(Trb::set_dequeue(0x2030, false, 7, 1).0[0], 0x2030);
+        // Phase 6 Part B.2: an interrupt endpoint's report, and Configure Endpoint.
+        let normal = Trb::normal(0x1_0000_4000, 8);
+        assert_eq!(normal.0, [0x4000, 0x1, 8, 1 << 10 | 1 << 5 | 1 << 2], "Normal, IOC and ISP");
+        let configure = Trb::with_input(kind::CONFIGURE_ENDPOINT, 0x3000, 7);
+        assert_eq!(configure.0, [0x3000, 0, 0, 12 << 10 | 7 << 24], "DC clear");
     }
 
     /// A Transfer Event's endpoint and residual, from dwords 3 and 2.

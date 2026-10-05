@@ -227,11 +227,12 @@ The whole device table, read from userspace — every `DeviceNode` the kernel ha
 4. every block device's partitions, from that pass, in table order — a RAM disk's own partitions
    come after it, and after every disk's;
 5. the console, the keyboard and the mouse;
-6. the USB devices, as the hub thread enumerates them (Phase 6 Part A.3), and each later arrival
-   when it comes. The boot waits for the first round before `init` starts, **for two seconds at
-   most**: a device still enumerating when the bound passes registers after `init`, as an arrival
-   does. **These are the only records added after the boot.** A device that leaves keeps its record
-   until Phase 6 Part C gives the registry departures.
+6. the USB devices, as the hub thread enumerates them (Phase 6 Part A.3), each followed by the
+   keyboards and mice it provides (Part B.2), and each later arrival when it comes. The boot waits
+   for the first round before `init` starts, **for two seconds at most**: a device still
+   enumerating when the bound passes registers after `init`, as an arrival does. **These are the
+   only records added after the boot.** A device that leaves keeps its records until Phase 6 Part
+   C gives the registry departures.
 
 So on a live USB boot of a machine with Nitrox installed, `/dev/blk/0` is the internal disk and
 `/dev/blk/1` the RAM disk, and the partitions start at 2. `KernelServerId::Registry`, bound by the
@@ -305,7 +306,11 @@ version or record size it does not know.
 **A record's served index and its path are one field.** `/dev/blk/<n>` resolves the block node
 whose served index is `n`, and `/dev/input/raw/<n>` the keyboard or mouse whose served index is
 `n` — the keyboard 0 and the mouse 1, the i8042 driver's own numbering, **not** a count within
-`Char`, where the console registered first. The console and PCI functions are served at no index.
+`Char`, where the console registered first. **A USB keyboard or mouse** (Phase 6 Part B.2) is
+served at the next index after every input node's: 2 and 3 beside the i8042's two, 0 and 1 on a
+machine without one, and never reused. Its record is a `Keyboard` or `Mouse` whose parent is its
+`UsbDevice`, whose driver is `usb-hid`, and whose name is the kind word. The console and PCI
+functions are served at no index.
 
 **Ids are stable for the life of a boot** and never reused, because the table only grows — a USB
 device that leaves included, whose record stays (Phase 6 Part A).

@@ -33668,3 +33668,74 @@ that ignores a parked reader.
 so a change to it would otherwise run no input gate.
 
 No behaviour changes. No ABI hash impact: a module boundary inside the kernel.
+
+## 2026-10-05 — Phase 6 Parts B.2–B.4: USB keyboards and mice
+
+Built together: B.4's gates were what showed B.2 and B.3 working, and each control below needs one
+of them.
+
+**B.2, the binding and polling.**
+- The hub thread binds every boot keyboard and boot mouse interface as a step of enumeration:
+  1. Configure Endpoint for their interrupt-IN endpoints;
+  2. `SET_CONFIGURATION`;
+  3. `SET_PROTOCOL`;
+  4. `SET_IDLE (0)` to keyboards;
+  5. a node, and one Normal TRB.
+- The DPC routes every Transfer Event but the default endpoint's to a table of bound endpoints. It
+  decodes the report against the last, queues the TRB again, and delivers through B.1's
+  `drivers::input`. A halt is reset by the hub thread, with no `SYN_DROPPED` after it.
+- Nodes are one of sixteen statics, and the served index is the next after every input node's.
+  The records are `Keyboard`/`Mouse` under their `UsbDevice`, with driver `usb-hid`.
+- A departure takes the device's endpoints out of the DPC's table before Disable Slot.
+- The hardware report holds when any keyboard node exists, counts any keyboard's presses, and
+  drains them all.
+
+**B.3, the wheel.** A small report-descriptor parser finds a mouse's buttons, X, Y and wheel, with
+report IDs and fields at any width. A mouse it describes runs in report protocol, and any other in
+boot protocol. The decoding is bus-neutral, in `drivers::hid`, and the mouse decoder takes a layout,
+boot protocol's being one. The wheel is negated to this system's sign.
+
+**B.4, the gates.** `check-input`, `check-login` and `check-report` take `--usb`: q35 with
+`i8042=off`, the gates' controller, `usb-kbd` and `usb-mouse`. CI runs all three under KVM.
+
+**What the first boots said:**
+- `test-qemu` bound its keyboard at `/dev/input/raw/2` and its mouse at `/3`.
+  - The hot-plugged keyboard was bound at `/4` and taken away when it left.
+  - The mouse swapped in for it was bound at `/5`.
+  - No endpoint halted.
+- **`check-input --usb` passed everything up to the wheel before B.3**, and everything after it:
+  the stalled-consumer motion sum, keys, chords, routing and the late key. It stopped exactly where
+  B.3 was missing, so that boot was B.3's negative control before B.3 existed.
+- `check-login --usb` passed a whole session typed and clicked on USB.
+- `check-report --usb` turned its pages on USB key presses.
+
+**Found on the way:**
+- **`input-server`'s device count is not a fixed fact.** Under TCG the manager read the registry
+  after the hot-plugged keyboard was bound, and handed over five devices where KVM handed four: the
+  Part A.3 race, now reaching input. The host asserts a bound instead: the i8042's two and the
+  first round's bindings, at least.
+- **The parser took a device's report sizes on trust.** A count and size whose product overflows
+  would have panicked a debug kernel, and a huge count would have looped two billion times at boot.
+  Found reading it back before any review. Checked arithmetic and a one-page limit end the walk
+  instead. A host test holds both: one overflows, one is bounded to a second. Each guard fails its
+  control: a panic, and 9.7 s.
+- **Two doc comments orphaned again**, by inserting an item where another's doc comment ended, in
+  `ring.rs` and `xtask`. The sweep caught both.
+- **`check-login --usb` under TCG failed on an ordering the gate had assumed.** When a file is
+  dragged out of `nxfiles`, it says so after asking the compositor to start the drag, and the
+  compositor says so on receipt: two processes answering one gesture, ordered by nothing. With USB
+  timing the compositor's line came first, and the gate's first `expect` scanned past it — the
+  transcript shows both lines, reversed. Both are now expected in either order. So is `nxterm`'s
+  title-bar drag and the compositor's receipt of it, which has the same shape. The drop on the
+  editor does not: the compositor logs before it delivers, so `nxedit` always speaks second.
+
+**Controls**, each failing:
+- **Boots:**
+  - a DPC that does not re-queue: only the first motion arrives (7, 3 of 210, 90);
+  - the report's presence check asking the i8042 alone: the report holds no page;
+  - no USB key count: page 2 never comes;
+  - the wheel not negated, and the descriptor ignored: the wheel step fails.
+- **Host:** `ErrorRollOver` decoded, the served index counted, and the interval encoded as high
+  speed's.
+
+No ABI hash impact: a driver, a table, records of existing kinds, and a gate flag.

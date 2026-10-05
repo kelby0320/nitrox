@@ -5,12 +5,14 @@ loss reworked so relative motion survives a slow consumer (2026-08-26), a key-pr
 hardware report (Phase 5 Part D, 2026-09-14), input routed only after the requests sent before
 it (2026-09-22), the input server's devices handed over by the device manager (administration
 Part B.3, 2026-09-24), each node's ring and read hand-off shared in `drivers::input` (Phase 6 Part
-B.1, 2026-10-05) — and this document describes what exists.** The whole path from an interrupt to a keystroke
+B.1, 2026-10-05), and USB keyboards and mice beside the i8042's (Phase 6 Parts B.2–B.4,
+2026-10-05) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
 |---|---|
 | i8042 controller, keyboard + mouse, one driver | `kernel/src/drivers/ps2/` |
+| USB HID boot keyboards and mice: bound and polled by the xHCI driver; their reports decoded | `kernel/src/drivers/xhci/hid.rs`, `kernel/src/drivers/hid/` |
 | Per-device lossy ring with a `SYN_DROPPED` marker, the parked read and its hand-off — shared by every input driver since Phase 6 Part B.1 | `kernel/src/drivers/input/` |
 | The `InputEvent` record crossing the kernel boundary | `kernel/src/libkern/input.rs` |
 | Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
@@ -84,14 +86,14 @@ this system already does with the console.
 ## 2. The layers
 
 ```
-        i8042 controller             (later: USB HID, i2c touchpad, …)
-       ┌──────┴──────┐
-   kbd port      aux port                          kernel: ONE Tier 1 driver
-      │ IRQ 1       │ IRQ 12                       ports 0x60/0x64 are shared, so
-      ▼             ▼                              this is one driver, two nodes
-  /dev/input/raw/0   /dev/input/raw/1              emitting InputEvent records
-      │            │
-      └──────┬─────┘
+        i8042 controller                   xHCI (Phase 6 Part B)
+       ┌──────┴──────┐                     ┌──────┴──────┐
+   kbd port      aux port              USB keyboard  USB mouse   later: i2c touchpad, …
+      │ IRQ 1       │ IRQ 12              │ interrupt-IN endpoints, polled by the DPC
+      ▼             ▼                     ▼             ▼
+  /dev/input/raw/0   /dev/input/raw/1   /dev/input/raw/2   /dev/input/raw/3
+      │            │                     │             │    each emitting InputEvent records
+      └──────┬─────┴─────────────────────┴─────────────┘
              ▼  each node handed over by device-mgr, which the input server subscribes
              ▼  to at /svc/devices/input: Arrived per device, then Settled (§5)
       ┌──────────────┐                             userspace resource server
@@ -246,7 +248,7 @@ wire break.
 | Concern | Where | Why there |
 |---|---|---|
 | Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; the i8042's one-byte output buffer needs a prompt ISR — *and* a tick-driven sweep for the bytes that buffer loses, see §2 |
-| Scancode → keycode | kernel driver | One small table every consumer would otherwise duplicate; getting it wrong is a bug, not a preference (`display-substrate.md` §5) |
+| Scancode → keycode, and a USB HID usage → keycode | kernel driver: the PS/2 driver's scancode table, and `drivers::hid`'s usage table beside it | One small table every consumer would otherwise duplicate; getting it wrong is a bug, not a preference (`display-substrate.md` §5) |
 | Which devices exist, and handing each to the owner of its class | `device-mgr` | Coldplug is a replay of the registry, and Phase 6's hotplug follows on the same channel; one owner per class keeps the kernel's one reader per device |
 | Merging device streams; taking devices as they arrive and depart; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
@@ -299,7 +301,7 @@ layers away.
 
 | Path | Served by | Held by |
 |---|---|---|
-| `/dev/input/raw/<n>` | kernel, one char `DeviceNode` per device | the root namespace; nothing resolves it on the input path |
+| `/dev/input/raw/<n>` | kernel, one char `DeviceNode` per device: the i8042's keyboard at 0 and mouse at 1, and a USB keyboard or mouse at the next index after every input node's, never reused (Phase 6 Part B.2) | the root namespace; nothing resolves it on the input path |
 | `/svc/devices/input` | `device-mgr` | `input-server`, the class's one owner — a second subscription is refused |
 | `/dev/input/new` | `input-server` | the compositor |
 | *(nothing)* | — | ordinary clients |

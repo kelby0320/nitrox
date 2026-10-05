@@ -26,6 +26,7 @@
 pub mod caps;
 pub mod context;
 pub mod desc;
+pub mod hid;
 mod hub;
 pub mod ring;
 
@@ -164,6 +165,10 @@ pub struct Xhci {
     /// The controller's own descriptor, whose address finds its function in the device table: the
     /// parent of every device it enumerates.
     pci: ResourceDescriptor,
+    /// **The HID endpoints the DPC polls** (Phase 6 Part B.2), and whether one halted for the hub
+    /// thread to reset.
+    hid: IrqSpinLock<hid::Table>,
+    hid_halted: AtomicBool,
 }
 
 /// What the hub thread is waiting for.
@@ -478,6 +483,8 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: desc,
+        hid: IrqSpinLock::new(LockRank::Leaf, hid::Table::new()),
+        hid_halted: AtomicBool::new(false),
     };
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. The first
@@ -686,6 +693,9 @@ fn on_event(x: &Xhci, trb: &Trb) {
             trb.completion_code(),
             trb.slot_id() as u64,
         ),
+        // **A HID endpoint's report** (Phase 6 Part B.2): the default endpoint's transfers are the
+        // hub thread's waits; every other endpoint's is a bound one's.
+        kind::TRANSFER_EVENT if trb.endpoint_id() != context::DCI_EP0 => hid::on_transfer(x, trb),
         kind::TRANSFER_EVENT => complete_if(
             x,
             |a| match a {
