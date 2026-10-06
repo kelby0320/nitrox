@@ -231,8 +231,8 @@ The whole device table, read from userspace — every `DeviceNode` the kernel ha
    keyboards and mice it provides (Part B.2), and each later arrival when it comes. The boot waits
    for the first round before `init` starts, **for two seconds at most**: a device still
    enumerating when the bound passes registers after `init`, as an arrival does. **These are the
-   only records added after the boot.** A device that leaves keeps its records until Phase 6 Part
-   C gives the registry departures.
+   only records added after the boot.** A device that leaves keeps its records, marked departed
+   (below).
 
 So on a live USB boot of a machine with Nitrox installed, `/dev/blk/0` is the internal disk and
 `/dev/blk/1` the RAM disk, and the partitions start at 2. `KernelServerId::Registry`, bound by the
@@ -242,15 +242,17 @@ kernel in **the root namespace only**, with `/dev/blk`'s rights. (Administration
   `DeviceRecord`s, then zero padding to the page (`kernel/src/libkern/device.rs`, mirrored in
   `userspace/libkern/src/device.rs`, whose `records` is the reader).
 - **`/dev/registry/<id>`** — node `id` itself, the handle `/dev/blk/<n>` or
-  `/dev/input/raw/<n>` would give for the same device.
+  `/dev/input/raw/<n>` would give for the same device. `NotFound` for a departed device.
+- **`/dev/registry/changes`** — the change node (Phase 6 Part C), below.
 
 ```rust
 #[repr(C)]
-pub struct RegistryHeader {   // 16 bytes
+pub struct RegistryHeader {   // 24 bytes, align 8
     pub magic: u32,           // REGISTRY_MAGIC, "DREG" little-endian
-    pub version: u32,         // REGISTRY_VERSION = 1
+    pub version: u32,         // REGISTRY_VERSION = 2 (Phase 6 Part C; 1 had no generation)
     pub count: u32,           // how many records follow: THE LENGTH
     pub record_size: u32,     // size_of::<DeviceRecord>() = 144
+    pub generation: u64,      // bumped once by every change: a registration, or a departure
 }
 
 #[repr(C)]
@@ -266,7 +268,7 @@ pub struct DeviceRecord {     // 144 bytes, align 8
     pub pci_class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
     pub seg: u16, pub bus: u8, pub dev: u8, pub func: u8,
     pub port: u8, pub speed: u8,                            // a USB device's; else 0
-    pub _pad: u8,
+    pub flags: u8,                                          // DEPARTED (0x01)
     pub logical_block_size: u32,                            // block devices; else 0
     pub name_len: u32,
     pub block_count: u64,                                   // block devices; else 0
@@ -288,8 +290,8 @@ ports:
   as most are. `revision` is 0.
 - `port` is its root port, numbered from 1 as the controller numbers them, and `speed` the speed
   the port reports, as xHCI's default speed IDs number them: 1 full, 2 low, 3 high, 4
-  SuperSpeed, 5 SuperSpeedPlus. **Both were `_pad`'s first two bytes**, zero for every other
-  kind, so no reader changed and `REGISTRY_VERSION` stayed 1.
+  SuperSpeed, 5 SuperSpeedPlus. **Both were the reserved bytes' first two**, zero for every other
+  kind, so no reader changed and `REGISTRY_VERSION` stayed 1; the third is now `flags`.
 - `name` is its product string, then its serial in parentheses if it fits — as a disk's is its
   model and serial — or `vvvv:pppp` when it gives no string.
 - `driver` is `xhci`, `parent` is the controller's PCI function, and it is served at no index.
@@ -313,7 +315,44 @@ machine without one, and never reused. Its record is a `Keyboard` or `Mouse` who
 functions are served at no index.
 
 **Ids are stable for the life of a boot** and never reused, because the table only grows — a USB
-device that leaves included, whose record stays (Phase 6 Part A).
+device that leaves included, whose record stays.
+
+### Departures and the generation
+
+*(Phase 6 Part C.)* **A device that leaves is departed, not removed**, since an id is its place:
+`/dev/registry/<id>`, `device-mgr`'s `usb-<id>` and an owner's `Departed` all name a device by it.
+- **Its record says so**: `flags` holds `DEPARTED`. It keeps every other field, its id and its
+  served index, **which no later device takes** — the next input node's index is the one after
+  every input node's, departed ones included.
+- **Its children depart with it**: every record whose parent chain reaches it — a USB device's
+  keyboard and mouse, and a disk's partitions.
+- **Its paths stop resolving**: `/dev/registry/<id>`, and `/dev/blk/<n>` or `/dev/input/raw/<n>`
+  at its served index, answer `NotFound`. A handle already held stays valid, and what it does is
+  its driver's: a USB input node is read until its ring is empty, then refuses
+  (`io-operation.md`).
+- **`DeviceRecord::block_index` and `input_index` answer `None` for it**, so a reader that asks
+  them is right without knowing departures exist; a reader that reads `served` directly has to
+  check `flags`.
+
+**Every change bumps the table's generation**, once: a registration, or a departure with its
+children. The snapshot's header carries it, so two snapshots with one generation say the same
+thing.
+
+### The change node: `/dev/registry/changes`
+
+*(Phase 6 Part C.)* **How a reader learns that the table changed.** A char node whose `Read`
+**waits until the generation is past the read's `offset`**, then completes with the current
+generation, eight little-endian bytes. A reader that is already behind is answered at once. It
+is the only char node that reads `offset` (`io-operation.md`).
+- **A reader that reads a snapshot and then waits past its generation misses nothing**: a change
+  in between answers the wait at once. That is the device manager's loop.
+- `length` must be at least 8, or `InvalidArgument`. **Four reads may wait at once**, and a fifth
+  is refused, `WouldBlock`.
+- They are answered by the thread that changed the table, after letting its lock go.
+- **Authority is the binding**: the root namespace only, as for `/dev/registry`.
+
+It replaced the notification the phase's scoping planned, because the kernel has no way to name
+the reader a notification would go to (`docs/planning/phase-6-usb.md` § *Part C in detail*).
 
 ## Discovery and driver matching (Phase 2)
 

@@ -33981,3 +33981,76 @@ read against the source, as the reviewer had:
     report ID;
   - the scoping's notification is marked revised;
   - a replug costs two records for an input device, not one.
+
+## 2026-10-05 — Phase 6 Part C: arrivals and departures
+
+Built to the detail pass, in its order:
+
+**C.1, the registry.** A departure is a state of a record. The record's spare byte is now `flags`,
+with `DEPARTED`, and every record whose parent chain reaches it departs with it. Its paths answer
+`NotFound`, and its served index is never reissued. Every change bumps the table's generation,
+which a version 2 snapshot header carries. `block_index`, and a new `input_index`, answer `None`
+for a departed record. `/dev/registry/changes` answers a `Read` once the generation is past the
+read's `offset`. To reach it, a char backend's `submit_read` now takes the offset (`CharRead`),
+which the console, the i8042 and USB ignore.
+
+**C.2, a USB departure**, in the hub thread:
+1. what each keyboard and mouse held is released (`keyboard::release_all`, `mouse::release_all`);
+2. its endpoints leave the DPC's table;
+3. its nodes retire: they drain, then refuse reads at submission, `PeerClosed`;
+4. its records depart, as one generation;
+5. its slot is disabled.
+
+Input node slots are given back under an epoch, checked under the node's lock.
+
+**C.3, the manager follows**: a read waits on the change node; each snapshot is diffed; `Arrived`
+and `Departed` go to owners; a device that came and went between two reads is told to no one.
+
+**C.4, the input server lets go**: `PeerClosed` means the device left. A slot retires when both
+the node and the manager have said so, in either order.
+
+**C.5, the gates.** `check-input --usb`:
+1. unplugs the boot keyboard;
+2. types on a keyboard plugged in;
+3. holds a key down on it and unplugs it — the window sees the release, which QEMU never sends;
+4. plugs a last one in.
+
+`boot-probe` holds departed paths to `NotFound`, and the manager to the registry's present records.
+
+**What the first boots said.** `test-qemu`'s hot keyboard came and went before the manager's first
+read and was told to no one, as the review of the detail pass predicted. The mouse swapped in for
+it reached the input server in its replay. When the mouse was pulled, the input server said `mouse
+24 left` before the manager's `Departed`, and retired the slot on the second.
+
+**Found on the way:**
+- **`test-qemu`'s devices check cannot see a manager that never follows.** With following removed
+  it passed: the hot devices had come and gone before the manager's one read, so the stale table
+  agreed with the registry. `check-input --usb` fails the same control at its first step, and is
+  the gate that holds following. Recorded in `boot-probe`'s doc.
+- **The first host test of a departed index never reissued could not fail.** The departed index
+  was below a present one, so even a reissuing table would have handed out the next. Its control
+  passed. It now departs the device with the highest index too.
+- **Two more doc comments orphaned**, #26 and #27, by anchoring an insertion on the next item's
+  line. One was caught reading the diff, the other by the sweep.
+- **`cargo xtask build` does not build the test harness**, so a `boot-probe` change that did not
+  compile looked clean. `cargo check -p test-harness` found it.
+
+**Controls**, each failing:
+- **Boots:**
+  - a departure that bumps no generation (`check-input --usb`'s first step);
+  - a departure that releases nothing (the held key's release never comes);
+  - a completed `PeerClosed` read treated as an error (the final check);
+  - a manager that never follows (`check-input --usb`).
+- **Host:**
+  - a departure taking every later node;
+  - a waiting read answered at its own generation;
+  - a departed path still resolving, and a departed index reissued;
+  - a keyboard or mouse releasing nothing;
+  - a retired reader parking;
+  - a retired slot preferred to a free one;
+  - an epoch ignored;
+  - a departed record arriving;
+  - `Departed` retiring before `PeerClosed`.
+
+No ABI hash impact: the registry is not a hash input, `CharBackend` is the kernel's own, and the
+snapshot's version is 2, which every reader parses through `libkern::device::records`.

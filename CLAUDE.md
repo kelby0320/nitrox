@@ -277,7 +277,9 @@ and `console: no UART at COM1`. `test-qemu` asserts the other half on its own bo
 **claimed** over MSI, COM1 present — so between them both outcomes and both kinds of COM1 are
 gated. It runs in CI's QEMU job, and so does **`check-report --usb`**, on a machine with no i8042
 whose pages turn on a USB keyboard (Phase 6 Part B). **`check-input --usb`** is the input gate's
-on that machine, in `input.yml` beside `--no-ps2-irq`.
+on that machine, in `input.yml` beside `--no-ps2-irq`. Since Phase 6 Part C it is also the gate for
+**devices that come and go**: it unplugs the boot keyboard, types on another plugged in, and holds a
+key down on that one as it is unplugged — the window must see the release, which QEMU never sends.
 
 **Every gate that boots a screen boots 1360×768** (Phase 5 Part E) — the laptop's 1366×768 as near
 as QEMU can show it, since its VGA shears any width that is not a multiple of 8 — while `test-qemu`

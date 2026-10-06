@@ -219,8 +219,10 @@ fn arrive(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) -> bool {
     }
 }
 
-/// The device at `port` left: disable its slot, then free what the controller had of it. Its node
-/// and record stay in the device table until Part C retires them (`TODO(usb-departed-records)`).
+/// **The device at `port` left** (Phase 6 Part C): let its keyboards and mice go, depart its
+/// records, then disable its slot and free what the controller had of it. Its records stay in the
+/// device table, marked departed, since an id is its place: the table grows by a record a node an
+/// arrival (`TODO(usb-departed-records)`).
 fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     let Some(dev) = attached[port as usize].take() else {
         return;

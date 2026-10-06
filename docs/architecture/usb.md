@@ -1,14 +1,16 @@
 # USB
 
-**Status: Phase 6 Part A built (2026-10-02), and Part B's keyboards and mice (B.1–B.5, 2026-10-05)**
+**Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05), and
+Part C's arrivals and departures (2026-10-05)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
 `usb-<id>` (A.3); and **a boot keyboard or mouse is bound**, polled by the DPC, and served at
 `/dev/input/raw/<n>` like the i8042's, a mouse's wheel read through its report descriptor (B.2,
-B.3), a keyboard's lights set by a `SET_REPORT` (B.5). No class driver binds anything else
-(Part D). A departure frees the device's slot and leaves its records, and nothing tells
-`device-mgr` of a device plugged in after it read the registry (Part C). The design ahead is
+B.3), a keyboard's lights set by a `SET_REPORT` (B.5); and **a device that leaves departs** (C):
+what its keyboards and mice held is released, their nodes retire and their slots are given back,
+and its records are marked departed, which `device-mgr` follows. No class driver binds anything else
+(Part D). The design ahead is
 [`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
 
 ## The controller
@@ -162,10 +164,11 @@ the zero descriptor, and what it is lives in the device table's entry beside the
 
 **A departure leaves the record**, and an id is never reused, which is why `device-mgr` names a USB
 device `usb-<id>` and not by its port ([`device-manager.md`](device-manager.md) §5). The port goes
-to the next device when this one leaves, and a connector has two port numbers. Until Part C the
-manager reads the registry once, at its start. A device plugged in after that is in `/dev/registry`
-and not in `/dev/devices`. A device the table cannot take — no memory for its node, or the table
-full — stays attached, and the log says it is missing from the registry.
+to the next device when this one leaves, and a connector has two port numbers. Since Part C the
+record is **marked departed**, with its keyboards and mice, and the manager — following the registry
+— tells their owner ([`device-node.md`](../spec/device-node.md) § *Departures and the generation*).
+A device the table cannot take — no memory for its node, or the table full — stays attached, and
+the log says it is missing from the registry.
 
 ## Keyboards and mice: HID (Part B)
 
@@ -249,9 +252,13 @@ review).
 - **Not carried**: buttons past the third and a horizontal wheel, which the parser finds and
   nothing above the kernel carries, and a fourth byte in boot protocol, which is the device's own.
 
-**The node** is one of sixteen statics, its `CharBackend` context the index, as the PS/2 driver's
-two are. Its ring, its parked read and the hand-off of a finished read are `drivers::input`'s,
-shared with PS/2 (B.1). **Its served index is the next after every input node's**:
+**The node's state** is one of sixteen static slots, its `CharBackend` context the slot and the
+slot's epoch. Its ring, its parked read and the hand-off of a finished read are `drivers::input`'s,
+shared with PS/2 (B.1). **A slot is given back when its device departs** (C): a new node takes a
+free slot, else a retired one, whose epoch is bumped and reader reset first — so a handle to a node
+retired from a slot since reused is refused `PeerClosed` rather than served the next device's ring.
+Sixteen bound the devices attached at once, not every device ever attached. **Its served index is
+the next after every input node's**, departed ones included:
 - beside the i8042's keyboard and mouse, at 0 and 1, a USB keyboard and mouse are 2 and 3;
 - on a machine without an i8042 they are 0 and 1;
 - an index is never reused.
@@ -263,10 +270,18 @@ as its name, and `device-mgr` hands it to `input-server` as it hands the i8042's
 exists. It asked the i8042 alone until B.2, and on a machine without one it held no page. It drains
 every keyboard's ring when it ends.
 
-**Departure**: the hub thread takes the device's endpoints out of the DPC's table **before Disable
-Slot**, so the DPC cannot touch a report buffer the release is about to free. Rings and buffers
-are the device's memory, freed only after its slot is disabled. The node stays, with no producer,
-until Part C retires it.
+**Departure** (Part C), in the hub thread, in this order:
+1. **what each bound interface holds is released**: a keyboard's last report decoded against an
+   empty one, its keys then its modifiers; a mouse's held buttons from its decoder's state, which
+   works whatever its report ID. QEMU sends nothing for a key held when its device goes, so this is
+   the only release there is;
+2. **its endpoints leave the DPC's table**, so the DPC cannot touch a report buffer the release is
+   about to free;
+3. **each node retires**: a read waiting is answered with the releases, or completed `PeerClosed`
+   if there were none; after them a read is refused at submission, `PeerClosed`; a lights write
+   still waiting is completed `PeerClosed`;
+4. **its records depart** — the device and its keyboards and mice, as one generation;
+5. **its slot is disabled**, and only then its memory freed: rings and buffers are the device's.
 
 **A keyboard's lights** (B.5) are a write to its node — one byte, in HID's order
 ([`io-operation.md`](../spec/io-operation.md) § Keyboard lights) — which the node's `submit_write`

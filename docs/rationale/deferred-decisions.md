@@ -368,18 +368,17 @@ read-ahead: after demand-paged program text lands**, when what remains is genuin
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
 scheduling rather than a trigger.
 
-**A departed USB device keeps its node and record — `TODO(usb-departed-records)`.** Phase 6 Part
-A registers a node and a record for every arrival, and a departure frees neither: the device table
-only grows, and a record's id is its place, which `/dev/registry/<id>` and `device-mgr`'s
-`usb-<id>` both index by. So every arrival costs a table entry for the rest of the boot, and a
-connector whose contact bounces — a departure, then an arrival, since PR #355 — adds one each time.
-Removing a record would shift every later id. **Part C retires a record in place instead**: its
-plan has a snapshot mark departed records rather than omit them, so an id keeps naming one device.
-**A bound keyboard or mouse also keeps its input node** (Part B.2): there are sixteen, and each
-binding takes the next for the rest of the boot, so a seventeenth binding — a receiver unplugged
-and replugged eight times — is not bound. Nothing a person sees changes until Part C hands a
-hot-plugged device to `input-server`, and Part C is where a node is retired (PR #358 review).
-Trigger: Phase 6 Part C, which is scheduled.
+**A departed USB device keeps its record — `TODO(usb-departed-records)`.** Phase 6 Part A registers
+a node and a record for every arrival, and a record's id is its place, which `/dev/registry/<id>`
+and `device-mgr`'s `usb-<id>` both index by — so removing one would shift every later id. **Part C
+retires a record in place instead** (2026-10-05): it is marked departed, and its paths stop
+resolving. **An input node's slot is given back** too, under an epoch, so sixteen bound the devices
+attached rather than every device ever attached. What remains is **the table's growth**: every
+arrival costs a record per node — two for a keyboard or a mouse, its device and its input node —
+at 144 bytes each, in every snapshot after it, and the device manager reads the whole snapshot at
+each change. A connector whose contact bounces adds them each time. The maintainer's call
+(2026-10-05) was to keep them for the boot. Trigger: the snapshot's size being felt — a machine
+whose devices come and go thousands of times in one boot.
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 

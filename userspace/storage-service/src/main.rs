@@ -1118,9 +1118,10 @@ impl Service {
         }
     }
 
-    /// The subscription: the manager has nothing to send after `Settled` until Phase 6 gives it
-    /// an event source. Its handles are closed rather than leaked, and the manager going away is
-    /// said once.
+    /// The subscription. **After `Settled` the manager sends a disk's `Arrived` or `Departed`** when
+    /// one comes or goes (Phase 6 Part C), and nothing makes one before Part D's mass storage, which
+    /// is where this takes them; until then each is said and ignored, its handles closed rather than
+    /// leaked. The manager going away is said once.
     fn serve_subscription(&mut self) {
         loop {
             match recv(self.subscription) {
