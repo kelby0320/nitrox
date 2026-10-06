@@ -252,8 +252,9 @@ review).
 - **Not carried**: buttons past the third and a horizontal wheel, which the parser finds and
   nothing above the kernel carries, and a fourth byte in boot protocol, which is the device's own.
 
-**The node's state** is one of sixteen static slots, its `CharBackend` context the slot and the
-slot's epoch. Its ring, its parked read and the hand-off of a finished read are `drivers::input`'s,
+**The node's state** is one of sixteen slots in a static `Nodes`, its `CharBackend` context the
+slot and the slot's epoch — a value rather than loose statics so a host test can take every slot,
+retire one, take it again and read through the old node, which no boot does. Its ring, its parked read and the hand-off of a finished read are `drivers::input`'s,
 shared with PS/2 (B.1). **A slot is given back when its device departs** (C): a new node takes a
 free slot, else a retired one, whose epoch is bumped and reader reset first — so a handle to a node
 retired from a slot since reused is refused `PeerClosed` rather than served the next device's ring.
@@ -279,7 +280,11 @@ every keyboard's ring when it ends.
    about to free;
 3. **each node retires**: a read waiting is answered with the releases, or completed `PeerClosed`
    if there were none; after them a read is refused at submission, `PeerClosed`; a lights write
-   still waiting is completed `PeerClosed`;
+   still waiting is completed `PeerClosed`. **A report the DPC decoded before step 2 and pushes
+   after this is dropped**, under the node's lock, as is one for a slot given to another device
+   since: the DPC decodes under the bound table's lock and pushes after letting it go, and the
+   releases must stay last. The reader may then see a key let go that it never saw pressed, which
+   is harmless where a key down after them would be held for good;
 4. **its records depart** — the device and its keyboards and mice, as one generation;
 5. **its slot is disabled**, and only then its memory freed: rings and buffers are the device's.
 

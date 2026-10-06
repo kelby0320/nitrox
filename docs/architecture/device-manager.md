@@ -88,16 +88,22 @@ waits again past the new generation:
 - **a record new and present is an arrival**: the manager takes its node from
   `/dev/registry/<id>` and sends the class's owner an `Arrived` with a duplicate of it — or, with
   no owner yet, keeps it for the replay;
-- **a record held present and departed now is a departure**: a `Departed` to the owner, and the
-  manager lets its own handle to the node go;
+- **a record held present and departed now is a departure**: the manager lets its own handle to
+  the node go, and sends a `Departed` to the owner **if the owner was handed it** — by its replay
+  or an `Arrived` that sent (`Owners::handed`, PR #361 review);
 - **a record that arrived and departed between two reads is told to no one**: it was never handed
-  over, so there is nothing to take back.
+  over, so there is nothing to take back. Nor is one whose node had gone by the time the manager
+  asked for it, or whose `Arrived` did not send.
 
 Since a change between the snapshot and the wait answers the wait at once, none is missed, which
 closes the race Phase 6 Part A.3 recorded: a device plugged in during the manager's start used to
-be in the registry and never in `/dev/devices`. The replay and the tables leave departed devices
-out. Each change is logged: `device-mgr: input-2 arrived, sent to input`, `… departed, sent to
-input`, or `… arrived, for the replay` when the class has no owner yet.
+be in the registry and never in `/dev/devices`. **A table that does not read after a change** —
+its snapshot's allocation or mapping failing — is said, and the manager waits past the generation
+the node answered with, not the one it holds, which the node would answer at once and so spin; the
+next change's diff tells what this one missed. A refused wait, or one that completes with an error,
+ends the following, and the manager serves what it has. The replay, the tables and the start leave
+departed devices out. Each change is logged: `device-mgr: input-2 arrived, sent to input`,
+`… departed, sent to input`, or `… arrived, for the replay` when the class has no owner yet.
 
 ## 4. Classes and owners
 

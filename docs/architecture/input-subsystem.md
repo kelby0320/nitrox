@@ -356,7 +356,8 @@ server, and one unplugged leaves it.** Three pieces, one per layer:
   **Only the driver knows what one device held**: the input server merges devices into one stream,
   and the compositor's interpreter sees only that. So a key held when its keyboard is unplugged is
   released, its repeat stops, and a drag in progress ends. Then the node retires: a read is answered
-  with what its ring still holds, and after that refused, `PeerClosed`.
+  with what its ring still holds, and after that refused, `PeerClosed`; a report pushed after it
+  retires is dropped, so the releases stay last (`Reader::offer`, PR #361 review).
 - **The device manager follows the registry** — a read waiting on `/dev/registry/changes` — and
   sends the input server an `Arrived` for a device plugged in and a `Departed` for one unplugged
   ([`device-manager.md`](device-manager.md) §3a).

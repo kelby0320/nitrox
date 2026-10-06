@@ -45,7 +45,7 @@ code depends on — nothing computes a category from a range.
 | `-10` | `NotFound` | A named resource does not exist. |
 | `-11` | `WouldBlock` | A non-blocking operation could not complete immediately — `sys_wait` with `deadline == 0` found nothing signaled. |
 | `-12` | `TimedOut` | A deadline elapsed before the operation completed. |
-| `-13` | `PeerClosed` | An IPC channel's peer endpoint has closed; no further traffic is possible on this endpoint. |
+| `-13` | `PeerClosed` | The other end has gone: an IPC channel's peer endpoint has closed, so no further traffic is possible on this endpoint — or **a device has departed** (Phase 6 Part C), so a read of its node, once its ring is drained, and a lights write to a keyboard's are refused ([`io-operation.md`](../spec/io-operation.md)). |
 | `-14` | `AlreadyExists` | The name the operation would create is already taken. |
 | `-15` | `NotEmpty` | A container still has members and the operation requires it to be empty. |
 

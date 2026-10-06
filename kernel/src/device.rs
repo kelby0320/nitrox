@@ -561,8 +561,8 @@ pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
 // async model as it is — `sys_io_submit`, a `PendingOperation`, `sys_wait` — and needs no way for
 // the kernel to name the manager, which a notification would have (the plan's detail pass).
 
-/// Reads that may wait on `/dev/registry/changes` at once: the device manager's and `boot-probe`'s,
-/// with room to spare. One more is refused, `WouldBlock`.
+/// Reads that may wait on `/dev/registry/changes` at once: the device manager's one, with room to
+/// spare. A fifth is refused, `WouldBlock`.
 pub const WAITERS_MAX: usize = 4;
 
 /// **The reads waiting for the table to pass a generation**, as a value a host test can drive.
@@ -655,6 +655,21 @@ fn changes_read(
     max_len: u64,
     _ctx: *mut (),
 ) -> Result<(), KError> {
+    read_changes(&WAITING, &GENERATION, buffer, po, buf_offset, offset, max_len)
+}
+
+/// [`changes_read`] against `waiting` and `generation`: the statics in a boot, and a host test's own
+/// (PR #361 review), so the read's two refusals are held through the read rather than through
+/// [`Waiters`] alone.
+fn read_changes(
+    waiting: &SpinLock<Waiters<WaitingRead>>,
+    generation: &AtomicU64,
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    offset: u64,
+    max_len: u64,
+) -> Result<(), KError> {
     if max_len < 8 {
         return Err(KError::InvalidArgument);
     }
@@ -664,8 +679,8 @@ fn changes_read(
         Full(WaitingRead),
     }
     let then = {
-        let mut waiting = WAITING.lock();
-        let generation = GENERATION.load(Ordering::Acquire);
+        let mut waiting = waiting.lock();
+        let generation = generation.load(Ordering::Acquire);
         if generation > offset {
             Then::Answer(generation)
         } else {
@@ -1074,12 +1089,20 @@ mod tests {
         assert!(r.node(kbd).is_none() && r.node(kbd_node).is_none(), "/dev/registry/<id>");
         assert!(r.input(3).is_some(), "the mouse still answers");
         r.depart(mouse);
+        assert!(!r.has(DeviceKind::UsbDevice), "what the hardware report and the i8042 ask");
+        assert!(r.has(DeviceKind::Keyboard), "the i8042's keyboard is still here");
         assert_eq!(r.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(4), "not 3, nor 2");
         // A block device the same way, for Part D: the partition departs with its disk.
         let (mut b, _, _) = booted();
         b.depart(3);
         assert!(b.block(0).is_none() && b.block(2).is_none(), "the disk and its partition");
         assert!(b.block(1).is_some(), "the RAM disk is no child of the disk");
+        // **And two levels down** (PR #361 review): Part D's USB disk is a device, its disk and its
+        // partition. The controller stands in for the device here, the partition its grandchild.
+        let (mut c, _, _) = booted();
+        c.depart(1);
+        assert!(c.block(0).is_none() && c.block(2).is_none(), "the controller's disk, and that disk's partition");
+        assert!(c.block(1).is_some() && c.node(0).is_some() && c.node(2).is_some(), "and nothing else");
     }
 
     /// **Every change counts once**: each registration, and a departure with its children.
@@ -1110,6 +1133,35 @@ mod tests {
             assert!(w.park(1, c).is_ok());
         }
         assert_eq!(w.park(1, 'g'), Err('g'), "a fifth");
+    }
+
+    /// **A change read shorter than its answer is refused, one that is behind is answered at once,
+    /// and a fifth waiting is refused** (PR #361 review): `io-operation.md`'s two refusals, through
+    /// the read itself. Seven bytes and eight, either side of the bound.
+    #[test]
+    fn a_change_read_is_refused_short_answered_behind_and_refused_a_fifth_place() {
+        init_global_heap();
+        let waiting = SpinLock::new(LockRank::Leaf, Waiters::new());
+        let generation = AtomicU64::new(5);
+        let page =
+            crate::drivers::adopt(MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+        let po = || {
+            crate::drivers::adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+        };
+        let read = |po: &ObjectRef, offset, len| read_changes(&waiting, &generation, &page, po, 0, offset, len);
+
+        let behind = po();
+        assert_eq!(read(&behind, 4, 7), Err(KError::InvalidArgument), "shorter than its answer");
+        assert!(!crate::sched::pending_op_is_signaled(behind.as_ptr()));
+        assert_eq!(read(&behind, 4, 8), Ok(()));
+        assert_eq!(crate::sched::pending_op_completion(behind.as_ptr()), (0, 8), "behind, so answered at once");
+
+        let ahead: [ObjectRef; WAITERS_MAX] = core::array::from_fn(|_| po());
+        for p in &ahead {
+            assert_eq!(read(p, 5, 8), Ok(()));
+            assert!(!crate::sched::pending_op_is_signaled(p.as_ptr()), "5 is not past 5: it waits");
+        }
+        assert_eq!(read(&po(), 5, 8), Err(KError::WouldBlock), "a fifth place to wait");
     }
 
     #[test]

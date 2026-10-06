@@ -2388,6 +2388,30 @@ fn registry_test(root_ns: u64) -> bool {
     if !keyboard || !mouse {
         return fail(b"no keyboard and mouse records");
     }
+    // **`/dev/registry/changes` refuses a read too short for its answer**, at submission (PR #361
+    // review): `io-operation.md`'s rule, which the manager's eight-byte reads never test. Asked past
+    // generation 0, which the table is long past, so a node that took it would answer at once rather
+    // than keep one of the four places a waiting read has.
+    let (st, changes) = ns_lookup(root_ns, b"/dev/registry/changes", RIGHT_READ);
+    if st != 0 || changes == 0 {
+        return fail(b"/dev/registry/changes does not open");
+    }
+    // SAFETY: register-only syscall.
+    let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
+    let short = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: page, buf_offset: 0, offset: 0, length: 7 };
+    // SAFETY: a valid `IoOp`; `changes` and `page` are handles this process holds.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, changes, (&short as *const IoOp) as u64) };
+    close(changes);
+    if page != 0 {
+        close(page);
+    }
+    if po != libkern::KError::InvalidArgument.as_i32() as i64 {
+        if po > 0 {
+            close(po as u64);
+        }
+        Line::new().s(b"boot-probe: registry: a seven-byte read of /dev/registry/changes gave ").i(po).end();
+        return fail(b"/dev/registry/changes did not refuse a read shorter than its answer");
+    }
     Line::new()
         .s(b"boot-probe: registry: ")
         .u(total as u64)

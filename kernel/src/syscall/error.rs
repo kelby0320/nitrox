@@ -40,8 +40,10 @@ pub enum KError {
     /// A blocking operation's deadline elapsed before it completed (e.g.
     /// `sys_wait` timed out with no handle signaled).
     TimedOut = -12,
-    /// An IPC channel's peer endpoint has closed: no further messages can be
-    /// sent or received on this endpoint.
+    /// The other end has gone: an IPC channel's peer endpoint has closed, so no
+    /// further messages can be sent or received on this endpoint — or a device
+    /// has departed, so its node's reads, once drained, and its lights writes
+    /// are refused (Phase 6 Part C).
     PeerClosed = -13,
     /// The name the operation would create is already taken (`sys_ns_bind` on
     /// an occupied path; a resource server's create/rename onto an existing

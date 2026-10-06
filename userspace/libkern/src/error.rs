@@ -23,7 +23,8 @@ pub enum KError {
     WouldBlock = -11,
     /// A blocking operation's deadline elapsed before it completed.
     TimedOut = -12,
-    /// An IPC channel's peer endpoint has closed.
+    /// The other end has gone: an IPC channel's peer endpoint has closed, or a
+    /// device has departed (Phase 6 Part C).
     PeerClosed = -13,
     /// The name the operation would create is already taken. Well-formed
     /// request, occupied name — which is why `mkdir --parents` can treat it as

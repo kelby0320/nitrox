@@ -32,7 +32,7 @@ pub mod ring;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::libkern::input::INPUT_EVENT_LEN;
+use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
 use crate::mm::{PAGE_SIZE, heap};
 use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
@@ -101,6 +101,17 @@ impl Reader {
         } else {
             ReadNow::Empty
         }
+    }
+
+    /// **Events from the interrupt path**, pushed as one group, or dropped once the device has gone
+    /// (PR #361 review): a retired node's ring ends with the releases its departure pushed, and an
+    /// event after them would be a key pressed on a keyboard that is not there. Whether they were
+    /// pushed.
+    pub fn offer(&mut self, events: &[InputEvent]) -> bool {
+        if !self.retired {
+            self.ring.push_group(events);
+        }
+        !self.retired
     }
 
     /// Park `read` until events arrive. The caller has had [`ReadNow::Empty`] under the same lock.
@@ -248,7 +259,7 @@ mod tests {
     use super::*;
     use crate::libkern::KBox;
     use crate::libkern::handle::KObjectType;
-    use crate::libkern::input::{InputEvent, KEY_PRESS};
+    use crate::libkern::input::KEY_PRESS;
     use crate::mm::test_support::init_global_heap;
     use crate::object::PendingOperation;
     use crate::object::header::test_probe;
@@ -301,6 +312,22 @@ mod tests {
         assert!(parked.retire().is_some(), "a read waiting on an empty ring is handed back");
         assert!(!parked.has_parked());
         assert_eq!(parked.read_now(&mut out, 0), ReadNow::Gone);
+    }
+
+    /// **A retired reader takes no more events** (PR #361 review): its ring ends with what its
+    /// departure pushed, so a report the DPC pushes late cannot follow the releases.
+    #[test]
+    fn a_retired_reader_takes_no_more_events() {
+        init_global_heap();
+        let mut r = Reader::new();
+        let mut out = [0u8; DRAIN_MAX];
+        assert!(r.offer(&[key(30)]), "taken while the device is here");
+        r.ring.push(key(31));
+        assert!(r.retire().is_none());
+        assert!(!r.offer(&[key(32)]), "and not after it has gone");
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(2 * INPUT_EVENT_LEN), "only what came before");
+        assert_eq!(InputEvent::read(&out[INPUT_EVENT_LEN..]).map(|e| e.code), Some(31));
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Gone);
     }
 
     /// **The DPC's half takes the parked read only when there is something for it**, drains no more

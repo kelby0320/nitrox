@@ -128,10 +128,15 @@ pub mod classes {
         records.iter().filter(|r| !r.is_departed() && Class::of(r.kind()) == Some(class)).collect()
     }
 
-    /// Who owns each class: a channel the manager holds, or nobody.
+    /// Who owns each class: a channel the manager holds, or nobody — and what each owner has been
+    /// handed.
     #[derive(Debug, Default)]
     pub struct Owners {
         owner: [Option<u64>; 2],
+        /// **The devices each class's owner has been handed**, by registry id (PR #361 review): a
+        /// `Departed` is owed for these alone. A device whose `Arrived` did not send, or whose node
+        /// the manager never took, was not handed over.
+        handed: [Vec<u32>; 2],
     }
 
     fn slot(class: Class) -> usize {
@@ -144,7 +149,7 @@ pub mod classes {
     impl Owners {
         /// Nobody owns anything.
         pub const fn new() -> Owners {
-            Owners { owner: [None, None] }
+            Owners { owner: [None, None], handed: [Vec::new(), Vec::new()] }
         }
 
         /// Make `channel` the owner of `class`. `false` if the class already has one — the
@@ -158,16 +163,37 @@ pub mod classes {
             true
         }
 
-        /// The owner behind `channel` has gone: free its class, and say which it was.
+        /// The owner behind `channel` has gone: free its class, forget what it was handed, and say
+        /// which class it was.
         pub fn release(&mut self, channel: u64) -> Option<Class> {
             for class in Class::ALL {
                 let s = &mut self.owner[slot(class)];
                 if *s == Some(channel) {
                     *s = None;
+                    self.handed[slot(class)].clear();
                     return Some(class);
                 }
             }
             None
+        }
+
+        /// `class`'s owner has been sent device `id`'s `Arrived`.
+        pub fn handed(&mut self, class: Class, id: u32) {
+            let h = &mut self.handed[slot(class)];
+            if !h.contains(&id) {
+                h.push(id);
+            }
+        }
+
+        /// **Device `id` has departed**: whether `class`'s owner was handed it, and so is owed a
+        /// `Departed` — once, since it is forgotten here.
+        pub fn departed(&mut self, class: Class, id: u32) -> bool {
+            let h = &mut self.handed[slot(class)];
+            let Some(i) = h.iter().position(|&d| d == id) else {
+                return false;
+            };
+            h.swap_remove(i);
+            true
         }
 
         /// `class`'s owner, if it has one.
@@ -561,6 +587,28 @@ mod tests {
         let mut chans: Vec<u64> = o.channels().collect();
         chans.sort();
         assert_eq!(chans, [11, 12]);
+    }
+
+    /// **A `Departed` is owed only for a device the owner was handed**, once (PR #361 review;
+    /// `rsproto-devices-ops.md`): not for one whose `Arrived` never went, nor to the next owner for
+    /// what the last one was handed — its replay hands it again.
+    #[test]
+    fn a_departed_is_owed_for_what_the_owner_was_handed_once() {
+        let mut o = Owners::new();
+        assert!(o.claim(Class::Input, 10));
+        o.handed(Class::Input, 3);
+        o.handed(Class::Input, 4);
+        assert!(!o.departed(Class::Input, 5), "never handed over");
+        assert!(!o.departed(Class::Block, 3), "handed to another class's owner");
+        assert!(o.departed(Class::Input, 3));
+        assert!(!o.departed(Class::Input, 3), "owed once");
+        assert_eq!(o.release(10), Some(Class::Input));
+        assert!(o.claim(Class::Input, 11));
+        assert!(!o.departed(Class::Input, 4), "the last owner's, not this one's");
+        o.handed(Class::Input, 4);
+        o.handed(Class::Input, 4);
+        assert!(o.departed(Class::Input, 4), "until its replay hands it");
+        assert!(!o.departed(Class::Input, 4), "handed twice, owed once");
     }
 
     /// **The rows decode as the shell's `open` decodes them**, with `Null` where a device has no
