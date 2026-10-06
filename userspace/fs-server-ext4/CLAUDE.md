@@ -40,8 +40,9 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   **host-tested** against the same `mke2fs` fixture as the parser (see
   `test_support`). Touches no syscalls.
 - **`src/main.rs` — the server `[[bin]]`.** The bare-target `_start` + the syscall
-  plumbing only: a `BlockReader` **and `BlockWriter`** over `sys_io_submit` (sector-at-
-  a-time into a scratch `MemoryObject`; writes are read-modify-write per sector), the
+  plumbing only: a `BlockReader` **and `BlockWriter`** over `sys_io_submit` (a 4 KiB block
+  per submit into a one-page scratch `MemoryObject`; a write smaller than a block reads the
+  block first — this said "sector-at-a-time" until 2026-10-06), the
   bootstrap (recv the **read-write** device handle via the setup message; `check_device` —
   the superblock and the root directory — and a refusal in place of Ready if it fails;
   forwarding channel; `Meta::Ready`), and the serve loop — a Model A lazy resolve replies the file's

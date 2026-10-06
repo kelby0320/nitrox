@@ -34348,3 +34348,85 @@ the test client gives up after twenty seconds without an event. The wait measure
 under KVM, and nothing under TCG; four runs passed, the read before the first unplug in each.
 
 No ABI hash impact: kernel internals only.
+
+## 2026-10-06 — Phase 6 Part E, detailed: fs-server-fat
+
+Part E's detail pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part E in detail*. A FAT12,
+FAT16 or FAT32 filesystem on a stick is served read-write, with long names, by a server built on
+the protocol `fs-server-ext4` speaks, moved into a library both use.
+
+**One fact measured for it, rather than assumed: the kernel serves a filesystem mapped in
+sectors.** FAT's data region need not start on a 4 KiB boundary, so a FAT server describes a file
+in 512-byte units. `fs-server-ext4` was made to reply that way, its runs multiplied by eight, and
+`test-qemu --kvm` passed: everything the boot reads from its root, and `boot-probe`'s page-cache
+tests. Every device address one sector on failed the boot. That run's addresses were all multiples
+of eight sectors, so a second, after PR #364's review, put an ext4 stick's partition at sector 2,049
+under the same patch: `check-storage --kvm` wrote it through a mapping, and on the host `e2fsck`
+found it clean and `debugfs` read the pattern where the guest put it. So no kernel change is
+needed, wherever a FAT's data region starts, provided no page spans two runs, which a cluster of at
+least 4 KiB guarantees.
+
+**Three calls put to the maintainer, who agreed to all three as recommended:**
+- **The protocol becomes a library, `libfsserver`**, rather than `fs-server-fat` starting as a
+  copy of `fs-server-ext4`'s 1,500-line binary. A fix to the subtle parts — `File::Forget` before a
+  free, a rename ahead of a session, the wait slots — then reaches both servers. The cost is
+  refactoring the root filesystem's server first, which every existing gate holds.
+- **Clusters under 4 KiB are refused**, with the reason; Part G's formatting makes such a stick
+  servable. Serving them read-only through `File::ReadRange`, or teaching the page cache to fill a
+  page from several runs, were the alternatives.
+- **FAT auto-mounts on removable disks only.** An ESP another system made is servable — `mkfs.fat -F
+  32` on 512 MiB gives 4 KiB clusters — and under ext4's rules a live boot would mount one on an
+  internal disk, which holds that disk in use, so `nxinstall` would refuse it until it was
+  unmounted. (This was first put as though Nitrox's own ESPs were such; PR #364's review found
+  their clusters are 512 bytes or 1 KiB, so they are refused whatever the rule.)
+
+**The calls made:**
+- **A file's id is its first cluster**: stable through a rename or move, as the kernel's one object
+  per file needs. An empty file has none and is uncached, and a truncate to zero is forgotten
+  before its clusters are freed, as a delete is.
+- **The write path batches from its first version**, as the throughput deferral asks: a grow
+  allocates in one pass, contiguous where it can, and zeroes in large transfers; the FAT's sectors
+  are cached, and each request's dirty ones written once, to every copy.
+- **The device layer gains a sector-granular, multi-sector path for FAT**, and `fs-server-ext4`
+  keeps its block-per-submit path, so Part H measures ext4 as it is.
+- **Names are case-insensitive and case-preserving, and times UTC**, as FAT is read everywhere else.
+- **`test-qemu`'s stick keeps its 512-byte clusters**, so the adjudicated boot holds the refusal
+  and its mounts do not change. `check-storage` gains a FAT32 stick, written by the guest and read
+  back on the host with `fsck.fat` and mtools.
+
+**Found on the way:** `fs-server-ext4`'s rules said its device layer moves a sector at a time. It
+moves a 4 KiB block a time; corrected with PR #364's review.
+
+## 2026-10-06 — PR #364, reviewed: ESPs that were never servable, and a spike that stayed aligned
+
+One blocking finding, two worth fixing and three optional, all taken into Part E's detail pass. Each
+was checked against the images and the tools before it went in.
+
+**1. No ESP this tooling makes is servable**, so the third call's recorded reason was false for the
+disks it named, and the gate step meant to hold it could not fail. Read from each image's boot
+sector, the release disk's ESP and the one `nxinstall` writes have 512-byte clusters and the live
+stick's 1 KiB, and the second call refuses all three. The call stands, for an ESP another system
+made. Its reason and the pass's account of it are corrected, and the step now holds a servable FAT
+on an internal disk: a third partition on the release disk's copy, since the AHCI driver binds only
+the first SATA disk it finds.
+
+**2. The spike never moved a page to or from an address off a 4 KiB boundary**, the case sector
+maps exist for: multiplying ext4's runs by eight kept every address a multiple of eight sectors.
+**Run, not read:** `check-storage --kvm` with the stick's partition at sector 2,049 and the same
+patch passed, the host finding the pattern where the guest wrote it. The gate's FAT stick is now
+formatted with its data region off a 4 KiB boundary, and `xtask` asserts it.
+
+**3. A FAT32 with 4 KiB clusters is FAT32 by count only from 257 MiB.** Below that `mkfs.fat` writes
+one anyway, with a warning, and `fsck.fat`, mtools and Linux read it as FAT32 from its boot sector.
+The library now decides the same way — FAT32 by its boot sector, FAT12 and FAT16 by count — and
+its host fixtures are read from files, so a 300 MiB image costs a sparse file.
+
+**Optional, all taken:**
+- **A FAT found dirty stays dirty at unmount**, as Linux leaves one, since nothing here can repair
+  it.
+- **The kernel checks a map before using it.** A `block_size` of `0` divides by zero, and a run
+  reaching past `u64::MAX` overflows an add, each a panic in this kernel. Pre-existing, and a
+  second server is one more process that could send either.
+- **`fs-server-ext4`'s rules said its device layer moves a sector at a time**; corrected here
+  rather than in E.7. A search for the phrase first found nothing: it was wrapped across two lines.
+
