@@ -24,7 +24,7 @@
 //! and return what to do — an IRP to complete, the hub thread to wake — and a host test drives them
 //! with heap memory standing in for the rings.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use super::context;
 use super::hub::{self, DeviceMem, Failed};
@@ -150,13 +150,18 @@ pub mod scsi {
         [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 
+    /// Fixed-format sense data's length, as `REQUEST SENSE` asks for it.
     pub const SENSE_LEN: usize = 18;
+    /// Standard `INQUIRY` data's length, through the product revision.
     pub const INQUIRY_LEN: usize = 36;
+    /// `READ CAPACITY(10)`'s answer: the last block's address and the block length.
     pub const CAPACITY_LEN: usize = 8;
 
-    /// Sense keys this driver acts on.
+    /// Sense key: the unit is not ready — becoming so, or with no medium.
     pub const NOT_READY: u8 = 0x2;
+    /// Sense key: the command was refused — for a flush, there is no cache to flush.
     pub const ILLEGAL_REQUEST: u8 = 0x5;
+    /// Sense key: the unit was reset or its medium changed, and says so once.
     pub const UNIT_ATTENTION: u8 = 0x6;
     /// The additional sense code for "medium not present", under `NOT_READY`.
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
@@ -166,7 +171,9 @@ pub mod scsi {
     pub struct Inquiry {
         /// A direct-access block device, connected: qualifier 0, type 0.
         pub direct_access: bool,
+        /// The vendor's identification, space-padded ASCII.
         pub vendor: [u8; 8],
+        /// The product's identification, space-padded ASCII.
         pub product: [u8; 16],
     }
 
@@ -371,6 +378,9 @@ pub(super) struct Dev {
     /// **The hub thread is recovering it**: a submit queues rather than starting a command under
     /// the recovery's feet.
     recovering: bool,
+    /// **An IRP a failed recovery could not stop**: its command's TRBs may still move its data, so it
+    /// is completed only by the departure that follows, once the slot is disabled.
+    stranded: Option<*mut Irp>,
     queue: Queue,
 }
 
@@ -447,9 +457,6 @@ pub(super) struct Disks {
 
 /// The boot's storage devices.
 static DISKS: Disks = Disks::new();
-
-/// The hub thread has a fault or a deadline to look at.
-static DUE: AtomicBool = AtomicBool::new(false);
 
 /// **The command for a block IRP**: its CDB, its length in the wrapper, its direction, whether it is
 /// a flush — or the error to refuse it with, when it does not fit `lun`.
@@ -579,13 +586,14 @@ impl Dev {
 
 impl Disks {
     /// **Device `i` has gone**: out of the table, its slot retired. What it held, to be completed
-    /// `PeerClosed` by the caller: its queue, and the command in flight.
-    fn depart(&self, i: usize) -> ([Option<*mut Irp>; QUEUE], Option<*mut Irp>) {
+    /// `PeerClosed` by the caller: its queue at once, and — once the slot is disabled — the command in
+    /// flight and one a failed recovery stranded.
+    fn depart(&self, i: usize) -> ([Option<*mut Irp>; QUEUE], [Option<*mut Irp>; 2]) {
         let dev = self.devs[i].lock().take();
         self.states[i].store(RETIRED, Ordering::Release);
         let mut queued = [None; QUEUE];
         let Some(mut dev) = dev else {
-            return (queued, None);
+            return (queued, [None; 2]);
         };
         for q in queued.iter_mut() {
             *q = dev.queue.pop().map(|c| c.irp);
@@ -594,7 +602,7 @@ impl Disks {
             Some(Owner::Irp { cmd, .. }) => Some(cmd.irp),
             _ => None,
         };
-        (queued, inflight)
+        (queued, [inflight, dev.stranded.take()])
     }
 
     /// The xHCI slot's storage device's table slot, if one is bound there.
@@ -667,6 +675,13 @@ impl Disks {
             let Some(cmd) = dev.inflight else {
                 return Some(Action::None);
             };
+            // **A command with a fault recorded is the hub thread's**, which will reset what is on
+            // its rings: a later event of it changes nothing. A deadline marked as the command was
+            // ending is not such a fault — the command made it, and its completion below clears
+            // the mark rather than leave it to be charged to the next command (PR #363 review).
+            if dev.fault.is_some_and(|f| f != Fault::Deadline) {
+                return Some(Action::None);
+            }
             let ok = matches!(code, code::SUCCESS | code::SHORT_PACKET);
             let at_csw = match cmd.stage {
                 // **The data stage is over**, whole or short — a short one ends at the TRB that came
@@ -705,6 +720,7 @@ impl Disks {
                 return Some(Action::Wake);
             }
             dev.inflight = None;
+            dev.fault = None;
             if let Some(next) = dev.queue.pop() {
                 dev.start(next, false, now);
             }
@@ -723,14 +739,14 @@ fn complete(irp: *mut Irp, status: i32, transferred: u64) {
     }
 }
 
-/// Do what an [`Action`] says. No lock held.
+/// Do what an [`Action`] says. No lock held. `x` is the controller in the DPC and the hub thread,
+/// and `None` in a submit, which never wakes the hub thread ([`Disks::bound`]).
 fn act(a: Action, x: Option<&Xhci>) {
     match a {
         Action::None => {}
         Action::Complete { irp, status, transferred } => complete(irp, status, transferred),
         Action::Hub { po } => crate::sched::complete_pending_op(po, 0, 0),
         Action::Wake => {
-            DUE.store(true, Ordering::Release);
             if let Some(x) = x {
                 crate::sched::signal_interrupt(x.hub_wake.as_ptr());
             }
@@ -869,6 +885,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: Prepare
         fault: None,
         hub_result: None,
         recovering: false,
+        stranded: None,
         queue: Queue::new(),
     };
     let Some((i, epoch)) = DISKS.take(dev) else {
@@ -1112,32 +1129,29 @@ fn dev_field<T: Default>(i: usize, f: impl FnOnce(&Dev) -> T) -> T {
 fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Result<HubResult, Failed> {
     let po = hub::new_operation()?;
     let now = crate::arch::Timer::read_ns();
-    {
-        let mut d = DISKS.devs[i].lock();
-        let Some(dev) = d.as_mut() else { return Err(Failed::Device("its device has gone")) };
-        dev.hub_result = None;
-        let owner = Owner::Hub { po: po.as_ptr() };
-        if status_only {
-            let tag = dev.tag;
-            dev.inflight = Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS });
-            dev.ask_status();
-        } else {
-            let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
-            let frags = if len == 0 { &frags[..0] } else { &frags[..] };
-            dev.issue(owner, lun, cdb, len, len > 0, frags, now);
-        }
+    if !DISKS.issue_hub(i, po.as_ptr(), lun, cdb, len, status_only, now) {
+        return Err(Failed::Device("its device has gone"));
     }
     let at = crate::arch::Timer::read_ns();
     let signalled =
         matches!(crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at), crate::sched::WaitResult::Signaled(_));
+    if !signalled {
+        match DISKS.take_back(i) {
+            TakeBack::Taken => return Err(Failed::Timeout),
+            TakeBack::Gone => return Err(Failed::Device("its device has gone")),
+            // **The DPC took it first**, and completes `po` only once it has let the device's lock
+            // go: so `po` is not dropped until then, as `hub::wait` waits (PR #363 review).
+            TakeBack::OnItsWay => {
+                use crate::sched::{WaitResult, wait_on};
+                let done = || matches!(wait_on(&[po.as_ptr() as usize], u64::MAX, 0), WaitResult::Signaled(_));
+                while !done() {
+                    hub::sleep(1_000_000);
+                }
+            }
+        }
+    }
     let mut d = DISKS.devs[i].lock();
     let Some(dev) = d.as_mut() else { return Err(Failed::Device("its device has gone")) };
-    if !signalled && matches!(dev.inflight, Some(Command { owner: Owner::Hub { .. }, .. })) {
-        // Taken back before the DPC can complete an operation this thread is about to drop. If the
-        // DPC took it first, its result is here, and its completion of `po` already happened.
-        dev.inflight = None;
-        return Err(Failed::Timeout);
-    }
     dev.hub_result.take().ok_or(Failed::Timeout)
 }
 
@@ -1186,34 +1200,14 @@ fn retire(i: usize) {
 
 // --- Recovery, deadlines and departure, in the hub thread ----------------------------------------
 
-/// **The earliest deadline of a command in flight**, for the hub thread to sleep until; `None` when
-/// nothing is in flight.
-pub(super) fn next_deadline() -> Option<u64> {
-    DISKS
-        .devs
-        .iter()
-        .filter_map(|s| s.lock().as_ref().and_then(|d| d.inflight))
-        .filter(|c| matches!(c.owner, Owner::Irp { .. }))
-        .map(|c| c.deadline)
-        .min()
+/// **How long the hub thread may sleep** at `now` ([`Disks::bound`]).
+pub(super) fn bound(now: u64) -> Option<u64> {
+    DISKS.bound(now)
 }
 
-/// **A device the hub thread must look at**: its xHCI slot, by table slot — one with a fault the DPC
-/// recorded, or a command past its deadline at `now`. The flag the DPC raises is taken here.
+/// **The devices the hub thread must look at** ([`Disks::due`]).
 pub(super) fn due(now: u64) -> [Option<u8>; MAX_DEVICES] {
-    DUE.store(false, Ordering::Release);
-    core::array::from_fn(|i| {
-        let mut d = DISKS.devs[i].lock();
-        let dev = d.as_mut()?;
-        if dev.fault.is_none()
-            && let Some(c) = dev.inflight
-            && matches!(c.owner, Owner::Irp { .. })
-            && now > c.deadline
-        {
-            dev.fault = Some(Fault::Deadline);
-        }
-        dev.fault.is_some().then_some(dev.slot)
-    })
+    DISKS.due(now)
 }
 
 /// What [`recover`] did.
@@ -1224,24 +1218,163 @@ pub(super) enum Recovered {
     Ended,
 }
 
+/// **How a recovery ends** ([`Disks::end_recovery`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum End {
+    /// The IRP completes with this status, and the next queued starts.
+    Complete(i32),
+    /// A unit attention: the command again, once.
+    Retry,
+    /// **Reset recovery failed**, so the bulk endpoints may never have stopped and the command's
+    /// TRBs may still move the IRP's data. It is held for the departure, which completes it once
+    /// the slot is disabled, as it completes a command in flight (PR #363 review).
+    Stranded,
+}
+
+/// **What a hub command whose wait ran out is doing** ([`Disks::take_back`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TakeBack {
+    /// Taken back before the DPC reached it: nothing will complete its operation.
+    Taken,
+    /// The DPC took it first: its completion of the operation is on its way.
+    OnItsWay,
+    /// The device has gone.
+    Gone,
+}
+
+impl Disks {
+    /// **How long the hub thread may sleep at `now`** (PR #363 review): until the earliest deadline of
+    /// an IRP's command in flight, and **never longer than a deadline's length while any disk is
+    /// bound**. A command started while it sleeps has a deadline at least that far off, so the
+    /// thread sees it by its deadline with nothing waking it: one wake a deadline's length on an idle
+    /// machine with a stick in, rather than one a command. `None` with no disk bound. (Until the
+    /// review it slept until the earliest deadline or without a bound, so a command started during
+    /// an unbounded sleep went unwatched until something else woke the thread.)
+    fn bound(&self, now: u64) -> Option<u64> {
+        let mut bound = None;
+        for s in &self.devs {
+            let d = s.lock();
+            let Some(dev) = d.as_ref() else { continue };
+            let mut until = bound.unwrap_or(now.saturating_add(DEADLINE_NS));
+            if let Some(c) = dev.inflight
+                && matches!(c.owner, Owner::Irp { .. })
+            {
+                until = until.min(c.deadline);
+            }
+            bound = Some(until);
+        }
+        bound
+    }
+
+    /// **The devices the hub thread must look at**: by table slot, the xHCI slot of each with a fault
+    /// the DPC recorded, or an IRP's command past its deadline at `now`, which is marked here.
+    fn due(&self, now: u64) -> [Option<u8>; MAX_DEVICES] {
+        core::array::from_fn(|i| {
+            let mut d = self.devs[i].lock();
+            let dev = d.as_mut()?;
+            if dev.fault.is_none()
+                && let Some(c) = dev.inflight
+                && matches!(c.owner, Owner::Irp { .. })
+                && now > c.deadline
+            {
+                dev.fault = Some(Fault::Deadline);
+            }
+            dev.fault.is_some().then_some(dev.slot)
+        })
+    }
+
+    /// **Begin recovering device `i`**: its fault and its IRP's command taken, so the hub thread's own
+    /// commands can use the rings, and every submit queued until [`Disks::end_recovery`]. `None` when
+    /// there is nothing to recover: no fault, or the command it was for has completed.
+    fn begin_recovery(&self, i: usize) -> Option<(Fault, IrpCmd, bool)> {
+        let mut d = self.devs[i].lock();
+        let dev = d.as_mut()?;
+        match (dev.fault.take(), dev.inflight.take()) {
+            (Some(f), Some(Command { owner: Owner::Irp { cmd, retried }, .. })) => {
+                dev.recovering = true;
+                Some((f, cmd, retried))
+            }
+            (_, inflight) => {
+                dev.inflight = inflight;
+                None
+            }
+        }
+    }
+
+    /// **End device `i`'s recovery of `cmd`** as `end` says, in the one lock scope that lets submits
+    /// start again: so none can start between the recovery's end and a retry, and have its command
+    /// replaced by the retry's (PR #363 review). A stranded command keeps the device recovering, so
+    /// nothing starts on a device about to be ended. What to do after, with no lock held.
+    fn end_recovery(&self, i: usize, cmd: IrpCmd, end: End, now: u64) -> Action {
+        let mut d = self.devs[i].lock();
+        let Some(dev) = d.as_mut() else {
+            return Action::Complete { irp: cmd.irp, status: KError::PeerClosed as i32, transferred: 0 };
+        };
+        match end {
+            End::Stranded => {
+                dev.stranded = Some(cmd.irp);
+                Action::None
+            }
+            End::Retry => {
+                dev.recovering = false;
+                dev.start(cmd, true, now);
+                Action::None
+            }
+            End::Complete(status) => {
+                dev.recovering = false;
+                if dev.inflight.is_none()
+                    && dev.fault.is_none()
+                    && let Some(next) = dev.queue.pop()
+                {
+                    dev.start(next, false, now);
+                }
+                let transferred = if status == 0 { cmd.len as u64 } else { 0 };
+                Action::Complete { irp: cmd.irp, status, transferred }
+            }
+        }
+    }
+
+    /// **Put one of the hub thread's commands on device `i`'s rings**, its operation at `po`: `cdb`
+    /// for unit `lun`, its data, `len` bytes, into the binding buffer — or, `status_only`, a status
+    /// wrapper alone, for the command last sent. Whether the device is still there.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_hub(&self, i: usize, po: *mut (), lun: u8, cdb: &[u8], len: u32, status_only: bool, now: u64) -> bool {
+        let mut d = self.devs[i].lock();
+        let Some(dev) = d.as_mut() else { return false };
+        dev.hub_result = None;
+        let owner = Owner::Hub { po };
+        if status_only {
+            let tag = dev.tag;
+            dev.inflight = Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS });
+            dev.ask_status();
+        } else {
+            let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
+            let frags = if len == 0 { &frags[..0] } else { &frags[..] };
+            dev.issue(owner, lun, cdb, len, len > 0, frags, now);
+        }
+        true
+    }
+
+    /// **A hub command's wait ran out**: taken back if the DPC has not reached it, so nothing
+    /// completes an operation the hub thread is about to drop.
+    fn take_back(&self, i: usize) -> TakeBack {
+        let mut d = self.devs[i].lock();
+        let Some(dev) = d.as_mut() else { return TakeBack::Gone };
+        if matches!(dev.inflight, Some(Command { owner: Owner::Hub { .. }, .. })) {
+            dev.inflight = None;
+            return TakeBack::Taken;
+        }
+        TakeBack::OnItsWay
+    }
+}
+
 /// **Recover device `i`**, whose command went wrong (bulk-only §6.7): a failed command's sense
 /// read — an illegal request to flush is no cache to flush, and a unit attention sends the command
 /// again once — a data stage's stall cleared and its status read, and reset recovery for anything
 /// else, a deadline included. The command is completed, and the next started. From the hub thread,
 /// with the device's memory.
 pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
-    let taken = {
-        let mut d = DISKS.devs[i].lock();
-        let Some(dev) = d.as_mut() else { return Recovered::Done };
-        match (dev.fault.take(), dev.inflight.take()) {
-            (Some(f), Some(Command { owner: Owner::Irp { cmd, retried }, .. })) => {
-                dev.recovering = true;
-                Some((f, cmd, retried))
-            }
-            _ => None,
-        }
-    };
-    let Some((fault, cmd, retried)) = taken else {
+    let Some((fault, cmd, retried)) = DISKS.begin_recovery(i) else {
         return Recovered::Done;
     };
     let mut sense = [0u8; scsi::SENSE_LEN];
@@ -1267,49 +1400,18 @@ pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
         }
         _ => reset_recovery(x, i, mem).map(|_| Some(KError::IoError as i32)).map_err(|_| ()),
     };
-    let now = crate::arch::Timer::read_ns();
-    if let Some(dev) = DISKS.devs[i].lock().as_mut() {
-        dev.recovering = false;
-    }
-    match outcome {
-        Ok(Some(status)) => {
-            let transferred = if status == 0 { cmd.len as u64 } else { 0 };
-            complete(cmd.irp, status, transferred);
-            start_next(i, now);
-            Recovered::Done
-        }
-        // A unit attention: the command again, once.
-        Ok(None) => {
-            let mut d = DISKS.devs[i].lock();
-            if let Some(dev) = d.as_mut() {
-                dev.start(cmd, true, now);
-                return Recovered::Done;
-            }
-            drop(d);
-            complete(cmd.irp, KError::PeerClosed as i32, 0);
-            Recovered::Done
-        }
-        Err(()) => {
-            complete(cmd.irp, KError::IoError as i32, 0);
-            Recovered::Ended
-        }
-    }
+    let end = match outcome {
+        Ok(Some(status)) => End::Complete(status),
+        Ok(None) => End::Retry,
+        Err(()) => End::Stranded,
+    };
+    act(DISKS.end_recovery(i, cmd, end, crate::arch::Timer::read_ns()), Some(x));
+    if end == End::Stranded { Recovered::Ended } else { Recovered::Done }
 }
 
-/// Start device `i`'s next queued command, if nothing is in flight.
-fn start_next(i: usize, now: u64) {
-    let mut d = DISKS.devs[i].lock();
-    if let Some(dev) = d.as_mut()
-        && dev.inflight.is_none()
-        && dev.fault.is_none()
-        && let Some(next) = dev.queue.pop()
-    {
-        dev.start(next, false, now);
-    }
-}
-
-/// What a departure leaves for after the slot is disabled: the command that was in flight.
-pub(super) struct Departed(Option<*mut Irp>);
+/// What a departure leaves for after the slot is disabled: the command that was in flight, and one
+/// a failed recovery stranded.
+pub(super) struct Departed([Option<*mut Irp>; 2]);
 
 /// **The device in xHCI slot `slot` has gone** (Phase 6 Part D.3): out of the table, so the DPC
 /// touches none of its memory; its queue completed `PeerClosed` now, and any later submit refused so
@@ -1317,18 +1419,18 @@ pub(super) struct Departed(Option<*mut Irp>);
 /// disabled: until then the controller may still move its data. From the hub thread.
 pub(super) fn depart(slot: u8) -> Departed {
     let Some(i) = DISKS.slot_of(slot) else {
-        return Departed(None);
+        return Departed([None; 2]);
     };
-    let (queued, inflight) = DISKS.depart(i);
+    let (queued, held) = DISKS.depart(i);
     for irp in queued.into_iter().flatten() {
         complete(irp, KError::PeerClosed as i32, 0);
     }
-    Departed(inflight)
+    Departed(held)
 }
 
 /// **Complete what a departure handed back**, `PeerClosed`, now that the slot is disabled.
 pub(super) fn finish(d: Departed) {
-    if let Some(irp) = d.0 {
+    for irp in d.0.into_iter().flatten() {
         complete(irp, KError::PeerClosed as i32, 0);
     }
 }
@@ -1509,6 +1611,7 @@ mod tests {
                 fault: None,
                 hub_result: None,
                 recovering: false,
+                stranded: None,
                 queue: Queue::new(),
             }
         }
@@ -1629,6 +1732,199 @@ mod tests {
         assert_eq!(disks.devs[j].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
     }
 
+    /// **The hub thread sleeps no longer than a deadline's length while a disk is bound** (PR #363
+    /// review: a stick that stalled on an idle machine was timed out only once another device
+    /// arrived). Idle, it sleeps a deadline's length; with a command in flight, until that command's
+    /// deadline if sooner. So a command started while it sleeps is seen by its own deadline, though
+    /// nothing wakes the thread for it. With no disk bound, nothing bounds the sleep.
+    #[test]
+    fn the_hub_thread_sleeps_no_longer_than_a_deadline_while_a_disk_is_bound() {
+        init_global_heap();
+        let disks = Disks::new();
+        let (mut fake, mut other) = (Fake::new(), Fake::new());
+        assert_eq!(disks.bound(0), None, "no disk: no bound");
+        let (i, ei) = disks.take(fake.dev(5)).unwrap();
+        let slept = 100;
+        let until = disks.bound(slept);
+        assert_eq!(until, Some(slept + DEADLINE_NS), "idle: a deadline's length");
+
+        // A command started while it sleeps, with nothing to wake it: seen by its own deadline.
+        let mut a = irp(IrpOp::Flush, 0, 0, &[]);
+        assert_eq!(disks.submit(&mut a, context(i, 0, ei), 150), Action::None, "no wake");
+        let woke = until.unwrap();
+        assert!(woke <= 150 + DEADLINE_NS, "the thread wakes before the command is due");
+        assert_eq!(disks.due(woke)[i], None, "and finds it not yet due");
+        assert_eq!(disks.bound(woke), Some(150 + DEADLINE_NS), "so sleeps until its deadline");
+        assert_eq!(disks.due(150 + DEADLINE_NS + 1)[i], Some(5), "and marks it then");
+
+        // Another disk's command, sooner than a deadline's length: the earliest bounds the sleep.
+        let (j, ej) = disks.take(other.dev(6)).unwrap();
+        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
+        disks.submit(&mut b, context(j, 0, ej), 120);
+        assert_eq!(disks.bound(130), Some(120 + DEADLINE_NS), "the earliest command's deadline");
+    }
+
+    /// **A deadline marked as its command ends is not charged to the next** (PR #363 review): the
+    /// status arriving before the hub thread takes the command completes it, clears the mark, and
+    /// leaves the next command running, with nothing for the hub thread to recover.
+    #[test]
+    fn a_deadline_marked_as_its_command_ends_is_not_charged_to_the_next() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+        let ctx = context(i, 0, epoch);
+        let (mut a, mut b) = (irp(IrpOp::Flush, 0, 0, &[]), irp(IrpOp::Flush, 0, 0, &[]));
+        disks.submit(&mut a, ctx, 0);
+        disks.submit(&mut b, ctx, 0);
+        assert_eq!(disks.due(DEADLINE_NS + 1)[i], Some(5), "past its deadline: marked");
+        assert_eq!(disks.on_transfer(5, 4, code::SUCCESS, 0, DEADLINE_NS + 2), Some(Action::None));
+        fake.answer(1, 0);
+        let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), DEADLINE_NS + 2);
+        assert_eq!(done, Some(Action::Complete { irp: &mut a, status: 0, transferred: 0 }), "it made it");
+        assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, None, "the mark went with it");
+        assert!(disks.begin_recovery(i).is_none(), "nothing for the hub thread to recover");
+        let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
+        let b_ptr = &mut b as *mut Irp;
+        assert!(matches!(running, Some(Owner::Irp { cmd, .. }) if cmd.irp == b_ptr), "the next left running");
+        assert_eq!(disks.due(DEADLINE_NS + 3)[i], None, "inside its own deadline");
+    }
+
+    /// **A command left for the hub thread ignores its later events**: after its command wrapper
+    /// stalls, the data stage's event asks for no status on rings the hub thread is about to reset.
+    #[test]
+    fn a_command_left_for_the_hub_thread_ignores_its_later_events() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+        let mut r = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
+        disks.submit(&mut r, context(i, 0, epoch), 0);
+        assert_eq!(disks.on_transfer(5, 4, code::STALL, 0, 1), Some(Action::Wake), "the command wrapper stalls");
+        let data_trb = fake.rings[0].as_ptr() as u64;
+        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, data_trb, 1), Some(Action::None), "the data's, ignored");
+        assert_eq!(fake.trb(0, 1), Trb::default(), "no status asked for");
+        assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
+    }
+
+    /// **A recovery ends in the scope that lets submits start again** (PR #363 review): a submit during
+    /// it waits, and a retry is the command in flight with the waiting one behind it — neither
+    /// replaced, and a departure hands back both.
+    #[test]
+    fn a_retry_is_in_flight_with_the_submit_that_waited_behind_it() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+        let ctx = context(i, 0, epoch);
+        let mut a = irp(IrpOp::Flush, 0, 0, &[]);
+        disks.submit(&mut a, ctx, 0);
+        disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
+        fake.answer(1, 1);
+        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
+        let (fault, cmd, retried) = disks.begin_recovery(i).unwrap();
+        assert_eq!((fault, cmd.irp, retried), (Fault::Status(Status::Failed), &mut a as *mut Irp, false));
+        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
+        assert_eq!(disks.submit(&mut b, ctx, 2), Action::None);
+        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "it waits behind the recovery");
+        assert_eq!(disks.end_recovery(i, cmd, End::Retry, 3), Action::None);
+        let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
+        let a_ptr = &mut a as *mut Irp;
+        assert!(matches!(running, Some(Owner::Irp { cmd, retried: true }) if cmd.irp == a_ptr), "the retry runs");
+        let (q, held) = disks.depart(i);
+        assert_eq!((q[0], q[1]), (Some(&mut b as *mut Irp), None), "the one that waited, handed back");
+        assert_eq!(held, [Some(&mut a as *mut Irp), None], "and the retry");
+    }
+
+    /// **A command a failed recovery stranded is the departure's** (PR #363 review): reset recovery
+    /// may never have stopped its endpoints, so it is not completed until the slot is disabled, and
+    /// nothing starts meanwhile.
+    #[test]
+    fn a_stranded_command_waits_for_the_departure() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+        let ctx = context(i, 0, epoch);
+        let mut a = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
+        disks.submit(&mut a, ctx, 0);
+        disks.due(DEADLINE_NS + 1);
+        let (fault, cmd, _) = disks.begin_recovery(i).unwrap();
+        assert_eq!(fault, Fault::Deadline);
+        assert_eq!(disks.end_recovery(i, cmd, End::Stranded, DEADLINE_NS + 2), Action::None, "not completed");
+        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
+        disks.submit(&mut b, ctx, DEADLINE_NS + 3);
+        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "nothing starts on a device being ended");
+        let (q, held) = disks.depart(i);
+        assert_eq!(q[0], Some(&mut b as *mut Irp));
+        assert_eq!(held, [None, Some(&mut a as *mut Irp)], "the stranded command, for after the slot is disabled");
+    }
+
+    /// **A hub command whose wait ran out is taken back only if the DPC has not reached it** (PR #363
+    /// review): once the DPC has, its completion of the operation is on its way and is waited for,
+    /// as `hub::wait` waits.
+    #[test]
+    fn a_hub_command_the_dpc_reached_is_waited_for() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, _) = disks.take(fake.dev(5)).unwrap();
+        let po = 0x1234 as *mut ();
+        assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
+        assert_eq!(disks.take_back(i), TakeBack::Taken, "before the DPC reached it");
+        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
+        assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
+        disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
+        fake.answer(2, 0);
+        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Hub { po }));
+        assert_eq!(disks.take_back(i), TakeBack::OnItsWay, "after it: its completion is on its way");
+        let result = disks.devs[i].lock().as_ref().unwrap().hub_result;
+        assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
+    }
+
+    /// **A command's TRBs never straddle the Link** (PR #363 review): a three-fragment read that would
+    /// not fit before it goes after it, the slots before it filled with No Ops.
+    #[test]
+    fn a_transfer_that_would_straddle_the_link_goes_after_it() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let mut dev = fake.dev(5);
+        while dev.bulk_in.producer.room_before_link(RING_TRBS) > 2 {
+            dev.bulk_in.producer.push(&mut RawSlots(dev.bulk_in.virt), Trb::no_op());
+        }
+        let before = dev.bulk_in.producer.next_slot();
+        let (i, epoch) = disks.take(dev).unwrap();
+        let frags = [0x1000, 0x2000, 0x3000].map(|base| PhysFrag { base, len: 512 });
+        let mut r = irp(IrpOp::Read, 0, 1536, &frags);
+        disks.submit(&mut r, context(i, 0, epoch), 0);
+        assert_eq!((fake.trb(0, before).kind(), fake.trb(0, before + 1).kind()), (kind::NO_OP, kind::NO_OP), "padding");
+        assert_eq!([0, 1, 2].map(|k| fake.trb(0, k).0[0]), [0x1000, 0x2000, 0x3000], "the read, whole, after the Link");
+        assert_ne!(fake.trb(0, 0).cycle(), fake.trb(0, before).cycle(), "on the ring's next pass");
+    }
+
+    /// **The status is its wrapper's own event** (PR #363 review): a read whose first TRB comes up
+    /// short raises an event there and another at its last TRB, which interrupts. The second arrives
+    /// on IN once the status is asked for, and is not the status, though the device has answered.
+    #[test]
+    fn a_short_reads_last_data_event_is_not_its_status() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(9)).unwrap();
+        let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
+        let mut r = irp(IrpOp::Read, 0, 8192, &frags);
+        disks.submit(&mut r, context(i, 0, epoch), 0);
+        let in_ring = fake.rings[0].as_ptr() as u64;
+        assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None), "short at the first");
+        fake.answer(1, 0);
+        let last = in_ring + 16;
+        assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, last, 1), Some(Action::None), "the last TRB's own");
+        assert!(matches!(disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.stage), Some(Stage::Status { .. })));
+        let done = disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1);
+        assert_eq!(done, Some(Action::Complete { irp: &mut r, status: 0, transferred: 8192 }), "the status wrapper's");
+    }
+
     /// **A slot taken, departed and taken again serves its old node nothing of the new device**
     /// (PR #361's lesson): the departure hands back the queue and the command in flight, a submit
     /// through the old context is refused `PeerClosed`, and the new device's context is served.
@@ -1650,7 +1946,7 @@ mod tests {
         disks.submit(&mut queued, old, 0);
         let (q, f) = disks.depart(disks.slot_of(14).unwrap());
         assert_eq!(q[0], Some(&mut queued as *mut Irp), "the queue handed back");
-        assert_eq!(f, Some(&mut inflight as *mut Irp), "and the command in flight");
+        assert_eq!(f, [Some(&mut inflight as *mut Irp), None], "and the command in flight");
         let mut late = irp(IrpOp::Flush, 0, 0, &[]);
         assert_eq!(disks.submit(&mut late, old, 0), Action::Complete { irp: &mut late, status: KError::PeerClosed as i32, transferred: 0 });
 

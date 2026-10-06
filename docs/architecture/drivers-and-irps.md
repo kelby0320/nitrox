@@ -263,7 +263,11 @@ and their completions are Transfer Events the controller's DPC reads off its eve
   hardware.
 - **The hub thread takes what waits**: a stall's recovery, a command past its thirty-second
   deadline, and the device's departure. The DPC marks the device and wakes it; the thread runs the
-  commands with waits in them, as [above](#a-kernel-thread-that-waits-phase-6-part-a2).
+  commands with waits in them, as [above](#a-kernel-thread-that-waits-phase-6-part-a2). It sleeps
+  until the earliest deadline of a command in flight, and **never longer than a deadline's length
+  while a disk is bound**, so a command started meanwhile is seen by its own deadline and a submit
+  never has to wake it — a submit may come from a page fault's fill, where waking a thread is not
+  the driver's to do.
 
 **Its `poll` does nothing.** A USB disk exists only once the scheduler runs, so the boot's polled
 `read_blocking` never reaches one; its partition table is read by the hub thread before the disk is

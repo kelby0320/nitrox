@@ -735,6 +735,20 @@ mod tests {
         assert!(storage_interface(&c).is_some());
     }
 
+    /// **An interface's endpoints are its own** (PR #363 review): a bulk-only interface with a bulk IN
+    /// alone does not take the next interface's bulk OUT to make up the pair.
+    #[test]
+    fn a_storage_interface_takes_no_endpoint_of_the_next_interface() {
+        let mut c = vec![9, 2, 0, 0, 2, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 1, 8, 6, 0x50, 0]); // bulk-only, its bulk IN alone
+        c.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+        c.extend_from_slice(&[9, 4, 1, 0, 1, 0xFF, 0, 0, 0]); // vendor, with a bulk OUT
+        c.extend_from_slice(&[7, 5, 0x02, 2, 64, 0, 0]);
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(storage_interface(&c), None);
+    }
+
     /// **A string, made printable**: UTF-16LE, anything outside printable ASCII as `?`, padding
     /// dropped, and cut to the space it is written into.
     #[test]

@@ -34286,3 +34286,56 @@ that in again. `check-live`, `check-install` and `check-report` hold the boot st
 
 No ABI hash impact: the registry is not a hash input, `LimineFile` is the bootloader's layout, and
 no syscall, record or exported type changed.
+
+## 2026-10-06 — PR #363, reviewed: a deadline nobody watched, and an overflow on a stick's table
+
+Two blocking findings, three worth fixing and four optional, all taken. Each was checked against the
+source before it was fixed.
+
+**1. A stick that stopped answering was never timed out.** The hub thread read the commands'
+deadlines only on its way to sleep. With nothing in flight it slept without a bound, and a command
+started after that woke nothing. The reviewer throttled a stick to 5 bytes a second and listed it:
+no recovery came until another device was plugged in. **The fix bounds the sleep**: while any disk
+is bound, the hub thread never sleeps longer than a deadline's length (`Disks::bound`). A command
+started meanwhile has a deadline at least that far off, so the thread sees it by its deadline
+without being woken.
+
+**A first fix was replaced after measuring it.** It had a submit that started a command while the
+thread slept unbounded wake it, through a DPC. The same probe showed it working — recovery 30.0 s
+after the stall — but the thread woke 50 times over the gate's run, in bursts: with commands faster
+than a wake, nearly every one started from idle and woke it again. The bounded sleep woke it 4
+times over the same run, and recovered 30.04 s after the stall. It also needs no atomic and no
+ordering argument between CPUs, which no host test could have held.
+
+**2. A GPT entry spanning every LBA panicked the kernel** in the add that counts its blocks, which
+runs before the check that it fits. Any stick plugged in reaches it now. The count is checked
+arithmetic, and so is `read_blocking`'s multiply of a header-supplied LBA. Two more in the same
+class: a GPT whose entry array is off the disk is refused before it is read, and `fits` no longer
+lets a disk of no blocks hold anything — no caller passes one.
+
+**3. A recovery's retry could replace a command started meanwhile.** `recovering` was cleared in
+one lock scope and the retry started in another. Recovery now begins and ends in `Disks` methods,
+and the end and the retry share one scope.
+
+**4. A hub command's operation could be dropped before the DPC completed it**, on a timeout that
+lost the race to the DPC. `run_once` now waits for that completion, as `hub::wait` does.
+
+**5. Three guards survived deletion**, and now have tests that fail without them:
+- the No-Op padding before the Link;
+- the status wrapper's TRB address — a short read's last data TRB raises its own event, after the
+  status is asked for;
+- `inside = false` in the descriptor walk.
+
+**Optional, all taken:**
+- **A deadline marked as its command was completing was charged to the next.** A completion now
+  clears the mark. A command with any other fault recorded ignores its later events: it is the hub
+  thread's, which is about to reset its rings.
+- **A failed reset recovery completed its IRP before anything had stopped its transfer.** The IRP is
+  now *stranded* on the device, which stays shut, and the departure that follows completes it once
+  the slot is disabled.
+- Two stale sentences, and doc comments on the new public items.
+
+**Controls:** every new guard was deleted or inverted in turn, and each deletion failed its test:
+twelve in `xhci::storage`, re-run on the final code; three in `partitions`; one in `desc`.
+
+No ABI hash impact: kernel internals only.

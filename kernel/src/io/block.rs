@@ -395,7 +395,11 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     let Some(backend) = dn.block_backend() else {
         return false;
     };
-    let len = (count * 512) as usize;
+    // **Checked**: a table's header names where its entries are, and is the disk's bytes, not ours.
+    let (Some(offset), Some(len)) = (lba.checked_mul(512), count.checked_mul(512)) else {
+        return false;
+    };
+    let len = len as usize;
     if dst.len() < len {
         return false;
     }
@@ -413,7 +417,7 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
         ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), crate::libkern::handle::KObjectType::PendingOperation)
     };
 
-    if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, lba * 512, 0, len as u64)
+    if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64)
         .is_err()
     {
         return false;

@@ -843,8 +843,10 @@ impl FileObject {
     /// map and issue a block **write** IRP from the frame to that LBA, blocking on each.
     /// Pages over a hole (`device_lba == 0`, unallocated) are skipped — growing a file is
     /// Part D. `file_obj` is this object's reference (pins the frames across the IRPs). Runs
-    /// in a syscall thread (it blocks). Returns `true` iff every write succeeded; `false`
-    /// for a non-block producer or an I/O/allocation failure.
+    /// in a syscall thread (it blocks). [`WriteBack::Written`] when every write succeeded,
+    /// [`WriteBack::Gone`] when the device refused one `PeerClosed` — it has left, and no later
+    /// write-back can do better — and [`WriteBack::Failed`] for a non-block producer or any
+    /// other I/O or allocation failure.
     pub fn writeback(file_obj: &ObjectRef) -> WriteBack {
         debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).

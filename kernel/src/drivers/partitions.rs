@@ -70,6 +70,7 @@ pub enum Scheme {
 
 /// What a disk's table says.
 pub struct Table {
+    /// Which scheme it is, with a GPT's disk GUID.
     pub scheme: Scheme,
     /// Its partitions, in table order.
     pub parts: KVec<Part>,
@@ -121,6 +122,9 @@ fn gpt(hdr: &[u8], blocks: u64, read_blocks: &mut dyn FnMut(u64, u64, &mut [u8])
     while array.len() < len {
         array.try_push(0).map_err(|_| Unread::NoMemory)?;
     }
+    if array_blocks > 0 && !fits(array_lba, array_blocks, blocks) {
+        return Err(Unread::Unsupported("its entries are off the disk"));
+    }
     if array_blocks > 0 && !read_blocks(array_lba, array_blocks, &mut array) {
         return Err(Unread::Io);
     }
@@ -132,7 +136,12 @@ fn gpt(hdr: &[u8], blocks: u64, read_blocks: &mut dyn FnMut(u64, u64, &mut [u8])
             continue;
         }
         let (first, last) = (u64_at(e, 32), u64_at(e, 40));
-        if last < first || !fits(first, last - first + 1, blocks) {
+        // **Counted only where it cannot overflow**: a stick's table is anyone's bytes, and an
+        // entry from 0 to the last LBA there could be would panic the add (PR #363 review).
+        let Some(count) = last.checked_sub(first).and_then(|n| n.checked_add(1)) else {
+            continue;
+        };
+        if !fits(first, count, blocks) {
             continue;
         }
         let mut guid = [0u8; 16];
@@ -140,7 +149,7 @@ fn gpt(hdr: &[u8], blocks: u64, read_blocks: &mut dyn FnMut(u64, u64, &mut [u8])
         let mut name = [0u8; 72];
         name.copy_from_slice(&e[56..128]);
         let number = parts.len() as u32 + 1;
-        let part = Part { first_lba: first, count: last - first + 1, number, kind: PartKind::Gpt { guid, name } };
+        let part = Part { first_lba: first, count, number, kind: PartKind::Gpt { guid, name } };
         parts.try_push(part).map_err(|_| Unread::NoMemory)?;
     }
     Ok(Table { scheme: Scheme::Gpt { disk_guid }, parts, extended: 0 })
@@ -204,10 +213,10 @@ fn is_volume_boot_sector(b: &[u8]) -> bool {
     fat16 || fat32
 }
 
-/// Whether `[first, first + count)` lies on a disk of `blocks` blocks. A disk of unknown size takes
-/// anything.
+/// Whether `[first, first + count)` lies on a disk of `blocks` blocks. Every caller knows the disk's
+/// size, so a disk of none holds nothing.
 fn fits(first: u64, count: u64, blocks: u64) -> bool {
-    first.checked_add(count).is_some_and(|end| blocks == 0 || end <= blocks)
+    first.checked_add(count).is_some_and(|end| end <= blocks)
 }
 
 /// **The GPT GUID of the disk the machine started from**, as Limine's module records give it:
@@ -355,10 +364,46 @@ mod tests {
     #[test]
     fn a_gpt_entry_off_the_disk_is_passed_over() {
         init_global_heap();
-        let img = gpt_image(4096, 4, &[(0x83, 2048, 4095, "fits"), (0x83, 2048, 4096, "past"), (0x83, 3000, 2999, "back")]);
+        let img = gpt_image(4096, 8, &[
+            (0x83, 2048, 4095, "fits"),
+            (0x83, 2048, 4096, "past"),
+            (0x83, 3000, 2999, "back"),
+            // **Every LBA there could be** (PR #363 review): its count overflows, and must not panic.
+            (0x83, 0, u64::MAX, "all"),
+            (0x83, 1, u64::MAX, "rest"),
+        ]);
         let t = img.read().unwrap();
         assert_eq!(t.parts.len(), 1);
         assert_eq!(t.parts[0].count, 2048, "the last block is the disk's last");
+    }
+
+    /// **A GPT whose entries are off the disk is not read** (PR #363 review): the header says where
+    /// they are, and a stick's header is anyone's bytes. The disk's last block is on it.
+    #[test]
+    fn a_gpt_whose_entries_are_off_the_disk_is_unsupported() {
+        init_global_heap();
+        let mut img = gpt_image(4096, 4, &[]);
+        for (lba, on) in [(4096u64, false), (u64::MAX, false), (4095, true)] {
+            img.at(BLOCK + 72)[..8].copy_from_slice(&lba.to_le_bytes());
+            match img.read() {
+                Err(Unread::Unsupported(_)) => assert!(!on, "block {lba} is on the disk"),
+                // The image stores its first blocks only, so a read of the last fails.
+                Err(Unread::Io) => assert!(on, "block {lba} is off the disk, yet was read"),
+                _ => panic!("block {lba}: neither refused nor read"),
+            }
+        }
+    }
+
+    /// **A disk of no blocks holds no partition**: every caller knows its disk's size, and an entry
+    /// cannot lie on none.
+    #[test]
+    fn a_disk_of_no_blocks_holds_no_partition() {
+        init_global_heap();
+        let mut img = Image::blank(8192);
+        sign(&mut img);
+        mbr_entry(&mut img, 0, 0x80, 0x0C, 2048, 2048);
+        img.1 = 0;
+        assert_eq!(img.read().unwrap().parts.len(), 0);
     }
 
     /// An entry size that does not divide a block is not a table this parser takes.

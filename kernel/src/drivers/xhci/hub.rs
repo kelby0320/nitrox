@@ -166,10 +166,11 @@ pub(super) extern "C" fn main(_arg: usize) {
     // **Then every later change**, woken by the DPC. The wake latches, so changes that land while
     // a device is being enumerated are found by the scan after it.
     loop {
-        // **Until the earliest storage command's deadline**, while one is in flight (Phase 6 Part
-        // D.3): that is what bounds a stick that stops answering.
-        let until = super::storage::next_deadline();
+        // **Until the earliest storage command's deadline** (Phase 6 Part D.3), and never longer
+        // than a deadline's length while a disk is bound: that is what bounds a stick that stops
+        // answering, including on an idle machine, where nothing else wakes this (PR #363 review).
         let now = crate::arch::Timer::read_ns();
+        let until = super::storage::bound(now);
         match crate::sched::wait_on(&[x.hub_wake.as_ptr() as usize], until.unwrap_or(u64::MAX), now) {
             crate::sched::WaitResult::Signaled(_) => crate::sched::interrupt_consume(x.hub_wake.as_ptr()),
             _ if until.is_some() => {}

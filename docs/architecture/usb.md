@@ -349,8 +349,17 @@ Endpoint*, or *Stop Endpoint* for one still running, *Set TR Dequeue Pointer* pa
 then `CLEAR_FEATURE(ENDPOINT_HALT)` — and the status read; and reset recovery, the class's reset
 request and both endpoints cleared, for a phase error, a bad wrapper, a stalled command wrapper or a
 command past its **thirty-second deadline**. The hub thread keeps that deadline, sleeping until the
-earliest one while a command is in flight; it is what bounds a stick that stops answering. A device
-that does not recover is ended as on an unplug.
+earliest one while a command is in flight; it is what bounds a stick that stops answering. **While
+any disk is bound it never sleeps longer than a deadline's length**, so a command started while it
+sleeps, whose deadline is at least that far off, is seen by its deadline with nothing waking the
+thread for it: one wake every thirty seconds on an idle machine with a stick in, rather than one a
+command. (Until PR #363's review it slept without a bound when nothing was in flight, so a stick
+that stalled on an idle machine was timed out when another device happened to arrive.) **A recovery
+ends in the one lock scope that lets submits start again**, so a retry cannot replace a command
+started meanwhile. A deadline marked as its command was completing goes with that command, and is
+not charged to the next. A device that does not recover is ended as on an unplug; **its command is
+completed by the departure**, once the slot is disabled, since a reset that failed may never have
+stopped the endpoints its TRBs are on.
 
 **A departure**, before the records depart: the device out of the DPC's table, its queue completed
 `PeerClosed`, and any later submit refused so; the command in flight completed `PeerClosed` once the
@@ -450,12 +459,18 @@ supervises.
   memory standing in for the rings, the wrapper page and the doorbell array: a read's TRBs, its
   status asked for at its data stage's end (short, there) and its completion; the next IRP started;
   a failed status and a stall left for the hub thread, and a submit meanwhile queued; and a slot
-  departed and taken again, its old node refused `PeerClosed` and its new one served. Each has a
-  control that fails it, the epoch's bump and check among them, which PR #361 found untested in the
-  input nodes'.
+  departed and taken again, its old node refused `PeerClosed` and its new one served. Since PR
+  #363's review, also: the hub thread's sleep bounded by a deadline's length while a disk is
+  bound; a deadline marked as its command ends not charged to the next; a command left
+  for the hub thread ignoring its later events; a recovery's retry in flight with the submit that
+  waited behind it; a stranded command held for the departure; a hub command the DPC reached
+  waited for; a transfer that would straddle the Link put after it; and a short read's last data
+  event not taken for its status. Each has a control that fails it, the epoch's bump and check
+  among them, which PR #361 found untested in the input nodes'.
 - **`drivers::partitions`** — GPT with its disk's GUID, MBR's entries by slot, a filesystem's boot
-  sector and a block whose status bytes no MBR has as no table, entries off the disk dropped, and
-  the boot disk by its GUID.
+  sector and a block whose status bytes no MBR has as no table, entries off the disk dropped — one
+  spanning every LBA there could be among them, which overflowed until PR #363's review — a GPT
+  whose entries are off the disk refused, and the boot disk by its GUID.
 - **`test-qemu`**'s stick is an MBR stick with one FAT partition: the host holds the disk's line,
   its partition and the storage service's report, and `boot-probe` the disk under its device, the
   partition under it, and the boot flag on the one disk the image booted from.
