@@ -34127,3 +34127,87 @@ every later device.
 
 No ABI hash impact: no value changes, only doc comments on `KError`, and `Nodes` is the kernel's
 own.
+
+## 2026-10-06 — Phase 6 Part D, detailed: mass storage
+
+Part D's detail pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part D in detail*. A
+bulk-only interface binds as a disk during enumeration. The disk's partition table is read where it
+arrives. The storage service mounts what arrives and tears down what departs. The stick a live boot
+started from is passed over.
+
+**Two facts measured for it, rather than assumed:**
+- **QEMU hot-plugs and re-plugs a stick.** `blockdev-add` then `device_add usb-storage` plugs one
+  into a running machine, at 8.2.2 (CI's) and 11.0.2 alike. `device_del` unplugs it and leaves the
+  node, so the same image plugs in again. A `-drive if=none` drive would have gone with its device.
+- **Limine's module records name the boot disk.** Printed on a live-stick boot and a disk boot,
+  every module's record carried the GPT disk GUID of the volume it came from, in the byte order a
+  GPT header stores it: the stick's on one, the disk's on the other, as `sgdisk -p` reads them.
+
+**The calls made:**
+- **The I/O path is the controller's DPC's, as AHCI's is its interrupt's.** A command goes on the
+  rings whole, and the status wrapper's completion ends it and starts the next.
+- **Recovery is the hub thread's**: stalls, bad status, and a command past its thirty-second
+  deadline. The deadline is what bounds a stick that stops answering, since the storage service
+  and `fs-server-ext4` wait on their reads with no bound of their own.
+- **A thread per disk was set aside.** It would cost two context switches a command, and the
+  controller's one wait record would have had to become many.
+- **One configuration per device**, so a second class's `SET_CONFIGURATION` cannot reset the first's
+  endpoints.
+- **The boot medium is a flag the kernel sets**, `BOOT` in a record's `flags`, from a GUID only the
+  kernel reads. The storage service passes the disk over and names it in `InUse`. `nxinstall`
+  refuses it as the running system.
+- **A departed mount is unmounted**: its dirty files' write-backs are refused and the files let go,
+  then `Meta::Unmount` ends the server, whose marking fails. (Until the review this said the server
+  was terminated, which would not have ended it.)
+- **Disk slots are a value a host test drives**, under an epoch. That is PR #361's lesson applied
+  before it could recur.
+
+**Two calls put to the maintainer, who agreed to both as recommended:**
+- **Where the gate lives: `check-storage`.** Its live boot mounts a stick read-only, so the gate
+  remounts it writable until Part F. The alternative was a new gate on an installed-style boot.
+- **`/dev/disk` names for a stick: none.** Those names are `init`'s, bound from what the boot's
+  probe found. A stick read in the first round would otherwise put its partitions among them. Its
+  `nitrox-root`, say, would lose to the internal disk's only because AHCI is probed first.
+
+## 2026-10-06 — PR #362, reviewed: a terminate that kills nothing, and files pinned for the boot
+
+One blocking finding, two worth fixing and three optional, all taken into Part D's detail pass. Each
+was read against the source before it went in.
+
+**1. "Its server is terminated" would not have ended `fs-server-ext4`.** `sys_process_terminate`
+queues `TerminateRequested` and does nothing else, and the server never reads its notification
+channel. So a stick pulled while mounted would have left a server running per pull, holding the
+device. Now the teardown sends `Meta::Unmount`, which ends the server whether or not it can record
+the filesystem clean.
+
+**Found reading it:** a server whose forwarding endpoint loses its peer spins, since the closed
+peer stays signalled and its loop waits again at once. The storage service's `mount` reaches that
+when it abandons a server after its `Ready`, believing a terminate ends it. Part D makes the server
+exit then, after a probe shows the spin, which is read, not run.
+
+**2. A pulled mount's dirty files would have been pinned for the boot, not lost.** A dirty file
+holds a reference to itself until a write-back succeeds or its server forgets it, and a write-back
+to a device that has gone never succeeds. Part D gains a kernel piece: a write-back refused
+`PeerClosed` lets its file go, as a `Forget` does. Any other failure keeps the pin, since that
+data can still reach a device that answers again.
+
+**3. The control meant to catch a departure leaving submits queued had nothing to hang on.** The
+teardown is driven by the manager's `Departed`, and the pulled stick had no I/O in flight. Now the
+teardown itself does I/O to the departed disk — the dirty file's write-back and the server's
+marking — and the gate asserts each comes back.
+
+**Optional:**
+- **Every command at binding is the hub thread's own, bounded at five seconds**, the partition
+  table's read among them. That read happens before the disk is published, so nothing else waits
+  on it while the hub thread does.
+- **Status 1 is read through `REQUEST SENSE`.** A data-stage stall clears that endpoint's halt and
+  reads the status. Only a phase error, a bad wrapper, a stalled command wrapper or a deadline
+  takes reset recovery, as bulk-only §6.7 lays out.
+- **`mount`'s comment on terminating a server** is corrected with item 1's fix.
+
+**And one of the pass's own claims was wrong.** It said a failed page-cache fill ends the faulting
+process. It suspends the faulting thread and notifies its process, and nothing supervises an
+ordinary program's faults. The thirty-second auto-terminate is deferred, so the program stays
+suspended. A program touching a pulled stick's unread page reaches that, and it goes to the
+deferrals with the pulled stick as its trigger. The pass also cited `fault-survival.md` for it,
+which is about kernel faults.
