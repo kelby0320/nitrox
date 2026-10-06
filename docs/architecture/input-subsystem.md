@@ -6,8 +6,9 @@ hardware report (Phase 5 Part D, 2026-09-14), input routed only after the reques
 it (2026-09-22), the input server's devices handed over by the device manager (administration
 Part B.3, 2026-09-24), each node's ring and read hand-off shared in `drivers::input` (Phase 6 Part
 B.1, 2026-10-05), USB keyboards and mice beside the i8042's (Phase 6 Parts B.2–B.4,
-2026-10-05), and Caps Lock, Num Lock, the keypad and the keyboards' lights (Phase 6 Part B.5,
-2026-10-05) — and this document describes what exists.** The whole path from an interrupt to a keystroke
+2026-10-05), Caps Lock, Num Lock, the keypad and the keyboards' lights (Phase 6 Part B.5,
+2026-10-05), and USB keyboards and mice that come and go after boot (Phase 6 Part C, 2026-10-05)
+— and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
@@ -32,11 +33,11 @@ property that paced injection cannot test: a burst of motion delivered *while* t
 recomposing the whole screen must still put the cursor exactly where the arithmetic says (§7).
 `cargo xtask check-terminal` types under Caps Lock and on the keypad, with Num Lock on and off, and
 reads the PS/2 keyboard's lights back from QEMU's trace of them; `check-input --usb` asserts a USB
-keyboard acknowledged its lights (§4c).
+keyboard acknowledged its lights (§4c), and unplugs its keyboard, types on another plugged in, and
+holds a key down on that one as it is unplugged, to see the release (§4d).
 
-**What is specified here and not built:** touchpads, gestures and absolute-coordinate devices; and
-a USB keyboard or mouse plugged in after the device manager's one read of the registry reaching
-the input server, which is Phase 6 Part C. `SYN_DROPPED` is produced by the driver and honoured by
+**What is specified here and not built:** touchpads, gestures and absolute-coordinate devices.
+`SYN_DROPPED` is produced by the driver and honoured by
 `libinput`, but the Surface protocol has **no loss marker**, so a client is not told when the
 *compositor's* outbox overflows (§5, and `../rationale/deferred-decisions.md`).
 
@@ -345,6 +346,29 @@ the newest matters.
 
 Scroll Lock is not a lock here, so its light stays off.
 
+### 4d. Devices that come and go
+
+*(Phase 6 Part C, 2026-10-05.)* **A USB keyboard or mouse plugged in after boot reaches the input
+server, and one unplugged leaves it.** Three pieces, one per layer:
+- **The driver releases what the device held.** On departure the hub thread decodes a keyboard's
+  last report against an empty one — its keys, then its modifiers, then `SYN_REPORT` — and
+  releases a mouse's held buttons from its decoder's state, and pushes the events to the node.
+  **Only the driver knows what one device held**: the input server merges devices into one stream,
+  and the compositor's interpreter sees only that. So a key held when its keyboard is unplugged is
+  released, its repeat stops, and a drag in progress ends. Then the node retires: a read is answered
+  with what its ring still holds, and after that refused, `PeerClosed`; a report pushed after it
+  retires is dropped, so the releases stay last (`Reader::offer`, PR #361 review).
+- **The device manager follows the registry** — a read waiting on `/dev/registry/changes` — and
+  sends the input server an `Arrived` for a device plugged in and a `Departed` for one unplugged
+  ([`device-manager.md`](device-manager.md) §3a).
+- **The input server retires a slot once both have said so**: its node answering `PeerClosed`, and
+  the manager's `Departed`, in either order (`input_server::leaving`). Retired on `Departed` alone,
+  it would close the node with releases unread. A node that has answered `PeerClosed` is not read
+  again, and `<kind> <id> left` is logged once. A device arriving takes a free slot and is written
+  the lights.
+
+Nothing changes in the compositor: the releases are ordinary events.
+
 ## 5. Namespace and authority
 
 | Path | Served by | Held by |
@@ -406,11 +430,6 @@ sandboxed compositor a construction rather than a feature.
 - **Multitouch slots, gesture recognition.** Land in the `input-server` or `libinput` when there is
   hardware to justify them. Neither requires a kernel change, which is the point of the
   arrangement.
-- **A hotplug event source.** The input server already takes devices as they arrive and depart
-  — up to eight, each `Departed` retiring its slot — because the device manager's replay is how
-  it gets even the i8042's two. The USB driver now registers a keyboard or mouse plugged in later;
-  what is missing is the device manager hearing of it, since it reads the registry once, which is
-  Phase 6 Part C.
 - **Key repeat.** ~~Belongs in `libinput`~~ — **decided 2026-08-10: the compositor generates
   it** (M4 Part C, [`widget-toolkit.md`](widget-toolkit.md) §9.2). It cannot live in
   `libinput`: that crate is pure and issues no syscalls, so it has nowhere to put a timer.

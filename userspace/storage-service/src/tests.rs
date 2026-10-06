@@ -94,7 +94,7 @@ fn rec(id: u32, kind: DeviceKind, served: u32, parent: u32, name: &str, blocks: 
         func: 0,
         port: 0,
         speed: 0,
-        _pad: 0,
+        flags: 0,
         logical_block_size: 512,
         name_len: name.len() as u32,
         block_count: blocks,

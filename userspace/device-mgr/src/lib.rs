@@ -123,14 +123,20 @@ pub mod classes {
     }
 
     /// The devices a new owner of `class` is sent, in table order — the replay that is coldplug.
+    /// **A departed device is left out** (Phase 6 Part C): it is not there to hand over.
     pub fn replay(records: &[DeviceRecord], class: Class) -> Vec<&DeviceRecord> {
-        records.iter().filter(|r| Class::of(r.kind()) == Some(class)).collect()
+        records.iter().filter(|r| !r.is_departed() && Class::of(r.kind()) == Some(class)).collect()
     }
 
-    /// Who owns each class: a channel the manager holds, or nobody.
+    /// Who owns each class: a channel the manager holds, or nobody — and what each owner has been
+    /// handed.
     #[derive(Debug, Default)]
     pub struct Owners {
         owner: [Option<u64>; 2],
+        /// **The devices each class's owner has been handed**, by registry id (PR #361 review): a
+        /// `Departed` is owed for these alone. A device whose `Arrived` did not send, or whose node
+        /// the manager never took, was not handed over.
+        handed: [Vec<u32>; 2],
     }
 
     fn slot(class: Class) -> usize {
@@ -143,7 +149,7 @@ pub mod classes {
     impl Owners {
         /// Nobody owns anything.
         pub const fn new() -> Owners {
-            Owners { owner: [None, None] }
+            Owners { owner: [None, None], handed: [Vec::new(), Vec::new()] }
         }
 
         /// Make `channel` the owner of `class`. `false` if the class already has one — the
@@ -157,16 +163,37 @@ pub mod classes {
             true
         }
 
-        /// The owner behind `channel` has gone: free its class, and say which it was.
+        /// The owner behind `channel` has gone: free its class, forget what it was handed, and say
+        /// which class it was.
         pub fn release(&mut self, channel: u64) -> Option<Class> {
             for class in Class::ALL {
                 let s = &mut self.owner[slot(class)];
                 if *s == Some(channel) {
                     *s = None;
+                    self.handed[slot(class)].clear();
                     return Some(class);
                 }
             }
             None
+        }
+
+        /// `class`'s owner has been sent device `id`'s `Arrived`.
+        pub fn handed(&mut self, class: Class, id: u32) {
+            let h = &mut self.handed[slot(class)];
+            if !h.contains(&id) {
+                h.push(id);
+            }
+        }
+
+        /// **Device `id` has departed**: whether `class`'s owner was handed it, and so is owed a
+        /// `Departed` — once, since it is forgotten here.
+        pub fn departed(&mut self, class: Class, id: u32) -> bool {
+            let h = &mut self.handed[slot(class)];
+            let Some(i) = h.iter().position(|&d| d == id) else {
+                return false;
+            };
+            h.swap_remove(i);
+            true
         }
 
         /// `class`'s owner, if it has one.
@@ -294,22 +321,59 @@ pub mod table {
         out
     }
 
-    /// `all.tsm`: every device, a row each, in table order.
+    /// `all.tsm`: every present device, a row each, in table order. **A departed device has no
+    /// row** (Phase 6 Part C): the tables say what the machine has.
     pub fn all(records: &[DeviceRecord]) -> Vec<u8> {
-        encode(records.iter().map(|r| row(r, records)).collect())
+        encode(records.iter().filter(|r| !r.is_departed()).map(|r| row(r, records)).collect())
     }
 
-    /// `<name>.tsm`: the one device called `name`, if there is one.
+    /// `<name>.tsm`: the one present device called `name`, if there is one.
     pub fn one(records: &[DeviceRecord], name: &str) -> Option<Vec<u8>> {
-        let r = records.iter().find(|r| names::name(r) == name)?;
+        let r = records.iter().find(|r| !r.is_departed() && names::name(r) == name)?;
         Some(encode(vec![row(r, records)]))
     }
 
-    /// The directory's entries: `all.tsm`, then each device's, in table order.
+    /// The directory's entries: `all.tsm`, then each present device's, in table order.
     pub fn entries(records: &[DeviceRecord]) -> Vec<String> {
         let mut out = vec![String::from("all.tsm")];
-        out.extend(records.iter().map(|r| format!("{}.tsm", names::name(r))));
+        out.extend(records.iter().filter(|r| !r.is_departed()).map(|r| format!("{}.tsm", names::name(r))));
         out
+    }
+}
+
+pub mod follow {
+    //! **What changed in the table between two reads** (Phase 6 Part C). The manager keeps the
+    //! records of its last read and, each time `/dev/registry/changes` answers, reads the table again
+    //! and diffs. An id is a record's place, so a record is found in the old read by its id.
+
+    use alloc::vec::Vec;
+    use libkern::device::DeviceRecord;
+
+    /// One thing to tell a class's owner.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Change {
+        /// A device the manager did not hold, present now: an `Arrived`.
+        Arrived(u32),
+        /// A device the manager held present, departed now: a `Departed`.
+        Departed(u32),
+    }
+
+    /// **What changed from `held` to `now`**, in table order:
+    /// - a record present now and not held is an arrival;
+    /// - a record held present and departed now is a departure;
+    /// - **a record that arrived and departed between the two reads is told to no one**: it was
+    ///   never handed over, so there is nothing to take back.
+    ///
+    /// A departure is final, so a record held departed and present now cannot be, and is ignored.
+    pub fn diff(held: &[DeviceRecord], now: &[DeviceRecord]) -> Vec<Change> {
+        let at = |id: u32| held.get(id as usize).filter(|r| r.id == id);
+        now.iter()
+            .filter_map(|r| match (r.is_departed(), at(r.id)) {
+                (false, None) => Some(Change::Arrived(r.id)),
+                (true, Some(h)) if !h.is_departed() => Some(Change::Departed(r.id)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -405,7 +469,7 @@ mod tests {
             func: 0,
             port: 0,
             speed: 0,
-            _pad: 0,
+            flags: 0,
             logical_block_size: 0,
             name_len: name.len() as u32,
             block_count: 0,
@@ -525,6 +589,28 @@ mod tests {
         assert_eq!(chans, [11, 12]);
     }
 
+    /// **A `Departed` is owed only for a device the owner was handed**, once (PR #361 review;
+    /// `rsproto-devices-ops.md`): not for one whose `Arrived` never went, nor to the next owner for
+    /// what the last one was handed — its replay hands it again.
+    #[test]
+    fn a_departed_is_owed_for_what_the_owner_was_handed_once() {
+        let mut o = Owners::new();
+        assert!(o.claim(Class::Input, 10));
+        o.handed(Class::Input, 3);
+        o.handed(Class::Input, 4);
+        assert!(!o.departed(Class::Input, 5), "never handed over");
+        assert!(!o.departed(Class::Block, 3), "handed to another class's owner");
+        assert!(o.departed(Class::Input, 3));
+        assert!(!o.departed(Class::Input, 3), "owed once");
+        assert_eq!(o.release(10), Some(Class::Input));
+        assert!(o.claim(Class::Input, 11));
+        assert!(!o.departed(Class::Input, 4), "the last owner's, not this one's");
+        o.handed(Class::Input, 4);
+        o.handed(Class::Input, 4);
+        assert!(o.departed(Class::Input, 4), "until its replay hands it");
+        assert!(!o.departed(Class::Input, 4), "handed twice, owed once");
+    }
+
     /// **The rows decode as the shell's `open` decodes them**, with `Null` where a device has no
     /// value — a keyboard's size is absent, not zero.
     #[test]
@@ -601,5 +687,52 @@ mod tests {
         assert_eq!(info_only(suffix::parse(b"info")), Asked::Directory);
         assert_eq!(info_only(suffix::parse(b"info/all.tsm")), Asked::File("all"));
         assert_eq!(info_only(suffix::parse(b"nonsense")), Asked::Unknown);
+    }
+
+    fn departed(mut r: DeviceRecord) -> DeviceRecord {
+        r.flags |= libkern::device::DEPARTED;
+        r
+    }
+
+    /// A USB keyboard plugged in after the boot's table: its device, then its keyboard node.
+    fn plugged(table: &mut Vec<DeviceRecord>) -> (u32, u32) {
+        let usb = table.len() as u32;
+        table.push(rec(usb, DeviceKind::UsbDevice, NOT_SERVED, 0, "QEMU USB Keyboard"));
+        table.push(rec(usb + 1, DeviceKind::Keyboard, 2, usb, "keyboard"));
+        (usb, usb + 1)
+    }
+
+    /// **What changed between two reads** (Phase 6 Part C): a device plugged in arrives, the same
+    /// device unplugged departs, and both in one read — a device that came and went between two
+    /// reads — is told to no one. A read with nothing new says nothing.
+    #[test]
+    fn a_diff_finds_arrivals_and_departures_and_skips_what_came_and_went() {
+        use super::follow::{Change, diff};
+        let held = boot();
+        assert!(diff(&held, &held).is_empty(), "nothing changed");
+        let mut now = boot();
+        let (usb, kbd) = plugged(&mut now);
+        assert_eq!(diff(&held, &now), vec![Change::Arrived(usb), Change::Arrived(kbd)]);
+        let mut gone = now.clone();
+        gone[usb as usize] = departed(gone[usb as usize]);
+        gone[kbd as usize] = departed(gone[kbd as usize]);
+        assert_eq!(diff(&now, &gone), vec![Change::Departed(usb), Change::Departed(kbd)]);
+        assert!(diff(&held, &gone).is_empty(), "came and went between two reads: told to no one");
+        assert!(diff(&gone, &gone).is_empty(), "a departure is told once");
+    }
+
+    /// **A departed device is in no replay and no table** (Phase 6 Part C), so an owner subscribing
+    /// after it went is not handed it, and `/dev/devices` does not list it.
+    #[test]
+    fn a_departed_device_is_in_no_replay_and_no_table() {
+        let mut t = boot();
+        let (usb, kbd) = plugged(&mut t);
+        assert_eq!(replay(&t, Class::Input).len(), 3, "the i8042's two and the USB keyboard");
+        t[usb as usize] = departed(t[usb as usize]);
+        t[kbd as usize] = departed(t[kbd as usize]);
+        assert_eq!(replay(&t, Class::Input).len(), 2);
+        assert_eq!(Table::decode(&table::all(&t)).unwrap().rows.len(), 8, "the boot's eight");
+        assert!(table::one(&t, &name(&t[kbd as usize])).is_none());
+        assert_eq!(table::entries(&t).len(), 9);
     }
 }

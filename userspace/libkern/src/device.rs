@@ -73,8 +73,9 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this build reads.
-pub const REGISTRY_VERSION: u32 = 1;
+/// The snapshot layout this build reads: 2 since Phase 6 Part C, whose header carries the table's
+/// generation.
+pub const REGISTRY_VERSION: u32 = 2;
 /// [`DeviceRecord::served`] for a node no indexed path serves.
 pub const NOT_SERVED: u32 = 0xFFFF_FFFF;
 /// [`DeviceRecord::parent`] for a node that belongs to nothing else.
@@ -87,6 +88,8 @@ pub const OUTCOME_CLAIMED: u32 = 1;
 pub const OUTCOME_DECLINED: u32 = 2;
 /// Longest driver name served, in bytes.
 pub const MAX_DRIVER_NAME: usize = 16;
+/// [`DeviceRecord::flags`]: the device has departed (Phase 6 Part C). See the kernel's mirror.
+pub const DEPARTED: u8 = 0x01;
 
 /// The start of a snapshot.
 #[repr(C)]
@@ -100,12 +103,15 @@ pub struct RegistryHeader {
     pub count: u32,
     /// `size_of::<DeviceRecord>()` as the kernel wrote it.
     pub record_size: u32,
+    /// The table's generation, bumped once by every change (Phase 6 Part C).
+    pub generation: u64,
 }
 
-const _: () = assert!(size_of::<RegistryHeader>() == 16);
-const _: () = assert!(align_of::<RegistryHeader>() == 4);
+const _: () = assert!(size_of::<RegistryHeader>() == 24);
+const _: () = assert!(align_of::<RegistryHeader>() == 8);
 const _: () = assert!(offset_of!(RegistryHeader, count) == 8);
 const _: () = assert!(offset_of!(RegistryHeader, record_size) == 12);
+const _: () = assert!(offset_of!(RegistryHeader, generation) == 16);
 
 /// One node of the device table. See the kernel's mirror for each field.
 #[repr(C)]
@@ -153,8 +159,8 @@ pub struct DeviceRecord {
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// Reserved; zero.
-    pub _pad: u8,
+    /// What has happened to it: [`DEPARTED`] (Phase 6 Part C).
+    pub flags: u8,
     /// Bytes per logical block, for a block device.
     pub logical_block_size: u32,
     /// Bytes of [`name`](Self::name) that are meaningful.
@@ -196,7 +202,7 @@ impl DeviceRecord {
 
     /// The record's bytes, as the kernel wrote them — what a `Devices::Arrived` carries.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `DeviceRecord` is `repr(C)` with an explicit `_pad`, so every byte is
+        // SAFETY: `DeviceRecord` is `repr(C)` with an explicit `flags` byte, so every byte is
         // initialised (the offset asserts above account for them all).
         unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
     }
@@ -206,10 +212,24 @@ impl DeviceRecord {
         DeviceKind::from_u32(self.kind)
     }
 
+    /// Whether the device has departed (Phase 6 Part C): [`DEPARTED`].
+    pub fn is_departed(&self) -> bool {
+        self.flags & DEPARTED != 0
+    }
+
     /// The `<n>` of the `/dev/blk/<n>` that serves it, if it is a block device and served — what
     /// a reader of the registry needs instead of probing `/dev/blk/0`, `1`, … for the first miss.
+    /// **`None` for a departed device**, whose path no longer resolves: a reader asking this is
+    /// right without knowing departures exist (Phase 6 Part C).
     pub fn block_index(&self) -> Option<u32> {
-        (self.kind().is_block() && self.served != NOT_SERVED).then_some(self.served)
+        (self.kind().is_block() && self.served != NOT_SERVED && !self.is_departed()).then_some(self.served)
+    }
+
+    /// The `<n>` of the `/dev/input/raw/<n>` that serves it, if it is a keyboard or a mouse and has
+    /// not departed — [`block_index`](Self::block_index)'s counterpart.
+    pub fn input_index(&self) -> Option<u32> {
+        let input = matches!(self.kind(), DeviceKind::Keyboard | DeviceKind::Mouse);
+        (input && self.served != NOT_SERVED && !self.is_departed()).then_some(self.served)
     }
 
     /// Its name's meaningful bytes.
@@ -244,6 +264,7 @@ pub struct Records<'a> {
     bytes: &'a [u8],
     count: usize,
     next: usize,
+    generation: u64,
 }
 
 impl Iterator for Records<'_> {
@@ -264,6 +285,12 @@ impl Records<'_> {
     /// How many records the snapshot holds.
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    /// The table's generation when the snapshot was taken (Phase 6 Part C): what to wait past on
+    /// `/dev/registry/changes`.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether it holds none.
@@ -295,19 +322,22 @@ pub fn records(bytes: &[u8]) -> Result<Records<'_>, SnapshotError> {
     if need > bytes.len() {
         return Err(SnapshotError::Truncated);
     }
-    Ok(Records { bytes, count, next: 0 })
+    let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8]));
+    Ok(Records { bytes, count, next: 0, generation })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn header(count: u32) -> [u8; 16] {
-        let mut h = [0u8; 16];
+    /// A header, version 2: generation 7.
+    fn header(count: u32) -> [u8; 24] {
+        let mut h = [0u8; 24];
         h[0..4].copy_from_slice(&REGISTRY_MAGIC.to_le_bytes());
         h[4..8].copy_from_slice(&REGISTRY_VERSION.to_le_bytes());
         h[8..12].copy_from_slice(&count.to_le_bytes());
         h[12..16].copy_from_slice(&(size_of::<DeviceRecord>() as u32).to_le_bytes());
+        h[16..24].copy_from_slice(&7u64.to_le_bytes());
         h
     }
 
@@ -324,11 +354,12 @@ mod tests {
     #[test]
     fn a_padded_snapshot_reads_exactly_its_count() {
         let mut page = [0u8; 4096];
-        page[..16].copy_from_slice(&header(2));
-        page[16..160].copy_from_slice(&record(0, DeviceKind::Disk));
-        page[160..304].copy_from_slice(&record(1, DeviceKind::Keyboard));
+        page[..24].copy_from_slice(&header(2));
+        page[24..168].copy_from_slice(&record(0, DeviceKind::Disk));
+        page[168..312].copy_from_slice(&record(1, DeviceKind::Keyboard));
         let rs = records(&page).unwrap();
         assert_eq!(rs.len(), 2);
+        assert_eq!(rs.generation(), 7, "the header's generation (Phase 6 Part C)");
         let kinds: [DeviceKind; 2] = {
             let mut it = records(&page).unwrap().map(|r| r.kind());
             [it.next().unwrap(), it.next().unwrap()]
@@ -341,22 +372,22 @@ mod tests {
     /// hold, another magic, another version, another record size, and fewer bytes than a header.
     #[test]
     fn a_snapshot_that_does_not_add_up_is_refused() {
-        let mut short = [0u8; 16 + 144];
-        short[..16].copy_from_slice(&header(2));
+        let mut short = [0u8; 24 + 144];
+        short[..24].copy_from_slice(&header(2));
         assert_eq!(records(&short).err(), Some(SnapshotError::Truncated));
-        let mut huge = [0u8; 16];
+        let mut huge = [0u8; 24];
         huge.copy_from_slice(&header(u32::MAX));
         assert_eq!(records(&huge).err(), Some(SnapshotError::Truncated));
         let mut magic = header(0);
         magic[0] ^= 1;
         assert_eq!(records(&magic).err(), Some(SnapshotError::BadMagic));
         let mut version = header(0);
-        version[4] = 2;
-        assert_eq!(records(&version).err(), Some(SnapshotError::BadVersion));
+        version[4] = 1;
+        assert_eq!(records(&version).err(), Some(SnapshotError::BadVersion), "version 1, before Part C");
         let mut size = header(0);
         size[12] = 1;
         assert_eq!(records(&size).err(), Some(SnapshotError::BadRecordSize));
-        assert_eq!(records(&[0u8; 15]).err(), Some(SnapshotError::Short));
+        assert_eq!(records(&[0u8; 23]).err(), Some(SnapshotError::Short), "a byte short of a header");
         assert_eq!(records(&header(0)).unwrap().len(), 0, "an empty table reads");
     }
 
@@ -376,6 +407,27 @@ mod tests {
         assert_eq!(rec(DeviceKind::Keyboard, 0).block_index(), None, "raw input's 0, not /dev/blk's");
         assert_eq!(rec(DeviceKind::Console, NOT_SERVED).block_index(), None);
         assert_eq!(rec(DeviceKind::Disk, NOT_SERVED).block_index(), None, "registered, served nowhere");
+    }
+
+    /// **A departed device has no index on either path** (Phase 6 Part C), so a reader that asks
+    /// for one is right without knowing departures exist. Its id and its served index stay in the
+    /// record, which is what a reader comparing two snapshots needs.
+    #[test]
+    fn a_departed_device_has_no_index() {
+        let rec = |kind: DeviceKind, flags: u8| {
+            let mut raw = record(4, kind);
+            raw[12..16].copy_from_slice(&3u32.to_le_bytes());
+            raw[39] = flags;
+            DeviceRecord::read(&raw).unwrap()
+        };
+        assert_eq!(rec(DeviceKind::Disk, 0).block_index(), Some(3));
+        assert_eq!(rec(DeviceKind::Disk, DEPARTED).block_index(), None);
+        assert_eq!(rec(DeviceKind::Keyboard, 0).input_index(), Some(3));
+        assert_eq!(rec(DeviceKind::Mouse, DEPARTED).input_index(), None);
+        assert_eq!(rec(DeviceKind::Disk, 0).input_index(), None, "a disk is no input device");
+        let gone = rec(DeviceKind::Keyboard, DEPARTED);
+        assert!(gone.is_departed());
+        assert_eq!((gone.id, gone.served), (4, 3), "its id and served index stay");
     }
 
     /// **One record from exactly its bytes**, at an odd address — a message body promises no

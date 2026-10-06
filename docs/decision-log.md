@@ -33981,3 +33981,149 @@ read against the source, as the reviewer had:
     report ID;
   - the scoping's notification is marked revised;
   - a replug costs two records for an input device, not one.
+
+## 2026-10-05 — Phase 6 Part C: arrivals and departures
+
+Built to the detail pass, in its order:
+
+**C.1, the registry.** A departure is a state of a record. The record's spare byte is now `flags`,
+with `DEPARTED`, and every record whose parent chain reaches it departs with it. Its paths answer
+`NotFound`, and its served index is never reissued. Every change bumps the table's generation,
+which a version 2 snapshot header carries. `block_index`, and a new `input_index`, answer `None`
+for a departed record. `/dev/registry/changes` answers a `Read` once the generation is past the
+read's `offset`. To reach it, a char backend's `submit_read` now takes the offset (`CharRead`),
+which the console, the i8042 and USB ignore.
+
+**C.2, a USB departure**, in the hub thread:
+1. what each keyboard and mouse held is released (`keyboard::release_all`, `mouse::release_all`);
+2. its endpoints leave the DPC's table;
+3. its nodes retire: they drain, then refuse reads at submission, `PeerClosed`;
+4. its records depart, as one generation;
+5. its slot is disabled.
+
+Input node slots are given back under an epoch, checked under the node's lock.
+
+**C.3, the manager follows**: a read waits on the change node; each snapshot is diffed; `Arrived`
+and `Departed` go to owners; a device that came and went between two reads is told to no one.
+
+**C.4, the input server lets go**: `PeerClosed` means the device left. A slot retires when both
+the node and the manager have said so, in either order.
+
+**C.5, the gates.** `check-input --usb`:
+1. unplugs the boot keyboard;
+2. types on a keyboard plugged in;
+3. holds a key down on it and unplugs it — the window sees the release, which QEMU never sends;
+4. plugs a last one in.
+
+`boot-probe` holds departed paths to `NotFound`, and the manager to the registry's present records.
+
+**What the first boots said.** `test-qemu`'s hot keyboard came and went before the manager's first
+read and was told to no one, as the review of the detail pass predicted. The mouse swapped in for
+it reached the input server in its replay. When the mouse was pulled, the input server said `mouse
+24 left` before the manager's `Departed`, and retired the slot on the second.
+
+**Found on the way:**
+- **`test-qemu`'s devices check cannot see a manager that never follows.** With following removed
+  it passed: the hot devices had come and gone before the manager's one read, so the stale table
+  agreed with the registry. `check-input --usb` fails the same control at its first step, and is
+  the gate that holds following. Recorded in `boot-probe`'s doc.
+- **The first host test of a departed index never reissued could not fail.** The departed index
+  was below a present one, so even a reissuing table would have handed out the next. Its control
+  passed. It now departs the device with the highest index too.
+- **Two more doc comments orphaned**, #26 and #27, by anchoring an insertion on the next item's
+  line. One was caught reading the diff, the other by the sweep.
+- **`cargo xtask build` does not build the test harness**, so a `boot-probe` change that did not
+  compile looked clean. `cargo check -p test-harness` found it.
+
+**Controls**, each failing:
+- **Boots:**
+  - a departure that bumps no generation (`check-input --usb`'s first step);
+  - a departure that releases nothing (the held key's release never comes);
+  - a completed `PeerClosed` read treated as an error (the final check);
+  - a manager that never follows (`check-input --usb`).
+- **Host:**
+  - a departure taking every later node;
+  - a waiting read answered at its own generation;
+  - a departed path still resolving, and a departed index reissued;
+  - a keyboard or mouse releasing nothing;
+  - a retired reader parking;
+  - a retired slot preferred to a free one;
+  - an epoch ignored;
+  - a departed record arriving;
+  - `Departed` retiring before `PeerClosed`.
+
+No ABI hash impact: the registry is not a hash input, `CharBackend` is the kernel's own, and the
+snapshot's version is 2, which every reader parses through `libkern::device::records`.
+
+## 2026-10-05 — PR #361, reviewed: a guard only its helper was tested for, and a retry that spun
+
+One blocking finding, one worth fixing and four optional. All are fixed.
+
+**1. The epoch guard on a reused input slot was tested only through `current()`.** The bump in
+`take_slot` and the checks in `submit_read` and `submit_write` could each be deleted with every
+kernel host test passing. No gate binds more than five nodes, so the retired arm of `take_slot` had
+never run anywhere. The plan's control, "the epoch check removed: its host test fails", passed as
+built.
+
+**Now the slots are a value**, `xhci::hid::Nodes`: each slot's state, epoch, reader, waiting lights
+write and keyboard bit, with `take`, `retire`, `push`, `read` and `write` as methods. One static
+holds the boot's, and the `CharBackend` functions are one-line calls into it. A host test takes all
+sixteen, retires a keyboard with a lights write left waiting, gives its slot to a mouse, and reads
+and writes through the keyboard's old context. Each of these controls fails it:
+- the epoch bump deleted;
+- the reader replacement deleted;
+- the waiting lights write left in place;
+- the check in `read` deleted;
+- the check in `write` deleted.
+
+The write check is visible on the host because the slot's new device is a mouse. Without the check
+the stale write is refused `Unsupported` (mice take no lights); with it, `PeerClosed`.
+
+**2. A registry read that failed after a change was retried at once, in a loop.** The manager
+re-armed its wait at the generation it held. The node answers such a read at once, so a failure
+that persisted would spin a CPU and write a line per pass. Now it waits past the generation the
+node answered with, read from its change page, which is mapped for the manager's life for that
+reason. The next change's read diffs against the records held, so what the failed read missed is
+told then. A probe made every read after a change fail, under `test-qemu`:
+- **as fixed:** three lines, at generations 25, 26 and 27, one per change, and the gate passed;
+- **with the generation left as it was** (the control): 180,963 lines, and the gate failed.
+
+Waiting past the answered generation was chosen over the reviewer's other option, ending the
+following. A transient failure then costs a delay until the next change, where ending would cost
+every later device.
+
+**3. Optional, all taken:**
+- **The registry's host tests now hold two more properties.** `has` leaves departed records out:
+  both USB devices departed, `has(UsbDevice)` is false. A departure takes a grandchild: the AHCI
+  controller departed, its disk and the disk's partition go with it. Their controls fail. The old
+  tests passed both with every case one level deep.
+- **A report pushed after its device departed is dropped**, under the node's lock (finding 5).
+  The DPC decodes under the bound table's lock and pushes after letting it go, so a press decoded
+  before `depart` could land after its releases, as a key held for good. `Reader::offer` refuses
+  a retired ring. `Nodes::push` also refuses a slot given to another device since: the DPC knows
+  the epoch its endpoint's node was made in. A reader may now see a release for a press it never
+  saw, which is harmless. A host test holds each refusal, and each fails its control.
+- **`device-mgr`'s start skips departed records** (finding 4). It no longer asks for their nodes or
+  counts them, so `/dev/registry/22 would not resolve` is gone from a green transcript.
+- **A wait record's status is read as the `i32` it is.** The sweep for that found a real defect in
+  the copy in `storage-service`'s `po_wait`: `-14` beside a zero word reads as 4294967282, so its
+  `AlreadyExists` comparison could never match, and `block` already owned would be reported as a
+  resolve that failed. Fixed with the rest; nothing reaches that path today.
+- **A `Departed` goes only to an owner that was handed the device**, as `rsproto-devices-ops.md`
+  says. Before, a record whose node lookup failed, or whose `Arrived` did not send, stayed present
+  and earned a `Departed` for an id never sent. `Owners` now keeps the ids it handed each class's
+  owner, cleared on release; a host test holds it.
+- **The change node's refusals now have tests through the read itself.** `changes_read` runs over a
+  waiters value and a generation, as `read_changes`. A host test holds:
+  - 7 bytes refused and 8 taken;
+  - a behind read answered at once;
+  - a fifth waiting read refused.
+
+  In the guest, `boot-probe` submits a 7-byte read. With the length check removed, `test-qemu`
+  fails there. The comment saying `boot-probe` waits on the node is corrected: `device-mgr` is its
+  only reader.
+- **`PeerClosed` is documented as a departed device's refusal too**, in `error-codes.md` and both
+  copies of `KError`.
+
+No ABI hash impact: no value changes, only doc comments on `KError`, and `Nodes` is the kernel's
+own.

@@ -157,7 +157,9 @@ fn po_wait(po: u64) -> (i64, u64) {
         WAIT_HANDLES[0] = po;
         let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
         let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        (w == 1, word(8) as i64, word(16))
+        // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would
+        // never compare equal (PR #361 review, the class of its finding 4).
+        (w == 1, word(8) as u32 as i32 as i64, word(16))
     };
     close(po);
     if done { (status, value) } else { (-1, 0) }
@@ -1118,9 +1120,10 @@ impl Service {
         }
     }
 
-    /// The subscription: the manager has nothing to send after `Settled` until Phase 6 gives it
-    /// an event source. Its handles are closed rather than leaked, and the manager going away is
-    /// said once.
+    /// The subscription. **After `Settled` the manager sends a disk's `Arrived` or `Departed`** when
+    /// one comes or goes (Phase 6 Part C), and nothing makes one before Part D's mass storage, which
+    /// is where this takes them; until then each is said and ignored, its handles closed rather than
+    /// leaked. The manager going away is said once.
     fn serve_subscription(&mut self) {
         loop {
             match recv(self.subscription) {

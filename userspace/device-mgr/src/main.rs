@@ -4,11 +4,12 @@
 //!
 //! ## Shape
 //!
-//! 1. Read `/dev/registry` once: every node's record, then each class device's node by id. Every
-//!    node present at boot registers before userspace starts — the boot waits for the USB hub
-//!    thread's first round, for two seconds at most — so one read is complete coldplug. A USB
-//!    device plugged in later, or still enumerating when that bound passed, is in the registry and
-//!    not here, until Phase 6 Part C tells the manager.
+//! 1. Read `/dev/registry`: every node's record, then each class device's node by id. Every node
+//!    present at boot registers before userspace starts — the boot waits for the USB hub thread's
+//!    first round, for two seconds at most — so the first read is complete coldplug.
+//!    **Then follow the table** (Phase 6 Part C): a read waits on `/dev/registry/changes` past the
+//!    generation of the last snapshot; each time it is answered the manager reads the table again,
+//!    diffs it ([`device_mgr::follow`]), and sends each class's owner its `Arrived` and `Departed`.
 //! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/devices`.
 //! 3. Serve. `<class>` makes the resolver that class's owner and replays its devices; `info` is a
@@ -24,12 +25,15 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use device_mgr::classes::{Class, Owners, replay};
+use device_mgr::follow::{Change, diff};
 use device_mgr::suffix::{self, Asked};
 use device_mgr::table;
 use libkern::debug::Line;
 use libkern::device::{DeviceRecord, records};
 use libkern::*;
-use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, build_arrived, build_settled};
+use librsproto::devices::{
+    OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed, build_settled,
+};
 use librsproto::file::{DIRENT_KIND_FILE, DirReplyWriter, parse_read_dir_request};
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply,
@@ -49,9 +53,11 @@ const SUBSCRIPTION_HEADROOM: usize = 32;
 /// Info-only endpoints at once. `service-mgr` asks for one at boot and couriers it for every
 /// session; the second is headroom, not a use.
 const MAX_INFO_ENDPOINTS: usize = 2;
-/// Directory sessions open at once: the wait set, less the endpoint, the control channel, the
-/// info-only endpoints and an owner per class.
-const MAX_DIRS: usize = MAX_WAIT_HANDLES - 2 - MAX_INFO_ENDPOINTS - Class::ALL.len();
+/// Directory sessions open at once: the wait set, less the endpoint, the control channel, the read
+/// waiting on `/dev/registry/changes`, the info-only endpoints and an owner per class.
+const MAX_DIRS: usize = MAX_WAIT_HANDLES - 3 - MAX_INFO_ENDPOINTS - Class::ALL.len();
+/// One page, for the eight bytes `/dev/registry/changes` answers with.
+const PAGE: u64 = 4096;
 /// What the manager takes each node with, and hands its owner: `/dev/blk`'s authority, which is
 /// the most any class needs — the storage service writes.
 const NODE_RIGHTS: u64 = RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
@@ -158,14 +164,15 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         WAIT_HANDLES[0] = po as u64;
         let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
         let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        (w == 1, word(8) as i64, word(16))
+        // The status is an `i32`, beside a zero reserved word.
+        (w == 1, word(8) as u32 as i32 as i64, word(16))
     };
     close(po as u64);
     if done && status == 0 { handle } else { 0 }
 }
 
-/// Every node's record, from one read of `/dev/registry`.
-fn read_registry(root_ns: u64) -> Option<Vec<DeviceRecord>> {
+/// Every node's record, from one read of `/dev/registry`, and the table's generation then.
+fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
     let snap = lookup(root_ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
     if snap == 0 {
         return None;
@@ -181,7 +188,10 @@ fn read_registry(root_ns: u64) -> Option<Vec<DeviceRecord>> {
     }
     // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
-    let out = records(bytes).ok().map(|rs| rs.collect());
+    let out = records(bytes).ok().map(|rs| {
+        let generation = rs.generation();
+        (rs.collect(), generation)
+    });
     // SAFETY: unmapping what was mapped above; `out` holds copies.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
     out
@@ -222,7 +232,18 @@ fn reply_channel(serve_end: u64, request_id: u64, client_end: u64) -> bool {
 
 struct Manager {
     serve_end: u64,
+    root_ns: u64,
+    /// The last snapshot's records.
     records: Vec<DeviceRecord>,
+    /// **The generation the change read waits past**: the last snapshot's — or, when the table did
+    /// not read after a change, the generation that change brought (PR #361 review).
+    past: u64,
+    /// `/dev/registry/changes`, the page its answer lands in and where that is mapped, and the read
+    /// waiting on it — `0` for none (Phase 6 Part C).
+    changes: u64,
+    change_buf: u64,
+    change_at: u64,
+    change_po: u64,
     /// Each class device's node, by registry id — what an owner is handed a duplicate of.
     nodes: Vec<(u32, u64)>,
     owners: Owners,
@@ -301,28 +322,17 @@ impl Manager {
         // **The replay is queued before the owner has the channel**, so a completed resolve is a
         // whole subscription: `Settled` is already waiting, and what it counts cannot depend on
         // how soon the owner reads, or whether it closes first.
-        let mut sent = 0u32;
+        let mut sent = Vec::new();
         for r in devices {
             let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == r.id) else {
                 continue;
             };
-            // **The owner's own duplicate**, so an owner that exits cannot take the device from
-            // the next one.
-            // SAFETY: duplicating a handle this process holds, with DUPLICATE.
-            let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, node, NODE_RIGHTS) };
-            if dup <= 0 {
-                continue;
-            }
-            let mut body = [0u8; librsproto::devices::RECORD_LEN];
-            let n = build_arrived(&mut body, r.as_bytes()).unwrap_or(0);
-            if send(ours, OP_DEVICES_ARRIVED, 0, 0, &body[..n], &[dup as u64]) {
-                sent += 1;
-            } else {
-                close(dup as u64);
+            if send_arrived(ours, r, node) {
+                sent.push(r.id);
             }
         }
         let mut body = [0u8; 4];
-        let n = build_settled(&mut body, sent).unwrap_or(0);
+        let n = build_settled(&mut body, sent.len() as u32).unwrap_or(0);
         let _ = send(ours, OP_DEVICES_SETTLED, 0, 0, &body[..n], &[]);
         if !reply_channel(reply_to, request_id, client_end) {
             // The queued nodes go with the channel: the kernel releases an undelivered transfer
@@ -332,7 +342,16 @@ impl Manager {
             return;
         }
         self.owners.claim(class, ours);
-        Line::new().s(b"device-mgr: ").s(class.name().as_bytes()).s(b" owned, ").u(sent as u64).s(b" device(s) sent").end();
+        for &id in &sent {
+            self.owners.handed(class, id);
+        }
+        Line::new()
+            .s(b"device-mgr: ")
+            .s(class.name().as_bytes())
+            .s(b" owned, ")
+            .u(sent.len() as u64)
+            .s(b" device(s) sent")
+            .end();
     }
 
     fn open_dir(&mut self, reply_to: u64, request_id: u64) {
@@ -347,6 +366,131 @@ impl Manager {
         } else {
             close(client_end);
             close(ours);
+        }
+    }
+
+    /// **Submit the read that waits on `/dev/registry/changes`** past [`Manager::past`], if none is
+    /// waiting (Phase 6 Part C). A refusal is said, and the manager stops following: it keeps what
+    /// it has, and serves it.
+    fn arm_changes(&mut self) {
+        if self.changes == 0 || self.change_po != 0 {
+            return;
+        }
+        let op = IoOp {
+            opcode: IO_OPCODE_READ,
+            flags: 0,
+            buffer: self.change_buf,
+            buf_offset: 0,
+            offset: self.past,
+            length: 8,
+        };
+        // SAFETY: a char `DeviceNode` with READ, and a valid `IoOp`.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.changes, (&op as *const IoOp) as u64) };
+        if po > 0 {
+            self.change_po = po as u64;
+        } else {
+            Line::new()
+                .s(b"device-mgr: /dev/registry/changes refused a read (")
+                .i(po)
+                .s(b"); no longer following")
+                .end();
+            close(self.changes);
+            self.changes = 0;
+        }
+    }
+
+    /// **The table changed** (Phase 6 Part C): read it again, diff it against the records held, and
+    /// tell each class's owner what arrived and what departed. Then wait again, past the new
+    /// generation.
+    ///
+    /// **A table that does not read waits for the next change** (PR #361 review), past the
+    /// generation the node answered with: past the one held, the node answers at once, so a read
+    /// that kept failing — the snapshot's allocation or its mapping, under memory pressure — would
+    /// spin a CPU, a line a pass. The next change's read diffs against the records held, so what
+    /// this one missed is told then.
+    fn follow(&mut self, status: i64) {
+        close(self.change_po);
+        self.change_po = 0;
+        if status != 0 {
+            Line::new()
+                .s(b"device-mgr: a wait on /dev/registry/changes failed (")
+                .i(status)
+                .s(b"); no longer following")
+                .end();
+            close(self.changes);
+            self.changes = 0;
+            return;
+        }
+        let Some((now, generation)) = read_registry(self.root_ns) else {
+            // SAFETY: `change_at` maps the change page read-only for the life of the manager, and the
+            // kernel wrote its first eight bytes before completing the read just waited on.
+            let answered = unsafe { core::ptr::read_volatile(self.change_at as *const u64) };
+            self.past = self.past.max(answered);
+            Line::new()
+                .s(b"device-mgr: the registry did not read after a change, to generation ")
+                .u(self.past)
+                .s(b"; waiting for the next")
+                .end();
+            return self.arm_changes();
+        };
+        for change in diff(&self.records, &now) {
+            match change {
+                Change::Arrived(id) => self.arrived(&now[id as usize]),
+                Change::Departed(id) => self.departed(&now[id as usize]),
+            }
+        }
+        self.records = now;
+        self.past = generation;
+        self.arm_changes();
+    }
+
+    /// A class device that arrived: take its node, and send its owner an `Arrived` if it has one —
+    /// else the replay will.
+    fn arrived(&mut self, r: &DeviceRecord) {
+        let Some(class) = Class::of(r.kind()) else { return };
+        let path = format!("/dev/registry/{}", r.id);
+        let node = lookup(self.root_ns, path.as_bytes(), NODE_RIGHTS);
+        if node == 0 {
+            // Departed meanwhile: handed to no one, so its departure, which the next read finds, is
+            // owed to no one.
+            return;
+        }
+        self.nodes.push((r.id, node));
+        let name = device_mgr::names::name(r);
+        let said = |how: &[u8]| Line::new().s(b"device-mgr: ").s(name.as_bytes()).s(how).end();
+        match self.owners.owner(class) {
+            Some(ch) if send_arrived(ch, r, node) => {
+                self.owners.handed(class, r.id);
+                let mut line = Line::new();
+                line.s(b"device-mgr: ").s(name.as_bytes()).s(b" arrived, sent to ").s(class.name().as_bytes()).end();
+            }
+            Some(_) => said(b" arrived, and its Arrived did not send"),
+            None => said(b" arrived, for the replay"),
+        }
+    }
+
+    /// A class device that departed: let its node go, and send its owner a `Departed` if it was
+    /// handed the device — `rsproto-devices-ops.md`'s rule, which an `Arrived` that did not send
+    /// would otherwise break.
+    fn departed(&mut self, r: &DeviceRecord) {
+        let Some(class) = Class::of(r.kind()) else { return };
+        if let Some(i) = self.nodes.iter().position(|(id, _)| *id == r.id) {
+            close(self.nodes[i].1);
+            self.nodes.remove(i);
+        }
+        let name = device_mgr::names::name(r);
+        let owed = self.owners.departed(class, r.id);
+        let Some(ch) = self.owners.owner(class).filter(|_| owed) else {
+            Line::new().s(b"device-mgr: ").s(name.as_bytes()).s(b" departed").end();
+            return;
+        };
+        let mut body = [0u8; 4];
+        let n = build_departed(&mut body, r.id).unwrap_or(0);
+        if send(ch, OP_DEVICES_DEPARTED, 0, 0, &body[..n], &[]) {
+            let mut line = Line::new();
+            line.s(b"device-mgr: ").s(name.as_bytes()).s(b" departed, sent to ").s(class.name().as_bytes()).end();
+        } else {
+            Line::new().s(b"device-mgr: ").s(name.as_bytes()).s(b" departed, and its Departed did not send").end();
         }
     }
 
@@ -400,6 +544,23 @@ impl Manager {
     }
 }
 
+/// **Send `ch` an `Arrived` for `r`, carrying the owner's own duplicate of `node`**, so an owner
+/// that exits cannot take the device from the next one. Whether it went.
+fn send_arrived(ch: u64, r: &DeviceRecord, node: u64) -> bool {
+    // SAFETY: duplicating a handle this process holds, with DUPLICATE.
+    let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, node, NODE_RIGHTS) };
+    if dup <= 0 {
+        return false;
+    }
+    let mut body = [0u8; librsproto::devices::RECORD_LEN];
+    let n = build_arrived(&mut body, r.as_bytes()).unwrap_or(0);
+    let sent = send(ch, OP_DEVICES_ARRIVED, 0, 0, &body[..n], &[dup as u64]);
+    if !sent {
+        close(dup as u64);
+    }
+    sent
+}
+
 /// Send `Meta::Ready` to `service-mgr`, naming this server and carrying the forwarding endpoint's
 /// client end.
 fn send_ready(control: u64, client_end: u64) -> bool {
@@ -424,12 +585,13 @@ fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"device-mgr: up\n");
-    let Some(records) = read_registry(root_ns) else {
+    let Some((records, generation)) = read_registry(root_ns) else {
         refuse(control, KError::NotFound, b"no /dev/registry it could read, so no devices to hand out");
     };
     let mut nodes = Vec::new();
     for r in &records {
-        if Class::of(r.kind()).is_none() {
+        // A device that departed before this read has no node to take (PR #361 review).
+        if Class::of(r.kind()).is_none() || r.is_departed() {
             continue;
         }
         let path = format!("/dev/registry/{}", r.id);
@@ -451,7 +613,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     let count = |c| replay(&records, c).len() as u64;
     Line::new()
         .s(b"device-mgr: ")
-        .u(records.len() as u64)
+        .u(records.iter().filter(|r| !r.is_departed()).count() as u64)
         .s(b" device(s) in the registry, ")
         .u(count(Class::Input))
         .s(b" input and ")
@@ -461,18 +623,39 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
     // `service --stop` never sends it: the manager is `essential`. `0` once `service-mgr` is gone.
     let mut control = control;
+    // **The table, followed** (Phase 6 Part C): the change node, and a page for its answers, mapped
+    // for the life of the manager so an answer can be read when the table cannot.
+    let changes = lookup(root_ns, b"/dev/registry/changes", RIGHT_READ | RIGHT_INSPECT);
+    // SAFETY: register-only syscall.
+    let change_buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
+    let change_at = if change_buf == 0 {
+        0
+    } else {
+        // SAFETY: register-only syscall; an object this process just created, mapped read-only.
+        unsafe { syscall4(SYS_MEMORY_MAP, change_buf, 0, PAGE, RIGHT_MAP_READ) }.max(0) as u64
+    };
+    if changes == 0 || change_at == 0 {
+        kprint(b"device-mgr: no /dev/registry/changes to follow; devices plugged in later will not be handed over\n");
+    }
     let mut m = Manager {
         serve_end,
+        root_ns,
         records,
+        past: generation,
+        changes: if change_at == 0 { 0 } else { changes },
+        change_buf,
+        change_at,
+        change_po: 0,
         nodes,
         owners: Owners::new(),
         dirs: Vec::new(),
         info_ends: Vec::new(),
     };
     loop {
+        m.arm_changes();
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the control channel,
-        // the info-only endpoints, an owner per class, and at most MAX_DIRS sessions —
-        // `mint_info_endpoint` and `open_dir` refuse past their bounds.
+        // the read waiting on the change node, the info-only endpoints, an owner per class, and at
+        // most MAX_DIRS sessions — `mint_info_endpoint` and `open_dir` refuse past their bounds.
         let waited = unsafe {
             let mut n = 0usize;
             let mut push = |h: u64| {
@@ -484,6 +667,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             push(m.serve_end);
             if control != 0 {
                 push(control);
+            }
+            if m.change_po != 0 {
+                push(m.change_po);
             }
             for &e in &m.info_ends {
                 push(e);
@@ -497,12 +683,17 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         for j in 0..waited.max(0) as usize {
-            // SAFETY: `waited` records were written; the handle is the first word of each.
-            let h = unsafe {
+            // SAFETY: `waited` records were written; the handle is the first word of each, and a
+            // completed operation's status the low half of the second — an `i32`, beside a zero
+            // reserved word.
+            let (h, status) = unsafe {
                 let off = j * 24;
-                u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
+                let word = |at: usize| u64::from_le_bytes(WAIT_RESULTS[at..at + 8].try_into().unwrap_or([0; 8]));
+                (word(off), word(off + 8) as u32 as i32 as i64)
             };
-            if h == m.serve_end {
+            if m.change_po != 0 && h == m.change_po {
+                m.follow(status);
+            } else if h == m.serve_end {
                 // **A root endpoint with no peer is the end of this manager**, not a message to
                 // skip: the kernel keeps a peer-closed channel signalled, so going round again
                 // would spin a CPU for the life of the boot (PR #333 review, finding 1). It happens

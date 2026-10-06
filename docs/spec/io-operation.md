@@ -126,7 +126,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 - **Block** devices (disks, partitions) follow the rules above: `offset`/`length`
   are logical-block multiples, translated into an [`Irp`](#relationship-to-the-irp).
 - **Char/stream** devices accept a `Read` (input). The block-alignment rules
-  **do not apply**: `offset` is ignored (a stream has no addressable position), and
+  **do not apply**: `offset` is ignored (a stream has no addressable position) — by
+  every char node but the registry's change node, which reads it as the generation the
+  reader holds ([`device-node.md`](device-node.md), Phase 6 Part C) — and
   `length` is the **maximum** bytes to read — the PO completes with `result` = the
   bytes actually delivered (≥ 1, ≤ `length`), which arrive when the device's RX
   interrupt fires (or immediately, if bytes are already buffered). The bytes land in
@@ -194,6 +196,21 @@ Char devices come in two flavours, and the difference is visible to a caller:
   A caller that does not know which flavour it holds should pass a `length` that is a
   multiple of the largest record it expects; a byte stream ignores the alignment and a
   record stream honours it.
+
+  **A USB input node whose device has departed** (Phase 6 Part C) answers a read with what its
+  ring still holds — the releases its driver pushed for every key and button the device held —
+  and, once the ring is empty, **refuses a read at submission, `PeerClosed`**, with no PO. A read
+  already waiting when the device went is answered with the releases, or completed `PeerClosed`
+  if there were none. A reader therefore learns of the departure from one answer, and cannot spin
+  on reads that each complete with an error.
+
+### The registry's change node
+
+*(Phase 6 Part C.)* `/dev/registry/changes` is a char node whose `Read` **waits until the
+registry's generation is past the read's `offset`**, then completes with the current generation:
+eight little-endian bytes, `result` 8. A read whose `offset` is already behind is answered at
+once. `length` below 8 is refused synchronously, `InvalidArgument`; a fifth read waiting at once
+is refused, `WouldBlock`. [`device-node.md`](device-node.md) § *The change node* has why.
 
 ## IoOpcode
 

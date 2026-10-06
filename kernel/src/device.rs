@@ -4,8 +4,14 @@
 //! aarch64 it would be a Device Tree Blob — and drivers append what they publish after it: disks,
 //! the partitions found on them, the RAM disk, the console, the i8042's keyboard and mouse, and
 //! the USB devices the hub thread enumerates. Each entry is an owning reference, so a registered
-//! node lives for the kernel's lifetime — a USB device that leaves included, until Part C of
-//! Phase 6 gives the table departures.
+//! node lives for the kernel's lifetime — a USB device that leaves included.
+//!
+//! **A device that leaves is departed, not removed** (Phase 6 Part C): an id is a record's place,
+//! and `/dev/registry/<id>`, `device-mgr`'s `usb-<id>` and an owner's `Departed` all name a device
+//! by it. A departed entry keeps its fields and its served index, which no later device takes; its
+//! paths stop resolving; and its children depart with it. **Every change bumps the table's
+//! generation**, which the snapshot carries and `/dev/registry/changes` answers a waiting read
+//! with, so a reader that waits past the generation of the snapshot it holds misses nothing.
 //!
 //! **What the table knows that a node does not** is kept beside it: the node's kind, which its
 //! `DeviceClass` is too coarse to say (the console and both i8042 nodes are all `Char`), **the
@@ -17,17 +23,19 @@
 //! [`DeviceNode`]: crate::object::DeviceNode
 
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::libkern::device::{
-    DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
+    DEPARTED, DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
     OUTCOME_DECLINED, OUTCOME_NONE, REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
 };
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KVec, SpinLock};
-use crate::object::ObjectRef;
-use crate::object::device_node::{DeviceClass, DeviceNode, ResourceDescriptor};
+use crate::libkern::handle::KObjectType;
+use crate::object::device_node::{CharBackend, DeviceClass, DeviceNode, ResourceDescriptor};
+use crate::object::{MemoryObject, ObjectRef};
+use crate::syscall::error::KError;
 
 /// One node, and what the table knows about it.
 struct Entry {
@@ -41,6 +49,8 @@ struct Entry {
     driver: &'static str,
     /// For a USB device, what its record carries that its node cannot say (Phase 6 Part A.3).
     usb: Option<UsbFacts>,
+    /// The device has left (Phase 6 Part C): its record says so, and its paths answer `NotFound`.
+    departed: bool,
 }
 
 /// **What a USB device's record carries** that its node does not (Phase 6 Part A.3). The node is a
@@ -68,6 +78,9 @@ pub struct UsbFacts {
 /// The table as a value, so a host test can build one without the kernel's.
 pub struct Registry {
     entries: KVec<Entry>,
+    /// Bumped once by every change: a registration, or a departure with its children (Phase 6
+    /// Part C).
+    generation: u64,
 }
 
 impl Default for Registry {
@@ -85,7 +98,39 @@ fn node_of(e: &Entry) -> &DeviceNode {
 impl Registry {
     /// An empty table.
     pub const fn new() -> Self {
-        Self { entries: KVec::new() }
+        Self { entries: KVec::new(), generation: 0 }
+    }
+
+    /// The table's generation: how many changes it has seen (Phase 6 Part C).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// **Depart node `id` and every node whose parent chain reaches it** (Phase 6 Part C): a USB
+    /// device's keyboard and mouse with it, a disk's partitions with the disk. One change, so one
+    /// generation. Whether anything departed that had not: an id the table does not hold, or one
+    /// already departed with all of its children, changes nothing.
+    pub fn depart(&mut self, id: u32) -> bool {
+        let mut gone: KVec<u32> = KVec::new();
+        let mut changed = false;
+        // A parent is registered before its children, so one pass in table order from `id` finds
+        // every descendant: a node is in the set exactly when its parent already is.
+        for i in id as usize..self.entries.len() {
+            let e = &self.entries[i];
+            if i != id as usize && !gone.contains(&e.parent) {
+                continue;
+            }
+            if gone.try_push(i as u32).is_err() {
+                break;
+            }
+            let e = &mut self.entries[i];
+            changed |= !e.departed;
+            e.departed = true;
+        }
+        if changed {
+            self.generation += 1;
+        }
+        changed
     }
 
     /// How many nodes it holds.
@@ -101,7 +146,11 @@ impl Registry {
     fn push(&mut self, entry: Entry) -> bool {
         // On failure the entry — and its reference — drops here, which is what the caller asked
         // for by handing the reference over.
-        self.entries.try_push(entry).is_ok()
+        let pushed = self.entries.try_push(entry).is_ok();
+        if pushed {
+            self.generation += 1;
+        }
+        pushed
     }
 
     /// Append a PCI function `pci` enumerated.
@@ -113,6 +162,7 @@ impl Registry {
             parent: NO_PARENT,
             driver: "",
             usb: None,
+            departed: false,
         })
     }
 
@@ -144,7 +194,7 @@ impl Registry {
             BlockKind::RamDisk => DeviceKind::RamDisk,
             BlockKind::Unknown => DeviceKind::Unknown,
         };
-        self.push(Entry { node, kind, served, parent, driver, usb: None })
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false })
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
@@ -155,7 +205,7 @@ impl Registry {
         served: u32,
         driver: &'static str,
     ) -> bool {
-        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None })
+        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false })
     }
 
     /// Append a keyboard or mouse a USB device provides (Phase 6 Part B.2), under `parent`, the
@@ -171,7 +221,7 @@ impl Registry {
     ) -> Option<u32> {
         let served = self.next_input_index();
         let parent = parent.unwrap_or(NO_PARENT);
-        self.push(Entry { node, kind, served, parent, driver, usb: None }).then_some(served)
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false }).then_some(served)
     }
 
     /// The index after every input node's: the next `/dev/input/raw/<n>`.
@@ -196,7 +246,9 @@ impl Registry {
         let parent = self.pci_parent(controller);
         let id = self.entries.len() as u32;
         let usb = Some(facts);
-        self.push(Entry { node, kind: DeviceKind::UsbDevice, served: NOT_SERVED, parent, driver, usb }).then_some(id)
+        let kind = DeviceKind::UsbDevice;
+        let entry = Entry { node, kind, served: NOT_SERVED, parent, driver, usb, departed: false };
+        self.push(entry).then_some(id)
     }
 
     /// The index of the PCI function at `desc`'s address, if `desc` names one.
@@ -212,30 +264,30 @@ impl Registry {
             .map_or(NO_PARENT, |i| i as u32)
     }
 
-    /// The block node `/dev/blk/<index>` serves.
+    /// The block node `/dev/blk/<index>` serves. **None for a departed one** (Phase 6 Part C).
     pub fn block(&self, index: u32) -> Option<ObjectRef> {
         self.entries
             .iter()
-            .find(|e| node_of(e).class() == DeviceClass::Block && e.served == index)
+            .find(|e| !e.departed && node_of(e).class() == DeviceClass::Block && e.served == index)
             .map(|e| e.node.clone())
     }
 
-    /// The input node `/dev/input/raw/<index>` serves.
+    /// The input node `/dev/input/raw/<index>` serves. **None for a departed one** (Phase 6 Part C).
     pub fn input(&self, index: u32) -> Option<ObjectRef> {
         self.entries
             .iter()
-            .find(|e| matches!(e.kind, DeviceKind::Keyboard | DeviceKind::Mouse) && e.served == index)
+            .find(|e| !e.departed && matches!(e.kind, DeviceKind::Keyboard | DeviceKind::Mouse) && e.served == index)
             .map(|e| e.node.clone())
     }
 
-    /// Node `id` — its place in the table.
+    /// Node `id` — its place in the table. **None for a departed one** (Phase 6 Part C).
     pub fn node(&self, id: u32) -> Option<ObjectRef> {
-        self.entries.get(id as usize).map(|e| e.node.clone())
+        self.entries.get(id as usize).filter(|e| !e.departed).map(|e| e.node.clone())
     }
 
-    /// Whether a node of `kind` is registered.
+    /// Whether a node of `kind` is registered and has not departed.
     pub fn has(&self, kind: DeviceKind) -> bool {
-        self.entries.iter().any(|e| e.kind == kind)
+        self.entries.iter().any(|e| !e.departed && e.kind == kind)
     }
 
     /// Every node as a record, in table order. `outcome_of` says what a driver did with a PCI
@@ -267,6 +319,9 @@ impl Registry {
                 func: d.func,
                 ..DeviceRecord::default()
             };
+            if e.departed {
+                r.flags |= DEPARTED;
+            }
             let mut driver = e.driver;
             if e.kind == DeviceKind::PciFunction {
                 match outcome_of(d) {
@@ -325,6 +380,7 @@ impl Registry {
             version: REGISTRY_VERSION,
             count: records.len() as u32,
             record_size: core::mem::size_of::<DeviceRecord>() as u32,
+            generation: self.generation,
         };
         let mut out: KVec<u8> = KVec::new();
         out.try_reserve(core::mem::size_of::<RegistryHeader>() + records.len() * core::mem::size_of::<DeviceRecord>())?;
@@ -360,6 +416,11 @@ pub fn init() {
     drop(table);
     ENUMERATED.store(count, Ordering::Release);
     crate::kprintln!("device: {} node(s) registered", count);
+    let backend = CharBackend { submit_read: changes_read, submit_write: None, ctx: core::ptr::null_mut() };
+    match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
+        Ok(node) => *CHANGES.lock() = Some(crate::drivers::adopt(node, KObjectType::DeviceNode)),
+        Err(_) => crate::kprintln!("device: no memory for /dev/registry/changes; nothing will learn of a change"),
+    }
 }
 
 /// Number of devices in the table.
@@ -389,6 +450,7 @@ pub fn register(node: ObjectRef, driver: &'static str) {
     if !DEVICES.lock().add_block(node, driver) {
         crate::kprintln!("device: table full; dropping a registered node");
     }
+    announce();
 }
 
 /// Append a partition of `disk`. The table takes ownership of `node`.
@@ -396,6 +458,7 @@ pub fn register_partition(node: ObjectRef, disk: &ObjectRef, driver: &'static st
     if !DEVICES.lock().add_block_child(node, disk, driver) {
         crate::kprintln!("device: table full; dropping a registered partition");
     }
+    announce();
 }
 
 /// Append a character node — the console, or an i8042 device served at
@@ -404,6 +467,7 @@ pub fn register_char(node: ObjectRef, kind: DeviceKind, served: u32, driver: &'s
     if !DEVICES.lock().add_char(node, kind, served, driver) {
         crate::kprintln!("device: table full; dropping a registered {:?}", kind);
     }
+    announce();
 }
 
 /// Append a USB device under the PCI function at `controller`'s address, carrying `facts`. The
@@ -420,6 +484,7 @@ pub fn register_usb(
     if id.is_none() {
         crate::kprintln!("device: table full; dropping a USB device");
     }
+    announce();
     id
 }
 
@@ -431,7 +496,17 @@ pub fn register_input(node: ObjectRef, kind: DeviceKind, parent: Option<u32>, dr
     if served.is_none() {
         crate::kprintln!("device: table full; dropping a {:?}", kind);
     }
+    announce();
     served
+}
+
+/// **Depart node `id` and every node whose parent chain reaches it** (Phase 6 Part C) — a USB
+/// device and its keyboards and mice — as one change, and answer the reads waiting on
+/// `/dev/registry/changes`. From the hub thread, never a DPC: the answers complete operations.
+pub fn depart(id: u32) {
+    if DEVICES.lock().depart(id) {
+        announce();
+    }
 }
 
 /// The node `/dev/blk/<index>` serves, as a cloned owning reference (the table keeps its own).
@@ -455,6 +530,11 @@ pub fn has(kind: DeviceKind) -> bool {
     DEVICES.lock().has(kind)
 }
 
+/// The node `/dev/registry/changes` serves (Phase 6 Part C), or `None` if it could not be made.
+pub fn changes_node() -> Option<ObjectRef> {
+    CHANGES.lock().clone()
+}
+
 /// What `/dev/registry` serves: the header and every node's record.
 pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
     // Outcomes are copied out before the table is locked, because the two locks share a rank
@@ -470,6 +550,158 @@ pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
     DEVICES.lock().snapshot_bytes(|d| {
         outcomes.iter().find(|(a, _)| *a == address(d)).map(|&(_, o)| o)
     })
+}
+
+// --- `/dev/registry/changes` (Phase 6 Part C) -----------------------------------
+//
+// **How a reader learns that the table changed**: a char node whose `Read` waits until the table's
+// generation is past the read's `offset`, then answers with the generation, eight bytes. A reader
+// that is behind is answered at once. The device manager reads a snapshot, then waits past its
+// generation, so a change between the two answers the wait at once and none is missed. It is the
+// async model as it is — `sys_io_submit`, a `PendingOperation`, `sys_wait` — and needs no way for
+// the kernel to name the manager, which a notification would have (the plan's detail pass).
+
+/// Reads that may wait on `/dev/registry/changes` at once: the device manager's one, with room to
+/// spare. A fifth is refused, `WouldBlock`.
+pub const WAITERS_MAX: usize = 4;
+
+/// **The reads waiting for the table to pass a generation**, as a value a host test can drive.
+pub struct Waiters<T> {
+    slots: [Option<(u64, T)>; WAITERS_MAX],
+}
+
+impl<T> Default for Waiters<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Waiters<T> {
+    /// None waiting.
+    pub const fn new() -> Self {
+        Self { slots: [const { None }; WAITERS_MAX] }
+    }
+
+    /// Wait `item` until the generation is past `after`, or hand it back when every slot is taken.
+    pub fn park(&mut self, after: u64, item: T) -> Result<(), T> {
+        match self.slots.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => {
+                *slot = Some((after, item));
+                Ok(())
+            }
+            None => Err(item),
+        }
+    }
+
+    /// **Every item `generation` is past**, taken out to be answered; the rest go on waiting.
+    pub fn take_passed(&mut self, generation: u64) -> [Option<T>; WAITERS_MAX] {
+        let mut out = [const { None }; WAITERS_MAX];
+        for (slot, o) in self.slots.iter_mut().zip(out.iter_mut()) {
+            if slot.as_ref().is_some_and(|(after, _)| generation > *after) {
+                *o = slot.take().map(|(_, item)| item);
+            }
+        }
+        out
+    }
+}
+
+/// A read waiting on the change node: what answers it.
+struct WaitingRead {
+    po: ObjectRef,
+    buffer: ObjectRef,
+    buf_offset: u64,
+}
+
+/// The generation the waiting reads are judged against: the table's, stored after every change
+/// and before the waiting reads are looked at, so a read that finds it old has parked in time for
+/// the change to find it.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The reads waiting. A leaf: nothing is completed or dropped while it is held.
+static WAITING: SpinLock<Waiters<WaitingRead>> = SpinLock::new(LockRank::Leaf, Waiters::new());
+
+/// The node `/dev/registry/changes` serves, made by [`init`].
+static CHANGES: SpinLock<Option<ObjectRef>> = SpinLock::new(LockRank::Leaf, None);
+
+/// **The table changed**: store its generation and answer every waiting read it is past. Thread
+/// context, with no lock held — answering completes an operation, which takes the scheduler's.
+fn announce() {
+    let generation = DEVICES.lock().generation();
+    // `fetch_max`: two changes announcing out of order must not move the generation back.
+    GENERATION.fetch_max(generation, Ordering::AcqRel);
+    let passed = WAITING.lock().take_passed(GENERATION.load(Ordering::Acquire));
+    for read in passed.into_iter().flatten() {
+        answer(&read.buffer, &read.po, read.buf_offset, GENERATION.load(Ordering::Acquire));
+    }
+}
+
+/// Write `generation` into `buffer` at `buf_offset` and complete `po` with its eight bytes.
+fn answer(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, generation: u64) {
+    // SAFETY: `buffer` is a live `MemoryObject` reference, held across this — `sys_io_submit`
+    // checked its type and the range.
+    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+    mo.copy_in(buf_offset as usize, &generation.to_le_bytes());
+    crate::sched::complete_pending_op(po.as_ptr(), 0, 8);
+}
+
+/// [`CharBackend::submit_read`] for `/dev/registry/changes`: **answer at once if the table is past
+/// `offset`, the generation the reader holds, or wait until it is.** At least eight bytes, or
+/// `InvalidArgument`; a fifth reader waiting is refused, `WouldBlock`.
+fn changes_read(
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    offset: u64,
+    max_len: u64,
+    _ctx: *mut (),
+) -> Result<(), KError> {
+    read_changes(&WAITING, &GENERATION, buffer, po, buf_offset, offset, max_len)
+}
+
+/// [`changes_read`] against `waiting` and `generation`: the statics in a boot, and a host test's own
+/// (PR #361 review), so the read's two refusals are held through the read rather than through
+/// [`Waiters`] alone.
+fn read_changes(
+    waiting: &SpinLock<Waiters<WaitingRead>>,
+    generation: &AtomicU64,
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    offset: u64,
+    max_len: u64,
+) -> Result<(), KError> {
+    if max_len < 8 {
+        return Err(KError::InvalidArgument);
+    }
+    enum Then {
+        Answer(u64),
+        Waiting,
+        Full(WaitingRead),
+    }
+    let then = {
+        let mut waiting = waiting.lock();
+        let generation = generation.load(Ordering::Acquire);
+        if generation > offset {
+            Then::Answer(generation)
+        } else {
+            match waiting.park(offset, WaitingRead { po: po.clone(), buffer: buffer.clone(), buf_offset }) {
+                Ok(()) => Then::Waiting,
+                Err(read) => Then::Full(read),
+            }
+        }
+    };
+    match then {
+        Then::Answer(generation) => {
+            answer(buffer, po, buf_offset, generation);
+            Ok(())
+        }
+        Then::Waiting => Ok(()),
+        Then::Full(read) => {
+            // Dropped here, with the lock let go: its references may be the last.
+            drop(read);
+            Err(KError::WouldBlock)
+        }
+    }
 }
 
 // --- What the drivers did with each function (Phase 5 Part D.1) ---------------
@@ -597,8 +829,8 @@ mod tests {
 
     fn no_submit(_: *mut Irp, _: *mut ()) {}
     fn no_poll(_: *mut ()) {}
-    fn no_read(_: &ObjectRef, _: &ObjectRef, _: u64, _: u64, _: *mut ()) -> Result<(), crate::syscall::error::KError> {
-        Err(crate::syscall::error::KError::Unsupported)
+    fn no_read(_: &ObjectRef, _: &ObjectRef, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
+        Err(KError::Unsupported)
     }
 
     fn block(desc: ResourceDescriptor, kind: BlockKind, name: &[u8], blocks: u64) -> ObjectRef {
@@ -787,6 +1019,149 @@ mod tests {
         assert_eq!(bytes.len(), header_len + 9 * record_len);
         let word = |off: usize| u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         assert_eq!((word(0), word(4), word(8), word(12)), (REGISTRY_MAGIC, REGISTRY_VERSION, 9, record_len as u32));
+        let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        assert_eq!(generation, 9, "one change per node registered (Phase 6 Part C)");
+    }
+
+    /// A booted table with two USB devices under an xHCI at 00:03.0: a keyboard on port 9 with its
+    /// keyboard node, then a mouse on port 10 with its mouse node. The USB devices' ids, and the
+    /// input nodes'.
+    fn with_usb(r: &mut Registry) -> (u32, u32, u32, u32) {
+        let at3 = pci_at(0, 3, 0);
+        let xhci = ResourceDescriptor {
+            identity: DeviceIdentity { class: 0x0c, subclass: 0x03, prog_if: 0x30, ..at3.identity },
+            ..at3
+        };
+        assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
+        let usb =
+            || adopt(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
+        let name = [0; MAX_DEVICE_NAME];
+        let facts = UsbFacts { vendor: 0x0627, product: 1, class: (3, 1, 1), port: 9, speed: 3, name, name_len: 0 };
+        let kbd = r.add_usb(usb(), &xhci, "xhci", facts).unwrap();
+        r.add_input(char_node(), DeviceKind::Keyboard, Some(kbd), "usb-hid").unwrap();
+        let mouse = r.add_usb(usb(), &xhci, "xhci", UsbFacts { port: 10, class: (3, 1, 2), ..facts }).unwrap();
+        r.add_input(char_node(), DeviceKind::Mouse, Some(mouse), "usb-hid").unwrap();
+        (kbd, kbd + 1, mouse, mouse + 1)
+    }
+
+    /// **A departure takes its children, and nothing else** (Phase 6 Part C): the USB keyboard's
+    /// keyboard node with it, the mouse beside it and every boot device untouched. The records stay,
+    /// marked rather than omitted, so ids still name places. One change, so one generation; a second
+    /// departure of the same device changes nothing.
+    #[test]
+    fn a_departure_takes_its_children_and_nothing_else() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        let (kbd, kbd_node, mouse, mouse_node) = with_usb(&mut r);
+        let before = r.generation();
+        let count = r.records(|_| None).unwrap().len();
+        assert!(r.depart(kbd));
+        assert_eq!(r.generation(), before + 1, "one change for the device and its node");
+        let recs = r.records(|_| None).unwrap();
+        assert_eq!(recs.len(), count, "marked, not omitted");
+        let departed: KVec<u32> = {
+            let mut v = KVec::new();
+            for x in recs.iter().filter(|x| x.flags & DEPARTED != 0) {
+                v.try_push(x.id).unwrap();
+            }
+            v
+        };
+        assert_eq!(&departed[..], &[kbd, kbd_node]);
+        assert!(r.node(mouse).is_some() && r.node(mouse_node).is_some(), "the mouse beside it stays");
+        assert!(!r.depart(kbd), "departed already");
+        assert_eq!(r.generation(), before + 1);
+        assert!(!r.depart(99), "an id the table does not hold");
+    }
+
+    /// **A departed device's paths refuse it, and its served index is never reissued** (Phase 6 Part
+    /// C): `/dev/input/raw/2` and `/dev/registry/<id>` answer nothing once the keyboard has gone.
+    /// With the mouse gone too — the highest index, which is the case a reissue would show in —
+    /// the next keyboard takes 4, not 3 and not 2.
+    #[test]
+    fn a_departed_device_is_found_by_no_path_and_its_index_stays_taken() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        let (kbd, kbd_node, mouse, _) = with_usb(&mut r);
+        assert!(r.input(2).is_some() && r.node(kbd_node).is_some());
+        assert!(r.has(DeviceKind::UsbDevice));
+        r.depart(kbd);
+        assert!(r.input(2).is_none(), "/dev/input/raw/2");
+        assert!(r.node(kbd).is_none() && r.node(kbd_node).is_none(), "/dev/registry/<id>");
+        assert!(r.input(3).is_some(), "the mouse still answers");
+        r.depart(mouse);
+        assert!(!r.has(DeviceKind::UsbDevice), "what the hardware report and the i8042 ask");
+        assert!(r.has(DeviceKind::Keyboard), "the i8042's keyboard is still here");
+        assert_eq!(r.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(4), "not 3, nor 2");
+        // A block device the same way, for Part D: the partition departs with its disk.
+        let (mut b, _, _) = booted();
+        b.depart(3);
+        assert!(b.block(0).is_none() && b.block(2).is_none(), "the disk and its partition");
+        assert!(b.block(1).is_some(), "the RAM disk is no child of the disk");
+        // **And two levels down** (PR #361 review): Part D's USB disk is a device, its disk and its
+        // partition. The controller stands in for the device here, the partition its grandchild.
+        let (mut c, _, _) = booted();
+        c.depart(1);
+        assert!(c.block(0).is_none() && c.block(2).is_none(), "the controller's disk, and that disk's partition");
+        assert!(c.block(1).is_some() && c.node(0).is_some() && c.node(2).is_some(), "and nothing else");
+    }
+
+    /// **Every change counts once**: each registration, and a departure with its children.
+    #[test]
+    fn the_generation_counts_every_change() {
+        init_global_heap();
+        let mut r = Registry::new();
+        assert_eq!(r.generation(), 0);
+        r.add_char(char_node(), DeviceKind::Keyboard, 0, "i8042");
+        r.add_char(char_node(), DeviceKind::Mouse, 1, "i8042");
+        assert_eq!(r.generation(), 2);
+        r.depart(0);
+        assert_eq!(r.generation(), 3);
+    }
+
+    /// **A waiting read is answered by the change past its generation, and not before** (Phase 6
+    /// Part C), and the slots run out at four: a fifth is handed back to be refused.
+    #[test]
+    fn a_waiting_read_is_answered_past_its_generation_and_not_before() {
+        let mut w: Waiters<char> = Waiters::new();
+        assert!(w.park(5, 'a').is_ok());
+        assert!(w.park(7, 'b').is_ok());
+        assert_eq!(w.take_passed(5), [None; WAITERS_MAX], "5 is not past 5");
+        assert_eq!(w.take_passed(6), [Some('a'), None, None, None]);
+        assert_eq!(w.take_passed(7), [None; WAITERS_MAX], "taken once");
+        assert_eq!(w.take_passed(9), [None, Some('b'), None, None]);
+        for c in ['c', 'd', 'e', 'f'] {
+            assert!(w.park(1, c).is_ok());
+        }
+        assert_eq!(w.park(1, 'g'), Err('g'), "a fifth");
+    }
+
+    /// **A change read shorter than its answer is refused, one that is behind is answered at once,
+    /// and a fifth waiting is refused** (PR #361 review): `io-operation.md`'s two refusals, through
+    /// the read itself. Seven bytes and eight, either side of the bound.
+    #[test]
+    fn a_change_read_is_refused_short_answered_behind_and_refused_a_fifth_place() {
+        init_global_heap();
+        let waiting = SpinLock::new(LockRank::Leaf, Waiters::new());
+        let generation = AtomicU64::new(5);
+        let page =
+            crate::drivers::adopt(MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+        let po = || {
+            crate::drivers::adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+        };
+        let read = |po: &ObjectRef, offset, len| read_changes(&waiting, &generation, &page, po, 0, offset, len);
+
+        let behind = po();
+        assert_eq!(read(&behind, 4, 7), Err(KError::InvalidArgument), "shorter than its answer");
+        assert!(!crate::sched::pending_op_is_signaled(behind.as_ptr()));
+        assert_eq!(read(&behind, 4, 8), Ok(()));
+        assert_eq!(crate::sched::pending_op_completion(behind.as_ptr()), (0, 8), "behind, so answered at once");
+
+        let ahead: [ObjectRef; WAITERS_MAX] = core::array::from_fn(|_| po());
+        for p in &ahead {
+            assert_eq!(read(p, 5, 8), Ok(()));
+            assert!(!crate::sched::pending_op_is_signaled(p.as_ptr()), "5 is not past 5: it waits");
+        }
+        assert_eq!(read(&po(), 5, 8), Err(KError::WouldBlock), "a fifth place to wait");
     }
 
     #[test]

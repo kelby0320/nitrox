@@ -4,11 +4,11 @@ Part of the [Nitrox Implementation Plan index](implementation-plan.md), which ho
 current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
-built 2026-10-05; Part C detailed 2026-10-05; Parts C–H not built.** This replaces the sketch
-written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below were
-agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next, as
-administration's parts did; what is here is the phase's shape, the design each part builds to, and
-the gate that closes it. **Nothing below describes current behaviour.**
+built 2026-10-05; Part C detailed and built 2026-10-05; Parts D–H not built.** This replaces the
+sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
+were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
+as administration's parts did; what is here is the phase's shape, the design each part builds to,
+and the gate that closes it. **Nothing below describes current behaviour.**
 
 ## Scope
 
@@ -1178,6 +1178,17 @@ stops its repeat as any release does.
   `/dev/blk` at its served index.
 - **C.5 The gates.** Below.
 - **C.6 Docs.** Below.
+- **C.1–C.6 built 2026-10-05.** Calls on the way:
+  - **`MemoryObject::copy_in`** writes a read's bytes into its buffer, replacing the console's and
+    the input nodes' copies of the same helper, since the change node would have been a third;
+  - **a refused or failed change read stops the manager following**, logged, rather than
+    retrying: it keeps the table it has and serves it;
+  - **`test-qemu`'s devices check cannot see a manager that never follows** when the hot-plug has
+    come and gone before the manager's one read — the control passed it — so `check-input --usb`,
+    which orders its own plugs, is the gate that holds following, and fails the same control;
+  - **the first host test of a departed index never reissued could not fail**: the departed index
+    sat below a present one, so a reissue would have taken the next anyway. It departs the device
+    with the highest index now, the case a reissue shows in, and fails its control.
 
 ### Gates
 

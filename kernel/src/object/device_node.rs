@@ -208,14 +208,25 @@ impl DeviceClass {
 #[derive(Copy, Clone)]
 pub struct CharBackend {
     /// Submit a stream read against the device.
-    pub submit_read:
-        fn(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, max_len: u64, ctx: *mut ()) -> Result<(), KError>,
+    pub submit_read: CharRead,
     /// **Submit a write to the device**, if it takes one (Phase 6 Part B.5): a keyboard's lights,
     /// one byte. `None` refuses a write as `Unsupported`, which is every char device before then.
     pub submit_write: Option<CharWrite>,
     /// Device context passed back to `submit_read` and `submit_write` (e.g. the console state).
     pub ctx: *mut (),
 }
+
+/// A char device's read: up to `max_len` bytes into `buffer` at `buf_offset`, completing `po`.
+/// **`offset` is the read's own**, from its `IoOp`: a stream has no position and ignores it, and the
+/// registry's change node reads it as the generation the reader holds (Phase 6 Part C).
+pub type CharRead = fn(
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    offset: u64,
+    max_len: u64,
+    ctx: *mut (),
+) -> Result<(), KError>;
 
 /// A char device's write: `len` bytes from `buffer` at `buf_offset`, completing `po`.
 pub type CharWrite =

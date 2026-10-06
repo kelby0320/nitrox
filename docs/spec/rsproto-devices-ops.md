@@ -1,11 +1,13 @@
 # rsproto — Devices operations (`0x0Fxx`)
 
-**Status: normative for what is built (2026-09-24).** `Arrived` and `Settled` are implemented in
-`userspace/device-mgr/` and encoded by `userspace/librsproto/src/devices.rs`; `Departed` is
-encoded there and **sent by nothing until Phase 6** gives the kernel an event source. `input-server`
-subscribes to `input` from boot on (Part B.3), and every session reads the tables at `/dev/devices`
-through an info-only endpoint (Part B.4). Written with administration Part B.2; see [`administration.md`](../planning/administration.md) § *Part B in
-detail* for the design and why each piece is shaped as it is.
+**Status: normative for what is built (2026-10-05).** `Arrived`, `Settled` and `Departed` are
+implemented in `userspace/device-mgr/` and encoded by `userspace/librsproto/src/devices.rs`. **Since
+Phase 6 Part C the manager follows the registry**, so an `Arrived` after `Settled` and a `Departed`
+are sent as devices come and go ([`device-manager.md`](../architecture/device-manager.md) §3a).
+`input-server` subscribes to `input` from boot on (Part B.3), and every session reads the tables at
+`/dev/devices` through an info-only endpoint (Part B.4). Written with administration Part B.2; see
+[`administration.md`](../planning/administration.md) § *Part B in detail* for the design and why
+each piece is shaped as it is.
 
 ## The shape
 
@@ -131,8 +133,11 @@ cannot know.
 ### `Departed` (`0x0F02`) — manager → owner
 
 **Unsolicited, `request_id` 0.** Body: a u32, the departed device's registry id — the `id` of the
-record its `Arrived` carried, which is stable within a boot. **Nothing sends one until Phase 6**;
-it is specified now so an owner is written against it from the start.
+record its `Arrived` carried, which is stable within a boot. **Sent since Phase 6 Part C**, once
+for a device the owner was handed and the registry now marks departed. A device that arrived and
+departed between two of the manager's reads was never handed over, and gets none. The owner's
+handle to the node stays valid, and its driver says what it does: a USB input node is read until
+its ring is empty and then refuses, `PeerClosed`, which may reach the owner first.
 
 ## References
 

@@ -208,8 +208,19 @@ controller, a `usb-kbd` and a `usb-mouse`, so a key or a click that arrives came
 at all. `check-input`, `check-login` and `check-report` take it, each asserting what it does on the
 i8042 less what is the i8042's own: `check-input` the held-release step, and `check-report` the
 FADT's 8042 and the first round's count, for which it asserts the machine's instead.
-`check-input --usb` adds one thing of USB's own: that the keyboard acknowledged its lights (Phase 6
-Part B.5).
+`check-input --usb` adds what is USB's own: that the keyboard acknowledged its lights (Phase 6 Part
+B.5), and **keyboards that come and go** (Part C). Over QMP it unplugs the boot keyboard, plugs
+another in and types on it, then holds a key down on that one and unplugs it — and the test client's
+window sees the release, which QEMU cannot have sent: its HID device sends nothing for a key held
+when it goes. Each answer is matched from the QMP command that caused it (`Session::line_since`),
+whichever process prints first. A last keyboard goes in for the rest of the gate. At its end the
+transcript must hold one `left` line per unplugged keyboard and neither line an input server prints
+for a node it goes on reading after its device has gone.
+
+**`test-qemu`'s hot-plug cannot hold the device manager to following the registry.** It lands
+before `init`, so on either side of the manager's first read, and when it has come and gone before
+that read, a manager that never follows still agrees with the registry. `check-input --usb` orders
+its own plugs, so it is the gate that does.
 
 **QEMU's trace is a gate's window onto a device the guest cannot report on** (Phase 6 Part B.5).
 `check-terminal` boots with `-trace ps2_set_ledstate -trace ps2_reset_keyboard -D <file>` and reads
