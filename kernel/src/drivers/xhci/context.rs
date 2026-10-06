@@ -165,14 +165,46 @@ pub fn interval(speed_id: u8, b_interval: u8) -> u8 {
     }
 }
 
+/// Endpoint types 2, Bulk OUT, and 6, Bulk IN, in dword 1 bits 5:3.
+const EP_TYPE_BULK_OUT: u32 = 2 << 3;
+const EP_TYPE_BULK_IN: u32 = 6 << 3;
+/// A bulk endpoint's Average TRB Length: 3 KiB, which xHCI 1.2 §4.14.1.1 suggests for bulk.
+const BULK_AVERAGE_TRB: u32 = 3072;
+
+/// **A bulk endpoint to configure** (Phase 6 Part D.2): its Device Context Index, direction,
+/// maximum packet and SuperSpeed burst, and transfer ring with its cycle state.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bulk {
+    pub dci: u8,
+    pub input: bool,
+    pub max_packet: u16,
+    /// A SuperSpeed companion's `bMaxBurst`; 0 below SuperSpeed.
+    pub burst: u8,
+    pub ring: u64,
+    pub cycle: bool,
+}
+
 /// **The input context for Configure Endpoint** (Phase 6 Part B.2): the slot — its speed, its root
 /// port, and its context entries raised to the highest endpoint's index — and each endpoint in
 /// `endpoints` added as *Interrupt IN*, with three retries, its maximum packet and burst, its
 /// interval, its ring, its Max ESIT Payload, and an Average TRB Length of the TRB each is given,
-/// its maximum packet. `ctx` must be `input_len` bytes, zeroed.
-pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, endpoints: &[Interrupt]) {
+/// its maximum packet. **And each in `bulks` added as Bulk IN or OUT** (Part D.2): three retries,
+/// its maximum packet and burst, no streams, its ring, and the average TRB length bulk is given.
+/// `ctx` must be `input_len` bytes, zeroed.
+pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, endpoints: &[Interrupt], bulks: &[Bulk]) {
     let mut add = ADD_SLOT;
     let mut entries = 1u32;
+    for b in bulks {
+        add |= 1 << b.dci;
+        entries = entries.max(b.dci as u32);
+        let ep = l.endpoint(b.dci);
+        let kind = if b.input { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
+        put(ctx, ep, 0);
+        put(ctx, ep + 4, CERR_3 | kind | (b.burst as u32) << 8 | (b.max_packet as u32) << 16);
+        put(ctx, ep + 8, (b.ring as u32 & !0xF) | b.cycle as u32);
+        put(ctx, ep + 12, (b.ring >> 32) as u32);
+        put(ctx, ep + 16, BULK_AVERAGE_TRB);
+    }
     for e in endpoints {
         add |= 1 << e.dci;
         entries = entries.max(e.dci as u32);
@@ -232,6 +264,30 @@ mod tests {
         assert_eq!(dword(&ctx, 64 + 8), 0x8000, "cycle state 0");
     }
 
+    /// **Bulk endpoints beside an interrupt one** (Phase 6 Part D.2): each where its index puts it,
+    /// typed IN or OUT, with its burst and maximum packet, no streams, its ring and cycle state,
+    /// and bulk's average TRB length; the slot's entries raised to the highest index.
+    #[test]
+    fn bulk_endpoints_are_typed_by_direction_beside_an_interrupt_one() {
+        let l = Layout::new(false);
+        let mut ctx = vec![0u8; l.input_len()];
+        let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x5000, cycle: true };
+        let bulk_in = Bulk { dci: 5, input: true, max_packet: 1024, burst: 15, ring: 0x2_0000_7000, cycle: false };
+        let bulk_out = Bulk { dci: 4, input: false, max_packet: 512, burst: 0, ring: 0x8000, cycle: true };
+        configure_endpoints(&mut ctx, l, 2, speed::SUPER, &[kbd], &[bulk_in, bulk_out]);
+        assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 4 | 1 << 5, "the slot and the three endpoints");
+        assert_eq!(dword(&ctx, 32) >> 27, 5, "entries up to index 5");
+        let i = l.endpoint(5);
+        assert_eq!(dword(&ctx, i), 0, "no streams, no interval");
+        assert_eq!(dword(&ctx, i + 4), 1024 << 16 | 15 << 8 | 6 << 3 | 3 << 1, "bulk IN, burst 15");
+        assert_eq!((dword(&ctx, i + 8), dword(&ctx, i + 12)), (0x7000, 0x2), "the ring, cycle state 0");
+        assert_eq!(dword(&ctx, i + 16), 3072);
+        let o = l.endpoint(4);
+        assert_eq!(dword(&ctx, o + 4), 512 << 16 | 2 << 3 | 3 << 1, "bulk OUT");
+        assert_eq!(dword(&ctx, o + 8), 0x8001);
+        assert_eq!(dword(&ctx, l.endpoint(3) + 4) >> 3 & 7, 7, "the keyboard's still interrupt IN");
+    }
+
     /// **The interval at each speed**, at both ends of its clamp: QEMU's 10 ms at full speed and its
     /// `bInterval` 7 at high speed are both 8 ms, exponent 6.
     #[test]
@@ -258,7 +314,7 @@ mod tests {
             let mut ctx = vec![0u8; l.input_len()];
             let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x1_0000_5000, cycle: true };
             let mouse = Interrupt { dci: 5, max_packet: 4, burst: 1, interval: 3, ring: 0x6000, cycle: false };
-            configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse]);
+            configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse], &[]);
             assert_eq!(dword(&ctx, 0), 0, "nothing dropped");
             assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 5, "A0, A3 and A5");
             assert_eq!(dword(&ctx, entry), 3 << 20 | 5 << 27, "high speed, entries to DCI 5");
@@ -286,7 +342,7 @@ mod tests {
         let l = Layout::new(false);
         let mut ctx = vec![0u8; l.input_len()];
         let big = Interrupt { dci: 3, max_packet: 0xFFFF, burst: 15, interval: 0, ring: 0, cycle: false };
-        configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big]);
+        configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big], &[]);
         let payload = 0xFFFF * 16;
         assert_eq!(dword(&ctx, 4 * 32) >> 24, payload >> 16, "Max ESIT Payload Hi");
         assert_eq!(dword(&ctx, 4 * 32 + 16) >> 16, payload & 0xFFFF, "Max ESIT Payload Lo");

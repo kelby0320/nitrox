@@ -845,14 +845,14 @@ impl FileObject {
     /// Part D. `file_obj` is this object's reference (pins the frames across the IRPs). Runs
     /// in a syscall thread (it blocks). Returns `true` iff every write succeeded; `false`
     /// for a non-block producer or an I/O/allocation failure.
-    pub fn writeback(file_obj: &ObjectRef) -> bool {
+    pub fn writeback(file_obj: &ObjectRef) -> WriteBack {
         debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         // The producer is immutable; the run map is read under the lock with the pages.
         let (device, block_size) = match &fo.producer {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
-            _ => return false,
+            _ => return WriteBack::Failed,
         };
         // Which pages are resident, under the lock; each is then looked at again as its IRP is
         // issued ([`begin_write`](Self::begin_write)), so a `Forget` stops the write-back
@@ -861,7 +861,7 @@ impl FileObject {
         {
             let inner = fo.inner.lock();
             if indices.try_reserve(inner.pages.len()).is_err() {
-                return false;
+                return WriteBack::Failed;
             }
             for p in inner.pages.iter().filter(|p| p.state == PageState::Ready) {
                 let _ = indices.try_push(p.index);
@@ -873,13 +873,13 @@ impl FileObject {
                 Ok(p) => unsafe {
                     ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
                 },
-                Err(_) => return false,
+                Err(_) => return WriteBack::Failed,
             };
             let (frame, dev_block) = match fo.begin_write(index, block_size) {
                 WriteStep::Go(frame, dev_block) => (frame, dev_block),
                 WriteStep::Skip => continue,
                 // Forgotten: what is unwritten stays so — its blocks are about to be freed.
-                WriteStep::Dead => return true,
+                WriteStep::Dead => return WriteBack::Written,
             };
             let dev_offset = dev_block * block_size as u64;
             if crate::io::block::dispatch_block_irp_into_frame(
@@ -894,15 +894,36 @@ impl FileObject {
             .is_err()
             {
                 fo.finish_io();
-                return false;
+                return WriteBack::Failed;
             }
-            let ok = block_on_po(&po);
+            let status = wait_status(&po);
             fo.finish_io();
-            if !ok {
-                return false;
+            match WriteBack::of(status) {
+                WriteBack::Written => {}
+                w => return w,
             }
         }
-        true
+        WriteBack::Written
+    }
+
+    /// **Let go of a dirty file whose device has gone** (Phase 6 Part D.3): a write-back its device
+    /// refused `PeerClosed`, which no later one can do better. Its self-pin is dropped, outside the
+    /// lock, so the file goes with its last user rather than staying for the boot with its pages,
+    /// its device and its registration. How many of its pages were resident: what was not written.
+    ///
+    /// **Not marked dead**, as a `Forget` marks it: a dead file's fill reads a hole, and a fill of a
+    /// departed device's file must fail — as it does, refused `PeerClosed` — not read as zeros.
+    pub fn let_go(file_obj: &ObjectRef) -> usize {
+        debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
+        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        let (pin, pages) = {
+            let mut g = fo.inner.lock();
+            let pages = g.pages.iter().filter(|p| p.state == PageState::Ready).count();
+            (g.self_pin.take(), pages)
+        };
+        drop(pin);
+        pages
     }
 
     /// The `(registration, file id)` naming this file to its filesystem server, for a cached
@@ -1091,11 +1112,34 @@ impl FileObject {
 /// fast path returns at once if `po` already completed (no lost wakeup). `now = 0`
 /// is fine: a no-deadline (`u64::MAX`) PO wait uses it only for the already-signalled
 /// check, which a `PendingOperation` answers from its flag.
-fn block_on_po(po: &ObjectRef) -> bool {
+fn wait_status(po: &ObjectRef) -> i32 {
     match crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) {
-        crate::sched::WaitResult::Signaled(_) => crate::sched::pending_op_completion(po.as_ptr()).0 == 0,
+        crate::sched::WaitResult::Signaled(_) => crate::sched::pending_op_completion(po.as_ptr()).0,
         // OutOfMemory (waiter registration failed); TimedOut cannot occur (no deadline).
-        _ => false,
+        _ => crate::syscall::error::KError::OutOfMemory as i32,
+    }
+}
+
+/// **What a write-back came to** (Phase 6 Part D.3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WriteBack {
+    /// Every resident page is on the device.
+    Written,
+    /// A page did not reach it; the file stays dirty, for a later write-back to try again.
+    Failed,
+    /// **Its device refused a page `PeerClosed`: it has gone**, and no later write-back can do
+    /// better. The caller lets the file go ([`FileObject::let_go`]).
+    Gone,
+}
+
+impl WriteBack {
+    /// What a page's write, completed with `status`, makes of the write-back.
+    pub fn of(status: i32) -> WriteBack {
+        match status {
+            0 => WriteBack::Written,
+            s if s == crate::syscall::error::KError::PeerClosed as i32 => WriteBack::Gone,
+            _ => WriteBack::Failed,
+        }
     }
 }
 
@@ -1746,6 +1790,27 @@ mod tests {
         assert_eq!(count(), 0, "a forgotten file is not counted, though something holds it");
         assert!(file_of(&held).end_io().is_some());
         drop(held);
+    }
+
+    /// **A write-back its device refused `PeerClosed` lets the file go** (Phase 6 Part D.3): only that
+    /// refusal is for good, so only it leads to [`FileObject::let_go`] — which drops the pin and
+    /// says what was resident, and **leaves the file alive**: unlike a forgotten one, its next fill
+    /// still asks its device, and fails, rather than reading a hole.
+    #[test]
+    fn a_write_back_refused_for_good_lets_the_file_go_and_no_other() {
+        init_global_heap();
+        assert_eq!(WriteBack::of(0), WriteBack::Written);
+        assert_eq!(WriteBack::of(crate::syscall::error::KError::PeerClosed as i32), WriteBack::Gone);
+        assert_eq!(WriteBack::of(crate::syscall::error::KError::IoError as i32), WriteBack::Failed, "a disk that may answer again");
+        let reg = registration();
+        let a = two_block_file(&reg, 7);
+        FileObject::writable_mapped(&a);
+        FileObject::writable_unmapped(a.as_ptr());
+        assert!(file_of(&a).is_dirty());
+        assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
+        assert!(!file_of(&a).is_dirty(), "the pin is gone");
+        assert!(!file_of(&a).is_dead(), "but not forgotten");
+        assert_ne!(file_of(&a).begin_read(1), 0, "a fill still reads its block, not a hole");
     }
 
     /// No sync writes a forgotten object, so a writable mapping must not pin it: nothing would

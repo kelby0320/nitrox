@@ -262,6 +262,65 @@ pub fn hid_interfaces(b: &[u8]) -> impl Iterator<Item = HidInterface> {
     found.into_iter().flatten()
 }
 
+/// **A bulk-only mass-storage interface** (Phase 6 Part D.2): its number, and its bulk IN and bulk
+/// OUT endpoints, each with a SuperSpeed companion's burst.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StorageInterface {
+    pub number: u8,
+    pub bulk_in: Endpoint,
+    pub bulk_out: Endpoint,
+}
+
+/// **The first bulk-only mass-storage interface a configuration describes** (`08/06/50`, alternate
+/// setting 0), with the first bulk endpoint of each direction after it and each one's companion.
+/// `None` when there is none, or it lacks either endpoint: bulk-only cannot run on one.
+pub fn storage_interface(b: &[u8]) -> Option<StorageInterface> {
+    let (mut number, mut inside) = (None, false);
+    let (mut bulk_in, mut bulk_out): (Option<Endpoint>, Option<Endpoint>) = (None, None);
+    // Which endpoint a companion after it would be: `Some(true)` for IN, `Some(false)` for OUT.
+    let mut last: Option<bool> = None;
+    for d in descriptors(b) {
+        match d[1] {
+            kind::INTERFACE if d.len() >= 9 => {
+                last = None;
+                if number.is_some() {
+                    // The interface after the chosen one: what follows is not its.
+                    inside = false;
+                    continue;
+                }
+                inside = d[3] == 0 && (d[5], d[6], d[7]) == (0x08, 0x06, 0x50);
+                if inside {
+                    number = Some(d[2]);
+                }
+            }
+            kind::ENDPOINT if d.len() >= 7 => {
+                last = None;
+                if !inside || d[3] & 0x3 != 0x2 {
+                    continue;
+                }
+                let w = u16::from_le_bytes([d[4], d[5]]);
+                let e = Endpoint { address: d[2], max_packet: w & 0x7FF, burst: 0, interval: 0 };
+                let is_in = d[2] & 0x80 != 0;
+                let slot = if is_in { &mut bulk_in } else { &mut bulk_out };
+                if slot.is_none() {
+                    *slot = Some(e);
+                    last = Some(is_in);
+                }
+            }
+            kind::SS_COMPANION if d.len() >= 6 => {
+                match last {
+                    Some(true) => bulk_in.iter_mut().for_each(|e| e.burst = d[2]),
+                    Some(false) => bulk_out.iter_mut().for_each(|e| e.burst = d[2]),
+                    None => {}
+                }
+                last = None;
+            }
+            _ => last = None,
+        }
+    }
+    Some(StorageInterface { number: number?, bulk_in: bulk_in?, bulk_out: bulk_out? })
+}
+
 /// What this kernel has, or will have, a driver for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Match {
@@ -632,6 +691,48 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].endpoint, None);
         assert_eq!(configuration_value(&[9, 2]), None);
+    }
+
+    /// **A stick's bulk-only interface**, as QEMU's SuperSpeed one describes it: its two bulk
+    /// endpoints, each with its own companion's burst, an interrupt endpoint and another interface's
+    /// bulk endpoints passed over.
+    #[test]
+    fn a_storage_interface_takes_its_bulk_endpoints_and_their_bursts() {
+        let mut c = vec![9, 2, 0, 0, 2, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 3, 8, 6, 0x50, 0]); // bulk-only
+        c.extend_from_slice(&[7, 5, 0x83, 3, 8, 0, 4]); // interrupt: not bulk
+        c.extend_from_slice(&[7, 5, 0x81, 2, 0, 4, 0]); // bulk IN, 1024 bytes
+        c.extend_from_slice(&[6, 0x30, 15, 0, 0, 0]); // its companion: burst 15
+        c.extend_from_slice(&[7, 5, 0x02, 2, 0, 4, 0]); // bulk OUT, 1024 bytes
+        c.extend_from_slice(&[6, 0x30, 3, 0, 0, 0]); // its companion: burst 3
+        c.extend_from_slice(&[9, 4, 1, 0, 2, 0xFF, 0, 0, 0]); // vendor
+        c.extend_from_slice(&[7, 5, 0x84, 2, 0, 2, 0]);
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        let s = storage_interface(&c).expect("a bulk-only interface");
+        assert_eq!(s.number, 0);
+        assert_eq!(s.bulk_in, Endpoint { address: 0x81, max_packet: 1024, burst: 15, interval: 0 });
+        assert_eq!(s.bulk_out, Endpoint { address: 0x02, max_packet: 1024, burst: 3, interval: 0 });
+        assert_eq!((s.bulk_in.dci(), s.bulk_out.dci()), (3, 4));
+    }
+
+    /// **Bulk-only needs both directions**: an interface with a bulk IN alone is none, and a SCSI
+    /// interface of another protocol (UAS, `0x62`) is not this one.
+    #[test]
+    fn a_storage_interface_without_both_bulk_endpoints_is_none() {
+        let mut c = vec![9, 2, 0, 0, 1, 1, 0, 0xA0, 50];
+        c.extend_from_slice(&[9, 4, 0, 0, 1, 8, 6, 0x50, 0]);
+        c.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(storage_interface(&c), None);
+        c[9 + 7] = 0x62;
+        c.extend_from_slice(&[7, 5, 0x02, 2, 64, 0, 0]);
+        let total = c.len() as u16;
+        c[2..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(storage_interface(&c), None, "UAS is not bulk-only");
+        c[9 + 7] = 0x50;
+        assert!(storage_interface(&c).is_some());
     }
 
     /// **A string, made printable**: UTF-16LE, anything outside printable ASCII as `?`, padding

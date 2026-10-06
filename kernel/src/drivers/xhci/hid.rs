@@ -391,12 +391,27 @@ struct Candidate {
     report_len: u16,
 }
 
-/// **Bind every boot keyboard and boot mouse interface of the device in `slot`** (Part B.2):
-/// configure their endpoints, set the configuration, set each to boot protocol, ask keyboards to
-/// report on change only, register a node for each, and start polling. `config` is its
-/// configuration descriptor, `parent` its `UsbDevice` record. Logged; a failure is the device's or
-/// the interface's (`phase-6-usb.md` § *Part B in detail*).
-pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8], parent: Option<u32>) {
+/// **A device's boot keyboard and mouse interfaces, prepared** for its one configuration (Phase 6
+/// Part D.2): each one's ring and report buffer, and the endpoints Configure Endpoint adds for them.
+pub(super) struct HidPrepared {
+    prepared: [Option<Prepared>; 4],
+    eps: [context::Interrupt; 4],
+    n: usize,
+}
+
+impl HidPrepared {
+    /// The endpoints Configure Endpoint adds for them.
+    pub(super) fn endpoints(&self) -> &[context::Interrupt] {
+        &self.eps[..self.n]
+    }
+}
+
+/// **Prepare every boot keyboard and boot mouse interface of a device** (Part B.2): memory for each
+/// endpoint, the device's own, freed with it. `None` when it has none, or memory ran out, which is
+/// said. The hub sends Configure Endpoint and `SET_CONFIGURATION` once for every class it binds, and
+/// then [`bind`] (Phase 6 Part D.2: a second `SET_CONFIGURATION` would reset the first class's
+/// endpoints).
+pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]) -> Option<HidPrepared> {
     let mut found: [Option<Candidate>; 4] = [None, None, None, None];
     let mut n = 0;
     for h in super::desc::hid_interfaces(config) {
@@ -415,20 +430,16 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         }
     }
     if n == 0 {
-        return;
+        return None;
     }
-    let Some(config_value) = super::desc::configuration_value(config) else {
-        return;
-    };
 
-    // **The device's steps**: memory for each endpoint, Configure Endpoint for all, then
-    // SET_CONFIGURATION. A failure here ends the whole binding.
+    // **Memory for each endpoint.** A failure here ends the whole binding.
     let mut prepared: [Option<Prepared>; 4] = [None, None, None, None];
     let mut eps = [context::Interrupt::default(); 4];
     for (i, c) in found.into_iter().flatten().enumerate() {
         let (Ok(ring), Ok(buf)) = (DmaBuffer::alloc(RING_TRBS * 16), DmaBuffer::alloc(crate::mm::PAGE_SIZE)) else {
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
-            return;
+            return None;
         };
         let ring_virt = ring.virt() as u64;
         let ring_phys = ring.phys().as_u64();
@@ -444,20 +455,20 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceM
         prepared[i] =
             Some(Prepared { c, producer, ring_virt, ring_phys, buf_phys: buf.phys().as_u64(), buf_virt: buf.virt() as u64 });
         // **The device's memory**: freed with it, and only after its slot is disabled.
-        if mem.hid.try_push(ring).is_err() || mem.hid.try_push(buf).is_err() {
+        if mem.class.try_push(ring).is_err() || mem.class.try_push(buf).is_err() {
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
-            return;
+            return None;
         }
     }
-    context::configure_endpoints(hub::input_bytes(&mut mem.input, x), x.layout, port, speed_id, &eps[..n]);
-    if let Err(e) = hub::command(x, Trb::with_input(kind::CONFIGURE_ENDPOINT, mem.input.phys().as_u64(), slot)) {
-        crate::kprintln!("usb: port {port}: Configure Endpoint failed: {e}; not bound");
-        return;
-    }
-    if let Err(e) = hub::control_out(x, slot, mem, [0x00, 9, config_value, 0, 0, 0, 0, 0]) {
-        crate::kprintln!("usb: port {port}: SET_CONFIGURATION failed: {e}; not bound");
-        return;
-    }
+    Some(HidPrepared { prepared, eps, n })
+}
+
+/// **Bind the prepared HID interfaces `p` of the device in `slot`**, its configuration set (Part
+/// B.2): set each to boot protocol, ask keyboards to report on change only, register a node for
+/// each, and start polling. `parent` is its `UsbDevice` record. Logged; a failure is the device's or
+/// the interface's (`phase-6-usb.md` § *Part B in detail*).
+pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrepared, parent: Option<u32>) {
+    let HidPrepared { prepared, .. } = p;
 
     // **Each interface's steps**: a stall ends that interface alone, and the others go on. **Any
     // other failure on the default endpoint ends the binding there** (PR #358 review): the request
