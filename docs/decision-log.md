@@ -34161,11 +34161,9 @@ started from is passed over.
 - **Disk slots are a value a host test drives**, under an epoch. That is PR #361's lesson applied
   before it could recur.
 
-**Two calls put to the maintainer:**
-- **Where the gate lives.** The pass recommends extending `check-storage`, whose live boot mounts a
-  stick read-only, with the gate remounting it writable until Part F. The alternative is a new gate
-  on an installed-style boot.
-- **`/dev/disk` names for a stick.** The pass recommends none. Those names are `init`'s, bound from
-  what the boot's probe found. A stick read in the first round would otherwise put its partitions
-  among them. Its `nitrox-root`, say, would lose to the internal disk's only because AHCI is probed
-  first.
+**Two calls put to the maintainer, who agreed to both as recommended:**
+- **Where the gate lives: `check-storage`.** Its live boot mounts a stick read-only, so the gate
+  remounts it writable until Part F. The alternative was a new gate on an installed-style boot.
+- **`/dev/disk` names for a stick: none.** Those names are `init`'s, bound from what the boot's
+  probe found. A stick read in the first round would otherwise put its partitions among them. Its
+  `nitrox-root`, say, would lose to the internal disk's only because AHCI is probed first.

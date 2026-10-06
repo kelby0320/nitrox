@@ -302,7 +302,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 | **A** | **xHCI and enumeration, reported.** The hub thread; the xHCI driver; enumeration at boot and on later port changes; `UsbDevice` records; the hardware report's USB page. | `test-qemu` boots with `usb-kbd`, `usb-mouse` and `usb-storage` attached and asserts each enumerated with its IDs and class. `check-report` asserts the live stick listed. On the laptop, the report's USB page is the survey this plan lacks. |
 | **B** | **HID keyboard and mouse, at boot.** Boot protocol, the usage table, the nodes, `input-server` taking them from the manager's replay. | A gate on a machine with **`i8042=off`**: a key and a click from USB reach a window, and a login at the greeter goes through. `test-interactive` and the other release gates unchanged with the i8042 on. |
 | **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the change node (a notification until Part C's detail pass), the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
-| **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. *(Detailed 2026-10-06: `check-storage` gains these steps, a live boot's read-only auto-mount remounted writable until Part F, pending the maintainer's call — § Part D in detail.)* |
+| **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. *(Detailed 2026-10-06: `check-storage` gains these steps, a live boot's read-only auto-mount remounted writable until Part F, the maintainer's call — § Part D in detail.)* |
 | **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. |
 | **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. |
 | **G** | **Formatting and partitioning**: `disk --partition`, `disk --format`. | A blank stick partitioned and formatted FAT through `with admin`, then mounted and written; refused while mounted. |
@@ -1391,7 +1391,7 @@ keeps its records for the boot, so `usb-departed-records` gains the windows.
 - **One parser for both paths**: the table's sectors are read into bytes and parsed by a function
   over them, host-tested. The boot's polled read and the hub thread's waited one both feed it, so a
   SATA disk with an MBR gains its partitions too.
-- **A stick's partitions get no `/dev/disk` names** (a call for the maintainer, below).
+- **A stick's partitions get no `/dev/disk` names** (the maintainer's call, below).
 - **Blocks of 512 bytes only.** A disk with another block size is published with its table unread,
   and the log says why.
 
@@ -1426,7 +1426,9 @@ keeps its records for the boot, so `usb-departed-records` gains the windows.
 4. A program with one of its files mapped, touching a page not yet in memory, is ended, as on any
    failed fill (`design/fault-survival.md` is where that would change).
 
-### Calls for the maintainer
+### The maintainer's calls, 2026-10-06
+
+The maintainer agreed to both, as recommended.
 
 - **The storage gate extends `check-storage`**, rather than adding a forty-third. That gate already
   boots a stick beside a disk, logs in on serial, writes with `test-pattern`, and checks a disk on
