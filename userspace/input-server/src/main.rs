@@ -37,6 +37,7 @@
 #![no_main]
 
 use input_server::devices::{Arrival, Notice, Table, notice};
+use input_server::leaving::{Act, Leaving};
 use input_server::{
     BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, lights_request, merge,
 };
@@ -156,11 +157,18 @@ fn close(h: u64) {
     }
 }
 
-/// One device: its node, its kind, its read buffer, and the read currently outstanding on it.
+/// One device: its node, its kind, its registry id, its read buffer, the read currently outstanding
+/// on it, and where it is in leaving.
 struct Device {
     node: u64,
     /// What the manager said it is — which decides whether it is written the lights.
     kind: DeviceKind,
+    /// Its registry id, which the manager's `Departed` names.
+    id: u32,
+    /// Where it is in leaving (Phase 6 Part C): see [`input_server::leaving`].
+    leaving: Leaving,
+    /// Both its node and the manager have said it has gone: the serve loop retires its slot.
+    retire_due: bool,
     buf_h: u64,
     buf_addr: u64,
     /// The in-flight read's `PendingOperation`, or `0` when none is outstanding.
@@ -170,7 +178,7 @@ struct Device {
 impl Device {
     /// Take `node` — the handle an `Arrived` carried — and map a read buffer for it. `None`, with
     /// the node closed, if the buffer cannot be had.
-    fn adopt(node: u64, kind: DeviceKind) -> Option<Self> {
+    fn adopt(node: u64, kind: DeviceKind, id: u32) -> Option<Self> {
         // SAFETY: register-only syscall.
         let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
         if buf_h <= 0 {
@@ -186,7 +194,8 @@ impl Device {
             close(node);
             return None;
         }
-        Some(Self { node, kind, buf_h: buf_h as u64, buf_addr: addr as u64, po: 0 })
+        let (buf_h, buf_addr) = (buf_h as u64, addr as u64);
+        Some(Self { node, kind, id, leaving: Leaving::Present, retire_due: false, buf_h, buf_addr, po: 0 })
     }
 
     /// Let the device go: its read, its buffer and its node.
@@ -202,10 +211,20 @@ impl Device {
         close(self.node);
     }
 
-    /// Submit a read if none is outstanding. Idempotent, so the caller can call it after
-    /// every harvest without tracking state.
+    /// **Its node answered `PeerClosed`** (Phase 6 Part C): it is not read again, the line is logged
+    /// once, and the slot is due for retiring if the manager has already said `Departed`.
+    fn peer_closed(&mut self) {
+        let (news, act) = self.leaving.peer_closed();
+        if news {
+            Line::new().s(b"input-server: ").s(kind_word(self.kind)).s(b" ").u(self.id as u64).s(b" left").end();
+        }
+        self.retire_due |= act == Act::Retire;
+    }
+
+    /// Submit a read if none is outstanding and its node is still read. Idempotent, so the caller
+    /// can call it after every harvest without tracking state.
     fn arm(&mut self) {
-        if self.po != 0 {
+        if self.po != 0 || !self.leaving.reading() {
             return;
         }
         let op = IoOp {
@@ -220,6 +239,9 @@ impl Device {
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.node, (&op as *const IoOp) as u64) };
         if po > 0 {
             self.po = po as u64;
+        } else if po == KError::PeerClosed.as_i32() as i64 {
+            // **Its device has gone, and its node has nothing left to read** (Phase 6 Part C).
+            self.peer_closed();
         } else {
             // The device drops out of the wait set until something else wakes the loop, and
             // on a quiet machine nothing may — so this is a device that stops delivering.
@@ -240,6 +262,11 @@ impl Device {
         // SAFETY: closing this read's PO; a new one is created by the next `arm`.
         unsafe { syscall4(SYS_HANDLE_CLOSE, self.po, 0, 0, 0) };
         self.po = 0;
+        if status == KError::PeerClosed.as_i32() {
+            // A read that was waiting when its device went, with no releases to answer it.
+            self.peer_closed();
+            return 0;
+        }
         if status != 0 {
             kprint(b"input-server: read completed with an error; events lost\n");
             return 0;
@@ -679,7 +706,7 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
     match n {
         // `notice` classifies an arrival as one only with exactly one handle: its node.
         Notice::Arrived { id, kind } => match srv.table.arrive(id) {
-            Arrival::Slot(slot) => match Device::adopt(handles[0], kind) {
+            Arrival::Slot(slot) => match Device::adopt(handles[0], kind, id) {
                 Some(d) => {
                     // **A keyboard that arrives is told the lights already on**, or plugging one
                     // in beside a keyboard with Caps Lock on would show it off.
@@ -721,13 +748,19 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
                 .end();
         }
         Notice::Settled(_) => return true,
+        // **Retired once its node has answered `PeerClosed` too** (Phase 6 Part C): until then the
+        // releases its driver pushed may still be in its ring, and it is read.
         Notice::Departed(id) => {
-            if let Some(slot) = srv.table.depart(id) {
-                if let Some(d) = srv.devices[slot].take() {
-                    d.retire();
+            if let Some(slot) = srv.table.slot(id)
+                && let Some(d) = srv.devices[slot].as_mut()
+            {
+                d.retire_due |= d.leaving.departed() == Act::Retire;
+                if !d.retire_due {
+                    let mut line = Line::new();
+                    line.s(b"input-server: device ").u(id as u64).s(b" departing; reading what it has left").end();
                 }
-                Line::new().s(b"input-server: device ").u(id as u64).s(b" departed from slot ").u(slot as u64).end();
             }
+            retire_due(srv);
         }
         Notice::Malformed => {
             handles.iter().for_each(|&h| close(h));
@@ -735,6 +768,20 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
         }
     }
     false
+}
+
+/// **Retire every slot both its node and the manager have let go** (Phase 6 Part C).
+fn retire_due(srv: &mut Server) {
+    for slot in 0..MAX_DEVICES {
+        if !srv.devices[slot].as_ref().is_some_and(|d| d.retire_due) {
+            continue;
+        }
+        if let Some(d) = srv.devices[slot].take() {
+            srv.table.depart(d.id);
+            Line::new().s(b"input-server: device ").u(d.id as u64).s(b" departed from slot ").u(slot as u64).end();
+            d.retire();
+        }
+    }
 }
 
 /// Take every message waiting on the subscription. Returns whether one of them was `Settled`.
@@ -871,6 +918,8 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
         for d in srv.devices.iter_mut().flatten() {
             d.arm();
         }
+        // An arm refused `PeerClosed` may have made a slot due.
+        retire_due(srv);
 
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
         // 1 + 1 + 1 + MAX_DEVICES + MAX_CONSUMERS, inside it.
@@ -969,6 +1018,8 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                 if let Some(d) = srv.devices[slot].as_mut() {
                     counts[slot] = d.harvest(&mut harvested[slot]);
                 }
+                // A read that completed `PeerClosed` is retired at the top of the next pass, after
+                // what this one harvested from the other devices is forwarded.
             } else if let Some(slot) = srv.channels.iter().position(|&c| c == h && c != 0) {
                 // **A signal here means one of two things, and they must be told apart.**
                 // The kernel signals an endpoint when its receive queue is non-empty *or*

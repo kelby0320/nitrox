@@ -320,6 +320,70 @@ pub fn lights_request(body: &[u8]) -> Option<u8> {
     }
 }
 
+pub mod leaving {
+    //! **A device leaving** (Phase 6 Part C). Two things say a device has gone, and they arrive in
+    //! no fixed order: its node answers a read `PeerClosed`, once the releases its driver pushed have
+    //! been read, and the manager sends `Departed`. **A slot is retired only when both have come**:
+    //! retired on `Departed` alone, it would close the node with releases still in its ring — a
+    //! mouse unplugged mid-drag, more than a harvest behind, would lose its button's release (PR
+    //! #360 review). And a node that has answered `PeerClosed` is not read again, so it cannot be
+    //! read in a spin.
+
+    /// Where a device is in leaving.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub enum Leaving {
+        /// Present, as far as this server knows.
+        #[default]
+        Present,
+        /// The manager said `Departed`; its node has not yet answered `PeerClosed`, so it is read.
+        Departing,
+        /// Its node answered `PeerClosed`; the manager's `Departed` has not come.
+        Left,
+    }
+
+    /// What to do with the slot.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Act {
+        /// Keep it.
+        Keep,
+        /// Retire it: both have come.
+        Retire,
+    }
+
+    impl Leaving {
+        /// Whether its node is still read: until it has answered `PeerClosed`.
+        pub fn reading(self) -> bool {
+            self != Leaving::Left
+        }
+
+        /// The manager's `Departed` came.
+        pub fn departed(&mut self) -> Act {
+            match *self {
+                Leaving::Present | Leaving::Departing => {
+                    *self = Leaving::Departing;
+                    Act::Keep
+                }
+                Leaving::Left => Act::Retire,
+            }
+        }
+
+        /// Its node answered `PeerClosed`: whether that is news — the one line to log — and what to do.
+        pub fn peer_closed(&mut self) -> (bool, Act) {
+            match *self {
+                Leaving::Present => {
+                    *self = Leaving::Left;
+                    (true, Act::Keep)
+                }
+                Leaving::Departing => {
+                    *self = Leaving::Left;
+                    (true, Act::Retire)
+                }
+                Leaving::Left => (false, Act::Keep),
+            }
+        }
+    }
+}
+
 pub mod devices {
     //! **The devices this server reads are the device manager's to hand over** (administration
     //! Part B.3). The server subscribes to `/svc/devices/input`; the manager replays every
@@ -426,6 +490,11 @@ pub mod devices {
             let slot = self.ids.iter().position(|&s| s == Some(id))?;
             self.ids[slot] = None;
             Some(slot)
+        }
+
+        /// The slot device `id` holds, if any — left held, unlike [`depart`](Self::depart).
+        pub fn slot(&self, id: u32) -> Option<usize> {
+            (0..MAX_DEVICES).find(|&s| self.id(s) == Some(id))
         }
 
         /// The device in `slot`, if any.
@@ -865,6 +934,25 @@ mod tests {
         let batch = [InputEvent::default(); BATCH_MAX];
         let mut out = [InputEvent::default(); FRAME_MAX];
         assert_eq!(c.frame(&batch, 99, &mut out), Some(FRAME_MAX));
+    }
+
+    /// **A slot is retired when its node has answered `PeerClosed` and the manager has said
+    /// `Departed`, in either order** (Phase 6 Part C): `Departed` first keeps the node read until it
+    /// answers, so the releases in its ring are delivered; `PeerClosed` first stops it being read. And
+    /// `PeerClosed` is news once, the one line logged.
+    #[test]
+    fn a_slot_retires_when_its_node_and_the_manager_have_both_said_so() {
+        use super::leaving::{Act, Leaving};
+        let mut d = Leaving::default();
+        assert_eq!(d.departed(), Act::Keep, "Departed first: the node still has its releases");
+        assert!(d.reading());
+        assert_eq!(d.peer_closed(), (true, Act::Retire));
+
+        let mut p = Leaving::default();
+        assert_eq!(p.peer_closed(), (true, Act::Keep), "PeerClosed first");
+        assert!(!p.reading(), "and not read again");
+        assert_eq!(p.peer_closed(), (false, Act::Keep), "news once");
+        assert_eq!(p.departed(), Act::Retire);
     }
 
     /// **One byte of lights, and nothing else**: each light alone and together, then the

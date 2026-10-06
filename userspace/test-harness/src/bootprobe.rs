@@ -1663,6 +1663,25 @@ fn clock_ns() -> u64 {
     t
 }
 
+/// **Wait `ns`**, on a channel of its own that nothing signals: `sys_wait` takes an absolute deadline
+/// and answers `TimedOut`.
+fn nap(ns: u64) {
+    let (mut ours, mut theirs) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let cr = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
+    if cr != 0 {
+        return;
+    }
+    let handles = [ours];
+    let mut results = [0u8; 24];
+    // SAFETY: one handle this process holds, and room for one result.
+    unsafe {
+        syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, clock_ns().saturating_add(ns));
+    }
+    close(ours);
+    close(theirs);
+}
+
 /// One exchange with the view broker: send `op` on `ch` carrying `body` and moving `handles`, and
 /// wait — at most ten seconds — for the reply to it. An `Exited` that arrives first is set aside in
 /// `exited` rather than mistaken for the reply. `None` if nothing came.
@@ -2386,12 +2405,14 @@ fn registry_test(root_ns: u64) -> bool {
 ///   `Settled`** with the count — the same devices `/dev/registry` lists as block;
 /// - **a second subscription is refused while the first is held**, and taken once it is closed —
 ///   one owner per class, the kernel's one reader per device kept at the manager;
-/// - **`info` lists `all.tsm` and a file per device, and `all.tsm` is a table** with a row per
-///   device the registry had when the manager read it. **That is the registry's first records, and
-///   every record after them is a USB device** (Phase 6 Part A.3): the manager reads the table once,
-///   and a device plugged in after that — `test-qemu`'s hot-plug, which may land on either side of
-///   the read — is in the table and not the manager until Part C tells it. A USB device it did
-///   read is listed as `usb-<id>.tsm`;
+/// - **`info` lists `all.tsm` and a file per present device, and `all.tsm` is a table** with a row
+///   each, **agreeing with the registry's present records** once the manager has caught up (Phase 6
+///   Part C): it follows the table, so `test-qemu`'s hot-plug — landing while this runs — is in
+///   both, or departed from both. Each present USB device is listed as `usb-<id>.tsm`. Until Part
+///   C the manager read the table once, and this held it to a prefix of the registry. **It cannot
+///   see a manager that never follows** when the hot-plug has come and gone before that manager's
+///   one read — a run with following removed passed it — so `check-input --usb`, which orders its
+///   own plugs, is the gate that holds following, and this holds agreement wherever the plug lands;
 /// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
 ///   sees that the input server took its devices from the manager rather than from the raw paths.
 ///   Were it not held, this resolve would take the class for a moment and give it back;
@@ -2404,11 +2425,6 @@ fn devices_test(root_ns: u64) -> bool {
         false
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
-
-    // What the registry says, to hold the manager to.
-    let Some(registry) = registry_records(root_ns) else {
-        return fail(b"the registry does not read");
-    };
 
     // **`block` has its owner from boot on** (administration Part C.5): `service-mgr` spawns the
     // storage service straight after the manager and waits for its `Ready`, which comes only after
@@ -2485,51 +2501,83 @@ fn devices_test(root_ns: u64) -> bool {
         return fail(b"the info-only endpoint would not open its directory");
     }
 
-    // The information side.
-    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
-        return fail(b"/svc/devices/info is not a directory");
-    };
-    let mut names = 0usize;
-    let mut has_all = false;
-    let mut usb_named = 0usize;
-    let listed = dir.read_dir(|e| {
-        if e.name != b"." && e.name != b".." {
-            names += 1;
-            has_all |= e.name == b"all.tsm";
-            let id = e
-                .name
-                .strip_prefix(b"usb-")
-                .and_then(|n| n.strip_suffix(b".tsm"))
-                .and_then(|n| core::str::from_utf8(n).ok()?.parse::<usize>().ok());
-            let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
-            usb_named += id.is_some_and(|id| registry.get(id).is_some_and(usb)) as usize;
-        }
-        true
-    });
-    dir.close();
-    if listed.is_err() {
-        return fail(b"the directory would not list");
-    }
-    // The records the manager read: the registry's first `read`, since a record is never removed
-    // until Part C, and nothing but a USB device — or a keyboard or mouse one provides (Part B.2) —
-    // is added after the boot.
-    let read = names.saturating_sub(1);
+    // **The information side: the manager agrees with the registry's present records** (Phase 6
+    // Part C). It follows the table, so once it has caught up its directory names every present
+    // device and no departed one, `all.tsm` has a row each, and every present USB device is
+    // `usb-<id>.tsm`. `test-qemu`'s hot-plug may still be landing as this runs, so both are read
+    // again until they agree, for five seconds at most. Until Part C the manager read the table
+    // once, and this held it to a prefix of the registry.
     let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
-    let usb_or_its_input = |r: &libkern::device::DeviceRecord| {
-        usb(r) || (r.driver() == b"usb-hid" && registry.get(r.parent as usize).is_some_and(usb))
+    let mut attempts = 0u32;
+    let (rows, usb_named, departed) = loop {
+        let Some(registry) = registry_records(root_ns) else {
+            return fail(b"the registry does not read");
+        };
+        let present: alloc::vec::Vec<&libkern::device::DeviceRecord> =
+            registry.iter().filter(|r| !r.is_departed()).collect();
+        let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+        let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
+            return fail(b"/svc/devices/info is not a directory");
+        };
+        let (mut names, mut has_all, mut usb_named, mut departed_named) = (0usize, false, 0usize, false);
+        let listed = dir.read_dir(|e| {
+            if e.name != b"." && e.name != b".." {
+                names += 1;
+                has_all |= e.name == b"all.tsm";
+                let id = e
+                    .name
+                    .strip_prefix(b"usb-")
+                    .and_then(|n| n.strip_suffix(b".tsm"))
+                    .and_then(|n| core::str::from_utf8(n).ok()?.parse::<usize>().ok());
+                if let Some(r) = id.and_then(|id| registry.get(id)).filter(|r| usb(r)) {
+                    usb_named += !r.is_departed() as usize;
+                    departed_named |= r.is_departed();
+                }
+            }
+            true
+        });
+        dir.close();
+        if listed.is_err() {
+            return fail(b"the directory would not list");
+        }
+        let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let tbytes = if st == 0 { read_all(table) } else { None };
+        close(table);
+        // The object is page-sized; the decoder stops at the table's terminator.
+        let rows = tbytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
+        let present_usb = present.iter().filter(|r| usb(r)).count();
+        let agree = has_all
+            && names == present.len() + 1
+            && rows == Some(present.len())
+            && usb_named == present_usb
+            && !departed_named;
+        if agree {
+            break (present.len(), usb_named, registry.len() - present.len());
+        }
+        attempts += 1;
+        if attempts == 50 {
+            Line::new()
+                .s(b"boot-probe: devices: ")
+                .u(names as u64)
+                .s(b" entries, ")
+                .u(rows.unwrap_or(0) as u64)
+                .s(b" rows and ")
+                .u(usb_named as u64)
+                .s(b" usb-<id> for ")
+                .u(present.len() as u64)
+                .s(b" present devices, ")
+                .u(present_usb as u64)
+                .s(b" of them USB")
+                .s(if departed_named { b"; a departed device listed" } else { b"" })
+                .end();
+            return fail(b"the manager's tables never agreed with the registry's present records");
+        }
+        nap(100_000_000);
     };
-    let later_all_usb = registry.get(read..).is_some_and(|later| later.iter().all(usb_or_its_input));
-    if !has_all || !later_all_usb {
-        Line::new().s(b"boot-probe: devices: ").u(names as u64).s(b" entries for ").u(registry.len() as u64).s(b" devices").end();
-        return fail(b"the directory is not all.tsm and a file per device the manager read");
-    }
-    if usb_named != registry[..read].iter().filter(|r| usb(r)).count() {
-        return fail(b"a USB device the manager read is not listed as usb-<id>.tsm");
-    }
     // **And a listed USB device's file is its table** (PR #356 review): one row, named `usb-<id>`,
     // of kind `usb`, driven by `xhci`. The listing alone says only that a name was made.
-    if let Some(r) = registry[..read].iter().find(|r| usb(r)) {
+    let now = registry_records(root_ns).unwrap_or_default();
+    if let Some(r) = now.iter().find(|r| usb(r) && !r.is_departed()) {
         let name = alloc::format!("usb-{}", r.id);
         let path = alloc::format!("/svc/devices/info/{name}.tsm");
         let (st, h) = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
@@ -2547,28 +2595,14 @@ fn devices_test(root_ns: u64) -> bool {
             return fail(b"a USB device's file is not its table");
         }
     }
-    let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-    let tbytes = if st == 0 { read_all(table) } else { None };
-    close(table);
-    let Some(tbytes) = tbytes else {
-        return fail(b"all.tsm would not map");
-    };
-    // The object is page-sized; the decoder stops at the table's terminator.
-    let rows = match libstream::wire::Table::decode(&tbytes) {
-        Ok(t) => t.rows.len(),
-        Err(_) => return fail(b"all.tsm is not a TSM1 table"),
-    };
-    if rows != read {
-        return fail(b"all.tsm has not a row per device the manager read");
-    }
     Line::new()
         .s(b"boot-probe: devices: block held by the storage service, input held by input-server, the info-only endpoint refusing block, all.tsm has ")
         .u(rows as u64)
         .s(b" rows, ")
         .u(usb_named as u64)
         .s(b" of them usb-<id>, and ")
-        .u((registry.len() - read) as u64)
-        .s(b" USB records since ok")
+        .u(departed as u64)
+        .s(b" departed records left out, agreeing with the registry ok")
         .end();
     true
 }

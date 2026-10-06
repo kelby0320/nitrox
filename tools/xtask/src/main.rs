@@ -2858,6 +2858,14 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 
+    // ---- Keyboards that come and go (Phase 6 Part C) ----
+    //
+    // **Here, while the window that holds the keyboard logs every key**, as the chord below has to
+    // be. Only on the machine whose keyboards are USB: the i8042's never leave.
+    if usb {
+        usb_keyboards_come_and_go(&mut qmp, &mut session)?;
+    }
+
     // ---- A registered chord is consumed (M8 Part B) ----
     //
     // **Here, not at the end of the gate.** The first version ran this after
@@ -3067,6 +3075,9 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
         }
     }
     println!("  ok: Super+F1 fired the manager's chord and reached no window");
+    if usb {
+        check_departures_quiet(&transcript)?;
+    }
 
     // **The USB keyboard took its lights** (Phase 6 Part B.5): the compositor's Num Lock, through
     // `input-server` to the keyboard's node, sent by the hub thread as a `SET_REPORT` the device
@@ -13079,7 +13090,90 @@ fn usb_input_args(cmd: &mut Command, add_controller: bool) {
     if add_controller {
         cmd.arg("-device").arg(XHCI_DEVICE);
     }
-    cmd.arg("-device").arg("usb-kbd,bus=xhci.0").arg("-device").arg("usb-mouse,bus=xhci.0");
+    // `id=usbkbd`, so `check-input --usb` can unplug it (Phase 6 Part C).
+    cmd.arg("-device").arg("usb-kbd,bus=xhci.0,id=usbkbd").arg("-device").arg("usb-mouse,bus=xhci.0");
+}
+
+/// **`check-input --usb`'s keyboards coming and going** (Phase 6 Part C), while the test client's
+/// window holds the keyboard and logs every key it receives:
+/// 1. **the boot keyboard unplugged**: the input server sees it leave, the manager says it departed,
+///    and its slot is retired;
+/// 2. **a keyboard plugged in**, then the only one, so every key after is its: the manager hands it
+///    over, the input server reads it and writes its lights, and a key typed on it reaches the window;
+/// 3. **a key held down on it, then the keyboard unplugged: the window sees the release.** QEMU
+///    sends nothing for a key held when its device goes (`hw/input/hid.c`, `hid_free`), so the
+///    release is the guest's — the driver letting go of what its last report held;
+/// 4. a keyboard plugged in for the rest of the gate.
+///
+/// Each line is matched from the action that causes it on, whichever process prints first: the
+/// input server's "left", the manager's departure and the kernel's lines answer one unplug.
+fn usb_keyboards_come_and_go(qmp: &mut Qmp, session: &mut Session) -> R<()> {
+    let secs = std::time::Duration::from_secs;
+    let any = |_: &str| true;
+    let first_word = |rest: String| rest.split(' ').next().unwrap_or("").to_string();
+    let boot_id = session
+        .transcript()
+        .lines()
+        .find_map(|l| l.strip_prefix("input-server: reading keyboard ")?.split(' ').next().map(str::to_string))
+        .ok_or("the input server read no keyboard at boot")?;
+
+    let from = session.transcript().len();
+    qmp.execute(r#"{"execute":"device_del","arguments":{"id":"usbkbd"}}"#)?;
+    session.line_since(from, &format!("input-server: keyboard {boot_id} left"), any, secs(30))?;
+    session.line_since(from, "departed, sent to input", any, secs(30))?;
+    session.line_since(from, &format!("input-server: device {boot_id} departed from slot "), any, secs(30))?;
+    println!("  ok: the boot keyboard unplugged: it left, the manager said so, and its slot was retired");
+
+    let from = session.transcript().len();
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"hotkbd","bus":"xhci.0"}}"#)?;
+    let raw = session.line_since(from, ": keyboard at /dev/input/raw/", any, secs(30))?;
+    let index = raw.split(',').next().unwrap_or("").to_string();
+    session.line_since(from, &format!("device-mgr: input-{index} arrived, sent to input"), any, secs(30))?;
+    let hot_id = first_word(session.line_since(from, "input-server: reading keyboard ", any, secs(30))?);
+    session.line_since(from, ": keyboard lights acknowledged", any, secs(30))?;
+    qmp.send_key("b", true)?;
+    session.expect("input-testclient: win key code=48 down=1")?;
+    qmp.send_key("b", false)?;
+    session.expect("input-testclient: win key code=48 down=0")?;
+    println!("  ok: a keyboard plugged in was handed over, read, given its lights, and typed on");
+
+    // `x` is keycode 45.
+    qmp.send_key("x", true)?;
+    session.expect("input-testclient: win key code=45 down=1")?;
+    let from = session.transcript().len();
+    qmp.execute(r#"{"execute":"device_del","arguments":{"id":"hotkbd"}}"#)?;
+    session.line_since(from, "input-testclient: win key code=45 down=0", any, secs(30))?;
+    session.line_since(from, &format!("input-server: keyboard {hot_id} left"), any, secs(30))?;
+    session.line_since(from, &format!("input-server: device {hot_id} departed from slot "), any, secs(30))?;
+    println!("  ok: a key held when its keyboard was unplugged was released, by the guest");
+
+    let from = session.transcript().len();
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"lastkbd","bus":"xhci.0"}}"#)?;
+    session.line_since(from, "input-server: reading keyboard ", any, secs(30))?;
+    Ok(())
+}
+
+/// **What `check-input --usb`'s departures leave in the transcript** (Phase 6 Part C): one `left`
+/// line for each of its two unplugged keyboards, and neither line an input server prints for a node
+/// it goes on reading after its device has gone — `read completed with an error` for a read that
+/// completes `PeerClosed`, and `read submit FAILED` at each pass for one refused. Asserting on the
+/// failed submit alone could not see the first (PR #360 review).
+fn check_departures_quiet(transcript: &str) -> R<()> {
+    let left = transcript.lines().filter(|l| l.starts_with("input-server: keyboard ") && l.ends_with(" left")).count();
+    if left != 2 {
+        return Err(format!("input gate FAILED: {left} `left` line(s) for the two keyboards unplugged").into());
+    }
+    for bad in ["input-server: read completed with an error", "input-server: read submit FAILED"] {
+        if transcript.contains(bad) {
+            return Err(format!(
+                "input gate FAILED: \"{bad}\" — the input server went on reading a node whose device had \
+                 gone, where `PeerClosed` should have ended it"
+            )
+            .into());
+        }
+    }
+    println!("  ok: each departure said `left` once, and no node was read after its device had gone");
+    Ok(())
 }
 
 /// What `check-report --usb`'s report says beside [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]
