@@ -2863,6 +2863,7 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
     // **Here, while the window that holds the keyboard logs every key**, as the chord below has to
     // be. Only on the machine whose keyboards are USB: the i8042's never leave.
     if usb {
+        await_registry_probe(&session)?;
         usb_keyboards_come_and_go(&mut qmp, &mut session)?;
     }
 
@@ -13380,6 +13381,31 @@ fn usb_input_args(cmd: &mut Command, add_controller: bool) {
     }
     // `id=usbkbd`, so `check-input --usb` can unplug it (Phase 6 Part C).
     cmd.arg("-device").arg("usb-kbd,bus=xhci.0,id=usbkbd").arg("-device").arg("usb-mouse,bus=xhci.0");
+}
+
+/// **`boot-probe`'s registry test has reported**, waited for before `check-input --usb`'s keyboards
+/// come and go (PR #363's gate run). The test reads the device table once and looks up every present
+/// record's paths, and an unplug in the middle of it fails it: a kept `--kvm` transcript had it
+/// reading the table between the gate's unplug of one keyboard and its plug of the next, and finding
+/// none. It landed among the swaps in every run kept, either side of the last plug.
+///
+/// **Not `boot-probe`'s whole verdict**: the test client gives up after twenty seconds without an
+/// event (`IDLE_LIMIT_NS` in `inputclient.rs`), and the verdict comes long after the registry test.
+/// Read from the transcript, not with `expect`, which would consume what the gate waits for next.
+fn await_registry_probe(s: &Session) -> R<()> {
+    let start = std::time::Instant::now();
+    let reported = |l: &str| {
+        l.starts_with("boot-probe: registry: ")
+            && (l.ends_with("keyboard and mouse at their raw indices ok") || l.ends_with(" FAIL"))
+    };
+    while !s.transcript().lines().any(|l| reported(l.trim_end())) {
+        if start.elapsed() > std::time::Duration::from_secs(90) {
+            return Err("boot-probe's registry test did not report within 90 s".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    println!("  ok: boot-probe's registry test reported, {} ms after the gate asked", start.elapsed().as_millis());
+    Ok(())
 }
 
 /// **`check-input --usb`'s keyboards coming and going** (Phase 6 Part C), while the test client's

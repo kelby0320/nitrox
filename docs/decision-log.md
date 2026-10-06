@@ -34338,4 +34338,13 @@ lost the race to the DPC. `run_once` now waits for that completion, as `hub::wai
 **Controls:** every new guard was deleted or inverted in turn, and each deletion failed its test:
 twelve in `xhci::storage`, re-run on the final code; three in `partitions`; one in `desc`.
 
+**Found in the full gate run: `check-input --usb --kvm` failed once**, with `boot-probe`'s registry
+test finding no keyboard. Not this change's: that machine binds no USB disk, so none of it runs
+there. A re-run with the transcript kept showed the cause. `boot-probe` read the device table
+between the gate's unplug of one keyboard and its plug of the next, and the read landed among the
+swaps in all three runs, failing in one. It is check-storage's overlap in another form. The gate now
+waits for that test to report before its keyboards come and go — not for the whole verdict, since
+the test client gives up after twenty seconds without an event. The wait measured under a second
+under KVM, and nothing under TCG; four runs passed, the read before the first unplug in each.
+
 No ABI hash impact: kernel internals only.

@@ -239,6 +239,13 @@ logs in after its verdict, and `check-storage` after its exit — whatever its v
 live stick's machine it takes the SATA disk's `nitrox-root` for its root and fails. Before Part D
 `check-storage` ended before `boot-probe` began; the sticks made it long enough to meet it.
 
+**A gate that plugs and unplugs must not do it under `boot-probe`'s registry test**, which reads the
+device table once and looks up each present record's paths. `check-input --usb` waits for that test
+to report before its keyboards come and go (`await_registry_probe`): a kept `--kvm` transcript had
+it reading the table between one keyboard's unplug and the next one's plug, and finding none. It
+waits for that test rather than the whole verdict, because the test client gives up after twenty
+seconds without an event; measured, the wait is under a second under KVM and nothing under TCG.
+
 **QEMU's trace is a gate's window onto a device the guest cannot report on** (Phase 6 Part B.5).
 `check-terminal` boots with `-trace ps2_set_ledstate -trace ps2_reset_keyboard -D <file>` and reads
 the PS/2 keyboard's lights from that file as it types: Num Lock's alone before anything is injected,
