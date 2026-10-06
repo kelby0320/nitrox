@@ -92,6 +92,10 @@ pub const MAX_DRIVER_NAME: usize = 16;
 /// its fields and its served index, which no later device takes; its paths answer `NotFound`. A
 /// departed device's children — a USB device's keyboard, a disk's partitions — are departed too.
 pub const DEPARTED: u8 = 0x01;
+/// [`DeviceRecord::flags`]: **the disk the machine started from** (Phase 6 Part D) — its GPT's GUID
+/// is the one Limine loaded the modules from. On a live boot it is the stick; on an installed
+/// machine the internal disk, whose root is `init`'s.
+pub const BOOT: u8 = 0x02;
 
 /// The start of a snapshot: then `count` [`DeviceRecord`]s, then zero padding to the page.
 #[repr(C)]
@@ -169,8 +173,8 @@ pub struct DeviceRecord {
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// What has happened to it: [`DEPARTED`] (Phase 6 Part C, from the byte that was reserved — the
-    /// layout is unchanged).
+    /// What has happened to it, and what it is: [`DEPARTED`] (Phase 6 Part C, from the byte that
+    /// was reserved — the layout is unchanged) and [`BOOT`] (Part D).
     pub flags: u8,
     /// Bytes per logical block, for a block device; zero otherwise.
     pub logical_block_size: u32,

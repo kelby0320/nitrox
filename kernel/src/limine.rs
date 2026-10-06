@@ -292,16 +292,32 @@ pub struct ModuleResponse {
     pub modules: *mut *mut LimineFile,
 }
 
-/// A loaded module descriptor (`struct limine_file`). Only the leading fields
-/// the kernel reads are mirrored; the bootloader's struct has more trailing
-/// fields (cmdline, media type, partition UUIDs) we never touch. `address` is an
-/// HHDM-virtual pointer, directly dereferenceable.
+/// A loaded module descriptor (`struct limine_file`). `address` is an HHDM-virtual pointer,
+/// directly dereferenceable.
+///
+/// **The media fields after `path` say where the file was loaded from** (Phase 6 Part D): for a
+/// GPT volume, `gpt_disk_uuid` is its disk's GUID **in the byte order a GPT header stores it** —
+/// measured on a live-stick boot and a disk boot against `sgdisk -p` — and the boot disk is the one
+/// whose header holds the same bytes. Zero for a volume that is not GPT.
 #[repr(C)]
 pub struct LimineFile {
     pub revision: u64,
     pub address: *mut u8,
     pub size: u64,
     pub path: *const u8,
+    /// The module's string (its `cmdline` before protocol 8); unread.
+    pub string: *const u8,
+    /// `0` generic, `1` optical, `2` TFTP.
+    pub media_type: u32,
+    pub unused: u32,
+    pub tftp_ip: u32,
+    pub tftp_port: u32,
+    /// The partition it was on, from 1; `0` for a whole disk.
+    pub partition_index: u32,
+    pub mbr_disk_id: u32,
+    pub gpt_disk_uuid: [u8; 16],
+    pub gpt_part_uuid: [u8; 16],
+    pub part_uuid: [u8; 16],
 }
 
 // --- SMP / MP (multiprocessor) request -----------------------------------

@@ -1475,6 +1475,17 @@ fn init_initramfs() {
     // SAFETY: `modules` points at an array of `module_count` `*mut LimineFile`;
     // the first is the initramfs.
     let file = unsafe { &**resp.modules };
+    // **The disk the machine started from** (Phase 6 Part D): the first module came off it, and its
+    // record names the disk's GPT GUID, which the partition pass compares every disk's with.
+    nitrox_kernel::drivers::partitions::set_boot_disk(file.gpt_disk_uuid);
+    match nitrox_kernel::drivers::partitions::boot_disk() {
+        Some(guid) => kprintln!(
+            "boot: the modules came from partition {} of the GPT disk {}",
+            file.partition_index,
+            nitrox_kernel::drivers::partitions::Guid(&guid)
+        ),
+        None => kprintln!("boot: the modules came from a volume Limine names no GPT disk for"),
+    }
     let (addr, size) = (file.address, file.size as usize);
     if addr.is_null() || size == 0 {
         kprintln!("initramfs: module empty");
