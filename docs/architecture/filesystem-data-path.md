@@ -5,7 +5,8 @@ with deferrals (a periodic writeback daemon, per-page dirty tracking) marked inl
 2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty tracking that the
 code never had corrected 2026-09-24. **One object per file, dirty objects kept until a sync, and
 `sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*), with
-`File::Forget` for a file its server frees.
+`File::Forget` for a file its server frees. A dirty file whose device has gone is let go (Phase 6
+Part D, 2026-10-06).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -135,6 +136,14 @@ sync and a fresh resolve.
   shutdown will unmount. Since a sync that begins with a writable mapping in place cannot clean,
   `libfs` and `nxsh` unmap before they sync. Otherwise every file they write would stay pinned
   until an unmount.
+- **A file whose device has gone is let go, unwritten** (Phase 6 Part D.3). A write-back its
+  device refuses `PeerClosed` — a USB disk that left ([`io-operation.md`](../spec/io-operation.md)
+  § *Device classes*) — is one no later write-back can do better, so `FileObject::let_go` drops
+  the object's pin on itself and the kernel logs how many pages went with it. The file then goes
+  with its last user, rather than staying for the boot with its pages, its device and its
+  registration. The sync answers `PeerClosed`. It is **not** marked dead, as a `Forget` marks a
+  file: a dead file's fill reads a hole, and a fill from a departed disk must fail, not read zeros.
+  Any other failure keeps the pin, for a later sync to try again.
 - **What still holds a file is countable**: `sys_ns_held` counts a registration's live cached
   objects, after the finished IRPs have let go of theirs. Asked after a sync, a non-zero answer is
   someone's handle or mapping, which is what an unmount is refused on.

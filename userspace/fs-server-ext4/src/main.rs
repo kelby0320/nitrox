@@ -1221,11 +1221,22 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
                     (0, false) if h == unsafe { CONTROL } => serve_control(reader),
                     (0, false) => serve_session(reader, h, serve_end),
                     // Pass 1: drain every queued forwarded request on the kernel endpoint.
-                    (1, true) => {
-                        while recv_on(serve_end) == 0 {
-                            handle_forwarded_resolve(reader, serve_end, device);
+                    (1, true) => loop {
+                        match recv_on(serve_end) {
+                            0 => handle_forwarded_resolve(reader, serve_end, device),
+                            // **Nothing can reach this server any more** (Phase 6 Part D.4): its
+                            // registration and every file it handed out have let go of the other
+                            // end. That peer stays signalled, so going round again would spin a
+                            // CPU for the rest of the boot — measured: a million passes, after
+                            // the storage service let a mount go without unmounting it. Exiting
+                            // is what `device-mgr` does in the same place (PR #333 review).
+                            rr if rr == KError::PeerClosed.as_i32() as i64 => {
+                                kprint(b"fs-server: nothing can reach this server any more; exiting\n");
+                                exit(0);
+                            }
+                            _ => break,
                         }
-                    }
+                    },
                     _ => {}
                 }
             }

@@ -34211,3 +34211,140 @@ ordinary program's faults. The thirty-second auto-terminate is deferred, so the 
 suspended. A program touching a pulled stick's unread page reaches that, and it goes to the
 deferrals with the pulled stick as its trigger. The pass also cited `fault-survival.md` for it,
 which is about kernel faults.
+
+## 2026-10-06 — Phase 6 Part D: mass storage
+
+Built to the detail pass, in its order, D.2 and D.3 together:
+
+**D.1, partition tables and the boot medium.** `drivers::partitions` parses a disk's table from
+its blocks, through a read function. GPT comes first, keeping the disk GUID. Otherwise an MBR's
+four primary entries are read, with an extended entry passed over and counted, and a protective one
+skipped. A filesystem's own boot sector is no table. The boot's polled read and a USB disk's binding
+both go through it. Limine's module records now bind their media fields, and the disk whose GPT
+GUID is module 0's is flagged `BOOT` (`0x02`) beside `DEPARTED`. `/dev/devices` gains a `boot`
+column.
+
+**D.2–D.3, bulk-only transport, recovery and departure** (`xhci::storage`):
+- The hub binds a device's classes in one configuration.
+- Binding is the hub thread's: `GET MAX LUN`, `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY(10)`
+  and the table, each bounded at five seconds, before the disk is published under its
+  `UsbDevice`.
+- The I/O path is the controller's DPC's.
+- Recovery and the thirty-second deadline are the hub thread's, per bulk-only §6.7.
+- A departure completes what the device held `PeerClosed`, its command in flight once the slot is
+  disabled.
+- The eight slots sit under an epoch, as a value the host tests drive.
+- A write-back refused `PeerClosed` lets its file go (`FileObject::let_go`).
+
+**D.4, the storage service follows.** An arrival is planned alone, beside the labels in use. A
+departure is torn down: the label goes, `sys_ns_sync` runs, then `Meta::Unmount`. The boot medium
+is passed over and in `InUse`. `nxinstall` names it as holding the running system. `fs-server-ext4`
+exits when nothing can reach it.
+
+**D.5, the gates.** `test-qemu`'s stick is an MBR with one FAT16 partition. `check-storage` plugs
+in an MBR ext4 stick, mounts it writable, writes, ejects and pulls it; the host carves it out
+clean with the pattern. It then pulls a whole-disk one while mounted with a file dirty, and plugs
+that in again. `check-live`, `check-install` and `check-report` hold the boot stick.
+
+**Where the build departed from the pass:**
+- **The status wrapper is asked for when the data stage ends**, not put on the rings with it.
+  QEMU's `usb-storage` never answers a status read queued behind a data stage still moving, which
+  is how the first `READ(10)` hung while `INQUIRY` did not. QEMU's trace showed the request parked.
+- **A file let go is not marked dead**, which the pass's host test wanted. A dead file's fill reads
+  a hole, and a departed disk's must fail.
+- **A command's TRBs never straddle the Link TRB.** They go on as one TD, after No Ops to the Link
+  when they would not fit (`push_td`).
+- **An IRP is checked at `submit`** and queued as the command it will be. Starting a queued one, in
+  the DPC under the device's lock, then cannot fail where nothing may be completed.
+- **A device being recovered starts nothing**: a submit queues instead.
+
+**Found on the way:**
+- **`fs-server-ext4`'s spin is real**, as PR #362's review read it. A mount let go without an
+  unmount spun its server a million passes; with the fix it says so once and exits.
+- **`check-storage` now waits for `boot-probe` to finish** before anything is typed. It starts once
+  the test harness's chain has, and the sticks made the gate long enough to meet it: a `--kvm` run's
+  kept transcript had it starting while a stick was pulled. Its later tests install a policy and
+  open view-broker clients until one is refused, and a `with admin` of the gate's could meet either
+  halfway. Its verdict on that machine is FAIL by the machine's shape: it takes the SATA disk's
+  `nitrox-root` for the root it wrote, and finds no scratch disk. It writes no disk directly. Before
+  Part D the gate ended before it began, so nobody had seen it run there.
+
+**Controls**, each failing:
+- **Boots:**
+  - the GUID comparison removed (`check-live`);
+  - a departure that keeps its device (`check-storage`). It failed earlier than planned, at the
+    next stick's binding: that stick took the same xHCI slot, and its `INQUIRY`'s events went to
+    the stale device;
+  - a departed disk refusing `IoError` rather than `PeerClosed` (the kernel's let-go line never
+    comes);
+  - the teardown terminating its server rather than unmounting it (the server's line never comes);
+  - the service ignoring `Departed` (its departure line never comes);
+  - no table read at arrival. It failed at step 1 rather than step 2, since the boot stick is a USB
+    disk too and its flag comes from its table.
+- **Host:** every test in `partitions`, `device`, `xhci::storage`, `desc`, `context`, `ring`,
+  `file_object`, the storage service and `nxinstall` added by the part.
+
+No ABI hash impact: the registry is not a hash input, `LimineFile` is the bootloader's layout, and
+no syscall, record or exported type changed.
+
+## 2026-10-06 — PR #363, reviewed: a deadline nobody watched, and an overflow on a stick's table
+
+Two blocking findings, three worth fixing and four optional, all taken. Each was checked against the
+source before it was fixed.
+
+**1. A stick that stopped answering was never timed out.** The hub thread read the commands'
+deadlines only on its way to sleep. With nothing in flight it slept without a bound, and a command
+started after that woke nothing. The reviewer throttled a stick to 5 bytes a second and listed it:
+no recovery came until another device was plugged in. **The fix bounds the sleep**: while any disk
+is bound, the hub thread never sleeps longer than a deadline's length (`Disks::bound`). A command
+started meanwhile has a deadline at least that far off, so the thread sees it by its deadline
+without being woken.
+
+**A first fix was replaced after measuring it.** It had a submit that started a command while the
+thread slept unbounded wake it, through a DPC. The same probe showed it working — recovery 30.0 s
+after the stall — but the thread woke 50 times over the gate's run, in bursts: with commands faster
+than a wake, nearly every one started from idle and woke it again. The bounded sleep woke it 4
+times over the same run, and recovered 30.04 s after the stall. It also needs no atomic and no
+ordering argument between CPUs, which no host test could have held.
+
+**2. A GPT entry spanning every LBA panicked the kernel** in the add that counts its blocks, which
+runs before the check that it fits. Any stick plugged in reaches it now. The count is checked
+arithmetic, and so is `read_blocking`'s multiply of a header-supplied LBA. Two more in the same
+class: a GPT whose entry array is off the disk is refused before it is read, and `fits` no longer
+lets a disk of no blocks hold anything — no caller passes one.
+
+**3. A recovery's retry could replace a command started meanwhile.** `recovering` was cleared in
+one lock scope and the retry started in another. Recovery now begins and ends in `Disks` methods,
+and the end and the retry share one scope.
+
+**4. A hub command's operation could be dropped before the DPC completed it**, on a timeout that
+lost the race to the DPC. `run_once` now waits for that completion, as `hub::wait` does.
+
+**5. Three guards survived deletion**, and now have tests that fail without them:
+- the No-Op padding before the Link;
+- the status wrapper's TRB address — a short read's last data TRB raises its own event, after the
+  status is asked for;
+- `inside = false` in the descriptor walk.
+
+**Optional, all taken:**
+- **A deadline marked as its command was completing was charged to the next.** A completion now
+  clears the mark. A command with any other fault recorded ignores its later events: it is the hub
+  thread's, which is about to reset its rings.
+- **A failed reset recovery completed its IRP before anything had stopped its transfer.** The IRP is
+  now *stranded* on the device, which stays shut, and the departure that follows completes it once
+  the slot is disabled.
+- Two stale sentences, and doc comments on the new public items.
+
+**Controls:** every new guard was deleted or inverted in turn, and each deletion failed its test:
+twelve in `xhci::storage`, re-run on the final code; three in `partitions`; one in `desc`.
+
+**Found in the full gate run: `check-input --usb --kvm` failed once**, with `boot-probe`'s registry
+test finding no keyboard. Not this change's: that machine binds no USB disk, so none of it runs
+there. A re-run with the transcript kept showed the cause. `boot-probe` read the device table
+between the gate's unplug of one keyboard and its plug of the next, and the read landed among the
+swaps in all three runs, failing in one. It is check-storage's overlap in another form. The gate now
+waits for that test to report before its keyboards come and go — not for the whole verdict, since
+the test client gives up after twenty seconds without an event. The wait measured under a second
+under KVM, and nothing under TCG; four runs passed, the read before the first unplug in each.
+
+No ABI hash impact: kernel internals only.

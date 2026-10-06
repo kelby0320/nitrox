@@ -30,6 +30,9 @@ pub mod kind {
     pub const STATUS: u32 = 4;
     /// Link: the next TRB is at the address this one carries.
     pub const LINK: u32 = 6;
+    /// No Op transfer: moves the ring on and transfers nothing (Phase 6 Part D.2, to keep a
+    /// command's TRBs from straddling the Link).
+    pub const NO_OP: u32 = 8;
     /// Enable Slot Command: the completion names a free slot.
     pub const ENABLE_SLOT: u32 = 9;
     /// Disable Slot Command.
@@ -42,6 +45,8 @@ pub mod kind {
     pub const EVALUATE_CONTEXT: u32 = 13;
     /// Reset Endpoint Command: a halted endpoint to Stopped.
     pub const RESET_ENDPOINT: u32 = 14;
+    /// Stop Endpoint Command: a running endpoint to Stopped (Phase 6 Part D.3).
+    pub const STOP_ENDPOINT: u32 = 15;
     /// Set TR Dequeue Pointer Command.
     pub const SET_TR_DEQUEUE: u32 = 16;
     /// No Op Command: completes with Success and does nothing else.
@@ -62,6 +67,9 @@ pub mod code {
     pub const STALL: u8 = 6;
     /// A transfer ended short: the device sent less than was asked for.
     pub const SHORT_PACKET: u8 = 13;
+    /// A command found its endpoint in a state it does not apply to: Reset Endpoint on one that is
+    /// not halted, say (Phase 6 Part D.3).
+    pub const CONTEXT_STATE_ERROR: u8 = 19;
 }
 
 /// Dword 3 bit 5: Interrupt On Completion.
@@ -80,6 +88,8 @@ const TRT_OUT: u32 = 2 << 16;
 const CYCLE: u32 = 1;
 /// A Normal TRB's dword 3 bit 2: Interrupt on Short Packet.
 const ISP: u32 = 1 << 2;
+/// A transfer TRB's dword 3 bit 4: the next TRB is part of the same transfer descriptor.
+const CHAIN: u32 = 1 << 4;
 /// A Link TRB's dword 3 bit 1: the reader flips its cycle state on following it.
 const TOGGLE_CYCLE: u32 = 1 << 1;
 
@@ -180,6 +190,21 @@ impl Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::NORMAL << 10 | ISP | IOC])
     }
 
+    /// **A Normal TRB of a bulk transfer** (Phase 6 Part D.2): `len` bytes at `buffer`, `chain`ed to
+    /// the next when the transfer goes on, interrupting on completion when `ioc` and on a short
+    /// packet when `isp`. **`td_size`** is how many packets the transfer still has after this TRB,
+    /// clamped to 31, as xHCI 1.2 §4.11.2.4 asks.
+    pub const fn bulk(buffer: u64, len: u32, chain: bool, ioc: bool, isp: bool, td_size: u32) -> Trb {
+        let flags = if chain { CHAIN } else { 0 } | if ioc { IOC } else { 0 } | if isp { ISP } else { 0 };
+        let td = if td_size > 31 { 31 } else { td_size };
+        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF | td << 17, kind::NORMAL << 10 | flags])
+    }
+
+    /// A No Op transfer TRB, which moves a ring on and transfers nothing.
+    pub const fn no_op() -> Trb {
+        Trb([0, 0, 0, kind::NO_OP << 10])
+    }
+
     /// A command naming a slot: Disable Slot.
     pub const fn disable_slot(slot: u8) -> Trb {
         Trb([0, 0, 0, kind::DISABLE_SLOT << 10 | (slot as u32) << 24])
@@ -247,6 +272,12 @@ impl Producer {
     /// **before** the controller can complete it.
     pub fn next_slot(&self) -> usize {
         self.enqueue
+    }
+
+    /// **How many TRBs fit before the Link**, of a ring of `len` slots (Phase 6 Part D.2): a
+    /// transfer descriptor longer than this would straddle it, which needs the Link chained.
+    pub fn room_before_link(&self, len: usize) -> usize {
+        len - 1 - self.enqueue
     }
 
     /// Write `trb` at the enqueue slot with this ring's cycle bit, and return the slot it went in.
@@ -376,6 +407,34 @@ mod tests {
         assert!(!mem.0[7].cycle(), "a Link the controller could follow before anything is written");
         let mut c = Controller { at: 0, cycle: ring.cycle() };
         assert_eq!(c.take(&mem), None, "nothing for the controller yet");
+    }
+
+    /// **A bulk TRB's fields** (Phase 6 Part D.2): the buffer, the length with the TD size above
+    /// it, clamped, and the chain, completion and short-packet bits only when asked for.
+    #[test]
+    fn a_bulk_trb_carries_its_td_size_and_only_the_bits_asked_for() {
+        let t = Trb::bulk(0x1_2345_6000, 4096, true, false, true, 7);
+        assert_eq!((t.0[0], t.0[1]), (0x2345_6000, 0x1));
+        assert_eq!(t.0[2], 4096 | 7 << 17);
+        assert_eq!(t.0[3], kind::NORMAL << 10 | CHAIN | ISP);
+        assert_eq!(Trb::bulk(0, 31, false, true, false, 99).0[2], 31 | 31 << 17, "TD size clamped to 31");
+        assert_eq!(Trb::bulk(0, 31, false, true, false, 0).0[3], kind::NORMAL << 10 | IOC);
+        assert_eq!(Trb::no_op().kind(), kind::NO_OP);
+    }
+
+    /// **Room before the Link** is every slot but the Link's, less what is written, and the whole
+    /// ring again once it wraps.
+    #[test]
+    fn the_room_before_the_link_shrinks_and_comes_back_at_the_wrap() {
+        let mut mem = Mem(vec![Trb::default(); 8]);
+        let mut ring = Producer::new(&mut mem, BASE);
+        assert_eq!(ring.room_before_link(8), 7);
+        for n in 0..6 {
+            ring.push(&mut mem, numbered(n));
+        }
+        assert_eq!(ring.room_before_link(8), 1);
+        ring.push(&mut mem, numbered(6));
+        assert_eq!(ring.room_before_link(8), 7, "wrapped");
     }
 
     /// **Three times round a ring of eight**, the controller taking each TRB as it is written:

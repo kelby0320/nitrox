@@ -3,7 +3,8 @@
 **Status: built as administration Part C drew it, C.1–C.8 — 2026-09-25; started and bound by
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
 since Part E.1b; its shutdown unmount built with Part E.4a; the installer's source passed over
-since Part G.1; a `description` column since the laptop polish's Part C; last checked 2026-10-01.**
+since Part G.1; a `description` column since the laptop polish's Part C; devices that arrive and
+depart, and the disk the machine started from, since Phase 6 Part D; last checked 2026-10-06.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
@@ -132,15 +133,21 @@ makes the auto-mount read-only (§6). A root matched to no device is not a live 
 **What is mounted at boot is every ext4 that is not already mounted**: `init`'s mounts are never
 mounted again, and FAT waits for Phase 6's server.
 
-**Bar one: the installer's source** (administration Part G.1). A partition named `nitrox-source`
-(`libgpt::INSTALL_SOURCE_LABEL`) is `install-root.img`'s, the pristine root the live stick's install
-entry loads for `nxinstall` to copy. Mounted, it would be in use, and the `disks` grant would
-withhold it from the installer. **The rule is the name, not "a RAM disk"**: a test image's scratch
-filesystem is a RAM disk this service mounts for `boot-probe`. The service's report of the device
-says so: `the installer's source, left unmounted`. **On a live boot every auto-mount is read-only**,
-since the machine's own disks are the install target and nothing written to one by accident could
-be taken back. An administrator's explicit mount (C.5c) will be writable either way; it is the
-automatic one that has to be careful.
+**Nor anything on the disk the machine started from** (Phase 6 Part D): the disk the kernel flags
+`BOOT` in its record, its GPT's GUID being the one Limine loaded the modules from, and its
+partitions. On a live boot that is the stick, which holds the system running from RAM; on an
+installed machine the internal disk, whose root is `init`'s anyway. The service's report says
+`on the disk the machine started from, passed over`.
+
+**Bar one more: the installer's source** (administration Part G.1). A partition named
+`nitrox-source` (`libgpt::INSTALL_SOURCE_LABEL`) is `install-root.img`'s, the pristine root the live
+stick's install entry loads for `nxinstall` to copy. Mounted, it would be in use, and the `disks`
+grant would withhold it from the installer. **The rule is the name, not "a RAM disk"**: a test
+image's scratch filesystem is a RAM disk this service mounts for `boot-probe`. The service's report
+of the device says so: `the installer's source, left unmounted`. **On a live boot every auto-mount
+is read-only**, since the machine's own disks are the install target and nothing written to one by
+accident could be taken back. An administrator's explicit mount (C.5c) will be writable either way;
+it is the automatic one that has to be careful.
 
 **A mount is named by a label**: the filesystem's own, else its partition's name, else `blk-<n>`,
 taking the first that is valid. A valid label is 1 to 64 bytes of printable ASCII with no `/`, not
@@ -177,6 +184,32 @@ forwarded waits for its answer with no deadline, so a reply that silently failed
 caller blocked for good. That is how the first `SUBNAMESPACE` reply failed: its namespace
 lacked `TRANSFER`.
 
+## 6a. Devices that arrive and depart
+
+*(Phase 6 Part D.)* **After `Settled`, the device manager sends an `Arrived` or a `Departed` for a
+disk that comes or goes** — a USB stick, its disk and each of its partitions as records of their own
+([`device-manager.md`](device-manager.md) §3a).
+
+**An arrival is read as at boot**: what it holds, through its node, which the service keeps. It is
+mounted by the boot's rules — ext4, not on the boot medium, not the installer's source, read-only on
+a live boot — beside the mounts there are: **only the new device is planned**, so one an
+administrator unmounted stays unmounted, and a label in use is numbered past as at boot. It is
+reported in the same line. Past `MAX_MOUNTS`, eight, it is said and left unmounted.
+
+**A departure takes the device out of the table and closes the service's node.** A mount on it is
+torn down as an unmount is, but with nothing kept:
+1. its label leaves `fs`;
+2. `sys_ns_sync` over the mount: every dirty file's write-back is refused `PeerClosed`, and the
+   kernel lets each such file go rather than keeping it for the boot
+   ([`filesystem-data-path.md`](filesystem-data-path.md));
+3. `Meta::Unmount`: the server's attempt to record the filesystem clean fails, and it answers and
+   exits — **not a terminate**, which is a request `fs-server-ext4` does not read;
+4. the namespace is closed.
+
+The log says `<label> left while mounted; what had not been written back is gone`, then
+`blk-<n> departed`. A stick pulled without an eject is left marked in use, which is what an eject —
+`with admin disk --unmount` until Phase 6 Part F — exists to prevent.
+
 ## 7. The session endpoint
 
 **Sessions reach the service through an endpoint of their own**, as they reach the device manager.
@@ -206,7 +239,9 @@ answers every request on a session.
   writable, on a live boot too. It is refused for a device already mounted, `init`'s included, for
   one holding nothing the service serves, and for a label that is invalid or taken.
 - **`InUse`** is every mounted device and the disk that holds it: what the `disks` grant must not
-  hand out raw, since a raw write to a disk reaches its partitions.
+  hand out raw, since a raw write to a disk reaches its partitions. **And the disk the machine
+  started from** (Phase 6 Part D), whether or not anything on it is mounted: on a live boot the
+  stick, which `nxinstall` then names as holding the running system.
 - **`Unmount`** is a chain, each link only once the one before it held:
   1. The label leaves `fs`.
   2. Every dirty file is written back: `sys_ns_sync` on the mount's namespace. That includes a
@@ -289,9 +324,10 @@ binds the service itself at `/svc/storage`.
 
 | Gate | What it asserts |
 |---|---|
-| `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real |
-| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller, **its root marked not cleanly unmounted first**, as an installed machine's is. The disk's `nitrox-root` is reported not clean and auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. **The table's `clean` says no, and still says no after the read-only unmount**, which the service logs as "not left clean (read-only, so as it was found)". `with admin disk` mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain, **after which the table says clean**. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs` |
-| `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
+| `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real. **And it passes the stick over** (Phase 6 Part D): mass storage makes the stick a disk, the kernel flags it as the one the machine started from, and the service reports it so |
+| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller, **its root marked not cleanly unmounted first**, as an installed machine's is. The disk's `nitrox-root` is reported not clean and auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. **The table's `clean` says no, and still says no after the read-only unmount**, which the service logs as "not left clean (read-only, so as it was found)". `with admin disk` mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain, **after which the table says clean**. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs`. **Then sticks plugged in over QMP** (Phase 6 Part D): the boot stick reported passed over; an MBR stick's ext4 auto-mounted read-only, remounted writable, written without a sync, ejected with `with admin disk --unmount` and pulled, its records departing and the service letting it go — and on the host, carved by its MBR, clean and holding the pattern; a whole-disk stick pulled while mounted writable with a file dirty, the teardown's write-back and the server's marking each answered at once — the kernel letting the dirty file go, the server unable to record the filesystem clean, the service's line — its label gone, a command after it running, and on the host still marked in use; and that stick plugged in again, at a new index, mounted again |
+| `check-install` | The live stick, a disk since Phase 6 Part D and the one the machine started from, is named as the installer's target and refused: it holds the running system, since the service names it in use |
+| `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. **The USB stick's MBR partition reads as FAT `NXSTICK`**, unmounted (Phase 6 Part D). The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
 | `test-interactive` | The serial session is built with `/storage`. `list /dev/storage` names a table per device, and `open /dev/storage/all.tsm \| filter mounted == "/"` prints the root's row, `init`'s. `list /storage` lists filesystems, not tables, and on a release boot none. **`with admin nxinstall` lists the ESP and never `/dev/blk/0` or the root**, where before C.6 it listed the disk under a live server; since administration Part G.2 a line naming `/dev/blk/0` is only its message on `stderr`, that it holds the running system, and that message must be there |
@@ -321,7 +357,6 @@ how, and what each suffix asks for where it arrives.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount.
-- **Arrivals after `Settled` are logged and ignored.** Nothing sends one until Phase 6's USB driver.
 - **Supervision.** `service-mgr` keeps the service's process handle, and nothing restarts it: its
   policy is `never`, and it is `essential`, so `service --stop` refuses it. If it exited, its
   subscription would close and `block` would be free for anything in the root namespace to take

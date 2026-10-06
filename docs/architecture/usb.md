@@ -1,7 +1,7 @@
 # USB
 
-**Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05), and
-Part C's arrivals and departures (2026-10-05)**
+**Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05),
+Part C's arrivals and departures (2026-10-05), and Part D's mass storage (D.1–D.6, 2026-10-06)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
@@ -9,8 +9,9 @@ is attached**, at boot and after it, logging each device and matching it against
 `/dev/input/raw/<n>` like the i8042's, a mouse's wheel read through its report descriptor (B.2,
 B.3), a keyboard's lights set by a `SET_REPORT` (B.5); and **a device that leaves departs** (C):
 what its keyboards and mice held is released, their nodes retire and their slots are given back,
-and its records are marked departed, which `device-mgr` follows. No class driver binds anything else
-(Part D). The design ahead is
+and its records are marked departed, which `device-mgr` follows; and **a bulk-only stick is a disk**
+(D), its partition table read where it arrives and its I/O driven by the controller's DPC. The
+design ahead is
 [`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
 
 ## The controller
@@ -123,9 +124,11 @@ enumerated; a disconnection disables the device's slot and frees its memory.
    — a bad index or language is a common stall — and the default endpoint recovered with *Reset
    Endpoint* and *Set TR Dequeue Pointer*, since a stall halts it until reset; any other failure
    on a string ends the device, as on every step;
-5. **the class match, logged and not acted on**: HID boot keyboard `03/01/01`, HID boot mouse
-   `03/01/02`, bulk-only mass storage `08/06/50`, a hub (listed, not supported), or nothing this
-   kernel drives. No `SET_CONFIGURATION`: the class driver that binds sets the configuration.
+5. **the class match, logged**: HID boot keyboard `03/01/01`, HID boot mouse `03/01/02`, bulk-only
+   mass storage `08/06/50`, a hub (listed, not supported), or nothing this kernel drives;
+6. **the classes bound, in one configuration** (Part D): each binding class's endpoints prepared,
+   then one *Configure Endpoint* adding all of them and one `SET_CONFIGURATION` — a second would
+   reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests.
 
 **Every command and transfer has a one-second deadline.** A device that misses a transfer's is
 abandoned and its slot disabled. A command that goes unanswered leaves the command ring in doubt —
@@ -309,6 +312,70 @@ request went unanswered.
 **The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, boot
 protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a wheel`.
 
+## Mass storage (Part D)
+
+**A bulk-only interface binds as a disk** (`kernel/src/drivers/xhci/storage.rs`), during
+enumeration and in the hub thread: `GET MAX LUN` (a stall means one unit), then for each unit
+`INQUIRY` — a direct-access device, or it is left alone — `TEST UNIT READY` with `REQUEST SENSE`
+between tries for up to five seconds, and `READ CAPACITY(10)`. **Every command at binding is the
+hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. A unit
+that is not ready (an empty card reader's slot), of 2 TiB or more, or not a block device is said and
+left alone.
+
+**The table is read before the disk is published** — its first two blocks, then a GPT's entries
+where its header puts them — through `drivers::partitions`, the parser the boot's polled read uses
+too ([`device-node.md`](../spec/device-node.md) § *Partition tables*). Then the disk is a `Disk`
+record under the `UsbDevice` record, named by INQUIRY's vendor and product and the device's serial,
+as a SATA disk is named by its model and serial, and its partitions are records under it. **A
+stick's partitions get no `/dev/disk` names**: those are how `init` finds its critical path, among
+what the boot's probe found. A disk whose GPT's GUID is the one Limine loaded the modules from is
+flagged as the disk the machine started from.
+
+**The I/O path is the DPC's**, as AHCI's is its interrupt's. A block IRP's `submit` — on any CPU,
+never blocking — queues it behind the one command in flight, which is all bulk-only runs; a
+device's units share it. A command goes on the rings as its command wrapper on bulk OUT and its
+data as one Normal TRB per IRP fragment, the last interrupting; with no data, the command wrapper
+interrupts. **The status wrapper is asked for when that stage ends**, not queued behind it: QEMU's
+`usb-storage` takes a status read that arrives while its data is still coming as part of the data
+stage and never answers it — a `READ(10)`, whose data QEMU reads asynchronously, hung that way in
+`test-qemu` while `INQUIRY`, answered at once, did not. The DPC completes the IRP at the status
+wrapper's event, when its signature, tag and status read and its residue is zero, and starts the
+next. One command moves at most 64 fragments, 256 KiB, the most any client submits.
+
+**Everything off that path is the hub thread's**, following bulk-only §6.7: status 1 read through
+`REQUEST SENSE` (an illegal request to `SYNCHRONIZE CACHE` is no cache to flush, and the flush
+completes; a unit attention retries the command once); a data stage's stall cleared — *Reset
+Endpoint*, or *Stop Endpoint* for one still running, *Set TR Dequeue Pointer* past what is queued,
+then `CLEAR_FEATURE(ENDPOINT_HALT)` — and the status read; and reset recovery, the class's reset
+request and both endpoints cleared, for a phase error, a bad wrapper, a stalled command wrapper or a
+command past its **thirty-second deadline**. The hub thread keeps that deadline, sleeping until the
+earliest one while a command is in flight; it is what bounds a stick that stops answering. **While
+any disk is bound it never sleeps longer than a deadline's length**, so a command started while it
+sleeps, whose deadline is at least that far off, is seen by its deadline with nothing waking the
+thread for it: one wake every thirty seconds on an idle machine with a stick in, rather than one a
+command. (Until PR #363's review it slept without a bound when nothing was in flight, so a stick
+that stalled on an idle machine was timed out when another device happened to arrive.) **A recovery
+ends in the one lock scope that lets submits start again**, so a retry cannot replace a command
+started meanwhile. A deadline marked as its command was completing goes with that command, and is
+not charged to the next. A device that does not recover is ended as on an unplug; **its command is
+completed by the departure**, once the slot is disabled, since a reset that failed may never have
+stopped the endpoints its TRBs are on.
+
+**A departure**, before the records depart: the device out of the DPC's table, its queue completed
+`PeerClosed`, and any later submit refused so; the command in flight completed `PeerClosed` once the
+slot is disabled, since until then the controller may still move its data. **The devices are eight
+slots under an epoch**, as the input nodes are: a handle to a departed stick's node is refused
+rather than served the next stick's. Each publish leaks its partition windows, as at boot
+(`TODO(usb-departed-records)`).
+
+**A stick pulled while mounted**, end to end: its I/O fails `PeerClosed` at once; the storage
+service, told by the device manager, tears its mount down ([`storage.md`](storage.md) §6a); the
+write-back of each file left dirty is refused, and the kernel lets the file go
+([`filesystem-data-path.md`](filesystem-data-path.md)); and the server, asked to unmount, cannot
+record the filesystem clean and exits. A program with one of the stick's files mapped that touches
+a page not yet in memory faults, and stays suspended, as after any fault in a program nothing
+supervises.
+
 ## The code, and what tests it
 
 - **`drivers::xhci::ring`** — TRBs, the producer ring (the command ring; transfer rings from A.2)
@@ -387,3 +454,27 @@ protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a
   - no USB key count;
   - the wheel not negated;
   - the descriptor ignored.
+- **`drivers::xhci::storage`** (Part D) — host tests on the wrappers and the SCSI commands' bytes
+  and answers; an IRP fitting its unit; and **the fast path driven through `Disks`**, with heap
+  memory standing in for the rings, the wrapper page and the doorbell array: a read's TRBs, its
+  status asked for at its data stage's end (short, there) and its completion; the next IRP started;
+  a failed status and a stall left for the hub thread, and a submit meanwhile queued; and a slot
+  departed and taken again, its old node refused `PeerClosed` and its new one served. Since PR
+  #363's review, also: the hub thread's sleep bounded by a deadline's length while a disk is
+  bound; a deadline marked as its command ends not charged to the next; a command left
+  for the hub thread ignoring its later events; a recovery's retry in flight with the submit that
+  waited behind it; a stranded command held for the departure; a hub command the DPC reached
+  waited for; a transfer that would straddle the Link put after it; and a short read's last data
+  event not taken for its status. Each has a control that fails it, the epoch's bump and check
+  among them, which PR #361 found untested in the input nodes'.
+- **`drivers::partitions`** — GPT with its disk's GUID, MBR's entries by slot, a filesystem's boot
+  sector and a block whose status bytes no MBR has as no table, entries off the disk dropped — one
+  spanning every LBA there could be among them, which overflowed until PR #363's review — a GPT
+  whose entries are off the disk refused, and the boot disk by its GUID.
+- **`test-qemu`**'s stick is an MBR stick with one FAT partition: the host holds the disk's line,
+  its partition and the storage service's report, and `boot-probe` the disk under its device, the
+  partition under it, and the boot flag on the one disk the image booted from.
+- **`check-storage`** plugs an MBR ext4 stick in over QMP, ejects it and checks it on the host, and
+  pulls a whole-disk one while mounted with a file dirty, asserting each line of the teardown;
+  `check-live`, `check-install` and `check-report` hold the boot stick as a disk, passed over and
+  refused ([`storage.md`](storage.md) §11).

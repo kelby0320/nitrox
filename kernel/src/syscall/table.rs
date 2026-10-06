@@ -2890,8 +2890,16 @@ fn write_back(file_obj: &ObjectRef) -> Result<(), KError> {
     use crate::object::FileObject;
     // SAFETY: `file_obj` pins a live `FileObject` (both callers checked the type).
     let mark = unsafe { &*(file_obj.as_ptr() as *const FileObject) }.clean_mark();
-    if !FileObject::writeback(file_obj) {
-        return Err(KError::IoError);
+    match FileObject::writeback(file_obj) {
+        crate::object::file_object::WriteBack::Written => {}
+        crate::object::file_object::WriteBack::Failed => return Err(KError::IoError),
+        // **Its device has gone** (Phase 6 Part D.3): nothing will take these pages, so the file is
+        // let go rather than kept for the boot, dirty, with its pages, device and registration.
+        crate::object::file_object::WriteBack::Gone => {
+            let pages = FileObject::let_go(file_obj);
+            crate::kprintln!("file: its device has gone; a dirty file and its {pages} page(s) let go, unwritten");
+            return Err(KError::PeerClosed);
+        }
     }
     // The data is on the device, but under Model A the *server* has no idea it happened:
     // an in-place, same-length overwrite never resolves anything, so nothing would move the

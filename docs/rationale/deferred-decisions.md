@@ -173,6 +173,12 @@ state the completion path has no way to express today. Trigger: a consumer that 
 larger than a megabyte. `fs-server-ext4`'s 4 KiB blocks are three orders of magnitude below it,
 so nothing is waiting.
 
+**A USB disk's bound is 64 fragments** (Phase 6 Part D, 2026-10-06): `xhci::storage::MAX_FRAGS`,
+one Normal TRB a fragment, so 256 KiB of page-aligned transfer — exactly the largest any client
+submits, `nxinstall`'s copy. The bound is the ring's: a transfer's TRBs are pushed as one TD that
+must fit before the Link TRB. A larger one is refused as AHCI's is. Part H, which measures a copy
+to a stick, is where a bigger transfer would first pay.
+
 **AHCI driver scope.** The Phase 2 AHCI driver (Part 3) supports a **single
 controller, single SATA disk, one command *issued* at a time** (slot 0). Multi-port /
 multi-disk, multiple controllers, and port multipliers are deferred to when a
@@ -379,6 +385,13 @@ at 144 bytes each, in every snapshot after it, and the device manager reads the 
 each change. A connector whose contact bounces adds them each time. The maintainer's call
 (2026-10-05) was to keep them for the boot. Trigger: the snapshot's size being felt — a machine
 whose devices come and go thousands of times in one boot.
+
+**Phase 6 Part D adds a USB disk** (2026-10-06). Its **slot is given back**: one of eight under an
+epoch (`xhci::storage::Disks`), as an input node's is, so eight bound the sticks attached at once.
+What stays is a record for the disk and one per partition, each with its node, and **each
+partition's window** (`io::block::Partition`), a 56-byte allocation leaked when the partition is
+published because a SATA disk's partitions live for the boot. A stick with four partitions plugged
+in a hundred times holds four hundred of them. Same trigger.
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 
@@ -1235,6 +1248,21 @@ maintainer took "asked, not forced" for Part A over building a kill inside it.
 lingering copy could misuse without a person present. Building it means tearing down another
 process's threads and address space from outside, which is a substantial kernel feature rather
 than a syscall.
+
+**A fault in a program nothing supervises is never ended — `TODO(unsupervised-fault)`.** A ring-3
+fault suspends the faulting thread and sends its process a notification; a supervisor holding the
+thread resumes or terminates it (`docs/spec/syscall-abi.md`). Nothing supervises an ordinary
+program, and the **thirty-second auto-terminate** that would end it is deferred
+(`notifications.md`), so its thread stays suspended for the boot, and the shell that ran it waits
+on it with nothing to say.
+
+**A pulled stick is the first ordinary way to reach it** (Phase 6 Part D, 2026-10-06). A file on a
+USB disk that has left fails its next page-cache fill, `PeerClosed`
+([`io-operation.md`](../spec/io-operation.md)), and a failed fill is a fault in the program that
+took it. Until then a fault meant a bug in the program. **The answer is the auto-terminate**, not a
+special case for a departed device: the program is ended thirty seconds after its fault, and its
+waiter learns that it crashed. **Trigger: the first report of a terminal stuck after a stick was
+pulled**, or Part F's Files, which reads from sticks as a matter of course.
 
 ### Filesystems
 

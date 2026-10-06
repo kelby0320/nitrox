@@ -29,6 +29,7 @@ pub mod desc;
 pub mod hid;
 mod hub;
 pub mod ring;
+pub mod storage;
 
 pub use hub::FIRST_ROUND_NS;
 
@@ -696,9 +697,14 @@ fn on_event(x: &Xhci, trb: &Trb) {
             trb.completion_code(),
             trb.slot_id() as u64,
         ),
-        // **A HID endpoint's report** (Phase 6 Part B.2): the default endpoint's transfers are the
-        // hub thread's waits; every other endpoint's is a bound one's.
-        kind::TRANSFER_EVENT if trb.endpoint_id() != context::DCI_EP0 => hid::on_transfer(x, trb),
+        // **A bound endpoint's transfer**: the default endpoint's transfers are the hub thread's
+        // waits; every other endpoint's is a storage device's (Phase 6 Part D.2) or a HID one's
+        // (Part B.2).
+        kind::TRANSFER_EVENT if trb.endpoint_id() != context::DCI_EP0 => {
+            if !storage::on_transfer(x, trb) {
+                hid::on_transfer(x, trb);
+            }
+        }
         kind::TRANSFER_EVENT => complete_if(
             x,
             |a| match a {

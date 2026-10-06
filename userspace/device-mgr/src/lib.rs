@@ -216,8 +216,9 @@ pub mod table {
     //! Columns: `name`, `kind`, `path`, `size` (bytes, a block device's), `description` (a disk's
     //! model and serial, a partition's label, a RAM disk's module and path, a PCI function's ids, a
     //! USB device's name, ids, class, port and speed),
-    //! `parent` (the name of the device it belongs to) and `driver`. What a device does not have is
-    //! `Null`, not zero or empty: a keyboard has no size, which is different from a size of nothing.
+    //! `parent` (the name of the device it belongs to), `driver`, and `boot` (whether it is the disk
+    //! the machine started from, Phase 6 Part D). What a device does not have is `Null`, not zero or
+    //! empty: a keyboard has no size, which is different from a size of nothing.
 
     use alloc::format;
     use alloc::string::String;
@@ -239,6 +240,7 @@ pub mod table {
             .field("description", TypeTag::String, nullable)
             .field("parent", TypeTag::String, nullable)
             .field("driver", TypeTag::String, nullable)
+            .field("boot", TypeTag::Bool, TypeModifiers::NONE)
     }
 
     fn text(bytes: &[u8]) -> Option<Value> {
@@ -298,6 +300,8 @@ pub mod table {
             or_null(description),
             or_null(parent),
             or_null(driver),
+            // **The disk the machine started from** (Phase 6 Part D): what `nxinstall` refuses.
+            Value::Bool(r.is_boot_medium()),
         ]
     }
 
@@ -615,7 +619,8 @@ mod tests {
     /// value — a keyboard's size is absent, not zero.
     #[test]
     fn all_tsm_is_a_table_a_row_per_device() {
-        let b = boot();
+        let mut b = boot();
+        b[2].flags |= libkern::device::BOOT;
         let bytes = table::all(&b);
         let t = Table::decode(&bytes).unwrap();
         assert_eq!(t.rows.len(), 8);
@@ -632,6 +637,8 @@ mod tests {
         assert_eq!(cell(0, "driver"), Value::Str("ahci".into()));
         assert_eq!(cell(1, "driver"), Value::Str("ahci (declined)".into()));
         assert_eq!(cell(0, "path"), Value::Null);
+        assert_eq!(cell(2, "boot"), Value::Bool(true), "the disk the machine started from");
+        assert_eq!(cell(3, "boot"), Value::Bool(false), "not its partition");
     }
 
     /// **The file the shell opens is page-padded**, as a memory object is: the table still

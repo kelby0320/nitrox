@@ -26,7 +26,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::libkern::device::{
-    DEPARTED, DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
+    BOOT, DEPARTED, DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
     OUTCOME_DECLINED, OUTCOME_NONE, REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
 };
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
@@ -51,6 +51,9 @@ struct Entry {
     usb: Option<UsbFacts>,
     /// The device has left (Phase 6 Part C): its record says so, and its paths answer `NotFound`.
     departed: bool,
+    /// **The disk the machine started from** (Phase 6 Part D): its GPT's GUID is the one Limine
+    /// loaded the modules from.
+    boot: bool,
 }
 
 /// **What a USB device's record carries** that its node does not (Phase 6 Part A.3). The node is a
@@ -133,6 +136,21 @@ impl Registry {
         changed
     }
 
+    /// **Flag `disk` as the disk the machine started from** (Phase 6 Part D). One change, so one
+    /// generation. Whether it changed anything: a node the table does not hold, or one flagged
+    /// already, does not.
+    pub fn mark_boot(&mut self, disk: &ObjectRef) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.node.as_ptr() == disk.as_ptr()) else {
+            return false;
+        };
+        if e.boot {
+            return false;
+        }
+        e.boot = true;
+        self.generation += 1;
+        true
+    }
+
     /// How many nodes it holds.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -163,6 +181,7 @@ impl Registry {
             driver: "",
             usb: None,
             departed: false,
+            boot: false,
         })
     }
 
@@ -186,7 +205,9 @@ impl Registry {
         self.add_block_under(node, parent, driver)
     }
 
-    fn add_block_under(&mut self, node: ObjectRef, parent: u32, driver: &'static str) -> bool {
+    /// **Append a block node under the entry `parent`**, by id: a USB disk under its `UsbDevice`
+    /// record (Phase 6 Part D), whose address names no PCI function.
+    pub fn add_block_under(&mut self, node: ObjectRef, parent: u32, driver: &'static str) -> bool {
         let served = self.entries.iter().filter(|e| node_of(e).class() == DeviceClass::Block).count() as u32;
         let kind = match BlockKind::from_u32(node_of_ref(&node).block_info().kind) {
             BlockKind::Disk => DeviceKind::Disk,
@@ -194,7 +215,7 @@ impl Registry {
             BlockKind::RamDisk => DeviceKind::RamDisk,
             BlockKind::Unknown => DeviceKind::Unknown,
         };
-        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false })
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false })
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
@@ -205,7 +226,7 @@ impl Registry {
         served: u32,
         driver: &'static str,
     ) -> bool {
-        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false })
+        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false, boot: false })
     }
 
     /// Append a keyboard or mouse a USB device provides (Phase 6 Part B.2), under `parent`, the
@@ -221,7 +242,7 @@ impl Registry {
     ) -> Option<u32> {
         let served = self.next_input_index();
         let parent = parent.unwrap_or(NO_PARENT);
-        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false }).then_some(served)
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false }).then_some(served)
     }
 
     /// The index after every input node's: the next `/dev/input/raw/<n>`.
@@ -247,7 +268,7 @@ impl Registry {
         let id = self.entries.len() as u32;
         let usb = Some(facts);
         let kind = DeviceKind::UsbDevice;
-        let entry = Entry { node, kind, served: NOT_SERVED, parent, driver, usb, departed: false };
+        let entry = Entry { node, kind, served: NOT_SERVED, parent, driver, usb, departed: false, boot: false };
         self.push(entry).then_some(id)
     }
 
@@ -321,6 +342,9 @@ impl Registry {
             };
             if e.departed {
                 r.flags |= DEPARTED;
+            }
+            if e.boot {
+                r.flags |= BOOT;
             }
             let mut driver = e.driver;
             if e.kind == DeviceKind::PciFunction {
@@ -488,6 +512,21 @@ pub fn register_usb(
     id
 }
 
+/// **Append a disk a USB device provides**, under its device's record `parent` (Phase 6 Part D). Its
+/// id, the place its partitions are registered under, or `None` if the table could not take it.
+pub fn register_block_under(node: ObjectRef, parent: u32, driver: &'static str) -> Option<u32> {
+    let id = {
+        let mut d = DEVICES.lock();
+        let id = d.len() as u32;
+        d.add_block_under(node, parent, driver).then_some(id)
+    };
+    if id.is_none() {
+        crate::kprintln!("device: table full; dropping a registered disk");
+    }
+    announce();
+    id
+}
+
 /// Append a keyboard or mouse a USB device provides, under its device's record `parent`, at the next
 /// `/dev/input/raw/<n>`. The table takes ownership of `node`. The `<n>`, or `None` when the table
 /// could not take it. From the hub thread (Phase 6 Part B.2).
@@ -507,6 +546,16 @@ pub fn depart(id: u32) {
     if DEVICES.lock().depart(id) {
         announce();
     }
+}
+
+/// **Flag `disk` as the disk the machine started from** (Phase 6 Part D), as one change. Whether
+/// it was not flagged before.
+pub fn mark_boot(disk: &ObjectRef) -> bool {
+    let marked = DEVICES.lock().mark_boot(disk);
+    if marked {
+        announce();
+    }
+    marked
 }
 
 /// The node `/dev/blk/<index>` serves, as a cloned owning reference (the table keeps its own).
@@ -1103,6 +1152,48 @@ mod tests {
         c.depart(1);
         assert!(c.block(0).is_none() && c.block(2).is_none(), "the controller's disk, and that disk's partition");
         assert!(c.block(1).is_some() && c.node(0).is_some() && c.node(2).is_some(), "and nothing else");
+    }
+
+    /// **A disk under a USB device names the device as its parent** (Phase 6 Part D), and its
+    /// partition the disk: a departure of the device takes both.
+    #[test]
+    fn a_disk_under_a_usb_device_departs_with_it() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        let (kbd, ..) = with_usb(&mut r);
+        let stick = block(ResourceDescriptor::ZERO, BlockKind::Disk, b"QEMU QEMU HARDDISK", 1 << 15);
+        let at = r.len() as u32;
+        assert!(r.add_block_under(stick.clone(), kbd, "usb-storage"));
+        let part = block(ResourceDescriptor::ZERO, BlockKind::Partition, b"partition 1 (unlabelled)", 1 << 14);
+        assert!(r.add_block_child(part, &stick, "mbr"));
+        let recs = r.records(|_| None).unwrap();
+        assert_eq!((recs[at as usize].parent, recs[at as usize + 1].parent), (kbd, at));
+        r.depart(kbd);
+        assert!(r.node(at).is_none() && r.node(at + 1).is_none(), "the disk and its partition depart with it");
+    }
+
+    /// **The boot disk is flagged, once, and nothing else is** (Phase 6 Part D): the disk's record
+    /// carries `BOOT` and its partition's does not, the flag is one change, and flagging it again,
+    /// or a node the table does not hold, changes nothing.
+    #[test]
+    fn the_boot_disk_is_flagged_once_and_nothing_else() {
+        init_global_heap();
+        let (mut r, disk, _) = booted();
+        let before = r.generation();
+        assert!(r.mark_boot(&disk));
+        assert_eq!(r.generation(), before + 1, "one change");
+        let recs = r.records(|_| None).unwrap();
+        let flagged: KVec<u32> = {
+            let mut v = KVec::new();
+            for x in recs.iter().filter(|x| x.flags & BOOT != 0) {
+                v.try_push(x.id).unwrap();
+            }
+            v
+        };
+        assert_eq!(&flagged[..], &[3], "the disk, not its partition");
+        assert!(!r.mark_boot(&disk), "flagged already");
+        assert!(!r.mark_boot(&char_node()), "a node the table does not hold");
+        assert_eq!(r.generation(), before + 1);
     }
 
     /// **Every change counts once**: each registration, and a departure with its children.

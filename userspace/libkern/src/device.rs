@@ -90,6 +90,9 @@ pub const OUTCOME_DECLINED: u32 = 2;
 pub const MAX_DRIVER_NAME: usize = 16;
 /// [`DeviceRecord::flags`]: the device has departed (Phase 6 Part C). See the kernel's mirror.
 pub const DEPARTED: u8 = 0x01;
+/// [`DeviceRecord::flags`]: the disk the machine started from (Phase 6 Part D). See the kernel's
+/// mirror.
+pub const BOOT: u8 = 0x02;
 
 /// The start of a snapshot.
 #[repr(C)]
@@ -159,7 +162,7 @@ pub struct DeviceRecord {
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// What has happened to it: [`DEPARTED`] (Phase 6 Part C).
+    /// What has happened to it, and what it is: [`DEPARTED`] (Phase 6 Part C) and [`BOOT`] (Part D).
     pub flags: u8,
     /// Bytes per logical block, for a block device.
     pub logical_block_size: u32,
@@ -215,6 +218,11 @@ impl DeviceRecord {
     /// Whether the device has departed (Phase 6 Part C): [`DEPARTED`].
     pub fn is_departed(&self) -> bool {
         self.flags & DEPARTED != 0
+    }
+
+    /// **Whether it is the disk the machine started from** (Phase 6 Part D): [`BOOT`].
+    pub fn is_boot_medium(&self) -> bool {
+        self.flags & BOOT != 0
     }
 
     /// The `<n>` of the `/dev/blk/<n>` that serves it, if it is a block device and served — what

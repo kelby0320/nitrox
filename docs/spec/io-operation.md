@@ -125,6 +125,12 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 
 - **Block** devices (disks, partitions) follow the rules above: `offset`/`length`
   are logical-block multiples, translated into an [`Irp`](#relationship-to-the-irp).
+
+  **A USB disk that has departed** (Phase 6 Part D), and every partition on it, completes a
+  request `PeerClosed`: one waiting behind another when the device went, the one in flight once
+  the controller has let go of its memory, and every one submitted after. Nothing comes back:
+  `result` is `0`. The kernel's write-back takes the same answer as final for a file on that
+  disk ([`filesystem-data-path.md`](../architecture/filesystem-data-path.md)).
 - **Char/stream** devices accept a `Read` (input). The block-alignment rules
   **do not apply**: `offset` is ignored (a stream has no addressable position) — by
   every char node but the registry's change node, which reads it as the generation the

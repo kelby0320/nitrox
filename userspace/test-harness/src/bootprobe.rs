@@ -2308,6 +2308,32 @@ fn registry_test(root_ns: u64) -> bool {
                 if !named {
                     return fail(b"a block record's name is not its device's");
                 }
+                // **A USB disk is under its USB device, and its partitions under it** (Phase 6
+                // Part D): said, for `test-qemu` to hold to the stick it attached.
+                if r.driver() == b"usb-storage" {
+                    if !all.get(r.parent as usize).is_some_and(|p| p.kind() == DeviceKind::UsbDevice) {
+                        return fail(b"a USB disk is not under its USB device");
+                    }
+                    Line::new()
+                        .s(b"boot-probe: registry: usb disk blk-")
+                        .u(r.served as u64)
+                        .s(b", ")
+                        .u(r.block_count)
+                        .s(b" blocks of ")
+                        .u(r.logical_block_size as u64)
+                        .s(b", under usb-")
+                        .u(r.parent as u64)
+                        .end();
+                } else if let Some(disk) = all.get(r.parent as usize).filter(|d| d.driver() == b"usb-storage") {
+                    Line::new()
+                        .s(b"boot-probe: registry: usb disk blk-")
+                        .u(disk.served as u64)
+                        .s(b"'s partition blk-")
+                        .u(r.served as u64)
+                        .s(b", by ")
+                        .s(r.driver())
+                        .end();
+                }
             }
             DeviceKind::Keyboard | DeviceKind::Mouse => {
                 let raw = alloc::format!("/dev/input/raw/{}", r.served);
@@ -2387,6 +2413,16 @@ fn registry_test(root_ns: u64) -> bool {
     }
     if !keyboard || !mouse {
         return fail(b"no keyboard and mouse records");
+    }
+    // **The disk the machine started from, flagged, and nothing else** (Phase 6 Part D): every boot
+    // that runs this one came off a GPT disk, so exactly one record says so, and it is a disk.
+    let mut boot = all.iter().filter(|r| r.is_boot_medium());
+    match (boot.next(), boot.next()) {
+        (Some(d), None) if d.kind() == DeviceKind::Disk && !d.is_departed() => {
+            Line::new().s(b"boot-probe: registry: the boot disk is blk-").u(d.served as u64).s(b", and nothing else is flagged").end();
+        }
+        (None, _) => return fail(b"no record is flagged as the disk the machine started from"),
+        _ => return fail(b"the boot flag is on more than one record, or on one that is not a present disk"),
     }
     // **`/dev/registry/changes` refuses a read too short for its answer**, at submission (PR #361
     // review): `io-operation.md`'s rule, which the manager's eight-byte reads never test. Asked past

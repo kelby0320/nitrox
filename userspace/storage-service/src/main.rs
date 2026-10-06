@@ -49,7 +49,7 @@ use libkern::abi::{IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
 use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
-use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_SETTLED, parse_arrived};
+use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DirReplyWriter, parse_read_dir_request};
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup};
 use librsproto::namespace::{
@@ -602,10 +602,12 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
         close(control);
         return Err(b"fs-server-ext4 would not spawn");
     };
-    // **From here a failure ends the server too** (PR #336 review, finding 3): it is terminated
-    // and its handle closed, so a refused or unanswered mount leaves no server running over the
-    // device and no handle held for one. A server that refused `Ready` has exited already, and
-    // terminating it is a no-op.
+    // **From here a failure lets the server go** (PR #336 review, finding 3): its control channel
+    // and its handle closed. **That, not the terminate, is what ends it** (PR #362 review): a
+    // terminate is a request, which `fs-server-ext4` does not read. A server that refused `Ready`
+    // has exited already; one that had not answered finds its control channel closed when it does,
+    // and exits; and one that answered and is then let go here exits when its forwarding endpoint
+    // loses its peer (Phase 6 Part D.4). The terminate stays, for a server that does listen.
     let abandon = |control: u64| {
         close(control);
         // SAFETY: the Process handle the spawn returned, with SIGNAL.
@@ -670,6 +672,9 @@ struct Service {
     /// this service mounts nothing and does not answer `InUse`: a device it took for free could
     /// be the running root.
     init_known: bool,
+    /// **A live boot**: the root on a RAM disk, so the machine's disks — and, until Phase 6 Part F,
+    /// a stick plugged in — mount read-only.
+    live: bool,
     mounted: Vec<Mount>,
     /// The buffer every device read passes through, kept past the boot's probe for a device read
     /// again ([`refresh`](Self::refresh)).
@@ -1121,16 +1126,23 @@ impl Service {
     }
 
     /// The subscription. **After `Settled` the manager sends a disk's `Arrived` or `Departed`** when
-    /// one comes or goes (Phase 6 Part C), and nothing makes one before Part D's mass storage, which
-    /// is where this takes them; until then each is said and ignored, its handles closed rather than
-    /// leaked. The manager going away is said once.
+    /// one comes or goes (Phase 6 Part C), and **this follows them** (Part D): an arrival read and
+    /// mounted by the boot's rules, a departure's mount torn down. Anything else is said and its
+    /// handles closed. The manager going away is said once.
     fn serve_subscription(&mut self) {
         loop {
             match recv(self.subscription) {
-                Ok(Some(m)) => {
-                    Line::new().s(b"storage-service: the device manager sent op ").u(m.op as u64).s(b" after Settled; ignored").end();
-                    m.handles.iter().for_each(|&h| close(h));
-                }
+                Ok(Some(m)) => match (m.op, m.handles.as_slice()) {
+                    (OP_DEVICES_ARRIVED, &[node]) => match parse_arrived(&m.body).and_then(DeviceRecord::read) {
+                        Some(r) => self.arrived(r, node),
+                        None => close(node),
+                    },
+                    (OP_DEVICES_DEPARTED, &[]) if let Some(id) = parse_departed(&m.body) => self.departed(id),
+                    _ => {
+                        Line::new().s(b"storage-service: the device manager sent op ").u(m.op as u64).s(b" it does not read; ignored").end();
+                        m.handles.iter().for_each(|&h| close(h));
+                    }
+                },
                 Ok(None) => return,
                 Err(()) => {
                     kprint(b"storage-service: the device manager has gone; the disks held are kept\n");
@@ -1143,9 +1155,83 @@ impl Service {
     }
 }
 
+impl Service {
+    /// **A device that arrived after the boot** (Phase 6 Part D): read as at boot, kept with its
+    /// node, mounted by the boot's rules beside the mounts there are, and said.
+    fn arrived(&mut self, record: DeviceRecord, node: u64) {
+        let found = probe(&DeviceIo::new(node, &record, &self.scratch));
+        let d = Device { found, record };
+        self.devices.push(d.clone());
+        self.nodes.push((record.id, node));
+        let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
+        let plan = storage_service::mounts::arrival(
+            core::slice::from_ref(&d),
+            &self.devices,
+            &self.all_mounts(),
+            &taken,
+            self.live,
+            self.init_known,
+        );
+        for p in plan {
+            if self.mounted.len() >= MAX_MOUNTS {
+                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: every mount slot is in use").end();
+                break;
+            }
+            match mount(self.root_ns, &p, node) {
+                Ok(m) => self.mounted.push(m),
+                Err(why) => Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end(),
+            }
+        }
+        report(&d, &self.all_mounts(), &self.devices);
+    }
+
+    /// **A device that departed** (Phase 6 Part D): a mount on it torn down, then the device out of
+    /// the table and its node closed.
+    fn departed(&mut self, id: u32) {
+        let Some(at) = self.devices.iter().position(|d| d.record.id == id) else {
+            return;
+        };
+        if let Some(i) = self.mounted.iter().position(|m| m.device == id) {
+            self.tear_down(i);
+        }
+        let d = self.devices.remove(at);
+        if let Some(n) = self.nodes.iter().position(|&(nid, _)| nid == id) {
+            close(self.nodes.remove(n).1);
+        }
+        Line::new().s(b"storage-service: ").s(table::name(&d.record).as_bytes()).s(b" departed").end();
+    }
+
+    /// **Tear down mount `i`, whose device has gone**: as an unmount, but nothing can be kept.
+    /// 1. Its label leaves `fs`.
+    /// 2. `sys_ns_sync`: every dirty file's write-back is refused, its device gone, and the kernel
+    ///    lets each such file go rather than keeping it for the boot.
+    /// 3. `Meta::Unmount`: the server's attempt to record the filesystem clean fails, and it answers
+    ///    and exits. **Not a terminate**, which it does not read (PR #362 review).
+    /// 4. The namespace is closed.
+    fn tear_down(&mut self, i: usize) {
+        let x = self.mounted.remove(i);
+        let root = b"/";
+        // SAFETY: a namespace handle this process holds, and a valid path.
+        let _ = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
+        if send(x.control, OP_UNMOUNT, 1, 0, &[], &[]) && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
+            if let Ok(Some(a)) = recv(x.control) {
+                a.handles.iter().for_each(|&h| close(h));
+            }
+        }
+        close(x.ns);
+        close(x.control);
+        close(x.process);
+        Line::new()
+            .s(b"storage-service: ")
+            .untrusted(x.label.as_bytes())
+            .s(b" left while mounted; what had not been written back is gone")
+            .end();
+    }
+}
+
 /// Say what one device holds, and whose it is. How an ext4 was left is not said while it is
 /// mounted writable, for the reason the table's `clean` is `Null` then: its state says "in use".
-fn report(d: &Device, mounts: &[Mounted]) {
+fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     let r = &d.record;
     let mount = mounts.iter().find(|m| m.device == r.id);
     let mut line = Line::new();
@@ -1191,6 +1277,9 @@ fn report(d: &Device, mounts: &[Mounted]) {
         // **Said, not left to an absence** (administration Part G.1): a gate can then match the
         // reason the pristine root was passed over, rather than only fail to find its mount.
         line.s(b"; the installer's source, left unmounted");
+    } else if storage_service::mounts::on_boot_medium(d, all) {
+        // And the disk the machine started from (Phase 6 Part D), for the same reason.
+        line.s(b"; on the disk the machine started from, passed over");
     }
     line.end();
 }
@@ -1299,6 +1388,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         nodes,
         init,
         init_known: known,
+        live,
         mounted,
         scratch,
         session_ends: Vec::new(),
@@ -1309,7 +1399,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     let mounts = s.all_mounts();
     Line::new().s(b"storage-service: ").u(s.devices.len() as u64).s(b" block device(s)").end();
     for d in &s.devices {
-        report(d, &mounts);
+        report(d, &mounts, &s.devices);
     }
     if live {
         kprint(b"storage-service: a live boot: the root is on a RAM disk, so the machine's disks mount read-only\n");
