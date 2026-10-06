@@ -34156,8 +34156,9 @@ started from is passed over.
 - **The boot medium is a flag the kernel sets**, `BOOT` in a record's `flags`, from a GUID only the
   kernel reads. The storage service passes the disk over and names it in `InUse`. `nxinstall`
   refuses it as the running system.
-- **A departed mount's server is terminated** rather than asked to unmount: it would try to mark
-  clean a filesystem on a device that is gone.
+- **A departed mount is unmounted**: its dirty files' write-backs are refused and the files let go,
+  then `Meta::Unmount` ends the server, whose marking fails. (Until the review this said the server
+  was terminated, which would not have ended it.)
 - **Disk slots are a value a host test drives**, under an epoch. That is PR #361's lesson applied
   before it could recur.
 
@@ -34167,3 +34168,46 @@ started from is passed over.
 - **`/dev/disk` names for a stick: none.** Those names are `init`'s, bound from what the boot's
   probe found. A stick read in the first round would otherwise put its partitions among them. Its
   `nitrox-root`, say, would lose to the internal disk's only because AHCI is probed first.
+
+## 2026-10-06 — PR #362, reviewed: a terminate that kills nothing, and files pinned for the boot
+
+One blocking finding, two worth fixing and three optional, all taken into Part D's detail pass. Each
+was read against the source before it went in.
+
+**1. "Its server is terminated" would not have ended `fs-server-ext4`.** `sys_process_terminate`
+queues `TerminateRequested` and does nothing else, and the server never reads its notification
+channel. So a stick pulled while mounted would have left a server running per pull, holding the
+device. Now the teardown sends `Meta::Unmount`, which ends the server whether or not it can record
+the filesystem clean.
+
+**Found reading it:** a server whose forwarding endpoint loses its peer spins, since the closed
+peer stays signalled and its loop waits again at once. The storage service's `mount` reaches that
+when it abandons a server after its `Ready`, believing a terminate ends it. Part D makes the server
+exit then, after a probe shows the spin, which is read, not run.
+
+**2. A pulled mount's dirty files would have been pinned for the boot, not lost.** A dirty file
+holds a reference to itself until a write-back succeeds or its server forgets it, and a write-back
+to a device that has gone never succeeds. Part D gains a kernel piece: a write-back refused
+`PeerClosed` lets its file go, as a `Forget` does. Any other failure keeps the pin, since that
+data can still reach a device that answers again.
+
+**3. The control meant to catch a departure leaving submits queued had nothing to hang on.** The
+teardown is driven by the manager's `Departed`, and the pulled stick had no I/O in flight. Now the
+teardown itself does I/O to the departed disk — the dirty file's write-back and the server's
+marking — and the gate asserts each comes back.
+
+**Optional:**
+- **Every command at binding is the hub thread's own, bounded at five seconds**, the partition
+  table's read among them. That read happens before the disk is published, so nothing else waits
+  on it while the hub thread does.
+- **Status 1 is read through `REQUEST SENSE`.** A data-stage stall clears that endpoint's halt and
+  reads the status. Only a phase error, a bad wrapper, a stalled command wrapper or a deadline
+  takes reset recovery, as bulk-only §6.7 lays out.
+- **`mount`'s comment on terminating a server** is corrected with item 1's fix.
+
+**And one of the pass's own claims was wrong.** It said a failed page-cache fill ends the faulting
+process. It suspends the faulting thread and notifies its process, and nothing supervises an
+ordinary program's faults. The thirty-second auto-terminate is deferred, so the program stays
+suspended. A program touching a pulled stick's unread page reaches that, and it goes to the
+deferrals with the pulled stick as its trigger. The pass also cited `fault-survival.md` for it,
+which is about kernel faults.

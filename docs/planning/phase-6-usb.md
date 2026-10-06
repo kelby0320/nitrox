@@ -1290,16 +1290,34 @@ The gate set stays at 42: these are steps in gates that exist.
   round, so a stick's partitions read there would be bound too.
 - **Limine's module records are bound as revision, address, size and path**
   (`kernel/src/limine.rs`). The media fields after them are not read.
-- **A failed page-cache fill ends the faulting process** (`kernel/src/arch/x86_64/idt.rs`), as a
-  fault on nothing does.
+- **A failed page-cache fill is a fault in the program that took it** (`idt.rs`). Its thread is
+  suspended and its process sent `SegFault` (`notifications.md`). Nothing supervises an ordinary
+  program's faults, and the thirty-second auto-terminate is deferred, so the thread stays
+  suspended, and its silence is all a shell waiting for it sees. (This pass first said the process
+  was ended, which is not so.)
+- **A dirty file pins itself** (`kernel/src/object/file_object.rs`), so a writer that exits without
+  syncing loses nothing. Two things let the pin go: a write-back that succeeds, and the server's
+  `File::Forget`. **A write-back that fails keeps it** (`write_back` in
+  `kernel/src/syscall/table.rs` returns before the unpin). So a file left dirty on a device that
+  has gone stays for the boot, with its pages, its device and its registration (PR #362 review).
+- **`sys_process_terminate` asks; it does not kill.** It queues `TerminateRequested`, and a process
+  that does not listen runs on (`syscall-abi.md`). That is the system's whole contract: there is no
+  forcible kill (PR #362 review).
 
 **Userspace:**
 - **The storage service reads every device synchronously**, in its one loop: `DeviceIo::read_at`
   waits on each read with no deadline. A device that never answered would stop the service.
 - **Arrivals and departures after `Settled` are logged and ignored** (`serve_subscription`).
 - **`fs-server-ext4` answers `IoError` when its device fails, and runs on.** It exits on
-  `Meta::Unmount` or a failed setup. The service notices a server's exit by its control channel
-  closing.
+  `Meta::Unmount`, answered whether or not its filesystem could be recorded clean, or a failed
+  setup — including a `Ready` it cannot send. **It never reads its notification channel**, so a
+  terminate request does nothing to it, and a closed control channel is ordinary to it after
+  `Ready`. The service notices a server's exit by its control channel closing (PR #362 review).
+- **A server whose forwarding endpoint has lost its peer spins**, by reading, not yet run: the
+  closed peer stays signalled, the drain stops at `PeerClosed`, and `serve_loop` waits again at
+  once. Nothing reaches it today, since every unmount sends `Meta::Unmount` first. The storage
+  service's `mount` comes closest: after a `Ready`, a namespace it cannot create or bind abandons
+  the server by terminating it, which does nothing, and closing the endpoint (PR #362 review).
 - **The service passes over the installer's source** by its partition name, auto-mounts read-only
   on a live boot, and mounts at most eight filesystems (`MAX_MOUNTS`).
 - **`InUse` names every mounted device and its disk**, and the `disks` grant withholds them.
@@ -1338,8 +1356,14 @@ The gate set stays at 42: these are steps in gates that exist.
 4. **A `Disk` record under the `UsbDevice` record.** It is named by INQUIRY's vendor and product
    and the device's serial string, with the block size and count `READ CAPACITY` gives. A unit of
    2 TiB or more, which `READ CAPACITY(10)` cannot describe, is logged and not published.
-5. **Its partition table is read there and then** (below), and its GPT disk GUID compared with the
-   boot disk's.
+5. **Its partition table is read there and then**, before the disk is published (below), and its
+   GPT disk GUID compared with the boot disk's.
+
+**Every command at binding is the hub thread's own, waited for and bounded at five seconds**, the
+table's read among them (PR #362 review). The disk is not published yet, so nothing else is waiting
+on it: a stall is recovered in line, and a command that misses its bound ends the binding and the
+device. A device bound slower than the first round's two seconds arrives after the boot has stopped
+waiting, as any slow device does today.
 
 **The I/O path is the DPC's**, as AHCI's is its interrupt's:
 - **`submit` queues the IRP behind the one in flight** and starts it if none is. Bulk-only runs one
@@ -1347,23 +1371,29 @@ The gate set stays at 42: these are steps in gates that exist.
 - **A command goes on the rings whole.** The command wrapper goes on bulk OUT. The data follows
   as one Normal TRB per IRP fragment, on OUT for a write and IN for a read. The status wrapper
   goes on bulk IN, and only its completion interrupts. One doorbell rings for each endpoint used.
-- **The DPC completes the IRP at the status wrapper's event**, and starts the next. The wrapper's
-  signature, tag and status are checked, and its residue must be zero. Every transfer event goes
-  to the storage table or the HID table, by slot and endpoint.
+- **The DPC completes the IRP at the status wrapper's event**, and starts the next, when the
+  wrapper reads — its signature, its tag, status 0 — and its residue is zero. Every transfer event
+  goes to the storage table or the HID table, by slot and endpoint.
 - **`max_frags` is 64**: 256 KiB a command, the largest any client submits.
-- **Reads and writes are `READ(10)` and `WRITE(10)`.** A flush is `SYNCHRONIZE CACHE(10)`. A device
-  that refuses it as an illegal request has no cache to flush, as many sticks have none, and the
-  flush completes.
-- **Everything off the fast path is the hub thread's**: a stalled endpoint, a bad status wrapper, a
-  phase error, a command past its deadline. The DPC marks the device and wakes the thread, as a HID
-  halt does. The thread runs bulk-only's reset recovery: the class's reset request, then each
-  endpoint's halt cleared (Reset Endpoint, Set TR Dequeue Pointer, `CLEAR_FEATURE`). It fails the
-  command `IoError` and starts the next. **A device that does not recover is ended**: its disk
-  departs as on an unplug, and its slot is disabled.
-- **Every command has a deadline**: thirty seconds, what Linux's `sd` gives one. The hub thread
-  keeps it, sleeping until the earliest deadline while any command is in flight. **This is what
+- **Reads and writes are `READ(10)` and `WRITE(10)`, and a flush is `SYNCHRONIZE CACHE(10)`.**
+- **Everything off the fast path is the hub thread's.** The DPC marks the device and wakes the
+  thread, as a HID halt does. Then, by what went wrong, following bulk-only §6.7 (PR #362 review):
+  - **status 1, the command failed**: the thread asks `REQUEST SENSE`. An illegal request to
+    `SYNCHRONIZE CACHE` means no cache to flush, as many sticks have none, and the flush completes.
+    A unit attention retries the command once. Anything else fails it `IoError`;
+  - **a stall in the data stage**: that endpoint's halt is cleared (Reset Endpoint, Set TR Dequeue
+    Pointer, `CLEAR_FEATURE`) and the status wrapper read, which says how the command ended;
+  - **status 2, a wrapper that does not read, a stall on the command wrapper, or a command past its
+    deadline**: reset recovery — the class's reset request, then both endpoints' halts cleared — and
+    the command fails `IoError`.
+
+  Then the next command starts. **A device that does not recover is ended**: its disk departs as
+  on an unplug, and its slot is disabled.
+- **Every command has a deadline**: thirty seconds, what Linux's `sd` gives one. **This is what
   bounds a stick that stops answering**: the storage service and `fs-server-ext4` wait on their
-  reads with no deadline of their own.
+  reads with no deadline of their own. The hub thread keeps it, sleeping until the earliest
+  deadline while any command is in flight, and looking at the deadlines whenever it wakes. Its
+  other waits are each bounded at five seconds at most, so a deadline is kept to within that.
 
 **A departure** joins the hub thread's `depart`, before the records:
 1. the disk leaves the DPC's table;
@@ -1380,8 +1410,9 @@ A partition's window (`io::block::Partition`) is leaked per publish, as at boot.
 keeps its records for the boot, so `usb-departed-records` gains the windows.
 
 **Partition tables are read where a disk arrives:**
-- **In thread context**: the hub thread dispatches an IRP and waits on its operation, bounded. Not
-  `read_blocking`, which polls with interrupts masked and is the boot's.
+- **At binding**: its first two blocks, the MBR and where a GPT's header would be, then a GPT's
+  entries where its header puts them, as `gpt::init` reads them. Not `read_blocking`, which polls
+  with interrupts masked and is the boot's.
 - **GPT** as today, keeping the header's disk GUID.
 - **MBR**: its four primary entries. Each one in use and not extended becomes a partition, named as
   an unlabelled GPT partition is, `partition <n> (unlabelled)`. A protective entry (`0xEE`) means
@@ -1389,8 +1420,9 @@ keeps its records for the boot, so `usb-departed-records` gains the windows.
 - **No table**: no partitions. The storage service probes the disk itself, as it probes a RAM disk
   now, and a filesystem at its start mounts as the disk.
 - **One parser for both paths**: the table's sectors are read into bytes and parsed by a function
-  over them, host-tested. The boot's polled read and the hub thread's waited one both feed it, so a
-  SATA disk with an MBR gains its partitions too.
+  over them, host-tested. The boot's polled read and the binding's both feed it, so a SATA disk
+  with an MBR gains its partitions too. **The disk and its partitions are registered together**,
+  once the table is read.
 - **A stick's partitions get no `/dev/disk` names** (the maintainer's call, below).
 - **Blocks of 512 bytes only.** A disk with another block size is published with its table unread,
   and the log says why.
@@ -1414,17 +1446,41 @@ keeps its records for the boot, so `usb-departed-records` gains the windows.
   removable one writable). It is logged as at boot, a line per device. Past `MAX_MOUNTS`, the
   device is said and left unmounted.
 - **A `Departed`** takes the device out of the table and closes the service's node for it. **A
-  mount on it is torn down**: its label leaves `fs`, its server is terminated, and its namespace is
-  closed. The log says the device left while mounted, and that what had not been written back is
-  lost. Not `Meta::Unmount`: the server would try to mark the filesystem clean on a device that is
-  gone, fail, and exit anyway.
+  mount on it is torn down**, as an unmount is but with nothing kept:
+  1. its label leaves `fs`;
+  2. **`sys_ns_sync` over the mount**: every dirty file's write-back is refused `PeerClosed`, and
+     each such file is let go (below);
+  3. **`Meta::Unmount`**: the server's attempt to record the filesystem clean fails, and it answers
+     and exits, as it does after any unmount. A read-only mount's server records nothing, and
+     exits at once;
+  4. the namespace is closed.
+
+  The log says the device left while mounted, and that what it had not written back is gone; the
+  kernel's own line names each file it let go. **Not
+  `sys_process_terminate`**: it is a request, and `fs-server-ext4` does not listen for it, so the
+  server would run on, holding the device (PR #362 review).
+
+**A write-back the device refuses `PeerClosed` lets its file go** (a kernel piece, PR #362 review).
+`PeerClosed` from a block device means it has departed, and nothing will ever take those pages. So
+the file is let go as the server's `Forget` lets it go: marked dead, its pin taken, its pages freed
+with its last reference, and a kernel line naming how many pages went. Any other failure keeps the
+pin as now, since the data can still reach a device that answers again. Without this, every file a
+pulled stick left dirty would stay for the boot, with its pages, its device and its registration.
+
+**`fs-server-ext4` exits when its forwarding endpoint has lost its peer**, as `device-mgr` has since
+PR #333: nothing can reach it any more. That closes the spin found above, which the storage
+service's `mount` can reach today, and whose comment, that terminating the server ends it, is
+corrected. It is read, not run, so the piece shows the spin with a probe first.
 
 **A stick pulled while mounted, end to end:**
 1. Its I/O fails `PeerClosed` in the kernel at once.
-2. The server answers its clients `IoError`.
-3. The manager's `Departed` reaches the storage service, which tears the mount down.
-4. A program with one of its files mapped, touching a page not yet in memory, is ended, as on any
-   failed fill (`design/fault-survival.md` is where that would change).
+2. The server answers its clients `IoError`, as it does now.
+3. The manager's `Departed` reaches the storage service, which tears the mount down. Its dirty
+   files are let go, and its server exits.
+4. **A program with one of its files mapped, touching a page not yet in memory, faults, and stays
+   suspended**, as any program's fault leaves it today. Ending it is the deferred auto-terminate's
+   job, not Part D's, but a pulled stick is the first ordinary way to reach it, so it is recorded
+   (§ *Not in Part D*).
 
 ### The maintainer's calls, 2026-10-06
 
@@ -1454,7 +1510,12 @@ The maintainer agreed to both, as recommended.
 - **One configuration per device**, so a composite device's second class cannot reset its first.
 - **The ten-byte commands only**: units under 2 TiB of 512-byte blocks, which is every stick this
   phase meets.
-- **A departed mount's server is terminated**, not asked to unmount (above).
+- **A departed mount is unmounted, not its server terminated** (PR #362 review). This pass first
+  had it the other way round, believing a terminate ends a process. It does not, and `Meta::Unmount`
+  ends `fs-server-ext4` whether or not the marking succeeds.
+- **A pulled stick's unwritten files are let go, not kept for the boot** (PR #362 review). Keeping
+  them would preserve data that can never be written, at the cost of their pages for the rest of the
+  boot.
 - **The boot medium is a flag the kernel sets**, from a record only it reads, so the storage
   service, `nxinstall` and the hardware report all read the same fact.
 
@@ -1475,7 +1536,8 @@ The maintainer agreed to both, as recommended.
   - one configuration per device, and bulk endpoint contexts;
   - the storage table, beside HID's in the DPC's routing;
   - the command and status wrappers, and the queue and its fast path;
-  - the SCSI commands at bind, the disk's record, and its table read in thread context.
+  - the SCSI commands at binding, each the hub thread's and bounded, the table's read among them;
+  - the disk's record, registered with its partitions.
 
   Host tests:
   - the bulk contexts' words;
@@ -1483,17 +1545,26 @@ The maintainer agreed to both, as recommended.
   - a status wrapper with a wrong signature, a wrong tag, status 1, status 2, and a residue;
   - `INQUIRY` and `READ CAPACITY` answers, including a unit of 2 TiB.
 - **D.3 Recovery and departure.** Covers:
-  - deadlines kept by the hub thread, reset recovery, and a device ended when it does not recover;
+  - deadlines kept by the hub thread;
+  - status 1 read through `REQUEST SENSE`, a data-stage stall cleared, reset recovery for the rest,
+    and a device ended when it does not recover;
   - a departure completing the queue `PeerClosed`;
-  - the eight slots under an epoch, as a value.
+  - the eight slots under an epoch, as a value;
+  - **a write-back the device refuses `PeerClosed` letting its file go.**
 
-  Host tests: a slot taken, retired and taken again, with a submit through the old context refused
-  — the bump, the check and the queue each with a control that fails it.
+  Host tests:
+  - a slot taken, retired and taken again, with a submit through the old context refused — the
+    bump, the check and the queue each with a control that fails it;
+  - what each status and each stall leads to, decided by a function of the event;
+  - a dirty file whose write-back is refused `PeerClosed` unpinned and dead, and one refused
+    `IoError` still pinned, beside `file_object`'s failed-fill test.
 - **D.4 The storage service follows.** Covers:
   - an arrival read and mounted by the boot's rules;
-  - a departure tearing its mount down;
+  - a departure's teardown: the label, `sys_ns_sync`, `Meta::Unmount`, the namespace;
   - the boot medium passed over and named by `InUse`;
-  - `nxinstall` naming a `boot` disk as holding the running system.
+  - `nxinstall` naming a `boot` disk as holding the running system;
+  - **`fs-server-ext4` exiting when its forwarding endpoint has lost its peer**, once a probe has
+    shown the spin, and `mount`'s comment on terminating corrected.
 
   Host tests: the mount plan for an arrival; the teardown plan for a departure; the boot medium
   never planned and always in use; `withheld` naming it.
@@ -1518,9 +1589,16 @@ The maintainer agreed to both, as recommended.
      carves the partition out by the MBR**: `e2fsck -fn` clean, `s_state` clean, and the pattern
      read with `debugfs`.
   3. **A whole-disk ext4 stick, pulled while mounted.** It is plugged in, mounted, remounted
-     writable, written without a sync, and `device_del`'d. The service says it left while
-     mounted, its label is gone from the table, and a command typed after it runs. The host finds
-     the filesystem still marked in use, which is what an unplug without an eject leaves.
+     writable, written without a sync, and `device_del`'d. **The teardown does I/O to a disk that
+     has gone** — the write-back of the file left dirty, and the server's attempt to record the
+     filesystem clean — and every piece of it must come back at once:
+     - the kernel says it let the dirty file go;
+     - the server says it could not record the filesystem clean, and exits;
+     - the service says the stick left while mounted;
+     - the label is gone from the table, and a command typed after it runs.
+
+     The host finds the filesystem still marked in use, which is what an unplug without an eject
+     leaves.
   4. **The same stick plugged in again** — the node survives, as measured. It is a new disk at a
      new index, and is mounted again: served indices are not reused for disks either.
 - **`check-live`**: the stick is a disk flagged `boot`, and the service passes it over.
@@ -1530,11 +1608,18 @@ The maintainer agreed to both, as recommended.
 - **`check-report`**: the USB page lists the stick's disk beside the device.
 - **Controls**, planned:
   - the GUID comparison removed: `check-install`'s refusal and `check-live`'s line fail;
-  - a departure that leaves its queue uncompleted: step 3's teardown never comes, since the
-    server's read never answers;
+  - **a departure that leaves a later submit queued** rather than refusing it: the teardown's
+    write-back never returns, and step 3's lines never come (PR #362 review: the first plan's
+    control for this had no I/O to hang on);
+  - the write-back's let-go removed: step 3's kernel line never comes;
+  - the teardown terminating the server instead of unmounting it: the server's exit line never
+    comes;
   - the service ignoring `Departed`: the label stays, and step 3 fails;
   - no table read at arrival: step 2 finds a disk holding nothing;
   - the status wrapper's tag unchecked: its host test fails.
+
+  **A command in flight at the moment of departure** is held by D.3's host tests alone: no gate can
+  place an unplug inside one command's few milliseconds without making the gate depend on timing.
 
 The gate set stays at 42.
 
@@ -1555,6 +1640,10 @@ The gate set stays at 42.
 - **Units of 2 TiB or more, and blocks of other than 512 bytes.**
 - **UAS and streams**, as for the phase.
 - **`/dev/disk` names for a stick** (the second call).
+- **Ending a program that faults on a departed stick's file.** Its thread stays suspended, as after
+  any fault in a program nothing supervises: the thirty-second auto-terminate `notifications.md`
+  defers is what ends it. A pulled stick is the first ordinary way a program reaches that, so it
+  goes into `deferred-decisions.md`, with a pulled stick as its trigger.
 
 ### Docs Part D owes
 
@@ -1567,8 +1656,11 @@ The gate set stays at 42.
 - **`drivers-and-irps.md`**: a block driver behind a bus, driven by its controller's DPC.
 - **`io-operation.md`**: block I/O on a departed disk completing `PeerClosed`.
 - **`rsproto-storage-ops.md`**: `InUse` naming the boot medium.
-- **`deferred-decisions.md`**: `usb-departed-records` with disk slots and partition windows, and
-  `block-transfer-split`'s bound for a USB disk.
+- **`deferred-decisions.md`**: `usb-departed-records` with disk slots and partition windows,
+  `block-transfer-split`'s bound for a USB disk, and an unsupervised program's fault — first
+  reached by a pulled stick — with the auto-terminate as its answer.
+- **`filesystem-data-path.md`**: a write-back refused `PeerClosed` letting its file go.
+- **`ext4-fs-server-rw.md`**: the server exiting when its forwarding endpoint has lost its peer.
 - **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-storage`'s new steps, and
   `test-qemu`'s stick.
 
