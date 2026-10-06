@@ -4,7 +4,8 @@
 since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a, the info-only
 endpoint reached through its route since E.1b; the installer session's rebinding gone since Part
 G.3; USB devices named since Phase 6 Part A.3, 2026-10-02; the table followed since Phase 6 Part C,
-2026-10-05; last checked 2026-10-05.** What exists:
+2026-10-05; the `boot` column since Phase 6 Part D, 2026-10-06; last checked 2026-10-06.** What
+exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -159,10 +160,13 @@ so counting within `Char` would have called the keyboard `input-1`. A USB device
 its name, IDs, class, port and speed — `QEMU USB Keyboard (…), 0627:0001 class 03/01/01, port 9,
 high-speed` — and its parent is the controller's `pci-` name.
 
-The columns are `name`, `kind`, `path`, `size`, `description`, `parent` and `driver`. **What a
-device does not have is `Null`, not zero**, because a keyboard has no size, which is different from
-a size of nothing. A table is minted as a fresh read-only memory object per resolve and is
-page-sized, and `Table::decode` stops at its terminator.
+The columns are `name`, `kind`, `path`, `size`, `description`, `parent`, `driver` and `boot`.
+**What a device does not have is `Null`, not zero**, because a keyboard has no size, which is
+different from a size of nothing. `boot` is true of one disk alone: the one the machine started
+from, which the kernel flags (Phase 6 Part D, [`device-node.md`](../spec/device-node.md) §
+*Partition tables*) — not its partitions. A USB disk's `driver` is `usb-storage` and its `parent`
+its USB device's name; an MBR partition's `driver` is `mbr`. A table is minted as a fresh read-only
+memory object per resolve and is page-sized, and `Table::decode` stops at its terminator.
 
 **A session reaches the tables through an info-only endpoint.** Resolving
 `/svc/devices/info-endpoint` answers a channel that is itself a forwarding endpoint, and on it the

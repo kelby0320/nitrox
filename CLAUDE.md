@@ -109,7 +109,9 @@ the keyboard and mouse are bound and served after the i8042's two and handed to 
 and **over QMP plugs a keyboard in, swaps it for a mouse on the same port while the machine is
 paused, and pulls that out**; every gate's controller is configured as the
 laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot give `qemu-xhci` MSI
-(`docs/architecture/usb.md`).
+(`docs/architecture/usb.md`). Since Part D **the stick is an MBR with one FAT16 partition**: it is
+bound as a disk under its `UsbDevice`, its table read, the partition reported FAT and not mounted,
+and the SATA disk the image boots from is the one record flagged `boot`.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
@@ -197,7 +199,9 @@ is a USB storage driver. It asserts the module became a disk named `nitrox-live`
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
 timer tick instead of its own interrupt takes 3 s or more), that a serial login writes under
 `/home`, and that the session reaches no disk — none does on any entry since administration Part
-G.3. It runs in CI's QEMU job.
+G.3. Since Phase 6 Part D the stick is **a disk too**, flagged as the one the machine started from
+by the GUID Limine loaded the modules from, and the storage service passes it over. It runs in CI's
+QEMU job.
 
 `cargo xtask check-install` is the **installer gate** (Phase 5 Parts H.1–H.2), on demand like
 `check-resolutions`: two boots, and a 512 MiB disk image. **It is a reinstall** (administration Part
@@ -209,7 +213,8 @@ release image deliberately does not narrate it), so what it asserts on **in the 
 kernel log: the ESP module that entry alone loads with the pristine root beside it, which the
 storage service leaves unmounted and the installer copies from; the disk's older install
 auto-mounted read-only; a session that holds no disk, and a view the `disks` grant filled; the
-target refused as in use, `with admin disk --unmount nitrox-root` freeing it, and the installer
+target refused as in use, the stick refused as holding the running system (Phase 6 Part D),
+`with admin disk --unmount nitrox-root` freeing it, and the installer
 asking before it writes — a `no` that writes nothing, then a `yes`; its questions for the new
 machine's first account answered (Part G.2); and the milestones a destructive operation records.
 It also aims the installer at the pristine root, a RAM disk, named correctly, and asserts nothing
@@ -247,7 +252,16 @@ through a mapping and **exits without a sync**. The host reads the disk mid-run 
 without the pattern, so what it finds after `with admin disk --unmount`, the unmount put there.
 With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock's
 `s_state` clean, and the file holding the pattern, read with `debugfs` rather than the library
-that wrote it. It runs in CI's QEMU job.
+that wrote it. **Since Phase 6 Part D it plugs sticks in over QMP** after that: the boot stick
+passed over; an MBR stick with one ext4 partition, auto-mounted read-only, remounted writable,
+written without a sync, unmounted and pulled; a whole-disk ext4 stick **pulled while mounted**,
+whose teardown's I/O must all come back at once — the kernel letting the dirty file go, the server
+unable to record the filesystem clean, the label gone and the shell still answering; and that stick
+again, at a new index. The host then carves the first's partition out by its MBR and requires it
+clean with the pattern, and finds the second still marked in use. **It logs in only once
+`boot-probe` has exited**, whatever its verdict, which on that machine is a FAIL by the machine's
+shape: its later tests install a policy and fill the view broker's clients, and the sticks made the
+gate long enough to meet them. It runs in CI's QEMU job.
 
 `cargo xtask check-shutdown` is the **shutdown gate** (administration Part E.4d), and the second
 whose verdict is a disk. It boots a copy of a `--selftest` disk image and, on serial once

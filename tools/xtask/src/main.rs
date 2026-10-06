@@ -4676,6 +4676,19 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
          live boot"
     );
 
+    // 1b. **`boot-probe` has finished, before anything is typed** (Phase 6 Part D). It starts once
+    //     the test harness's chain has, and the sticks made this gate long enough to meet it: a
+    //     `--kvm` run had it starting while a stick was pulled. Its later tests open view-broker
+    //     clients until the broker refuses one, and install a policy, either of which a `with
+    //     admin` here could meet halfway. **Its verdict is not this gate's**: on this machine it
+    //     takes the SATA disk's `nitrox-root` for the root it wrote, and finds no scratch disk, so
+    //     it fails. It writes no disk directly, so the one the host checks is still the gate's.
+    //     Waited for as `check-shutdown` waits, whatever its code.
+    if !s.expect_within("service-mgr: 'boot-probe' exited code=", std::time::Duration::from_secs(300))? {
+        return Err("`boot-probe` did not exit within five minutes of the storage service's report".into());
+    }
+    println!("  ok: boot-probe has finished, so nothing of it overlaps what is typed");
+
     // 2. A serial login. The prompt is searched for in the whole transcript, as `check-live`
     //    does: it and the greeter come up together.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);

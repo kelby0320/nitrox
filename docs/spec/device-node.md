@@ -10,7 +10,8 @@ Design context: [`drivers-and-irps.md`](../architecture/drivers-and-irps.md)
 slice 5). PCI(e) is the only discovery source in Phase 2; partitions became
 DeviceNodes in slice 6, and `Char` nodes arrived with the console and the i8042.
 USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, and a record's
-`port` and `speed`.
+`port` and `speed`. USB disks, MBR partitions and the `BOOT` flag arrived with Phase 6 Part D
+(2026-10-06).
 
 ## The DeviceNode object
 
@@ -125,8 +126,9 @@ pub struct ResourceDescriptor {
 A block-class `DeviceNode` is the unit the async I/O core operates on:
 [`sys_io_submit`](io-operation.md) on a block-`DeviceNode` handle issues a block
 `Read`/`Write`. This is why no separate "BlockDevice" `KObjectType` exists — a
-block device **is** a `DeviceNode`, whether it is a whole disk (AHCI) or a
-partition (GPT, slice 6, layered as a second IRP stack frame over the disk).
+block device **is** a `DeviceNode`, whether it is a whole disk (AHCI, or a USB
+stick since Phase 6 Part D) or a partition (GPT or MBR, layered as a second IRP
+stack frame over the disk).
 
 A block node additionally exposes its geometry to the I/O core:
 
@@ -148,6 +150,31 @@ in bytes, and refused **synchronously** rather than completed. That limit is not
 `BlockGeometry`: it is a property of the driver's command structures rather than of
 the medium, and a device node does not publish it. See
 [`io-operation.md`](io-operation.md) § `length` for the rule and the AHCI figure.
+
+### Partition tables
+
+*(Phase 6 Part D.1.)* **A disk's table is parsed by `drivers::partitions`**, from its 512-byte
+blocks, whoever reads them: the boot's polled read for a SATA disk or a RAM disk, and a USB disk's
+binding, which reads before the disk is published.
+- **GPT** first: a header at block 1 signed `EFI PART`, its entries where it says, at most 128. Each
+  entry in use is a partition, numbered by its place among those in use and named by its label, or
+  `partition <n> (unlabelled)`. The header's disk GUID is kept.
+- **MBR** otherwise: block 0 signed `0x55AA`, and every entry's status byte `0x00` or `0x80`, the
+  check Linux makes — **and not a filesystem's own boot sector**, which carries the same signature:
+  FAT's, by its jump, its bytes per sector and its extended boot signature with its type string,
+  or NTFS's or exFAT's by the name after the jump. Each primary entry in use is a partition,
+  numbered by its slot and named `partition <n> (unlabelled)`. An extended entry is passed over and
+  counted — its logical partitions are not read — and a protective one (`0xEE`) skipped.
+- **None**: the disk holds a filesystem as it is, or nothing.
+
+An entry that does not fit the disk is passed over in either scheme. A partition's record names its
+disk as its parent and its scheme as its driver: `gpt` or `mbr`. **Only a boot disk's GPT
+partitions get `/dev/disk` names**; a USB disk's get none, since those names are how `init` finds
+its critical path.
+
+**The disk the machine started from** is the one whose GPT disk GUID equals module 0's Limine
+record's: its media fields name the GPT disk the bootloader loaded it from, in the byte order a GPT
+header stores the GUID. That disk's record carries `BOOT` (below).
 
 ## Naming and namespace resolution
 
@@ -268,7 +295,7 @@ pub struct DeviceRecord {     // 144 bytes, align 8
     pub pci_class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
     pub seg: u16, pub bus: u8, pub dev: u8, pub func: u8,
     pub port: u8, pub speed: u8,                            // a USB device's; else 0
-    pub flags: u8,                                          // DEPARTED (0x01)
+    pub flags: u8,                                          // DEPARTED (0x01), BOOT (0x02)
     pub logical_block_size: u32,                            // block devices; else 0
     pub name_len: u32,
     pub block_count: u64,                                   // block devices; else 0
@@ -314,6 +341,15 @@ machine without one, and never reused. Its record is a `Keyboard` or `Mouse` who
 `UsbDevice`, whose driver is `usb-hid`, and whose name is the kind word. The console and PCI
 functions are served at no index.
 
+**A USB disk** (Phase 6 Part D) is a `Disk` record whose parent is its `UsbDevice`, whose driver is
+`usb-storage`, and whose name is its INQUIRY vendor and product, then the device's serial in
+brackets. One record per logical unit published; its partitions are records under it.
+
+**`BOOT`** (`0x02` in `flags`, Phase 6 Part D) marks **the disk the machine started from**: on a
+live boot the stick, on an installed machine the internal disk. Every disk whose GUID matches is
+flagged, so a copy of the boot disk plugged in beside it is flagged too; a boot from a volume Limine
+names no GPT disk for flags none. Setting it is a change of the table, as a registration is.
+
 **Ids are stable for the life of a boot** and never reused, because the table only grows — a USB
 device that leaves included, whose record stays.
 
@@ -325,7 +361,7 @@ device that leaves included, whose record stays.
   served index, **which no later device takes** — the next input node's index is the one after
   every input node's, departed ones included.
 - **Its children depart with it**: every record whose parent chain reaches it — a USB device's
-  keyboard and mouse, and a disk's partitions.
+  keyboard and mouse, and its disk with that disk's partitions.
 - **Its paths stop resolving**: `/dev/registry/<id>`, and `/dev/blk/<n>` or `/dev/input/raw/<n>`
   at its served index, answer `NotFound`. A handle already held stays valid, and what it does is
   its driver's: a USB input node is read until its ring is empty, then refuses

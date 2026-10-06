@@ -1,11 +1,12 @@
 # rsproto — Storage operations (`0x10xx`)
 
-**Status: normative for what is built (2026-09-25).** `Mount`, `Unmount` and `InUse` are
-implemented in `userspace/storage-service/` and encoded by `userspace/librsproto/src/storage.rs`
-(administration Part C.5c). The view broker's `storage` grant binds the admin endpoint into a view
-(C.6), and `disk --mount` and `disk --unmount` speak these requests there (C.7). See
-[`storage.md`](../architecture/storage.md) for the service, and [`administration.md`](../planning/administration.md) § *Part C in detail*
-for the design and its reasons.
+**Status: normative for what is built (2026-09-25; `InUse` and the boot medium 2026-10-06).**
+`Mount`, `Unmount` and `InUse` are implemented in `userspace/storage-service/` and encoded by
+`userspace/librsproto/src/storage.rs` (administration Part C.5c). The view broker's `storage` grant
+binds the admin endpoint into a view (C.6), and `disk --mount` and `disk --unmount` speak these
+requests there (C.7). See [`storage.md`](../architecture/storage.md) for the service, and
+[`administration.md`](../planning/administration.md) § *Part C in detail* for the design and its
+reasons.
 
 ## The shape
 
@@ -101,7 +102,10 @@ and each link runs only once the one before it held:
 | 4 | 4 × `count` | registry ids, ascending |
 
 Every mounted filesystem's device, `init`'s included, **and the disk that holds it**, since a raw
-write to a disk reaches its partitions. A RAM disk holding a partition counts as its disk. The view
+write to a disk reaches its partitions. A RAM disk holding a partition counts as its disk. **And the
+disk the machine started from** (Phase 6 Part D), its record's `BOOT` flag
+([`device-node.md`](device-node.md)), mounted or not: a live stick holds the kernel and the
+modules, which nothing mounts. The view
 broker asks this before it binds the `disks` grant's devices (C.6), so a view cannot be handed the
 root's disk raw. **Refused `NoAccess` when `init`'s mounts are not all known**: an answer would
 leave out a root the service could not place, and the broker refuses `disks` when this is not

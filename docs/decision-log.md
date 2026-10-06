@@ -34211,3 +34211,78 @@ ordinary program's faults. The thirty-second auto-terminate is deferred, so the 
 suspended. A program touching a pulled stick's unread page reaches that, and it goes to the
 deferrals with the pulled stick as its trigger. The pass also cited `fault-survival.md` for it,
 which is about kernel faults.
+
+## 2026-10-06 — Phase 6 Part D: mass storage
+
+Built to the detail pass, in its order, D.2 and D.3 together:
+
+**D.1, partition tables and the boot medium.** `drivers::partitions` parses a disk's table from
+its blocks, through a read function. GPT comes first, keeping the disk GUID. Otherwise an MBR's
+four primary entries are read, with an extended entry passed over and counted, and a protective one
+skipped. A filesystem's own boot sector is no table. The boot's polled read and a USB disk's binding
+both go through it. Limine's module records now bind their media fields, and the disk whose GPT
+GUID is module 0's is flagged `BOOT` (`0x02`) beside `DEPARTED`. `/dev/devices` gains a `boot`
+column.
+
+**D.2–D.3, bulk-only transport, recovery and departure** (`xhci::storage`):
+- The hub binds a device's classes in one configuration.
+- Binding is the hub thread's: `GET MAX LUN`, `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY(10)`
+  and the table, each bounded at five seconds, before the disk is published under its
+  `UsbDevice`.
+- The I/O path is the controller's DPC's.
+- Recovery and the thirty-second deadline are the hub thread's, per bulk-only §6.7.
+- A departure completes what the device held `PeerClosed`, its command in flight once the slot is
+  disabled.
+- The eight slots sit under an epoch, as a value the host tests drive.
+- A write-back refused `PeerClosed` lets its file go (`FileObject::let_go`).
+
+**D.4, the storage service follows.** An arrival is planned alone, beside the labels in use. A
+departure is torn down: the label goes, `sys_ns_sync` runs, then `Meta::Unmount`. The boot medium
+is passed over and in `InUse`. `nxinstall` names it as holding the running system. `fs-server-ext4`
+exits when nothing can reach it.
+
+**D.5, the gates.** `test-qemu`'s stick is an MBR with one FAT16 partition. `check-storage` plugs
+in an MBR ext4 stick, mounts it writable, writes, ejects and pulls it; the host carves it out
+clean with the pattern. It then pulls a whole-disk one while mounted with a file dirty, and plugs
+that in again. `check-live`, `check-install` and `check-report` hold the boot stick.
+
+**Where the build departed from the pass:**
+- **The status wrapper is asked for when the data stage ends**, not put on the rings with it.
+  QEMU's `usb-storage` never answers a status read queued behind a data stage still moving, which
+  is how the first `READ(10)` hung while `INQUIRY` did not. QEMU's trace showed the request parked.
+- **A file let go is not marked dead**, which the pass's host test wanted. A dead file's fill reads
+  a hole, and a departed disk's must fail.
+- **A command's TRBs never straddle the Link TRB.** They go on as one TD, after No Ops to the Link
+  when they would not fit (`push_td`).
+- **An IRP is checked at `submit`** and queued as the command it will be. Starting a queued one, in
+  the DPC under the device's lock, then cannot fail where nothing may be completed.
+- **A device being recovered starts nothing**: a submit queues instead.
+
+**Found on the way:**
+- **`fs-server-ext4`'s spin is real**, as PR #362's review read it. A mount let go without an
+  unmount spun its server a million passes; with the fix it says so once and exits.
+- **`check-storage` now waits for `boot-probe` to finish** before anything is typed. It starts once
+  the test harness's chain has, and the sticks made the gate long enough to meet it: a `--kvm` run's
+  kept transcript had it starting while a stick was pulled. Its later tests install a policy and
+  open view-broker clients until one is refused, and a `with admin` of the gate's could meet either
+  halfway. Its verdict on that machine is FAIL by the machine's shape: it takes the SATA disk's
+  `nitrox-root` for the root it wrote, and finds no scratch disk. It writes no disk directly. Before
+  Part D the gate ended before it began, so nobody had seen it run there.
+
+**Controls**, each failing:
+- **Boots:**
+  - the GUID comparison removed (`check-live`);
+  - a departure that keeps its device (`check-storage`). It failed earlier than planned, at the
+    next stick's binding: that stick took the same xHCI slot, and its `INQUIRY`'s events went to
+    the stale device;
+  - a departed disk refusing `IoError` rather than `PeerClosed` (the kernel's let-go line never
+    comes);
+  - the teardown terminating its server rather than unmounting it (the server's line never comes);
+  - the service ignoring `Departed` (its departure line never comes);
+  - no table read at arrival. It failed at step 1 rather than step 2, since the boot stick is a USB
+    disk too and its flag comes from its table.
+- **Host:** every test in `partitions`, `device`, `xhci::storage`, `desc`, `context`, `ring`,
+  `file_object`, the storage service and `nxinstall` added by the part.
+
+No ABI hash impact: the registry is not a hash input, `LimineFile` is the bootloader's layout, and
+no syscall, record or exported type changed.

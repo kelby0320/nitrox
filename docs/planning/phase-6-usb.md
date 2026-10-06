@@ -4,8 +4,8 @@ Part of the [Nitrox Implementation Plan index](implementation-plan.md), which ho
 current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
-built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed 2026-10-06; Parts D–H not
-built.** This replaces the
+built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06;
+Parts E–H not built.** This replaces the
 sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
 were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
 as administration's parts did; what is here is the phase's shape, the design each part builds to,
@@ -1570,6 +1570,28 @@ The maintainer agreed to both, as recommended.
   never planned and always in use; `withheld` naming it.
 - **D.5 The gates.** Below.
 - **D.6 Docs.** Below.
+- **D.1–D.6 built 2026-10-06**, D.2 and D.3 together. Calls on the way:
+  - **the status wrapper is asked for when the data stage ends**, not put on the rings with it as
+    § *The shape* says: QEMU's `usb-storage` never answers a status read queued behind a data stage
+    still moving, which is how the first `READ(10)` hung while `INQUIRY` did not. Its trace showed
+    the request parked;
+  - **a command's TRBs never straddle the Link TRB**: they go on as one TD, after No Ops to the
+    Link when they would not fit before it (`push_td`);
+  - **an IRP is checked at `submit`** and queued as the command it will be, so starting a queued
+    one, in the DPC under the device's lock, cannot fail there, where nothing may be completed;
+  - **a device being recovered starts nothing**: a submit queues instead, since a command started
+    then would go on the rings under the hub thread's own;
+  - **a file let go is not marked dead**, as D.3's host test first wanted: a dead file's fill reads
+    a hole, and a departed disk's must fail;
+  - **`fs-server-ext4`'s spin was measured** before the fix: a million passes after the storage
+    service let a mount go without an unmount, and one line and an exit with it;
+  - **`check-storage` waits for `boot-probe` to finish before anything is typed.** The sticks made
+    the gate long enough to meet it, and its later tests install a policy and fill the view
+    broker's clients, which a `with admin` of the gate's could meet halfway;
+  - two controls failed earlier than planned, each still failing its gate: **no table read at
+    arrival** failed at step 1, since the boot stick is a USB disk and its flag comes from its
+    table; and **a departure that keeps its device** at the next stick's binding, which took the
+    same xHCI slot and had its events routed to the stale device.
 
 ### Gates
 

@@ -222,6 +222,23 @@ before `init`, so on either side of the manager's first read, and when it has co
 that read, a manager that never follows still agrees with the registry. `check-input --usb` orders
 its own plugs, so it is the gate that does.
 
+**A stick is QEMU's `usb-storage`, and what it holds is the host's to check** (Phase 6 Part D).
+`test-qemu`'s is an MBR naming one FAT16 partition (`mbr_fat_stick`), as a shop sells one, so the
+first round reads a table and the storage service reports a filesystem it does not mount.
+`check-storage` plugs its sticks in after the login: each is a node added with `blockdev-add` and a
+`usb-storage` device on it, and `device_del` pulls the device and leaves the node, so the same image
+goes in again as a new device. Each is a file the host reads once the machine has stopped — carved
+by its MBR where it has one — as it reads the SATA disk. A command in flight at the moment of an
+unplug is the driver's host tests' alone: no gate can place an unplug inside one command's few
+milliseconds without depending on timing.
+
+**A gate that boots a test image and types meets `boot-probe` unless it waits for it.** `boot-probe`
+starts once the test harness's chain has finished, and some of its tests change what a session
+leans on: they install a policy, and open view-broker clients until one is refused. `check-shutdown`
+logs in after its verdict, and `check-storage` after its exit — whatever its verdict, since on the
+live stick's machine it takes the SATA disk's `nitrox-root` for its root and fails. Before Part D
+`check-storage` ended before `boot-probe` began; the sticks made it long enough to meet it.
+
 **QEMU's trace is a gate's window onto a device the guest cannot report on** (Phase 6 Part B.5).
 `check-terminal` boots with `-trace ps2_set_ledstate -trace ps2_reset_keyboard -D <file>` and reads
 the PS/2 keyboard's lights from that file as it types: Num Lock's alone before anything is injected,

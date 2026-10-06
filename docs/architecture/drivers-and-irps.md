@@ -32,6 +32,7 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > § "Flush" added 2026-09-24, with administration Part C.2. § "Module tiers" corrected 2026-10-02
 > (PR #353 review): its rule still made hot-pluggable drivers Tier 2, which Phase 6's decisions
 > reversed. § "A kernel thread that waits" added the same day, with Phase 6 Part A.2's hub thread.
+> § "A block driver behind a bus" added 2026-10-06, with Phase 6 Part D's USB disks.
 
 ## Three concepts, kept distinct
 
@@ -245,6 +246,33 @@ under `sys_wait` — blocks it with a deadline on the same waitables. The USB hu
   and its transfer queued again there, since none of that waits on the device. The thread comes
   back only for what needs a command and its answer — a halted endpoint's reset — signalled through
   the same `InterruptObject`.
+
+### A block driver behind a bus (Phase 6 Part D)
+
+A USB disk is a block `DeviceNode` like a SATA one, and its partitions the same `Partition` windows
+over it, but **its driver owns no interrupt**: its commands are TRBs on the xHCI controller's rings,
+and their completions are Transfer Events the controller's DPC reads off its event ring
+([`usb.md`](usb.md) § *Mass storage*). So the work splits three ways:
+- **`submit` queues.** The backend's `submit` checks the IRP against the disk and the fragment
+  bound, and either starts it or queues it behind the one in flight, since bulk-only runs one
+  command at a time. A start only writes TRBs and rings a doorbell, which may be done under the
+  device's leaf lock from any context.
+- **The controller's DPC drives it.** A Transfer Event for a storage endpoint goes to the storage
+  driver before the HID one. It moves the command a stage on, completes the IRP at its status, and
+  starts the next queued — the same path AHCI's interrupt takes, one layer further from the
+  hardware.
+- **The hub thread takes what waits**: a stall's recovery, a command past its thirty-second
+  deadline, and the device's departure. The DPC marks the device and wakes it; the thread runs the
+  commands with waits in them, as [above](#a-kernel-thread-that-waits-phase-6-part-a2).
+
+**Its `poll` does nothing.** A USB disk exists only once the scheduler runs, so the boot's polled
+`read_blocking` never reaches one; its partition table is read by the hub thread before the disk is
+published, through the same parser as a SATA disk's (`drivers::partitions`).
+
+**Its device can leave with IRPs outstanding.** Every one is completed `PeerClosed` — the queue at
+once, the one in flight only after the controller has disabled the slot and can no longer touch its
+memory — and every later submit is refused the same way
+([`io-operation.md`](../spec/io-operation.md) § *Device classes*). A SATA disk does not leave.
 
 ## Device discovery and enumeration
 

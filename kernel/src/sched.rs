@@ -3202,6 +3202,9 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
 
         // Record the frame, mark Suspended, park off the run queue. The
         // `ExceptionFrame` stays on this (now-frozen) kernel stack until resume.
+        // TODO(unsupervised-fault): nothing supervises an ordinary program, so with
+        // the thirty-second auto-terminate deferred its thread stays here for the
+        // boot — first reached by a pulled stick's failed fill (Phase 6 Part D).
         // SAFETY: `me` is the running thread, pinned, lock held.
         unsafe {
             Thread::set_exception_frame(me_obj, frame_ptr);

@@ -7,9 +7,10 @@
 //!
 //! **The I/O path is the DPC's**, as AHCI's is its interrupt's. A block IRP's `submit` queues it
 //! behind the one in flight, since bulk-only runs one command at a time. **A command goes on the
-//! rings whole**: its command wrapper on bulk OUT, its data as one Normal TRB per IRP fragment, and
-//! its status wrapper on bulk IN, whose completion alone interrupts. The DPC completes the IRP at the
-//! status wrapper's event, and starts the next.
+//! rings in two steps**: its command wrapper on bulk OUT and its data as one Normal TRB per IRP
+//! fragment, the last interrupting; then, at that event, its status wrapper on bulk IN — QEMU's
+//! device never answers a status wrapper queued behind data still moving. The DPC completes the IRP
+//! at the status wrapper's event, and starts the next.
 //!
 //! **Everything else is the hub thread's** ([`recover`]): a stall, a status wrapper that is not a
 //! pass, a command past its thirty-second deadline. The DPC marks the device and wakes the thread,

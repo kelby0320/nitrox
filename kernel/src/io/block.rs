@@ -448,7 +448,8 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
 
 /// A block-device partition: a window `[start_lba, start_lba + block_count)` on a
 /// parent block device. Leaked to `'static` by its creator (a partition lives for
-/// the kernel's lifetime, like a disk).
+/// the kernel's lifetime, like a disk) — a USB disk's too, which departs and keeps its
+/// windows with its records (`TODO(usb-departed-records)`).
 pub struct Partition {
     /// The parent disk's backend — where rebased IRPs are forwarded.
     disk: BlockBackend,

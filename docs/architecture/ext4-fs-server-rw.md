@@ -10,7 +10,7 @@ file only after the kernel has answered `File::Forget` for it. C.3 (2026-09-24):
 and `s_state` kept — § *Read-only mounts, and how a filesystem was left*. C.5b–C.5c (2026-09-25):
 **the storage service spawns it for every filesystem it mounts**, keeps its control channel, and
 unmounts it with `Meta::Unmount`, which `boot-probe` drives on every `test-qemu` run
-([`storage.md`](storage.md)).
+([`storage.md`](storage.md)). Phase 6 Part D.4 (2026-10-06): a server nothing can reach exits.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -108,6 +108,13 @@ session may use the last slot only once it has closed. **`init` keeps its end** 
 unmount, since Part E.4a, so the root server's session capacity is `MAX_SESSIONS - 1`, 30, for the
 whole boot, as the storage service's mounts' has always been. A closed control channel is still
 ordinary.
+
+**A server nothing can reach exits** (Phase 6 Part D.4). Its forwarding endpoint's other end is
+held by its registration and every file it handed out. Once all of them have gone — a mount let go
+without an unmount, as the storage service lets go of a USB disk that left — a receive there
+answers `PeerClosed` for the rest of the boot. The server logs `fs-server: nothing can reach this
+server any more; exiting` and exits, rather than spinning a CPU on it, as `device-mgr` does in the
+same place. It writes nothing on the way out: its disk, if it left, takes nothing.
 
 ## Journaling (jbd2) — deferred
 
