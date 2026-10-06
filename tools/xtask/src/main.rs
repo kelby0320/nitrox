@@ -4118,6 +4118,20 @@ fn run_install_steps(
     session.expect("view: alice admin nxinstall — exited, code 1")?;
     println!("  ok: the pristine root, a RAM disk, was refused for being one, named correctly");
 
+    // 7c. **The stick the machine started from, refused** (Phase 6 Part D): mass storage makes it a
+    //     disk, the storage service names it in use, so `disks` withholds it, and the installer says
+    //     it holds the running system. Its index is the service's report of it.
+    let stick = session
+        .transcript()
+        .lines()
+        .find(|l| l.contains("storage-service: blk-") && l.contains("on the disk the machine started from"))
+        .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("blk-")).map(str::to_string))
+        .ok_or("the storage service did not report the stick the machine started from")?;
+    install_gate_with_admin(qmp, session, "nxinstall", &format!(" /dev/blk/{stick}"))?;
+    session.expect(&format!("nxinstall: refused /dev/blk/{stick}: it holds the running system"))?;
+    session.expect("view: alice admin nxinstall — exited, code 1")?;
+    println!("  ok: the stick the machine started from was refused: it holds the running system");
+
     // 8. **Freed, as the installer said** (administration Part G.3): `with admin disk --unmount`,
     //    naming the label, and the storage service's own line that it went.
     install_gate_with_admin(qmp, session, "disk", " --unmount nitrox-root")?;
@@ -4320,6 +4334,11 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // 2. The module is a disk, and its partition is named.
     s.expect("ramdisk: module 1 (/boot/root.img)")?;
     s.expect(&format!("label \"{LIVE_ROOT_PARTLABEL}\" -> block node"))?;
+    // 2b. **The stick is a disk too** (Phase 6 Part D), in the hub thread's first round — and the
+    //     disk the machine started from, by the GUID Limine loaded the modules from.
+    s.expect(": LUN 0: disk \"QEMU QEMU HARDDISK (")?;
+    s.expect("gpt: the disk the machine started from: its GUID is the one Limine loaded from")?;
+    s.expect("label \"NITROX_ESP\" -> block node")?;
 
     // 3. The root is that partition, and the desktop comes up off it without waiting on a tick.
     s.expect(&format!("init:   /: fs-server-ext4 on gpt-partlabel:{LIVE_ROOT_PARTLABEL} (rw)"))?;
@@ -4338,6 +4357,16 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // disk, so it is the only place the rule's input is real, and the fact is what makes a
     // machine's own disks auto-mount read-only (C.5b).
     s.expect("storage-service: a live boot")?;
+    // **And the stick is passed over** (Phase 6 Part D): read from the whole transcript, since the
+    // service reports every device before it says what kind of boot this is.
+    if !s.transcript().lines().any(|l| {
+        l.contains("storage-service: blk-")
+            && l.contains("(disk QEMU QEMU HARDDISK (")
+            && l.contains("; on the disk the machine started from, passed over")
+    }) {
+        return Err("the storage service did not pass over the stick the machine started from".into());
+    }
+    println!("  ok: the stick is a disk, flagged as the one the machine started from, and passed over");
     // **And no session on this boot holds a disk** — none does on any entry since administration
     // Part G.3 — and absence is the kind of property that rots silently: nothing fails when a
     // sandbox quietly widens. Asserted both ways at the end of the run, below.
@@ -4458,11 +4487,21 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     fs::copy(image_path(), &disk)?;
     mark_root_not_clean(&disk)?;
     cmd_image_live_for(BuildMode::Selftest)?;
+    // **Two sticks to plug in** (Phase 6 Part D): an MBR one holding an ext4 partition, which is
+    // ejected and read on the host, and a whole-disk ext4, which is pulled while mounted.
+    let stick_mbr = work.join("stick-mbr.img");
+    mbr_ext4_stick(&stick_mbr, 32, STICK_MBR_LABEL)?;
+    let stick_whole = work.join("stick-whole.img");
+    whole_ext4_stick(&stick_whole, 16, STICK_WHOLE_LABEL)?;
+    let qmp_sock = work.join("qmp.sock");
+    let _ = fs::remove_file(&qmp_sock);
 
     let ovmf = locate_ovmf()?;
     let mut cmd = Command::new("qemu-system-x86_64");
     qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
-    cmd.arg("-device")
+    cmd.arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_sock.display()))
+        .arg("-device")
         .arg(XHCI_DEVICE)
         .arg("-drive")
         .arg(format!("if=none,id=stick,format=raw,file={}", live_test_image_path().display()))
@@ -4488,7 +4527,10 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
         "xtask: storage gate — booting the test live image beside a copy of the release disk…\n"
     );
     let mut session = Session::spawn(cmd, "check-storage")?;
-    let result = run_storage_steps(&mut session, &disk, &work);
+    let result = run_storage_steps(&mut session, &disk, &work).and_then(|()| {
+        let mut qmp = Qmp::connect(&qmp_sock)?;
+        run_stick_steps(&mut session, &mut qmp)
+    });
     let transcript = session.finish();
     if let Err(e) = result {
         println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
@@ -4496,11 +4538,52 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     }
     println!("\nxtask: the machine is stopped; the disk, on the host:");
     check_storage_disk(&disk, &work)?;
+    println!("\nxtask: and the sticks:");
+    check_sticks(&stick_mbr, &stick_whole, &work)?;
     println!(
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
          unmount, and the filesystem was left clean ✓"
     );
     Ok(())
+}
+
+/// The labels of `check-storage`'s two sticks (Phase 6 Part D).
+const STICK_MBR_LABEL: &str = "nxstick";
+const STICK_WHOLE_LABEL: &str = "nxwhole";
+
+/// `mke2fs`'s features for a filesystem `fs-server-ext4` serves: the live image's root's.
+const SERVED_EXT4_FEATURES: &str = "^has_journal,^64bit,^metadata_csum,^resize_inode";
+
+/// **An ext4 of `blocks` 4 KiB blocks labelled `label`, made in the file `path`.**
+fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
+    require_tool("mke2fs")?;
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg(SERVED_EXT4_FEATURES)
+        .arg("-b").arg("4096")
+        .arg("-L").arg(label)
+        .arg(path)
+        .arg(blocks.to_string()))
+}
+
+/// **A stick with an MBR naming one Linux partition**, `mib` MiB, the partition from 1 MiB to the
+/// end holding an ext4 labelled `label` (Phase 6 Part D).
+fn mbr_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
+    let f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.set_len(mib * 1024 * 1024)?;
+    drop(f);
+    let count = (mib * 2048 - 2048) as u32;
+    write_mbr(path, 2048, count, 0x83)?;
+    let fs_img = path.with_extension("ext4");
+    let _ = fs::remove_file(&fs_img);
+    served_ext4(&fs_img, count as u64 * 512 / 4096, label)?;
+    splice_into(path, 1024 * 1024, &fs_img)
+}
+
+/// **A stick that is a filesystem**: `mib` MiB of ext4 labelled `label`, with no table at all.
+fn whole_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
+    let _ = fs::remove_file(path);
+    served_ext4(path, mib * 256, label)
 }
 
 /// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
@@ -4712,6 +4795,190 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     // And the table, which said no after the read-only unmount, now says yes.
     clean_now(s, true)?;
     println!("  ok: `with admin disk --unmount` ran the chain, and the table says clean");
+    Ok(())
+}
+
+/// **Sticks that come and go** (Phase 6 Part D), after the disk's steps, plugged and pulled over
+/// QMP. Each wait reads from the moment of its action, since the kernel, the device manager and the
+/// storage service each answer one and their lines land in any order.
+///
+/// 1. **The boot stick is passed over**: the kernel flags it, and the service says so.
+/// 2. **An MBR stick plugged in**: its disk and partition read in the kernel, the partition's ext4
+///    auto-mounted read-only, the boot being a live one; remounted writable through the `storage`
+///    grant, written through a mapping without a sync, and ejected — `with admin disk --unmount`,
+///    until Part F. Pulled then, its records depart and the service drops it.
+/// 3. **A whole-disk stick pulled while mounted** writable, with a file left dirty: the teardown's
+///    write-back and the server's marking each come back at once, the dirty file let go, the server
+///    gone, the label gone, and a command after it runs.
+/// 4. **The same stick plugged in again** is a new disk at a new index, mounted again.
+fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
+    let secs = std::time::Duration::from_secs;
+    let any = |_: &str| true;
+    // The whole line holding `pat` after `from`, waited for.
+    let line_of = |s: &mut Session, from: usize, pat: &str| -> R<String> {
+        s.line_since(from, pat, |_: &str| true, std::time::Duration::from_secs(60))?;
+        let t = s.transcript();
+        t[from.min(t.len())..]
+            .lines()
+            .find(|l| l.contains(pat))
+            .map(|l| l.trim().to_string())
+            .ok_or_else(|| format!("no line holding {pat:?}").into())
+    };
+    let blk_of = |line: &str| -> R<String> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix("blk-"))
+            .map(|n| n.trim_end_matches(|c: char| !c.is_ascii_digit()).to_string())
+            .ok_or_else(|| format!("no `blk-<n>` in {line:?}").into())
+    };
+    let plug = |qmp: &mut Qmp, id: &str, node: &str| -> R<()> {
+        qmp.execute(&format!(
+            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","id":"{id}","bus":"xhci.0","drive":"{node}"}}}}"#
+        ))?;
+        Ok(())
+    };
+    let pull = |qmp: &mut Qmp, id: &str| -> R<()> {
+        qmp.execute(&format!(r#"{{"execute":"device_del","arguments":{{"id":"{id}"}}}}"#))?;
+        Ok(())
+    };
+    let add_node = |qmp: &mut Qmp, node: &str, file: &Path| -> R<()> {
+        qmp.execute(&format!(
+            r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":"{node}","file":{{"driver":"file","filename":"{}"}}}}}}"#,
+            file.display()
+        ))?;
+        Ok(())
+    };
+
+    // 1. The boot stick: flagged by the kernel, passed over by the service.
+    let boot = s.transcript();
+    if !boot.contains("gpt: the disk the machine started from") {
+        return Err("the kernel did not flag the live stick as the disk the machine started from".into());
+    }
+    if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains("; on the disk the machine started from, passed over")) {
+        return Err("the storage service did not say it passed the boot stick over".into());
+    }
+    println!("  ok: the boot stick is flagged, and passed over");
+
+    // 2. The MBR stick.
+    let mbr_img = build_cache().join("check-storage").join("stick-mbr.img");
+    add_node(qmp, "stickmbr", &mbr_img)?;
+    let from = s.transcript().len();
+    plug(qmp, "stickmbr", "stickmbr")?;
+    let disk_line = line_of(s, from, ": LUN 0: disk \"QEMU QEMU HARDDISK (")?;
+    let port = disk_line
+        .strip_prefix("usb: port ")
+        .and_then(|r| r.split(':').next())
+        .ok_or_else(|| format!("no port in {disk_line:?}"))?
+        .to_string();
+    s.line_since(from, "mbr:  partition 1 lba 2048..", any, secs(60))?;
+    let mounted = line_of(s, from, &format!("(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}', left clean; mounted at /storage/{STICK_MBR_LABEL} (ro)"))?;
+    let index = blk_of(&mounted)?;
+    println!("  ok: an MBR stick plugged in: its partition read, its ext4 mounted read-only at /storage/{STICK_MBR_LABEL}");
+    with_admin_asked(s, &format!("disk --unmount {STICK_MBR_LABEL}"))?;
+    s.expect(&format!("storage-service: unmounted {STICK_MBR_LABEL}, left clean (read-only, so as it was found)"))?;
+    s.expect(&format!("disk: unmounted {STICK_MBR_LABEL}"))?;
+    s.expect("/home>")?;
+    with_admin_asked(s, &format!("disk --mount /dev/blk/{index}"))?;
+    s.expect(&format!("storage-service: mounted {STICK_MBR_LABEL} (rw), as asked"))?;
+    s.expect("/home>")?;
+    let at = format!("/storage/{STICK_MBR_LABEL}/{STORAGE_PATTERN_FILE}");
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+    s.expect("/home>")?;
+    with_admin_asked(s, &format!("disk --unmount {STICK_MBR_LABEL}"))?;
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect(&format!("storage-service: unmounted {STICK_MBR_LABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {STICK_MBR_LABEL}"))?;
+    s.expect("/home>")?;
+    println!("  ok: remounted writable, written without a sync, and ejected");
+    let from = s.transcript().len();
+    pull(qmp, "stickmbr")?;
+    s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
+    s.line_since(from, &format!("storage-service: blk-{index} departed"), any, secs(30))?;
+    println!("  ok: pulled, its records departed, and the service let it go");
+
+    // 3. The whole-disk stick, pulled while mounted.
+    let whole_img = build_cache().join("check-storage").join("stick-whole.img");
+    add_node(qmp, "stickwhole", &whole_img)?;
+    let from = s.transcript().len();
+    plug(qmp, "stickwhole", "stickwhole")?;
+    let disk_line = line_of(s, from, ": LUN 0: disk \"QEMU QEMU HARDDISK (")?;
+    let port = disk_line
+        .strip_prefix("usb: port ")
+        .and_then(|r| r.split(':').next())
+        .ok_or_else(|| format!("no port in {disk_line:?}"))?
+        .to_string();
+    s.line_since(from, "partitions: no table: neither a GPT nor an MBR", any, secs(60))?;
+    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}', left clean; mounted at /storage/{STICK_WHOLE_LABEL} (ro)"))?;
+    let whole = blk_of(&mounted)?;
+    println!("  ok: a whole-disk stick plugged in, read as no table, and its ext4 mounted as the disk");
+    with_admin_asked(s, &format!("disk --unmount {STICK_WHOLE_LABEL}"))?;
+    s.expect(&format!("disk: unmounted {STICK_WHOLE_LABEL}"))?;
+    s.expect("/home>")?;
+    with_admin_asked(s, &format!("disk --mount /dev/blk/{whole}"))?;
+    s.expect(&format!("storage-service: mounted {STICK_WHOLE_LABEL} (rw), as asked"))?;
+    s.expect("/home>")?;
+    let at = format!("/storage/{STICK_WHOLE_LABEL}/{STORAGE_PATTERN_FILE}");
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+    s.expect("/home>")?;
+    let from = s.transcript().len();
+    pull(qmp, "stickwhole")?;
+    s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
+    // **The teardown's I/O to a disk that has gone comes back at once**: the write-back of the
+    // file left dirty — whose refusal lets it go — and the server's attempt to record the
+    // filesystem clean.
+    s.line_since(from, "file: its device has gone; a dirty file and its ", any, secs(30))?;
+    s.line_since(from, "fs-server: unmounted, but the filesystem could not be recorded clean", any, secs(30))?;
+    s.line_since(from, &format!("storage-service: {STICK_WHOLE_LABEL} left while mounted; what had not been written back is gone"), any, secs(30))?;
+    s.line_since(from, &format!("storage-service: blk-{whole} departed"), any, secs(30))?;
+    let from = s.transcript().len();
+    s.send("list /storage")?;
+    s.expect("/home>")?;
+    if s.transcript()[from..].lines().skip(1).any(|l| l.contains(STICK_WHOLE_LABEL)) {
+        return Err(format!("/storage still lists {STICK_WHOLE_LABEL} after its stick was pulled").into());
+    }
+    println!("  ok: pulled while mounted: the dirty file let go, the server gone, the label gone, the session going on");
+
+    // 4. Plugged in again: a new disk, a new index, mounted again.
+    let from = s.transcript().len();
+    plug(qmp, "stickwhole2", "stickwhole")?;
+    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}', not left clean; mounted at /storage/{STICK_WHOLE_LABEL} (ro)"))?;
+    let again = blk_of(&mounted)?;
+    if again.parse::<u32>().ok() <= whole.parse::<u32>().ok() {
+        return Err(format!("plugged in again, the stick took blk-{again}, not an index past blk-{whole}").into());
+    }
+    println!("  ok: plugged in again: blk-{again}, a new index, mounted again — and not left clean, as pulled");
+    Ok(())
+}
+
+/// The sticks, once the machine has stopped (Phase 6 Part D): the ejected one's partition carved
+/// out by its MBR, `e2fsck -fn` clean, `s_state` clean and the pattern read with `debugfs`; the
+/// pulled one still marked in use, which is what an unplug without an eject leaves.
+fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let part = work.join("stick-mbr-part.ext4");
+    let mut f = fs::File::open(mbr)?;
+    let len = f.metadata()?.len() - 1024 * 1024;
+    f.seek(SeekFrom::Start(1024 * 1024))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf)?;
+    fs::write(&part, buf)?;
+    check_ext4_clean(&part, &format!("the ejected stick's {STICK_MBR_LABEL}"))?;
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+    match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
+        Some(b) if b == pattern => println!("  ok: the ejected stick holds the pattern, read with debugfs"),
+        Some(b) => return Err(format!("the ejected stick's file is {} bytes and not the pattern", b.len()).into()),
+        None => return Err("the ejected stick has no pattern file: the eject did not write it back".into()),
+    }
+    let state = ext4_s_state(whole)?;
+    if state & EXT4_VALID_FS != 0 {
+        return Err(format!(
+            "the stick pulled while mounted writable records itself clean (s_state {state:#06x}): \
+             nothing should have been able to mark it"
+        )
+        .into());
+    }
+    println!("  ok: the stick pulled while mounted is still marked in use (s_state {state:#06x})");
     Ok(())
 }
 
@@ -5067,6 +5334,11 @@ fn run_shutdown_reboot(s: &mut Session) -> R<()> {
 /// filesystem `fs_img`: `e2fsck -fn` clean, and the superblock's `s_state` recording a clean
 /// unmount with no error — `check-storage`'s and `check-recovery`'s.
 fn check_left_clean(fs_img: &Path) -> R<()> {
+    check_ext4_clean(fs_img, &format!("the disk's {ROOT_PARTLABEL}"))
+}
+
+/// `e2fsck -fn` clean and `s_state` recorded clean, for the ext4 image `fs_img`, which is `what`.
+fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
     // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
     // `check_installed_root` reads it.
     let out = Command::new("e2fsck")
@@ -5079,7 +5351,7 @@ fn check_left_clean(fs_img: &Path) -> R<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     if text.contains("? no") || !text.contains(" files (") {
-        return Err(format!("e2fsck is not happy with the disk's {ROOT_PARTLABEL}:\n{text}").into());
+        return Err(format!("e2fsck is not happy with {what}:\n{text}").into());
     }
     println!("  ok: e2fsck -fn finds it clean");
     let state = ext4_s_state(fs_img)?;
@@ -5363,6 +5635,9 @@ const REPORT_FACTS: &[&[&str]] = &[
     &["boot: HHDM ", ", cmdline \"hwreport\""],
     &["drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"],
     &["usb: port 1: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
+    // **Its disk, beside it** (Phase 6 Part D), and the disk the machine started from.
+    &["usb: port 1: LUN 0: disk \"QEMU QEMU HARDDISK (", " blocks of 512 bytes, record "],
+    &["gpt: the disk the machine started from: its GUID is the one Limine loaded from"],
     &["usb: first round: 1 device(s) in "],
     &["ramdisk: module 1 (/boot/root.img)"],
     &["label \"nitrox-live\" -> block node"],
@@ -13202,11 +13477,11 @@ const USB_INPUT_FACTS: &[&[&str]] = &[
 /// - **`p2=8,p3=8` gives eight connectors.** The defaults give four, which these four fill, and a
 ///   device plugged in later would land behind the hub, where the driver does not look (PR #353
 ///   review).
-/// - The stick is a blank image: nothing reads it until mass storage exists.
+/// - **The stick is a stick from a shop** (Phase 6 Part D): an MBR naming one FAT partition, which
+///   the first round reads and the storage service reports and leaves unmounted, until Part E.
 fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
     let stick = build_cache().join("test-qemu-usb-stick.img");
-    let f = fs::File::create(&stick).map_err(|e| format!("create {}: {e}", stick.display()))?;
-    f.set_len(16 * 1024 * 1024).map_err(|e| format!("size {}: {e}", stick.display()))?;
+    mbr_fat_stick(&stick, 16, "NXSTICK")?;
     cmd.arg("-device")
         .arg(format!("{XHCI_DEVICE},p2=8,p3=8"))
         .arg("-device")
@@ -13221,6 +13496,45 @@ fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
         .arg("usb-hub,bus=xhci.0")
         .arg("-device")
         .arg("usb-ccid,bus=xhci.0");
+    Ok(())
+}
+
+/// **A stick as a shop sells one** (Phase 6 Part D): `mib` MiB, an MBR naming one FAT16 partition
+/// from 1 MiB to the end, labelled `label`.
+fn mbr_fat_stick(path: &Path, mib: u64, label: &str) -> R<()> {
+    require_tool("mformat")?;
+    let f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.set_len(mib * 1024 * 1024).map_err(|e| format!("size {}: {e}", path.display()))?;
+    drop(f);
+    let count = (mib * 2048 - 2048) as u32;
+    write_mbr(path, 2048, count, 0x0E)?;
+    run(Command::new("mformat")
+        .arg("-i")
+        .arg(format!("{}@@1048576", path.display()))
+        .arg("-T")
+        .arg(count.to_string())
+        .arg("-c")
+        .arg("1")
+        .arg("-v")
+        .arg(label)
+        .arg("::"))?;
+    Ok(())
+}
+
+/// **Write an MBR into `img`'s first block** (Phase 6 Part D): one entry, of MBR type `kind`, for
+/// `count` blocks from `first`, and the signature. The other three entries are left empty.
+fn write_mbr(img: &Path, first: u32, count: u32, kind: u8) -> R<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut mbr = [0u8; 512];
+    let e = &mut mbr[0x1BE..0x1CE];
+    e[4] = kind;
+    e[8..12].copy_from_slice(&first.to_le_bytes());
+    e[12..16].copy_from_slice(&count.to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    let mut f = fs::OpenOptions::new().write(true).open(img).map_err(|e| format!("open {}: {e}", img.display()))?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&mbr)?;
     Ok(())
 }
 
@@ -13456,6 +13770,19 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["usb: port 13: its default endpoint takes 64-byte packets, not 8; evaluated"],
     &["usb: port 13: 08e6:4433 class 0b/00/00, full-speed, \"QEMU USB CCID (", "\": nothing this kernel drives"],
     &["usb: first round: 5 device(s) in "],
+    // **The stick bound as a disk, its MBR read** (Phase 6 Part D): INQUIRY's strings and the
+    // capacity QEMU gives a 16 MiB image, and the one FAT16 partition the gate wrote.
+    &["usb: port 3: LUN 0: disk \"QEMU QEMU HARDDISK (", "\", 32768 blocks of 512 bytes, record "],
+    &["mbr:  partition 1 lba 2048..32767 (30720 sectors) type 0x0e -> block node"],
+    &["mbr: 1 partition(s)"],
+    &["boot-probe: registry: usb disk blk-", ", 32768 blocks of 512, under usb-"],
+    &["boot-probe: registry: usb disk blk-", "'s partition blk-", ", by mbr"],
+    &["storage-service: blk-", " (partition partition 1 (unlabelled)): fat 'NXSTICK'"],
+    // **The disk the machine started from**: named by Limine's record, flagged in the registry,
+    // and the only one flagged — the SATA disk the test image boots from (Phase 6 Part D.1).
+    &["boot: the modules came from partition 1 of the GPT disk "],
+    &["gpt: the disk the machine started from: its GUID is the one Limine loaded from"],
+    &["boot-probe: registry: the boot disk is blk-0, and nothing else is flagged"],
     // **And the table got each** (Part A.3): `boot-probe`'s line per `UsbDevice` record, read
     // through `/dev/registry` — under the controller's function, with the IDs, class, port, speed
     // (as xHCI numbers them: 1 full, 3 high, 4 SuperSpeed) and name the hub thread logged. The
