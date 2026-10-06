@@ -33,35 +33,23 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   59 blocks of it, and the first version used one). Host-tested with `e2fsck -fn` **and**
   `dumpe2fs` as oracles, and read back by this crate's own parser: `e2fsck` would accept a
   filesystem the reader cannot walk, and the reader would accept its own mistakes.
-- **`src/serve.rs` — the request→reply core.** `serve_resolve(reader, request,
-  content, reply)` parses a forwarded `Namespace::Resolve`, reads the file via the
-  `BlockReader`, and builds the reply (success names a `MemoryObject` of the
-  content; error carries a `KError`). Generic over `BlockReader`, so it is
-  **host-tested** against the same `mke2fs` fixture as the parser (see
-  `test_support`). Touches no syscalls.
-- **`src/main.rs` — the server `[[bin]]`.** The bare-target `_start` + the syscall
-  plumbing only: a `BlockReader` **and `BlockWriter`** over `sys_io_submit` (a 4 KiB block
-  per submit into a one-page scratch `MemoryObject`; a write smaller than a block reads the
-  block first — this said "sector-at-a-time" until 2026-10-06), the
-  bootstrap (recv the **read-write** device handle via the setup message; `check_device` —
-  the superblock and the root directory — and a refusal in place of Ready if it fails;
-  forwarding channel; `Meta::Ready`), and the serve loop — a Model A lazy resolve replies the file's
-  `BlockRun` map + transfers a device handle, a `RESOLVE_GROW` request grows the file
-  (`maybe_grow` → `grow_file`), and a `RESOLVE_CREATE` request first creates it
-  (`maybe_grow` → `create_file`, splitting the suffix into parent-dir + leaf name) before
-  mapping. A `RESOLVE_RENAME` request is handled by `try_resolve_rename` **before** anything
-  else: it is the one resolve that mutates the tree and replies with no object at all
-  (`OBJECT_KIND_NONE`), and it must run ahead of the directory-session path, which infers
-  "directory open" from the suffix naming a directory — renaming a directory names one too.
-  **A file is freed only after the kernel has forgotten it** (administration Part C.1b): an
-  unlink's last name, or a rename's replaced file, sends `File::Forget` on the forwarding
-  endpoint `SENDMODE_BLOCK`, waits for the answer on buffers of its own — never
-  `WAIT_HANDLES`/`WAIT_RESULTS`, which `serve_loop` is still walking — and only then calls
-  `release_inode`. **A read-only mount serves through `ReadOnly`** (administration Part C.3):
-  every write refused, so no mutation needs its own check, and the block-file reply's read-only
-  mark comes from the same type. A writable mount `mark_mounted`s before `Ready`; the control
-  channel is kept, while open, for `Meta::Unmount`, which `mark_clean`s, replies and exits.
-  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+- **`src/volume.rs` — ext4 as a `libfsserver::Volume`** (Phase 6 Part E.1): the wrapper the
+  server loop calls, delegating each method to `ext4.rs`, and the host tests of the resolve core
+  (`libfsserver::serve`) driven through it against the `mke2fs` fixture.
+- **`src/main.rs` — the server `[[bin]]`**: a `_start` that takes the device from
+  `libfsserver::server::bootstrap` and hands `server::run` an `Ext4` over it — or over the
+  `ReadOnly` a read-only mount is served through. **The protocol is `libfsserver`'s** since Part
+  E.1, which serves `fs-server-fat` the same way: the setup message, `check_device` and a refusal
+  in place of Ready, the forwarding channel and `Meta::Ready`, the serve loop (a Model A resolve
+  replying the file's `BlockRun` map and a device handle; `RESOLVE_GROW` and `RESOLVE_CREATE`
+  growing or creating first; a `RESOLVE_RENAME` handled **before** the directory-session path,
+  which infers "directory open" from the suffix naming a directory), `File::Forget` before an
+  unlinked or replaced file's `release_inode`, and the control channel's `Meta::Unmount`, which
+  `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
+  `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
+  `MemoryObject`, a write smaller than a block reading the block first (this said
+  "sector-at-a-time" until 2026-10-06). **Alloc-free** — fixed `.bss` buffers, no
+  `#[global_allocator]`.
 
 ## Scope
 
@@ -110,9 +98,9 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
 
 ## Forbidden
 
-- `alloc` in the library half (`ext4.rs`, `mkfs.rs`, `lib.rs`) — buffer-based only. The list
-  names every module because a rules file that enumerates three of four is one that permits the
-  fourth by omission (PR #310 review).
+- `alloc` in the library half (`ext4.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`) — buffer-based only.
+  The list names every module because a rules file that enumerates three of four is one that
+  permits the fourth by omission (PR #310 review).
 - Touching **file data** — the kernel owns the data path (Model A); the server writes
   only metadata (bitmaps, extent tree, inode, superblock). **One exception, deliberate**
   (administration Part C.1): `grow_file` writes zeroes over what it adds — the old last block's

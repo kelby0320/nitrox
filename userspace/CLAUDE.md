@@ -160,6 +160,7 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 - `userspace/libcrypto/CLAUDE.md` — hand-rolled SHA-256 / HMAC / PBKDF2, no_alloc
 - `userspace/init/CLAUDE.md` — PID 1, critical-path constraints
 - `userspace/eshell/CLAUDE.md` — emergency shell constraints (similar to init)
+- `userspace/libfsserver/CLAUDE.md` — the filesystem-server protocol, shared by both servers
 - `userspace/fs-server-ext4/CLAUDE.md` — filesystem driver
 - `userspace/service-mgr/CLAUDE.md` — service supervisor
 - `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)

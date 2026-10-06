@@ -19,98 +19,15 @@
 
 pub mod ext4;
 pub mod mkfs;
-pub mod serve;
+pub mod volume;
 
 pub use ext4::read_file;
-pub use serve::{Served, serve_resolve};
+pub use volume::Ext4;
 
-/// Random-access read of the underlying block device, by byte offset. The reader
-/// translates filesystem structures (the superblock at byte 1024, blocks at
-/// `block_no * block_size`, …) into `read_at` calls; the implementor maps them to
-/// device reads (the fs-server: `sys_io_submit` over the 512-byte sectors that
-/// cover the range; host tests: a slice of an in-memory image).
-pub trait BlockReader {
-    /// Fill `buf` with the bytes at device byte `offset`. `Err` on any short or
-    /// failed read.
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError>;
-
-    /// Whether this is a **read-only mount** — `true` only for [`ReadOnly`]. What the block-file
-    /// reply marks a file with comes from here, so the mark and the refusal of every write are
-    /// one fact, the type the server serves through.
-    fn read_only(&self) -> bool {
-        false
-    }
-}
-
-/// A read failure.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FsError {
-    /// A device read failed or returned short.
-    Io,
-    /// Not an ext4 filesystem (bad superblock magic), or a structure was
-    /// malformed (bad extent magic, truncated directory, …).
-    Corrupt,
-    /// A feature this minimal reader does not support (an unknown `incompat`
-    /// flag, a non-extent inode, a 64-bit filesystem, …).
-    Unsupported,
-    /// A path component was not found, or the path named a non-regular file.
-    NotFound,
-    /// The file is larger than the caller's buffer (the 64 KiB Phase-2 cap).
-    TooLarge,
-    /// A create/rename target already exists (POSIX `EEXIST`).
-    Exists,
-    /// An `rmdir` target directory is not empty (POSIX `ENOTEMPTY`).
-    NotEmpty,
-    /// A write to a **read-only mount** ([`ReadOnly`], administration Part C.3). What the
-    /// server answers is `NoAccess`.
-    ReadOnly,
-}
-
-/// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
-/// metadata mutation the write path needs (block/inode bitmaps, extent tree, inode,
-/// superblock). `write_at` writes `buf` at absolute byte `offset` (device-block aligned in
-/// practice). Read-only builds never require this; the RW server implements it over
-/// `sys_io_submit` writes.
-pub trait BlockWriter {
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
-}
-
-/// **A read-only mount** (administration Part C.3): reads pass through to the device, and every
-/// write is refused with [`FsError::ReadOnly`] before it reaches it.
-///
-/// The server serves a read-only mount through this type, so read-only is not a check each
-/// mutating operation has to remember. Any mutation, reached any way, fails at its first write
-/// having changed nothing: a mutation only reads before it writes, and none of its writes
-/// happen. The host tests hold every mutating operation to that against this same type.
-pub struct ReadOnly<'a, R: BlockReader>(pub &'a R);
-
-impl<R: BlockReader> BlockReader for ReadOnly<'_, R> {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        self.0.read_at(offset, buf)
-    }
-
-    fn read_only(&self) -> bool {
-        true
-    }
-}
-
-impl<R: BlockReader> BlockWriter for ReadOnly<'_, R> {
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<(), FsError> {
-        Err(FsError::ReadOnly)
-    }
-}
-
-/// One contiguous mapping from a file's blocks to the device, for the **Model A** data
-/// path (`docs/architecture/filesystem-data-path.md`). `device_lba` is a **filesystem
-/// block** number (`0` = a hole → reads as zero); the kernel scales it to a byte offset by
-/// the filesystem block size. Mirrors the wire `BlockRun` (`docs/spec/rsproto-block-ops.md`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub struct BlockRun {
-    pub file_block: u64,
-    pub device_lba: u64,
-    pub length: u32,
-    pub flags: u32,
-}
+/// **The block-device traits and their types live in `libfsserver`** (Phase 6 Part E.1), which
+/// serves ext4 and FAT alike; they are re-exported here so this library's users — the
+/// installer, the storage service and `boot-probe` — name them as they always have.
+pub use libfsserver::{BlockReader, BlockRun, BlockWriter, FsError, ReadOnly};
 
 // --- little-endian byte helpers (shared by the ext4 parser) -----------------
 
@@ -158,8 +75,14 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A `BlockReader` over an in-memory image.
+    /// A `BlockReader` over an in-memory image. Its writes are refused, so a test reading through
+    /// a server's [`crate::Ext4`] volume, which takes a writer, cannot change it.
     pub(crate) struct ImageReader(pub Vec<u8>);
+    impl BlockWriter for ImageReader {
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<(), FsError> {
+            Err(FsError::Io)
+        }
+    }
     impl BlockReader for ImageReader {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
             let start = offset as usize;

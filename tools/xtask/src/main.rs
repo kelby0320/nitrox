@@ -14606,6 +14606,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libfsserver`'s own tests (Phase 6 Part E.1). Its resolve core is generic over a volume,
+    // so the bulk of what tests it runs above, through `fs-server-ext4`'s.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libfsserver")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libfs` — whole-file and path helpers, host-tested where they do not touch a
     // namespace. Was `coreutils::fs` until M10 Part A; it moved down a layer when a
     // graphical file browser needed it and needed none of the shell-program machinery
