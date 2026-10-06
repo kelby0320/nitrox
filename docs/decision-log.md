@@ -34348,3 +34348,45 @@ the test client gives up after twenty seconds without an event. The wait measure
 under KVM, and nothing under TCG; four runs passed, the read before the first unplug in each.
 
 No ABI hash impact: kernel internals only.
+
+## 2026-10-06 — Phase 6 Part E, detailed: fs-server-fat
+
+Part E's detail pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part E in detail*. A FAT12,
+FAT16 or FAT32 filesystem on a stick is served read-write, with long names, by a server built on
+the protocol `fs-server-ext4` speaks, moved into a library both use.
+
+**One fact measured for it, rather than assumed: the kernel serves a filesystem mapped in
+sectors.** FAT's data region need not start on a 4 KiB boundary, so a FAT server describes a file
+in 512-byte units. `fs-server-ext4` was made to reply that way, its runs multiplied by eight, and
+`test-qemu --kvm` passed: everything the boot reads from its root, and `boot-probe`'s page-cache
+tests. Every device address one sector on failed the boot. So no kernel change is needed, provided
+no page spans two runs, which a cluster of at least 4 KiB guarantees.
+
+**Three calls put to the maintainer, who agreed to all three as recommended:**
+- **The protocol becomes a library, `libfsserver`**, rather than `fs-server-fat` starting as a
+  copy of `fs-server-ext4`'s 1,500-line binary. A fix to the subtle parts — `File::Forget` before a
+  free, a rename ahead of a session, the wait slots — then reaches both servers. The cost is
+  refactoring the root filesystem's server first, which every existing gate holds.
+- **Clusters under 4 KiB are refused**, with the reason; Part G's formatting makes such a stick
+  servable. Serving them read-only through `File::ReadRange`, or teaching the page cache to fill a
+  page from several runs, were the alternatives.
+- **FAT auto-mounts on removable disks only.** Every Nitrox disk has a FAT ESP. Under ext4's rules a
+  live boot would mount the internal disk's, which holds that disk in use, so `nxinstall` would
+  refuse it until it was unmounted.
+
+**The calls made:**
+- **A file's id is its first cluster**: stable through a rename or move, as the kernel's one object
+  per file needs. An empty file has none and is uncached, and a truncate to zero is forgotten
+  before its clusters are freed, as a delete is.
+- **The write path batches from its first version**, as the throughput deferral asks: a grow
+  allocates in one pass, contiguous where it can, and zeroes in large transfers; the FAT's sectors
+  are cached, and each request's dirty ones written once, to every copy.
+- **The device layer gains a sector-granular, multi-sector path for FAT**, and `fs-server-ext4`
+  keeps its block-per-submit path, so Part H measures ext4 as it is.
+- **Names are case-insensitive and case-preserving, and times UTC**, as FAT is read everywhere else.
+- **`test-qemu`'s stick keeps its 512-byte clusters**, so the adjudicated boot holds the refusal
+  and its mounts do not change. `check-storage` gains a FAT32 stick, written by the guest and read
+  back on the host with `fsck.fat` and mtools.
+
+**Found on the way:** `fs-server-ext4`'s rules say its device layer moves a sector at a time. It
+moves a 4 KiB block a time. E.7 corrects it.

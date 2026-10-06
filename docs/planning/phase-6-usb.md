@@ -4,8 +4,8 @@ Part of the [Nitrox Implementation Plan index](implementation-plan.md), which ho
 current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
-built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06;
-Parts E–H not built.** This replaces the
+built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
+E detailed 2026-10-06; Parts E–H not built.** This replaces the
 sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
 were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
 as administration's parts did; what is here is the phase's shape, the design each part builds to,
@@ -303,7 +303,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 | **B** | **HID keyboard and mouse, at boot.** Boot protocol, the usage table, the nodes, `input-server` taking them from the manager's replay. | A gate on a machine with **`i8042=off`**: a key and a click from USB reach a window, and a login at the greeter goes through. `test-interactive` and the other release gates unchanged with the i8042 on. |
 | **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the change node (a notification until Part C's detail pass), the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
 | **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. *(Detailed 2026-10-06: `check-storage` gains these steps, a live boot's read-only auto-mount remounted writable until Part F, the maintainer's call — § Part D in detail.)* |
-| **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. |
+| **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. *(Detailed 2026-10-06: the protocol moves into `libfsserver` first, clusters under 4 KiB are refused, and FAT auto-mounts on removable disks only — the maintainer's calls, § Part E in detail.)* |
 | **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. |
 | **G** | **Formatting and partitioning**: `disk --partition`, `disk --format`. | A blank stick partitioned and formatted FAT through `with admin`, then mounted and written; refused while mounted. |
 | **H** | **Copy throughput**: `time`, the measurements on the laptop, the fix for what dominates, and the number. | The number, measured on the laptop and recorded. No QEMU gate holds a time, since TCG's is not the machine's. |
@@ -1685,6 +1685,275 @@ The gate set stays at 42.
 - **`ext4-fs-server-rw.md`**: the server exiting when its forwarding endpoint has lost its peer.
 - **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-storage`'s new steps, and
   `test-qemu`'s stick.
+
+## Part E in detail *(2026-10-06)*
+
+**`fs-server-fat`.** A FAT12, FAT16 or FAT32 filesystem on a stick is served read-write, with long
+names:
+- the protocol `fs-server-ext4` speaks moves into a library both servers use;
+- a FAT library and server are built on it;
+- the storage service spawns a server by what a device holds, and auto-mounts FAT on removable
+  disks only.
+
+### What exists, and what is missing (checked 2026-10-06)
+
+**The kernel's data path (Model A):**
+- **A page fills and writes back as one contiguous device range**: the page's first filesystem
+  block, located in the file's runs, then `PAGE_SIZE` bytes from there
+  (`model_a_start_fill` and `begin_write` in `kernel/src/object/file_object.rs`). The comment
+  says it handles a block size dividing a page "where a page's blocks are contiguous within one
+  run". Nothing checks that they are.
+- **`block_size` is the server's**, taken from the `FILE_BLOCKS` reply and never validated; a run's
+  `device_lba` is in units of it. A `device_lba` of `0` is a hole.
+- **A file's size is a `u32`** in the reply (`content_len`), so 4 GiB less a byte, which is
+  FAT32's own largest file.
+- **A reply carries at most 64 runs** (`MAX_RUNS` in `userspace/fs-server-ext4/src/serve.rs`), and
+  ext4 refuses a file in more extents, `TooLarge`: "too fragmented to inline in the resolve reply".
+  `MapRange`, which would map more on demand, is specified and deferred
+  ([`rsproto-block-ops.md`](../spec/rsproto-block-ops.md)).
+- **One page-cache object per file id per registration**, and every resolve of an id returns that
+  object, resized to the reply (`FileObject::cache_in`). **An id of `0` is uncached**, and
+  `sys_ns_sync` writes back only cached objects. Grow, create and truncate are path resolves
+  (`sys_file_grow` and its siblings are `sys_ns_lookup` with a size op), so a client always holds
+  the object for the id its last resolve returned.
+
+**The ext4 server:**
+- **`fs-server-ext4`'s binary is about 1,500 lines, nearly all of it protocol**
+  (`userspace/fs-server-ext4/src/main.rs`): the setup message and its read-only flag, `Ready` or a
+  refusal, the forwarding endpoint, directory sessions and their wait slots, a rename resolved
+  before anything else, `File::Forget` before a file's blocks are freed, `File::Touch` by id, the
+  control channel's `Meta::Unmount`, and the exit when nothing can reach it. Its ext4 calls are
+  about twenty: check, clean-state marks, path and directory resolution, map, grow, create,
+  truncate, the listing, mkdir, unlink, rmdir, two renames, two touches and release.
+- **Its device layer reads and writes one 4 KiB block per `sys_io_submit`**, a sub-block write by
+  reading the block first (`DiskReader`). Its crate rules say "sector-at-a-time", which is stale.
+- **The library half is a format library too**: `nxinstall` links it.
+
+**The storage service:**
+- **It recognises FAT from its boot sector** (`probe::fat_label`), reports the label, and never
+  mounts it. Auto-mount takes `Found::Ext4` alone (`mounts::plan`), and the server is
+  `/bin/fs-server-ext4`, a constant (`FS_SERVER` in `userspace/storage-service/src/main.rs`).
+- **Every Nitrox disk has a FAT ESP.** Under ext4's rules, a live boot would auto-mount the internal
+  disk's: on the laptop and in `check-install`, `check-recovery` and `check-storage`. A mounted
+  partition holds its disk in use, so `nxinstall` would refuse the disk until it was unmounted.
+
+**Testing:**
+- **The host has `mformat`, `mcopy`, `mdir`, `mkfs.fat` and `fsck.fat`** (mtools 4.0.43, dosfstools
+  4.2), as CI's Ubuntu 24.04 has. **CI's main workflow installs `mtools` for its QEMU job, where
+  `check-storage` runs, and `dosfstools` for no job**; its host tests install nothing and rely on
+  what the runner ships. The display and input workflows install both.
+- **`test-qemu`'s stick is FAT16 with 512-byte clusters** (`mformat -c 1`, `mbr_fat_stick`).
+
+### The spike: a filesystem mapped in sectors
+
+FAT's clusters start wherever the data region does, which need not be on a 4 KiB boundary. So a FAT
+server describes a file in **512-byte sectors** — `block_size` 512, runs in sectors from the
+partition's start — and every page must lie within one cluster.
+
+**Run, not read.** `fs-server-ext4` was made to reply in sectors — `block_size` 512, every run's
+start, device address and length multiplied by eight — and `test-qemu --kvm` passed. Through it
+went everything the boot reads from its root, and `boot-probe`'s page-cache tests: a 32 KiB file
+faulted a page at a time, a write through a mapping and its sync, a grow, a create and a truncate.
+**The control**, every device address one sector on, failed the boot. So **the kernel serves a
+sector-mapped filesystem unchanged**, provided no page spans two runs: a cluster of at least
+4 KiB.
+
+### The shape
+
+**One protocol library, two servers.** `libfsserver` takes everything in `fs-server-ext4`'s
+binary that is not ext4, generic over a `Volume` trait whose methods are the twenty calls above.
+`fs-server-ext4`'s binary becomes the trait over its library and a `_start`. `fs-server-fat` is
+the second user. `no_std`, no `alloc`: the buffers become a value each binary holds in a static,
+as today's are statics.
+
+**The device layer** moves into the library as it is, a 4 KiB block per submit. **It gains a
+second path**, sector-granular and moving up to 64 KiB per submit, which the FAT server uses: FAT
+structures are sector-aligned, and a partition's last sectors need not fill a 4 KiB block.
+**`fs-server-ext4` keeps its block path**, so Part H measures it as it is.
+
+**The FAT library** (`userspace/fs-server-fat`, a library and a binary, as ext4's):
+- **What it takes**: a boot sector with 512-byte sectors, the FAT type by cluster count as the
+  specification defines it, clusters of 4 KiB or more, and sizes that fit the device. Anything
+  else is a reason, not a mount: `512-byte clusters, smaller than a page`, say.
+- **Names**: long names, case-preserving and **case-insensitive**, as FAT is on every system that
+  reads it. A name that is a valid upper-case 8.3 name gets a short entry alone. Any other gets
+  long-name entries and a generated short name with a numeric tail — `LONGNA~1.TXT`, the next
+  free. A long name's checksum is checked against its short entry, and a stale one ignored.
+  Names are UTF-8 in the system and UTF-16 on the disk. A character FAT forbids (`"*/:<>?\|` and
+  control characters) is refused, `InvalidArgument`.
+- **A file's map is its cluster chain in sector runs**, a run per contiguous stretch, at most 64.
+  A file in more fragments is refused `TooLarge`, as ext4's is.
+- **A file's id is its first cluster.** It stays the same through a rename or a move, which is what
+  the kernel's one object per file needs. An empty file has no cluster, so its id is `0`,
+  uncached: it holds nothing to write back. **A truncate to zero ends the id**, so the server sends
+  `File::Forget` for it before freeing the clusters, as for a delete.
+- **`File::Touch` arrives by id**, and FAT has no table from a first cluster to its directory entry.
+  The server keeps one, bounded, filled at each block-file resolve and kept through renames: an id
+  it no longer holds misses its `mtime`, which `File::Touch` is allowed to.
+- **The write path batches from its first version**, as the throughput deferral requires:
+  - a grow allocates every cluster it needs in one pass, contiguous where it can be, searching
+    from FAT32's next-free hint or the last allocation;
+  - it **zeroes what it adds** on the device, as ext4's does, in transfers of up to 64 KiB;
+  - **the FAT's sectors are cached**, and a request's dirty ones written once each before its
+    reply, adjacent sectors in one transfer, to every copy of the FAT;
+  - data before metadata: the clusters zeroed, then the chain, then the directory entry. A crash
+    between them leaves lost clusters, never two files sharing one.
+- **A directory grows by a cluster** when full; FAT12 and FAT16's fixed root does not, and is
+  `NoSpace` full. `rmdir` takes an empty directory; a rename across directories repoints a moved
+  directory's `..`.
+- **How it was left**: the dirty bit is the boot sector's state byte, which `fsck.fat` and Linux
+  read. A writable mount sets it before `Ready`, and an unmount clears it as its last write, beside
+  FAT32's free count, which `fsck.fat` checks. A filesystem found dirty is reported and served, as
+  ext4's is.
+- **Listings**: `.` and `..` are not listed, as on ext4. A directory is `0o755`, a file `0o644`, a
+  read-only one `0o444`. A volume label entry is not a file. **Times are UTC** both ways: FAT stores
+  no zone, and the system has none either.
+
+**The storage service:**
+- **What a device holds** is read by the server that would serve it: ext4 as now, and FAT by
+  `fs-server-fat`'s own check, with its label, whether it was left clean, and — if not servable —
+  why.
+- **The server is chosen by kind**: `/bin/fs-server-ext4` or `/bin/fs-server-fat`.
+- **FAT auto-mounts on a removable disk alone**: one behind USB mass storage, as Part F defines it.
+  An internal disk's FAT — its ESP — is mounted only by an administrator's `disk --mount`. On a
+  live boot a removable FAT mounts read-only, as ext4 does, until Part F.
+- **The report** names a FAT the way it names ext4 — `fat 'NXSTICK', left clean; mounted at
+  /storage/NXSTICK (ro)` — and says why one is not served. The table's `clean` is FAT's too.
+
+### The maintainer's calls, 2026-10-06
+
+The maintainer agreed to all three, as recommended.
+
+- **The protocol becomes a library**, rather than `fs-server-fat` starting as a copy of
+  `fs-server-ext4`'s binary. One copy of the subtle parts — `File::Forget` before a free, a rename
+  ahead of a session, the wait slots — so a fix made to one server is made to both, and Part H's
+  changes to the device layer land once. The cost is refactoring the root filesystem's server
+  first, which every existing gate holds.
+- **Clusters under 4 KiB are refused**, with the reason, and Part G's `disk --format` makes such a
+  stick servable. A stick of 4 GiB or more has clusters of 4 to 32 KiB. The alternatives were
+  serving such volumes read-only through `File::ReadRange`, a second data path in the server; or
+  teaching the page cache to fill a page from several runs, real kernel work with partial-failure
+  semantics. Full support goes to the deferrals, with a stick someone needs as its trigger.
+- **FAT auto-mounts on removable disks only**, so no ESP is mounted that nobody asked for, and
+  installing from a live stick stays as it is. The alternatives were ext4's rules, which would mount
+  every other disk's ESP; or no FAT auto-mount until Part F.
+
+### Calls made in this pass, without the maintainer
+
+- **Maps in sectors**, proven by the spike; no kernel change.
+- **A file's id is its first cluster**, with zero-length files uncached and a truncate to zero
+  forgotten. The alternative, ids the server hands out from a table, would survive the empty
+  case but not a table overflow; the first cluster needs no table to be stable.
+- **Case-insensitive and case-preserving names, UTC times**, as FAT is read everywhere else.
+- **`test-qemu`'s stick keeps its 512-byte clusters**, so the boot every CI run adjudicates holds
+  the refusal, and its set of mounts — what `boot-probe` checks — does not change.
+  `check-storage` holds the server.
+
+### Pieces
+
+- **E.1 `libfsserver`.** The protocol out of `fs-server-ext4`'s binary and `serve.rs`, generic over
+  `Volume`; `fs-server-ext4` its first user, with no change in behaviour. Held by every gate that
+  boots, since it serves the root. Host tests: what `serve.rs` tested moves with it.
+- **E.2 The FAT library: reading.** The boot sector and type, the FAT, directories with long names,
+  lookup, the sector map, the listing, the check with its reasons, the label and the clean state.
+
+  Host tests, on images `mformat` and `mkfs.fat` build at FAT12, FAT16 and FAT32:
+  - names, kinds and sizes as `mdir` lists them, and contents as `mtype` reads them;
+  - a long name, a Unicode one, and a long name whose checksum does not match its short entry;
+  - a lookup in another case;
+  - a file in many fragments, mapped run by run, and one in more than 64 refused;
+  - each refusal: 1 KiB sectors, 2 KiB clusters, a boot sector that is not FAT.
+- **E.3 The FAT library: writing.** Create, grow, truncate, unlink, mkdir, rmdir, both renames,
+  touch, the dirty bit and FSInfo; the FAT cache; the sector-granular device path in `libfsserver`.
+
+  Host tests, every mutation followed by `fsck.fat -n`, which must find the image clean, and by
+  mtools reading back what was written:
+  - long and Unicode names written by this library and listed by `mdir`;
+  - short names unique — a second `LONGNA~1` is `LONGNA~2`;
+  - a grow's new range read as zeroes;
+  - a full volume `NoSpace`, and a full fixed root;
+  - a directory moved with its `..` repointed;
+  - **batching counted**: a 1 MiB grow costs a handful of device writes, by a writer that counts
+    them, where an unbatched path would cost hundreds.
+- **E.4 `fs-server-fat`.** `libfsserver` over the FAT library: first-cluster ids, the id table for
+  `File::Touch`, `File::Forget` before a delete's, a truncate to zero's or a replaced rename
+  target's clusters are freed, and read-only mounts through `ReadOnly`.
+- **E.5 The storage service by kind.** The FAT probe through `fs-server-fat`'s check; the server by
+  kind; FAT auto-mounted on removable disks alone; the report's lines and why one is not served;
+  `disk --mount` taking FAT.
+
+  Host tests: the plan for a FAT on a stick and on an internal disk, the probe for a servable and
+  an unservable image, and the report's line for each.
+- **E.6 The gates.** Below.
+- **E.7 Docs.** Below.
+
+### Gates
+
+- **Every gate that boots holds E.1**: the root filesystem's server is rebuilt on `libfsserver`.
+- **`test-qemu`**: the stick's FAT is reported, with its clusters, as not served; the boot's mounts
+  are unchanged; and `/bin/fs-server-fat` is in the image, which `check-images` holds in both.
+- **`check-storage` gains a FAT stick**, built on the host by `mkfs.fat -F 32 -s 8` behind an MBR,
+  with `mcopy` putting a long-named file, a Unicode-named one, a nested directory and a pattern file
+  on it:
+  1. **Plugged in**: auto-mounted read-only, removable on a live boot. `list` shows the host's
+     names and sizes, and `test-pattern --check` reads the host's pattern.
+  2. **The release disk's ESP is not mounted**: it is FAT, and not removable.
+  3. **Written**: `with admin disk` remounts it writable. In the shell, `mkdir`, a `copy` to a long
+     Unicode name, a `rename` and a `remove`; then `test-pattern --write` through a mapping without
+     a sync.
+  4. **Ejected and pulled**: `with admin disk --unmount`, which writes back and records the
+     filesystem clean, then `device_del`.
+  5. **On the host**: `fsck.fat -n` clean, its dirty bit included; `mdir` lists the guest's names,
+     long and short; `mcopy` reads the pattern back.
+- **CI**: `dosfstools` and `mtools` installed for the host tests and the QEMU job.
+- **Controls**, planned:
+  - only the first copy of the FAT written: `fsck.fat -n` fails, on the host and in step 5;
+  - a grow that does not zero: its host test reads old bytes;
+  - every short name's tail `~1`: `fsck.fat -n` finds duplicates;
+  - the dirty bit left at unmount: step 5 fails;
+  - the server chosen by a constant: step 1 fails, `fs-server-ext4` refusing the stick;
+  - FAT auto-mounted on any disk: step 2 fails, and `check-install`'s target is in use;
+  - the cluster rule removed: `test-qemu`'s line fails;
+  - a write path that does not batch: its counted host test fails;
+  - a case-sensitive lookup: its host test fails.
+
+The gate set stays at 42.
+
+**On the laptop**, for the maintainer to try:
+- a FAT32 stick from a shop, plugged in after boot, is in `disk --list` and mounted at
+  `/storage/<label>`, read-only on the live stick and writable on the installed system;
+- a file written to it there reads back on another computer.
+
+### Not in Part E
+
+- **Writable auto-mount on a live boot, `Eject`, the mount watch and Files** (Part F).
+  **Formatting** (Part G). **Throughput** (Part H).
+- **exFAT**, as for the phase.
+- **Clusters under 4 KiB** (the second call).
+- **A file in more than 64 fragments**, which `MapRange` would lift for both servers.
+- **A name longer than 255 bytes in UTF-8**, which a directory entry's `name_len` cannot carry. A
+  long name of 255 UTF-16 units can be up to 765 bytes. Such a name is not listed.
+- **Sectors other than 512 bytes**, which no stick this phase meets uses.
+- **Repair**: a dirty filesystem is served as found (`TODO(fs-repair)`).
+- **The attributes beyond read-only and directory** — hidden, system, archive — and Windows' case
+  bits for short names: a lower-case 8.3 name gets a long-name entry instead.
+
+### Docs Part E owes
+
+- **A new `docs/architecture/fat-fs-server.md`**: the library, the names, the sector map and ids, <!-- check-docs: allow-missing -->
+  the cache and batching, the dirty bit, and what it refuses.
+- **`ext4-fs-server-rw.md` and `fs-server-ext4`'s `CLAUDE.md`**: the protocol in `libfsserver`; and
+  the device layer's granularity, corrected.
+- **`libfsserver`'s own `CLAUDE.md`**, and `userspace/CLAUDE.md`'s crate layering.
+- **`filesystem-data-path.md`**: maps in sectors, a page within one run, and the first cluster as
+  an id.
+- **`rsproto-namespace-ops.md`**: `file_id` for FAT.
+- **`storage.md`**: servers by kind, FAT auto-mounted on removable disks, the report's lines and
+  refusals.
+- **`deferred-decisions.md`**: clusters under 4 KiB, with a stick someone needs as the trigger;
+  more than 64 fragments under `MapRange`; names over 255 bytes; the `File::Touch` table's bound.
+- **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-storage`'s FAT stick and
+  `test-qemu`'s refusal.
 
 ## Definition of Done
 
