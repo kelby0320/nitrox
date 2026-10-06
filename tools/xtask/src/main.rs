@@ -14616,6 +14616,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `fs-server-fat`'s library tests (Phase 6 Part E), against images mtools and `mkfs.fat`
+    // build, and — for what it writes — `fsck.fat -n`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("fs-server-fat")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libfs` — whole-file and path helpers, host-tested where they do not touch a
     // namespace. Was `coreutils::fs` until M10 Part A; it moved down a layer when a
     // graphical file browser needed it and needed none of the shell-program machinery

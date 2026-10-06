@@ -98,9 +98,18 @@ jobs:
       # Host-side tests: kernel lib (compiled against the host triple via
       # an internal override in xtask) plus the tools workspace.
       #
+      # `fs-server-fat`'s tests build their images with mtools and `mkfs.fat`, and require
+      # `fsck.fat -n` to find what the library wrote clean (Phase 6 Part E). The runner ships
+      # `e2fsprogs`, which the ext4 tests need, and is not promised to ship these.
+      - name: Install the FAT tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mtools dosfstools
+
       # `e2fsprogs` is a real dependency of this step, not a nicety: the ext4
       # mutation tests build an image with `mke2fs` and then require `e2fsck -fn`
-      # to find it clean, which is what keeps the write path honest.
+      # to find it clean, which is what keeps the write path honest. mtools and
+      # `dosfstools` are the same for FAT.
       - name: cargo xtask test
         run: cargo xtask test
 

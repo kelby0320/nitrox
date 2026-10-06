@@ -1,0 +1,17 @@
+[package]
+name = "fs-server-fat"
+version = "0.1.0"
+edition = "2024"
+
+# FAT12, FAT16 and FAT32 with long names (Phase 6 Part E): a **library**, `no_std` and no `alloc`,
+# host-tested against images `mformat`, `mkfs.fat` and `mcopy` build and checked with `fsck.fat`;
+# and, from Part E.4, the server binary over it, built on `libfsserver` as `fs-server-ext4` is.
+[lib]
+name = "fs_server_fat"
+path = "src/lib.rs"
+
+[dependencies]
+# The block-device traits, and (from E.4) the protocol.
+libfsserver = { path = "../libfsserver" }
+# The listing's entry kinds, and (from E.4) the wire format.
+librsproto = { path = "../librsproto" }
