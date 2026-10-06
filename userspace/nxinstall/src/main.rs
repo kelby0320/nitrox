@@ -793,6 +793,13 @@ fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Wit
             path: cell(&devices, r, "path"),
             description: cell(&devices, r, "description"),
             parent: cell(&devices, r, "parent"),
+            boot: devices
+                .schema
+                .fields
+                .iter()
+                .position(|f| f.name == "boot")
+                .and_then(|i| devices.rows.get(r).and_then(|row| row.get(i)))
+                .is_some_and(|v| *v == Value::Bool(true)),
         })
         .collect();
     let mounts: Vec<Mount> = (0..storage.rows.len())

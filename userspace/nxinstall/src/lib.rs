@@ -243,6 +243,8 @@ pub mod withheld {
         pub description: String,
         /// The name of the device it belongs to: a partition's disk.
         pub parent: String,
+        /// **The disk the machine started from** (Phase 6 Part D): on a live boot, the stick.
+        pub boot: bool,
     }
 
     /// A block device as the storage service reports it. An empty field is `Null`.
@@ -282,7 +284,7 @@ pub mod withheld {
     }
 
     /// **Every disk and RAM disk the machine has and the view does not reach, that something has
-    /// mounted**, in the table's order. `reachable` is the view's own `/dev/blk/<n>` paths. A disk
+    /// mounted or the machine started from**, in the table's order. `reachable` is the view's own `/dev/blk/<n>` paths. A disk
     /// missing for no reason the tables give — nothing on it mounted — is left out: there is nothing
     /// true to say about it.
     pub fn withheld(devices: &[Device], mounts: &[Mount], reachable: &[&str]) -> Vec<Withheld> {
@@ -296,7 +298,9 @@ pub mod withheld {
             for p in devices.iter().filter(|p| p.parent == d.name) {
                 found.extend(on(&p.name));
             }
-            let why = if found.iter().any(|m| m.by == "init") {
+            // **The disk the machine started from holds the running system** (Phase 6 Part D),
+            // whether or not anything on it is mounted: the live stick, its system in RAM.
+            let why = if d.boot || found.iter().any(|m| m.by == "init") {
                 Why::Running
             } else if let Some(m) = found.iter().find(|m| m.by == "storage") {
                 let label = String::from(m.at.rsplit('/').next().unwrap_or_default());
@@ -494,6 +498,7 @@ mod tests {
             path: path.into(),
             description: description.into(),
             parent: parent.into(),
+            boot: false,
         }
     }
 
@@ -546,6 +551,21 @@ mod tests {
         assert!(w[1].message().ends_with("holds the running system."));
         assert!(!w[1].message().contains("unmount"), "init's mounts are never unmounted");
         assert_eq!((w[0].refusal(), w[1].refusal()), ("it is in use", "it holds the running system"));
+    }
+
+    /// **The live stick is the running system** (Phase 6 Part D): the disk the machine started from,
+    /// withheld with nothing on it mounted, is named so — and the same disk unflagged, with nothing
+    /// mounted, would not be named at all.
+    #[test]
+    fn the_disk_the_machine_started_from_holds_the_running_system() {
+        let mut stick = dev("blk-4", "disk", "/dev/blk/4", "QEMU QEMU HARDDISK (1-0000:00:04.0-1)", "usb-12");
+        stick.boot = true;
+        let w = withheld(&[stick.clone()], &[], &[]);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].why, Why::Running);
+        assert!(w[0].message().ends_with("holds the running system."), "{}", w[0].message());
+        stick.boot = false;
+        assert!(withheld(&[stick], &[], &[]).is_empty(), "nothing gives a reason, so nothing is said");
     }
 
     /// **A release boot**: the disk under `/` is the running system. A disk the view lacks with

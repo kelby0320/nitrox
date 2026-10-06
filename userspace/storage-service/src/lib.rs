@@ -575,9 +575,12 @@ pub mod mounts {
     /// partitions. Registry ids, ascending. **The holder is the parent only if it is a block
     /// device**: a partition's is its disk or RAM disk, while a whole disk's is the PCI function
     /// of its controller, which is not one and not grantable.
+    ///
+    /// **And the disk the machine started from** (Phase 6 Part D): it holds the running system,
+    /// whether or not anything on it is mounted, so `disks` withholds it and `nxinstall` says why.
     pub fn in_use(devices: &[Device], mounted: &[Mounted]) -> Vec<u32> {
         use libkern::device::NO_PARENT;
-        let mut ids = Vec::new();
+        let mut ids: Vec<u32> = devices.iter().filter(|d| d.record.is_boot_medium()).map(|d| d.record.id).collect();
         for m in mounted {
             ids.push(m.device);
             let parent = devices.iter().find(|d| d.record.id == m.device).map(|d| d.record.parent);
@@ -609,18 +612,32 @@ pub mod mounts {
     /// would be in use, and the `disks` grant would withhold it from `nxinstall`, which copies it.
     /// **The rule is the name, not "a RAM disk"**: a test image's scratch filesystem is a RAM disk
     /// this service mounts, for `boot-probe`.
+    ///
+    /// **Nor anything on the disk the machine started from** (Phase 6 Part D): on a live boot the
+    /// stick, which holds the system running from RAM ([`on_boot_medium`]).
     pub fn automount(devices: &[Device], already: &[Mounted], live: bool, init_known: bool) -> Vec<Plan> {
+        plan(devices, devices, already, &[], live, init_known)
+    }
+
+    /// **The mounts devices that arrived after the boot get** (Phase 6 Part D): `new`, by the boot's
+    /// rules, among `all` the service knows, with `taken` the labels of the mounts there are. Only
+    /// the new are planned: one an administrator unmounted stays so.
+    pub fn arrival(new: &[Device], all: &[Device], already: &[Mounted], taken: &[String], live: bool, init_known: bool) -> Vec<Plan> {
+        plan(new, all, already, taken, live, init_known)
+    }
+
+    fn plan(candidates: &[Device], all: &[Device], already: &[Mounted], taken: &[String], live: bool, init_known: bool) -> Vec<Plan> {
         if !init_known {
             return Vec::new();
         }
         let mode = if live { Mode::Ro } else { Mode::Rw };
-        let mut taken: Vec<String> = Vec::new();
+        let mut taken: Vec<String> = taken.to_vec();
         let mut plan = Vec::new();
-        for d in devices {
+        for d in candidates {
             if !matches!(d.found, Found::Ext4 { .. }) || already.iter().any(|m| m.device == d.record.id) {
                 continue;
             }
-            if is_install_source(d) {
+            if is_install_source(d) || on_boot_medium(d, all) {
                 continue;
             }
             let label = labels::unique(&labels::preferred(d), &taken);
@@ -628,6 +645,12 @@ pub mod mounts {
             plan.push(Plan { device: d.record.id, label, mode });
         }
         plan
+    }
+
+    /// **Whether `d` is on the disk the machine started from** (Phase 6 Part D): that disk, flagged
+    /// in its record, or one of its partitions.
+    pub fn on_boot_medium(d: &Device, all: &[Device]) -> bool {
+        d.record.is_boot_medium() || all.iter().any(|p| p.record.id == d.record.parent && p.record.is_boot_medium())
     }
 
     /// Whether `d` is the installer's pristine source: a partition named

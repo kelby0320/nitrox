@@ -584,6 +584,46 @@ fn an_administrators_mount_is_refused_for_each_reason() {
     assert_eq!(Refusal::InitUnknown.kerror(), libkern::KError::NoAccess);
 }
 
+/// **A live stick, booted from**: its disk flagged the boot medium, and an ext4 on a partition of
+/// it — as a stick holding a filesystem beside the system would be. Neither is planned, and the
+/// disk is in use with nothing mounted; another stick's ext4 is planned as ever.
+#[test]
+fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true) };
+    let mut stick = rec(20, DeviceKind::Disk, 8, 19, "QEMU QEMU HARDDISK (1-0000:00:04.0-1)", 65_536);
+    stick.flags |= libkern::device::BOOT;
+    let ds = std::vec![
+        dev(stick, Found::Nothing),
+        dev(rec(21, DeviceKind::Partition, 9, 20, "NITROX_ESP", 32_768), Found::Fat { label: String::new() }),
+        dev(rec(22, DeviceKind::Partition, 10, 20, "data", 16_384), ext4("data")),
+        dev(rec(30, DeviceKind::Disk, 11, 29, "another stick", 16_384), ext4("other")),
+    ];
+    assert!(crate::mounts::on_boot_medium(&ds[0], &ds) && crate::mounts::on_boot_medium(&ds[2], &ds));
+    assert!(!crate::mounts::on_boot_medium(&ds[3], &ds));
+    let planned: Vec<u32> = automount(&ds, &[], true, true).into_iter().map(|p| p.device).collect();
+    assert_eq!(planned, [30], "the other stick alone");
+    assert_eq!(in_use(&ds, &[]), [20], "the boot disk, with nothing mounted");
+    let mut unflagged = ds.clone();
+    unflagged[0].record.flags = 0;
+    assert_eq!(automount(&unflagged, &[], true, true).len(), 2, "the flag is what passes it over");
+}
+
+/// **An arrival is planned alone, by the boot's rules, beside the mounts there are**: a device an
+/// administrator unmounted stays unmounted, and a label in use is numbered past.
+#[test]
+fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true) };
+    let unmounted = dev(rec(11, DeviceKind::RamDisk, 7, NO_PARENT, "scratch.img", 16_384), ext4("nitrox-scratch"));
+    let new = dev(rec(40, DeviceKind::Partition, 12, 39, "partition 1 (unlabelled)", 16_384), ext4("stick"));
+    let all = std::vec![unmounted, new.clone()];
+    let taken = std::vec![String::from("stick")];
+    let plan = crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &taken, true, true);
+    assert_eq!(plan, [Plan { device: 40, label: String::from("stick-2"), mode: Mode::Ro }]);
+    assert_eq!(crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &[], false, false), [], "init's mounts unknown");
+}
+
 /// **What is in use is every mounted device and the disk that holds it** — never a partition's
 /// sibling, and a RAM disk counts as the disk it is.
 #[test]
