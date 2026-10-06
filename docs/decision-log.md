@@ -34127,3 +34127,45 @@ every later device.
 
 No ABI hash impact: no value changes, only doc comments on `KError`, and `Nodes` is the kernel's
 own.
+
+## 2026-10-06 — Phase 6 Part D, detailed: mass storage
+
+Part D's detail pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part D in detail*. A
+bulk-only interface binds as a disk during enumeration. The disk's partition table is read where it
+arrives. The storage service mounts what arrives and tears down what departs. The stick a live boot
+started from is passed over.
+
+**Two facts measured for it, rather than assumed:**
+- **QEMU hot-plugs and re-plugs a stick.** `blockdev-add` then `device_add usb-storage` plugs one
+  into a running machine, at 8.2.2 (CI's) and 11.0.2 alike. `device_del` unplugs it and leaves the
+  node, so the same image plugs in again. A `-drive if=none` drive would have gone with its device.
+- **Limine's module records name the boot disk.** Printed on a live-stick boot and a disk boot,
+  every module's record carried the GPT disk GUID of the volume it came from, in the byte order a
+  GPT header stores it: the stick's on one, the disk's on the other, as `sgdisk -p` reads them.
+
+**The calls made:**
+- **The I/O path is the controller's DPC's, as AHCI's is its interrupt's.** A command goes on the
+  rings whole, and the status wrapper's completion ends it and starts the next.
+- **Recovery is the hub thread's**: stalls, bad status, and a command past its thirty-second
+  deadline. The deadline is what bounds a stick that stops answering, since the storage service
+  and `fs-server-ext4` wait on their reads with no bound of their own.
+- **A thread per disk was set aside.** It would cost two context switches a command, and the
+  controller's one wait record would have had to become many.
+- **One configuration per device**, so a second class's `SET_CONFIGURATION` cannot reset the first's
+  endpoints.
+- **The boot medium is a flag the kernel sets**, `BOOT` in a record's `flags`, from a GUID only the
+  kernel reads. The storage service passes the disk over and names it in `InUse`. `nxinstall`
+  refuses it as the running system.
+- **A departed mount's server is terminated** rather than asked to unmount: it would try to mark
+  clean a filesystem on a device that is gone.
+- **Disk slots are a value a host test drives**, under an epoch. That is PR #361's lesson applied
+  before it could recur.
+
+**Two calls put to the maintainer:**
+- **Where the gate lives.** The pass recommends extending `check-storage`, whose live boot mounts a
+  stick read-only, with the gate remounting it writable until Part F. The alternative is a new gate
+  on an installed-style boot.
+- **`/dev/disk` names for a stick.** The pass recommends none. Those names are `init`'s, bound from
+  what the boot's probe found. A stick read in the first round would otherwise put its partitions
+  among them. Its `nitrox-root`, say, would lose to the internal disk's only because AHCI is probed
+  first.
