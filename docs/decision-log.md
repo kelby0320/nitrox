@@ -34544,3 +34544,67 @@ eviction is exercised by a change bigger than the cache, beside a test that a re
 dirty is refused.
 
 **Controls:** 13 for the fixes, and 5 flushes each removed in turn, all failing.
+
+## 2026-10-07 — Phase 6 Part F, detailed: removable media for a session
+
+Part F's detail pass, in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part F in detail*. A stick
+plugged in mounts writable on any boot. A session ejects it without a password, from Files or
+`disk --eject`, and Files' sidebar lists the drives as they come and go.
+
+**What the pass found:**
+- **A session cannot send the storage service a request.** Every session reaches it through one
+  endpoint, shared by all of them through `service-mgr`'s route, which answers resolves of `fs…`
+  and `info…` alone.
+- **Nothing tells a client that the mounts changed**, and the table has no `removable` column.
+- **The unmount chain is not an administrator's in anything but who may reach it.**
+- **Files waits on its compositor channel alone**, and its sidebar is Places.
+
+**The shape:** two channels a session opens on its endpoint, as an admin session is opened on the
+admin endpoint. A media session at `/dev/storage/media` carries `Eject` — the unmount chain, on a
+removable mount only. A watch at `/dev/storage/watch` carries bare `Changed` pings, and takes no
+slot in the service's wait set. The table gains `removable`, `disk` gains `--eject`, and Files gains
+Drives with eject buttons.
+
+**The maintainer's calls, all four as recommended:**
+- **the watch is a ping**, and the client reads the table again — Part C's shape;
+- **Drives lists every mount under `/storage`**, with an eject button on the removable ones;
+- **the Save As chooser is unchanged**: a stick is reached by Up, `storage`, then its label;
+- **a new desktop gate, `check-media`, on the live image**, so the gate set goes to 44: the gate
+  under TCG and under KVM.
+
+**Calls made without the maintainer:**
+- an ejected stick stays unmounted until it is plugged in again;
+- any session can eject any stick;
+- eject is the chain and the flush, with no `START STOP UNIT`;
+- `/dev/storage/media` and `/dev/storage/watch` are not listed in `/dev/storage`;
+- Drives lists mounts only, so a stick refused for its clusters does not appear, and why it did not
+  mount is filed with Part G as what makes it usable.
+
+## 2026-10-07 — PR #366, reviewed: a watch outside the wait set, and a mount's name
+
+No blocking findings, four worth fixing and three optional, all taken into Part F's detail pass.
+Each was checked against the code before it went in.
+
+1. **The gate set goes to 44, not 43.** Every gate in CI's QEMU job counts twice, under TCG and
+   under KVM: `check-shutdown` and `check-logout` each took the set up by two. The pass's entry
+   above said 43, and is corrected in place while unmerged.
+2. **Four media channels would have run out at four Files.** The shell starts a Files per Places
+   pick and per launch (`desktop-shell`, `launcher.launch`), each holding its channel for its life,
+   and the service has one wait set for the machine. **The watch is now a channel of its own**, at
+   `/dev/storage/watch`, which the service only sends on, so it takes no wait slot. 32 are held, and
+   a watcher that has gone is found when a ping to it fails. **Ejecting is a media session held for
+   the request**, bounded at 2. The ping and the re-read of the table, the maintainer's call, are
+   unchanged.
+3. **A mount's name is the `mounted` column's**, not `label`, which is the filesystem's own. They
+   differ for a filesystem with no label and for two with one, so Drives and `Eject` use the mount
+   name, and F.3's tests carry fixtures where the two differ.
+4. **Three current-behaviour documents say a session endpoint answers the filesystems and the
+   table and nothing else**: `graphical-session.md`, and `session-and-auth.md` twice. They join the
+   docs Part F owes, with `fat-fs-server.md` §8 and possibly `widget-toolkit.md`.
+
+**Optional, all taken:**
+- `check-media`'s step 2 looks for the stick's row on the screen with no input after the plug,
+  since any input would wake Files on its compositor channel and draw the row anyway.
+- The phase's *Removable media* design is marked where the pass revised it.
+- `shell-language.md` §10d's `disk` row gains the `description` column it has lacked since the
+  laptop polish.

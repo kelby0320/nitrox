@@ -5,7 +5,7 @@ current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
-E detailed and built 2026-10-06; Parts F–H not built.** This replaces the
+E detailed and built 2026-10-06; Part F detailed 2026-10-07; Parts F–H not built.** This replaces the
 sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
 were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
 as administration's parts did; what is here is the phase's shape, the design each part builds to,
@@ -253,7 +253,10 @@ For such a disk:
   the command; Files has an eject button. It is the only unmount a session can ask for: an
   internal disk still needs the `storage` grant.
 - **A session can follow mounts**: a watch on the session endpoint that sends a message per mount
-  and unmount, so Files' **Drives** in Places update without polling.
+  and unmount, so Files' **Drives** in Places update without polling. *(Revised 2026-10-07, in Part
+  F's detail pass: a bare ping per change, after which a client reads the table again, on a watch
+  of its own beside the media session that ejects; and Drives a section below Places — § Part F in
+  detail.)*
 - **Surprise removal** is a departure: the server's I/O fails, it exits, the mount is torn down,
   and the log says the device left while mounted. What had not been written back is lost, which is
   what *eject* exists to prevent.
@@ -304,7 +307,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 | **C** | **Arrivals and departures.** Departed records, retired indices, `PeerClosed`, the generation, the change node (a notification until Part C's detail pass), the manager's diff, `input-server` taking and retiring devices. | B's gate plugs a second `usb-kbd` in over QMP and types on it, then unplugs it, and the input server retires its slot. Host tests on the manager's diff. |
 | **D** | **Mass storage.** Bulk-only and SCSI; MBR, whole-disk and runtime partition scans; the storage service mounting late arrivals and tearing down departures; the boot medium passed over; `nxinstall` refusing it. | A storage gate plugs in an ext4 stick over QMP: it auto-mounts writable, takes a file, ejects (through the admin `Unmount` until F), and the host checks it with `e2fsck` and `debugfs`. Then a stick unplugged while mounted, torn down. `check-live` and `check-install` see the boot stick passed over and refused. *(Detailed 2026-10-06: `check-storage` gains these steps, a live boot's read-only auto-mount remounted writable until Part F, the maintainer's call — § Part D in detail.)* |
 | **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. *(Detailed 2026-10-06: the protocol moves into `libfsserver` first, clusters under 4 KiB are refused, and FAT auto-mounts on removable disks only — the maintainer's calls, § Part E in detail.)* |
-| **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. |
+| **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. *(Detailed 2026-10-07: a media session at `/dev/storage/media` carries `Eject`, and a watch at `/dev/storage/watch` bare pings, Files re-reading the table; Drives lists every mount under `/storage`; the chooser is unchanged; a new desktop gate, `check-media`, on the live image — the maintainer's calls, § Part F in detail.)* |
 | **G** | **Formatting and partitioning**: `disk --partition`, `disk --format`. | A blank stick partitioned and formatted FAT through `with admin`, then mounted and written; refused while mounted. |
 | **H** | **Copy throughput**: `time`, the measurements on the laptop, the fix for what dominates, and the number. | The number, measured on the laptop and recorded. No QEMU gate holds a time, since TCG's is not the machine's. |
 
@@ -2051,6 +2054,249 @@ The gate set stays at 42.
   more than 64 fragments under `MapRange`; names over 255 bytes; the `File::Touch` table's bound.
 - **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-storage`'s FAT stick and
   `test-qemu`'s refusal.
+
+## Part F in detail *(2026-10-07)*
+
+**Removable media for a session.** A stick plugged in mounts writable on any boot. A session can
+eject it without a password, from Files or `disk --eject`, and Files' sidebar lists the drives as
+they come and go.
+
+### What exists, and what is missing (checked 2026-10-07)
+
+**The storage service:**
+- **A live boot auto-mounts everything read-only**, sticks included (`mounts::plan`'s `mode`),
+  since Part D: the maintainer's call then was a live stick's mount remounted writable through the
+  `storage` grant until this part.
+- **A session reaches the service through one endpoint, shared by every session.** `service-mgr`
+  resolves `/svc/storage/session-endpoint` once and hands each login supervisor a route to it
+  (administration Part E.1b). The supervisors bind it at `/storage` with the base `/fs` and at
+  `/dev/storage` with the base `/info`, in every session and application. **What arrives there is
+  only resolves of `fs…` and `info…`** (`suffix::session_only`). Nothing a session holds can send
+  the service a request, and the service cannot tell one session from another.
+- **Unmounting is an admin session's alone**: a resolve on the admin endpoint opens a channel
+  carrying `Mount`, `Unmount` and `InUse`
+  ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)). The view broker binds that endpoint
+  at `/dev/storage/admin` in a view with the `storage` grant, which is what `with admin disk
+  --unmount` uses. **The unmount chain** — the label out of `fs`, `sys_ns_sync`, refused while a
+  file is held, `Meta::Unmount`, `IoOpcode::Flush` — is the service's (`Service::unmount`), and
+  nothing about it is specific to an administrator.
+- **Nothing tells a client that the mounts changed.** The table, `/dev/storage/all.tsm`, is read
+  afresh on each resolve, so a client polls or does not know. It has no `removable` column: the
+  rule is `mounts::removable`, used for the auto-mount alone.
+- **The wait set is 32 handles** (`MAX_WAIT_HANDLES`): the endpoint, the subscription, the control
+  channel, 4 session endpoints, 8 mounts, 2 admin endpoints and 4 admin sessions leave 11 for
+  directory sessions (`MAX_DIRS`). A new kind of channel takes its bound from there.
+
+**Files (`nxfiles`):**
+- **The sidebar is Places alone**: Home, the three home folders and Root, from `libfs::places`,
+  which the shell's Places menu also reads. No drives, and nothing about `/storage`.
+- **It waits on one handle**, the compositor channel (`wait_one` in `main.rs`): "a browser has no
+  second source of work". A watch is a second source.
+- **A sidebar row is a `ListRow`**: a label, a swatch and cells, one press for the whole row. An
+  eject control is a second target in the row, as a tab's close button is in a tab.
+- **The font has the eject glyph** (`U+23CF` in DejaVu Sans), so the control can be text.
+
+**Saving onto a stick from `nxedit`:**
+- **The Save As chooser walks directories**, with an Up button. Its name field is joined to the
+  current directory, so a typed `/storage/STICK/a.txt` becomes `/home/alice//storage/…`.
+- **A listing is a union with the namespace's bindings** (`libfs::list_dir`), so `/` lists
+  `storage` and `/storage` lists each mounted label: a stick is reached by Up to `/`, `storage`,
+  then its label.
+- **A save holds nothing afterwards**: `nxedit` writes a temporary file and renames it over the
+  target (`save` in `main.rs`), so an eject straight after a save is not refused for a held file.
+
+**The gates:** `check-storage` remounts its sticks writable through `with admin disk`, because a
+live boot mounts them read-only. **No gate drives Files at a drive**, and none ejects as a session.
+
+### The shape
+
+**Two channels a session can open on its endpoint, neither of which mounts.** A resolve on the
+session endpoint is answered with a channel of the service's own, as an admin endpoint's resolve is
+answered with an admin session:
+- **A media session at `/dev/storage/media`** (`info/media`) carries **`Eject`**, by the name the
+  filesystem is mounted under: the unmount chain, held check included, on a mount the service made
+  of a **removable** disk, answered once it is safe to pull the stick. An internal disk's mount is
+  refused `NoAccess`, naming the `storage` grant: today's rule for internal disks stands. **A media
+  session is held for a request**, opened to eject and closed after: the service waits on each, so
+  each takes a slot in its wait set.
+- **A watch at `/dev/storage/watch`** (`info/watch`) carries nothing but a bare **`Changed`**, sent
+  whenever the set of mounts changes — an auto-mount, an eject, an administrator's mount or unmount,
+  a teardown, a shutdown's unmount. The client then reads `/dev/storage/all.tsm` again. **The
+  service only sends on a watch**, so a watch takes no slot in its wait set: a client holds one for
+  its life at no cost to anyone else's. **A full queue is a ping already waiting**, since a watch
+  carries nothing else, so a watcher that falls behind loses nothing. A watcher that has gone is
+  found when a ping to it fails `PeerClosed`; when the list is full, every watcher is pinged first,
+  which costs the living a needless read and frees the dead. *(Revised with PR #366's review: one
+  channel carrying both took a wait slot for every watcher, and every Places pick or Applications
+  launch starts a Files of its own, so four would have run out at four Files — and `disk --eject`
+  with them.)*
+
+**The table gains `removable`**: whether the device is a disk behind USB mass storage, or a
+partition of one (`mounts::removable`). It is what Files decides an eject button by, and what
+`disk --list` shows beside the rest.
+
+**A stick mounts writable on any boot.** `mounts::plan` mounts a removable disk's filesystem
+writable on a live boot too; an internal disk's stays read-only there, as the install target.
+
+**`disk --eject NAME`**, run in any session with no grant: a media session's `Eject`, by the name
+under `/storage`. Its refusals name the reason: nothing mounted under that name; not removable, use
+`with admin disk --unmount`; a file on it still open or mapped; and every media session taken, which
+is `WouldBlock`, to try again.
+
+**A mount's name is the `mounted` column's**, `/storage/<name>`, never the `label` column, which is
+the filesystem's own (PR #366 review). The two differ for a filesystem with no label, mounted under
+its partition's name or `blk-<n>`, and for two with one label, the second mounted `<label>-2`.
+
+**Files' Drives**, below Places in the sidebar:
+- **every mount under `/storage`**, by its name from the table's `mounted` column; each a row that
+  opens it;
+- **an eject button on a removable drive's row**, the eject glyph, as a tab carries its close
+  button. Pressing it sends `Eject`; a refusal is said in the window's notice strip — "NXFAT is in
+  use: a file on it is open";
+- **kept current by the watch**: Files waits on its watch beside the compositor, and opens a media
+  session only to eject. A drive that goes, ejected or pulled, takes any tab inside it back to
+  Home, with a notice. **A Files refused a watch** — every one of the 32 held — reads the table when
+  a window opens and when one takes focus, and follows nothing between;
+- **Places stay as they are**, and so does the shell's Places menu.
+
+**The chooser is unchanged**: a stick is reached from `nxedit`'s Save As by Up to `/`, `storage`,
+then its label. A chooser with places and drives is filed in the deferrals.
+
+### The maintainer's calls, 2026-10-07
+
+The maintainer agreed to all four, as recommended.
+
+- **The watch is a ping, and the client reads the table again**, rather than a message per mount
+  carrying the mount. One queued ping means "read again", so a client whose queue fills loses
+  nothing, and the table stays the one answer to "what is mounted". It is Part C's shape: a change
+  node read again, not a stream trusted. The alternative needed a replay for a client that missed a
+  message, and gave Files a second account of the mounts beside the table.
+- **Drives lists every mount under `/storage`**, an eject button on the removable ones. On a live
+  boot that includes the internal disk's read-only root, where an installed system's files are. The
+  alternative listed sticks alone.
+- **The chooser is unchanged.** Up, `storage`, the label works today. The alternatives were a
+  chooser listing places and drives, a real toolkit change, or a name field taking an absolute path.
+- **A new gate, `check-media`, on the live image**, in CI's QEMU job: the gate set goes to 44, since
+  a gate there runs under TCG and KVM (PR #366 review; this said 43). On the live image a stick
+  mounts writable only by this part's rule, so the gate holds it; and a gate of its own fails
+  readably. The alternative was more steps in `check-logout`, on the release image, where sticks
+  already mount writable.
+
+### Calls made in this pass, without the maintainer
+
+- **`/dev/storage/media` and `/dev/storage/watch` are not listed** in `/dev/storage`, as
+  `admin-endpoint` is not: the directory lists the tables, which `test-interactive` holds.
+- **Media sessions are bounded at 2**, held for a request, which leaves 9 directory sessions.
+  **Watches at 32**, outside the wait set: one per Files process, and the shell starts a Files per
+  Places pick and per launch (PR #366 review). Both bounds are the machine's, not a session's,
+  since the service cannot tell sessions apart.
+- **An ejected stick stays unmounted until it is plugged in again.** A session that could mount a
+  removable disk would be a second way to mount; it is filed, with a person who ejected by mistake
+  as the trigger.
+- **Eject is the unmount chain and the flush, and no more**: no `START STOP UNIT` to the device. A
+  stick needs nothing past its cache flushed, which the chain's `IoOpcode::Flush` does.
+- **Any session can eject any stick.** The service cannot tell sessions apart, and the phase does
+  not give each session its own view of `/storage`.
+- **A stick refused for its clusters, or ejected, is not in Drives.** Drives lists mounts. Saying
+  why a stick did not mount is a column the table does not have yet; filed, with Part G's
+  formatting as what makes such a stick usable.
+
+### Pieces
+
+- **F.1 The service: removable writable, `Eject`, the watch.** `mounts::plan`'s mode by removable;
+  the `removable` column; the media and watch suffixes; media sessions, bounded in the wait set;
+  `Eject` through the unmount chain, refused for an internal mount; watches outside the wait set, a
+  `Changed` to each per change, a gone watcher dropped when a ping fails and every watcher pinged
+  when the list is full. The codec in `librsproto::storage`, its spec beside `Mount`'s.
+
+  Host tests: the plan's mode for a stick and an internal disk on a live boot and an installed one;
+  the eject rule — removable, internal, `init`'s, a name nothing is mounted under, and a mount whose
+  name is not its filesystem's label; the suffixes and `session_only`; the column; the watch list
+  full, with gone watchers freed and living ones kept; the codec, from bytes laid out by hand.
+- **F.2 `disk --eject`.** The coreutil's third verb, on a media session, and its refusals.
+- **F.3 Files' Drives.** The section, its rows from the table, the eject button, the watch as the
+  second handle in Files' wait, a media session per eject, a drive that goes taking its tabs home,
+  and no watch read at open and focus.
+
+  Host tests: rows from a table — every mount under `/storage`, an eject button on the removable
+  ones only — **with fixtures whose mount names are not their labels**: two sticks labelled `DATA`,
+  mounted `DATA` and `DATA-2`, each row ejecting its own, and one with no label, mounted under its
+  partition's name, still listed (PR #366 review). A press on the button is `Eject` and a press on
+  the row opens it; a refusal's notice; a tab moved home when its drive leaves the table.
+- **F.4 The gates.** Below.
+- **F.5 Docs.** Below.
+
+### Gates
+
+- **`test-qemu` (`boot-probe`)**: through a session endpoint, a watch opens and a media session
+  opens. **The probe's own unmount and remount of the scratch disk each send a `Changed`**,
+  and the table read after each says so. `Eject` of the scratch disk, a RAM disk, is refused
+  `NoAccess`.
+- **`check-storage`**: its sticks mount **writable** on the live boot, with no remount. Each is
+  written, then **`disk --eject <name>`** with no password, and the service records it clean before
+  it is pulled. `disk --eject nitrox-root` is refused, naming `with admin disk --unmount`, which the
+  internal disk keeps using. The host checks are as they are.
+- **`check-media`**, new: the live image as the boot stick, beside a copy of the release disk, on
+  the graphical greeter.
+  1. **A login, and Files at Home.** Drives lists the internal disk's `nitrox-root`, read-only, with
+     no eject button.
+  2. **A FAT stick plugged in** over QMP while Files is open: auto-mounted writable, and **its row
+     appears on the screen with no input after the plug** — read from screendumps of the sidebar
+     until the eject glyph's ink is there, within a bound. Any input would wake Files on its
+     compositor channel and draw the row whether the watch woke it or not (PR #366 review).
+  3. **Saved from `nxedit`**: text typed, Save As, Up to `/`, `storage`, the stick, a name, Save.
+  4. **Ejected from Files**: a click on the stick's eject button. The service records the
+     filesystem clean, with no password asked, and the stick is pulled.
+  5. **On the host**: `fsck.fat -n` clean, and `mtype` reads back what was typed.
+
+  **What it asserts is effects**, not a log line of Files' own: the row on the screen at step 2,
+  and an eject at step 4 that happens only if the button is drawn and hit where the gate aims.
+- **CI**: `check-media` and `check-media --kvm` in the QEMU job.
+- **Controls**, planned:
+  - the auto-mount read-only on a live boot again: `check-storage`'s first write is refused;
+  - `Eject` allowed for an internal mount: `check-storage`'s refusal fails;
+  - no `Changed` on an unmount: `boot-probe`'s watch test fails;
+  - Files not waiting on its watch: `check-media`'s step 2 finds no row with no input sent;
+  - the watch in the wait set again, bounded at 4: the watch-list host test, at five watchers;
+  - the eject button on every drive: the Files host test fails;
+  - the held check skipped for a session's eject: the host test of the rule fails.
+
+**The gate set goes from 42 to 44**: `check-media` under TCG and under KVM, as every gate in CI's
+QEMU job counts (PR #366 review; this pass said 43).
+
+**On the laptop**, for the maintainer to try:
+- a FAT32 stick from a shop, plugged in on the live stick, is in Files' Drives and writable;
+- a file saved onto it from `nxedit`, ejected from Files, reads back on another computer;
+- pulled without an eject, its row goes and the session carries on.
+
+### Not in Part F
+
+- **Formatting** (Part G) and **throughput** (Part H).
+- **Mounting a stick again from a session** after an eject, and **saying why a stick did not
+  mount** — both filed above.
+- **Drives in the chooser and in the shell's Places menu.**
+- **Per-session visibility under `/storage`**, as for the phase.
+
+### Docs Part F owes
+
+- **`storage.md`**: removable media — writable on any boot, `Eject`, the media session, the watch,
+  the `removable` column; and §11's gates.
+- **`rsproto-storage-ops.md`**: the media session and `Eject`, the watch and `Changed`.
+- **`shell-language.md` §10d**: `disk --eject`, and the `removable` column in `--list`'s schema.
+- **`desktop-shell.md`'s account of places** (no document describes Files on its own, and that is
+  where its sidebar's places are): Files' Drives beside them, and the shell's Places menu as it
+  is.
+- **The three documents that say a session endpoint answers the filesystems and the table and
+  nothing else** (PR #366 review): `graphical-session.md` on what an application reaches, and
+  `session-and-auth.md`'s paragraph on the boundary and its table's `/dev/storage` row. After this
+  part it also opens a media session that ejects a stick, and a watch.
+- **`fat-fs-server.md` §8**: `check-storage`'s FAT stick is no longer remounted writable.
+- **`widget-toolkit.md`**, if the eject button lands in `ListRow` or `list_view` rather than in
+  Files alone.
+- **`deferred-decisions.md`**: a session mounting an ejected stick; why a stick did not mount;
+  drives in the chooser and the Places menu.
+- **`qemu-integration-tests.md` and the root `CLAUDE.md`**: `check-media`, and `check-storage`'s
+  sticks writable and ejected.
 
 ## Definition of Done
 
