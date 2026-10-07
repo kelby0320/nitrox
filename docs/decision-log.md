@@ -34699,3 +34699,45 @@ Controls: the eject naming only its own mount fails the library's test; Files ke
 asked for fails its test; the codec not splitting fails its test; the reserve removed fails the
 short-window test; and the all-or-nothing check removed would leave `check-storage`'s first
 partition unmounted, which the gate now asserts against.
+
+## 2026-10-07 — Phase 6 Part G, detailed: formatting and partitioning
+
+The detail pass is in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part G in detail*: a blank or
+foreign stick — or an external hard drive — partitioned and formatted through `with admin`, and
+mounted when it is done; and drives of 2 TiB or more, which the USB storage driver leaves alone.
+
+**What the pass found:**
+- **`nxinstall` already partitions and formats** through the raw disk the `disks` grant gives it, and
+  `fs-server-ext4` has the formatter it uses. `fs-server-fat` has none, and `libgpt` writes no MBR.
+- **A stick's partition table is read once**, when its disk is published, and nothing reads it
+  again; and **a departed partition's window still forwards to its disk**.
+- **The USB storage driver speaks only the ten-byte SCSI commands**, so a unit of 2 TiB or more is
+  logged and not published.
+- **Why a device is not mounted is in its log line alone.**
+
+**The shape:** `disk` writes the table and the filesystem through the `disks` grant, then asks the
+storage service — a new `Storage` request, `Reread` — to read the device again and mount what is
+there by an arrival's rules. When the table changed, the service first asks the kernel to rescan
+the disk: `IoOpcode::Rescan`, an ABI hash change, which on a USB disk retires its partitions'
+windows, departs them, reads the table again and publishes the new ones. `--partition` writes one
+spanning partition; `--format` makes a filesystem on a partition, or on a whole disk writes the
+default table first. The USB driver gains the sixteen-byte commands, and the table a `note` column.
+
+**The maintainer's calls:**
+- **`disk` writes, and the service reads the device again**; and **a mounted device is never
+  formatted** — unmount, format, and it is mounted again, the procedure everywhere.
+- **The kernel rescans a USB disk whose table changed.** Discussed: unmounting and remounting work on
+  the kernel's partition windows and never move them, so a format of an existing partition needs no
+  rescan and a new table does.
+- **Both verbs**, `--format` writing the default table on a whole disk; **one spanning partition** for
+  now, several with sizes filed.
+- **GPT as well as MBR**, the default table following the filesystem — an MBR for FAT, a GPT for ext4
+  — with `--mbr` and `--gpt` to choose: the maintainer's case is an external hard drive formatted
+  GPT and ext4.
+- **The sixteen-byte commands in this part**, so such a drive appears at all.
+- **A `note` column** for why a device did not mount; Files unchanged.
+
+**Calls made without the maintainer:** FAT32 from about 257 MiB and FAT16 below it, clusters never
+under 4 KiB, under 16 MiB refused; partitions from 1 MiB; default labels `NITROX` and `nitrox`; a
+partition's type kept when it is formatted; no new right for `Rescan`, whose holder can already
+overwrite the disk; 4096-byte logical sectors filed.
