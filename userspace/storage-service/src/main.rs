@@ -15,9 +15,9 @@
 //!    reported and never mounted here. Whether the root is on a RAM disk decides whether this is
 //!    a live boot.
 //! 4. **Mount what it can serve** (C.5b): every ext4 `init` did not mount, and a FAT on a
-//!    removable disk (Phase 6 Part E.5), read-only on a live boot. Each gets the server for its
-//!    kind spawned over it and a namespace of its own with that server bound at `/`, and is named
-//!    by its label.
+//!    removable disk (Phase 6 Part E.5) — an internal disk's read-only on a live boot, a removable
+//!    one's writable on any (Part F). Each gets the server for its kind spawned over it and a
+//!    namespace of its own with that server bound at `/`, and is named by its label.
 //! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/storage`. `info` is a directory session, `info/<name>.tsm` a table as a fresh
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
@@ -25,7 +25,10 @@
 //!    the mounted server's own registration and nothing passes through this service.
 //!    `session-endpoint` mints an endpoint on which only `info` and `fs` are answered, and
 //!    `admin-endpoint` one on which any resolve opens an **admin session**: a channel for
-//!    `Storage` requests (C.5c) — `Mount`, `Unmount` and `InUse`.
+//!    `Storage` requests (C.5c) — `Mount`, `Unmount` and `InUse`. `info/media` opens a **media
+//!    session**, carrying `Eject` alone, and `info/watch` a **watch**, which this service only
+//!    pings when the mounts change — on a session endpoint as at `/svc/storage` (Phase 6 Part F;
+//!    [`storage_service::watch`]).
 //!
 //! **An unmount is a chain** (C.5c): the label leaves `fs`, every dirty file is written back
 //! (`sys_ns_sync`), the unmount is refused if a file is still held (`sys_ns_held`), the server
@@ -58,12 +61,16 @@ use librsproto::namespace::{
     resolve_reply, subnamespace_reply,
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
-use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use, parse_mount};
+use librsproto::storage::{
+    OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use,
+    parse_mount,
+};
 use storage_service::mounts::{self, Plan, Server, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
+use storage_service::watch::{Sent, Watches};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -89,10 +96,18 @@ const MAX_MOUNTS: usize = 8;
 const MAX_ADMIN_ENDPOINTS: usize = 2;
 /// Admin sessions open at once: a `disk --mount` or `--unmount` is one, briefly.
 const MAX_ADMIN_SESSIONS: usize = 4;
+/// **Media sessions open at once** (Phase 6 Part F): each is held for an `Eject`, by Files or
+/// `disk --eject`, and closed after. A watch is not one, and takes no slot ([`storage_service::watch`]).
+const MAX_MEDIA_SESSIONS: usize = 2;
 /// Directory sessions open at once: the wait set, less the endpoint, the subscription, the control
 /// channel, and every other kind's bound.
-const MAX_DIRS: usize =
-    MAX_WAIT_HANDLES - 3 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS - MAX_ADMIN_ENDPOINTS - MAX_ADMIN_SESSIONS;
+const MAX_DIRS: usize = MAX_WAIT_HANDLES
+    - 3
+    - MAX_SESSION_ENDPOINTS
+    - MAX_MOUNTS
+    - MAX_ADMIN_ENDPOINTS
+    - MAX_ADMIN_SESSIONS
+    - MAX_MEDIA_SESSIONS;
 /// How long a filesystem server may take to answer `Meta::Ready`: `init`'s bound for its own.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 /// How many times an unmount asks whether a file is held before it believes the answer, and how
@@ -166,12 +181,19 @@ fn po_wait(po: u64) -> (i64, u64) {
 
 /// Send `body` on `ch` as `op`, echoing `request_id`, with `flags`, moving `handles`.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
+    send_raw(ch, op, request_id, flags, body, handles) == 0
+}
+
+/// [`send`], answering the syscall's own result: `0`, or `WouldBlock` for a full queue, or
+/// `PeerClosed`. **Through `REPLY_MSG`**, whole: the kernel copies a full message from the pointer
+/// it is given, so a buffer the size of the message alone would have it read past the end.
+fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
         let Some(rs_len) =
             encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
         else {
-            return false;
+            return KError::InvalidArgument.as_i32() as i64;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = handles.len() as u8;
@@ -183,7 +205,17 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
             (&raw const REPLY_HANDLES) as u64,
             handles.len() as u64,
             SENDMODE_NOBLOCK,
-        ) == 0
+        )
+    }
+}
+
+/// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
+/// a refused send is a client gone (Phase 6 Part F).
+fn ping(ch: u64) -> Sent {
+    match send_raw(ch, OP_STORAGE_CHANGED, 0, 0, &[], &[]) {
+        0 => Sent::Queued,
+        r if r == KError::WouldBlock.as_i32() as i64 => Sent::Full,
+        _ => Sent::Gone,
     }
 }
 
@@ -686,6 +718,11 @@ struct Service {
     admin_ends: Vec<u64>,
     /// Admin sessions: channels carrying `Storage` requests.
     admin_sessions: Vec<u64>,
+    /// **Media sessions** (Phase 6 Part F): channels carrying `Eject`, in the wait set.
+    media_sessions: Vec<u64>,
+    /// **Watches** (Phase 6 Part F): channels this service only sends a ping on, outside the wait
+    /// set.
+    watches: Watches,
     dirs: Vec<(u64, Listing)>,
 }
 
@@ -774,6 +811,8 @@ impl Service {
             },
             Asked::SessionEndpoint => self.mint_session_endpoint(from, m.request_id),
             Asked::AdminEndpoint => self.mint_admin_endpoint(from, m.request_id),
+            Asked::Media => self.open_media_session(from, m.request_id),
+            Asked::Watch => self.open_watch(from, m.request_id),
             Asked::Unknown => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
         }
         true
@@ -813,6 +852,90 @@ impl Service {
             kprint(b"storage-service: an admin endpoint minted\n");
         } else {
             close(ours);
+        }
+    }
+
+    /// **Answer with a media session** (Phase 6 Part F): a channel carrying `Eject`, which ejects a
+    /// stick and mounts nothing — so a session endpoint answers it, as it answers the tables.
+    /// `WouldBlock` with every one taken: each is held for a request, so a retry finds one.
+    fn open_media_session(&mut self, reply_to: u64, request_id: u64) {
+        if self.media_sessions.len() >= MAX_MEDIA_SESSIONS {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+        }
+        let Some((client_end, ours)) = make_channel(4) else {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        };
+        if reply_channel(reply_to, request_id, client_end) {
+            self.media_sessions.push(ours);
+        } else {
+            close(ours);
+        }
+    }
+
+    /// **Answer with a watch** (Phase 6 Part F): a channel this service only sends a ping on, kept
+    /// outside its wait set. `WouldBlock` once every watch is held by a client still there.
+    fn open_watch(&mut self, reply_to: u64, request_id: u64) {
+        let Some((client_end, ours)) = make_channel(2) else {
+            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        };
+        match self.watches.add(ours, ping) {
+            Ok(gone) => {
+                gone.into_iter().for_each(close);
+                // A reply that does not go closes the client's end, and the next ping finds the
+                // watch gone.
+                let _ = reply_channel(reply_to, request_id, client_end);
+            }
+            Err(()) => {
+                close(ours);
+                close(client_end);
+                reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            }
+        }
+    }
+
+    /// **Tell every watch the mounts changed**, and let go of the ones whose clients have gone.
+    fn mounts_changed(&mut self) {
+        self.watches.changed(ping).into_iter().for_each(close);
+    }
+
+    /// The names mounted under `/storage`, in order: what a watch is told has changed.
+    fn mount_names(&self) -> Vec<String> {
+        self.mounted.iter().map(|m| m.label.clone()).collect()
+    }
+
+    /// One `Eject` on media session `i` (Phase 6 Part F): the unmount chain, held check included,
+    /// on a removable mount the service made, refused for anything else.
+    fn serve_media(&mut self, i: usize) {
+        let ch = self.media_sessions[i];
+        let m = match recv_request(ch) {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(()) => {
+                close(ch);
+                self.media_sessions.remove(i);
+                return;
+            }
+        };
+        let refuse = |err: KError, why: &[u8]| {
+            let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 128];
+            let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
+            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
+        };
+        if m.op != OP_STORAGE_EJECT {
+            return refuse(KError::Unsupported, b"a media session carries Eject alone");
+        }
+        let Ok(name) = core::str::from_utf8(&m.body) else {
+            return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
+        };
+        if let Err(r) = storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
+            return refuse(r.kerror(), r.why());
+        }
+        match self.unmount(name, true) {
+            Ok(()) => {
+                Line::new().s(b"storage-service: ejected ").untrusted(name.as_bytes()).s(b", safe to remove").end();
+                let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &[], &[]);
+            }
+            Err((err, why)) => refuse(err, why),
         }
     }
 
@@ -1020,7 +1143,9 @@ impl Service {
     fn shut_down(&mut self) -> ! {
         while let Some(x) = self.mounted.last() {
             let label = x.label.clone();
-            if let Err((_, why)) = self.unmount(&label, false) {
+            let result = self.unmount(&label, false);
+            self.mounts_changed();
+            if let Err((_, why)) = result {
                 // Out of the list whatever happened: the chain drops a mount once its server has
                 // been told, and one refused earlier is not asked again.
                 self.mounted.retain(|m| m.label != label);
@@ -1392,6 +1517,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         mounted,
         scratch,
         session_ends: Vec::new(),
+        media_sessions: Vec::new(),
+        watches: Watches::new(),
         admin_ends: Vec::new(),
         admin_sessions: Vec::new(),
         dirs: Vec::new(),
@@ -1447,11 +1574,18 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             for &a in &s.admin_sessions {
                 push(a);
             }
+            for &m in &s.media_sessions {
+                push(m);
+            }
             for &(d, _) in &s.dirs {
                 push(d);
             }
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
+        // **What a watch is told** (Phase 6 Part F): the names mounted before this turn, against
+        // after it. Compared here, once, rather than at each place that mounts or unmounts, so no
+        // path — an arrival, an eject, an administrator's request, a departure — can miss a ping.
+        let before = s.mount_names();
         for j in 0..waited.max(0) as usize {
             // SAFETY: `waited` records were written; the handle is the first word of each.
             let h = unsafe {
@@ -1490,9 +1624,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 }
             } else if let Some(i) = s.admin_sessions.iter().position(|&a| a == h) {
                 s.serve_admin(i);
+            } else if let Some(i) = s.media_sessions.iter().position(|&m| m == h) {
+                s.serve_media(i);
             } else if let Some(i) = s.dirs.iter().position(|&(d, _)| d == h) {
                 s.serve_dir(i);
             }
+        }
+        if s.mount_names() != before {
+            s.mounts_changed();
         }
     }
 }

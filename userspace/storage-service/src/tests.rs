@@ -10,7 +10,7 @@ use libstream::wire::{Table, Value};
 use crate::probe::{Found, fat_label, probe};
 use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::labels;
-use crate::mounts::{Plan, Refusal, Server, at, automount, explicit, in_use};
+use crate::mounts::{EjectRefusal, Plan, Refusal, Server, at, automount, eject, explicit, in_use};
 use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
@@ -348,7 +348,7 @@ fn all_tsm_has_a_row_per_device() {
     // A device that names nothing has an empty cell, not an empty string.
     let unnamed = Device { record: rec(9, DeviceKind::Disk, 5, NO_PARENT, "", 8), found: Found::Nothing };
     let i = table::schema().fields.iter().position(|f| f.name == "description").unwrap();
-    assert_eq!(table::row(&unnamed, None)[i], Value::Null);
+    assert_eq!(table::row(&unnamed, None, &[])[i], Value::Null);
     assert_eq!(column(&t, 0, "size"), &Value::Int(262_144 * 512));
     assert_eq!(column(&t, 0, "filesystem"), &Value::Null, "a disk holding a table holds no filesystem");
     assert_eq!(column(&t, 2, "filesystem"), &s("fat"));
@@ -370,12 +370,12 @@ fn clean_is_null_while_mounted_writable() {
     let at = |mode| Mounted { device: 7, at: String::from("/x"), by: By::Storage, mode };
     // By name, not position: a column added in front of these would otherwise move them.
     let col = |name: &str| table::schema().fields.iter().position(|f| f.name == name).unwrap();
-    let clean = |m: Option<&Mounted>| table::row(&ds[3], m)[col("clean")].clone();
+    let clean = |m: Option<&Mounted>| table::row(&ds[3], m, &ds)[col("clean")].clone();
     assert_eq!(clean(Some(&at(Mode::Rw))), Value::Null);
     assert_eq!(clean(Some(&at(Mode::Ro))), Value::Bool(false));
     assert_eq!(clean(None), Value::Bool(false));
-    assert_eq!(table::row(&ds[4], None)[col("clean")], Value::Bool(true));
-    assert_eq!(table::row(&ds[3], Some(&at(Mode::Ro)))[col("by")], s("storage"));
+    assert_eq!(table::row(&ds[4], None, &ds)[col("clean")], Value::Bool(true));
+    assert_eq!(table::row(&ds[3], Some(&at(Mode::Ro)), &ds)[col("by")], s("storage"));
 }
 
 #[test]
@@ -695,9 +695,9 @@ fn on_usb(mut r: DeviceRecord) -> DeviceRecord {
 }
 
 /// **A FAT is auto-mounted on a removable disk alone** — a stick's partition, or a stick holding
-/// one whole — by `fs-server-fat`, read-only on a live boot. An internal disk's servable FAT is not,
-/// nor a stick's FAT its server would refuse; an ext4 is mounted wherever it is, by
-/// `fs-server-ext4`.
+/// one whole — by `fs-server-fat`, writable on a live boot too (Phase 6 Part F). An internal disk's
+/// servable FAT is not, nor a stick's FAT its server would refuse; an ext4 is mounted wherever it
+/// is, by `fs-server-ext4`.
 #[test]
 fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
@@ -718,7 +718,7 @@ fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     let got: Vec<(u32, &str, Mode, Server)> = plan.iter().map(|p| (p.device, p.label.as_str(), p.mode, p.server)).collect();
     assert_eq!(
         got,
-        [(5, "data", Mode::Ro, Server::Ext4), (21, "NXSTICK", Mode::Ro, Server::Fat), (30, "WHOLE", Mode::Ro, Server::Fat)]
+        [(5, "data", Mode::Ro, Server::Ext4), (21, "NXSTICK", Mode::Rw, Server::Fat), (30, "WHOLE", Mode::Rw, Server::Fat)]
     );
     let mut on_sata = ds.clone();
     on_sata[3].record.driver = [0; 16];
@@ -804,4 +804,115 @@ fn a_fat_made_on_a_whole_stick_is_still_served() {
     mbr_entry_over(&lucky, 0x0C, 8, 64);
     lucky.0.borrow_mut()[0x1BE] = 0x33;
     assert_eq!(probe_record(&lucky, &disk).server(), Some(Server::Fat), "status 0x33 is no entry's");
+}
+
+// --- removable media for a session (Phase 6 Part F) --------------------------------------------
+
+/// A stick, a partition on it holding `found`, and the release boot's devices: the internal disk,
+/// its ESP and root, and the RAM disk.
+fn with_a_stick(found: Found) -> Vec<Device> {
+    let mut ds = devices();
+    ds.push(Device { record: on_usb(rec(20, DeviceKind::Disk, 5, 19, "a stick", 614_400)), found: Found::Nothing });
+    ds.push(Device { record: rec(21, DeviceKind::Partition, 6, 20, "partition 1 (unlabelled)", 614_000), found });
+    ds
+}
+
+/// **A stick mounts writable on a live boot** (Phase 6 Part F); an internal disk's filesystem stays
+/// read-only there, as the install target. On an installed machine both are writable.
+#[test]
+fn a_stick_mounts_writable_on_any_boot_and_an_internal_disk_read_only_on_a_live_one() {
+    let ds = with_a_stick(Found::Fat { label: String::from("NXFAT"), clean: Some(true), refused: None });
+    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
+    let modes = |live| -> Vec<(u32, Mode)> {
+        automount(&ds, &init, live, true).into_iter().map(|p| (p.device, p.mode)).collect()
+    };
+    assert_eq!(modes(true), [(8, Mode::Ro), (21, Mode::Rw)], "a live boot: the RAM disk read-only, the stick writable");
+    assert_eq!(modes(false), [(8, Mode::Rw), (21, Mode::Rw)]);
+}
+
+/// **A session ejects a stick, by the name it is mounted under**, and nothing else: not an internal
+/// disk's mount, not `init`'s, not a name nothing is mounted under. **The name is the mount's, not
+/// the filesystem's label** (PR #366 review): two sticks labelled `DATA` are mounted `DATA` and
+/// `DATA-2`, and each name ejects its own; a stick with no label, mounted under its partition's
+/// name, is ejected by that.
+#[test]
+fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
+    let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
+    let mut ds = with_a_stick(fat("DATA"));
+    ds.push(Device { record: on_usb(rec(30, DeviceKind::Disk, 7, 29, "another stick", 65_536)), found: fat("DATA") });
+    ds.push(Device { record: on_usb(rec(40, DeviceKind::Disk, 8, 39, "a third", 65_536)), found: fat("") });
+    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
+    let mut mounted: Vec<Mounted> = init.to_vec();
+    for p in automount(&ds, &init, true, true) {
+        mounted.push(Mounted { device: p.device, at: at(&p.label), by: By::Storage, mode: p.mode });
+    }
+    let names: Vec<&str> = mounted.iter().filter_map(|m| m.at.strip_prefix("/storage/")).collect();
+    assert_eq!(names, ["nitrox-live", "DATA", "DATA-2", "blk-8"], "the names the table's `mounted` column holds");
+    assert_eq!(eject(&ds, &mounted, "DATA"), Ok(21));
+    assert_eq!(eject(&ds, &mounted, "DATA-2"), Ok(30), "the second stick's own name, not its label");
+    assert_eq!(eject(&ds, &mounted, "blk-8"), Ok(40), "a stick with no label");
+    assert_eq!(eject(&ds, &mounted, "nitrox-live"), Err(EjectRefusal::NotRemovable), "a RAM disk's partition");
+    assert_eq!(eject(&ds, &mounted, "/"), Err(EjectRefusal::NotMounted), "init's root is not under /storage");
+    assert_eq!(eject(&ds, &mounted, "NXFAT"), Err(EjectRefusal::NotMounted));
+    let by_init = [Mounted { device: 21, at: at("DATA"), by: By::Init, mode: Mode::Rw }];
+    assert_eq!(eject(&ds, &by_init, "DATA"), Err(EjectRefusal::NotMounted), "`init`'s, wherever it put it");
+    assert_eq!(EjectRefusal::NotRemovable.kerror(), libkern::KError::NoAccess);
+    assert!(core::str::from_utf8(EjectRefusal::NotRemovable.why()).unwrap().contains("with admin disk --unmount"));
+}
+
+/// **The table says what is removable**: a stick and its partition, not the internal disk's.
+#[test]
+fn the_table_says_what_is_removable() {
+    let ds = with_a_stick(Found::Nothing);
+    let t = decode(&table::all(&ds, &[]));
+    let removable: Vec<(String, bool)> = (0..t.rows.len())
+        .map(|i| match (column(&t, i, "name"), column(&t, i, "removable")) {
+            (Value::Str(n), Value::Bool(b)) => (n.clone(), *b),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let internal = ["blk-0", "blk-1", "blk-2", "blk-3", "blk-4"].map(|n| (n, false));
+    let want: Vec<(String, bool)> = internal
+        .into_iter()
+        .chain([("blk-5", true), ("blk-6", true)])
+        .map(|(n, b)| (String::from(n), b))
+        .collect();
+    assert_eq!(removable, want);
+}
+
+/// **A session opens a media session and a watch**, and through a session endpoint too; neither is
+/// a table.
+#[test]
+fn a_session_opens_a_media_session_and_a_watch() {
+    assert_eq!(suffix::parse(b"info/media"), Asked::Media);
+    assert_eq!(suffix::parse(b"info/watch"), Asked::Watch);
+    assert_eq!(session_only(Asked::Media), Asked::Media);
+    assert_eq!(session_only(Asked::Watch), Asked::Watch);
+    assert_eq!(suffix::parse(b"info/media.tsm"), Asked::File("media"), "a table's name is not the channel");
+}
+
+/// **The watches**: each ping sent; a full queue kept, since it holds a ping already; a gone one
+/// dropped and returned to close. With every one of the 32 held, a new watch pings them all first,
+/// freeing the gone — and is refused when none had gone.
+#[test]
+fn the_watches_keep_the_living_and_free_the_gone() {
+    use crate::watch::{MAX_WATCHES, Sent, Watches};
+    let mut w = Watches::new();
+    for e in 0..MAX_WATCHES as u64 {
+        assert_eq!(w.add(e, |_| panic!("not full yet: nobody is pinged")), Ok(std::vec![]));
+    }
+    let gone = |e: u64| if e % 10 == 3 { Sent::Gone } else if e % 2 == 0 { Sent::Full } else { Sent::Queued };
+    assert_eq!(w.add(100, gone), Ok(std::vec![3, 13, 23]), "full: every watcher pinged, the gone freed");
+    assert_eq!(w.ends().len(), MAX_WATCHES - 2);
+    assert!(w.ends().contains(&100) && w.ends().contains(&4), "the new one in, a full one kept");
+    while w.ends().len() < MAX_WATCHES {
+        w.add(200 + w.ends().len() as u64, |_| Sent::Queued).unwrap();
+    }
+    assert_eq!(w.add(999, |_| Sent::Queued), Err(()), "full of the living");
+    let mut pinged = 0;
+    assert_eq!(w.changed(|_| {
+        pinged += 1;
+        Sent::Queued
+    }), std::vec![] as std::vec::Vec<u64>);
+    assert_eq!(pinged, MAX_WATCHES, "a change pings every watcher");
 }
