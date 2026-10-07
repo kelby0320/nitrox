@@ -34544,3 +34544,36 @@ eviction is exercised by a change bigger than the cache, beside a test that a re
 dirty is refused.
 
 **Controls:** 13 for the fixes, and 5 flushes each removed in turn, all failing.
+
+## 2026-10-07 — Phase 6 Part F, detailed: removable media for a session
+
+Part F's detail pass, in [`phase-6-usb.md`](planning/phase-6-usb.md) § *Part F in detail*. A stick
+plugged in mounts writable on any boot. A session ejects it without a password, from Files or
+`disk --eject`, and Files' sidebar lists the drives as they come and go.
+
+**What the pass found:**
+- **A session cannot send the storage service a request.** Every session reaches it through one
+  endpoint, shared by all of them through `service-mgr`'s route, which answers resolves of `fs…`
+  and `info…` alone.
+- **Nothing tells a client that the mounts changed**, and the table has no `removable` column.
+- **The unmount chain is not an administrator's in anything but who may reach it.**
+- **Files waits on its compositor channel alone**, and its sidebar is Places.
+
+**The shape:** one media channel per client at `/dev/storage/media`, opened by a resolve on the
+session endpoint as an admin session is opened on the admin endpoint. It carries `Eject` — the
+unmount chain, on a removable mount only — and a `Watch` of bare `Changed` pings. The table gains
+`removable`, `disk` gains `--eject`, and Files gains Drives with eject buttons.
+
+**The maintainer's calls, all four as recommended:**
+- **the watch is a ping**, and the client reads the table again — Part C's shape;
+- **Drives lists every mount under `/storage`**, with an eject button on the removable ones;
+- **the Save As chooser is unchanged**: a stick is reached by Up, `storage`, then its label;
+- **a new desktop gate, `check-media`, on the live image**, so the gate set goes to 43.
+
+**Calls made without the maintainer:**
+- an ejected stick stays unmounted until it is plugged in again;
+- any session can eject any stick;
+- eject is the chain and the flush, with no `START STOP UNIT`;
+- `/dev/storage/media` is not listed in `/dev/storage`;
+- Drives lists mounts only, so a stick refused for its clusters does not appear, and why it did not
+  mount is filed with Part G as what makes it usable.
