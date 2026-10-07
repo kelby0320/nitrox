@@ -34726,18 +34726,47 @@ default table first. The USB driver gains the sixteen-byte commands, and the tab
 **The maintainer's calls:**
 - **`disk` writes, and the service reads the device again**; and **a mounted device is never
   formatted** — unmount, format, and it is mounted again, the procedure everywhere.
-- **The kernel rescans a USB disk whose table changed.** Discussed: unmounting and remounting work on
-  the kernel's partition windows and never move them, so a format of an existing partition needs no
-  rescan and a new table does.
-- **Both verbs**, `--format` writing the default table on a whole disk; **one spanning partition** for
-  now, several with sizes filed.
-- **GPT as well as MBR**, the default table following the filesystem — an MBR for FAT, a GPT for ext4
-  — with `--mbr` and `--gpt` to choose: the maintainer's case is an external hard drive formatted
-  GPT and ext4.
+- **The kernel rescans a USB disk whose table changed.** Discussed: unmounting and remounting work
+  on the kernel's partition windows and never move them, so a format of an existing partition needs
+  no rescan and a new table does.
+- **Both verbs**, `--format` writing the default table on a whole disk; **one spanning partition**
+  for now, several with sizes filed.
+- **GPT as well as MBR**, the default table following the filesystem — an MBR for FAT, a GPT for
+  ext4 — with `--mbr` and `--gpt` to choose: the maintainer's case is an external hard drive
+  formatted GPT and ext4.
 - **The sixteen-byte commands in this part**, so such a drive appears at all.
 - **A `note` column** for why a device did not mount; Files unchanged.
 
-**Calls made without the maintainer:** FAT32 from about 257 MiB and FAT16 below it, clusters never
+**Calls made without the maintainer:** FAT32 from about 256.5 MiB and FAT16 below it, clusters never
 under 4 KiB, under 16 MiB refused; partitions from 1 MiB; default labels `NITROX` and `nitrox`; a
-partition's type kept when it is formatted; no new right for `Rescan`, whose holder can already
-overwrite the disk; 4096-byte logical sectors filed.
+partition's type kept when it is formatted; no new right for `Rescan`, which a partition's window
+refuses and whose disk's holder can already overwrite the disk; 4096-byte logical sectors filed.
+
+## 2026-10-07 — PR #368, reviewed: a partition's start, its siblings, and the boot disk
+
+No blocking findings; five worth fixing and two optional, all taken into Part G's detail pass. The
+first was reproduced by the reviewer on a host image, the rest checked against the code.
+
+1. **`--partition` wiped only the disk's first mebibyte**, and every partition it makes starts at
+   1 MiB — so an ext4 made there before kept its superblock at 1 MiB + 1024, and the new partition
+   arrived holding the old filesystem, mounted writable. The plan's gate would have failed at its
+   second step. **`--partition` now zeroes the first two mebibytes**, the table's and the new
+   partition's first, with a control: the sibling of PR #365's finding 4, one level down.
+2. **`Reread` of a partition was refused for a mounted sibling, after the write**: the `disks` grant
+   withholds a mounted device and its disk, never a sibling. A partition's `Reread` needs no rescan,
+   so it is refused only while that partition is mounted; a disk's, while anything on it is.
+3. **The boot disk's partitions are in the view**: `InUse` carries the disk alone. **`disk` refuses
+   a target on the disk the machine started from itself**, from `/dev/devices`' `boot` flag, before
+   writing, and the service refuses its `Reread`. Widening `InUse` would make the view withhold
+   them, and is not done here: `nxinstall` lists the ESP today and two gates hold it there.
+4. **"No new right" covered a disk's holder, not a partition's**: a partition window forwards a
+   `Flush` to its disk, and a `Rescan` routed the same way would let any filesystem server retire
+   its siblings' windows. **A partition's window answers `Rescan` itself, `Unsupported`**, with a
+   host test.
+5. **An MBR on a drive of 2 TiB or more**, the default for `--partition`, would have wrapped its
+   32-bit count or left the drive's end unused. **From 2 TiB the default table is a GPT** and
+   `--mbr` is refused, naming `--gpt`, with neighbour tests at 2 TiB.
+
+**Optional, both taken:** the FAT16/FAT32 line is a quarter-mebibyte band where neither is valid at
+4 KiB clusters, and FAT16 takes 8 KiB clusters there; and after a bare `--partition`, `disk` waits
+for the new partition's row and names its `blk-<n>`, rather than for a mount that never comes.

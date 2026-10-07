@@ -2333,7 +2333,9 @@ or more, which the USB storage driver leaves alone today.
 - **`with admin` holds both grants a format needs**: `disks`, every block device not in use bound
   raw at `/dev/blk/<n>`, and `storage`, the admin session (`view_broker::policy::seed`). **In use**
   is `InUse`'s answer: a mounted device, the disk holding it, and the disk the machine started from
-  — so a mounted stick is not in the view at all.
+  — so a mounted stick is not in the view at all. **A disk, not its partitions**: a mounted
+  partition's sibling is in the view, and so are the partitions of the disk the machine started
+  from.
 - **`nxinstall` already partitions and makes a filesystem** through the raw disk the `disks` grant
   gives it: `libgpt::table::build` for a GPT, `fs_server_ext4::mkfs::format` for an ext4 the size of
   the partition, written through `nxinstall`'s own device-window writer (`device::PartitionIo`).
@@ -2382,7 +2384,9 @@ internal ext4 as at boot, an internal FAT not at all.
 **A mounted device is never formatted**: unmount it, format it, and it is mounted again — the
 procedure everywhere. The refusal is in two places. The `disks` grant leaves a mounted device, and
 the disk holding it, out of the view, so `disk` cannot open it. And the service refuses `Reread`
-while anything on the disk is mounted. **The remount is the service's**, as an arrival's is, so
+of a device that is mounted — of a partition, while it is; of a disk, while anything on it is, since
+a disk's `Reread` rescans its partitions (PR #368 review: a partition's sibling may stay mounted,
+as the grant allows). **The remount is the service's**, as an arrival's is, so
 the person runs nothing for it.
 
 **When the table changes, the kernel reads it again.** Unmounting and mounting work on the kernel's
@@ -2391,41 +2395,55 @@ right, so `Reread` of a partition is a probe and a mount. **Partitioning moves t
 stick sold as one FAT filling the disk has no partition window to mount after a table is written,
 and a stick that had two partitions keeps a window for the second pointing into the middle of the
 new one. So `Reread` of a disk asks the kernel to **rescan** it first:
-- **`IoOpcode::Rescan`**, on a disk's node, needing `WRITE` as `Flush` does. The storage service
+- **`IoOpcode::Rescan`**, on a disk's node, needing `WRITE` as `Flush` does. **A partition's window
+  answers it itself, `Unsupported`**, where it passes a `Flush` down: forwarded, it would let a
+  holder of one partition — every filesystem server holds one — retire its siblings' windows (PR
+  #368 review). The storage service
   sends it, once nothing on the disk is mounted. **A USB disk** answers it: the hub thread retires
   each of its partitions' windows — a retired window refuses I/O, `PeerClosed` — departs their
   records, reads the table as at the disk's arrival, and publishes what it finds. The new
   partitions reach the service as arrivals, and are mounted as arrivals are.
 - **Any other disk answers `Unsupported`.** Partitioning an internal disk stays `nxinstall`'s, with
   a reboot after it; a format of an internal disk's partition needs no rescan.
-- **No new right guards it.** A holder of a writable raw disk can already overwrite every byte on
-  it, and a rescan does nothing worse; the `disks` grant gives one out only for a disk with nothing
-  mounted.
+- **No new right guards it.** It reaches only a holder of the writable *disk*, who can already
+  overwrite every byte on it, and a rescan does nothing worse; the `disks` grant gives one out only
+  for a disk with nothing mounted.
 
 **The commands:**
 - **`disk --partition DISK [--gpt]`** writes a table with **one partition spanning the disk**, from
-  1 MiB: an MBR, or with `--gpt` a GPT. It wipes what an older layout left where a reader looks —
-  the first and last mebibyte of the disk, so no stale GPT outlives an MBR — and asks for the
-  `Reread`. The new partition is typed for FAT (`0x0C`, or Microsoft basic data on a GPT), the
-  default filesystem.
+  1 MiB: an MBR, or with `--gpt` a GPT. It wipes what an older layout left where a reader looks:
+  **the first two mebibytes of the disk** — the table's and **the new partition's first** — and the
+  last, so no stale GPT outlives an MBR and **no old filesystem at 1 MiB outlives the table** (PR
+  #368 review: an ext4 made there before keeps its superblock at 1 MiB + 1024, and came back,
+  mounted, in a partition the plan said held nothing). Then it asks for the `Reread`. The new
+  partition is typed for FAT (`0x0C`, or Microsoft basic data on a GPT), the default filesystem.
+- **An MBR stops at 2 TiB**: its entries count sectors in 32 bits. **From 2 TiB the default table is
+  a GPT**, for `--partition` as for `--format`, and `--mbr` there is refused, naming `--gpt` — a
+  count cast to 32 bits would wrap to a smaller partition, and one clamped would leave the rest of
+  the drive unused, saying nothing (PR #368 review).
 - **`disk --format DEVICE fat|ext4 [LABEL] [--mbr|--gpt]`** makes a filesystem. **On a partition**,
   the filesystem in it. **On a whole disk**, `--partition`'s table first, and the filesystem in its
   one partition — the fast path for the usual case, a stick formatted in one command. **The default
   table follows the filesystem**: an MBR for FAT, what cameras, televisions and other systems expect
-  of a stick; a GPT for ext4, what a Linux drive is given. `--mbr` and `--gpt` choose. A
+  of a stick; a GPT for ext4, what a Linux drive is given; a GPT for either from 2 TiB. `--mbr` and
+  `--gpt` choose. A
   filesystem filling a whole disk with no table is not offered, though the service still mounts one
   another system made.
-- **What each says**: what it wrote, then what the service mounted, `/storage/<name>`. For a disk
-  the new partition arrives after the rescan, so `disk` opens a watch first and waits, bounded, for
-  the table to show it mounted.
+- **What each says**: what it wrote, then what the service did with it. For a disk the new partition
+  arrives after the rescan, so `disk` opens a watch first and waits, bounded, **for the new
+  partition's row**: after `--format`, mounted, `/storage/<name>`; after a bare `--partition`,
+  holding nothing, and named `blk-<n>` for the `--format` that follows (PR #368 review: it is never
+  mounted, so a wait for that would only have run to its bound).
 
 **The formatters:**
-- **FAT** is a new `mkfs` in `fs-server-fat`'s library, choosing by size with clusters of at least
-  4 KiB, the server's floor: **FAT32** from about 257 MiB, where 4 KiB clusters reach FAT32's
+- **FAT** is a new `mkfs` in `fs-server-fat`'s library, choosing by size with clusters of at least 4
+  KiB, the server's floor: **FAT32** from about 256.5 MiB, where 4 KiB clusters reach FAT32's
   65,525, with clusters of 4 KiB up to 8 GiB, 8 up to 16, 16 up to 32 and 32 above, Microsoft's
-  steps; **FAT16** below that; and **under 16 MiB, refused**, since 4 KiB clusters cannot make a
-  FAT16 there. Over 2 TiB is refused too, FAT32's sector count being 32 bits. The data region is
-  aligned to the cluster.
+  steps; **FAT16** below that, at 4 KiB clusters while they keep its count under 65,525 — and at 8
+  KiB in the quarter-mebibyte below FAT32's line where they would not, since at 4 KiB neither type
+  is valid there (PR #368 review: from 256.22 MiB FAT16 passes 65,524, and FAT32 reaches 65,525 only
+  at 256.47); and **under 16 MiB, refused**, since 4 KiB clusters cannot make a FAT16 there. Over 2
+  TiB is refused too, FAT32's sector count being 32 bits. The data region is aligned to the cluster.
 - **ext4** is `fs-server-ext4`'s formatter as `nxinstall` runs it: 4 KiB blocks and an inode per 16
   KiB.
 - **The device-window writer moves out of `nxinstall`**, since `disk` needs it too: a helper with
@@ -2475,11 +2493,17 @@ a person reading it learns that a stick needs formatting. Files is unchanged.
 - **`--format PART` keeps the partition's type**: the kernel and the storage service read the
   filesystem, not the type byte, and so does every system a stick is carried to.
 - **Volume IDs and UUIDs are random**, from the kernel's entropy, as `nxinstall`'s are.
-- **A refusal before anything is written**: a device not in the view — in use, or the boot medium —
-  is named as such; a disk not removable is refused for `--partition` and a whole-disk `--format`,
-  naming `nxinstall`.
-- **`Reread` refusals**: a device nothing has heard of, `NotFound`; anything on its disk mounted,
-  `WouldBlock`; a disk that cannot be rescanned, `Unsupported`.
+- **A refusal before anything is written**: a device not in the view — in use — is named as such;
+  **a device on the disk the machine started from is refused by `disk` itself**, from
+  `/dev/devices`' `boot` flag on the target or its disk, since the view withholds that disk alone
+  (PR #368 review: the live stick's ESP and root, and an installed machine's ESP, were in the view,
+  and nothing the plan named refused them); and a disk not removable is refused for `--partition`
+  and a whole-disk `--format`, naming `nxinstall`. Widening `InUse` to the boot disk's partitions
+  would make the view withhold them too; it is not done here, since `nxinstall` lists the ESP in
+  the view today and `test-interactive` and `boot-probe` hold it there.
+- **`Reread` refusals**: a device nothing has heard of, `NotFound`; a partition mounted, or a disk
+  with anything on it mounted, `WouldBlock`; anything on the disk the machine started from,
+  `NoAccess`; a disk that cannot be rescanned, `Unsupported`.
 - **4096-byte logical sectors stay unread**, filed: some older enclosures for large drives present
   them, and they reach into both filesystem servers.
 
@@ -2489,19 +2513,22 @@ a person reading it learns that a stick needs formatting. Files is unchanged.
   hub thread's re-read and re-publish of a USB disk's table.
 
   Host tests: the sixteen-byte CDBs, `READ CAPACITY(16)`'s answer, a unit's choice of ten or
-  sixteen; a window refusing I/O once retired; a rescan departing a disk's partitions and nothing
-  else.
+  sixteen; a window refusing I/O once retired; **a partition's window answering `Rescan` itself,
+  `Unsupported`**; a rescan departing a disk's partitions and nothing else.
 - **G.2 The formatters.** `fs-server-fat`'s `mkfs`; `libgpt`'s MBR builder and basic data type; the
   device-window writer, shared.
 
   Host tests: FAT images `fsck.fat -n` finds clean and mtools reads, at each type's and cluster
-  size's neighbours — 16 MiB, the FAT16/FAT32 line, 8, 16 and 32 GiB, as sparse images — and each
-  one served by the library; an MBR `sfdisk` reads as written, from bytes laid out by hand too.
+  size's neighbours — 16 MiB, both edges of the FAT16/FAT32 band, 8, 16 and 32 GiB, as sparse
+  images — and each one served by the library; an MBR `sfdisk` reads as written, from bytes laid
+  out by hand too; **the MBR builder refusing a disk of 2 TiB or more**, and the default table at
+  2 TiB less a sector and at 2 TiB.
 - **G.3 The storage service.** `Reread` (`0x1005`), its rescan, and mounting what is found; the
   `note` column.
 
-  Host tests: the refusals; the plan for a device read again; each `note`.
-- **G.4 `disk --partition` and `disk --format`.**
+  Host tests: the refusals — a partition's `Reread` taken beside a mounted sibling, a disk's refused
+  for one, anything on the boot disk refused; the plan for a device read again; each `note`.
+- **G.4 `disk --partition` and `disk --format`**, with the boot-disk refusal before any write.
 - **G.5 The gates.** Below.
 - **G.6 Docs.** Below.
 
@@ -2524,8 +2551,13 @@ a person reading it learns that a stick needs formatting. Files is unchanged.
      partition at 1 MiB, **no GPT signature left** at LBA 1, `fsck.fat -n` clean, and `mtype`
      reading what was written.
   4. **`disk --list`'s `note`** names the internal FAT's reason, `not removable, so not mounted`.
+  5. **`with admin disk --format` of a partition of the boot stick** is refused before anything is
+     written, naming the disk the machine started from.
 - **No new gate**: the set stays at 44.
 - **Controls**, planned:
+  - `--partition` wiping only the disk's first mebibyte: step 2's partition arrives holding step 1's
+    ext4, and is mounted;
+  - `disk` without its boot-disk check: step 5's refusal fails;
   - a rescan that departs no partition: step 2 finds the GPT's partition still listed;
   - an MBR written without wiping the GPT: the kernel reads the stale GPT, and step 3's host check
     finds its signature;
