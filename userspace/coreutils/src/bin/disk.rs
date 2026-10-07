@@ -4,6 +4,7 @@
 //! disk --list                        # every block device, its filesystem, where it is mounted
 //! disk --mount /dev/blk/1 [LABEL]    # mount it writable at /storage/<label>
 //! disk --unmount LABEL               # unmount it, leaving the filesystem clean
+//! disk --eject NAME                  # unmount a stick from /storage/<name>, so it can be pulled
 //! ```
 //!
 //! ## Two endpoints, two authorities
@@ -11,6 +12,11 @@
 //! **`--list` reads what every session can**: `/dev/storage/all.tsm`, the storage service's
 //! table, through the session endpoint every login binds (administration Part C.6). It needs no
 //! grant, and it is the same table a pipeline can `open` and `filter`.
+//!
+//! **So does `--eject`** (Phase 6 Part F): a **media session**, `/dev/storage/media` on the same
+//! endpoint, carries `Eject` by the name a stick is mounted under — the table's `mounted` column,
+//! not its `label`. The service runs the unmount chain on a removable drive's mount alone; an
+//! internal disk's is refused, naming `--unmount`, which still needs the grant.
 //!
 //! **`--mount` and `--unmount` need the `storage` grant.** They speak `Storage`
 //! (`rsproto-storage-ops.md`) on `/dev/storage/admin`, which the view broker binds only into a
@@ -40,7 +46,7 @@ use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
 use libkern::debug::Line;
 use libkern::error::KError;
 use libkern::{exit, kprint};
-use librsproto::storage::{OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount};
+use librsproto::storage::{OP_STORAGE_EJECT, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::wire::Table;
@@ -54,14 +60,17 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const TABLE: &[u8] = b"/dev/storage/all.tsm";
 /// Where the `storage` grant binds the admin endpoint.
 const ADMIN: &[u8] = b"/dev/storage/admin";
+/// A media session, through the session endpoint (Phase 6 Part F).
+const MEDIA: &[u8] = b"/dev/storage/media";
 
-const FLAGS: [Flag; 3] = [
+const FLAGS: [Flag; 4] = [
     Flag::long_only("list", "every block device, its filesystem, and where it is mounted"),
     Flag::long_only("mount", "mount DEVICE writable at /storage/<label> (needs the storage grant)"),
     Flag::long_only("unmount", "unmount the filesystem called LABEL (needs the storage grant)"),
+    Flag::long_only("eject", "unmount the removable drive at /storage/NAME, so it can be pulled"),
 ];
 
-const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LABEL\n\
+const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LABEL | --eject NAME\n\
     \n\
     --list              every block device, what it holds, where it is mounted, and whether\n\
     \x20                   it was left clean, as a table\n\
@@ -69,8 +78,11 @@ const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LA
     \x20                   the label the storage service chooses\n\
     --unmount LABEL     write back every file, flush the drive, and unmount; refused while a\n\
     \x20                   file on it is open\n\
+    --eject NAME        the same for the removable drive at /storage/NAME, after which it can\n\
+    \x20                   be pulled out\n\
     \n\
-    Mounting and unmounting need the storage grant: run them with `with admin`.\n\
+    Mounting and unmounting need the storage grant: run them with `with admin`. Ejecting a\n\
+    removable drive does not.\n\
     \n\
     \x20     --help    show this help and exit\n\
     \x20     --version show version information and exit\n";
@@ -91,13 +103,17 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.answer(VERSION);
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
-    let verbs = [args.has("list"), args.has("mount"), args.has("unmount")];
+    let verbs = [args.has("list"), args.has("mount"), args.has("unmount"), args.has("eject")];
     let code = match (verbs, ops.as_slice()) {
-        ([true, false, false], []) => list(&stage),
-        ([false, true, false], [device]) => mount(&stage, device, ""),
-        ([false, true, false], [device, label]) => mount(&stage, device, label),
-        ([false, false, true], [label]) => unmount(&stage, label),
-        _ => stage.die(b"disk: one of --list, --mount DEVICE [LABEL] or --unmount LABEL (try --help)\n", EXIT_USAGE),
+        ([true, false, false, false], []) => list(&stage),
+        ([false, true, false, false], [device]) => mount(&stage, device, ""),
+        ([false, true, false, false], [device, label]) => mount(&stage, device, label),
+        ([false, false, true, false], [label]) => unmount(&stage, label),
+        ([false, false, false, true], [name]) => eject(&stage, name),
+        _ => stage.die(
+            b"disk: one of --list, --mount DEVICE [LABEL], --unmount LABEL or --eject NAME (try --help)\n",
+            EXIT_USAGE,
+        ),
     };
     exit(code)
 }
@@ -178,9 +194,9 @@ fn device_name(operand: &str) -> Option<String> {
 
 /// Why a `Storage` request failed.
 enum Failure {
-    /// This namespace has no admin endpoint: the `storage` grant was not given.
-    NoGrant,
-    /// The admin endpoint is here and opened no session, for this reason: every admin session in
+    /// Nothing at the path answered: for the admin endpoint, the `storage` grant was not given.
+    NotHere,
+    /// The endpoint is here and opened no session, for this reason: every session of the kind in
     /// use is `WouldBlock`.
     Unopened(KError),
     /// The session broke, or its reply did not parse.
@@ -189,24 +205,25 @@ enum Failure {
     Refused(String),
 }
 
-/// Open an admin session on `/dev/storage/admin`, send one request, and return the reply's body.
+/// Open a session at `at` — an admin session on `/dev/storage/admin`, or a media session on
+/// `/dev/storage/media` — send one request, and return the reply's body.
 ///
-/// **No grant, told apart from a busy one.** Without the grant the path resolves through the
+/// **No grant, told apart from a busy one.** Without the grant the admin path resolves through the
 /// session endpoint at the base `/info`, where `info/admin` is no table, or through nothing at all:
 /// `NotFound` either way. That is the one answer that means "not in a view with `storage`". Any
 /// other is the service's, and is printed as such: telling a person with the grant to go and get
 /// it is worse than saying nothing.
-fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
-    let (st, session) = libfs::lookup_wait(stage.namespace, ADMIN, librsproto::session::DIR_SESSION_RIGHTS);
+fn ask(stage: &Stage, at: &[u8], op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
+    let (st, session) = libfs::lookup_wait(stage.namespace, at, librsproto::session::DIR_SESSION_RIGHTS);
     if st == KError::NotFound.as_i32() {
-        return Err(Failure::NoGrant);
+        return Err(Failure::NotHere);
     }
     if st != 0 || session == 0 {
         return Err(Failure::Unopened(KError::from_i32(st)));
     }
     let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
     let reply = librsproto::session::round_trip(session, &mut buf, 1, op, body);
-    // SAFETY: closing the admin session this call opened.
+    // SAFETY: closing the session this call opened.
     unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
     let len = reply.map_err(|_| Failure::Transport)?;
     let msg = librsproto::decode(&buf[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len]).map_err(|_| Failure::Transport)?;
@@ -226,10 +243,19 @@ fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
 /// Report a failed request about `what`, and return the exit status for it.
 fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i64 {
     let text = match f {
-        Failure::NoGrant => format!(
+        Failure::NotHere if verb == "eject" => {
+            String::from("disk: cannot eject here -- no /dev/storage/media in this namespace\n")
+        }
+        Failure::NotHere => format!(
             "disk: cannot {verb} here -- mounting and unmounting need the storage grant: `with admin disk --{verb} ...`\n"
         ),
-        Failure::Unopened(e) => format!("disk: {what} not {verb}ed: the storage service opened no admin session ({e:?})\n"),
+        Failure::Unopened(KError::WouldBlock) if verb == "eject" => {
+            format!("disk: {what} not ejected: every media session is in use; try again\n")
+        }
+        Failure::Unopened(e) => {
+            let kind = if verb == "eject" { "media" } else { "admin" };
+            format!("disk: {what} not {verb}ed: the storage service opened no {kind} session ({e:?})\n")
+        }
         Failure::Transport => format!("disk: lost the storage service while asking to {verb} {what}\n"),
         Failure::Refused(why) => format!("disk: {what} not {verb}ed: {why}\n"),
     };
@@ -248,7 +274,7 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
         say(stage, "disk: that label is too long\n");
         return EXIT_USAGE;
     };
-    let reply = match ask(stage, OP_STORAGE_MOUNT, &body[..n]) {
+    let reply = match ask(stage, ADMIN, OP_STORAGE_MOUNT, &body[..n]) {
         Ok(r) => r,
         Err(f) => return failed(stage, "mount", &device, f),
     };
@@ -271,7 +297,7 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
 
 /// `disk --unmount LABEL`.
 fn unmount(stage: &Stage, label: &str) -> i64 {
-    if let Err(f) = ask(stage, OP_STORAGE_UNMOUNT, label.as_bytes()) {
+    if let Err(f) = ask(stage, ADMIN, OP_STORAGE_UNMOUNT, label.as_bytes()) {
         return failed(stage, "unmount", label, f);
     }
     match stage.streams.stdout {
@@ -286,6 +312,26 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
         None => stage.note(format!("{label} unmounted\n").as_bytes()),
     }
     Line::new().s(b"disk: unmounted ").untrusted(label.as_bytes()).end();
+    EXIT_OK
+}
+
+/// `disk --eject NAME`: a media session's `Eject`, answered once the stick can be pulled. `NAME`
+/// may be given as its path, `/storage/NAME`, as `--list` shows it.
+fn eject(stage: &Stage, name: &str) -> i64 {
+    let name = name.strip_prefix("/storage/").unwrap_or(name);
+    if let Err(f) = ask(stage, MEDIA, OP_STORAGE_EJECT, name.as_bytes()) {
+        return failed(stage, "eject", name, f);
+    }
+    match stage.streams.stdout {
+        Some(h) => {
+            let schema = Schema::new()
+                .field("name", TypeTag::String, TypeModifiers::NONE)
+                .field("ejected", TypeTag::Bool, TypeModifiers::NONE);
+            write_table(stage, h, &schema, &[alloc::vec![Value::Str(String::from(name)), Value::Bool(true)]]);
+        }
+        None => stage.note(format!("{name} ejected: it can be removed\n").as_bytes()),
+    }
+    Line::new().s(b"disk: ejected ").untrusted(name.as_bytes()).end();
     EXIT_OK
 }
 
