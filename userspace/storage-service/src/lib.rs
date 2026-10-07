@@ -7,7 +7,8 @@
 //! - [`table`] — the TSM1 tables `/svc/storage/info` serves;
 //! - [`labels`] — what a mount is called under `/storage`;
 //! - [`mounts`] — what is mounted at boot, and how;
-//! - [`suffix`] — what a resolve that reached the service asked for, and where it may ask it.
+//! - [`suffix`] — what a resolve that reached the service asked for, and where it may ask it;
+//! - [`watch`] — the sessions following the mounts, and who is told when they change.
 //!
 //! The binary is the event loop: taking `block` from the device manager, reading each device, and
 //! serving.
@@ -205,7 +206,8 @@ pub mod sources {
     //!
     //! **A live boot is one whose root is on a RAM disk**: the root's partition belongs to one, or
     //! the root is one. That is what makes the machine's own disks the install target, so the
-    //! service auto-mounts read-only there.
+    //! service auto-mounts an internal disk read-only there (a removable one writable, since
+    //! Phase 6 Part F).
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -323,11 +325,13 @@ pub mod table {
     //! `/dev/blk/<n>`, so a row here and a row there are the same device.
     //!
     //! Columns: `name`, `kind`, `size`, `filesystem` (`ext4` or `fat`), `label` (the filesystem's
-    //! own), `mounted` (where), `by` (`init` or `storage`), `mode` (`ro` or `rw`) and `clean`,
+    //! own), `mounted` (where), `by` (`init` or `storage`), `mode` (`ro` or `rw`), `clean`,
     //! whether the filesystem was left cleanly unmounted. **`clean` is `Null` for anything but
     //! ext4 and FAT, and for a filesystem mounted writable**: that one's state says it is in use,
     //! because it is, and says nothing about how it was left. What a device does not have is
-    //! `Null`.
+    //! `Null`. And `removable` (Phase 6 Part F): whether the device is a disk behind USB mass
+    //! storage, or a partition of one — what a session may eject, and what Files puts an eject
+    //! button on.
 
     use alloc::format;
     use alloc::string::String;
@@ -407,10 +411,12 @@ pub mod table {
             .field("by", TypeTag::String, nullable)
             .field("mode", TypeTag::String, nullable)
             .field("clean", TypeTag::Bool, nullable)
+            .field("removable", TypeTag::Bool, TypeModifiers::NONE)
     }
 
-    /// `d`'s row, mounted as `mount` says.
-    pub fn row(d: &Device, mount: Option<&Mounted>) -> Vec<Value> {
+    /// `d`'s row, mounted as `mount` says, among `all` the devices — which a partition's disk is
+    /// one of, to say whether it is removable.
+    pub fn row(d: &Device, mount: Option<&Mounted>, all: &[Device]) -> Vec<Value> {
         let r = &d.record;
         let text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Str(String::from(s)));
         let size = (r.logical_block_size != 0)
@@ -436,6 +442,7 @@ pub mod table {
             text(mount.map(|m| m.by.word())),
             text(mount.map(|m| if m.mode == Mode::Ro { "ro" } else { "rw" })),
             clean,
+            Value::Bool(crate::mounts::removable(d, all)),
         ]
     }
 
@@ -453,13 +460,13 @@ pub mod table {
 
     /// `all.tsm`: every block device, a row each, in registry order.
     pub fn all(devices: &[Device], mounts: &[Mounted]) -> Vec<u8> {
-        encode(devices.iter().map(|d| row(d, mount_of(d, mounts))).collect())
+        encode(devices.iter().map(|d| row(d, mount_of(d, mounts), devices)).collect())
     }
 
     /// `<name>.tsm`: the one device called `name`, if there is one.
     pub fn one(devices: &[Device], mounts: &[Mounted], name: &str) -> Option<Vec<u8>> {
         let d = devices.iter().find(|d| self::name(&d.record) == name)?;
-        Some(encode(vec![row(d, mount_of(d, mounts))]))
+        Some(encode(vec![row(d, mount_of(d, mounts), devices)]))
     }
 
     /// The directory's entries: `all.tsm`, then each device's, in registry order.
@@ -534,10 +541,11 @@ pub mod mounts {
     //! likely, which nobody asked to have mounted: an administrator's `disk --mount` takes one.
     //! Whatever it mounts, it spawns the server for its kind ([`Server`]).
     //!
-    //! **A live boot mounts read-only**: the root is on a RAM disk, which makes the machine's own
-    //! disks the install target, and nothing written to one of them by accident could be taken
-    //! back. An administrator's explicit mount (C.5c) is writable either way; it is the automatic
-    //! one that has to be careful.
+    //! **A live boot mounts the machine's own disks read-only**: the root is on a RAM disk, which
+    //! makes them the install target, and nothing written to one of them by accident could be taken
+    //! back. **A removable disk mounts writable on any boot** (Phase 6 Part F): a stick is the
+    //! session's, which may eject it ([`eject`]). An administrator's explicit mount (C.5c) is
+    //! writable either way; it is the automatic one that has to be careful.
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -578,7 +586,8 @@ pub mod mounts {
         pub device: u32,
         /// Its label, unique among the plan's.
         pub label: String,
-        /// `ro` on a live boot, `rw` otherwise.
+        /// `ro` for an internal disk on a live boot, `rw` otherwise (Phase 6 Part F; every mount of
+        /// a live boot was `ro` until then).
         pub mode: Mode,
         /// The server for what it holds.
         pub server: Server,
@@ -732,7 +741,6 @@ pub mod mounts {
         if !init_known {
             return Vec::new();
         }
-        let mode = if live { Mode::Ro } else { Mode::Rw };
         let mut taken: Vec<String> = taken.to_vec();
         let mut plan = Vec::new();
         for d in candidates {
@@ -747,9 +755,69 @@ pub mod mounts {
             }
             let label = labels::unique(&labels::preferred(d), &taken);
             taken.push(label.clone());
+            let mode = if live && !removable(d, all) { Mode::Ro } else { Mode::Rw };
             plan.push(Plan { device: d.record.id, label, mode, server });
         }
         plan
+    }
+
+    /// **Why a session's eject was refused** (Phase 6 Part F).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum EjectRefusal {
+        /// Nothing is mounted under that name.
+        NotMounted,
+        /// What is mounted there is not on a removable disk.
+        NotRemovable,
+    }
+
+    impl EjectRefusal {
+        /// The error a client is answered with.
+        pub fn kerror(self) -> libkern::KError {
+            match self {
+                EjectRefusal::NotMounted => libkern::KError::NotFound,
+                EjectRefusal::NotRemovable => libkern::KError::NoAccess,
+            }
+        }
+
+        /// The reason, as the refusal says it.
+        pub fn why(self) -> &'static [u8] {
+            match self {
+                EjectRefusal::NotMounted => b"nothing is mounted under that name",
+                EjectRefusal::NotRemovable => {
+                    b"it is not removable: an internal disk is unmounted with the storage grant (with admin disk --unmount)"
+                }
+            }
+        }
+    }
+
+    /// **A session's eject of the drive holding the mount named `name`**: the names of every mount
+    /// this service made on that disk, in the order they were made — `name` among them — if
+    /// something is mounted under `/storage/<name>` on a removable disk.
+    ///
+    /// **The drive, not the one filesystem** (PR #367 review): a stick is pulled whole, so an
+    /// eject that unmounted one partition and said the stick could be pulled left its other
+    /// partitions mounted, their unwritten files lost and their filesystems marked in use — the
+    /// outcome an eject exists to prevent. **The name is the mount's**, what [`at`] made of a
+    /// [`Plan`]'s label — the table's `mounted` column — never the filesystem's own label, which
+    /// two sticks can share and a stick can lack. An internal disk's mount is the `storage`
+    /// grant's to unmount, as it always was; `init`'s mounts are not this service's.
+    pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<Vec<String>, EjectRefusal> {
+        use crate::table::By;
+        let want = at(name);
+        let m = mounted.iter().find(|m| m.by == By::Storage && m.at == want).ok_or(EjectRefusal::NotMounted)?;
+        let d = devices.iter().find(|d| d.record.id == m.device).ok_or(EjectRefusal::NotMounted)?;
+        if !removable(d, devices) {
+            return Err(EjectRefusal::NotRemovable);
+        }
+        // The disk: the device itself when a filesystem fills it, else the partition's parent.
+        let partition = d.record.kind() == libkern::device::DeviceKind::Partition;
+        let disk = if partition { d.record.parent } else { d.record.id };
+        let on_disk = |id: u32| devices.iter().any(|x| x.record.id == id && (id == disk || x.record.parent == disk));
+        Ok(mounted
+            .iter()
+            .filter(|m| m.by == By::Storage && on_disk(m.device))
+            .filter_map(|m| m.at.strip_prefix("/storage/").map(String::from))
+            .collect())
     }
 
     /// **Whether `d` is on a removable disk** (Phase 6 Part E.5): a disk behind USB mass storage
@@ -809,6 +877,11 @@ pub mod suffix {
         /// `admin-endpoint`: a forwarding endpoint of the service's own, on which any resolve is
         /// answered with an admin session — a channel for `Storage` requests (C.5c).
         AdminEndpoint,
+        /// `info/media`: a media session, carrying `Eject` (Phase 6 Part F).
+        Media,
+        /// `info/watch`: a watch, on which the service sends a ping per change in the mounts
+        /// (Phase 6 Part F).
+        Watch,
         /// Anything else.
         Unknown,
     }
@@ -827,6 +900,12 @@ pub mod suffix {
         if suffix == b"admin-endpoint" {
             return Asked::AdminEndpoint;
         }
+        if suffix == b"info/media" {
+            return Asked::Media;
+        }
+        if suffix == b"info/watch" {
+            return Asked::Watch;
+        }
         if let Some(file) = suffix.strip_prefix(b"info/") {
             return match file.strip_suffix(b".tsm").map(core::str::from_utf8) {
                 Some(Ok(name)) if !name.is_empty() && !name.contains('/') => Asked::File(name),
@@ -844,13 +923,89 @@ pub mod suffix {
     }
 
     /// What a resolve arriving on a session endpoint gets: the tables and the filesystems as
-    /// asked, and **any endpoint answered as if it did not exist**: another session endpoint,
-    /// whose holder could then mint more, and above all the admin endpoint, which mounts and
-    /// unmounts.
+    /// asked, a media session and a watch (Phase 6 Part F), and **any endpoint answered as if it
+    /// did not exist**: another session endpoint, whose holder could then mint more, and above all
+    /// the admin endpoint, which mounts and unmounts. A media session ejects a stick and mounts
+    /// nothing, which is what a session may do.
     pub fn session_only(asked: Asked<'_>) -> Asked<'_> {
         match asked {
             Asked::SessionEndpoint | Asked::AdminEndpoint => Asked::Unknown,
             other => other,
+        }
+    }
+}
+
+pub mod watch {
+    //! **The sessions following the mounts** (Phase 6 Part F): each a channel the service holds one
+    //! end of and **only sends on** — a bare `Changed` per change — so none takes a slot in the
+    //! service's wait set, and a client holds one for its life at no cost to another's.
+    //!
+    //! **A full queue is a ping already waiting**, since a watch carries nothing else: nothing is
+    //! owed, and a watcher that falls behind loses no change. **A watcher that has gone is found by
+    //! the ping that fails**, `PeerClosed`, and dropped then; when the list is full, every watcher is
+    //! pinged first, which costs the living a needless read of the table and frees the dead.
+    //!
+    //! Nothing here makes a syscall: a ping is the caller's, as an [`Sent`] it reports, so every rule
+    //! is a host test.
+
+    use alloc::vec::Vec;
+
+    /// How many watches can be held: the machine's, not a session's, since the service cannot tell
+    /// sessions apart. The shell starts a Files per Places pick and per launch, each holding one.
+    pub const MAX_WATCHES: usize = 32;
+
+    /// What a ping did.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Sent {
+        /// It is queued.
+        Queued,
+        /// The queue is full — of pings, since a watch carries nothing else.
+        Full,
+        /// The client has gone.
+        Gone,
+    }
+
+    /// The watches held: this service's ends of them.
+    #[derive(Default, Debug)]
+    pub struct Watches {
+        ends: Vec<u64>,
+    }
+
+    impl Watches {
+        /// None held.
+        pub fn new() -> Watches {
+            Watches { ends: Vec::new() }
+        }
+
+        /// The ends held, in the order they were taken.
+        pub fn ends(&self) -> &[u64] {
+            &self.ends
+        }
+
+        /// **Ping every watcher**, `ping` sending to each end, and let go of the ones that have
+        /// gone — returned, for the caller to close.
+        pub fn changed(&mut self, mut ping: impl FnMut(u64) -> Sent) -> Vec<u64> {
+            let mut gone = Vec::new();
+            self.ends.retain(|&e| match ping(e) {
+                Sent::Gone => {
+                    gone.push(e);
+                    false
+                }
+                Sent::Queued | Sent::Full => true,
+            });
+            gone
+        }
+
+        /// **Take a new watch's end.** With the list full, every watcher is pinged first, freeing
+        /// the gone; `Err` if it is full still, and the caller refuses the watch. The ends of the
+        /// gone, for the caller to close.
+        pub fn add(&mut self, end: u64, ping: impl FnMut(u64) -> Sent) -> Result<Vec<u64>, ()> {
+            let gone = if self.ends.len() >= MAX_WATCHES { self.changed(ping) } else { Vec::new() };
+            if self.ends.len() >= MAX_WATCHES {
+                return Err(());
+            }
+            self.ends.push(end);
+            Ok(gone)
         }
     }
 }

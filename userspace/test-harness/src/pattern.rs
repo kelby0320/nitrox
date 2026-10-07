@@ -4,12 +4,18 @@
 //! ```text
 //! test-pattern --write PATH   # create PATH, map it writable, fill it, unmap, exit: no sync
 //! test-pattern --check PATH   # read PATH and compare it with the pattern
+//! test-pattern --eject-held PATH NAME   # hold PATH open, and ask for NAME's eject meanwhile
 //! ```
 //!
 //! **Why a test program.** No release program writes through a mapping and lets go without a
 //! sync: `libfs`, `nxsh` and `nxedit` all sync. So the case an unmount's write-back exists for has
 //! no writer outside a test image. `cargo xtask check-storage` runs this at a serial prompt on a
 //! live test image, against a SATA disk it then reads on the host.
+//!
+//! **`--eject-held` is a second process a shell cannot be** (Phase 6 Part F): `nxsh` has no
+//! background jobs yet, so nothing at a prompt can hold a file while `disk --eject` runs. This holds
+//! `PATH` and sends the `Eject` itself, on a media session as `disk` and Files open one, and says
+//! what the service answered — which, a file on it being held, must be a refusal.
 //!
 //! **A refusal is named**, with the kernel's status: on a read-only mount the create is refused
 //! `NoAccess`, and the gate matches that rather than a generic "cannot create".
@@ -55,8 +61,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let code = match args.as_slice() {
         [_, "--write", path] => write(ns, path.as_bytes()),
         [_, "--check", path] => check(ns, path.as_bytes()),
+        [_, "--eject-held", path, name] => eject_held(ns, path.as_bytes(), name.as_bytes()),
         _ => {
-            kprint(b"usage: test-pattern --write PATH | --check PATH\n");
+            kprint(b"usage: test-pattern --write PATH | --check PATH | --eject-held PATH NAME\n");
             2
         }
     };
@@ -165,6 +172,61 @@ fn check(ns: u64, path: &[u8]) -> i64 {
                 l.s(b", and differs from the pattern at byte ").u(i as u64);
             }
             l.s(b" FAIL").end();
+            1
+        }
+    }
+}
+
+/// `--eject-held`: hold `path`, ask the storage service to eject `name` through a media session,
+/// let go — and succeed only if the eject was refused for the file held.
+fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
+    use librsproto::storage::OP_STORAGE_EJECT;
+    let (st, held) = libfs::lookup_wait(ns, path, RIGHT_MAP_READ);
+    if st != 0 || held == 0 {
+        Line::new()
+            .s(b"test-pattern: ")
+            .untrusted(path)
+            .s(b" would not open to hold: ")
+            .s(status_name(st).as_bytes())
+            .s(b" FAIL")
+            .end();
+        return 1;
+    }
+    let (st, media) = libfs::lookup_wait(ns, b"/dev/storage/media", librsproto::session::DIR_SESSION_RIGHTS);
+    let answer = if st == 0 && media != 0 {
+        let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+        let reply = librsproto::session::round_trip(media, &mut buf, 1, OP_STORAGE_EJECT, name);
+        // SAFETY: closing the media session this call opened.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, media) };
+        let off = libkern::abi::IPC_HEADER_SIZE;
+        reply.ok().and_then(|len| librsproto::decode(&buf[off..off + len]).ok()).map(|m| {
+            let refusal = (m.flags & librsproto::RS_FLAG_ERROR != 0)
+                .then(|| librsproto::error::parse_error(m.body).map(|e| (e.kerror, alloc::vec::Vec::from(e.msg))))
+                .flatten();
+            (m.op, refusal)
+        })
+    } else {
+        None
+    };
+    // SAFETY: closing the file this call held.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, held) };
+    let mut l = Line::new();
+    l.s(b"test-pattern: eject of ").untrusted(name).s(b" with ").untrusted(path).s(b" held: ");
+    match answer {
+        Some((OP_STORAGE_EJECT, Some((kerror, why)))) if kerror == KError::WouldBlock.as_i32() => {
+            l.s(b"refused, ").untrusted(&why).s(b" ok").end();
+            0
+        }
+        Some((_, Some((kerror, why)))) => {
+            l.s(b"refused ").s(status_name(kerror).as_bytes()).s(b", ").untrusted(&why).s(b" FAIL").end();
+            1
+        }
+        Some(_) => {
+            l.s(b"ejected FAIL").end();
+            1
+        }
+        None => {
+            l.s(b"no answer (status ").i(st as i64).s(b") FAIL").end();
             1
         }
     }

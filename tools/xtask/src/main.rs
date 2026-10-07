@@ -17,6 +17,7 @@
 //!   check-logout    log out from the desktop's power menu, waiting on the editor's question
 //!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
 //!   check-live      boot the live image as a USB stick with no disk; mount, greeter, and a write
+//!   check-media     the live desktop: a stick plugged in, shown in Files, saved to, ejected
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -157,6 +158,22 @@ mod browser {
     pub const ROW_H: i32 = 25;
     /// The column header above the rows (`nxfiles::HEADER_H`), new in Part I.
     pub const HEADER_H: i32 = 25;
+    /// The menu bar above the path strip (`nxfiles::MENU_BAR_H`).
+    pub const MENU_BAR_H: i32 = 24;
+    /// The Drives heading below the places (`nxfiles::DRIVES_HEADING_H`, a row's height): Phase 6
+    /// Part F.
+    pub const DRIVES_HEADING_H: i32 = ROW_H;
+}
+
+/// **The editor's chooser, as the gates aim at it** — `nxedit::CHOOSER_KEY`, the key its dialog's
+/// elements are numbered from. `the_gates_editor_table_is_the_editors` keeps the copy honest; the
+/// layout itself is `libui`'s, which this crate links, so the gate lays the chooser out as the
+/// editor does rather than writing down where its controls are.
+mod editor {
+    /// The chooser's key base (`nxedit::CHOOSER_KEY`).
+    pub const CHOOSER_KEY: u64 = 200;
+    /// Its Up button's key, as `libui::chooser::view` numbers it.
+    pub const CHOOSER_UP_KEY: u64 = CHOOSER_KEY + 7;
 }
 
 const DEMO_USER: &str = "alice";
@@ -438,6 +455,7 @@ fn main() -> ExitCode {
         "check-fbcon",
         "check-live",
         "check-storage",
+        "check-media",
         "check-shutdown",
         "check-report",
         "check-install",
@@ -533,6 +551,7 @@ fn main() -> ExitCode {
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
         Some("check-storage") => cmd_check_storage(accel, gate_size),
+        Some("check-media") => cmd_check_media(accel, gate_size),
         Some("check-shutdown") => cmd_check_shutdown(accel, gate_size),
         Some("check-install") => cmd_check_install(accel, gate_size),
         Some("check-recovery") => cmd_check_recovery(accel, gate_size),
@@ -2233,7 +2252,8 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
     s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    s.expect("help-rows=13")?;
+    // Sixteen since Phase 6 Part F gave `--eject` its two lines and the grant's note a third.
+    s.expect("help-rows=16")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
@@ -4498,7 +4518,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     // **Two sticks to plug in** (Phase 6 Part D): an MBR one holding an ext4 partition, which is
     // ejected and read on the host, and a whole-disk ext4, which is pulled while mounted.
     let stick_mbr = work.join("stick-mbr.img");
-    mbr_ext4_stick(&stick_mbr, 32, STICK_MBR_LABEL)?;
+    mbr_ext4_stick(&stick_mbr, 48, [STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
     let stick_whole = work.join("stick-whole.img");
     whole_ext4_stick(&stick_whole, 16, STICK_WHOLE_LABEL)?;
     // **And a FAT stick** (Phase 6 Part E.6), for `fs-server-fat`.
@@ -4550,7 +4570,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     println!("\nxtask: the machine is stopped; the disk, on the host:");
     check_storage_disk(&disk, &work)?;
     println!("\nxtask: and the sticks:");
-    check_sticks(&stick_mbr, &stick_whole, &work)?;
+    check_sticks(&stick_mbr, &work.join("stick-whole-pulled.img"), &work)?;
     check_fat_stick(&stick_fat, &work)?;
     println!(
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
@@ -4561,6 +4581,11 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
 
 /// The labels of `check-storage`'s two sticks (Phase 6 Part D).
 const STICK_MBR_LABEL: &str = "nxstick";
+/// The MBR stick's second partition's label (PR #367 review): an eject takes the whole stick.
+const STICK_MBR_LABEL_2: &str = "nxstick2";
+/// The MBR stick's two partitions, as sectors: the first 31 MiB from 1 MiB, the second 15 MiB from
+/// 32 MiB, on a 48 MiB stick.
+const STICK_MBR_PARTS: [(u32, u32); 2] = [(2048, 63_488), (65_536, 30_720)];
 const STICK_WHOLE_LABEL: &str = "nxwhole";
 
 /// `mke2fs`'s features for a filesystem `fs-server-ext4` serves: the live image's root's.
@@ -4580,16 +4605,22 @@ fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
 
 /// **A stick with an MBR naming one Linux partition**, `mib` MiB, the partition from 1 MiB to the
 /// end holding an ext4 labelled `label` (Phase 6 Part D).
-fn mbr_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
+///
+/// **Two partitions since PR #367's review**, an ext4 in each of [`STICK_MBR_PARTS`], so an eject
+/// named for one is seen to take the other.
+fn mbr_ext4_stick(path: &Path, mib: u64, labels: [&str; 2]) -> R<()> {
     let f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     f.set_len(mib * 1024 * 1024)?;
     drop(f);
-    let count = (mib * 2048 - 2048) as u32;
-    write_mbr(path, 2048, count, 0x83)?;
-    let fs_img = path.with_extension("ext4");
-    let _ = fs::remove_file(&fs_img);
-    served_ext4(&fs_img, count as u64 * 512 / 4096, label)?;
-    splice_into(path, 1024 * 1024, &fs_img)
+    let parts = STICK_MBR_PARTS.map(|(first, count)| (first, count, 0x83));
+    write_mbr_parts(path, &parts)?;
+    for ((first, count), label) in STICK_MBR_PARTS.into_iter().zip(labels) {
+        let fs_img = path.with_extension(format!("{label}.ext4"));
+        let _ = fs::remove_file(&fs_img);
+        served_ext4(&fs_img, count as u64 * 512 / 4096, label)?;
+        splice_into(path, first as u64 * 512, &fs_img)?;
+    }
+    Ok(())
 }
 
 /// **A stick that is a filesystem**: `mib` MiB of ext4 labelled `label`, with no table at all.
@@ -4858,6 +4889,19 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     s.expect(&format!("test-pattern: {at} refused: NoAccess (-2)"))?;
     s.expect("/home>")?;
     println!("  ok: a write to it is refused NoAccess");
+    //    **And a session's eject of it is refused** (Phase 6 Part F): an internal disk is the
+    //    `storage` grant's to unmount, and the refusal says how — with no password asked.
+    let from = s.transcript().len();
+    s.send(&format!("disk --eject {ROOT_PARTLABEL}"))?;
+    s.expect(&format!(
+        "disk: {ROOT_PARTLABEL} not ejected: it is not removable: an internal disk is unmounted with the storage \
+         grant (with admin disk --unmount)"
+    ))?;
+    s.expect("/home>")?;
+    if s.transcript()[from..].contains("password:") {
+        return Err("`disk --eject` asked for a password".into());
+    }
+    println!("  ok: `disk --eject {ROOT_PARTLABEL}` is refused, naming `with admin disk --unmount`");
 
     // 4. Unmounted, and mounted writable, through the `storage` grant.
     let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
@@ -4955,9 +4999,9 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
 ///
 /// 1. **The boot stick is passed over**: the kernel flags it, and the service says so.
 /// 2. **An MBR stick plugged in**: its disk and partition read in the kernel, the partition's ext4
-///    auto-mounted read-only, the boot being a live one; remounted writable through the `storage`
-///    grant, written through a mapping without a sync, and ejected — `with admin disk --unmount`,
-///    until Part F. Pulled then, its records depart and the service drops it.
+///    auto-mounted **writable**, on a live boot too (Part F), and written through a mapping without
+///    a sync. **An eject while a file on it is held is refused**, and `disk --eject` then ejects it
+///    with no password. Pulled then, its records depart and the service drops it.
 /// 3. **A whole-disk stick pulled while mounted** writable, with a file left dirty: the teardown's
 ///    write-back and the server's marking each come back at once, the dirty file let go, the server
 ///    gone, the label gone, and a command after it runs.
@@ -5036,26 +5080,36 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         .ok_or_else(|| format!("no port in {disk_line:?}"))?
         .to_string();
     s.line_since(from, "mbr:  partition 1 lba 2048..", any, secs(60))?;
-    let mounted = line_of(s, from, &format!("(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}', left clean; mounted at /storage/{STICK_MBR_LABEL} (ro)"))?;
+    let mounted = line_of(s, from, &format!("(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}'; mounted at /storage/{STICK_MBR_LABEL} (rw)"))?;
     let index = blk_of(&mounted)?;
-    println!("  ok: an MBR stick plugged in: its partition read, its ext4 mounted read-only at /storage/{STICK_MBR_LABEL}");
-    with_admin_asked(s, &format!("disk --unmount {STICK_MBR_LABEL}"))?;
-    s.expect(&format!("storage-service: unmounted {STICK_MBR_LABEL}, left clean (read-only, so as it was found)"))?;
-    s.expect(&format!("disk: unmounted {STICK_MBR_LABEL}"))?;
+    line_of(s, from, &format!("(partition partition 2 (unlabelled)): ext4 '{STICK_MBR_LABEL_2}'; mounted at /storage/{STICK_MBR_LABEL_2} (rw)"))?;
+    println!("  ok: an MBR stick plugged in: its two partitions read, each ext4 mounted writable on a live boot");
+    // A pattern on each, written through a mapping and not synced, for the eject to write back.
+    let ats = [STICK_MBR_LABEL, STICK_MBR_LABEL_2].map(|l| format!("/storage/{l}/{STORAGE_PATTERN_FILE}"));
+    for at in &ats {
+        s.send(&format!("test-pattern --write {at}"))?;
+        s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+        s.expect("/home>")?;
+    }
+    // **Refused while a file on the stick is held** — on its *other* partition (PR #367 review):
+    // a session's eject takes the whole stick, so a file held on either refuses it, and both stay
+    // mounted. `test-pattern` holds the file and asks, since a shell with no background jobs
+    // cannot hold one while it runs `disk`.
+    s.send(&format!("test-pattern --eject-held {} {STICK_MBR_LABEL}", ats[1]))?;
+    s.expect(&format!("storage-service: {STICK_MBR_LABEL_2} is in use: 1 file(s) still open or mapped"))?;
+    s.expect(&format!(
+        "test-pattern: eject of {STICK_MBR_LABEL} with {} held: refused, a file on it is still open or mapped ok",
+        ats[1]
+    ))?;
     s.expect("/home>")?;
-    with_admin_asked(s, &format!("disk --mount /dev/blk/{index}"))?;
-    s.expect(&format!("storage-service: mounted {STICK_MBR_LABEL} (rw), as asked"))?;
+    // **And nothing was ejected**: the partition named is still mounted, not unmounted before the
+    // other one refused. A token the typed line does not hold, so the match is the answer.
+    s.send(&format!("format(\"still-mounted={{}}\", (list /storage | filter name == \"{STICK_MBR_LABEL}\" | count))"))?;
+    s.expect("still-mounted=1")?;
     s.expect("/home>")?;
-    let at = format!("/storage/{STICK_MBR_LABEL}/{STORAGE_PATTERN_FILE}");
-    s.send(&format!("test-pattern --write {at}"))?;
-    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
-    s.expect("/home>")?;
-    with_admin_asked(s, &format!("disk --unmount {STICK_MBR_LABEL}"))?;
-    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
-    s.expect(&format!("storage-service: unmounted {STICK_MBR_LABEL}, left clean"))?;
-    s.expect(&format!("disk: unmounted {STICK_MBR_LABEL}"))?;
-    s.expect("/home>")?;
-    println!("  ok: remounted writable, written without a sync, and ejected");
+    println!("  ok: an eject of one partition while a file on the other is held is refused, and leaves both mounted");
+    eject_stick(s, &[STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
+    println!("  ok: written without a sync, and both partitions ejected by one `disk --eject`, no password asked");
     let from = s.transcript().len();
     pull(qmp, "stickmbr")?;
     s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
@@ -5074,15 +5128,9 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         .ok_or_else(|| format!("no port in {disk_line:?}"))?
         .to_string();
     s.line_since(from, "partitions: no table: neither a GPT nor an MBR", any, secs(60))?;
-    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}', left clean; mounted at /storage/{STICK_WHOLE_LABEL} (ro)"))?;
+    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
     let whole = blk_of(&mounted)?;
-    println!("  ok: a whole-disk stick plugged in, read as no table, and its ext4 mounted as the disk");
-    with_admin_asked(s, &format!("disk --unmount {STICK_WHOLE_LABEL}"))?;
-    s.expect(&format!("disk: unmounted {STICK_WHOLE_LABEL}"))?;
-    s.expect("/home>")?;
-    with_admin_asked(s, &format!("disk --mount /dev/blk/{whole}"))?;
-    s.expect(&format!("storage-service: mounted {STICK_WHOLE_LABEL} (rw), as asked"))?;
-    s.expect("/home>")?;
+    println!("  ok: a whole-disk stick plugged in, read as no table, and its ext4 mounted writable as the disk");
     let at = format!("/storage/{STICK_WHOLE_LABEL}/{STORAGE_PATTERN_FILE}");
     s.send(&format!("test-pattern --write {at}"))?;
     s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
@@ -5097,6 +5145,10 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.line_since(from, "fs-server: unmounted, but the filesystem could not be recorded clean", any, secs(30))?;
     s.line_since(from, &format!("storage-service: {STICK_WHOLE_LABEL} left while mounted; what had not been written back is gone"), any, secs(30))?;
     s.line_since(from, &format!("storage-service: blk-{whole} departed"), any, secs(30))?;
+    // **The stick as the pull left it, copied now**, for the host to find still marked in use: the
+    // same stick plugged in again below is mounted writable, which marks it in use whatever the
+    // pull did (Phase 6 Part F; read-only until then, which wrote nothing).
+    fs::copy(&whole_img, whole_img.with_file_name("stick-whole-pulled.img"))?;
     let from = s.transcript().len();
     s.send("list /storage")?;
     s.expect("/home>")?;
@@ -5108,15 +5160,15 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     // 4. Plugged in again: a new disk, a new index, mounted again.
     let from = s.transcript().len();
     plug(qmp, "stickwhole2", "stickwhole")?;
-    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}', not left clean; mounted at /storage/{STICK_WHOLE_LABEL} (ro)"))?;
+    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
     let again = blk_of(&mounted)?;
     if again.parse::<u32>().ok() <= whole.parse::<u32>().ok() {
         return Err(format!("plugged in again, the stick took blk-{again}, not an index past blk-{whole}").into());
     }
-    println!("  ok: plugged in again: blk-{again}, a new index, mounted again — and not left clean, as pulled");
+    println!("  ok: plugged in again: blk-{again}, a new index, mounted again");
 
-    // 5. **A FAT stick** (Phase 6 Part E.6), served by `fs-server-fat`: auto-mounted read-only, the
-    //    boot being a live one, and what the host put there listed and read.
+    // 5. **A FAT stick** (Phase 6 Part E.6), served by `fs-server-fat`: auto-mounted writable, on a
+    //    live boot too (Part F), and what the host put there listed and read.
     let fat_img = build_cache().join("check-storage").join("stick-fat.img");
     add_node(qmp, "stickfat", &fat_img)?;
     let from = s.transcript().len();
@@ -5124,11 +5176,11 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     let mounted = line_of(
         s,
         from,
-        &format!("(partition partition 1 (unlabelled)): fat '{STICK_FAT_LABEL}', left clean; mounted at /storage/{STICK_FAT_LABEL} (ro)"),
+        &format!("(partition partition 1 (unlabelled)): fat '{STICK_FAT_LABEL}'; mounted at /storage/{STICK_FAT_LABEL} (rw)"),
     )?;
     let fat = blk_of(&mounted)?;
-    s.line_since(from, "fs-server: ready (fat, read-only)", any, secs(30))?;
-    println!("  ok: a FAT stick plugged in, its FAT32 mounted read-only by fs-server-fat at /storage/{STICK_FAT_LABEL}");
+    s.line_since(from, "fs-server: ready (fat, read-write)", any, secs(30))?;
+    println!("  ok: a FAT stick plugged in, its FAT32 mounted writable by fs-server-fat at /storage/{STICK_FAT_LABEL}");
     let root = format!("/storage/{STICK_FAT_LABEL}");
     // **What a command printed**: everything up to the prompt after it, its echo and the prompt
     // aside.
@@ -5165,17 +5217,10 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.expect("/home>")?;
     println!("  ok: the host's names listed — long, Unicode, nested — with their sizes, and its pattern read through a mapping");
 
-    // 6. **Written**: remounted writable through the `storage` grant; a directory made, the
-    //    Unicode-named file copied into it under a longer name built from its own — the serial
-    //    line carries ASCII alone, so the name comes from the listing — the long-named one renamed
-    //    into it, one removed, and a file written through a mapping without a sync.
-    with_admin_asked(s, &format!("disk --unmount {STICK_FAT_LABEL}"))?;
-    s.expect(&format!("storage-service: unmounted {STICK_FAT_LABEL}, left clean (read-only, so as it was found)"))?;
-    s.expect(&format!("disk: unmounted {STICK_FAT_LABEL}"))?;
-    s.expect("/home>")?;
-    with_admin_asked(s, &format!("disk --mount /dev/blk/{fat}"))?;
-    s.expect(&format!("storage-service: mounted {STICK_FAT_LABEL} (rw), as asked"))?;
-    s.expect("/home>")?;
+    // 6. **Written**, with no remount: a directory made, the Unicode-named file copied into it
+    //    under a longer name built from its own — the serial line carries ASCII alone, so the name
+    //    comes from the listing — the long-named one renamed into it, one removed, and a file
+    //    written through a mapping without a sync.
     let made = format!("{root}/{FAT_MADE_DIR}");
     for command in [
         format!("mkdir {made}"),
@@ -5202,14 +5247,10 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     if !made_names.contains(&copied) || !made_names.contains(&format!("entry={FAT_RENAMED}|file|")) {
         return Err(format!("`list {made}` is not the copy and the rename:\n{made_names}").into());
     }
-    println!("  ok: remounted writable; a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping");
+    println!("  ok: a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping");
 
-    // 7. **Ejected and pulled**: the unmount writes back and records the filesystem clean.
-    with_admin_asked(s, &format!("disk --unmount {STICK_FAT_LABEL}"))?;
-    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
-    s.expect(&format!("storage-service: unmounted {STICK_FAT_LABEL}, left clean"))?;
-    s.expect(&format!("disk: unmounted {STICK_FAT_LABEL}"))?;
-    s.expect("/home>")?;
+    // 7. **Ejected and pulled**: the eject writes back and records the filesystem clean.
+    eject_stick(s, &[STICK_FAT_LABEL])?;
     let from = s.transcript().len();
     pull(qmp, "stickfat")?;
     s.line_since(from, &format!("storage-service: blk-{fat} departed"), any, secs(30))?;
@@ -5217,24 +5258,51 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     Ok(())
 }
 
+/// **`disk --eject NAME`, as a session runs it** (Phase 6 Part F): no `with`, and no password asked.
+/// The chain writes back and records the filesystem clean before the service says the stick can
+/// be pulled, and `disk` says so after.
+///
+/// **The drive goes whole** (PR #367 review): `names` are every filesystem on the stick, the first
+/// the one named, and each is unmounted, in the order mounted, before the service and `disk` name
+/// them all.
+fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
+    let from = s.transcript().len();
+    s.send(&format!("disk --eject {}", names[0]))?;
+    for name in names {
+        s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+        s.expect(&format!("storage-service: unmounted {name}, left clean"))?;
+    }
+    let all = names.join(", ");
+    s.expect(&format!("storage-service: ejected {all}, safe to remove"))?;
+    s.expect(&format!("disk: ejected {all}"))?;
+    s.expect("/home>")?;
+    if s.transcript()[from..].contains("password:") {
+        return Err(format!("`disk --eject {}` asked for a password", names[0]).into());
+    }
+    Ok(())
+}
+
 /// The sticks, once the machine has stopped (Phase 6 Part D): the ejected one's partition carved
 /// out by its MBR, `e2fsck -fn` clean, `s_state` clean and the pattern read with `debugfs`; the
-/// pulled one still marked in use, which is what an unplug without an eject leaves.
+/// pulled one — `whole`, copied as the pull left it — still marked in use, which is what an unplug
+/// without an eject leaves.
 fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let part = work.join("stick-mbr-part.ext4");
-    let mut f = fs::File::open(mbr)?;
-    let len = f.metadata()?.len() - 1024 * 1024;
-    f.seek(SeekFrom::Start(1024 * 1024))?;
-    let mut buf = vec![0u8; len as usize];
-    f.read_exact(&mut buf)?;
-    fs::write(&part, buf)?;
-    check_ext4_clean(&part, &format!("the ejected stick's {STICK_MBR_LABEL}"))?;
+    // **Each partition, carved by its MBR entry**: one eject took both (PR #367 review).
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
-    match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
-        Some(b) if b == pattern => println!("  ok: the ejected stick holds the pattern, read with debugfs"),
-        Some(b) => return Err(format!("the ejected stick's file is {} bytes and not the pattern", b.len()).into()),
-        None => return Err("the ejected stick has no pattern file: the eject did not write it back".into()),
+    for ((first, count), label) in STICK_MBR_PARTS.into_iter().zip([STICK_MBR_LABEL, STICK_MBR_LABEL_2]) {
+        let part = work.join(format!("stick-mbr-{label}.ext4"));
+        let mut f = fs::File::open(mbr)?;
+        f.seek(SeekFrom::Start(first as u64 * 512))?;
+        let mut buf = vec![0u8; count as usize * 512];
+        f.read_exact(&mut buf)?;
+        fs::write(&part, buf)?;
+        check_ext4_clean(&part, &format!("the ejected stick's {label}"))?;
+        match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
+            Some(b) if b == pattern => println!("  ok: the ejected stick's {label} holds the pattern, read with debugfs"),
+            Some(b) => return Err(format!("the ejected stick's {label} file is {} bytes and not the pattern", b.len()).into()),
+            None => return Err(format!("the ejected stick's {label} has no pattern file: the eject did not write it back").into()),
+        }
     }
     let state = ext4_s_state(whole)?;
     if state & EXT4_VALID_FS != 0 {
@@ -5248,19 +5316,16 @@ fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
     Ok(())
 }
 
-/// **The FAT stick, once the machine has stopped** (Phase 6 Part E.6): its partition carved out,
-/// `fsck.fat -n` clean — the dirty bit among what it checks — and mtools reading what the guest
-/// did: the names it made, long and Unicode, the host's file under its new name, the one removed
-/// gone, the copy's bytes, and the pattern it wrote through a mapping.
-fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
+/// **A stick's FAT partition carved out** — sparsely, at the MBR's 1 MiB — to `part`, and required
+/// clean: `fsck.fat -n` finds nothing, and the dirty bit is clear.
+fn carve_fat_clean(stick: &Path, part: &Path, what: &str) -> R<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     const MIB: u64 = 1024 * 1024;
-    // Carved sparsely: 299 MiB, nearly all of it never written.
-    let part = work.join("stick-fat-part.img");
+    // Carved sparsely: nearly all of it never written.
     let mut from = fs::File::open(stick)?;
     let len = from.metadata()?.len() - MIB;
     from.seek(SeekFrom::Start(MIB))?;
-    let mut to = fs::File::create(&part)?;
+    let mut to = fs::File::create(part)?;
     let mut buf = vec![0u8; MIB as usize];
     for _ in 0..len / MIB {
         from.read_exact(&mut buf)?;
@@ -5272,21 +5337,31 @@ fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
     }
     to.set_len(len)?;
     drop(to);
-    let out = Command::new("fsck.fat").arg("-n").arg(&part).output()?;
+    let out = Command::new("fsck.fat").arg("-n").arg(part).output()?;
     if !out.status.success() {
         return Err(format!(
-            "fsck.fat -n does not find the FAT stick clean:\n{}{}",
+            "fsck.fat -n does not find {what} clean:\n{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         )
         .into());
     }
     let mut boot = [0u8; 512];
-    fs::File::open(&part)?.read_exact(&mut boot)?;
+    fs::File::open(part)?.read_exact(&mut boot)?;
     if boot[0x41] & 1 != 0 {
-        return Err("the FAT stick's dirty bit is set after its unmount".into());
+        return Err(format!("{what}'s dirty bit is set after its unmount").into());
     }
-    println!("  ok: fsck.fat -n finds the FAT stick clean, its dirty bit clear");
+    println!("  ok: fsck.fat -n finds {what} clean, its dirty bit clear");
+    Ok(())
+}
+
+/// **The FAT stick, once the machine has stopped** (Phase 6 Part E.6): its partition carved out,
+/// `fsck.fat -n` clean — the dirty bit among what it checks — and mtools reading what the guest
+/// did: the names it made, long and Unicode, the host's file under its new name, the one removed
+/// gone, the copy's bytes, and the pattern it wrote through a mapping.
+fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
+    let part = work.join("stick-fat-part.img");
+    carve_fat_clean(stick, &part, "the FAT stick")?;
     let at = format!("{}", part.display());
     let listed = mtools_cmd("mdir").arg("-i").arg(&at).arg("-/").arg("-b").arg("::").output()?;
     let listed: std::collections::BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
@@ -5353,6 +5428,357 @@ fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
     }
     println!("  ok: {path} holds the pattern, {STORAGE_PATTERN_LEN} bytes, read by debugfs");
     Ok(())
+}
+
+/// The FAT stick `check-media` plugs in: its label, and so the name it is mounted under.
+const MEDIA_LABEL: &str = "NXMEDIA";
+/// What `check-media` types into the editor, and what the host then reads off the stick.
+const MEDIA_TEXT: &str = "saved onto a stick from nxedit";
+/// The name it is saved under, at the stick's root.
+const MEDIA_FILE: &str = "from-nitrox.txt";
+
+/// `cargo xtask check-media` — **removable media in a session** (Phase 6 Part F), on the desktop a
+/// person uses: the **release** live image as the boot stick, beside a copy of the release disk,
+/// logged in at the graphical greeter.
+///
+/// 1. **Files at Home**: Drives lists the internal disk's `nitrox-root`, mounted read-only on a
+///    live boot, with **no eject button**.
+/// 2. **A FAT stick plugged in** over QMP, and **nothing typed or moved after it**: auto-mounted
+///    writable, and its row with an eject button appears in Files' sidebar — read off screendumps
+///    until it is drawn. Any input would wake Files on its compositor channel and draw the row
+///    whether the watch had woken it or not (PR #366 review).
+/// 3. **Saved from the editor**: text typed, Save As, the chooser's Up to `/` — aimed at where
+///    `libui` lays the button out for the theme the image stages — and `storage/<stick>/<file>`
+///    named in its field, which is joined to `/`.
+/// 4. **Ejected from Files**: a click on the stick's eject button. The chain records the
+///    filesystem clean with no password asked, the row goes, and the stick is pulled.
+/// 5. **On the host**: `fsck.fat -n` clean, and `mtype` reads back what was typed.
+///
+/// **It asserts effects**, not Files' own account of itself: the row on the screen at step 2,
+/// and at step 4 an eject that happens only if the button was drawn where the gate aims.
+fn cmd_check_media(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    require_tool("fsck.fat")?;
+    for tool in ["mformat", "mtype"] {
+        require_tool(tool)?;
+    }
+    cmd_image(BuildMode::Normal)?;
+    cmd_image_live()?;
+    let work = build_cache().join("check-media");
+    fs::create_dir_all(&work)?;
+    let disk = work.join("disk.img");
+    let _ = fs::remove_file(&disk);
+    fs::copy(image_path(), &disk)?;
+    let stick = work.join("stick.img");
+    media_stick(&stick)?;
+    let qmp_sock = work.join("qmp.sock");
+    let _ = fs::remove_file(&qmp_sock);
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_sock.display()))
+        .arg("-device")
+        .arg(XHCI_DEVICE)
+        .arg("-drive")
+        .arg(format!("if=none,id=boot,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=boot")
+        .arg("-drive")
+        .arg(format!("if=none,id=disk,format=raw,file={}", disk.display()))
+        .arg("-device")
+        .arg("ide-hd,drive=disk,bus=ide.0")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: media gate — booting the live image beside a copy of the release disk…\n");
+    let mut session = Session::spawn(cmd, "check-media")?;
+    let result = Qmp::connect(&qmp_sock).and_then(|mut qmp| {
+        qmp.screen = Some(size);
+        run_media_steps(&mut session, &mut qmp, &stick, &work, size)
+    });
+    let transcript = session.finish();
+    let _ = fs::remove_file(&qmp_sock);
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    if transcript.contains(DEMO_PASSWORD) {
+        return Err("the password reached the console".into());
+    }
+    println!("\nxtask: the machine is stopped; the stick, on the host:");
+    let part = work.join("stick-part.img");
+    carve_fat_clean(&stick, &part, "the ejected stick")?;
+    let out = mtools_cmd("mtype").arg("-i").arg(&part).arg(format!("::{MEDIA_FILE}")).output()?;
+    let want = format!("{MEDIA_TEXT}\n");
+    if !out.status.success() || out.stdout != want.as_bytes() {
+        return Err(format!(
+            "mtype reads {MEDIA_FILE} off the stick as {:?}, not the {want:?} typed into the editor",
+            String::from_utf8_lossy(&out.stdout)
+        )
+        .into());
+    }
+    println!("  ok: mtype reads back what was typed into the editor");
+    println!("\nxtask: a stick plugged into the live desktop appeared in Files, took a file from the editor, and ejected clean ✓");
+    Ok(())
+}
+
+/// **The stick `check-media` plugs in**: a FAT32 partition behind an MBR, as one is sold, labelled
+/// [`MEDIA_LABEL`] and empty. 300 MiB is what FAT32 by count needs at 4 KiB clusters, the smallest
+/// `fs-server-fat` serves; the file is sparse.
+fn media_stick(path: &Path) -> R<()> {
+    const MIB: u64 = 1024 * 1024;
+    let _ = fs::remove_file(path);
+    fs::File::create(path)?.set_len(300 * MIB)?;
+    let count = (300 * 2048 - 2048) as u32;
+    write_mbr(path, 2048, count, 0x0C)?;
+    let at = format!("{}@@{MIB}", path.display());
+    run(mtools_cmd("mformat")
+        .arg("-i").arg(&at)
+        .arg("-F").arg("-c").arg("8")
+        .arg("-T").arg(count.to_string())
+        .arg("-v").arg(MEDIA_LABEL)
+        .arg("::"))?;
+    Ok(())
+}
+
+/// **How much is drawn in a rectangle of a screendump**: the pixels differing from its top-left
+/// one by more than the faintest edge of anti-aliased text. Glyph ink against a flat ground.
+fn ink_in(dump: &(u32, u32, Vec<u8>), x: i32, y: i32, w: i32, h: i32) -> usize {
+    let (dw, dh, rgb) = dump;
+    let px = |x: i32, y: i32| {
+        let i = (y as usize * *dw as usize + x as usize) * 3;
+        (rgb[i], rgb[i + 1], rgb[i + 2])
+    };
+    let (x0, y0) = (x.clamp(0, *dw as i32 - 1), y.clamp(0, *dh as i32 - 1));
+    let ground = px(x0, y0);
+    let mut n = 0;
+    for yy in y0..(y + h).min(*dh as i32) {
+        for xx in x0..(x + w).min(*dw as i32) {
+            let c = px(xx, yy);
+            let d = c.0.abs_diff(ground.0) as u32 + c.1.abs_diff(ground.1) as u32 + c.2.abs_diff(ground.2) as u32;
+            if d > 96 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The steps; see [`cmd_check_media`].
+fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, size: DisplaySize) -> R<()> {
+    let secs = std::time::Duration::from_secs;
+    let any = |_: &str| true;
+    const APPS_CLICK: (i32, i32) = (60, 12);
+    let dump_at = work.join("screen.ppm");
+    let look = |qmp: &mut Qmp| -> R<(u32, u32, Vec<u8>)> {
+        qmp.screendump(&dump_at)?;
+        parse_ppm(&fs::read(&dump_at)?)
+    };
+    let launch = |qmp: &mut Qmp, s: &mut Session, program: &str| -> R<(u32, i32, i32)> {
+        click_at(qmp, s, APPS_CLICK.0, APPS_CLICK.1)?;
+        s.expect("desktop-shell: applications menu open")?;
+        type_into_menu(qmp, s, program)?;
+        press(qmp, "ret")?;
+        s.expect(&format!("desktop-shell: launched {program} into its own namespace"))?;
+        s.expect("desktop-shell: placed window ")?;
+        let placed = s.rest_of_line()?;
+        parse_placement(&placed).ok_or_else(|| format!("could not read {program}'s placement from {placed:?}").into())
+    };
+
+    // 1. **Log in, and Files at Home**, with the internal disk in Drives and no eject button on it.
+    s.expect("desktop-session-mgr: greeter presented")?;
+    logout_gate_login(qmp, s, size)?;
+    let (files_id, fx, fy) = launch(qmp, s, "nxfiles")?;
+    let side_x = fx + chrome::CONTENT_X;
+    let content_top = fy + chrome::TITLE_BAR_H + browser::MENU_BAR_H + browser::PATH_H;
+    let places = HOME_FOLDERS.len() as i32 + 2;
+    let drive_top = |i: i32| content_top + (places + i) * browser::ROW_H + browser::DRIVES_HEADING_H;
+    let button_w = libui::widget::ROW_BUTTON_W as i32;
+    let label_ink = |d: &(u32, u32, Vec<u8>), i: i32| {
+        ink_in(d, side_x, drive_top(i), browser::SIDEBAR_W - button_w, browser::ROW_H)
+    };
+    let button_ink = |d: &(u32, u32, Vec<u8>), i: i32| {
+        ink_in(d, side_x + browser::SIDEBAR_W - button_w, drive_top(i), button_w, browser::ROW_H)
+    };
+    let settled = parse_ppm(&settle_and_capture(qmp, &dump_at)?)?;
+    let (root_label, root_button) = (label_ink(&settled, 0), button_ink(&settled, 0));
+    if root_label < 30 || root_button != 0 || label_ink(&settled, 1) != 0 {
+        return Err(format!(
+            "Files' first drive row has {root_label} px of label and {root_button} of button, and its second {} px: \
+             the internal disk alone, with no eject button, was expected (dump {})",
+            label_ink(&settled, 1),
+            dump_at.display()
+        )
+        .into());
+    }
+    println!("  ok: Files lists the internal disk in Drives, with no eject button");
+
+    // 2. **The stick, plugged in with nothing typed after it**: its row read off the screen.
+    qmp.execute(&format!(
+        r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":"media","file":{{"driver":"file","filename":"{}"}}}}}}"#,
+        stick.display()
+    ))?;
+    let from = s.transcript().len();
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media"}}"#)?;
+    // **No "left clean" on a writable mount's line**, which says nothing of how it was found: the
+    // mount has marked it in use (`storage.md` §9).
+    s.line_since(from, &format!("fat '{MEDIA_LABEL}'; mounted at /storage/{MEDIA_LABEL} (rw)"), any, secs(60))?;
+    let deadline = std::time::Instant::now() + secs(30);
+    loop {
+        let d = look(qmp)?;
+        if label_ink(&d, 1) >= 30 && button_ink(&d, 1) >= 10 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "the stick mounted, and 30 s later Files' second drive row has {} px of label and {} of eject \
+                 button: the watch did not wake it (dump {})",
+                label_ink(&d, 1),
+                button_ink(&d, 1),
+                dump_at.display()
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    println!("  ok: the stick mounted writable, and its row and eject button appeared with no input");
+
+    // 3. **Saved from the editor**, through Save As.
+    launch(qmp, s, "nxedit")?;
+    let _ = settle_and_capture(qmp, &dump_at)?;
+    for (i, c) in MEDIA_TEXT.chars().enumerate() {
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+        s.expect(&format!("nxedit: buffer rev {}", i + 1))?;
+    }
+    let from = s.transcript().len();
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(qmp, "s")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    s.expect("nxedit: choosing a file in /home - ")?;
+    s.expect("nxedit: the chooser has the keyboard")?;
+    s.line_since(from, "desktop-shell: placed dialog ", any, secs(30))?;
+    let placed = s.transcript()[from..]
+        .lines()
+        .find_map(|l| l.split_once("desktop-shell: placed dialog ").map(|(_, r)| r.to_string()))
+        .ok_or("no dialog placement")?;
+    let (_, _, dx, dy, dw, dh) = parse_dialog_placement(&placed)
+        .ok_or_else(|| format!("could not read the chooser's placement from {placed:?}"))?;
+    let up = chooser_up_at(dw, dh)?;
+    click_at(qmp, s, dx + up.0, dy + up.1)?;
+    s.expect("nxedit: the chooser moved to / - ")?;
+    press(qmp, "backspace")?;
+    s.expect("nxedit: chooser name so far ")?;
+    let left: usize = s
+        .rest_of_line()?
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or("could not read how much of the name was left")?;
+    for n in (0..left).rev() {
+        press(qmp, "backspace")?;
+        s.expect(&format!("nxedit: chooser name so far {n} chars"))?;
+    }
+    let name = format!("storage/{MEDIA_LABEL}/{MEDIA_FILE}");
+    for (i, c) in name.chars().enumerate() {
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+        s.expect(&format!("nxedit: chooser name so far {} chars", i + 1))?;
+    }
+    press(qmp, "ret")?;
+    s.expect(&format!("nxedit: saved /storage/{MEDIA_LABEL}/{MEDIA_FILE} - "))?;
+    qmp.send_key("ctrl", true)?;
+    press(qmp, "q")?;
+    qmp.send_key("ctrl", false)?;
+    s.expect("nxedit: quitting")?;
+    s.expect("nxedit: closing")?;
+    let _ = settle_and_capture(qmp, &dump_at)?;
+    println!("  ok: the editor saved onto the stick through Save As: Up to /, then storage/{MEDIA_LABEL}");
+
+    // 4. **Ejected from Files**, by its button: the chain, and no password.
+    let from = s.transcript().len();
+    let pressed = click_at(qmp, s, side_x + browser::SIDEBAR_W - button_w / 2, drive_top(1) + browser::ROW_H / 2)?;
+    if !pressed.contains(&format!("win={files_id}")) {
+        return Err(format!("the click on the eject button reached {pressed:?}, not Files' window {files_id}").into());
+    }
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect(&format!("storage-service: unmounted {MEDIA_LABEL}, left clean"))?;
+    s.expect(&format!("storage-service: ejected {MEDIA_LABEL}, safe to remove"))?;
+    s.expect(&format!("nxfiles: {MEDIA_LABEL} ejected"))?;
+    if s.transcript()[from..].contains("password") {
+        return Err("ejecting from Files asked for a password".into());
+    }
+    // **The row's label, not its button**: the pointer rests where the button was, and the cursor
+    // is drawn into the screen this reads.
+    let deadline = std::time::Instant::now() + secs(30);
+    while label_ink(&look(qmp)?, 1) != 0 {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("the ejected stick's row is still drawn (dump {})", dump_at.display()).into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let from = s.transcript().len();
+    qmp.execute(r#"{"execute":"device_del","arguments":{"id":"media"}}"#)?;
+    s.line_since(from, "storage-service: blk-", |rest: &str| rest.ends_with(" departed"), secs(30))?;
+    println!("  ok: ejected from Files with no password, recorded clean, its row gone, and pulled");
+    Ok(())
+}
+
+/// **Where the chooser's Up button is**, inside a chooser window `w`×`h`: laid out by `libui`, as the
+/// editor lays it out, with the theme the image stages — whose `font_px` sizes the title above it.
+fn chooser_up_at(w: u32, h: u32) -> R<(i32, i32)> {
+    let (theme, _) = staged_theme()?;
+    if (w, h) != (libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H) {
+        let (tw, th) = (libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H);
+        return Err(format!("the chooser was placed {w}x{h}, not the toolkit's {tw}x{th}").into());
+    }
+    let font = host_font(theme.font_ui.as_str())?;
+    let mut state = libui::chooser::ChooserState::saving("untitled");
+    let view: libui::element::Element<u64> = libui::chooser::view(
+        libui::chooser::Mode::Save,
+        "/home",
+        &[],
+        &mut state,
+        editor::CHOOSER_KEY,
+        None,
+        |k| k,
+        0,
+        0,
+        0,
+        true,
+        &theme,
+    );
+    let l = libui::layout::layout(
+        &view,
+        libdraw::geom::Rect::new(0, 0, w, h),
+        &libui::paint::FontMetrics::new(&font, theme.font_px),
+    );
+    let r = libui::layout::locate(&view, &l, editor::CHOOSER_UP_KEY).ok_or("the chooser has no Up button")?;
+    Ok((r.origin.x + r.size.w as i32 / 2, r.origin.y + r.size.h as i32 / 2))
 }
 
 /// The file `check-shutdown` writes, under the serial session's `/home` — `alice`'s home on the
@@ -13898,12 +14324,19 @@ fn mbr_fat_stick(path: &Path, mib: u64, label: &str) -> R<()> {
 /// **Write an MBR into `img`'s first block** (Phase 6 Part D): one entry, of MBR type `kind`, for
 /// `count` blocks from `first`, and the signature. The other three entries are left empty.
 fn write_mbr(img: &Path, first: u32, count: u32, kind: u8) -> R<()> {
+    write_mbr_parts(img, &[(first, count, kind)])
+}
+
+/// An MBR naming each of `parts` — first sector, sector count, type — in its own entry, up to four.
+fn write_mbr_parts(img: &Path, parts: &[(u32, u32, u8)]) -> R<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut mbr = [0u8; 512];
-    let e = &mut mbr[0x1BE..0x1CE];
-    e[4] = kind;
-    e[8..12].copy_from_slice(&first.to_le_bytes());
-    e[12..16].copy_from_slice(&count.to_le_bytes());
+    for (i, &(first, count, kind)) in parts.iter().take(4).enumerate() {
+        let e = &mut mbr[0x1BE + i * 16..0x1CE + i * 16];
+        e[4] = kind;
+        e[8..12].copy_from_slice(&first.to_le_bytes());
+        e[12..16].copy_from_slice(&count.to_le_bytes());
+    }
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
     let mut f = fs::OpenOptions::new().write(true).open(img).map_err(|e| format!("open {}: {e}", img.display()))?;
@@ -18966,11 +19399,30 @@ mod tests {
             ("SIDEBAR_PAD", browser::SIDEBAR_PAD, get("SIDEBAR_PAD")),
             ("PATH_H", browser::PATH_H, get("PATH_H")),
             ("ROW_H", browser::ROW_H, get("ROW_H")),
+            ("MENU_BAR_H", browser::MENU_BAR_H, get("MENU_BAR_H")),
         ] {
             assert_eq!(gate, app, "`browser::{what}` is {gate}, the browser's is {app}");
         }
         // `HEADER_H` is the toolkit's, which the browser re-exports rather than spelling.
         assert_eq!(browser::HEADER_H, libui::widget::LIST_HEADER_H as i32);
+        // **The Drives heading is a row's height** (Phase 6 Part F), spelled as one there.
+        assert!(
+            text.contains("pub const DRIVES_HEADING_H: u32 = ROW_H;") && browser::DRIVES_HEADING_H == browser::ROW_H,
+            "the browser's Drives heading is no longer a row's height, and `check-media` aims below it"
+        );
+    }
+
+    /// **The gate's copy of the editor's chooser key is the editor's**, and the toolkit puts the
+    /// chooser's Up button at that key plus seven — found, in the window the toolkit sizes, in the
+    /// strip below the title, at the theme the image stages (Phase 6 Part F).
+    #[test]
+    fn the_gates_editor_table_is_the_editors() {
+        let path = repo_root().join("userspace/nxedit/src/lib.rs");
+        let text = fs::read_to_string(&path).expect("the editor's source is readable");
+        let line = format!("pub const CHOOSER_KEY: u64 = {};", editor::CHOOSER_KEY);
+        assert!(text.contains(&line), "no `{line}` in {}", path.display());
+        let (x, y) = chooser_up_at(libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H).expect("an Up button");
+        assert!(x > 0 && x < 40 && y > libui::widget::TITLE_BAR_H as i32 && y < 90, "Up is at ({x}, {y})");
     }
 
     /// The gate's copy of the greeter's window is the greeter's own.

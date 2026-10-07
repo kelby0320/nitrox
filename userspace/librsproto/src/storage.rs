@@ -6,6 +6,11 @@
 //! `/dev/storage/admin` in a view with the `storage` grant (C.6). What reaches it is therefore
 //! the grant's to decide; the service answers every request on it.
 //!
+//! **A session has two channels of its own** (Phase 6 Part F), opened by resolving `info/media` and
+//! `info/watch` on the session endpoint — `/dev/storage/media` and `/dev/storage/watch` in a session:
+//! a **media session**, carrying [`OP_STORAGE_EJECT`] and nothing that mounts; and a **watch**, on
+//! which the service sends [`OP_STORAGE_CHANGED`] and nothing else.
+//!
 //! The filesystems themselves, and the table of what is on each disk, are ordinary `Namespace` and
 //! `File` operations under `/svc/storage/fs` and `/svc/storage/info`, not these.
 //!
@@ -27,6 +32,32 @@ pub const OP_STORAGE_UNMOUNT: u16 = 0x1001;
 /// filesystem's device, `init`'s included, and the disk that holds it. Body: empty. Reply body
 /// [`build_in_use`]: their registry ids.
 pub const OP_STORAGE_IN_USE: u16 = 0x1002;
+
+/// Client → service, on a **media session** (Phase 6 Part F): **eject a stick**, by the name it is
+/// mounted under — `/storage/<name>`, the table's `mounted` column, not its `label`. Body: the
+/// name's bytes. The service runs `Unmount`'s chain on a mount of a **removable** disk and answers
+/// once it is safe to pull: `NotFound` for a name nothing is mounted under, `NoAccess` for an
+/// internal disk's, which needs the `storage` grant, and `WouldBlock` while a file is held. **The
+/// drive goes whole**: every filesystem the service mounted on the same disk is unmounted, or none
+/// is (PR #367 review). Reply body: their mount names, one per line ([`ejected_names`]).
+pub const OP_STORAGE_EJECT: u16 = 0x1003;
+/// Service → client, on a **watch** (Phase 6 Part F): **the set of mounts changed**; read the table
+/// again. Body: empty. Not a reply, and nothing answers it. **A watch carries nothing else**, so a
+/// watch whose queue is full holds a ping already, and a client that reads one after many changes
+/// has missed none of them.
+pub const OP_STORAGE_CHANGED: u16 = 0x1004;
+
+/// Whether a message on a watch is a ping: [`OP_STORAGE_CHANGED`] with no body. Anything else on a
+/// watch is not something the service sends, and a client ignores it.
+pub fn is_changed(op: u16, body: &[u8]) -> bool {
+    op == OP_STORAGE_CHANGED && body.is_empty()
+}
+
+/// **The names an `Eject` reply says were unmounted**, in its body's order: one per line, since a
+/// mount name is printable and never holds a newline. An empty line is no name.
+pub fn ejected_names(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    body.split(|&b| b == b'\n').filter(|n| !n.is_empty())
+}
 
 /// Bytes before a `Mount` body's two strings: their lengths, `u16` each.
 pub const MOUNT_PREFIX_LEN: usize = 4;
@@ -112,6 +143,30 @@ mod tests {
         assert_eq!(parse_mount(&out[..n + 1]), None, "a byte after");
         assert_eq!(parse_mount(&[0, 0, 0]), None, "no prefix");
         assert_eq!(parse_mount(&[0xFF, 0xFF, 0, 0, b'x']), None, "a length past the end");
+    }
+
+    /// **An `Eject` reply's names, from bytes laid out by hand**: one per line, a trailing newline
+    /// and an empty body naming nothing extra.
+    #[test]
+    fn an_eject_reply_names_each_mount_on_a_line() {
+        fn names(b: &[u8]) -> std::vec::Vec<&[u8]> {
+            ejected_names(b).collect()
+        }
+        assert_eq!(names(b"ONE\nTWO"), [&b"ONE"[..], b"TWO"]);
+        assert_eq!(names(b"partition 1\n"), [&b"partition 1"[..]]);
+        assert!(names(b"").is_empty());
+    }
+
+    /// **A ping is the op and nothing else**: a body is not one, nor is another op.
+    #[test]
+    fn a_ping_is_changed_with_no_body() {
+        assert!(is_changed(OP_STORAGE_CHANGED, &[]));
+        assert!(!is_changed(OP_STORAGE_CHANGED, &[0]), "a body");
+        assert!(!is_changed(OP_STORAGE_EJECT, &[]), "another op");
+        let ops = [OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, OP_STORAGE_IN_USE, OP_STORAGE_EJECT, OP_STORAGE_CHANGED];
+        for (i, a) in ops.iter().enumerate() {
+            assert!(ops[i + 1..].iter().all(|b| b != a), "{a:#06x} used twice");
+        }
     }
 
     #[test]

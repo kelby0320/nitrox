@@ -1,12 +1,13 @@
 # fs-server-fat
 
-**Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; last checked
-2026-10-07.** `userspace/fs-server-fat`
-serves FAT12, FAT16 and FAT32 read-write, with long names, over `libfsserver`'s protocol. The
-storage service spawns it for a FAT on a removable disk, and for any FAT an administrator mounts
-([`storage.md`](storage.md) §6). Its host tests build images with `mformat` and `mkfs.fat`, and
-require `fsck.fat -n` to find each one clean after every change. `check-storage` writes a FAT32
-stick through it, and the host reads the stick back with mtools.
+**Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; a stick mounted
+writable on a live boot too, and ejected by a session, since Part F; last checked 2026-10-07.**
+`userspace/fs-server-fat` serves FAT12, FAT16 and FAT32 read-write, with long names, over
+`libfsserver`'s protocol. The storage service spawns it for a FAT on a removable disk, and for any
+FAT an administrator mounts ([`storage.md`](storage.md) §6). Its host tests build images with
+`mformat` and `mkfs.fat`, and require `fsck.fat -n` to find each one clean after every change.
+`check-storage` writes a FAT32 stick through it, and `check-media` saves onto one from the editor;
+the host reads each back with mtools.
 
 A FAT server is the second user of the Model A data path, after ext4. Read
 [`filesystem-data-path.md`](filesystem-data-path.md) for the contract first. This document covers
@@ -187,11 +188,15 @@ too, rather than answered as if it could have been made.
 - **`test-qemu`**: the test stick's FAT16, with 512-byte clusters, is reported as not served for
   them, so the boot's mounts are as they were.
 - **`check-storage`**: a 300 MiB FAT32 stick, its data region off a 4 KiB boundary, auto-mounted
-  read-only. The host's long, Unicode and nested names are listed in the guest, and its pattern
-  is read through a mapping. Then it is remounted writable and written: a directory, a copy to a
-  long Unicode name, a rename, a removal, and a file through a mapping. Ejected and pulled, it is
-  `fsck.fat -n` clean on the host, and mtools reads what the guest did. An internal FAT on the
-  SATA disk is left unmounted, not being removable.
+  writable, the live boot notwithstanding (read-only, and remounted writable through the `storage`
+  grant, until Part F). The host's long, Unicode and nested names are listed in the guest, and its
+  pattern is read through a mapping. Then it is written: a directory, a copy to a long Unicode
+  name, a rename, a removal, and a file through a mapping. Ejected with `disk --eject` and pulled,
+  it is `fsck.fat -n` clean on the host, and mtools reads what the guest did. An internal FAT on
+  the SATA disk is left unmounted, not being removable.
+- **`check-media`** (Part F): an empty FAT32 stick plugged into the live desktop, a file saved onto
+  it from the editor, ejected from Files; `fsck.fat -n` clean on the host, and `mtype` reads the
+  file back.
 
 ## 9. Not built
 

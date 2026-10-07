@@ -73,6 +73,7 @@ cargo xtask check-install  # install to a blank disk from the live menu, then bo
 cargo xtask check-recovery # reset a password on an installed disk from the live image, then boot it
 cargo xtask image --live --selftest # the test live image: the live stick with the test packages
 cargo xtask check-storage  # that stick beside a copy of the release disk; the host checks the disk
+cargo xtask check-media    # the live desktop: a stick plugged in, shown in Files, saved to, ejected
 cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
 ```
@@ -248,27 +249,40 @@ verdict is a disk. It boots the **test live image** (`image --live --selftest`: 
 the test packages on its root) as a USB stick beside **a copy of the release disk** on the AHCI
 controller — the laptop with Nitrox installed and a stick in it, and the one topology with a second
 disk the host can read afterwards. On serial, the disk's `nitrox-root` is auto-mounted read-only
-and refuses a write, `with admin disk` remounts it writable, and `test-pattern` writes a pattern
-through a mapping and **exits without a sync**. The host reads the disk mid-run and finds the file
-without the pattern, so what it finds after `with admin disk --unmount`, the unmount put there.
-With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock's
-`s_state` clean, and the file holding the pattern, read with `debugfs` rather than the library
-that wrote it. **Since Phase 6 Part D it plugs sticks in over QMP** after that: the boot stick
-passed over; an MBR stick with one ext4 partition, auto-mounted read-only, remounted writable,
-written without a sync, unmounted and pulled; a whole-disk ext4 stick **pulled while mounted**,
-whose teardown's I/O must all come back at once — the kernel letting the dirty file go, the server
-unable to record the filesystem clean, the label gone and the shell still answering; and that stick
-again, at a new index. The host then carves the first's partition out by its MBR and requires it
-clean with the pattern, and finds the second still marked in use. **Since Part E it holds
-`fs-server-fat`**: the disk copy carries a third partition, an internal FAT reported not removable
-and left unmounted, beside an ESP refused for its clusters; and a 300 MiB FAT32 stick whose data
-region is off a 4 KiB boundary — asserted before the boot — is auto-mounted read-only, its host
-names (Unicode among them) listed, remounted writable, written to (a directory, a copy to a long
-Unicode name, a rename, a removal, a file through a mapping), ejected and pulled. On the host
-`fsck.fat -n` finds it clean and mtools reads what the guest wrote. **It logs in only once
-`boot-probe` has exited**, whatever its verdict, which on that machine is a FAIL by the machine's
-shape: its later tests install a policy and fill the view broker's clients, and the sticks made the
-gate long enough to meet them. It runs in CI's QEMU job.
+and refuses a write — as `disk --eject` of it is refused, it not being removable — `with admin disk`
+remounts it writable, and `test-pattern` writes a pattern through a mapping and **exits without a
+sync**. The host reads the disk mid-run and finds the file without the pattern, so what it finds
+after `with admin disk --unmount`, the unmount put there. With the machine stopped, the host carves
+the partition out: `e2fsck -fn` clean, the superblock's `s_state` clean, and the file holding the
+pattern, read with `debugfs` rather than the library that wrote it. **Since Phase 6 Part D it plugs
+sticks in over QMP** after that: the boot stick passed over; an MBR stick with two ext4 partitions,
+each auto-mounted **writable** (Part F) and written without a sync, an eject of the first refused
+while `test-pattern --eject-held` holds a file on the second, both left mounted, then both ejected
+by one `disk --eject` with no password, and pulled; a
+whole-disk ext4 stick **pulled while mounted**, whose teardown's I/O must all come back at once —
+the kernel letting the dirty file go, the server unable to record the filesystem clean, the label
+gone and the shell still answering; and that stick again, at a new index. The host then carves the
+first's partitions out by its MBR and requires each clean with its pattern, and finds the second —
+copied as the pull left it — still marked in use. **Since Part E it holds `fs-server-fat`**: the
+disk copy carries a third partition, an internal FAT reported not removable and left unmounted,
+beside an ESP refused for its clusters; and a 300 MiB FAT32 stick whose data region is off a 4 KiB
+boundary — asserted before the boot — is auto-mounted writable, its host names (Unicode among them)
+listed, written to (a directory, a copy to a long Unicode name, a rename, a removal, a file through
+a mapping), ejected with `disk --eject` and pulled. On the host `fsck.fat -n` finds it clean and
+mtools reads what the guest wrote. **It logs in only once `boot-probe` has exited**, whatever its
+verdict, which on that machine is a FAIL by the machine's shape: its later tests install a policy
+and fill the view broker's clients, and the sticks made the gate long enough to meet them. It runs
+in CI's QEMU job.
+
+`cargo xtask check-media` is the **removable-media gate** (Phase 6 Part F), on the desktop a person
+uses: the **release** live image as the boot stick beside a copy of the release disk, logged in at
+the graphical greeter. Files lists the internal `nitrox-root` in its sidebar's Drives with no eject
+button; a FAT stick plugged in over QMP is auto-mounted writable and **its row appears on the screen
+with nothing typed after the plug** — read off screendumps, since any input would wake Files whether
+the storage service's watch had or not; the editor saves onto it through Save As, Up to `/` aimed
+where `libui` lays the chooser out for the staged theme; **Files' eject button ejects it** with no
+password and its row goes; and on the host `fsck.fat -n` finds it clean and `mtype` reads back what
+was typed. It runs in CI's QEMU job.
 
 `cargo xtask check-shutdown` is the **shutdown gate** (administration Part E.4d), and the second
 whose verdict is a disk. It boots a copy of a `--selftest` disk image and, on serial once

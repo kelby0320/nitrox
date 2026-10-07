@@ -1626,6 +1626,35 @@ longer holds misses its `mtime` on an in-place write. The fix, should it matter,
 entry by walking the directories, or to keep the table per open file rather than bounded.
 **Trigger**: an `mtime` someone needs that a busy stick lost.
 
+**A session mounting a stick it ejected (`session-remount`).** A session ejects a removable
+disk's mount with no grant (Phase 6 Part F), and the stick then stays unmounted until it is plugged
+in again or an administrator mounts it with `with admin disk --mount`. A session that could mount a
+removable disk would be a second way to mount, beside the admin session's, with its own rules for
+what a session may take. **Trigger**: a person who ejected by mistake and could not pull the stick
+out to plug it in again.
+
+**Saying why a stick did not mount (`unmounted-why`).** Files' Drives lists mounts (Phase 6 Part F),
+so a stick the storage service refused — a FAT with clusters under a page, say — or holding nothing
+it serves appears nowhere but the service's log line. The table has no column for the reason.
+**Trigger**: Part G's formatting, which is what would make such a stick usable, and which needs a
+place to be offered.
+
+**Files waiting on the storage service — `TODO(files-storage-wait)`.** Files reads the storage
+table after each watch ping, and sends an `Eject` and waits for its answer, on its one thread
+(Phase 6 Part F). The service is one thread too, and may be in an unmount chain — a flush, a
+server's answer bounded at thirty seconds — so a Files that reads or ejects meanwhile repaints
+nothing until it answers. Since PR #367's review a window opens before Files asks the service
+anything. The fix is the resolve and the request as pending operations in Files' wait, beside the
+compositor's channel and the watch. **Trigger**: an eject or a table read slow enough that a
+person sees the window stop.
+
+**Drives in the chooser and the shell's Places menu (`chooser-drives`).** The editor's Save As and
+Open reach a stick by Up to `/`, `storage`, then its name, and the shell's Places menu lists Home,
+the home folders and Root. Phase 6 Part F kept both as they were — the chooser by the maintainer's
+call in its detail pass — and gave the drives to Files' sidebar alone. A chooser listing places and
+drives is a toolkit change; a name field taking an absolute path is a smaller one. **Trigger**:
+saving to a stick being a thing people do often enough to find the walk slow.
+
 **ext4 with blocks smaller than a page — `TODO(ext4-subpage-runs)`.** The kernel fills a page as one
 device range from the page's first block, so a page must lie within one run. FAT's server makes
 that so by refusing small clusters; **`fs-server-ext4` does not check it**. With 4 KiB blocks, which

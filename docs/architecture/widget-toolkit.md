@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -669,6 +669,27 @@ optimisation: a hundred windows cost as many elements as fit on screen, and the 
 that many. It is designed against two callers deliberately — a window list is reordered in
 place, a launcher's results are replaced wholesale — because a model API drawn for one
 consumer is the failure §5 was avoiding.
+
+**A row can carry a button at its trailing end** (`ListRow::button`, a `RowButton`; Phase 6 Part F):
+one glyph, dim and in full ink under the pointer with the tab close box's face behind it, as a tab
+carries its `×`. Files' drives use it for eject. **It is pressed through the list's own
+`activate`, with a key of its own**, so a list with buttons takes no more parameters than one
+without and the caller tells the button from the row by the key. Over the button is still over the
+row, which stays lit; a press on it is not a grab of the row, by the router's rule that a nearer
+`on_press` shadows an `on_press_down`. The row's body and its button are both keyed — the body with
+the row's own key, as a tab's label takes its tab's — since the diff wants a container's children
+all keyed or none.
+
+**A row with a button keeps its layers in place whether it is lit or not**, and so, since the same
+day, does an inactive tab (`check-media` found it). The router finds the widget a press captured
+by its id, and an id survives a repaint only while its siblings keep their positions. A lit row's
+wash, and a hovered tab's face, used to be *inserted* before the content holding the button, so
+when the press lit the row and the release arrived after that repaint — always, on an unfocused
+window, since the raise is a repaint between them — the captured button was gone: the click was
+lost, or landed on the row and opened the drive it meant to eject. An empty `text("")` holds the
+slot now. **A layer that comes and goes goes after the targets, or holds its slot**; inside the
+captured widget itself, its own children may move freely. Pinned by
+`a_rows_button_keeps_its_click_across_a_repaint_that_lights_it` and its tab and title-bar siblings.
 
 **A knock-on worth recording**: `deferred-decisions.md` gives key repeat the trigger "the
 first text field — M4's toolkit". With no text field in M4, that wording would say the

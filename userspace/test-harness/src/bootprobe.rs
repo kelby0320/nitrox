@@ -2834,9 +2834,15 @@ fn storage_mount_test(root_ns: u64) -> bool {
 /// 5. Each refusal is its own: a hidden label, `init`'s root, a device already mounted, a FAT device,
 ///    an unknown label.
 /// 6. A session endpoint reaches no admin endpoint.
+/// 7. **A watch and a media session, opened through a session endpoint** (Phase 6 Part F): the
+///    watch is pinged by the unmount and by the remount, and not by the unmount refused; the media
+///    session's `Eject` of the scratch disk — a RAM disk, not removable — is refused `NoAccess`,
+///    and of a name nothing is mounted under `NotFound`, both leaving the mount as it was.
 fn storage_admin_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
-    use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount, parse_in_use};
+    use librsproto::storage::{
+        OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount, is_changed, parse_in_use,
+    };
     use libstream::wire::{Table, Value};
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: storage admin: ").s(what).s(b" FAIL").end();
@@ -2918,6 +2924,46 @@ fn storage_admin_test(root_ns: u64) -> bool {
         ok
     };
 
+    // 0. **A watch and a media session, as a session opens them** (Phase 6 Part F): a resolve of
+    //    `info/watch` and of `info/media` on a session endpoint, each answered with a channel.
+    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
+    let open = |suffix: &[u8]| -> Option<u64> {
+        let mut req = [0u8; 64];
+        let n = librsproto::namespace::resolve_request(&mut req, chan, 0, suffix)?;
+        if !rs_send(endpoint, librsproto::OP_NS_RESOLVE, 1, &req[..n], &[]) {
+            return None;
+        }
+        let m = receive(endpoint, clock_ns() + 5_000_000_000)?;
+        if m.error || m.handles.len() != 1 {
+            m.handles.iter().for_each(|&h| close(h));
+            return None;
+        }
+        Some(m.handles[0])
+    };
+    let (watch, media) = if st == 0 && endpoint != 0 { (open(b"info/watch"), open(b"info/media")) } else { (None, None) };
+    close(endpoint);
+    let (Some(watch), Some(media)) = (watch, media) else {
+        watch.into_iter().chain(media).for_each(close);
+        return finish(fail(b"a session endpoint opened no watch, or no media session"));
+    };
+    let finish = |ok: bool| {
+        close(watch);
+        close(media);
+        finish(ok)
+    };
+    // **Whether the watch was pinged**, waiting until `deadline` for the first — `0` only looks —
+    // and taking every ping queued behind it.
+    let pinged = |deadline: u64| {
+        let mut any = false;
+        while let Some(m) = receive(watch, if any { 0 } else { deadline }) {
+            m.handles.iter().for_each(|&h| close(h));
+            any |= is_changed(m.op, &m.body);
+        }
+        any
+    };
+    // Whatever earlier tests' mounts and unmounts queued.
+    pinged(0);
+
     // 1. What is in use.
     let mut ids = alloc::vec::Vec::new();
     let in_use = ask(OP_STORAGE_IN_USE, &[]);
@@ -2938,6 +2984,12 @@ fn storage_admin_test(root_ns: u64) -> bool {
     close(held);
     if !refused(&busy, KError::WouldBlock) {
         return finish(fail(b"an unmount with a file held was not refused WouldBlock"));
+    }
+    // **No ping for a refusal**: the service pings at the end of the turn that changed the mounts,
+    // so one owed for that turn is queued before the reply to any later request — and `InUse`'s
+    // reply being here means a look at the watch now would find it.
+    if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
+        return finish(fail(b"an unmount refused pinged the watch, or InUse was not answered"));
     }
     if read(root_ns, b"/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
         return finish(fail(b"a refused unmount did not leave the mount as it was"));
@@ -2961,9 +3013,12 @@ fn storage_admin_test(root_ns: u64) -> bool {
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
     close(fh);
 
-    // 4. Unmount, then the label is gone.
+    // 4. Unmount, then the label is gone — and the watch is told.
     if !answered(&ask(OP_STORAGE_UNMOUNT, b"nitrox-scratch")) {
         return finish(fail(b"the unmount was not answered"));
+    }
+    if !pinged(clock_ns() + 5_000_000_000) {
+        return finish(fail(b"the unmount did not ping the watch"));
     }
     let (st, gone) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/README", RIGHT_MAP_READ);
     close(gone);
@@ -3000,6 +3055,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
     let again = ask(OP_STORAGE_MOUNT, &body[..n]);
     if !again.as_ref().is_some_and(|m| !m.error && m.body == b"nitrox-scratch") {
         return finish(fail(b"a Mount by name did not bring nitrox-scratch back"));
+    }
+    if !pinged(clock_ns() + 5_000_000_000) {
+        return finish(fail(b"the remount did not ping the watch"));
     }
     if read(root_ns, b"/svc/storage/fs/nitrox-scratch/unsynced").as_deref() != Some(&want[..]) {
         return finish(fail(b"the remounted filesystem does not hold the unsynced file"));
@@ -3043,7 +3101,30 @@ fn storage_admin_test(root_ns: u64) -> bool {
     if !refused(&reply, KError::NotFound) {
         return finish(fail(b"a session endpoint answered admin-endpoint"));
     }
-    kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session ok\n");
+
+    // 9. **A session's eject** of the scratch disk, a RAM disk: refused `NoAccess`, since an
+    //    internal disk is the `storage` grant's; a name nothing is mounted under, `NotFound`.
+    let eject = |id: u64, name: &[u8]| {
+        if !rs_send(media, OP_STORAGE_EJECT, id, name, &[]) {
+            return None;
+        }
+        let m = receive(media, clock_ns() + 30_000_000_000)?;
+        m.handles.iter().for_each(|&h| close(h));
+        Some(m)
+    };
+    if !refused(&eject(1, b"nitrox-scratch"), KError::NoAccess) {
+        return finish(fail(b"a session's eject of the scratch disk was not refused NoAccess"));
+    }
+    if !refused(&eject(2, b"no-such-label"), KError::NotFound) {
+        return finish(fail(b"a session's eject of an unknown name was not refused NotFound"));
+    }
+    if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
+        return finish(fail(b"an eject refused pinged the watch"));
+    }
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode")))) != Some(Some(alloc::string::String::from("rw"))) {
+        return finish(fail(b"a refused eject unmounted the scratch disk"));
+    }
+    kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session, a watch pinged by the unmount and the remount and not by a refusal, a session's eject of a RAM disk refused NoAccess ok\n");
     finish(true)
 }
 

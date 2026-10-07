@@ -219,7 +219,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/dev/views` | the view broker's forwarding endpoint, **scoped to `/s/<session>`** | the session's identity to the broker — see below |
 | `/dev/devices` | an **info-only** endpoint of the device manager's, scoped to `/info` | the machine's devices as typed tables, and nothing to take one with — see below |
 | `/storage` | the storage service's **session** endpoint, scoped to `/fs` | every mounted filesystem, `/storage/<label>/…`, and nothing to mount with — see below |
-| `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds |
+| `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds; since Phase 6 Part F a media session that ejects a removable disk's mount, and a watch pinged when the mounts change ([`storage.md`](storage.md) §8a) |
 | `/dev/services` | `service-mgr`'s **session** endpoint for its services | the table of services, `all.tsm`, and nothing to start or stop one with — [`rsproto-services-ops.md`](../spec/rsproto-services-ops.md) |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
@@ -323,8 +323,10 @@ is mounted. `desktop-session-mgr` hands the endpoint to `desktop-shell` as its e
 shell binds it the same two ways into every application ([`storage.md`](storage.md)).
 
 **The endpoint is the boundary, again.** On a session endpoint the service answers the filesystems
-and the table, and `admin-endpoint` is `NotFound` however it is bound, so the shell, holding it
-with `BIND_NAMESPACE`, cannot mint the endpoint that mounts. Mounting is the view broker's
+and the table — and since Phase 6 Part F a **media session**, which ejects a removable disk's mount
+and nothing else, and a **watch** — and `admin-endpoint` is `NotFound` however it is bound, so the
+shell, holding it with `BIND_NAMESPACE`, cannot mint the endpoint that mounts. Any session can eject
+any stick: the service cannot tell sessions apart. Mounting is the view broker's
 `storage` grant. `test-interactive` lists `/dev/storage` and filters its table from a serial login,
 and asserts that `/storage` lists filesystems, not tables. `check-login` asserts both bindings in
 the graphical session and in every application namespace. A boot without the service builds
