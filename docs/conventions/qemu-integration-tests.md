@@ -240,6 +240,18 @@ by its MBR where it has one — as it reads the SATA disk. A command in flight a
 unplug is the driver's host tests' alone: no gate can place an unplug inside one command's few
 milliseconds without depending on timing.
 
+**`check-media` plugs a stick into a desktop and reads the result off the screen** (Phase 6 Part
+F). It boots the **release** live image beside a copy of the release disk and logs in at the
+graphical greeter, so what it drives is what a person has: Files, the editor, the eject button.
+Its one claim no log line could carry is that **a stick appears in Files with nothing typed or
+moved after the plug** — any input would wake Files on its compositor channel and draw the row
+whether the storage service's watch had woken it or not — so after the `device_add` it only takes
+screendumps, until the row's label and its eject glyph have ink where the browser's metrics put the
+second drive row. Where it aims inside a dialog it does not write down: the editor's chooser is laid
+out on the host by `libui`, with the theme the image stages, and the gate clicks where that layout
+puts the Up button. **A cursor is drawn into the screen a gate reads**, so a check for something
+gone looks where the pointer is not.
+
 **A gate that boots a test image and types meets `boot-probe` unless it waits for it.** `boot-probe`
 starts once the test harness's chain has finished, and some of its tests change what a session
 leans on: they install a policy, and open view-broker clients until one is refused. `check-shutdown`
@@ -280,10 +292,10 @@ distribution/affinity self-tests are meaningful), `-display none`,
 **`test-qemu` and `test-interactive` boot QEMU's default screen, 1280×800; every gate that looks at
 or clicks on a screen boots 1360×768** — `check-display`, `check-input`, `check-terminal`,
 `check-login`, `check-logout`, `check-fbcon`, `check-live`, `check-report`, `check-install`,
-`check-storage`, `check-shutdown`, `check-recovery`, and the `shot` and `bench-compose` tools (Phase
-5 Part E). So every CI run boots two sizes, and a size written back into a client fails somewhere.
-`--size WxH` boots one of those at another size; `qemu_base_args` takes the screen from every
-caller, so a new boot cannot forget to say.
+`check-storage`, `check-media`, `check-shutdown`, `check-recovery`, and the `shot` and
+`bench-compose` tools (Phase 5 Part E). So every CI run boots two sizes, and a size written back
+into a client fails somewhere. `--size WxH` boots one of those at another size; `qemu_base_args`
+takes the screen from every caller, so a new boot cannot forget to say.
 
 - **The size is QEMU's, not the image's**: `-vga none -device VGA,xres=…,yres=…` makes QEMU's
   EDID prefer the mode, and OVMF and Limine boot into it.

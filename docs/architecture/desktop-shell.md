@@ -2,7 +2,9 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-29**, when administration Part F.3 gave the power menu
+**Partly built, and checked 2026-10-07**, when Phase 6 Part F gave the file browser's sidebar
+Drives beside the places this menu shares (§4). Checked 2026-09-29, when administration Part F.3
+gave the power menu
 **Restart** and **Shut down**, asked of the view broker once the windows have closed (§4b). Part F.2
 had given the top bar that **power menu** at its right-hand end the same day, and taught the shell
 to **end its session**, closing its windows first. Before that, checked 2026-09-22, when the desktop
@@ -291,6 +293,16 @@ sidebar asks too: it moved there from `nxfiles` so the two cannot come to disagr
 person's places are. Choosing one launches `nxfiles` with the path as `argv[1]`, which is where
 its first window opens; its home is still `HOME`. The design's `Trash` is dropped, because there is
 no trash.
+
+**The file browser's sidebar has Drives below its places** (Phase 6 Part F), and this menu does
+not: every filesystem mounted under `/storage`, by the name it is mounted under, with an eject
+button (⏏) on a removable drive's row — a press sends `Eject` on a media session, and the window's
+strip says what the storage service answered ([`storage.md`](storage.md) §8a). Files follows them
+through the storage service's **watch**, waited on beside its compositor channel, so a stick plugged
+in is drawn with nothing pressed; a Files refused a watch reads the table when a window opens and
+when one takes focus. A drive that goes, ejected or pulled, takes every tab inside it home. Drives
+in this menu and in the editor's chooser are filed
+([`deferred-decisions.md`](../rationale/deferred-decisions.md)).
 
 **The desktop-name prompt** (`Super+R`) is a popup of its own above the bottom bar's right-hand
 end, where the desktop's name is: a line saying what it is for, and the field. It borrowed the

@@ -5,11 +5,11 @@ current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
-E detailed and built 2026-10-06; Part F detailed 2026-10-07; Parts F–H not built.** This replaces the
-sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
-were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
-as administration's parts did; what is here is the phase's shape, the design each part builds to,
-and the gate that closes it. **Nothing below describes current behaviour.**
+E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Parts G–H not built.** This
+replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
+decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
+when it is next, as administration's parts did; what is here is the phase's shape, the design each
+part builds to, and the gate that closes it. **Nothing below describes current behaviour.**
 
 ## Scope
 
@@ -2225,6 +2225,21 @@ The maintainer agreed to all four, as recommended.
   the row opens it; a refusal's notice; a tab moved home when its drive leaves the table.
 - **F.4 The gates.** Below.
 - **F.5 Docs.** Below.
+- **F.1–F.5 built 2026-10-07.** Calls on the way (the decision log's "Phase 6 Part F, built" has
+  the reasoning):
+  - **the ping is decided once per turn**, comparing the names mounted before and after it;
+  - **a drive's row and button are keyed by its block device**, not its position;
+  - **the eject button is the toolkit's `RowButton`** — and with it a toolkit bug the gate found: a
+    lit row's wash was inserted before its content, so a release after the repaint lost the click
+    or opened the drive. Rows with a button, and inactive tabs, which had the same bug, now hold
+    the slot;
+  - **`check-storage`'s pulled stick is checked as a copy taken at the pull**, since the re-plugged
+    stick now mounts writable and is marked in use by its own mount;
+  - **the held check on a session's eject is held by `check-storage`**, through `test-pattern
+    --eject-held`, since the chain is the binary's and `nxsh` has no background jobs;
+  - **`check-media`'s Save As goes Up to `/` and names `storage/<stick>/<file>`** rather than
+    clicking rows whose order is the namespace's; `nxedit` says when an open chooser moves;
+  - **CI runs `check-media` under KVM**, as every QEMU gate there.
 
 ### Gates
 

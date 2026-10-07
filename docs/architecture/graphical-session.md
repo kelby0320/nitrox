@@ -275,8 +275,10 @@ could bind it at any base. On the endpoint bound at `/svc/storage`, `admin-endpo
 endpoint that mounts and unmounts. So `desktop-session-mgr` is handed a route to a **session
 endpoint**, on which the service answers the filesystems and the table and nothing else (it
 resolved one itself until administration Part E.1b), and hands that to the shell as its eighth
-extra ([`storage.md`](storage.md) §7). Mounting reaches a program only through the view broker's
-`storage` grant.
+extra ([`storage.md`](storage.md) §7). **Since Phase 6 Part F it also opens a media session**, which
+ejects a removable disk's mount and mounts nothing, and **a watch**, pinged when the mounts change:
+Files' Drives use both ([`storage.md`](storage.md) §8a). Mounting reaches a program only through the
+view broker's `storage` grant.
 
 **`service-mgr`'s services endpoint too** (administration Part E.2b): its ninth extra, bound at
 `/dev/services` in every application. It is a session endpoint of `service-mgr`'s own, answering

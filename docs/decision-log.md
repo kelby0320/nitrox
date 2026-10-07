@@ -34608,3 +34608,57 @@ Each was checked against the code before it went in.
 - The phase's *Removable media* design is marked where the pass revised it.
 - `shell-language.md` §10d's `disk` row gains the `description` column it has lacked since the
   laptop polish.
+
+## 2026-10-07 — Phase 6 Part F, built: removable media for a session
+
+**Built as detailed**: a stick mounts writable on any boot, an internal disk read-only on a live
+one; a session opens a **media session** at `/dev/storage/media` for one `Eject`, by the name the
+filesystem is mounted under, and a **watch** at `/dev/storage/watch` the service only pings; the
+table gains `removable`; `disk --eject NAME` runs in any session; Files' sidebar lists **Drives**
+below its places, with an eject button on a removable drive, kept current by the watch; and
+`check-media` drives it all on the live desktop.
+
+**Calls made on the way:**
+- **When to ping is decided once per turn of the service's loop**: the names mounted under
+  `/storage` before the turn against after it. A ping at each place that mounts or unmounts was the
+  alternative, and a path that forgot one would have left a watcher stale; a refusal changes no
+  name and pings nobody, which `boot-probe` checks by looking at the watch after a later request's
+  reply, which a ping owed for the earlier turn would precede.
+- **A drive's row and button are keyed by its block device**, not its position, so a stick pulled
+  between a frame and a click cannot move another drive's eject button under the pointer.
+- **The eject button is the toolkit's**, `ListRow::button` (`RowButton`), pressed through the list's
+  own `activate` with a key of its own, as a tab carries its `×`.
+- **And the gate found a toolkit bug with it.** A press on the eject button opened the drive in one
+  run of two. `list_view` *inserted* its wash before a lit row's content, so when the press lit the
+  row and the release came after the repaint — always, for a click on an unfocused window — the
+  button the router had captured by its tree id had a new one, and the release either did nothing
+  or reached the row's own `on_press`. A row with a button now holds the wash's slot when unlit.
+  **The tab strip had the same bug**: an inactive tab's hover face was inserted before its label and
+  `×`, and a host test pressing in one frame and releasing in the next lost the close; it holds its
+  slot too. The title bar's buttons, checked the same way, were sound. The button's own hover face
+  may still come and go: it is inside the widget a press captures.
+- **A writable mount's report line says nothing of how the filesystem was found**, as before, so
+  `check-storage`'s re-plugged stick no longer reads "not left clean" — and, now mounted writable,
+  is marked in use by its own mount, which would have let the host's "still marked in use" pass
+  whatever the pull did. **The host checks a copy taken right after the pull** instead.
+- **The held check on a session's eject is held by `check-storage`, not a host test**: the chain is
+  the binary's, and `nxsh` has no background jobs yet to hold a file while `disk` runs. So
+  `test-pattern --eject-held PATH NAME` holds the file and asks for the eject itself, on a media
+  session, and must be refused.
+- **`check-media`'s Save As walks Up to `/`** — aimed where `libui` lays the chooser out for the
+  theme the image stages, since `xtask` links the toolkit — **then names `storage/<stick>/<file>`**
+  in the field, which is joined to `/`, rather than clicking the rows: where `storage` falls among
+  `/`'s rows is the namespace's to decide. `nxedit` says when an open chooser moves, which it never
+  did.
+- **CI runs `check-media` under KVM**, as every QEMU gate there; the set's 44 counts the local TCG
+  run too. The detail pass wrote "`check-media` and `check-media --kvm`" for CI.
+- **The planned control on the watch's bound** needed the host test to write down 32, not
+  `MAX_WATCHES`, or a bound of four would have passed it.
+- The service's live-boot line says **internal** disks mount read-only.
+
+**Controls, the seven planned, each failing where it should**: the auto-mount read-only on a live
+boot again fails `check-storage` at the first stick's writable mount; `Eject` allowed for an
+internal mount fails it at `nitrox-root`'s refusal; the held check skipped for a session's eject
+fails it at `test-pattern --eject-held`; no ping on a change fails `boot-probe` at the unmount's;
+Files not waiting on its watch fails `check-media` at the plug, the row never drawn; the watch
+bounded at four fails the watch-list host test; an eject button on every drive fails Files'.
