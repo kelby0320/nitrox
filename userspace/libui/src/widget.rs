@@ -535,6 +535,13 @@ pub fn tab_strip<Msg: Clone>(
                 Insets { top: 0, right: 0, bottom: TAB_RULE, left: 0 },
                 stack(tab_face(theme.face, TAB_RADIUS)),
             ));
+        } else {
+            // **The face's slot, held when unlit** (Phase 6 Part F): a press on the `×` lights the
+            // tab, and a face inserted before the label and `×` moved them along one, so a release
+            // after that repaint found nothing it had captured and the close was lost.
+            // `a_tabs_close_box_keeps_its_click_across_a_repaint_that_lights_it`; the list row's
+            // button had the same bug first.
+            layers.push(text(""));
         }
         let ink_colour = if current { theme.foreground } else { theme.foreground_dim };
         // **The close box lights on hover** (desktop refresh, after Part K): a small face in
@@ -2976,6 +2983,14 @@ pub fn list_view<Msg>(
             layers.push(wash(theme.accent, libdraw::theme::SELECTION_COVERAGE));
         } else if over {
             layers.push(wash(theme.accent, hover));
+        } else if r.button.is_some() {
+            // **A row with a button keeps its layers in place, lit or not** (Phase 6 Part F). The
+            // router finds the widget a press captured by its id, and an id survives a repaint
+            // only while its siblings keep their positions: a wash inserted here when the press
+            // lit the row moved the body and its button along one, and the release that followed
+            // the repaint was lost — or, in `check-media`, opened the drive instead of ejecting
+            // it. A row with no button has its handler on the row itself, which no layer moves.
+            layers.push(text(""));
         }
         // **The label, then whatever trailing cells the list declares** (desktop refresh,
         // Part I). A row with no columns is what it always was: one padded label. With them,
@@ -3031,6 +3046,8 @@ pub fn list_view<Msg>(
             // and the button needs a key for hover to name it: the body takes the row's own, as a
             // tab's label takes its tab's, so `hovered` over it still names the row.
             Some(b) => {
+                // The face may come and go: it is inside the button, which is the widget a press
+                // captures, and that keeps its id however its own children move.
                 let mut face = alloc::vec::Vec::with_capacity(2);
                 let glyph_ink = if hovered == Some(b.key) {
                     face.push(center(sized(
@@ -3345,6 +3362,168 @@ mod list_view_tests {
             ground_at(&paint(&build(eject, Some(7)))),
             "as over the row itself"
         );
+    }
+
+    /// **A press on a row's button is still the button's after a repaint lights the row** (Phase 6
+    /// Part F, `check-media`'s third run): the press establishes hover, the next frame draws the
+    /// row washed and the button's face behind its glyph, and the release that follows lands in
+    /// that frame. Every pairing of the two frames, each way round.
+    #[test]
+    fn a_rows_button_keeps_its_click_across_a_repaint_that_lights_it() {
+        use crate::diff::Tree;
+        use crate::route::Router;
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+        let t = Theme::default();
+        let (w, h) = (200u32, 25u32);
+        let build = |hovered: Option<u64>, selected: Option<usize>| {
+            let row = ListRow {
+                key: 7,
+                label: "NXFAT",
+                swatch: Some(Swatch::dot(t.ok)),
+                button: Some(RowButton { key: 8, glyph: "x" }),
+                ..Default::default()
+            };
+            let mut st = ListState::default();
+            st.selected = selected;
+            list_view::<u64>(&[row], &[], &mut st, h, h, |k| k, None, None, hovered, None, &t)
+        };
+        let at = |pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x: (w - ROW_BUTTON_W / 2) as i32,
+            y: h as i32 / 2,
+            ..Default::default()
+        };
+        let all = libdraw::geom::Rect::new(0, 0, w, h);
+        const CELL: crate::layout::FixedCell = crate::layout::FixedCell { w: 8, h: 16 };
+        let states = [(None, None), (Some(8), None), (Some(7), None), (None, Some(0)), (Some(8), Some(0))];
+        for before in states {
+            for after in states {
+                let mut tree = Tree::new();
+                let e1 = build(before.0, before.1);
+                let l1 = crate::layout::layout(&e1, all, &CELL);
+                tree.update(&e1, &l1).expect("a clean frame");
+                let mut r = Router::new();
+                let down = r.pointer(&tree, &e1, &l1, at(true)).0;
+                let e2 = build(after.0, after.1);
+                let l2 = crate::layout::layout(&e2, all, &CELL);
+                tree.update(&e2, &l2).expect("a clean frame");
+                let up = r.pointer(&tree, &e2, &l2, at(false)).0;
+                assert_eq!((down, up), (alloc::vec![], alloc::vec![8]), "pressed in {before:?}, released in {after:?}");
+            }
+        }
+    }
+
+    /// **An inactive tab's `×` keeps its click across the repaint that lights the tab**, the class
+    /// of [`RowButton`]'s bug: the hover face an inactive tab gains came before its label and `×`,
+    /// and moved them along one.
+    #[test]
+    fn a_tabs_close_box_keeps_its_click_across_a_repaint_that_lights_it() {
+        use crate::diff::Tree;
+        use crate::route::Router;
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+        #[derive(Clone, PartialEq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let t = Theme::default();
+        let tabs = [Tab { key: 1, label: "one", marked: false }, Tab { key: 2, label: "two", marked: false }];
+        let build = |hovered: Option<u64>| tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::none(), &t);
+        const CELL: crate::layout::FixedCell = crate::layout::FixedCell { w: 8, h: 16 };
+        let all = libdraw::geom::Rect::new(0, 0, 400, TAB_STRIP_H);
+        let x = (TAB_SIDE + TAB_W + TAB_GAP) as i32 + TAB_CLOSE_CX;
+        let at = |pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x,
+            y: TAB_STRIP_H as i32 / 2 + 2,
+            ..Default::default()
+        };
+        let states = [None, Some(2), Some(tab_close_key(2))];
+        for before in states {
+            for after in states {
+                let mut tree = Tree::new();
+                let e1 = build(before);
+                let l1 = crate::layout::layout(&e1, all, &CELL);
+                tree.update(&e1, &l1).expect("a clean frame");
+                let mut r = Router::new();
+                let _ = r.pointer(&tree, &e1, &l1, at(true));
+                let e2 = build(after);
+                let l2 = crate::layout::layout(&e2, all, &CELL);
+                tree.update(&e2, &l2).expect("a clean frame");
+                let up = r.pointer(&tree, &e2, &l2, at(false)).0;
+                assert_eq!(up, alloc::vec![M::Close(2)], "pressed with {before:?} lit, released with {after:?}");
+            }
+        }
+    }
+
+    /// **A title bar's buttons keep their click across a repaint that changes focus or hover** — the
+    /// class of [`RowButton`]'s bug, swept: a click on an unfocused window is a raise between the
+    /// press and the release, so the release always meets a repainted bar.
+    #[test]
+    fn a_title_bars_buttons_keep_their_click_across_a_repaint() {
+        use crate::diff::Tree;
+        use crate::route::Router;
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+        #[derive(Clone, PartialEq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let t = Theme::default();
+        let build = |focused: bool, hovered: Option<u64>| {
+            title_bar(
+                "a window",
+                Some("/home"),
+                focused,
+                M::Drag,
+                TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+                hovered,
+                &t,
+            )
+        };
+        const CELL: crate::layout::FixedCell = crate::layout::FixedCell { w: 8, h: 16 };
+        let all = libdraw::geom::Rect::new(0, 0, 400, TITLE_BAR_H);
+        let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
+        let close_x = (400 - TITLE_BUTTON_PAD - TITLE_BUTTON_W / 2 - 1) as i32;
+        let at = |x: i32, pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x,
+            y: 16,
+            ..Default::default()
+        };
+        for (x, want, key) in [
+            (close_x, M::Close, TITLE_CLOSE_KEY),
+            (close_x - step, M::Max, TITLE_MAXIMISE_KEY),
+            (close_x - 2 * step, M::Min, TITLE_MINIMISE_KEY),
+        ] {
+            for before in [false, true] {
+                for after in [false, true] {
+                    let mut tree = Tree::new();
+                    let e1 = build(before, None);
+                    let l1 = crate::layout::layout(&e1, all, &CELL);
+                    tree.update(&e1, &l1).expect("a clean frame");
+                    let mut r = Router::new();
+                    let _ = r.pointer(&tree, &e1, &l1, at(x, true));
+                    // The repaint the press causes: the button lit, and focus as the raise left it.
+                    let e2 = build(after, Some(key));
+                    let l2 = crate::layout::layout(&e2, all, &CELL);
+                    tree.update(&e2, &l2).expect("a clean frame");
+                    let up = r.pointer(&tree, &e2, &l2, at(x, false)).0;
+                    assert_eq!(up, alloc::vec![want.clone()], "focused {before} then {after}");
+                }
+            }
+        }
     }
 
     /// A row's columns are where the list declares them, and its swatch is drawn.
