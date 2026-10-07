@@ -4,13 +4,15 @@
 `service-mgr` since Part E.1a, its session endpoint handed to sessions as `service-mgr`'s route
 since Part E.1b; its shutdown unmount built with Part E.4a; the installer's source passed over
 since Part G.1; a `description` column since the laptop polish's Part C; devices that arrive and
-depart, and the disk the machine started from, since Phase 6 Part D; last checked 2026-10-06.**
+depart, and the disk the machine started from, since Phase 6 Part D; FAT read by its server's check
+and served by `fs-server-fat` on a removable disk since Phase 6 Part E; last checked 2026-10-06.**
 What exists:
 - `storage-service`, the owner of `block`. It reads what each disk, partition and RAM disk holds,
   and which of them `init` mounted, and serves that as TSM1 tables at `/svc/storage/info` (C.5a).
-- **Mounting** (C.5b): every ext4 `init` did not mount is auto-mounted, read-only on a live boot,
-  with an `fs-server-ext4` and a namespace of its own, and named by its label — bar the installer's
-  source, a partition named `nitrox-source` (§6).
+- **Mounting** (C.5b): every ext4 `init` did not mount is auto-mounted, and every FAT on a
+  removable disk (Phase 6 Part E), read-only on a live boot, with the server for its kind —
+  `fs-server-ext4` or `fs-server-fat` — and a namespace of its own, and named by its label — bar the
+  installer's source, a partition named `nitrox-source` (§6).
   `/svc/storage/fs/<label>/…` answers with `SUBNAMESPACE`, so a resolve continues in that
   namespace.
 - **The session endpoint** (C.5b): minted at `/svc/storage/session-endpoint`, answering the
@@ -52,6 +54,7 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 | The service | `userspace/storage-service/` | The library decides what a device holds, which devices are `init`'s, whether this is a live boot, and the tables. The binary is the event loop |
 | The manifest reader | `userspace/libinittoml/` | `init.toml`'s schema and parser, shared with `init` so the two cannot read it differently |
 | The ext4 checks | `userspace/fs-server-ext4/src/ext4.rs` | `check_device`, `volume_label` and `was_left_clean`: what the server itself runs, so the service never offers a filesystem the server would refuse |
+| The FAT checks | `userspace/fs-server-fat/src/volume.rs` | `Fat::check`, the label and `was_left_clean`, for the same reason; the check's refusal is the reason a FAT is not served (Phase 6 Part E.5) |
 | The partition-table reader | `userspace/libgpt/` | Each disk's entries, for `init.toml`'s UUID sources |
 | The `Storage` codec | `userspace/librsproto/src/storage.rs` | `Mount`, `Unmount` and `InUse` bodies ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)) |
 | The busy check | `kernel/src/syscall/table.rs` (`sys_ns_held`) | How many of a mount's files something still holds, after the finished IRPs have let go |
@@ -75,17 +78,23 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
    continued twice — into `service-mgr`'s registry, then into a mount's namespace — two of the
    four continuations the kernel allows.
 
-On a `test-qemu` boot the log reads, the RAM disk being the test image's scratch filesystem
+On a `test-qemu` boot the log reads, the RAM disk being the test image's scratch filesystem and the
+last two the USB stick's disk and partition
 ([`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md)):
 
 ```
-storage-service: 4 block device(s)
-storage-service: blk-0 (disk QEMU HARDDISK (QM00001)): no filesystem
+storage-service: 6 block device(s)
+storage-service: blk-0 (disk QEMU HARDDISK (QM00001)): no filesystem; on the disk the machine started from, passed over
 storage-service: blk-1 (ramdisk module 1 (/boot/scratch.img)): ext4 'nitrox-scratch'; mounted at /storage/nitrox-scratch (rw)
-storage-service: blk-2 (partition NITROX_ESP): fat 'NITROX_ESP'
+storage-service: blk-2 (partition NITROX_ESP): fat 'NITROX_ESP', left clean; not served: 512-byte clusters, smaller than a page
 storage-service: blk-3 (partition nitrox-root): ext4; init's at / (rw)
+storage-service: blk-4 (disk QEMU QEMU HARDDISK (1-0000:00:03.0-3)): no filesystem
+storage-service: blk-5 (partition partition 1 (unlabelled)): fat 'NXSTICK', left clean; not served: 512-byte clusters, smaller than a page
 storage-service: not a live boot
 ```
+
+(This showed four devices, and the ESP as `fat 'NITROX_ESP'` alone, until Phase 6 Part E; the
+stick and the disk's line came with Part D.)
 
 ## 4. What a device holds
 
@@ -93,10 +102,14 @@ storage-service: not a live boot
   a directory. That is the check the server runs before it says Ready, so a device the service
   calls ext4 is one a server would serve. Its label (`s_volume_name`, empty when `mke2fs` was
   given no `-L`, as the image builder's is) and whether it was left clean come with it.
-- **FAT**, from its boot sector: the `0x55AA` signature, a sector size from 512 to 4096, the
-  extended boot signature `0x29`, and the type string after it. Recognised and reported, never
-  mounted: there is no `fs-server-fat` until Phase 6. A GPT disk's protective MBR carries the
-  signature and none of the rest, so a whole disk is not mistaken for a filesystem.
+- **FAT**, read by `fs-server-fat`'s own check (Phase 6 Part E.5), as ext4 is by its server's:
+  its label, whether it was left clean, and, if the server would refuse it, why — in the refusal's
+  own words ([`fat-fs-server.md`](fat-fs-server.md) §2). **A boot sector the library cannot parse is
+  still a FAT if it carries the four marks every formatter writes**: the `0x55AA` signature, a
+  sector size from 512 to 4096, the extended boot signature `0x29`, and the type string after it.
+  So a FAT with 4 KiB sectors is reported refused for them rather than as nothing. A GPT disk's
+  protective MBR carries the signature and none of the rest, so a whole disk is not mistaken for a
+  filesystem.
 - **Nothing**, otherwise: a disk holding a partition table, a blank one, or a filesystem neither
   reader can read. An ext4 its server would refuse, a 64-bit one say, is also "nothing" today (§12).
 
@@ -130,8 +143,13 @@ makes the auto-mount read-only (§6). A root matched to no device is not a live 
 
 ## 6. Mounting
 
-**What is mounted at boot is every ext4 that is not already mounted**: `init`'s mounts are never
-mounted again, and FAT waits for Phase 6's server.
+**What is mounted at boot is every ext4 that is not already mounted, and every FAT on a removable
+disk** (Phase 6 Part E.5): `init`'s mounts are never mounted again. **Removable** is a disk behind
+USB mass storage — its record's driver is `usb-storage` — or a partition of one; a SATA disk never
+is, whatever its bay. **An internal disk's FAT is most likely its ESP**, which nobody asked to have
+mounted; the report says `not removable, so not mounted`, and an administrator's `disk --mount`
+takes one (§8). A FAT its server would refuse is mounted by neither, and the report says why:
+`not served: 512-byte clusters, smaller than a page`, which every Nitrox ESP is.
 
 **Nor anything on the disk the machine started from** (Phase 6 Part D): the disk the kernel flags
 `BOOT` in its record, its GPT's GUID being the one Limine loaded the modules from, and its
@@ -157,9 +175,10 @@ order, so the first device found keeps the plain name.
 **Mounting a device**:
 1. Duplicate its node for the server, **narrowed to the mode**: a read-only mount's server holds
    no `WRITE` on the device, whatever its own read-only mode does above that.
-2. Spawn `/bin/fs-server-ext4`, the store's copy since the root is mounted by now, and send it the
-   setup message: the device, and the read-only flag for `ro`
-   ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md)).
+2. Spawn the server for what it holds — `/bin/fs-server-ext4` or `/bin/fs-server-fat`, the store's
+   copies since the root is mounted by now — and send it the setup message: the device, and the
+   read-only flag for `ro` ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md),
+   [`fat-fs-server.md`](fat-fs-server.md)). Both speak `libfsserver`'s protocol.
 3. Wait, bounded as `init` waits, for its `Meta::Ready`, and take the endpoint it carries.
 4. Create a namespace and bind that endpoint at its `/`. This is why the service holds
    `BIND_NAMESPACE`: it binds only into namespaces it created (§10).
@@ -191,10 +210,10 @@ disk that comes or goes** — a USB stick, its disk and each of its partitions a
 ([`device-manager.md`](device-manager.md) §3a).
 
 **An arrival is read as at boot**: what it holds, through its node, which the service keeps. It is
-mounted by the boot's rules — ext4, not on the boot medium, not the installer's source, read-only on
-a live boot — beside the mounts there are: **only the new device is planned**, so one an
-administrator unmounted stays unmounted, and a label in use is numbered past as at boot. It is
-reported in the same line. Past `MAX_MOUNTS`, eight, it is said and left unmounted.
+mounted by the boot's rules — ext4, or FAT on a removable disk, not on the boot medium, not the
+installer's source, read-only on a live boot — beside the mounts there are: **only the new device is
+planned**, so one an administrator unmounted stays unmounted, and a label in use is numbered past as
+at boot. It is reported in the same line. Past `MAX_MOUNTS`, eight, it is said and left unmounted.
 
 **A departure takes the device out of the table and closes the service's node.** A mount on it is
 torn down as an unmount is, but with nothing kept:
@@ -203,7 +222,7 @@ torn down as an unmount is, but with nothing kept:
    kernel lets each such file go rather than keeping it for the boot
    ([`filesystem-data-path.md`](filesystem-data-path.md));
 3. `Meta::Unmount`: the server's attempt to record the filesystem clean fails, and it answers and
-   exits — **not a terminate**, which is a request `fs-server-ext4` does not read;
+   exits — **not a terminate**, which is a request neither filesystem server reads;
 4. the namespace is closed.
 
 The log says `<label> left while mounted; what had not been written back is gone`, then
@@ -237,7 +256,9 @@ answers every request on a session.
 
 - **`Mount`** names a device as the tables do, `blk-<n>`, and optionally a label. It is always
   writable, on a live boot too. It is refused for a device already mounted, `init`'s included, for
-  one holding nothing the service serves, and for a label that is invalid or taken.
+  one holding nothing the service serves — a FAT its server would refuse among them — and for a
+  label that is invalid or taken. **An internal disk's servable FAT is mounted here**, the rule
+  that leaves it alone being the automatic mount's.
 - **`InUse`** is every mounted device and the disk that holds it: what the `disks` grant must not
   hand out raw, since a raw write to a disk reaches its partitions. **And the disk the machine
   started from** (Phase 6 Part D), whether or not anything on it is mounted: on a live boot the
@@ -279,10 +300,11 @@ block device in registry order, then one `<name>.tsm` per device. **A name is `/
 | `mounted` | string, nullable | where |
 | `by` | string, nullable | `init` or `storage` |
 | `mode` | string, nullable | `ro` or `rw` |
-| `clean` | bool, nullable | whether an ext4 was left cleanly unmounted |
+| `clean` | bool, nullable | whether an ext4 or a FAT was left cleanly unmounted |
 
-**`clean` is `Null` for a filesystem mounted writable.** A writable mount clears the bit before
-it answers Ready ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md)), so that state says "in use",
+**`clean` is `Null` for a filesystem mounted writable.** A writable mount marks the filesystem in
+use before it answers Ready ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md),
+[`fat-fs-server.md`](fat-fs-server.md) §6), so that state says "in use",
 because it is, and nothing about how the filesystem was left. The service's log line follows the
 same rule.
 
@@ -325,21 +347,23 @@ binds the service itself at `/svc/storage`.
 | Gate | What it asserts |
 |---|---|
 | `check-live` | The storage service says the boot is a live one. It is the only boot whose root is on a RAM disk, so the only one where the rule's input is real. **And it passes the stick over** (Phase 6 Part D): mass storage makes the stick a disk, the kernel flags it as the one the machine started from, and the service reports it so |
-| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller, **its root marked not cleanly unmounted first**, as an installed machine's is. The disk's `nitrox-root` is reported not clean and auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. **The table's `clean` says no, and still says no after the read-only unmount**, which the service logs as "not left clean (read-only, so as it was found)". `with admin disk` mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain, **after which the table says clean**. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs`. **Then sticks plugged in over QMP** (Phase 6 Part D): the boot stick reported passed over; an MBR stick's ext4 auto-mounted read-only, remounted writable, written without a sync, ejected with `with admin disk --unmount` and pulled, its records departing and the service letting it go — and on the host, carved by its MBR, clean and holding the pattern; a whole-disk stick pulled while mounted writable with a file dirty, the teardown's write-back and the server's marking each answered at once — the kernel letting the dirty file go, the server unable to record the filesystem clean, the service's line — its label gone, a command after it running, and on the host still marked in use; and that stick plugged in again, at a new index, mounted again |
+| `check-storage` | **The whole chain, with the host holding the result.** The test live image boots as a USB stick beside a copy of the release disk on the AHCI controller, **its root marked not cleanly unmounted first**, as an installed machine's is. The disk's `nitrox-root` is reported not clean and auto-mounted read-only, the boot being a live one, and `test-pattern --write` there is refused `NoAccess`. **The table's `clean` says no, and still says no after the read-only unmount**, which the service logs as "not left clean (read-only, so as it was found)". `with admin disk` mounts it writable. `test-pattern --write` writes a pattern through a mapping and exits without a sync, and **the host, reading the disk meanwhile, finds the file at its size without the pattern and the superblock marked mounted**. `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount` runs the chain, **after which the table says clean**. With the machine stopped, the host carves the partition out: `e2fsck -fn` clean, `s_state` clean read from the superblock's bytes, and the file holding the pattern, read with `debugfs`. **Then sticks plugged in over QMP** (Phase 6 Part D): the boot stick reported passed over; an MBR stick's ext4 auto-mounted read-only, remounted writable, written without a sync, ejected with `with admin disk --unmount` and pulled, its records departing and the service letting it go — and on the host, carved by its MBR, clean and holding the pattern; a whole-disk stick pulled while mounted writable with a file dirty, the teardown's write-back and the server's marking each answered at once — the kernel letting the dirty file go, the server unable to record the filesystem clean, the service's line — its label gone, a command after it running, and on the host still marked in use; and that stick plugged in again, at a new index, mounted again. **And FAT** (Phase 6 Part E): the copy of the release disk carries a third partition, an internal FAT that `fs-server-fat` could serve, **reported `not removable, so not mounted`**, and the disk's ESP reported refused for its 512-byte clusters; then a 300 MiB FAT32 stick, its data region off a 4 KiB boundary, which `xtask` asserts before the boot, is plugged in and auto-mounted read-only by `fs-server-fat`, its long, Unicode and nested names listed and its pattern read through a mapping; remounted writable, a directory made, a copy to a long Unicode name, a rename and a removal, and a file written through a mapping; ejected and pulled. On the host, carved by its MBR, `fsck.fat -n` finds it clean with its dirty bit clear, `mdir` lists the guest's names and `mtype` reads its copy, its rename and its pattern |
 | `check-install` | The live stick, a disk since Phase 6 Part D and the one the machine started from, is named as the installer's target and refused: it holds the running system, since the service names it in use |
-| `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. **The USB stick's MBR partition reads as FAT `NXSTICK`**, unmounted (Phase 6 Part D). The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
+| `test-qemu` (`boot-probe`) | `block` is held, so a subscription to it is refused. `/svc/storage/info/all.tsm` has a row per block record in registry order, which is the manager's replay reaching its owner whole. `nitrox-root` is the one row mounted at `/`, `init`'s, writable ext4, with `clean` `Null`. **The service mounted the scratch disk and nothing else**, writable, at `/storage/nitrox-scratch`. The ESP reads as FAT and the disk as holding no filesystem. **The USB stick's MBR partition reads as FAT `NXSTICK`**, unmounted (Phase 6 Part D), and `xtask` holds the service's line to its reason: `not served: 512-byte clusters, smaller than a page` (Part E). The directory lists `all.tsm` and a file per device, and a suffix the service does not serve is `NotFound` |
 | `test-qemu` (`boot-probe`), admin | Through an admin session opened as the view broker will open one: `InUse` names the scratch disk, `init`'s root and its disk, and not the ESP. **An unmount is refused while the `README` is held**, and leaves the mount as it was. **A file written through a mapping and never synced is on the device after the unmount**, which also left the filesystem clean. The label is then gone, a hidden label is refused, and a `Mount` by name brings the filesystem back writable, with the file. `init`'s root, the mounted scratch disk and the ESP are refused, each for its own reason, as is an unknown label. A session endpoint answers `admin-endpoint` with `NotFound` |
 | `test-qemu` (`boot-probe`), grants | **`disks` leaves out what is in use**: `nxinstall`'s listing in the admin view, read back through a stdout pipe, holds the ESP and not the disk holding `init`'s root, the root, or the mounted scratch disk. Not an exit code, since `nxinstall` refuses each of those by its own rules whether granted or not |
 | `test-interactive` | The serial session is built with `/storage`. `list /dev/storage` names a table per device, and `open /dev/storage/all.tsm \| filter mounted == "/"` prints the root's row, `init`'s. `list /storage` lists filesystems, not tables, and on a release boot none. **`with admin nxinstall` lists the ESP and never `/dev/blk/0` or the root**, where before C.6 it listed the disk under a live server; since administration Part G.2 a line naming `/dev/blk/0` is only its message on `stderr`, that it holds the running system, and that message must be there |
 | `test-qemu` (`boot-probe`), `disk` | **`disk` in the admin view, run as `with admin disk` runs it**: `--unmount nitrox-scratch` writes its one-row table to stdout and exits 0, and the service's table then shows the scratch disk unmounted. `--mount /dev/blk/<n>` writes `blk-<n>`, `nitrox-scratch` and `/storage/nitrox-scratch`, and the table shows it mounted writable again. **With every admin session taken, `disk --unmount` exits 1 and its `stderr` names the service's `WouldBlock`**, not the grant, and the mount stays |
-| `test-interactive`, `disk` | `disk --list \| filter mounted == "/"` prints the root's row, `init`'s, in a session with no grant. **`disk --mount` there fails naming the `storage` grant and `with`.** Through `with admin` and a typed password, the same mount reaches the service and is refused by it: the ESP holds FAT, which it recognises and cannot serve. A release boot has nothing it could mount, so the service's own refusal is the evidence the grant arrived |
+| `test-interactive`, `disk` | `disk --list \| filter mounted == "/"` prints the root's row, `init`'s, in a session with no grant. **`disk --mount` there fails naming the `storage` grant and `with`.** Through `with admin` and a typed password, the same mount reaches the service and is refused by it: the ESP holds a FAT its server refuses for its 512-byte clusters. A release boot has nothing it could mount, so the service's own refusal is the evidence the grant arrived |
 | `check-login` | The graphical session has `/storage`, and so does every application namespace the shell builds. In a desktop terminal, `with admin nxinstall /dev/blk/0` is refused: that disk is not in the view at all, and since administration Part G.2 the installer says why — it holds the running system, as the tables report `init`'s mount |
 | `test-qemu` (`boot-probe`), mounts | Through `/svc/storage`: `fs` lists `nitrox-scratch` as a directory. Its `README` reads. **A file created, written through a mapping and synced there is on the device**, read back from the RAM disk raw, since a re-resolve would only read the page cache. A session endpoint bound at `/storage` with the base `/fs` and at `/dev/storage` with `/info` reaches the same file and the same table, and bound with no base it mints nothing. An unknown label is `NotFound` |
 
-Host tests hold the rest: FAT against sectors `mformat` wrote and a real protective MBR, ext4
-against a filesystem `mkfs` made (and one whose root inode `check_device` refuses), each source
-scheme, the live-boot rule, every column's rule, every label rule and clash, what a boot mounts and
-how, and what each suffix asks for where it arrives.
+Host tests hold the rest: FAT against sectors `mformat` wrote and a real protective MBR, and
+through its server's check against images `mkfs.fat` made — served, refused for its clusters,
+refused for its sectors, found dirty; ext4 against a filesystem `mkfs` made (and one whose root
+inode `check_device` refuses); each source scheme, the live-boot rule, every column's rule, every
+label rule and clash, what a boot mounts, by which server, and a FAT on a removable disk alone; and
+what each suffix asks for where it arrives.
 
 ## 12. Not built, and what that costs
 
@@ -356,7 +380,7 @@ how, and what each suffix asks for where it arrives.
   gates it for `init`'s root. A machine turned off without one is still left not clean.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
-  mount.
+  mount. A FAT does say (Phase 6 Part E).
 - **Supervision.** `service-mgr` keeps the service's process handle, and nothing restarts it: its
   policy is `never`, and it is `essential`, so `service --stop` refuses it. If it exited, its
   subscription would close and `block` would be free for anything in the root namespace to take

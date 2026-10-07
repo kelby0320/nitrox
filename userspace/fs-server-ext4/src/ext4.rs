@@ -778,6 +778,8 @@ pub fn map_file<R: BlockReader>(
         n += 1;
         lb += len;
     }
+    // TODO(ext4-subpage-runs): with blocks under a page, a run boundary inside a page is not
+    // refused, and the kernel would fill that page from one device range regardless.
     Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 

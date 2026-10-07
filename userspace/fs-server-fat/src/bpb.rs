@@ -243,6 +243,8 @@ pub fn parse(b: &[u8; 512]) -> Result<Geometry, Unservable> {
 
 /// **The server's rule** on a geometry that parsed: clusters of at least a page.
 pub fn servable(g: &Geometry) -> Result<(), Unservable> {
+    // TODO(fat-small-clusters): a page of such a FAT can span two clusters, which the kernel's one
+    // device range per page cannot fill.
     if g.cluster_bytes() < MIN_CLUSTER {
         return Err(Unservable::SmallClusters { bytes: g.cluster_bytes() });
     }

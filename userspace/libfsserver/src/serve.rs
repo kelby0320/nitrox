@@ -46,8 +46,9 @@ pub enum Served {
 }
 
 /// Largest `BlockRun` map inlined in a Model A resolve reply. A file needing more runs is
-/// too fragmented to inline (→ `TooLarge`); the standalone `MapRange` op covers it (deferred).
-/// 64 runs = 1536 body bytes, comfortably inside the 4 KiB IPC payload.
+/// too fragmented to inline (→ `TooLarge`); the standalone `MapRange` op covers it
+/// (`TODO(map-range)`, for both servers). 64 runs = 1536 body bytes, comfortably inside the 4 KiB
+/// IPC payload.
 pub const MAX_RUNS: usize = 64;
 
 /// Serve one forwarded request: dispatch by op to [`serve_resolve`] (a

@@ -162,6 +162,7 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 - `userspace/eshell/CLAUDE.md` — emergency shell constraints (similar to init)
 - `userspace/libfsserver/CLAUDE.md` — the filesystem-server protocol, shared by both servers
 - `userspace/fs-server-ext4/CLAUDE.md` — filesystem driver
+- `userspace/fs-server-fat/CLAUDE.md` — FAT's filesystem server, the second on `libfsserver`
 - `userspace/service-mgr/CLAUDE.md` — service supervisor
 - `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)
 - `userspace/session-mgr/CLAUDE.md` — session supervisor (login, per-user namespaces)

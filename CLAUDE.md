@@ -110,8 +110,9 @@ and **over QMP plugs a keyboard in, swaps it for a mouse on the same port while 
 paused, and pulls that out**; every gate's controller is configured as the
 laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot give `qemu-xhci` MSI
 (`docs/architecture/usb.md`). Since Part D **the stick is an MBR with one FAT16 partition**: it is
-bound as a disk under its `UsbDevice`, its table read, the partition reported FAT and not mounted,
-and the SATA disk the image boots from is the one record flagged `boot`.
+bound as a disk under its `UsbDevice`, its table read, the partition reported FAT and not mounted —
+since Part E **with the reason, its 512-byte clusters**, which `fs-server-fat` refuses — and the
+SATA disk the image boots from is the one record flagged `boot`.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
@@ -258,7 +259,13 @@ written without a sync, unmounted and pulled; a whole-disk ext4 stick **pulled w
 whose teardown's I/O must all come back at once — the kernel letting the dirty file go, the server
 unable to record the filesystem clean, the label gone and the shell still answering; and that stick
 again, at a new index. The host then carves the first's partition out by its MBR and requires it
-clean with the pattern, and finds the second still marked in use. **It logs in only once
+clean with the pattern, and finds the second still marked in use. **Since Part E it holds
+`fs-server-fat`**: the disk copy carries a third partition, an internal FAT reported not removable
+and left unmounted, beside an ESP refused for its clusters; and a 300 MiB FAT32 stick whose data
+region is off a 4 KiB boundary — asserted before the boot — is auto-mounted read-only, its host
+names (Unicode among them) listed, remounted writable, written to (a directory, a copy to a long
+Unicode name, a rename, a removal, a file through a mapping), ejected and pulled. On the host
+`fsck.fat -n` finds it clean and mtools reads what the guest wrote. **It logs in only once
 `boot-probe` has exited**, whatever its verdict, which on that machine is a FAIL by the machine's
 shape: its later tests install a policy and fill the view broker's clients, and the sticks made the
 gate long enough to meet them. It runs in CI's QEMU job.

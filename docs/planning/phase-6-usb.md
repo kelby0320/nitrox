@@ -5,7 +5,7 @@ current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
-E detailed 2026-10-06; Parts E–H not built.** This replaces the
+E detailed and built 2026-10-06; Parts F–H not built.** This replaces the
 sketch written on 2026-09-10, before Phase 5 and administration. The scope and the decisions below
 were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass when it is next,
 as administration's parts did; what is here is the phase's shape, the design each part builds to,
@@ -1942,6 +1942,37 @@ The maintainer agreed to all three, as recommended.
   an unservable image, and the report's line for each.
 - **E.6 The gates.** Below.
 - **E.7 Docs.** Below.
+- **E.1–E.7 built 2026-10-06.** Calls on the way:
+  - **a full volume is `TooLarge`**, as a full ext4's is, where this pass said `NoSpace`: the
+    protocol has no such error, and `TooLarge` is what both servers answer;
+  - **a write path's reads may evict a dirty FAT sector, a read's may not**: a grow's allocation
+    can dirty more sectors than the cache holds, and a walk on the read path would then have had
+    nowhere to load. It is refused `Io` there, not served stale;
+  - **a truncate writes its cut before it frees**: a cache evicting in its own order could
+    otherwise put the freed clusters on the disk before the end mark that stops the chain at them;
+  - **a read-only mount is refused before anything is read**, so a create of a file that exists,
+    or a grow to less, is refused too, where `fs-server-ext4` answers them as done;
+  - **`libfsserver`'s bootstrap takes the disk's constructor**, so ext4 keeps its 4 KiB `Disk`;
+  - **removable is the record's driver, `usb-storage`, or the parent disk's**: the storage service
+    holds block records alone, so the parent chain to a `UsbDevice` was not one it could follow;
+  - **a FAT the library cannot parse is still a FAT if the recogniser takes it**, so 4 KiB sectors
+    are reported refused rather than as nothing; and an unmounted FAT's line says why, `not served:
+    <the reason>` or `not removable, so not mounted`;
+  - **the kernel's check is the parse the resolve uses** (`block_map`), and its test drives every
+    map it takes through the fill's arithmetic, so the check removed panics where the kernel would;
+  - **the gate types no Unicode**: the serial line discipline drops bytes past ASCII and `nxsh`'s
+    strings have no escape for one, so the long Unicode name the guest writes is built from one it
+    listed. A parenthesised argument straight after a command's name reads as a call, so `copy` and
+    `rename` lead with `--force` and the guest's directory has no space in its name;
+  - **a 1 MiB grow costs 19 writes** on a fresh FAT32: sixteen of zeroes, the FAT once per copy,
+    and the entry;
+  - two controls failed earlier than planned, each still failing its gate: **the dirty bit left at
+    unmount** at the eject, the service reading the stick back not clean, before the host's check;
+    and **the cluster rule removed** in `boot-probe`'s verdict, its set of mounts changed, before
+    `test-qemu`'s line;
+  - **found while writing the docs**: `fs-server-ext4` does not refuse a run boundary inside a page,
+    which only an ext4 of blocks under 4 KiB can have, and nothing Nitrox makes does
+    (`TODO(ext4-subpage-runs)`).
 
 ### Gates
 

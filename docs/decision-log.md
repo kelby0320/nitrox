@@ -34430,3 +34430,51 @@ its host fixtures are read from files, so a 300 MiB image costs a sparse file.
 - **`fs-server-ext4`'s rules said its device layer moves a sector at a time**; corrected here
   rather than in E.7. A search for the phrase first found nothing: it was wrapped across two lines.
 
+
+## 2026-10-06 — Phase 6 Part E, built: `fs-server-fat`
+
+Part E as its detail pass drew it, in seven pieces on `phase6/part-e`: **`libfsserver`**, the
+protocol out of `fs-server-ext4`; **the FAT library**, reading and then writing; **`fs-server-fat`**
+and the kernel's map check; **the storage service by kind**; the gates; the docs. A FAT stick is
+served read-write, with long names. The design is in
+[`fat-fs-server.md`](architecture/fat-fs-server.md), and the gates in
+[`storage.md`](architecture/storage.md) §11.
+
+**Calls made on the way**, each recorded in the plan's built note:
+- **A full volume is `TooLarge`**, not the `NoSpace` the detail pass named. The protocol has no such
+  error, and a full ext4 is `TooLarge` too.
+- **The FAT cache's read path never evicts a dirty sector, and a write path's may**, after writing
+  it to every copy. A grow's allocation can dirty more sectors than the cache holds.
+- **A truncate writes the chain's cut before freeing past it.** Otherwise a crash could leave the
+  file's chain running into free clusters, since eviction writes sectors in no particular order.
+- **A read-only mount is refused before anything is read**, so a create of a file that exists is
+  refused too. `fs-server-ext4` answers that one as done; the two differ there.
+- **Removable is the registry record's driver**, `usb-storage`, or its parent disk's. The storage
+  service holds block records alone, and the plan's "the parent chain reaches a `UsbDevice`" was not
+  a chain it could follow.
+- **A FAT the library cannot parse is still reported as a FAT** if the boot-sector recogniser takes
+  it, with the reason it is refused: 4 KiB sectors, say.
+- **The kernel's check is `block_map`, the parse the resolve uses.** Its test runs every map it
+  accepts through the fill's arithmetic, so with the check removed the test panics where the kernel
+  would.
+
+**Measured:** a 1 MiB grow on a fresh FAT32 costs 19 device writes — sixteen 64 KiB writes of
+zeroes, the FAT once per copy, and the entry. A write per cluster would be 256.
+
+**Controls.** Every planned control fails its test or gate: 12 on the library's write side, 2 in
+the kernel, 5 in the storage service, 6 at the gates. Two gate controls failed earlier than the
+plan said:
+- the dirty bit left at unmount failed at the eject, where the service reads the stick back as not
+  left clean, before the host's check;
+- the cluster rule removed failed in `boot-probe`'s verdict, its set of mounts changed, before
+  `test-qemu`'s line was read.
+
+**The gate types no Unicode.** The serial line discipline drops every byte past ASCII, and `nxsh`'s
+strings have no escape for one. So the long Unicode name the guest writes is built from a name it
+listed (`for r in (list …) { copy … }`), and `mdir` on the host reads it.
+
+**Found:** `fs-server-ext4` does not refuse a run boundary inside a page. An ext4 of blocks under
+4 KiB could have one, and the kernel would fill that page from one device range regardless. Nothing
+Nitrox makes has such blocks; filed as `TODO(ext4-subpage-runs)`, the fix being the server's.
+
+**ABI:** no hash impact. The map check is kernel-internal, and the rest is userspace, gates and CI.

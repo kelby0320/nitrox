@@ -36,7 +36,7 @@ static ZEROES: [u8; SPAN] = [0; SPAN];
 
 /// **How many files [`Fat::touch_file`] can find by id.** FAT has no table from a first cluster
 /// to its entry, so the volume keeps one, filled as files are mapped: a file it no longer holds
-/// misses a stamp, which `File::Touch` is allowed to.
+/// misses a stamp, which `File::Touch` is allowed to (`TODO(fat-touch-table)`).
 pub const ID_TABLE: usize = 256;
 /// How many files removed and not yet released are held for [`Fat::release`]. The server releases
 /// each straight after the kernel forgets it, so one is the most ever waiting.
@@ -291,6 +291,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         let from = cursor.saturating_sub(1).min(u32::MAX as u64) as u32;
         let resume = dir::entries(self.r, g, &mut self.cache.borrow_mut(), d, from, |f| {
             let mut name = [0u8; 255];
+            // TODO(fat-long-utf8-names): a long name over 255 bytes of UTF-8 is left out.
             let Some(n) = f.name(&mut name) else {
                 return true;
             };

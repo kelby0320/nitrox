@@ -6,7 +6,9 @@ with deferrals (a periodic writeback daemon, per-page dirty tracking) marked inl
 code never had corrected 2026-09-24. **One object per file, dirty objects kept until a sync, and
 `sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*), with
 `File::Forget` for a file its server frees. A dirty file whose device has gone is let go (Phase 6
-Part D, 2026-10-06).
+Part D, 2026-10-06). **A second implementer, `fs-server-fat`**, maps in 512-byte sectors and names a
+file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 Part E, 2026-10-06,
+§ *A page within one run*).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -81,6 +83,23 @@ BlockRun {
 Naming is deliberately neutral: `MapRange`/`AllocRange`/`BlockRun`, not "extents." These are
 new **`Block`-category** ops (`0x03xx`) in the RS wire format (`docs/spec/rsproto-block-ops.md`).
 
+### A page within one run
+
+*(Phase 6 Part E, 2026-10-06.)* **A run's unit is the server's `block_size`**, from the resolve
+reply: ext4's block, or the 512-byte sector `fs-server-fat` maps in, since a FAT's data region need
+not begin on a 4 KiB boundary. **The kernel fills and writes a page as one contiguous device
+range**: the page's first block, found in the runs, then `PAGE_SIZE` bytes from there
+(`model_a_start_fill` and `begin_write` in `kernel/src/object/file_object.rs`). So **no page may
+span two runs**, and the server guarantees it: FAT's by refusing clusters smaller than a page, since
+a file's clusters then start on page boundaries within it; ext4's with blocks of a page by
+construction. The kernel cannot check it, and does not.
+
+**What it does check** is the arithmetic a reply reaches (Phase 6 Part E.4): a `block_size` that is
+not a power of two from 512 to a page, or a run whose ends do not fit a `u64`, fails the resolve
+`KernelError` ([`rsproto-namespace-ops.md`](../spec/rsproto-namespace-ops.md) § *The `FILE_BLOCKS`
+body*). A `block_size` of `0` divided by zero, and a run near `u64::MAX` overflowed an add, each of
+which panics a kernel built with overflow checks.
+
 ## The kernel interface (filesystem-neutral)
 
 Also fs-agnostic — the kernel never knows which filesystem backs a file.
@@ -114,8 +133,11 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
 ## One object per file
 
 *(Administration Part C.1, 2026-09-24.)* **A registration keeps one `FileObject` per file**, keyed
-by an id the server gives the file in its resolve reply: its inode number, for ext4
-(`rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*). Every resolve of the file shares that
+by an id the server gives the file in its resolve reply: its inode number, for ext4, and its first
+cluster, for FAT (`rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*). An empty FAT file has no
+cluster and replies `0`, uncached; a truncate to zero ends its id, so its server sends
+`File::Forget` before freeing the chain, as for a removal ([`fat-fs-server.md`](fat-fs-server.md)
+§3). Every resolve of the file shares that
 object, so two processes mapping one file read each other's writes without a sync, and a sync or
 an unmount can enumerate everything a filesystem has handed out. Before, each lookup built its own
 object: a file mapped by two processes had two caches, and neither saw the other's writes until a
