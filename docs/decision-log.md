@@ -34707,8 +34707,9 @@ foreign stick — or an external hard drive — partitioned and formatted throug
 mounted when it is done; and drives of 2 TiB or more, which the USB storage driver leaves alone.
 
 **What the pass found:**
-- **`nxinstall` already partitions and formats** through the raw disk the `disks` grant gives it, and
-  `fs-server-ext4` has the formatter it uses. `fs-server-fat` has none, and `libgpt` writes no MBR.
+- **`nxinstall` already partitions and formats** through the raw disk the `disks` grant gives it,
+  and `fs-server-ext4` has the formatter it uses. `fs-server-fat` has none, and `libgpt` writes no
+  MBR.
 - **A stick's partition table is read once**, when its disk is published, and nothing reads it
   again; and **a departed partition's window still forwards to its disk**.
 - **The USB storage driver speaks only the ten-byte SCSI commands**, so a unit of 2 TiB or more is
