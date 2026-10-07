@@ -2252,7 +2252,8 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
     s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    s.expect("help-rows=13")?;
+    // Sixteen since Phase 6 Part F gave `--eject` its two lines and the grant's note a third.
+    s.expect("help-rows=16")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
