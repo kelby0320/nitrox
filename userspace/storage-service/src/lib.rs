@@ -1,7 +1,7 @@
 //! The storage service's decisions (administration Part C.5): everything that can be wrong about a
 //! disk without a boot to show it.
 //!
-//! - [`probe`] — what a device holds: ext4, read the way its server reads it; FAT, recognised; or
+//! - [`probe`] — what a device holds: ext4 or FAT, each read the way its server reads it; or
 //!   nothing;
 //! - [`sources`] — which devices `init` mounted, from `init.toml`, and whether this is a live boot;
 //! - [`table`] — the TSM1 tables `/svc/storage/info` serves;
@@ -22,14 +22,18 @@ pub mod probe {
     //! - An **ext4** filesystem, if `fs-server-ext4`'s own `check_device` accepts it. That is the
     //!   check its server runs before it says Ready, so the service never offers to mount what the
     //!   server would refuse. Its label and whether it was left clean come with it.
-    //! - A **FAT** filesystem, recognised from its boot sector and reported, never mounted: there is
-    //!   no `fs-server-fat` until Phase 6.
+    //! - A **FAT** filesystem (Phase 6 Part E.5), read by `fs-server-fat`'s own check, with its
+    //!   label, how it was left, and — if its server would refuse it — why. A boot sector the
+    //!   library cannot parse is still a FAT if [`fat_label`] recognises it, so a FAT with 4 KiB
+    //!   sectors is reported as one that is not served rather than as nothing.
     //! - **Nothing** either recognises: a disk holding a partition table, a blank one, or a
     //!   filesystem neither can read.
 
+    use alloc::format;
     use alloc::string::String;
     use fs_server_ext4::BlockReader;
     use fs_server_ext4::ext4::{check_device, volume_label, was_left_clean};
+    use fs_server_fat::Fat;
 
     /// What a device holds.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +49,11 @@ pub mod probe {
         Fat {
             /// Its own label, empty when it has none.
             label: String,
+            /// Whether it was left cleanly unmounted; `None` if the state would not read.
+            clean: Option<bool>,
+            /// **Why `fs-server-fat` would refuse it**, in the words its refusal would carry —
+            /// `512-byte clusters, smaller than a page` — or `None` if it would serve it.
+            refused: Option<String>,
         },
         /// Nothing this service recognises.
         Nothing,
@@ -63,7 +72,26 @@ pub mod probe {
         /// The filesystem's own label, if it has one.
         pub fn label(&self) -> Option<&str> {
             match self {
-                Found::Ext4 { label, .. } | Found::Fat { label } if !label.is_empty() => Some(label),
+                Found::Ext4 { label, .. } | Found::Fat { label, .. } if !label.is_empty() => Some(label),
+                _ => None,
+            }
+        }
+
+        /// Whether the filesystem was left cleanly unmounted, if it says.
+        pub fn clean(&self) -> Option<bool> {
+            match self {
+                Found::Ext4 { clean, .. } | Found::Fat { clean, .. } => *clean,
+                Found::Nothing => None,
+            }
+        }
+
+        /// **The server that would serve it**, or `None` for nothing, or a FAT its server would
+        /// refuse.
+        pub fn server(&self) -> Option<crate::mounts::Server> {
+            use crate::mounts::Server;
+            match self {
+                Found::Ext4 { .. } => Some(Server::Ext4),
+                Found::Fat { refused: None, .. } => Some(Server::Fat),
                 _ => None,
             }
         }
@@ -78,12 +106,59 @@ pub mod probe {
             return Found::Ext4 { label, clean: was_left_clean(r).ok() };
         }
         let mut sector = [0u8; 512];
-        if r.read_at(0, &mut sector).is_ok()
-            && let Some(label) = fat_label(&sector)
-        {
-            return Found::Fat { label };
+        let recognised = r.read_at(0, &mut sector).ok().and_then(|()| fat_label(&sector));
+        let fat = Fat::new(r);
+        if fat.geometry().is_err() && recognised.is_none() {
+            return Found::Nothing;
         }
-        Found::Nothing
+        let label = recognised.unwrap_or_else(|| String::from_utf8_lossy(fat.label()).into_owned());
+        let refused = fat.check().err().map(|why| format!("{why}"));
+        Found::Fat { label, clean: fat.was_left_clean().ok(), refused }
+    }
+
+    /// **What a device holds, by its record** (PR #365 review, finding 4): [`probe`], and for a
+    /// **whole disk whose first sector carries a partition entry**, never a filesystem of its own.
+    /// Partitioning a stick that held a filesystem whole leaves that filesystem's bytes: `sfdisk`
+    /// and `parted` write the entries into sector 0 and keep the rest. An ext4's superblock at byte
+    /// 1024 then reads as ever, beside the partitions the kernel publishes, and the disk would be
+    /// mounted whole over them — so such a disk holds nothing. A FAT's boot sector is sector 0
+    /// itself, which the kernel reads as no table (`kernel/src/drivers/partitions.rs`), so no
+    /// partition is published; mounted, the stale FAT would allocate clusters inside the partition
+    /// nothing can see. It is reported, and refused.
+    pub fn probe_record<R: BlockReader>(r: &R, record: &libkern::device::DeviceRecord) -> Found {
+        use libkern::device::DeviceKind;
+        let found = probe(r);
+        let whole = matches!(record.kind(), DeviceKind::Disk | DeviceKind::RamDisk);
+        let mut sector = [0u8; 512];
+        if !whole || r.read_at(0, &mut sector).is_err() || !partition_entries(&sector, record.block_count) {
+            return found;
+        }
+        match found {
+            Found::Fat { label, clean, .. } => Found::Fat { label, clean, refused: Some(String::from(STALE_FAT)) },
+            _ => Found::Nothing,
+        }
+    }
+
+    /// Why a whole disk's FAT beside partition entries is not served.
+    pub const STALE_FAT: &str = "its first sector holds partition entries too, so this FAT may be stale";
+
+    /// **Whether a disk's first sector carries a partition entry**: signed `0x55AA`, every entry's
+    /// status `0x00` or `0x80` — the check Linux makes, which a filesystem's boot code rarely
+    /// passes — and one entry in use that lies on the disk. GPT's protective entry counts.
+    pub fn partition_entries(sector: &[u8; 512], blocks: u64) -> bool {
+        if sector[510] != 0x55 || sector[511] != 0xAA {
+            return false;
+        }
+        let entry = |slot: usize| &sector[0x1BE + 16 * slot..0x1BE + 16 * (slot + 1)];
+        if !(0..4).all(|slot| matches!(entry(slot)[0], 0x00 | 0x80)) {
+            return false;
+        }
+        (0..4).any(|slot| {
+            let e = entry(slot);
+            let first = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+            let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+            e[4] != 0 && first != 0 && count != 0 && first.checked_add(count).is_some_and(|end| end <= blocks)
+        })
     }
 
     /// **A FAT boot sector's volume label**, or `None` if `sector` is not a FAT boot sector.
@@ -250,8 +325,9 @@ pub mod table {
     //! Columns: `name`, `kind`, `size`, `filesystem` (`ext4` or `fat`), `label` (the filesystem's
     //! own), `mounted` (where), `by` (`init` or `storage`), `mode` (`ro` or `rw`) and `clean`,
     //! whether the filesystem was left cleanly unmounted. **`clean` is `Null` for anything but
-    //! ext4, and for a filesystem mounted writable**: that one's state says it is in use, because
-    //! it is, and says nothing about how it was left. What a device does not have is `Null`.
+    //! ext4 and FAT, and for a filesystem mounted writable**: that one's state says it is in use,
+    //! because it is, and says nothing about how it was left. What a device does not have is
+    //! `Null`.
 
     use alloc::format;
     use alloc::string::String;
@@ -339,10 +415,10 @@ pub mod table {
         let text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Str(String::from(s)));
         let size = (r.logical_block_size != 0)
             .then(|| Value::Int((r.logical_block_size as u64).saturating_mul(r.block_count) as i64));
-        let clean = match (&d.found, mount) {
+        let clean = match (d.found.clean(), mount) {
             (_, Some(m)) if m.mode == Mode::Rw => Value::Null,
-            (Found::Ext4 { clean: Some(c), .. }, _) => Value::Bool(*c),
-            _ => Value::Null,
+            (Some(c), _) => Value::Bool(c),
+            (None, _) => Value::Null,
         };
         // **What the device calls itself** (the laptop polish's Part C): the model and serial a
         // SATA disk reports, a RAM disk's module, a partition's name in its table — what `nxinstall`
@@ -453,8 +529,10 @@ pub mod labels {
 
 pub mod mounts {
     //! **What this service mounts at boot.** Every device holding a filesystem it can serve that
-    //! is not already mounted: today that is every ext4 `init` did not mount. FAT is recognised
-    //! and not served until Phase 6.
+    //! is not already mounted: every ext4 `init` did not mount, and **a FAT on a removable disk**
+    //! (Phase 6 Part E.5) — one behind USB mass storage. An internal disk's FAT is its ESP, most
+    //! likely, which nobody asked to have mounted: an administrator's `disk --mount` takes one.
+    //! Whatever it mounts, it spawns the server for its kind ([`Server`]).
     //!
     //! **A live boot mounts read-only**: the root is on a RAM disk, which makes the machine's own
     //! disks the install target, and nothing written to one of them by accident could be taken
@@ -466,10 +544,34 @@ pub mod mounts {
     use libinittoml::manifest::Mode;
 
     use crate::labels;
-    use crate::probe::Found;
     use crate::table::{Device, Mounted};
 
-    /// One mount to make: the device, its label and its mode.
+    /// **The driver a disk behind USB mass storage is published by**, as its registry record names
+    /// it (`kernel/src/drivers/xhci/storage.rs`). What makes a disk removable, in this phase's
+    /// sense: a SATA disk never is, whatever its bay.
+    pub const USB_STORAGE: &[u8] = b"usb-storage";
+
+    /// **The server that serves a filesystem** (Phase 6 Part E.5), spawned from the store's copy,
+    /// since the root is mounted by now.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Server {
+        /// `fs-server-ext4`.
+        Ext4,
+        /// `fs-server-fat`.
+        Fat,
+    }
+
+    impl Server {
+        /// Where it is spawned from.
+        pub fn path(self) -> &'static [u8] {
+            match self {
+                Server::Ext4 => b"/bin/fs-server-ext4",
+                Server::Fat => b"/bin/fs-server-fat",
+            }
+        }
+    }
+
+    /// One mount to make: the device, its label, its mode and its server.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Plan {
         /// The registry id of the device.
@@ -478,6 +580,8 @@ pub mod mounts {
         pub label: String,
         /// `ro` on a live boot, `rw` otherwise.
         pub mode: Mode,
+        /// The server for what it holds.
+        pub server: Server,
     }
 
     /// Why an administrator's mount was refused: a [`KError`](libkern::KError) and the words the
@@ -552,9 +656,7 @@ pub mod mounts {
         if mounted.iter().any(|m| m.device == d.record.id) {
             return Err(Refusal::AlreadyMounted);
         }
-        if !matches!(d.found, Found::Ext4 { .. }) {
-            return Err(Refusal::NothingToServe);
-        }
+        let server = d.found.server().ok_or(Refusal::NothingToServe)?;
         let label = if label.is_empty() {
             labels::unique(&labels::preferred(d), taken)
         } else if !labels::valid(label) {
@@ -567,7 +669,7 @@ pub mod mounts {
         if !room {
             return Err(Refusal::Full);
         }
-        Ok(Plan { device: d.record.id, label, mode: Mode::Rw })
+        Ok(Plan { device: d.record.id, label, mode: Mode::Rw, server })
     }
 
     /// **The devices in use, which must not be granted raw**: every mounted filesystem's device,
@@ -634,17 +736,27 @@ pub mod mounts {
         let mut taken: Vec<String> = taken.to_vec();
         let mut plan = Vec::new();
         for d in candidates {
-            if !matches!(d.found, Found::Ext4 { .. }) || already.iter().any(|m| m.device == d.record.id) {
+            let Some(server) = d.found.server() else {
+                continue;
+            };
+            if server == Server::Fat && !removable(d, all) {
                 continue;
             }
-            if is_install_source(d) || on_boot_medium(d, all) {
+            if already.iter().any(|m| m.device == d.record.id) || is_install_source(d) || on_boot_medium(d, all) {
                 continue;
             }
             let label = labels::unique(&labels::preferred(d), &taken);
             taken.push(label.clone());
-            plan.push(Plan { device: d.record.id, label, mode });
+            plan.push(Plan { device: d.record.id, label, mode, server });
         }
         plan
+    }
+
+    /// **Whether `d` is on a removable disk** (Phase 6 Part E.5): a disk behind USB mass storage
+    /// ([`USB_STORAGE`]), or one of its partitions.
+    pub fn removable(d: &Device, all: &[Device]) -> bool {
+        let usb = |r: &libkern::device::DeviceRecord| r.driver() == USB_STORAGE;
+        usb(&d.record) || all.iter().any(|p| p.record.id == d.record.parent && usb(&p.record))
     }
 
     /// **Whether `d` is on the disk the machine started from** (Phase 6 Part D): that disk, flagged

@@ -61,7 +61,7 @@ nobody chose it; an administrator's mount is a choice.
 |---|---|
 | `NotFound` | no block device has that name |
 | `AlreadyExists` | it is mounted already, by `init` or by the service; or another mount has that label |
-| `Unsupported` | it holds no filesystem the service can serve — FAT until Phase 6, or nothing |
+| `Unsupported` | it holds no filesystem the service can serve: nothing, or a FAT its server would refuse (Phase 6 Part E) |
 | `InvalidArgument` | the label is not a valid one ([`storage.md`](../architecture/storage.md) §6), or the body is malformed |
 | `WouldBlock` | every mount slot is in use |
 | `IoError` | the filesystem's server did not come up; the reason says how |

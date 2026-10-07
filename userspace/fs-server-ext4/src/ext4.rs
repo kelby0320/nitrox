@@ -592,7 +592,7 @@ fn read_dir_inner<R: BlockReader>(
 ) -> Result<u64, FsError> {
     let sb = read_superblock(r)?;
     let inode = read_inode(r, &sb, dir_ino)?;
-    if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&inode) {
         return Err(FsError::NotFound);
     }
     let size = rd_u32(&inode, 4) as u64;
@@ -778,6 +778,8 @@ pub fn map_file<R: BlockReader>(
         n += 1;
         lb += len;
     }
+    // TODO(ext4-subpage-runs): with blocks under a page, a run boundary inside a page is not
+    // refused, and the kernel would fill that page from one device range regardless.
     Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 
@@ -876,7 +878,7 @@ pub fn touch_at<RW: BlockReader + BlockWriter>(
 ) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
-    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&parent) {
         return Err(FsError::NotFound);
     }
     let target_ino = dir_lookup(rw, &sb, &parent, name)?;
@@ -1303,6 +1305,15 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     Ok(ino)
 }
 
+/// **Whether an inode is a directory a session may still use**: a directory with a link counted.
+/// A removed directory keeps its mode and its extent — [`free_inode`] zeroes `i_links_count` and
+/// stamps `i_dtime`, nothing more — so a session held open on one passed a check of the mode alone,
+/// and could write entries into a block since given to another file (PR #365 review, finding 5).
+/// Every operation that takes a directory by inode asks this.
+fn live_dir(inode: &[u8; 256]) -> bool {
+    rd_u16(inode, 0) & S_IFMT == S_IFDIR && rd_u16(inode, 26) != 0
+}
+
 /// A directory's default mode: `S_IFDIR | 0o755`.
 const DIR_MODE: u16 = S_IFDIR | 0o755;
 
@@ -1591,7 +1602,7 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
     }
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
-    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&parent) {
         return Err(FsError::NotFound);
     }
     if dir_lookup(rw, &sb, &parent, name).is_ok() {
@@ -1673,7 +1684,7 @@ pub fn unlink_at<RW: BlockReader + BlockWriter>(
 ) -> Result<Option<u32>, FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
-    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&parent) {
         return Err(FsError::NotFound);
     }
     let target_ino = dir_lookup(rw, &sb, &parent, name)?;
@@ -1748,7 +1759,7 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
     }
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
-    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&parent) {
         return Err(FsError::NotFound);
     }
     let sub_ino = dir_lookup(rw, &sb, &parent, name)?;
@@ -1955,7 +1966,7 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     }
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
-    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+    if !live_dir(&parent) {
         return Err(FsError::NotFound);
     }
     if dir_lookup(rw, &sb, &parent, new).is_ok() {

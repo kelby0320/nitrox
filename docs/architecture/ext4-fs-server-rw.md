@@ -11,6 +11,13 @@ and `s_state` kept — § *Read-only mounts, and how a filesystem was left*. C.5
 **the storage service spawns it for every filesystem it mounts**, keeps its control channel, and
 unmounts it with `Meta::Unmount`, which `boot-probe` drives on every `test-qemu` run
 ([`storage.md`](storage.md)). Phase 6 Part D.4 (2026-10-06): a server nothing can reach exits.
+Phase 6 Part E.1 (2026-10-06): **the protocol is `libfsserver`'s** — the bootstrap, the loop,
+directory sessions, `File::Forget` and `File::Touch`, `Meta::Unmount`, and `ReadOnly` — shared with
+`fs-server-fat` ([`fat-fs-server.md`](fat-fs-server.md)); this crate is ext4 as a `Volume` and a
+`_start`, and keeps its 4 KiB `Disk`. PR #365's review (2026-10-07): **a removed directory is
+refused to a session still holding its inode**, since a removal keeps the inode's mode and extent
+and zeroes only its link count; every operation by inode now asks for a link counted. And a server
+that panics exits, rather than spinning with resolves waiting on it.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**

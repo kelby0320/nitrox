@@ -34430,3 +34430,117 @@ its host fixtures are read from files, so a 300 MiB image costs a sparse file.
 - **`fs-server-ext4`'s rules said its device layer moves a sector at a time**; corrected here
   rather than in E.7. A search for the phrase first found nothing: it was wrapped across two lines.
 
+
+## 2026-10-06 — Phase 6 Part E, built: `fs-server-fat`
+
+Part E as its detail pass drew it, in seven pieces on `phase6/part-e`: **`libfsserver`**, the
+protocol out of `fs-server-ext4`; **the FAT library**, reading and then writing; **`fs-server-fat`**
+and the kernel's map check; **the storage service by kind**; the gates; the docs. A FAT stick is
+served read-write, with long names. The design is in
+[`fat-fs-server.md`](architecture/fat-fs-server.md), and the gates in
+[`storage.md`](architecture/storage.md) §11.
+
+**Calls made on the way**, each recorded in the plan's built note:
+- **A full volume is `TooLarge`**, not the `NoSpace` the detail pass named. The protocol has no such
+  error, and a full ext4 is `TooLarge` too.
+- **The FAT cache's read path never evicts a dirty sector, and a write path's may**, after writing
+  it to every copy. A grow's allocation can dirty more sectors than the cache holds.
+- **A truncate writes the chain's cut before freeing past it.** Otherwise a crash could leave the
+  file's chain running into free clusters, since eviction writes sectors in no particular order.
+- **A read-only mount is refused before anything is read**, so a create of a file that exists is
+  refused too. `fs-server-ext4` answers that one as done; the two differ there.
+- **Removable is the registry record's driver**, `usb-storage`, or its parent disk's. The storage
+  service holds block records alone, and the plan's "the parent chain reaches a `UsbDevice`" was not
+  a chain it could follow.
+- **A FAT the library cannot parse is still reported as a FAT** if the boot-sector recogniser takes
+  it, with the reason it is refused: 4 KiB sectors, say.
+- **The kernel's check is `block_map`, the parse the resolve uses.** Its test runs every map it
+  accepts through the fill's arithmetic, so with the check removed the test panics where the kernel
+  would.
+
+**Measured:** a 1 MiB grow on a fresh FAT32 costs 19 device writes — sixteen 64 KiB writes of
+zeroes, the FAT once per copy, and the entry. A write per cluster would be 256.
+
+**Controls.** Every planned control fails its test or gate: 12 on the library's write side, 2 in
+the kernel, 5 in the storage service, 6 at the gates. Two gate controls failed earlier than the
+plan said:
+- the dirty bit left at unmount failed at the eject, where the service reads the stick back as not
+  left clean, before the host's check;
+- the cluster rule removed failed in `boot-probe`'s verdict, its set of mounts changed, before
+  `test-qemu`'s line was read.
+
+**The gate types no Unicode.** The serial line discipline drops every byte past ASCII, and `nxsh`'s
+strings have no escape for one. So the long Unicode name the guest writes is built from a name it
+listed (`for r in (list …) { copy … }`), and `mdir` on the host reads it.
+
+**Found:** `fs-server-ext4` does not refuse a run boundary inside a page. An ext4 of blocks under
+4 KiB could have one, and the kernel would fill that page from one device range regardless. Nothing
+Nitrox makes has such blocks; filed as `TODO(ext4-subpage-runs)`, the fix being the server's.
+
+**ABI:** no hash impact. The map check is kernel-internal, and the rest is userspace, gates and CI.
+
+## 2026-10-07 — PR #365, reviewed: a panic on a hostile stick, and order nothing held
+
+One blocking finding, six worth fixing and two optional. All are taken. Each was reproduced, or
+shown by reading, before it was fixed, and each fix has a control that fails it.
+
+**1. A long-name entry of ordinal 0 panicked the FAT server**, and a panicked server spun for ever
+with resolves waiting on it. Once a name was whole the part expected next was `0`, so an entry of
+ordinal 0 matched and was placed at part `0 - 1`. An ordinal outside `1..=20` is now never a part.
+**Fixed as a class**: a host test puts garbage in every structure of FAT12, FAT16 and FAT32 images
+and runs every operation, requiring an error and never a panic. As first written it scattered random
+bytes, and in 900 tries it never found this panic. An ordinal-0 entry with no other bits set reads
+as the end of the directory, so it is never seen as a long name. Mutating real entries — a field
+made random, an entry turned into a long-name part with its neighbour's checksum — found it at once.
+**And a server that panics exits**, saying where: both servers' handlers spun, and a forwarded
+resolve has no deadline. An exit closes the endpoint, and the kernel fails each resolve
+`PeerClosed`.
+
+**2. Nothing held "data, then the chain, then the entry".** A new test records every write a change
+makes, replays them onto the starting image one at a time, and after each one checks what a crash
+there would leave: chains allocated, no cluster in two files, no file longer than its chain, and a
+grow's new bytes zero over free clusters filled with garbage. **Every flush in the write path is now
+one its removal fails.** Three of them needed more than the reviewer's mutations to show it:
+- `mkdir`'s own flush was redundant with `insert`'s, and is removed. `insert`'s is now the one rule:
+  the FAT is on the disk before any entry is written.
+- `place`'s flush mattered only where the link and the new cluster are in non-adjacent FAT sectors.
+  `flush` writes adjacent dirty sectors in one write, which made the first version of the test
+  pass by luck.
+- **A rename's window is the one exception the checker allows**: one file under two names (two
+  entries starting at the same cluster), as Linux's vfat leaves it.
+
+**3. A cached file's block size could change under the kernel's map check.** `block_map` checks a
+reply's runs against that reply's block size, but the cached object keeps the size it was made
+with. `FileObject::cache_in` now refuses a reply in another block size, `KernelError`.
+
+**4. A stick partitioned over a whole-disk filesystem was mounted whole.** The review's scenario
+does not happen as described: for a FAT, **the kernel reads such a sector as no table at all**,
+since a FAT boot sector there wins (Part D's rule, `is_volume_boot_sector`). So no partition was
+published, and the stale FAT alone would have been mounted, over a partition nothing could see.
+For an ext4, whose superblock at 1024 survives `sfdisk`, the double mount did happen. **The storage
+service now never mounts a whole disk whose first sector carries a partition entry**: an ext4 there
+reads as nothing, and a FAT is reported "may be stale" and refused. **Linux reads that sector as a
+partition table**, where this kernel reads a filesystem. **The maintainer's call: keep the kernel's
+reading.** What FAT is for here is a modern stick formatted FAT32 as sold — an MBR and one
+partition — and nothing requires supporting the older shapes Linux also reads. The storage
+service's rule keeps the odd case safe either way.
+
+**5. A directory session outlived its directory**, on both servers. On FAT the cluster can be freed
+and taken by a file. On ext4 the inode keeps its mode and extent, with only its link count zeroed.
+Every operation by directory id now asks for a live one: on FAT, a cluster still allocated whose
+first entry is a `.` naming it; on ext4, a directory with a link counted.
+
+**6. A long name over 255 bytes of UTF-8 could be neither listed nor reached**, and its directory
+not removed. It is now listed by its short name, and a lookup compares long names in UTF-16 as they
+are stored. **The reviewer's test name, 90 CJK characters and `.txt`, was never on the disk**:
+mtools cuts a long name at about 255 bytes, mid-character. The test uses 85, which `mdir` confirms
+is stored whole.
+
+**7. A read past a short chain answered success** with the buffer's old bytes. It is `Corrupt`, as
+the map already said.
+
+**Optional, taken:** the `touch_file` guard has a test that fails without it; and dirty-sector
+eviction is exercised by a change bigger than the cache, beside a test that a read with every slot
+dirty is refused.
+
+**Controls:** 13 for the fixes, and 5 flushes each removed in turn, all failing.

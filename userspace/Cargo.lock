@@ -136,6 +136,16 @@ dependencies = [
 name = "fs-server-ext4"
 version = "0.1.0"
 dependencies = [
+ "libfsserver",
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
+name = "fs-server-fat"
+version = "0.1.0"
+dependencies = [
+ "libfsserver",
  "libkern",
  "librsproto",
 ]
@@ -194,6 +204,14 @@ dependencies = [
 
 [[package]]
 name = "libfs"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
+name = "libfsserver"
 version = "0.1.0"
 dependencies = [
  "libkern",
@@ -476,6 +494,7 @@ name = "storage-service"
 version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
+ "fs-server-fat",
  "libgpt",
  "libheap",
  "libinittoml",

@@ -25,3 +25,5 @@ path = "src/main.rs"
 librsproto = { path = "../librsproto" }
 # The raw syscall surface (used only by the `[[bin]]`; the reader lib needs none).
 libkern = { path = "../libkern" }
+# The protocol half of the server, and the block-device traits (Phase 6 Part E.1).
+libfsserver = { path = "../libfsserver" }

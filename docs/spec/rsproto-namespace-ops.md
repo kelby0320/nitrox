@@ -134,9 +134,9 @@ The 8-byte `ResolveReply` above, then:
 
 | Offset | Size | Field |
 |---|---|---|
-| 8 | 4 | `block_size` — the filesystem's block size, in bytes |
+| 8 | 4 | `block_size` — the unit of the runs, in bytes: ext4's block, or FAT's 512-byte sector. **A power of two from 512 to a page**, else the kernel refuses the reply (below) |
 | 12 | 4 | `run_count` |
-| 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`; a server names the file by it in `File::Forget` before freeing it. `0` means none: the kernel gives such a file an object of its own, uncached |
+| 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4; its first cluster, for FAT, which has no inode — so an empty FAT file has none and replies `0`, and a truncate to zero ends its id, which its server forgets as for a removal. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`; a server names the file by it in `File::Forget` before freeing it. `0` means none: the kernel gives such a file an object of its own, uncached |
 | 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for |
 | 28 | 4 | reserved, zero |
 | 32 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
@@ -146,6 +146,19 @@ offset 16 to 32. Both sides are in-tree and pre-stabilization, so this was a fla
 (`librsproto::namespace::file_blocks_prefix` writes it, `kernel/src/rsproto.rs` reads it). Every
 resolve of a file with an id, a grow, create and truncate included, updates the one object to the
 size and map its reply carries.
+
+**A reply for a cached file in another block size is refused** too, `KernelError` (PR #365 review,
+finding 3): its runs were checked against its own block size, and the object the kernel caches for
+the id keeps the one it was made with, so they would be used against a size nothing checked them
+for. A file's block size is its filesystem's, and does not change.
+
+**A map the kernel cannot use is refused** (Phase 6 Part E.4): a `block_size` that is not a power of
+two from 512 to a page, or a run whose ends — `file_block + length`, `device_lba + length`, and that
+times `block_size` — do not fit a `u64`. The resolve fails `KernelError`, as for a body too short
+for its runs. The page cache divides by the block size and multiplies a device block by it, and a
+second server is one more process whose reply reaches that arithmetic. **A page must lie within one
+run**, since the kernel fills and writes it as one device range; that one the kernel cannot check,
+and each server guarantees it (`filesystem-data-path.md` § *A page within one run*).
 
 #### The `SUBNAMESPACE` body
 

@@ -1592,14 +1592,47 @@ not only in the doc that decided it.
   user meets it rather than only in the design doc. Trigger: the tables arriving for some other
   reason (text rendering in the compositor is the likely one), since carrying them for two shell
   operators alone is not the trade.
-**Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
+**FAT clusters smaller than a page — `TODO(fat-small-clusters)`.** `fs-server-fat` refuses a FAT
+whose clusters are under 4 KiB, saying so (Phase 6 Part E, the maintainer's call). The kernel fills
+and writes a page as one device range, and a FAT's data region need not start on a page boundary,
+so a page of such a FAT can span two clusters that are not adjacent on the device. **Every Nitrox
+ESP is refused this way** — 512-byte clusters on the release disk and what `nxinstall` writes, 1 KiB
+on the live stick — as is a small stick formatted with the defaults. A stick of 4 GiB or more
+formatted by another system has clusters of 4 to 32 KiB. The ways to serve one: through
+`File::ReadRange`, read-only, a second data path in the server; or a page filled from several runs,
+real kernel work with a partial-failure case. Part G's `disk --format` makes such a stick servable
+meanwhile. **Trigger**: a stick someone needs that cannot be reformatted.
 
-> **The workflow arrived from a different direction** (2026-09-10): a USB thumb drive is
-> FAT32, so Phase 6 needs this whether or not anybody ever updates a bootloader in place. The
-> ESP-write case comes free with it, and Phase 5's installer would like it.
->
-> **Scheduled** (2026-10-01): Phase 6 Part E, `fs-server-fat` read-write, FAT12/16/32 with long
-> names. The read-only first step is skipped: a stick is written to.
+**A file in more runs than a reply holds — `TODO(map-range)`.** A block-file reply carries at most
+64 runs (`MAX_RUNS` in `libfsserver`), and a file in more fragments is refused `TooLarge`, by both
+servers. `MapRange`, which would let the kernel ask for a range's runs as it needs them, is
+specified and not built ([`rsproto-block-ops.md`](../spec/rsproto-block-ops.md)). FAT's server
+allocates next to a file's last cluster where it can, so a file it writes stays in few runs; a FAT
+another system filled first-fit over holes is the likely case. **Trigger**: a file someone needs
+that is refused for it.
+
+**A FAT long name over 255 bytes of UTF-8 — `TODO(fat-long-utf8-names)`.** A long name is up to 255
+UTF-16 units, which can take 765 bytes of UTF-8, and a listing entry's `name_len` carries 255. Such
+a file is **listed by its short name**, and reached by either: a lookup compares long names in
+UTF-16, as they are stored (PR #365 review; until then it was left out of the listing, could not be
+reached, and its directory could not be removed). What is deferred is listing it by its long name.
+**Trigger**: a stick with such a name on it — 86 CJK characters is enough — or a wider listing
+entry for another reason.
+
+**`File::Touch` on FAT finds a file through a table — `TODO(fat-touch-table)`.** FAT has no table
+from a first cluster to its directory entry, so `fs-server-fat` keeps one: 256 entries, filled as
+files are mapped and kept through renames, the oldest dropped first (Phase 6 Part E). A file it no
+longer holds misses its `mtime` on an in-place write. The fix, should it matter, is to find the
+entry by walking the directories, or to keep the table per open file rather than bounded.
+**Trigger**: an `mtime` someone needs that a busy stick lost.
+
+**ext4 with blocks smaller than a page — `TODO(ext4-subpage-runs)`.** The kernel fills a page as one
+device range from the page's first block, so a page must lie within one run. FAT's server makes
+that so by refusing small clusters; **`fs-server-ext4` does not check it**. With 4 KiB blocks, which
+every filesystem Nitrox makes has, it holds by construction. An ext4 of 1 KiB blocks whose extent
+ends inside a page would fill that page from the wrong blocks. Found writing Phase 6 Part E's docs.
+The fix is the server's: refuse a map whose run boundary falls inside a page. **Trigger**: an ext4
+with smaller blocks someone needs to read.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
 of a directory for a record with enough slack before appending a new block, and the server
@@ -2196,6 +2229,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Read-write FAT | 2026-10-06 | **`fs-server-fat`, Phase 6 Part E** — FAT12, FAT16 and FAT32 read-write with long names, on `libfsserver`'s protocol beside `fs-server-ext4`. The trigger arrived from another direction than the one the entry named, a USB stick rather than an ESP update (2026-09-10), and the read-only first step was skipped, since a stick is written to. Files are mapped in 512-byte sectors and named by their first cluster; clusters under a page are refused, so no Nitrox ESP is served (`TODO(fat-small-clusters)`); the storage service mounts a FAT on a removable disk alone. [`fat-fs-server.md`](../architecture/fat-fs-server.md). |
 | A grace period for `with` (`view-grace`) | 2026-10-01 | **Remembered per session, terminal and view, for five minutes** — the laptop polish's Part A. `with` sends a one-time `Tty::Token` from its terminal and the broker redeems it with `tty-server` over its own channel, so a caller cannot claim another terminal; a refused password, `with --forget` and the session's end forget it. `boot-probe` holds the forgery control. |
 | A new user's folders (`home-folders`) | 2026-09-30 | **Whoever makes a home makes its folders**, from `libfs::HOME_FOLDERS`, the list `nxfiles`' sidebar and the shell's Places menu read — the maintainer's call in administration Part D's detail pass, over a session making missing folders at each login and over a skeleton directory. The view broker made them for every account `account --add` adds from Part D.3, and **Part G.2's installer makes them for the first**: it writes the new machine's one account, its policy and `/home/<name>` with the three folders onto the installed root, where it used to copy the build's demo home. `check-install` reads them off the installed disk on the host. |
 | A press whose release never arrives (`lost-release`) | 2026-09-23 | **QEMU held it.** Its PS/2 queue is sixteen bytes, and a packet that will not fit stays in the device's state until the next injected event (`ps2_mouse_send_packet`, the same in 8.2 and 11.0). A gate injects a click's release last and then waits, so after a walk that filled the queue the press went and the release waited for ever. Proven by a guest probe that held the i8042 drain for a 3-step walk and a click: ten releases held of ten, and QEMU's trace showed no button-up packet until the next event. The gates now flush — an event that moves nothing, which can only deliver what was injected — after a click's press receipt and while waiting after any other release (`expect_after_pointer`): ten of ten through the real `click_at`, none without its flush. **Guarded since PR #331's review**: the `ps2-hold-gate` kernel feature, which `test-harness` implies, holds the i8042 drain after F9, and `check-input` builds the held release with it on every run — asserting the release is held, then that each flush delivers it. The entry's reasoning ruled out everything *in* the guest correctly, and said a fix had to be below the gate; the loss was below the guest, in the injector, so the gate — the one thing that knows it has stopped injecting — is where the fix belongs. |

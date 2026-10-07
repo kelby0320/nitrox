@@ -224,7 +224,15 @@ its own plugs, so it is the gate that does.
 
 **A stick is QEMU's `usb-storage`, and what it holds is the host's to check** (Phase 6 Part D).
 `test-qemu`'s is an MBR naming one FAT16 partition (`mbr_fat_stick`), as a shop sells one, so the
-first round reads a table and the storage service reports a filesystem it does not mount.
+first round reads a table and the storage service reports a filesystem it does not mount — with
+512-byte clusters, which `fs-server-fat` refuses, so the boot's set of mounts is the same with the
+FAT server as without it (Phase 6 Part E). `check-storage`'s FAT stick is the one that is served: a
+300 MiB FAT32 formatted in place in a sparse image by `mformat -i <file>@@<offset>`, so the gate
+writes no 300 MiB file, and carved back sparsely for `fsck.fat`. Its data region is off a 4 KiB
+boundary, the case files mapped in sectors exist for, and `xtask` asserts that from the boot sector
+before the boot, since a formatter that aligned it would leave the gate proving less. **The serial
+line carries ASCII alone** — the line discipline drops every byte past it — so a Unicode name the
+guest writes is one it took from a listing, never one typed.
 `check-storage` plugs its sticks in after the login: each is a node added with `blockdev-add` and a
 `usb-storage` device on it, and `device_del` pulls the device and leaves the node, so the same image
 goes in again as a new device. Each is a file the host reads once the machine has stopped — carved

@@ -10,7 +10,7 @@ use libstream::wire::{Table, Value};
 use crate::probe::{Found, fat_label, probe};
 use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::labels;
-use crate::mounts::{Plan, Refusal, at, automount, explicit, in_use};
+use crate::mounts::{Plan, Refusal, Server, at, automount, explicit, in_use};
 use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
@@ -22,6 +22,8 @@ use crate::table::{self, By, Device, Mounted};
 const FAT32: &[u8; 512] = include_bytes!("../fixtures/mformat-fat32.bin");
 const FAT16: &[u8; 512] = include_bytes!("../fixtures/mformat-fat16.bin");
 const PROTECTIVE_MBR: &[u8; 512] = include_bytes!("../fixtures/gpt-protective-mbr.bin");
+/// What `fs-server-fat` refuses a Nitrox ESP for: its clusters are a sector.
+const SMALL: &str = "512-byte clusters, smaller than a page";
 
 /// An in-memory device.
 struct Image(RefCell<Vec<u8>>);
@@ -65,6 +67,23 @@ fn ext4(label: &[u8]) -> Image {
     )
     .unwrap();
     img
+}
+
+/// **A FAT `mkfs.fat` made** of `kib` KiB with `args`, read into memory.
+fn mkfs_fat(kib: u64, args: &[&str]) -> Image {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(std::format!("nitrox-storage-{}-{n}.img", std::process::id()));
+    std::fs::File::create(&path).unwrap().set_len(kib * 1024).unwrap();
+    let out = std::process::Command::new("mkfs.fat")
+        .args(args)
+        .arg(&path)
+        .output()
+        .expect("mkfs.fat must be installed (dosfstools) to run storage-service's tests");
+    assert!(out.status.success(), "mkfs.fat {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    Image(RefCell::new(bytes))
 }
 
 /// A device whose first sector is `sector` and the rest zero.
@@ -196,7 +215,12 @@ fn an_ext4_its_server_would_refuse_is_nothing() {
 
 #[test]
 fn fat_and_nothing_are_found_on_a_device() {
-    assert_eq!(probe(&with_sector(FAT32)), Found::Fat { label: String::from("NITROX_ESP") });
+    let esp = Found::Fat {
+        label: String::from("NITROX_ESP"),
+        clean: Some(true),
+        refused: Some(String::from(SMALL)),
+    };
+    assert_eq!(probe(&with_sector(FAT32)), esp, "the image builder's ESP, which fs-server-fat refuses");
     assert_eq!(probe(&with_sector(PROTECTIVE_MBR)), Found::Nothing);
     assert_eq!(probe(&Image(RefCell::new(std::vec![0u8; 8192]))), Found::Nothing);
     assert_eq!(probe(&Image(RefCell::new(std::vec![0u8; 100]))), Found::Nothing, "too short to read");
@@ -287,7 +311,7 @@ fn a_live_boot_is_a_root_on_a_ram_disk() {
 
 fn devices() -> Vec<Device> {
     let found = |r: &DeviceRecord| match r.id {
-        6 => Found::Fat { label: String::from("NITROX_ESP") },
+        6 => Found::Fat { label: String::from("NITROX_ESP"), clean: Some(true), refused: Some(String::from(SMALL)) },
         7 => Found::Ext4 { label: String::new(), clean: Some(false) },
         8 => Found::Ext4 { label: String::from("nitrox-live"), clean: Some(true) },
         _ => Found::Nothing,
@@ -329,7 +353,7 @@ fn all_tsm_has_a_row_per_device() {
     assert_eq!(column(&t, 0, "filesystem"), &Value::Null, "a disk holding a table holds no filesystem");
     assert_eq!(column(&t, 2, "filesystem"), &s("fat"));
     assert_eq!(column(&t, 2, "label"), &s("NITROX_ESP"));
-    assert_eq!(column(&t, 2, "clean"), &Value::Null, "clean is ext4's");
+    assert_eq!(column(&t, 2, "clean"), &Value::Bool(true), "clean is FAT's too (Phase 6 Part E.5)");
     assert_eq!(column(&t, 3, "mounted"), &s("/"));
     assert_eq!(column(&t, 3, "by"), &s("init"));
     assert_eq!(column(&t, 3, "mode"), &s("rw"));
@@ -427,7 +451,7 @@ fn a_boot_mounts_every_ext4_that_is_not_inits() {
     let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
     assert_eq!(
         automount(&devices(), &init, false, true),
-        [Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw }]
+        [Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw, server: Server::Ext4 }]
     );
     assert_eq!(automount(&devices(), &[], false, true).len(), 2, "with no init mount, both ext4s");
 }
@@ -488,7 +512,7 @@ fn the_installers_source_is_passed_over_and_nothing_else() {
         std::vec![
             dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
             dev(rec(5, DeviceKind::RamDisk, 1, NO_PARENT, "root.img", 57_344), Found::Nothing),
-            dev(rec(6, DeviceKind::RamDisk, 2, NO_PARENT, "install-esp.img", 67_584), Found::Fat { label: String::new() }),
+            dev(rec(6, DeviceKind::RamDisk, 2, NO_PARENT, "install-esp.img", 67_584), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }),
             dev(rec(7, DeviceKind::RamDisk, 3, NO_PARENT, "install-root.img", 24_576), Found::Nothing),
             dev(rec(8, DeviceKind::Partition, 4, 3, "nitrox-root", 196_541), ext4("")),
             dev(rec(9, DeviceKind::Partition, 5, 5, "nitrox-live", 53_248), ext4("")),
@@ -550,7 +574,7 @@ fn init_root() -> Vec<Mounted> {
 fn an_administrator_mounts_by_name() {
     let ds = devices();
     let plan = explicit(&ds, &init_root(), &[], true, true, "blk-4", "").unwrap();
-    assert_eq!(plan, Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw });
+    assert_eq!(plan, Plan { device: 8, label: String::from("nitrox-live"), mode: Mode::Rw, server: Server::Ext4 });
     let plan = explicit(&ds, &init_root(), &[], true, true, "blk-4", "stick").unwrap();
     assert_eq!(plan.label, "stick");
     let taken = [String::from("nitrox-live")];
@@ -595,7 +619,7 @@ fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
     stick.flags |= libkern::device::BOOT;
     let ds = std::vec![
         dev(stick, Found::Nothing),
-        dev(rec(21, DeviceKind::Partition, 9, 20, "NITROX_ESP", 32_768), Found::Fat { label: String::new() }),
+        dev(rec(21, DeviceKind::Partition, 9, 20, "NITROX_ESP", 32_768), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }),
         dev(rec(22, DeviceKind::Partition, 10, 20, "data", 16_384), ext4("data")),
         dev(rec(30, DeviceKind::Disk, 11, 29, "another stick", 16_384), ext4("other")),
     ];
@@ -620,7 +644,7 @@ fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
     let all = std::vec![unmounted, new.clone()];
     let taken = std::vec![String::from("stick")];
     let plan = crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &taken, true, true);
-    assert_eq!(plan, [Plan { device: 40, label: String::from("stick-2"), mode: Mode::Ro }]);
+    assert_eq!(plan, [Plan { device: 40, label: String::from("stick-2"), mode: Mode::Ro, server: Server::Ext4 }]);
     assert_eq!(crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &[], false, false), [], "init's mounts unknown");
 }
 
@@ -638,4 +662,146 @@ fn in_use_is_each_mount_and_its_disk() {
     // a block device, so the disk alone is in use.
     let bare = [Mounted { device: 3, at: String::from("/storage/bare"), by: By::Storage, mode: Mode::Rw }];
     assert_eq!(in_use(&ds, &bare), [3], "the disk's controller (id 1) is not a device to withhold");
+}
+
+// --- FAT (Phase 6 Part E.5) ---------------------------------------------------------------------
+
+/// **A FAT is read by its server's own check**: one with 4 KiB clusters is served, with its label
+/// and how it was left; one with 512-byte clusters is a FAT its server refuses, and says why; and
+/// one whose sectors are 4 KiB, which the library cannot parse but [`fat_label`] recognises, is
+/// still a FAT, refused for its sectors. A FAT found not cleanly unmounted says so.
+#[test]
+fn a_fat_is_read_by_its_servers_own_check() {
+    let served = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "NXSTICK"]);
+    assert_eq!(probe(&served), Found::Fat { label: String::from("NXSTICK"), clean: Some(true), refused: None });
+    assert_eq!(probe(&served).server(), Some(Server::Fat));
+    let small = mkfs_fat(2048, &["-F", "12", "-s", "1"]);
+    assert_eq!(probe(&small), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) });
+    assert_eq!(probe(&small).server(), None, "refused, so nothing would serve it");
+    let mut wide = *FAT32;
+    wide[11..13].copy_from_slice(&4096u16.to_le_bytes());
+    let Found::Fat { refused: Some(why), .. } = probe(&with_sector(&wide)) else {
+        panic!("a FAT with 4 KiB sectors is a FAT");
+    };
+    assert_eq!(why, "4096-byte sectors; only 512-byte sectors are served");
+    served.0.borrow_mut()[0x25] |= 1;
+    assert_eq!(probe(&served).clean(), Some(false), "the state byte's bit, as fsck.fat reads it");
+}
+
+/// A record published by USB mass storage: a stick's disk.
+fn on_usb(mut r: DeviceRecord) -> DeviceRecord {
+    r.driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
+    r
+}
+
+/// **A FAT is auto-mounted on a removable disk alone** — a stick's partition, or a stick holding
+/// one whole — by `fs-server-fat`, read-only on a live boot. An internal disk's servable FAT is not,
+/// nor a stick's FAT its server would refuse; an ext4 is mounted wherever it is, by
+/// `fs-server-ext4`.
+#[test]
+fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
+    let refused = Found::Fat { label: String::from("SMALL"), clean: Some(true), refused: Some(String::from(SMALL)) };
+    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true) };
+    let ds = std::vec![
+        dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
+        dev(rec(4, DeviceKind::Partition, 1, 3, "internal", 131_072), fat("INTERNAL")),
+        dev(rec(5, DeviceKind::Partition, 2, 3, "data", 131_072), ext4("data")),
+        dev(on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", 614_400)), Found::Nothing),
+        dev(rec(21, DeviceKind::Partition, 4, 20, "partition 1 (unlabelled)", 614_000), fat("NXSTICK")),
+        dev(on_usb(rec(30, DeviceKind::Disk, 5, 29, "a whole stick", 65_536)), fat("WHOLE")),
+        dev(on_usb(rec(40, DeviceKind::Disk, 6, 39, "an old stick", 4_096)), refused),
+    ];
+    assert!(!crate::mounts::removable(&ds[1], &ds) && crate::mounts::removable(&ds[4], &ds));
+    let plan = automount(&ds, &[], true, true);
+    let got: Vec<(u32, &str, Mode, Server)> = plan.iter().map(|p| (p.device, p.label.as_str(), p.mode, p.server)).collect();
+    assert_eq!(
+        got,
+        [(5, "data", Mode::Ro, Server::Ext4), (21, "NXSTICK", Mode::Ro, Server::Fat), (30, "WHOLE", Mode::Ro, Server::Fat)]
+    );
+    let mut on_sata = ds.clone();
+    on_sata[3].record.driver = [0; 16];
+    let planned: Vec<u32> = automount(&on_sata, &[], false, true).into_iter().map(|p| p.device).collect();
+    assert_eq!(planned, [5, 30], "the driver is what makes the partition's disk removable");
+}
+
+/// **An administrator mounts an internal FAT**, writable and by `fs-server-fat`: the rule above is
+/// the automatic mount's. One its server would refuse is refused here too.
+#[test]
+fn an_administrator_mounts_an_internal_fat_but_not_one_its_server_refuses() {
+    let mut ds = devices();
+    ds[2].found = Found::Fat { label: String::from("BIGESP"), clean: Some(true), refused: None };
+    let plan = explicit(&ds, &init_root(), &[], true, true, "blk-2", "").unwrap();
+    assert_eq!(plan, Plan { device: 6, label: String::from("BIGESP"), mode: Mode::Rw, server: Server::Fat });
+    assert_eq!(explicit(&devices(), &init_root(), &[], true, true, "blk-2", ""), Err(Refusal::NothingToServe), "512-byte clusters");
+}
+
+/// The servers are spawned from the store's copies.
+#[test]
+fn each_server_is_spawned_from_the_store() {
+    assert_eq!(Server::Ext4.path(), b"/bin/fs-server-ext4");
+    assert_eq!(Server::Fat.path(), b"/bin/fs-server-fat");
+}
+
+/// Write one MBR entry into `img`'s first sector, as `sfdisk` does over whatever was there: status
+/// `0x00`, `kind`, from `first` for `count` blocks, and the signature.
+fn mbr_entry_over(img: &Image, kind: u8, first: u32, count: u32) {
+    let mut s = img.0.borrow_mut();
+    let e = &mut s[0x1BE..0x1CE];
+    e.fill(0);
+    e[4] = kind;
+    e[8..12].copy_from_slice(&first.to_le_bytes());
+    e[12..16].copy_from_slice(&count.to_le_bytes());
+    s[510] = 0x55;
+    s[511] = 0xAA;
+}
+
+/// **A whole disk whose first sector carries a partition entry is never mounted whole** (PR #365
+/// review, finding 4). A stick formatted FAT whole and then partitioned keeps its FAT's boot sector
+/// beside the entry: reported, and refused, so neither the automatic mount nor an administrator's
+/// takes it. The same bytes as a partition are a FAT like any other. An ext4 made whole and then
+/// partitioned keeps its superblock at 1024: that disk holds nothing, its partitions being what
+/// holds filesystems.
+#[test]
+fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
+    use crate::probe::{STALE_FAT, probe_record};
+    let blocks = 131_072u64;
+    let stale = mkfs_fat(64 * 1024, &["-F", "32", "-s", "8", "-n", "OLDFAT"]);
+    mbr_entry_over(&stale, 0x83, 2048, (blocks - 2048) as u32);
+    let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", blocks));
+    let found = probe_record(&stale, &disk);
+    assert_eq!(found, Found::Fat { label: String::from("OLDFAT"), clean: Some(true), refused: Some(String::from(STALE_FAT)) });
+    let ds = std::vec![Device { record: disk, found }];
+    assert_eq!(automount(&ds, &[], false, true), [], "not mounted by itself");
+    assert_eq!(explicit(&ds, &[], &[], true, true, "blk-3", ""), Err(Refusal::NothingToServe), "nor as asked");
+    let part = rec(21, DeviceKind::Partition, 4, 20, "partition 1", blocks);
+    assert_eq!(probe_record(&stale, &part).server(), Some(Server::Fat), "a partition's own sector 0 is its own");
+
+    let whole = ext4(b"whole");
+    mbr_entry_over(&whole, 0x83, 2048, 2048);
+    assert!(matches!(probe(&whole), Found::Ext4 { .. }), "the superblock is still there");
+    let disk = rec(30, DeviceKind::Disk, 5, 1, "a disk", 4096 * 8);
+    assert_eq!(probe_record(&whole, &disk), Found::Nothing);
+}
+
+/// **A FAT made whole on a stick is still served**: `mkfs.fat` leaves zeros where a table's
+/// entries would be, and Windows' boot code puts text there, whose bytes are no entry's status.
+#[test]
+fn a_fat_made_on_a_whole_stick_is_still_served() {
+    use crate::probe::probe_record;
+    let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", 4096));
+    let zeros = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "WHOLE"]);
+    assert_eq!(probe_record(&zeros, &disk).server(), Some(Server::Fat));
+    let text = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "WINDOWS"]);
+    let mut code = [0u8; 0x1FE - 0x1AC];
+    let words = b"Remove disks or other media.\xFF\r\nDisk error\xFF\r\nPress any key to restart\r\n";
+    code[..words.len()].copy_from_slice(words);
+    text.0.borrow_mut()[0x1AC..0x1FE].copy_from_slice(&code);
+    assert_eq!(probe_record(&text, &disk).server(), Some(Server::Fat));
+    // Boot code that happens to hold an entry fitting the disk, but with a status no MBR has.
+    let lucky = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "LUCKY"]);
+    mbr_entry_over(&lucky, 0x0C, 8, 64);
+    lucky.0.borrow_mut()[0x1BE] = 0x33;
+    assert_eq!(probe_record(&lucky, &disk).server(), Some(Server::Fat), "status 0x33 is no entry's");
 }

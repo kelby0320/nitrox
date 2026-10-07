@@ -13,6 +13,8 @@ libinittoml = { path = "../libinittoml" }
 # The ext4 library, for what a device holds: `check_device`, the label and the clean state. The
 # service reads; the servers it spawns (C.5b) are the ones that serve.
 fs-server-ext4 = { path = "../fs-server-ext4" }
+# The FAT library, for the same: its server's own check, its label and its state (Phase 6 Part E.5).
+fs-server-fat = { path = "../fs-server-fat" }
 
 # The library/binary split every resource server here uses: the library is what can be wrong
 # about a disk — what it holds, whether `init` mounted it, what a live boot is, its row in the

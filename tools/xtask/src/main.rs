@@ -704,6 +704,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     "auth-service",
     "logging-service",
     "fs-server-ext4",
+    // FAT's server (Phase 6 Part E.4). Store-only: no root is FAT, so the storage service is what
+    // spawns it, for a stick, from `/bin` like any second mount.
+    "fs-server-fat",
     "tty-server",
     // The display arm's two servers. They were initramfs-resident until 2026-08-11 for one
     // reason — they predate `/bin` — and neither has a bootstrap role: a compositor cannot
@@ -783,6 +786,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // two builds' bytes differ.
     build_userspace_bin("init", None)?;
     build_userspace_bin("fs-server-ext4", None)?;
+    build_userspace_bin("fs-server-fat", None)?;
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
@@ -2238,7 +2242,8 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("need the storage grant")?;
     s.expect("/home>")?;
     //      (c) **With it, the request reaches the service**, whose own reason comes back: the
-    //          ESP holds FAT, which it recognises and cannot serve. On a release boot there is
+    //          ESP holds a FAT its server refuses for its 512-byte clusters (Phase 6 Part E,
+    //          when a FAT could be served; before, any FAT was refused). On a release boot there is
     //          nothing it could mount, so the refusal is the evidence the grant arrived; the
     //          successful mount and unmount through a view are `boot-probe`'s, on a test image's
     //          scratch disk.
@@ -4477,6 +4482,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
     require_tool("debugfs")?;
+    require_tool("fsck.fat")?;
     // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
     // wrote. The release image is built first: building the test stick rebuilds the programs
     // for its own mode.
@@ -4487,6 +4493,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     let _ = fs::remove_file(&disk);
     fs::copy(image_path(), &disk)?;
     mark_root_not_clean(&disk)?;
+    add_internal_fat(&disk)?;
     cmd_image_live_for(BuildMode::Selftest)?;
     // **Two sticks to plug in** (Phase 6 Part D): an MBR one holding an ext4 partition, which is
     // ejected and read on the host, and a whole-disk ext4, which is pulled while mounted.
@@ -4494,6 +4501,9 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     mbr_ext4_stick(&stick_mbr, 32, STICK_MBR_LABEL)?;
     let stick_whole = work.join("stick-whole.img");
     whole_ext4_stick(&stick_whole, 16, STICK_WHOLE_LABEL)?;
+    // **And a FAT stick** (Phase 6 Part E.6), for `fs-server-fat`.
+    let stick_fat = work.join("stick-fat.img");
+    fat32_stick(&stick_fat, &work)?;
     let qmp_sock = work.join("qmp.sock");
     let _ = fs::remove_file(&qmp_sock);
 
@@ -4541,6 +4551,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     check_storage_disk(&disk, &work)?;
     println!("\nxtask: and the sticks:");
     check_sticks(&stick_mbr, &stick_whole, &work)?;
+    check_fat_stick(&stick_fat, &work)?;
     println!(
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
          unmount, and the filesystem was left clean ✓"
@@ -4585,6 +4596,132 @@ fn mbr_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
 fn whole_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
     let _ = fs::remove_file(path);
     served_ext4(path, mib * 256, label)
+}
+
+/// The FAT stick's label, and the names the host puts on it (Phase 6 Part E.6): a long name, a
+/// Unicode one, a file two directories down, and one the guest removes. Beside them, the pattern
+/// at [`STORAGE_PATTERN_FILE`], which the guest reads back.
+const STICK_FAT_LABEL: &str = "NXFAT";
+const FAT_LONG_NAME: &str = "a long file name from the host.txt";
+const FAT_UNICODE_NAME: &str = "naïve résumé 名前.txt";
+const FAT_NESTED_DIR: &str = "nested/deeper";
+const FAT_NESTED_NAME: &str = "inner file.txt";
+const FAT_DOOMED: &str = "REMOVE.ME";
+/// What the guest makes on the FAT stick: a directory, a copy of the Unicode-named file into it
+/// under a longer Unicode name built from its own, the long-named file renamed into it, and a file
+/// written through a mapping. **The directory's name has no space**, so a path through it is one
+/// bareword: a parenthesised path straight after a command's name reads as a call to it
+/// (`userspace/nxsh/src/parse.rs`), so `copy` and `rename` lead with `--force` when theirs must be
+/// computed.
+const FAT_MADE_DIR: &str = "made-by-nitrox";
+const FAT_RENAMED: &str = "renamed from the host.txt";
+const FAT_WRITTEN: &str = "written-by-nitrox.bin";
+/// The internal FAT: the third partition's name and its filesystem's label.
+const INTERNAL_FAT_PARTLABEL: &str = "internal-fat";
+const INTERNAL_FAT_LABEL: &str = "NXINTERNAL";
+
+/// The host's bytes for each file it puts on the FAT stick: told apart by name.
+fn fat_host_bytes(name: &str) -> Vec<u8> {
+    match name {
+        FAT_LONG_NAME => (0..9_000u32).map(|i| (i % 251) as u8).collect(),
+        FAT_UNICODE_NAME => b"unicode, from the host\n".to_vec(),
+        FAT_NESTED_NAME => b"two directories down\n".to_vec(),
+        STORAGE_PATTERN_FILE => (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect(),
+        _ => b"the guest removes this\n".to_vec(),
+    }
+}
+
+/// An mtools command, with names in UTF-8 and no complaint about a geometry mtools did not choose.
+fn mtools_cmd(tool: &str) -> Command {
+    let mut c = Command::new(tool);
+    c.env("MTOOLS_SKIP_CHECK", "1").env("LC_ALL", "C.UTF-8");
+    c
+}
+
+/// **A FAT stick for `fs-server-fat`** (Phase 6 Part E.6): 300 MiB, sparse, an MBR naming one FAT32
+/// partition from 1 MiB, formatted `mformat -F -c 8` — **FAT32 by its cluster count, with 4 KiB
+/// clusters, and its data region off a 4 KiB boundary**, which is the case maps in sectors exist
+/// for and is asserted here from the boot sector, so a formatter that aligned it would fail the
+/// gate before the boot. Then the host's files: [`fat_host_bytes`]'s, by `mcopy`.
+fn fat32_stick(path: &Path, work: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    for tool in ["mformat", "mcopy", "mmd"] {
+        require_tool(tool)?;
+    }
+    const MIB: u64 = 1024 * 1024;
+    let _ = fs::remove_file(path);
+    fs::File::create(path)?.set_len(300 * MIB)?;
+    let count = (300 * 2048 - 2048) as u32;
+    write_mbr(path, 2048, count, 0x0C)?;
+    let at = format!("{}@@{MIB}", path.display());
+    run(mtools_cmd("mformat")
+        .arg("-i").arg(&at)
+        .arg("-F").arg("-c").arg("8")
+        .arg("-T").arg(count.to_string())
+        .arg("-v").arg(STICK_FAT_LABEL)
+        .arg("::"))?;
+    let mut boot = [0u8; 512];
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(MIB))?;
+    f.read_exact(&mut boot)?;
+    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u64;
+    let fat_sectors = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]) as u64;
+    let data = 2048 + reserved + boot[16] as u64 * fat_sectors;
+    let clusters = (count as u64 + 2048 - data) / boot[13] as u64;
+    if data % 8 == 0 || boot[13] != 8 || clusters < 65_525 {
+        return Err(format!(
+            "the FAT stick's data region is at sector {data} with {} sectors a cluster and {clusters} \
+             clusters: the gate needs FAT32 by count, 4 KiB clusters, and data off a 4 KiB boundary",
+            boot[13]
+        )
+        .into());
+    }
+    let src = work.join("fat-src");
+    let _ = fs::remove_dir_all(&src);
+    fs::create_dir_all(&src)?;
+    run(mtools_cmd("mmd").arg("-i").arg(&at).arg("::nested").arg(format!("::{FAT_NESTED_DIR}")))?;
+    for (name, dest) in [
+        (FAT_LONG_NAME, FAT_LONG_NAME.to_string()),
+        (FAT_UNICODE_NAME, FAT_UNICODE_NAME.to_string()),
+        (FAT_NESTED_NAME, format!("{FAT_NESTED_DIR}/{FAT_NESTED_NAME}")),
+        (STORAGE_PATTERN_FILE, STORAGE_PATTERN_FILE.to_string()),
+        (FAT_DOOMED, FAT_DOOMED.to_string()),
+    ] {
+        let file = src.join(name);
+        fs::write(&file, fat_host_bytes(name))?;
+        run(mtools_cmd("mcopy").arg("-i").arg(&at).arg(&file).arg(format!("::{dest}")))?;
+    }
+    println!(
+        "xtask: the FAT stick: FAT32 of {clusters} 4 KiB clusters, its data from sector {data}, off \
+         a 4 KiB boundary ✓"
+    );
+    Ok(())
+}
+
+/// **An internal disk's FAT** (Phase 6 Part E.6): a third partition on the copy of the release
+/// disk, grown for it — 64 MiB of FAT32 with 4 KiB clusters, which `fs-server-fat` would serve,
+/// on a disk that is not removable, so nothing mounts it by itself. On the same disk because the
+/// AHCI driver binds the first SATA disk it finds.
+fn add_internal_fat(disk: &Path) -> R<()> {
+    require_tool("sgdisk")?;
+    require_tool("mformat")?;
+    const MIB: u64 = 1024 * 1024;
+    let len = fs::metadata(disk)?.len();
+    fs::OpenOptions::new().write(true).open(disk)?.set_len(len + 65 * MIB)?;
+    // The backup GPT to the new end, then the partition in the space between.
+    run(Command::new("sgdisk").arg("-e").arg(disk))?;
+    run(Command::new("sgdisk")
+        .arg("-n").arg("3:0:0")
+        .arg("-t").arg("3:0700")
+        .arg("-c").arg(format!("3:{INTERNAL_FAT_PARTLABEL}"))
+        .arg(disk))?;
+    let (lba, sectors) = partition_extent(disk, 3)?;
+    run(mtools_cmd("mformat")
+        .arg("-i").arg(format!("{}@@{}", disk.display(), lba * 512))
+        .arg("-F").arg("-c").arg("8")
+        .arg("-T").arg(sectors.to_string())
+        .arg("-v").arg(INTERNAL_FAT_LABEL)
+        .arg("::"))
 }
 
 /// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
@@ -4872,6 +5009,21 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     }
     println!("  ok: the boot stick is flagged, and passed over");
 
+    // 1b. **The internal FAT is not mounted, and the release disk's ESP not served** (Phase 6 Part
+    //     E.6): the first servable and on a disk that is not removable, the second refused for its
+    //     512-byte clusters. Read from the boot's report, as the boot stick's line is.
+    let internal = format!(
+        "(partition {INTERNAL_FAT_PARTLABEL}): fat '{INTERNAL_FAT_LABEL}', left clean; not removable, so not mounted"
+    );
+    if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains(&internal)) {
+        return Err(format!("no report of the internal FAT left unmounted: {internal:?}").into());
+    }
+    let esp = "(partition NITROX_ESP): fat 'NITROX_ESP', left clean; not served: 512-byte clusters, smaller than a page";
+    if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains(esp)) {
+        return Err(format!("no report of the release disk's ESP refused for its clusters: {esp:?}").into());
+    }
+    println!("  ok: the internal FAT is servable and not mounted, not being removable; the ESP is refused for its clusters");
+
     // 2. The MBR stick.
     let mbr_img = build_cache().join("check-storage").join("stick-mbr.img");
     add_node(qmp, "stickmbr", &mbr_img)?;
@@ -4962,6 +5114,106 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         return Err(format!("plugged in again, the stick took blk-{again}, not an index past blk-{whole}").into());
     }
     println!("  ok: plugged in again: blk-{again}, a new index, mounted again — and not left clean, as pulled");
+
+    // 5. **A FAT stick** (Phase 6 Part E.6), served by `fs-server-fat`: auto-mounted read-only, the
+    //    boot being a live one, and what the host put there listed and read.
+    let fat_img = build_cache().join("check-storage").join("stick-fat.img");
+    add_node(qmp, "stickfat", &fat_img)?;
+    let from = s.transcript().len();
+    plug(qmp, "stickfat", "stickfat")?;
+    let mounted = line_of(
+        s,
+        from,
+        &format!("(partition partition 1 (unlabelled)): fat '{STICK_FAT_LABEL}', left clean; mounted at /storage/{STICK_FAT_LABEL} (ro)"),
+    )?;
+    let fat = blk_of(&mounted)?;
+    s.line_since(from, "fs-server: ready (fat, read-only)", any, secs(30))?;
+    println!("  ok: a FAT stick plugged in, its FAT32 mounted read-only by fs-server-fat at /storage/{STICK_FAT_LABEL}");
+    let root = format!("/storage/{STICK_FAT_LABEL}");
+    // **What a command printed**: everything up to the prompt after it, its echo and the prompt
+    // aside.
+    let output = |s: &mut Session, command: &str| -> R<String> {
+        let from = s.transcript().len();
+        s.send(command)?;
+        s.expect("/home>")?;
+        let t = s.transcript();
+        Ok(t[from.min(t.len())..].lines().skip(1).filter(|l| !l.contains("/home>")).collect::<Vec<_>>().join("\n"))
+    };
+    let listing = |s: &mut Session, dir: &str| -> R<String> {
+        output(s, &format!("list {dir} | map {{ |r| format(\"entry={{}}|{{}}|{{}}\", r.name, r.kind, r.size) }}"))
+    };
+    let names = listing(s, &root)?;
+    for (name, kind, size) in [
+        (FAT_LONG_NAME, "file", fat_host_bytes(FAT_LONG_NAME).len()),
+        (FAT_UNICODE_NAME, "file", fat_host_bytes(FAT_UNICODE_NAME).len()),
+        ("nested", "dir", 0),
+        (STORAGE_PATTERN_FILE, "file", STORAGE_PATTERN_LEN),
+        (FAT_DOOMED, "file", fat_host_bytes(FAT_DOOMED).len()),
+    ] {
+        if !names.contains(&format!("entry={name}|{kind}|{size}")) {
+            return Err(format!("`list {root}` does not show {name:?}, a {kind} of {size} bytes:\n{names}").into());
+        }
+    }
+    let nested = listing(s, &format!("{root}/{FAT_NESTED_DIR}"))?;
+    let want = format!("entry={FAT_NESTED_NAME}|file|{}", fat_host_bytes(FAT_NESTED_NAME).len());
+    if !nested.contains(&want) {
+        return Err(format!("`list {root}/{FAT_NESTED_DIR}` does not show {want:?}:\n{nested}").into());
+    }
+    let at = format!("{root}/{STORAGE_PATTERN_FILE}");
+    s.send(&format!("test-pattern --check {at}"))?;
+    s.expect(&format!("test-pattern: {at} holds the pattern, {STORAGE_PATTERN_LEN} bytes ok"))?;
+    s.expect("/home>")?;
+    println!("  ok: the host's names listed — long, Unicode, nested — with their sizes, and its pattern read through a mapping");
+
+    // 6. **Written**: remounted writable through the `storage` grant; a directory made, the
+    //    Unicode-named file copied into it under a longer name built from its own — the serial
+    //    line carries ASCII alone, so the name comes from the listing — the long-named one renamed
+    //    into it, one removed, and a file written through a mapping without a sync.
+    with_admin_asked(s, &format!("disk --unmount {STICK_FAT_LABEL}"))?;
+    s.expect(&format!("storage-service: unmounted {STICK_FAT_LABEL}, left clean (read-only, so as it was found)"))?;
+    s.expect(&format!("disk: unmounted {STICK_FAT_LABEL}"))?;
+    s.expect("/home>")?;
+    with_admin_asked(s, &format!("disk --mount /dev/blk/{fat}"))?;
+    s.expect(&format!("storage-service: mounted {STICK_FAT_LABEL} (rw), as asked"))?;
+    s.expect("/home>")?;
+    let made = format!("{root}/{FAT_MADE_DIR}");
+    for command in [
+        format!("mkdir {made}"),
+        format!(
+            "for r in (list {root} | filter {{ |r| r.name ~= /^na/ }}) {{ copy --force (format(\"{root}/{{}}\", r.name)) (format(\"{made}/a copy of {{}}\", r.name)) }}"
+        ),
+        format!("rename --force (\"{root}/{FAT_LONG_NAME}\") (\"{made}/{FAT_RENAMED}\")"),
+        format!("remove {root}/{FAT_DOOMED}"),
+    ] {
+        // A refusal is a line naming the program, or the shell's own; what each prints on success
+        // (`mkdir`'s table of what it created, say) is the host's to judge, after the eject.
+        let said = output(s, &command)?;
+        let program = command.split_whitespace().find(|w| ["mkdir", "copy", "rename", "remove"].contains(w)).unwrap_or("nxsh");
+        if said.lines().any(|l| l.contains(&format!("{program}: ")) || l.contains("nxsh: ")) {
+            return Err(format!("`{command}` was refused:\n{said}").into());
+        }
+    }
+    let at = format!("{root}/{FAT_WRITTEN}");
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+    s.expect("/home>")?;
+    let made_names = listing(s, &made)?;
+    let copied = format!("entry=a copy of {FAT_UNICODE_NAME}|file|{}", fat_host_bytes(FAT_UNICODE_NAME).len());
+    if !made_names.contains(&copied) || !made_names.contains(&format!("entry={FAT_RENAMED}|file|")) {
+        return Err(format!("`list {made}` is not the copy and the rename:\n{made_names}").into());
+    }
+    println!("  ok: remounted writable; a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping");
+
+    // 7. **Ejected and pulled**: the unmount writes back and records the filesystem clean.
+    with_admin_asked(s, &format!("disk --unmount {STICK_FAT_LABEL}"))?;
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect(&format!("storage-service: unmounted {STICK_FAT_LABEL}, left clean"))?;
+    s.expect(&format!("disk: unmounted {STICK_FAT_LABEL}"))?;
+    s.expect("/home>")?;
+    let from = s.transcript().len();
+    pull(qmp, "stickfat")?;
+    s.line_since(from, &format!("storage-service: blk-{fat} departed"), any, secs(30))?;
+    println!("  ok: ejected, recorded clean, and pulled");
     Ok(())
 }
 
@@ -4993,6 +5245,89 @@ fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
         .into());
     }
     println!("  ok: the stick pulled while mounted is still marked in use (s_state {state:#06x})");
+    Ok(())
+}
+
+/// **The FAT stick, once the machine has stopped** (Phase 6 Part E.6): its partition carved out,
+/// `fsck.fat -n` clean — the dirty bit among what it checks — and mtools reading what the guest
+/// did: the names it made, long and Unicode, the host's file under its new name, the one removed
+/// gone, the copy's bytes, and the pattern it wrote through a mapping.
+fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const MIB: u64 = 1024 * 1024;
+    // Carved sparsely: 299 MiB, nearly all of it never written.
+    let part = work.join("stick-fat-part.img");
+    let mut from = fs::File::open(stick)?;
+    let len = from.metadata()?.len() - MIB;
+    from.seek(SeekFrom::Start(MIB))?;
+    let mut to = fs::File::create(&part)?;
+    let mut buf = vec![0u8; MIB as usize];
+    for _ in 0..len / MIB {
+        from.read_exact(&mut buf)?;
+        if buf.iter().any(|&b| b != 0) {
+            to.write_all(&buf)?;
+        } else {
+            to.seek(SeekFrom::Current(MIB as i64))?;
+        }
+    }
+    to.set_len(len)?;
+    drop(to);
+    let out = Command::new("fsck.fat").arg("-n").arg(&part).output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "fsck.fat -n does not find the FAT stick clean:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let mut boot = [0u8; 512];
+    fs::File::open(&part)?.read_exact(&mut boot)?;
+    if boot[0x41] & 1 != 0 {
+        return Err("the FAT stick's dirty bit is set after its unmount".into());
+    }
+    println!("  ok: fsck.fat -n finds the FAT stick clean, its dirty bit clear");
+    let at = format!("{}", part.display());
+    let listed = mtools_cmd("mdir").arg("-i").arg(&at).arg("-/").arg("-b").arg("::").output()?;
+    let listed: std::collections::BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("::/"))
+        .map(str::to_string)
+        .collect();
+    let want: std::collections::BTreeSet<String> = [
+        FAT_UNICODE_NAME.to_string(),
+        "nested/".to_string(),
+        format!("{FAT_NESTED_DIR}/"),
+        format!("{FAT_NESTED_DIR}/{FAT_NESTED_NAME}"),
+        STORAGE_PATTERN_FILE.to_string(),
+        format!("{FAT_MADE_DIR}/"),
+        format!("{FAT_MADE_DIR}/a copy of {FAT_UNICODE_NAME}"),
+        format!("{FAT_MADE_DIR}/{FAT_RENAMED}"),
+        FAT_WRITTEN.to_string(),
+    ]
+    .into_iter()
+    .collect();
+    if listed != want {
+        return Err(format!("mdir lists the FAT stick as\n{listed:#?}\nwhere the guest left\n{want:#?}").into());
+    }
+    let read = |path: &str| -> R<Vec<u8>> {
+        let out = mtools_cmd("mtype").arg("-i").arg(&at).arg(format!("::{path}")).output()?;
+        if !out.status.success() {
+            return Err(format!("mtype could not read {path:?} off the FAT stick").into());
+        }
+        Ok(out.stdout)
+    };
+    if read(&format!("{FAT_MADE_DIR}/a copy of {FAT_UNICODE_NAME}"))? != fat_host_bytes(FAT_UNICODE_NAME) {
+        return Err("the guest's copy of the Unicode-named file does not hold its bytes".into());
+    }
+    if read(&format!("{FAT_MADE_DIR}/{FAT_RENAMED}"))? != fat_host_bytes(FAT_LONG_NAME) {
+        return Err("the renamed file does not hold the long-named file's bytes".into());
+    }
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+    if read(FAT_WRITTEN)? != pattern {
+        return Err(format!("{FAT_WRITTEN} on the FAT stick does not hold the pattern: the eject did not write it back").into());
+    }
+    println!("  ok: mdir lists the guest's names, long and Unicode; mtype reads the copy, the rename and the pattern");
     Ok(())
 }
 
@@ -13816,7 +14151,12 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["mbr: 1 partition(s)"],
     &["boot-probe: registry: usb disk blk-", ", 32768 blocks of 512, under usb-"],
     &["boot-probe: registry: usb disk blk-", "'s partition blk-", ", by mbr"],
-    &["storage-service: blk-", " (partition partition 1 (unlabelled)): fat 'NXSTICK'"],
+    // **Reported, with its clusters, as not served** (Phase 6 Part E.6): 512-byte clusters, which
+    // `fs-server-fat` refuses, so the boot's mounts — what `boot-probe` checks — are as they were.
+    &[
+        "storage-service: blk-",
+        " (partition partition 1 (unlabelled)): fat 'NXSTICK', left clean; not served: 512-byte clusters, smaller than a page",
+    ],
     // **The disk the machine started from**: named by Limine's record, flagged in the registry,
     // and the only one flagged — the SATA disk the test image boots from (Phase 6 Part D.1).
     &["boot: the modules came from partition 1 of the GPT disk "],
@@ -14602,6 +14942,26 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("fs-server-ext4")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libfsserver`'s own tests (Phase 6 Part E.1). Its resolve core is generic over a volume,
+    // so the bulk of what tests it runs above, through `fs-server-ext4`'s.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libfsserver")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `fs-server-fat`'s library tests (Phase 6 Part E), against images mtools and `mkfs.fat`
+    // build, and — for what it writes — `fsck.fat -n`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("fs-server-fat")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

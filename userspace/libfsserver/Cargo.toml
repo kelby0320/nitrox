@@ -1,0 +1,17 @@
+[package]
+name = "libfsserver"
+version = "0.1.0"
+edition = "2024"
+
+# The half of a filesystem server that is the protocol (Phase 6 Part E.1): the block-device traits,
+# the forwarded-request core, and the server loop — setup, `Ready` or a refusal, directory
+# sessions, `File::Forget` before a free, `Meta::Unmount` — generic over a `Volume` each
+# filesystem implements. `no_std`, no `alloc`: fixed buffers, as the server it came out of had.
+# `fs-server-ext4` is its first user and `fs-server-fat` its second. The host-testable core is
+# tested through those crates' volumes, against images their own tools build.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libkern = { path = "../libkern" }
+librsproto = { path = "../librsproto" }
