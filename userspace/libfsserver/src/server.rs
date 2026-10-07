@@ -6,7 +6,9 @@
 //! 1. The supervisor spawns the server, installing **one** handle — a **control channel**
 //!    endpoint — which the kernel delivers in `rdx` (`_start`'s third argument).
 //! 2. It sends a **setup message** on that channel transferring the **block-device** handle, and
-//!    whether to serve it read-only; [`bootstrap`] receives it and makes a [`Disk`] over it.
+//!    whether to serve it read-only; [`bootstrap`] receives it and makes the server's disk over
+//!    it — ext4's 4 KiB [`Disk`](crate::disk::Disk), or FAT's
+//!    [`SectorDisk`](crate::disk::SectorDisk).
 //! 3. The server **checks the device holds a filesystem it can serve** ([`Volume::check`]). If
 //!    not, it sends a refusal saying why in place of the Ready ([`send_refusal`]) and exits; the
 //!    supervisor prints the reason.
@@ -23,7 +25,6 @@
 //! A server never holds `BIND_NAMESPACE` (its supervisor binds its endpoint) and receives only the
 //! handles it needs at spawn — see `docs/rationale/why-supervisor-registration.md`.
 
-use crate::disk::Disk;
 use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use librsproto::file::{
@@ -1122,14 +1123,15 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
 }
 
 /// **Steps 1 and 2 of the bootstrap**: receive the block-device handle, and whether to serve it
-/// read-only, via the setup message on `control`; then a [`Disk`] over it. A server that cannot
-/// do either says so and exits.
-pub fn bootstrap(control: u64) -> (Disk, bool) {
+/// read-only, via the setup message on `control`; then the server's disk over it, made by
+/// `disk` — [`Disk::new`](crate::disk::Disk::new) for ext4. A server that cannot do either says
+/// so and exits.
+pub fn bootstrap<D>(control: u64, disk: fn(u64) -> Result<D, &'static [u8]>) -> (D, bool) {
     let (device, read_only) = match recv_device(control) {
         Some(d) => d,
         None => fail(b"fs-server: setup recv failed\n"),
     };
-    match Disk::new(device) {
+    match disk(device) {
         Ok(disk) => (disk, read_only),
         Err(why) => fail(why),
     }

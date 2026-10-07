@@ -22,7 +22,7 @@ use crate::dir::{self, ATTR_ARCHIVE, ATTR_DIR, DELETED, DOT, DOTDOT, Dir, ENTRY,
 use crate::table::{self, Cache, Next};
 use crate::{BlockReader, BlockRun, BlockWriter, FsError};
 use libfsserver::disk::SPAN;
-use libfsserver::{DirEntry, Mapped};
+use libfsserver::{DirEntry, Mapped, Volume};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE};
 
 /// The mode a listing gives a directory, a file, and a file marked read-only: FAT keeps no
@@ -819,7 +819,106 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     }
 }
 
+/// **FAT as the protocol sees it** (Phase 6 Part E.4): what `libfsserver`'s loop calls, each the
+/// library's own method. A file's id is its first cluster, and a truncate to zero ends one, so the
+/// loop forgets and releases it as it does an unlinked file's.
+impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
+    const NAME: &'static [u8] = b"fs-server-fat";
+    const KIND: &'static [u8] = b"fat";
+    type Unservable = Unservable;
+
+    fn read_only(&self) -> bool {
+        self.r.read_only()
+    }
+
+    fn check(&self) -> Result<(), Unservable> {
+        Fat::check(self)
+    }
+
+    fn state_unwritable() -> Unservable {
+        Unservable::StateUnwritable
+    }
+
+    fn was_left_clean(&self) -> Result<bool, FsError> {
+        Fat::was_left_clean(self)
+    }
+
+    fn mark_mounted(&self) -> Result<(), FsError> {
+        Fat::mark_mounted(self)
+    }
+
+    fn mark_clean(&self) -> Result<(), FsError> {
+        Fat::mark_clean(self)
+    }
+
+    fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError> {
+        Fat::map_file(self, path, runs)
+    }
+
+    fn read_file(&self, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
+        Fat::read_file(self, path, out)
+    }
+
+    fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        Fat::read_file_range(self, path, offset, len, out)
+    }
+
+    fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
+        Fat::create_file(self, parent, name, now)
+    }
+
+    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+        Fat::grow_file(self, path, size, now)
+    }
+
+    fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<Option<u64>, FsError> {
+        Fat::truncate_file(self, path, size, now)
+    }
+
+    fn resolve_dir(&self, path: &[u8]) -> Result<u64, FsError> {
+        Fat::resolve_dir(self, path)
+    }
+
+    fn read_dir(&self, dir: u64, cursor: u64, emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
+        Fat::read_dir(self, dir, cursor, emit)
+    }
+
+    fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
+        Fat::mkdir_at(self, dir, name, now)
+    }
+
+    fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError> {
+        Fat::unlink_at(self, dir, name, now)
+    }
+
+    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
+        Fat::rmdir_at(self, dir, name, now)
+    }
+
+    fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
+        Fat::touch_at(self, dir, name, now)
+    }
+
+    fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError> {
+        Fat::rename_at(self, dir, old, new, now)
+    }
+
+    fn rename_path(&self, old: &[u8], new: &[u8], replace: bool, now: i64) -> Result<Option<u64>, FsError> {
+        Fat::rename_path(self, old, new, replace, now)
+    }
+
+    fn touch_file(&self, id: u64, now: i64) -> Result<(), FsError> {
+        Fat::touch_file(self, id, now)
+    }
+
+    fn release(&self, id: u64, now: i64) -> Result<(), FsError> {
+        Fat::release(self, id, now)
+    }
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod write_tests;
+#[cfg(test)]
+mod serve_tests;

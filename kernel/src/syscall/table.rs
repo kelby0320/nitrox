@@ -3128,9 +3128,8 @@ fn build_and_install_file_blocks(
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
-    use crate::libkern::KVec;
-    use crate::object::{BlockRun, FileObject};
-    use crate::rsproto::{FILE_BLOCKS_READ_ONLY, file_blocks_reply_header, file_blocks_run, reply_body};
+    use crate::object::FileObject;
+    use crate::rsproto::{FILE_BLOCKS_READ_ONLY, reply_body};
 
     // The block device rides in handles[0].
     let device = match transfers[0].take() {
@@ -3141,24 +3140,14 @@ fn build_and_install_file_blocks(
         }
         None => return (KError::InvalidArgument as i32, 0), // success but no device
     };
-    // Parse the header + BlockRun map from the reply body.
+    // Parse the header + BlockRun map from the reply body, refusing one the page cache cannot use.
     let Some(body) = reply_body(reply_msg) else {
         return (KError::KernelError as i32, 0);
     };
-    let Some(header) = file_blocks_reply_header(body) else {
-        return (KError::KernelError as i32, 0);
+    let (header, runs) = match block_map(body) {
+        Ok(m) => m,
+        Err(e) => return (e as i32, 0),
     };
-    let mut runs: KVec<BlockRun> = KVec::new();
-    if runs.try_reserve(header.run_count as usize).is_err() {
-        return (KError::OutOfMemory as i32, 0);
-    }
-    for i in 0..header.run_count as usize {
-        let Some((file_block, device_lba, length, flags)) = file_blocks_run(body, i) else {
-            return (KError::KernelError as i32, 0);
-        };
-        // `try_reserve` above guarantees this push does not allocate.
-        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
-    }
 
     // SAFETY: `reg` addresses the live `UserspaceServerReg` this reply arrived through.
     let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) })
@@ -3333,6 +3322,42 @@ fn continued_dest<'o>(
         return Err(KError::Unsupported);
     }
     continued_path(dest, consumed, base, out)
+}
+
+/// **A block-file reply's map**: its header and runs, or `KernelError` for one the page cache
+/// cannot use (Phase 6 Part E.4) — a body too short for its runs, as always, and now:
+///
+/// - **a block size that is not a power of two from a sector to a page.** The fill divides by it,
+///   and a page's blocks are found by it; `0` would divide by zero.
+/// - **a run whose ends do not fit a `u64`**: its file blocks' end, its device blocks' end, and
+///   that end in bytes. The fill and the write-back add within a run and multiply a device block
+///   by the block size, and a kernel built with overflow checks panics on either.
+///
+/// A server is a process, and a second one (`fs-server-fat`) is one more whose reply reaches that
+/// arithmetic. `OutOfMemory` if the runs cannot be held.
+fn block_map(
+    body: &[u8],
+) -> Result<(crate::rsproto::FileBlocksHeader, crate::libkern::KVec<crate::object::BlockRun>), KError> {
+    use crate::object::BlockRun;
+    use crate::rsproto::{file_blocks_reply_header, file_blocks_run};
+    let header = file_blocks_reply_header(body).ok_or(KError::KernelError)?;
+    let bs = header.block_size;
+    if !bs.is_power_of_two() || !(512..=PAGE_SIZE as u32).contains(&bs) {
+        return Err(KError::KernelError);
+    }
+    let mut runs = crate::libkern::KVec::new();
+    runs.try_reserve(header.run_count as usize).map_err(|_| KError::OutOfMemory)?;
+    for i in 0..header.run_count as usize {
+        let (file_block, device_lba, length, flags) = file_blocks_run(body, i).ok_or(KError::KernelError)?;
+        let fits = file_block.checked_add(length as u64).is_some()
+            && device_lba.checked_add(length as u64).and_then(|end| end.checked_mul(bs as u64)).is_some();
+        if !fits {
+            return Err(KError::KernelError);
+        }
+        // `try_reserve` above guarantees this push does not allocate.
+        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
+    }
+    Ok((header, runs))
 }
 
 /// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: the file's size, its
@@ -3562,6 +3587,57 @@ mod tests {
     use crate::libkern::handle::KObjectType;
     use crate::mm::test_support::init_global_heap;
     use crate::object::Process;
+
+    /// **A block map the page cache cannot use is refused** (Phase 6 Part E.4), each bound at the
+    /// values either side of it: a block size of 256, 512, 4096 and 8192 (and 0, and one that is
+    /// no power of two), and a run whose file end, device end or device end in bytes is
+    /// `u64::MAX` — taken — or one past it — refused. **Every map taken is used** as the fill and
+    /// the write-back use one, so without the check this test panics where the kernel would.
+    #[test]
+    fn a_block_map_the_page_cache_cannot_use_is_refused() {
+        init_global_heap();
+        let body = |bs: u32, runs: &[(u64, u64, u32)]| {
+            let mut b = vec![0u8; 32 + 24 * runs.len()];
+            b[8..12].copy_from_slice(&bs.to_le_bytes());
+            b[12..16].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+            for (i, &(file_block, device_lba, length)) in runs.iter().enumerate() {
+                let at = 32 + 24 * i;
+                b[at..at + 8].copy_from_slice(&file_block.to_le_bytes());
+                b[at + 8..at + 16].copy_from_slice(&device_lba.to_le_bytes());
+                b[at + 16..at + 20].copy_from_slice(&length.to_le_bytes());
+            }
+            b
+        };
+        let used = |b: &[u8]| -> bool {
+            let Ok((h, runs)) = block_map(b) else {
+                return false;
+            };
+            let bs = h.block_size as u64;
+            let _first_block_of_a_page = PAGE_SIZE as u64 / bs;
+            for r in runs.iter().filter(|r| r.length > 0) {
+                let last = r.file_block + r.length as u64 - 1;
+                let _byte = crate::object::file_object::device_block_in(&runs, last) * bs;
+            }
+            true
+        };
+        let ok_run = [(0, 2048, 8)];
+        for (bs, taken) in [(0, false), (256, false), (511, false), (512, true), (1024, true), (3000, false), (4096, true), (8192, false)] {
+            assert_eq!(used(&body(bs, &ok_run)), taken, "block size {bs}");
+        }
+        let top = u64::MAX;
+        let in_bytes = top / 512; // the last device block whose end in bytes fits
+        for (run, taken, what) in [
+            ((top - 8, 2048, 8), true, "a file end of u64::MAX"),
+            ((top - 7, 2048, 8), false, "one past"),
+            ((0, top - 8, 8), false, "a device end of u64::MAX, which no block size fits in bytes"),
+            ((0, top - 7, 8), false, "a device end one past u64::MAX"),
+            ((0, in_bytes - 8, 8), true, "a device end in bytes of u64::MAX, to the sector"),
+            ((0, in_bytes - 7, 8), false, "one past"),
+        ] {
+            assert_eq!(used(&body(512, &[run])), taken, "{what}");
+        }
+        assert_eq!(block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(), Some(KError::KernelError), "a run cut short");
+    }
 
     #[test]
     fn unknown_number_is_unsupported() {

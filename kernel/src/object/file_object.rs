@@ -1276,7 +1276,7 @@ impl Drop for FileObject {
 
 /// The device block holding file block `file_block` in `runs`; `0` for a hole or a block
 /// past the map.
-fn device_block_in(runs: &KVec<BlockRun>, file_block: u64) -> u64 {
+pub(crate) fn device_block_in(runs: &KVec<BlockRun>, file_block: u64) -> u64 {
     runs.iter()
         .find_map(|r| {
             if file_block >= r.file_block && file_block < r.file_block + r.length as u64 {

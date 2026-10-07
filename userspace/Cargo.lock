@@ -146,6 +146,7 @@ name = "fs-server-fat"
 version = "0.1.0"
 dependencies = [
  "libfsserver",
+ "libkern",
  "librsproto",
 ]
 

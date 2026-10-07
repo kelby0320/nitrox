@@ -111,6 +111,12 @@ impl Unservable {
     }
 }
 
+impl libfsserver::Refusal for Unservable {
+    fn fs_error(&self) -> FsError {
+        Unservable::fs_error(*self)
+    }
+}
+
 impl core::fmt::Display for Unservable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {

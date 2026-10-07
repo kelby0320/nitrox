@@ -17,7 +17,9 @@ servers speak one protocol and a fix to it is a fix to both:
 - **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, generic over
   `Volume`, and the one `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
   **through each server's volume**, in that server's crate, against an image its own tools built.
-- **`disk.rs`** — `Disk`, the device over `sys_io_submit`: a 4 KiB block per submit.
+- **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
+  server uses; and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
+  FAT's uses. A server hands `server::bootstrap` the one it wants.
 - **`server.rs`** — the bootstrap and the loop: the setup message, `Ready` or a refusal, the
   forwarding endpoint, directory sessions and their wait slots, a rename resolved ahead of a
   session, `File::Forget` before a file is freed, `File::Touch` by id, and `Meta::Unmount`.

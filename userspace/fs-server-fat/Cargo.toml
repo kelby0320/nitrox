@@ -5,13 +5,20 @@ edition = "2024"
 
 # FAT12, FAT16 and FAT32 with long names (Phase 6 Part E): a **library**, `no_std` and no `alloc`,
 # host-tested against images `mformat`, `mkfs.fat` and `mcopy` build and checked with `fsck.fat`;
-# and, from Part E.4, the server binary over it, built on `libfsserver` as `fs-server-ext4` is.
+# and the server binary over it, built on `libfsserver` as `fs-server-ext4` is.
 [lib]
 name = "fs_server_fat"
 path = "src/lib.rs"
 
+# The server (Part E.4): `libfsserver`'s loop over the library, and a `_start`. Alloc-free.
+[[bin]]
+name = "fs-server-fat"
+path = "src/main.rs"
+
 [dependencies]
-# The block-device traits, and (from E.4) the protocol.
+# The block-device traits, the sector-granular disk, and the protocol.
 libfsserver = { path = "../libfsserver" }
-# The listing's entry kinds, and (from E.4) the wire format.
+# The listing's entry kinds, and the wire format.
 librsproto = { path = "../librsproto" }
+# The raw syscall surface (used only by the `[[bin]]`; the library needs none).
+libkern = { path = "../libkern" }

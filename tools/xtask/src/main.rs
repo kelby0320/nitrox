@@ -704,6 +704,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     "auth-service",
     "logging-service",
     "fs-server-ext4",
+    // FAT's server (Phase 6 Part E.4). Store-only: no root is FAT, so the storage service is what
+    // spawns it, for a stick, from `/bin` like any second mount.
+    "fs-server-fat",
     "tty-server",
     // The display arm's two servers. They were initramfs-resident until 2026-08-11 for one
     // reason — they predate `/bin` — and neither has a bootstrap role: a compositor cannot
@@ -783,6 +786,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // two builds' bytes differ.
     build_userspace_bin("init", None)?;
     build_userspace_bin("fs-server-ext4", None)?;
+    build_userspace_bin("fs-server-fat", None)?;
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
