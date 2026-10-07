@@ -3168,7 +3168,11 @@ fn build_and_install_file_blocks(
     } else {
         match FileObject::cache_in(&reg_ref, candidate) {
             Ok(f) => f,
-            Err(_) => return (KError::OutOfMemory as i32, 0),
+            Err(crate::object::file_object::CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
+            // A malformed reply, as one `block_map` refuses (PR #365 review, finding 3).
+            Err(crate::object::file_object::CacheInError::BlockSizeChanged) => {
+                return (KError::KernelError as i32, 0);
+            }
         }
     };
     drop(reg_ref);

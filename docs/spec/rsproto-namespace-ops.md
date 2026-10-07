@@ -147,6 +147,11 @@ offset 16 to 32. Both sides are in-tree and pre-stabilization, so this was a fla
 resolve of a file with an id, a grow, create and truncate included, updates the one object to the
 size and map its reply carries.
 
+**A reply for a cached file in another block size is refused** too, `KernelError` (PR #365 review,
+finding 3): its runs were checked against its own block size, and the object the kernel caches for
+the id keeps the one it was made with, so they would be used against a size nothing checked them
+for. A file's block size is its filesystem's, and does not change.
+
 **A map the kernel cannot use is refused** (Phase 6 Part E.4): a `block_size` that is not a power of
 two from 512 to a page, or a run whose ends — `file_block + length`, `device_lba + length`, and that
 times `block_size` — do not fit a `u64`. The resolve fails `KernelError`, as for a body too short

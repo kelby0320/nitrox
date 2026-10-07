@@ -39,6 +39,59 @@ impl BlockWriter for FileImage {
     }
 }
 
+/// **An image in memory, copy-on-write over a shared base**: what a test that tries many variants
+/// of one image writes to, without copying the whole image for each. Writes land in a sector
+/// overlay; reads see the overlay first.
+pub(crate) struct Overlay {
+    pub base: std::rc::Rc<Vec<u8>>,
+    pub sectors: std::cell::RefCell<std::collections::HashMap<u64, [u8; 512]>>,
+}
+
+impl Overlay {
+    pub fn new(base: std::rc::Rc<Vec<u8>>) -> Overlay {
+        Overlay { base, sectors: Default::default() }
+    }
+
+    fn sector(&self, s: u64) -> Result<[u8; 512], FsError> {
+        if let Some(d) = self.sectors.borrow().get(&s) {
+            return Ok(*d);
+        }
+        let at = (s * 512) as usize;
+        let src = self.base.get(at..at + 512).ok_or(FsError::Io)?;
+        Ok(src.try_into().unwrap())
+    }
+}
+
+impl BlockReader for Overlay {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let (s, within) = (at / 512, (at % 512) as usize);
+            let n = (512 - within).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&self.sector(s)?[within..within + n]);
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+impl BlockWriter for Overlay {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let (s, within) = (at / 512, (at % 512) as usize);
+            let n = (512 - within).min(buf.len() - done);
+            let mut d = self.sector(s)?;
+            d[within..within + n].copy_from_slice(&buf[done..done + n]);
+            self.sectors.borrow_mut().insert(s, d);
+            done += n;
+        }
+        Ok(())
+    }
+}
+
 /// **A fresh path under the temp directory**, unique per call: cargo runs tests in parallel.
 pub(crate) fn scratch(what: &str) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);

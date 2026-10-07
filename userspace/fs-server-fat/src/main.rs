@@ -13,7 +13,6 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
 use fs_server_fat::{Fat, ReadOnly};
 use libfsserver::disk::SectorDisk;
 use libfsserver::server;
@@ -36,10 +35,8 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     }
 }
 
+/// **Say where, and exit**, so a resolve waiting on this server fails rather than waits for ever.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        // SAFETY: `pause` is always valid in ring 3 and has no effects.
-        unsafe { asm!("pause", options(nomem, nostack)) };
-    }
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    server::panicked(info)
 }

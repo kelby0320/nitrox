@@ -116,6 +116,51 @@ pub mod probe {
         Found::Fat { label, clean: fat.was_left_clean().ok(), refused }
     }
 
+    /// **What a device holds, by its record** (PR #365 review, finding 4): [`probe`], and for a
+    /// **whole disk whose first sector carries a partition entry**, never a filesystem of its own.
+    /// Partitioning a stick that held a filesystem whole leaves that filesystem's bytes: `sfdisk`
+    /// and `parted` write the entries into sector 0 and keep the rest. An ext4's superblock at byte
+    /// 1024 then reads as ever, beside the partitions the kernel publishes, and the disk would be
+    /// mounted whole over them — so such a disk holds nothing. A FAT's boot sector is sector 0
+    /// itself, which the kernel reads as no table (`kernel/src/drivers/partitions.rs`), so no
+    /// partition is published; mounted, the stale FAT would allocate clusters inside the partition
+    /// nothing can see. It is reported, and refused.
+    pub fn probe_record<R: BlockReader>(r: &R, record: &libkern::device::DeviceRecord) -> Found {
+        use libkern::device::DeviceKind;
+        let found = probe(r);
+        let whole = matches!(record.kind(), DeviceKind::Disk | DeviceKind::RamDisk);
+        let mut sector = [0u8; 512];
+        if !whole || r.read_at(0, &mut sector).is_err() || !partition_entries(&sector, record.block_count) {
+            return found;
+        }
+        match found {
+            Found::Fat { label, clean, .. } => Found::Fat { label, clean, refused: Some(String::from(STALE_FAT)) },
+            _ => Found::Nothing,
+        }
+    }
+
+    /// Why a whole disk's FAT beside partition entries is not served.
+    pub const STALE_FAT: &str = "its first sector holds partition entries too, so this FAT may be stale";
+
+    /// **Whether a disk's first sector carries a partition entry**: signed `0x55AA`, every entry's
+    /// status `0x00` or `0x80` — the check Linux makes, which a filesystem's boot code rarely
+    /// passes — and one entry in use that lies on the disk. GPT's protective entry counts.
+    pub fn partition_entries(sector: &[u8; 512], blocks: u64) -> bool {
+        if sector[510] != 0x55 || sector[511] != 0xAA {
+            return false;
+        }
+        let entry = |slot: usize| &sector[0x1BE + 16 * slot..0x1BE + 16 * (slot + 1)];
+        if !(0..4).all(|slot| matches!(entry(slot)[0], 0x00 | 0x80)) {
+            return false;
+        }
+        (0..4).any(|slot| {
+            let e = entry(slot);
+            let first = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+            let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+            e[4] != 0 && first != 0 && count != 0 && first.checked_add(count).is_some_and(|end| end <= blocks)
+        })
+    }
+
     /// **A FAT boot sector's volume label**, or `None` if `sector` is not a FAT boot sector.
     ///
     /// Recognised by four things every FAT formatter writes: the `0x55 0xAA` signature, a

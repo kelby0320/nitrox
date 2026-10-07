@@ -26,6 +26,9 @@ servers speak one protocol and a fix to it is a fix to both:
 
 ## Rules
 
+- **A server that panics exits** (`server::panicked`, which both binaries' handlers call): a
+  forwarded resolve has no deadline, so a server spinning in its handler held every client waiting
+  on it for ever. An exit closes the endpoint, and the kernel fails each `PeerClosed`.
 - **`no_std`, no `alloc`.** The loop's buffers are statics: one set per process, which is one
   server. A library holding them is no different from the binary holding them, since a server is
   one process serving one filesystem.

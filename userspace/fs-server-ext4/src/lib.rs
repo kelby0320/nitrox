@@ -1403,6 +1403,27 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "rmdir");
     }
 
+    /// **A directory removed is no directory to a session still holding its inode** (PR #365
+    /// review, finding 5): every operation that takes a directory by inode refuses it `NotFound`.
+    /// A removed directory keeps its mode and extent, so the mode check alone let `mkdir_at` write
+    /// an entry into a block the removal had freed.
+    #[test]
+    fn a_removed_directory_is_refused_to_a_session_still_holding_it() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+        ext4::mkdir_at(&rw, sys, b"gone", TEST_NOW).unwrap();
+        let gone = dir_ino(&rw, b"/system/gone");
+        ext4::rmdir_at(&rw, sys, b"gone", TEST_NOW).unwrap();
+        assert_eq!(ext4::mkdir_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::touch_at(&rw, gone, b".", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::unlink_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::rmdir_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::rename_at(&rw, gone, b"x", b"y", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::read_dir_stat(&rw, gone, 0, |_, _, _, _| true).err(), Some(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.into_inner(), "a removed directory left alone");
+    }
+
     #[test]
     fn rename_at_moves_within_a_dir_and_stays_e2fsck_clean() {
         use std::cell::RefCell;

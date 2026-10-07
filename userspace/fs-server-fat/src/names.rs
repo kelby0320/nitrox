@@ -65,6 +65,13 @@ pub fn eq_fold(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// [`eq_fold`] **on UTF-16 units**, as a long name is stored: so a name too long for 255 bytes of
+/// UTF-8 compares as surely as any other.
+pub fn units_eq_fold(a: &[u16], b: &[u16]) -> bool {
+    let fold = |u: u16| if u < 0x80 { (u as u8).to_ascii_lowercase() as u16 } else { u };
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| fold(x) == fold(y))
+}
+
 /// Whether `c` may stand in a short name as it is: an upper-case letter, a digit, or one of the
 /// marks the specification allows.
 fn short_char(c: u8) -> bool {

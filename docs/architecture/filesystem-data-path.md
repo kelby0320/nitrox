@@ -92,13 +92,16 @@ range**: the page's first block, found in the runs, then `PAGE_SIZE` bytes from 
 (`model_a_start_fill` and `begin_write` in `kernel/src/object/file_object.rs`). So **no page may
 span two runs**, and the server guarantees it: FAT's by refusing clusters smaller than a page, since
 a file's clusters then start on page boundaries within it; ext4's with blocks of a page by
-construction. The kernel cannot check it, and does not.
+construction, and with smaller blocks not at all (`TODO(ext4-subpage-runs)`). The kernel cannot
+check it, and does not.
 
 **What it does check** is the arithmetic a reply reaches (Phase 6 Part E.4): a `block_size` that is
 not a power of two from 512 to a page, or a run whose ends do not fit a `u64`, fails the resolve
 `KernelError` ([`rsproto-namespace-ops.md`](../spec/rsproto-namespace-ops.md) § *The `FILE_BLOCKS`
 body*). A `block_size` of `0` divided by zero, and a run near `u64::MAX` overflowed an add, each of
-which panics a kernel built with overflow checks.
+which panics a kernel built with overflow checks. **Nor may a reply change a cached file's block
+size** (PR #365 review): the object keeps the one it was made with, so `FileObject::cache_in`
+refuses a reply in another, whose runs were checked against a size the object will not use.
 
 ## The kernel interface (filesystem-neutral)
 

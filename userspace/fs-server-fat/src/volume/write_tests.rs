@@ -458,3 +458,78 @@ fn a_read_only_mount_refuses_every_change() {
     drop(fat);
     assert!(std::fs::read(&img).unwrap() == before, "the image is unchanged");
 }
+
+/// **`File::Touch` stamps only the file the table says**: the entry at the place it holds must
+/// still be a live file with that cluster (PR #365 review, optional). Here another system removed
+/// the file and put an empty one in its slot; the table cannot know, and the touch must not stamp
+/// the newcomer. The table's own `forget` never runs, so this is the guard alone.
+#[test]
+fn a_touch_by_id_stamps_nothing_where_another_file_took_the_place() {
+    let img = mformat(16, &["-c", "4"]);
+    put(&img, "OLD.TXT", b"old\n");
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let mut runs = [BlockRun::default(); 4];
+    let id = fat.map_file(b"/OLD.TXT", &mut runs).unwrap().id;
+    mdel(&img, "OLD.TXT");
+    put(&img, "NEW.TXT", b"");
+    let stamp = |fat: &Fat<FileImage>| {
+        let mut m = 0;
+        fat.read_dir(fat.resolve_dir(b"/").unwrap(), 0, |e| {
+            m = e.mtime;
+            false
+        })
+        .unwrap();
+        m
+    };
+    let before = stamp(&Fat::new(&disk));
+    assert_eq!(fat.touch_file(id, NOW + 7200), Err(FsError::NotFound));
+    assert_eq!(stamp(&Fat::new(&disk)), before, "the newcomer unstamped");
+}
+
+/// **A change bigger than the FAT cache** (PR #365 review, optional): a 100 MiB grow on a 300 MiB
+/// FAT32 dirties 200 FAT sectors where the cache holds 64, so sectors are evicted dirty and
+/// written as they go. Then a shrink, a regrow and a removal; `fsck.fat -n` clean after each, and the
+/// free count back where it started.
+#[test]
+fn a_change_bigger_than_the_fat_cache_evicts_and_stays_clean() {
+    let img = mformat(300, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let free = Cache::count_free(&disk, &g).unwrap();
+    make(&fat, "/", "big.bin", b"");
+    let steps: [(&str, &dyn Fn()); 3] = [
+        ("a 100 MiB grow", &|| fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap()),
+        ("a shrink to 10 MiB", &|| assert_eq!(fat.truncate_file(b"/big.bin", 10 << 20, NOW), Ok(None))),
+        ("a regrow", &|| fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap()),
+    ];
+    for (what, step) in steps {
+        step();
+        settle(&fat, what);
+    }
+    let root = fat.resolve_dir(b"/").unwrap();
+    let id = fat.unlink_at(root, b"big.bin", NOW).unwrap().unwrap();
+    fat.release(id, NOW).unwrap();
+    settle(&fat, "the removal");
+    assert_eq!(Cache::count_free(&disk, &g).unwrap(), free);
+}
+
+/// **A read never loads over a dirty sector**: with every slot of the cache dirty, a read of a
+/// sector it does not hold is refused, and the dirty sectors are still there to be written. Only a
+/// write path may evict one, writing it out first.
+#[test]
+fn a_read_with_every_slot_dirty_is_refused_and_loses_nothing() {
+    let img = mformat(300, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let mut cache = Cache::new();
+    let per = 128; // FAT32 entries a sector
+    for s in 0..crate::table::CACHE_SECTORS as u32 {
+        cache.set(&disk, &g, (s * per).max(2), table::end_mark(&g)).unwrap();
+    }
+    let beyond = crate::table::CACHE_SECTORS as u32 * per + 5;
+    assert_eq!(cache.next(&disk, &g, beyond), Err(FsError::Io));
+    assert_eq!(cache.flush(&disk, &g).unwrap(), 2, "all 64 still dirty: one run, to each copy");
+}

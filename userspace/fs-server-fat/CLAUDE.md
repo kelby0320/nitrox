@@ -31,11 +31,15 @@ loop.
   library. The binary has no `#[global_allocator]`.
 - **A FAT is anyone's bytes.** Every field read off one is checked before it is used; a malformed
   one is an `FsError`, never a panic, and every chain walk is bounded by the volume's cluster
-  count.
+  count. `garbage_in_any_structure_is_an_error_never_a_panic` holds that as a class: a new reader
+  of on-disk bytes belongs in what it exercises. (It missed the first such panic until it mutated
+  real entries rather than scattering bytes: PR #365's review found it.)
 - **Data, then the chain, then the entry.** A grow zeroes, writes the FAT, then the entry; a
   truncate writes the entry, then the cut, then frees; a removal frees nothing until `release`,
   which the loop calls after `File::Forget`. Changing that order is changing what a crash can do:
-  read `fat-fs-server.md` §5 first.
+  read `fat-fs-server.md` §5 first. **`crash_tests` crashes each change after every write** and
+  checks what is left; every flush in the write path is one its removal fails, so a flush no test
+  needs is a question to answer, not one to leave (PR #365 review).
 - **The write path batches** (`TODO(fs-throughput)`): allocation in one pass, zeroes in 64 KiB
   writes, the FAT's dirty sectors written together. `a_one_mebibyte_grow_costs_a_handful_of_writes`
   counts it; a change that makes it slower should say so with a number.

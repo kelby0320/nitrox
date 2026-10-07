@@ -162,6 +162,32 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         Ok(b[0] & 1 == 0)
     }
 
+    /// **The directory with id `id`, if it still is one** (PR #365 review, finding 5). A session
+    /// names its directory by id — its first cluster — and a removal frees that cluster, which a
+    /// grow may then take, so a number that is a cluster is not enough: it must still be allocated,
+    /// and its first entry still a `.` naming it. A directory made again at the same cluster is one
+    /// again. A fixed root, or FAT32's, is always.
+    fn live_dir(&self, g: &Geometry, cache: &mut Cache, id: u64) -> Result<Dir, FsError> {
+        let d = Dir::from_id(g, id)?;
+        let Dir::Chain(c) = d else {
+            return Ok(d);
+        };
+        if d == Dir::root(g) {
+            return Ok(d);
+        }
+        if matches!(cache.next(self.r, g, c)?, Next::Free | Next::Bad) {
+            return Err(FsError::NotFound);
+        }
+        let mut e = [0u8; 32];
+        self.r.read_at(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
+        let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
+        let named = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
+        if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || named != c {
+            return Err(FsError::NotFound);
+        }
+        Ok(d)
+    }
+
     /// **How long the chain from `first` is, and its last cluster**: `(0, 0)` for none.
     fn chain_end(&self, g: &Geometry, cache: &mut Cache, first: u32) -> Result<(u32, u32), FsError> {
         let (mut n, mut last) = (0, 0);
@@ -234,7 +260,8 @@ impl<'a, R: BlockReader> Fat<'a, R> {
     }
 
     /// **Read `len` bytes of the file at `path` from `offset`** into `out`: how many, fewer at the
-    /// file's end.
+    /// file's end. A chain that ends before the bytes asked for is `Corrupt`, as `map_file` says it
+    /// is: answering the length would hand back whatever `out` held (PR #365 review, finding 7).
     pub fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
         let g = self.geometry()?;
         let mut cache = self.cache.borrow_mut();
@@ -246,10 +273,12 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         let cb = g.cluster_bytes() as u64;
         let (first, last) = ((offset / cb) as u32, ((end - 1) / cb) as u32);
         let mut err = None;
+        let mut reached = None;
         cache.walk(self.r, g, f.cluster, |k, c| {
             if k < first {
                 return true;
             }
+            reached = Some(k);
             let from = (k as u64 * cb).max(offset);
             let to = ((k as u64 + 1) * cb).min(end);
             let at = g.cluster_sector(c) * SECTOR as u64 + (from - k as u64 * cb);
@@ -259,7 +288,13 @@ impl<'a, R: BlockReader> Fat<'a, R> {
             }
             k < last
         })?;
-        err.map_or(Ok((end - offset) as usize), Err)
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if reached != Some(last) {
+            return Err(FsError::Corrupt);
+        }
+        Ok((end - offset) as usize)
     }
 
     /// **Read the whole file at `path`** into `out`; `TooLarge` if it does not fit.
@@ -284,14 +319,16 @@ impl<'a, R: BlockReader> Fat<'a, R> {
     /// **List directory `id` from `cursor`**, each file and directory into `emit` until it answers
     /// `false`. The cursor to resume from — one past the slot to begin at, so `0` is both the start
     /// and the end — or `0` when the directory is done. A file whose long name is too long for a
-    /// listing entry is passed over.
+    /// listing entry is listed by its short name.
     pub fn read_dir(&self, id: u64, cursor: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
         let g = self.geometry()?;
-        let d = Dir::from_id(g, id)?;
+        let mut cache = self.cache.borrow_mut();
+        let d = self.live_dir(g, &mut cache, id)?;
         let from = cursor.saturating_sub(1).min(u32::MAX as u64) as u32;
-        let resume = dir::entries(self.r, g, &mut self.cache.borrow_mut(), d, from, |f| {
+        let resume = dir::entries(self.r, g, &mut cache, d, from, |f| {
             let mut name = [0u8; 255];
-            // TODO(fat-long-utf8-names): a long name over 255 bytes of UTF-8 is left out.
+            // TODO(fat-long-utf8-names): a long name over 255 bytes of UTF-8 is listed by its
+            // short name, which a lookup answers to as surely as the long one.
             let Some(n) = f.name(&mut name) else {
                 return true;
             };
@@ -482,8 +519,10 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     }
 
     /// **Write the entries naming `name` into `d`**, its short entry made by `short` from its
-    /// short name: the directory grown first if it must be, and the FAT written before the
-    /// entries. Where its short entry is.
+    /// short name: the directory grown first if it must be, and **every FAT change made so far
+    /// written before the entries** — a grown directory's link, and a `mkdir`'s cluster, which the
+    /// entry names. This one flush is the rule for both (PR #365 review, finding 2). Where its short
+    /// entry is.
     fn insert(
         &self,
         g: &Geometry,
@@ -620,7 +659,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// and zeroes — before the entry that names it. `Exists` if the name is taken.
     pub fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
         self.change(|g, cache| {
-            let d = Dir::from_id(g, dir)?;
+            let d = self.live_dir(g, cache, dir)?;
             if self.find(g, cache, d, name)?.is_some() {
                 return Err(FsError::Exists);
             }
@@ -638,7 +677,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 let mut z = Zeroer::new(self.r);
                 z.add(at + SECTOR as u64, g.cluster_bytes() as u64 - SECTOR as u64)?;
                 z.finish()?;
-                cache.flush(self.r, g)?;
+                // Its cluster's chain goes on the disk with `insert`'s flush, before the entry.
                 self.insert(g, cache, d, name, |s| dir::short_entry(g.kind, s, ATTR_DIR, new, 0, now)).map(drop)
             };
             let out = made();
@@ -654,7 +693,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// returned for the server to forget and then release. `Unsupported` for a directory.
     pub fn unlink_at(&self, dir: u64, name: &[u8], _now: i64) -> Result<Option<u64>, FsError> {
         self.change(|g, cache| {
-            let d = Dir::from_id(g, dir)?;
+            let d = self.live_dir(g, cache, dir)?;
             let f = dir::lookup(self.r, g, cache, d, name)?;
             if f.is_dir() {
                 return Err(FsError::Unsupported);
@@ -668,7 +707,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// `NotEmpty` if it holds anything; `Unsupported` for a file.
     pub fn rmdir_at(&self, dir: u64, name: &[u8], _now: i64) -> Result<(), FsError> {
         self.change(|g, cache| {
-            let d = Dir::from_id(g, dir)?;
+            let d = self.live_dir(g, cache, dir)?;
             let f = dir::lookup(self.r, g, cache, d, name)?;
             if !f.is_dir() {
                 return Err(FsError::Unsupported);
@@ -689,7 +728,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// Stamp `name` in directory `dir` written at `now`.
     pub fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
         self.change(|g, cache| {
-            let d = Dir::from_id(g, dir)?;
+            let d = self.live_dir(g, cache, dir)?;
             let f = dir::lookup(self.r, g, cache, d, name)?;
             dir::rewrite(self.r, g, cache, d, f.slot, f.slot, |_, e| dir::stamp(e, now))
         })
@@ -733,7 +772,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Rename `old` to `new`, both in directory `dir`.** `Exists` if `new` is taken by another.
     pub fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError> {
         self.change(|g, cache| {
-            let d = Dir::from_id(g, dir)?;
+            let d = self.live_dir(g, cache, dir)?;
             self.rename(g, cache, (d, old), (d, new), false, now).map(drop)
         })
     }
@@ -923,3 +962,7 @@ mod tests;
 mod write_tests;
 #[cfg(test)]
 mod serve_tests;
+#[cfg(test)]
+mod hostile_tests;
+#[cfg(test)]
+mod crash_tests;

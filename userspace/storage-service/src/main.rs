@@ -60,7 +60,7 @@ use librsproto::namespace::{
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use, parse_mount};
 use storage_service::mounts::{self, Plan, Server, automount, explicit, in_use};
-use storage_service::probe::{Found, probe};
+use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
@@ -712,7 +712,7 @@ impl Service {
     fn read_found(&self, id: u32) -> Option<Found> {
         let &(_, node) = self.nodes.iter().find(|(d, _)| *d == id)?;
         let d = self.devices.iter().find(|d| d.record.id == id)?;
-        Some(probe(&DeviceIo::new(node, &d.record, &self.scratch)))
+        Some(probe_record(&DeviceIo::new(node, &d.record, &self.scratch), &d.record))
     }
 
     /// [`refresh`](Self::refresh) every device nothing has mounted. A mounted one is left to its
@@ -1158,7 +1158,7 @@ impl Service {
     /// **A device that arrived after the boot** (Phase 6 Part D): read as at boot, kept with its
     /// node, mounted by the boot's rules beside the mounts there are, and said.
     fn arrived(&mut self, record: DeviceRecord, node: u64) {
-        let found = probe(&DeviceIo::new(node, &record, &self.scratch));
+        let found = probe_record(&DeviceIo::new(node, &record, &self.scratch), &record);
         let d = Device { found, record };
         self.devices.push(d.clone());
         self.nodes.push((record.id, node));
@@ -1325,7 +1325,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         {
             tables.push(t);
         }
-        devices.push(Device { found: probe(&io), record });
+        devices.push(Device { found: probe_record(&io, &record), record });
         nodes.push((record.id, node));
     }
     let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();

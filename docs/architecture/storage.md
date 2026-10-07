@@ -113,6 +113,19 @@ stick and the disk's line came with Part D.)
 - **Nothing**, otherwise: a disk holding a partition table, a blank one, or a filesystem neither
   reader can read. An ext4 its server would refuse, a 64-bit one say, is also "nothing" today (§12).
 
+**A whole disk whose first sector carries a partition entry is never a filesystem of its own**
+(PR #365 review, finding 4): signed `0x55AA`, every entry's status `0x00` or `0x80`, one entry in
+use on the disk (`probe::probe_record`). Partitioning a stick that held a filesystem whole leaves
+that filesystem's bytes, since `sfdisk` and `parted` write the entries into sector 0 and keep the
+rest. **An ext4** keeps its superblock at byte 1024, beside the partitions the kernel publishes, and
+was mounted whole over them; such a disk now holds nothing. **A FAT**'s boot sector is sector 0
+itself, which the kernel reads as no table (`kernel/src/drivers/partitions.rs`), so no partition is
+published; mounted, the stale FAT would allocate clusters inside the partition nothing can see. It
+is reported, `not served: its first sector holds partition entries too, so this FAT may be stale`,
+and mounted by nothing. Linux reads such a sector as a partition table; this kernel keeps Phase 6
+Part D's reading, by the maintainer's call (2026-10-07): what FAT is for here is a stick formatted
+FAT32 as sold, an MBR and a partition, and nothing requires the older shapes Linux reads.
+
 ## 5. `init`'s mounts, and a live boot
 
 `init` records its mounts as bindings, and nothing names the device behind one. What does is

@@ -111,6 +111,31 @@ fn fail(msg: &[u8]) -> ! {
     exit(1)
 }
 
+/// **What a server's panic handler does: say where, and exit** (PR #365 review, finding 1). A
+/// server that spun in its handler, as both did, left every resolve forwarded to it waiting for
+/// ever, since a forwarded resolve has no deadline. One that exits closes its endpoint, so the
+/// kernel fails each of them `PeerClosed`, and its supervisor sees it go.
+pub fn panicked(info: &core::panic::PanicInfo) -> ! {
+    match info.location() {
+        Some(at) => {
+            let mut digits = [0u8; 10];
+            let mut n = at.line();
+            let mut i = digits.len();
+            loop {
+                i -= 1;
+                digits[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            say(&[b"fs-server: panicked at ", at.file().as_bytes(), b":", &digits[i..], b"; exiting\n"]);
+        }
+        None => say(&[b"fs-server: panicked; exiting\n"]),
+    }
+    exit(1)
+}
+
 /// **Print one line made of `parts`**, in one `kprint`, so another process's output cannot land
 /// in the middle of it. What does not fit 192 bytes is cut.
 fn say(parts: &[&[u8]]) {

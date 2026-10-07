@@ -103,6 +103,15 @@ pub struct BlockRun {
     pub flags: u32,
 }
 
+/// **Why [`FileObject::cache_in`] refused a block-file reply.**
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CacheInError {
+    /// Nothing could be allocated.
+    OutOfMemory,
+    /// The reply's block size is not the one the cached object for its file was made with.
+    BlockSizeChanged,
+}
+
 /// Fill state of a cached page.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PageState {
@@ -364,6 +373,14 @@ impl FileObject {
         self.size().div_ceil(PAGE_SIZE)
     }
 
+    /// The unit of its runs, for a Model A file: the block size its server replied.
+    fn block_size(&self) -> Option<u32> {
+        match &self.producer {
+            Producer::FsServerBlocks { block_size, .. } => Some(*block_size),
+            _ => None,
+        }
+    }
+
     /// The id this object is cached under in its registration, if it is cached.
     pub fn file_id(&self) -> Option<u64> {
         match &self.producer {
@@ -487,9 +504,13 @@ impl FileObject {
     /// candidate is entered in the cache and returned. Either way, every resolve of one file
     /// gets one object.
     ///
-    /// The candidate drops outside the cache's lock, since its `Drop` takes that lock. `Err`
-    /// only on allocation failure, with nothing entered and nothing resized.
-    pub fn cache_in(reg: &ObjectRef, candidate: ObjectRef) -> Result<ObjectRef, AllocError> {
+    /// The candidate drops outside the cache's lock, since its `Drop` takes that lock. `Err` on
+    /// allocation failure, with nothing entered and nothing resized; and **for a reply whose block
+    /// size is not the cached object's** (PR #365 review, finding 3), with nothing resized. Its runs
+    /// were checked against its own block size, and the object keeps the one it was made with — a
+    /// producer's is fixed — so they would be used against a size nothing checked them for. A file
+    /// changes block size only if its server does something no filesystem does.
+    pub fn cache_in(reg: &ObjectRef, candidate: ObjectRef) -> Result<ObjectRef, CacheInError> {
         debug_assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
         debug_assert_eq!(candidate.object_type(), KObjectType::FileObject);
         // SAFETY: both references pin live objects of the asserted types (header at offset 0).
@@ -500,17 +521,21 @@ impl FileObject {
             )
         };
         let id = cand.file_id().expect("a cached object has an id");
-        match r.cache_get_or_insert(id, &candidate)? {
+        match r.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
             None => Ok(candidate),
             Some(existing) => {
                 // SAFETY: `existing` pins a live `FileObject`.
                 let ex = unsafe { &*(existing.as_ptr() as *const FileObject) };
+                if ex.block_size() != cand.block_size() {
+                    drop(candidate);
+                    return Err(CacheInError::BlockSizeChanged);
+                }
                 // **Its own statement**: a guard made inside `resize`'s argument list lives to the
                 // end of the call, and `resize` takes the other object's lock — two page-cache
                 // locks nested, which the rank checker refuses (a boot caught it; a host test
                 // cannot, since the checker is inert under `cfg(test)`).
                 let runs = core::mem::replace(&mut cand.inner.lock().runs, KVec::new());
-                ex.resize(cand.size(), runs)?;
+                ex.resize(cand.size(), runs).map_err(|_| CacheInError::OutOfMemory)?;
                 drop(candidate);
                 Ok(existing)
             }
@@ -1427,10 +1452,15 @@ mod tests {
     /// What a block-file reply builds for file `id` of `reg`, `size` bytes over a device the
     /// test never reads (these tests drive the cache, not the fill). `id` `0` is uncached.
     fn candidate(reg: &ObjectRef, id: u64, size: usize) -> ObjectRef {
+        candidate_in(reg, id, size, 4096)
+    }
+
+    /// [`candidate`] in blocks of `block_size`.
+    fn candidate_in(reg: &ObjectRef, id: u64, size: usize, block_size: u32) -> ObjectRef {
         let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let device = unsafe { ObjectRef::from_raw(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode) };
-        let f = FileObject::try_new(size, Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: id })
+        let f = FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
             .unwrap();
         // SAFETY: as above.
         unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
@@ -1449,6 +1479,23 @@ mod tests {
         }
         f.mark_ready(index);
         frame
+    }
+
+    /// **A reply that changes a cached file's block size is refused**, the cached object as it was
+    /// (PR #365 review, finding 3). The kernel's map check reads each reply's runs against that
+    /// reply's block size; the object keeps the one it was made with, so taking the second reply's
+    /// runs would use them against a size nothing checked them for. The same size is taken as ever.
+    #[test]
+    fn a_reply_changing_a_cached_files_block_size_is_refused() {
+        init_global_heap();
+        let reg = registration();
+        let first = FileObject::cache_in(&reg, candidate_in(&reg, 7, 2 * PAGE_SIZE, 4096)).unwrap();
+        let changed = FileObject::cache_in(&reg, candidate_in(&reg, 7, PAGE_SIZE, 512));
+        assert_eq!(changed.err(), Some(CacheInError::BlockSizeChanged));
+        assert_eq!(file_of(&first).size(), 2 * PAGE_SIZE, "nothing resized");
+        let same = FileObject::cache_in(&reg, candidate_in(&reg, 7, PAGE_SIZE, 4096)).unwrap();
+        assert_eq!(same.as_ptr(), first.as_ptr());
+        assert_eq!(file_of(&first).size(), PAGE_SIZE, "a reply in its own block size resizes it");
     }
 
     #[test]

@@ -166,14 +166,17 @@ impl Lfn {
     }
 
     /// Take one long-name entry. Anything out of order, or with a different checksum, abandons
-    /// what was assembled: such a name is stale, and the short entry stands alone.
+    /// what was assembled: such a name is stale, and the short entry stands alone. **An ordinal
+    /// outside `1..=20` is never a part**, with the last-part flag or without: once a name is
+    /// whole the part expected next is `0`, and an entry of ordinal `0` matched it and was
+    /// placed at part `0 - 1` (PR #365 review, finding 1).
     fn feed(&mut self, slot: u32, e: &[u8; 32]) {
         let ord = e[0] & 0x1F;
+        if ord == 0 || ord > 20 {
+            self.active = false;
+            return;
+        }
         if e[0] & 0x40 != 0 {
-            if ord == 0 || ord > 20 {
-                self.active = false;
-                return;
-            }
             *self = Lfn::new();
             self.active = true;
             self.expect = ord;
@@ -234,6 +237,10 @@ pub struct Found {
     long_len: Option<usize>,
     /// Whether it has a long name at all, fitting or not.
     has_long: bool,
+    /// **Its long name as stored**, in UTF-16 units, which a lookup compares against: a name too
+    /// long for 255 bytes of UTF-8 has no [`Found::long`] to compare (PR #365 review, finding 6).
+    units: [u16; names::MAX_UNITS],
+    units_len: usize,
 }
 
 impl Found {
@@ -243,11 +250,12 @@ impl Found {
     }
 
     /// **Its name as the system shows it**: its long name, or its short one shown, into `out`. Its
-    /// length, or `None` for a long name too long for 255 bytes of UTF-8 — such a file is not
-    /// listed.
+    /// length. **A long name too long for 255 bytes of UTF-8 is shown by its short name**, which
+    /// every entry has and [`Found::is_named`] answers to — so the file is listed, reached and
+    /// removable, where it used to be left out of the listing altogether (PR #365 review, finding
+    /// 6). `None` is not answered today; it stays in the signature for a name that cannot be shown.
     pub fn name(&self, out: &mut [u8; 255]) -> Option<usize> {
-        if self.has_long {
-            let n = self.long_len?;
+        if let (true, Some(n)) = (self.has_long, self.long_len) {
             out[..n].copy_from_slice(&self.long[..n]);
             return Some(n);
         }
@@ -257,10 +265,13 @@ impl Found {
         Some(n)
     }
 
-    /// **Whether `name` names it**: its long name, or its short one, without ASCII case.
+    /// **Whether `name` names it**: its long name, or its short one, without ASCII case. The long
+    /// name is compared in UTF-16, as it is stored.
     pub fn is_named(&self, name: &[u8]) -> bool {
-        if let Some(n) = self.long_len
-            && names::eq_fold(&self.long[..n], name)
+        let mut asked = [0u16; names::MAX_UNITS];
+        if self.has_long
+            && let Some(n) = names::to_utf16(name, &mut asked)
+            && names::units_eq_fold(&self.units[..self.units_len], &asked[..n])
         {
             return true;
         }
@@ -290,11 +301,15 @@ fn found(kind: Kind, dir: Dir, slot: u32, e: &[u8; 32], long: Option<(&[u16], u3
         long: [0; 255],
         long_len: None,
         has_long: false,
+        units: [0; names::MAX_UNITS],
+        units_len: 0,
     };
     if let Some((units, start)) = long {
         f.has_long = true;
         f.first_slot = start;
         f.long_len = names::from_utf16(units, &mut f.long);
+        f.units_len = units.len().min(names::MAX_UNITS);
+        f.units[..f.units_len].copy_from_slice(&units[..f.units_len]);
     }
     f
 }

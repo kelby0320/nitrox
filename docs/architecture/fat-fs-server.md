@@ -1,6 +1,7 @@
 # fs-server-fat
 
-**Status: built — Phase 6 Part E, 2026-10-06; last checked 2026-10-06.** `userspace/fs-server-fat`
+**Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; last checked
+2026-10-07.** `userspace/fs-server-fat`
 serves FAT12, FAT16 and FAT32 read-write, with long names, over `libfsserver`'s protocol. The
 storage service spawns it for a FAT on a removable disk, and for any FAT an administrator mounts
 ([`storage.md`](storage.md) §6). Its host tests build images with `mformat` and `mkfs.fat`, and
@@ -39,7 +40,12 @@ one on the stack.
   which `mkfs.fat` writes, with a warning, below about 257 MiB.
 - **Every field is checked before it is used**: a malformed one is refused with what made no
   sense, and a chain or entry naming a cluster outside the volume reads as `Corrupt`. A FAT is
-  anyone's bytes.
+  anyone's bytes. **A host test holds it as a class**: garbage over the boot sector, the FAT, the
+  root and the first clusters, and real entries' fields made random or turned into long-name parts,
+  then every operation, on all three kinds — which found a long-name part of ordinal 0 underflowing
+  (PR #365 review). **A server that panics anyway exits**, saying where: a forwarded resolve has no
+  deadline, and one waiting on a server spinning in its handler waited for ever, where an exit
+  closes the endpoint and the kernel fails it `PeerClosed`.
 - **Clusters of at least a page** — the server's rule, not the library's, which works at any
   size, so its tests run on small images (§3).
 - **The volume's last sector reads**, so it is not larger than its device.
@@ -86,15 +92,21 @@ to lose.
 - **A name a FAT cannot hold is refused**, `InvalidArgument`: empty, `.` or `..`, a control
   character or any of `"*/:<>?\|`, longer than 255 units, or ending in a space or a dot, which
   other systems strip.
-- **A name over 255 bytes of UTF-8 is not listed**: a listing entry's `name_len` carries 255, and a
-  long name of 255 units can take 765 bytes.
+- **A name over 255 bytes of UTF-8 is listed by its short name**, since a listing entry's
+  `name_len` carries 255 and a long name of 255 units can take 765 bytes. **A lookup compares long
+  names in UTF-16**, as they are stored, so such a file answers to either name, and its directory
+  can be emptied and removed. It used to be left out of the listing and unreachable, and its
+  directory then refused removal as not empty (PR #365 review).
 - **`.` and `..` are not listed**, as on ext4, nor is the volume label's entry. A directory is
   `0o755`, a file `0o644`, a read-only one `0o444`.
 
 ## 5. Writing
 
 **Data, then the chain, then the entry.** A crash between them loses clusters, which a check
-reclaims, and never gives one cluster to two files:
+reclaims, and never gives one cluster to two files — the one exception a rename's, below, which
+leaves one file under two names. **A host test crashes each change after every write it makes**,
+and checks what a crash there would leave: each flush that orders the writes is one its removal
+fails (PR #365 review, finding 2):
 - **A grow** zeroes what it adds on the device first: what the file's own clusters held past its
   end, and every cluster it takes. Then it writes the new chain to the FAT, links it to the file's
   last cluster and writes that, and only then writes the entry's size and first cluster.
@@ -121,8 +133,14 @@ reclaims, and never gives one cluster to two files:
 - **A directory grows by a zeroed cluster** when it has no run of free entries long enough for a
   name: the cluster is written before it is linked. **FAT12 and FAT16's fixed root does not grow**,
   and is `TooLarge` full, as is any directory at the specification's 65,536 entries.
-- **`mkdir`** writes its cluster — `.`, `..` and zeroes — before the entry that names it.
-  **`rmdir`** takes an empty directory; a file is `Unsupported`, as is a directory to `unlink`.
+- **`mkdir`** writes its cluster — `.`, `..` and zeroes — before the entry that names it. **One
+  flush is the rule for every entry written**: the FAT's changes go to the disk before any entry,
+  which covers a grown directory's link and a new directory's cluster alike. **`rmdir`** takes an
+  empty directory; a file is `Unsupported`, as is a directory to `unlink`.
+- **A directory removed is no directory to a session still holding it** (PR #365 review): a
+  session names its directory by id, its first cluster, which the removal frees and a grow may
+  take. Every operation by id first checks that cluster is still allocated and still begins with a
+  `.` naming it, and refuses `NotFound` otherwise.
 - **A rename** writes the new name first — new entries, or a replaced file's entry pointed at the
   source — then deletes the old one, so a crash leaves the file under both names rather than
   neither. A directory moved to another parent has its `..` repointed: `0` for the root,
@@ -161,7 +179,10 @@ too, rather than answered as if it could have been made.
   followed by `fsck.fat -n`**, which must find the image clean, and mtools reading back what was
   written: long and Unicode names, unique short names, a grow reading zeroes over a deleted file's
   clusters, a full volume and a full fixed root, a directory moved, the dirty bit both ways, a
-  1 MiB grow's writes counted, and a read-only mount refusing everything. And through
+  1 MiB grow's writes counted, and a read-only mount refusing everything. **Each change crashed
+  after every write** and the image checked as the crash would leave it (§5); **garbage in every
+  structure** met with an error, never a panic (§2); a change bigger than the FAT cache, which
+  evicts dirty sectors; and a removed directory refused to a session. And through
   `libfsserver`'s request core: a file replied in sectors with its first cluster as its id.
 - **`test-qemu`**: the test stick's FAT16, with 512-byte clusters, is reported as not served for
   them, so the boot's mounts are as they were.

@@ -743,3 +743,65 @@ fn each_server_is_spawned_from_the_store() {
     assert_eq!(Server::Ext4.path(), b"/bin/fs-server-ext4");
     assert_eq!(Server::Fat.path(), b"/bin/fs-server-fat");
 }
+
+/// Write one MBR entry into `img`'s first sector, as `sfdisk` does over whatever was there: status
+/// `0x00`, `kind`, from `first` for `count` blocks, and the signature.
+fn mbr_entry_over(img: &Image, kind: u8, first: u32, count: u32) {
+    let mut s = img.0.borrow_mut();
+    let e = &mut s[0x1BE..0x1CE];
+    e.fill(0);
+    e[4] = kind;
+    e[8..12].copy_from_slice(&first.to_le_bytes());
+    e[12..16].copy_from_slice(&count.to_le_bytes());
+    s[510] = 0x55;
+    s[511] = 0xAA;
+}
+
+/// **A whole disk whose first sector carries a partition entry is never mounted whole** (PR #365
+/// review, finding 4). A stick formatted FAT whole and then partitioned keeps its FAT's boot sector
+/// beside the entry: reported, and refused, so neither the automatic mount nor an administrator's
+/// takes it. The same bytes as a partition are a FAT like any other. An ext4 made whole and then
+/// partitioned keeps its superblock at 1024: that disk holds nothing, its partitions being what
+/// holds filesystems.
+#[test]
+fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
+    use crate::probe::{STALE_FAT, probe_record};
+    let blocks = 131_072u64;
+    let stale = mkfs_fat(64 * 1024, &["-F", "32", "-s", "8", "-n", "OLDFAT"]);
+    mbr_entry_over(&stale, 0x83, 2048, (blocks - 2048) as u32);
+    let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", blocks));
+    let found = probe_record(&stale, &disk);
+    assert_eq!(found, Found::Fat { label: String::from("OLDFAT"), clean: Some(true), refused: Some(String::from(STALE_FAT)) });
+    let ds = std::vec![Device { record: disk, found }];
+    assert_eq!(automount(&ds, &[], false, true), [], "not mounted by itself");
+    assert_eq!(explicit(&ds, &[], &[], true, true, "blk-3", ""), Err(Refusal::NothingToServe), "nor as asked");
+    let part = rec(21, DeviceKind::Partition, 4, 20, "partition 1", blocks);
+    assert_eq!(probe_record(&stale, &part).server(), Some(Server::Fat), "a partition's own sector 0 is its own");
+
+    let whole = ext4(b"whole");
+    mbr_entry_over(&whole, 0x83, 2048, 2048);
+    assert!(matches!(probe(&whole), Found::Ext4 { .. }), "the superblock is still there");
+    let disk = rec(30, DeviceKind::Disk, 5, 1, "a disk", 4096 * 8);
+    assert_eq!(probe_record(&whole, &disk), Found::Nothing);
+}
+
+/// **A FAT made whole on a stick is still served**: `mkfs.fat` leaves zeros where a table's
+/// entries would be, and Windows' boot code puts text there, whose bytes are no entry's status.
+#[test]
+fn a_fat_made_on_a_whole_stick_is_still_served() {
+    use crate::probe::probe_record;
+    let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", 4096));
+    let zeros = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "WHOLE"]);
+    assert_eq!(probe_record(&zeros, &disk).server(), Some(Server::Fat));
+    let text = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "WINDOWS"]);
+    let mut code = [0u8; 0x1FE - 0x1AC];
+    let words = b"Remove disks or other media.\xFF\r\nDisk error\xFF\r\nPress any key to restart\r\n";
+    code[..words.len()].copy_from_slice(words);
+    text.0.borrow_mut()[0x1AC..0x1FE].copy_from_slice(&code);
+    assert_eq!(probe_record(&text, &disk).server(), Some(Server::Fat));
+    // Boot code that happens to hold an entry fitting the disk, but with a status no MBR has.
+    let lucky = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "LUCKY"]);
+    mbr_entry_over(&lucky, 0x0C, 8, 64);
+    lucky.0.borrow_mut()[0x1BE] = 0x33;
+    assert_eq!(probe_record(&lucky, &disk).server(), Some(Server::Fat), "status 0x33 is no entry's");
+}

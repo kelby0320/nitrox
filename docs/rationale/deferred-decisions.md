@@ -1613,9 +1613,11 @@ that is refused for it.
 
 **A FAT long name over 255 bytes of UTF-8 — `TODO(fat-long-utf8-names)`.** A long name is up to 255
 UTF-16 units, which can take 765 bytes of UTF-8, and a listing entry's `name_len` carries 255. Such
-a file is left out of a listing, and still reached by its name (Phase 6 Part E). **Trigger**: a
-stick with such a name on it — 86 CJK characters is enough — or a wider listing entry for another
-reason.
+a file is **listed by its short name**, and reached by either: a lookup compares long names in
+UTF-16, as they are stored (PR #365 review; until then it was left out of the listing, could not be
+reached, and its directory could not be removed). What is deferred is listing it by its long name.
+**Trigger**: a stick with such a name on it — 86 CJK characters is enough — or a wider listing
+entry for another reason.
 
 **`File::Touch` on FAT finds a file through a table — `TODO(fat-touch-table)`.** FAT has no table
 from a first cluster to its directory entry, so `fs-server-fat` keeps one: 256 entries, filled as
