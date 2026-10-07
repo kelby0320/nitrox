@@ -655,6 +655,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             };
             app.show_chooser(&dir, rows);
+            // **And a receipt when an open chooser moves** — Up, or a directory row — which said
+            // nothing until Phase 6 Part F's gate walked one to a stick: the first listing is
+            // announced below with the window it opens, and a move opens no window.
+            if chooser.is_some()
+                && let Some(c) = app.chooser()
+            {
+                libkern::debug::Line::new()
+                    .s(b"nxedit: the chooser moved to ")
+                    .untrusted(c.dir.as_bytes())
+                    .s(b" - ")
+                    .u(c.entries.len() as u64)
+                    .s(b" entries")
+                    .end();
+            }
         }
         match (app.chooser().is_some(), chooser.is_some()) {
             (true, false) => {

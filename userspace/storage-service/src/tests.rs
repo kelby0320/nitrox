@@ -897,8 +897,12 @@ fn a_session_opens_a_media_session_and_a_watch() {
 #[test]
 fn the_watches_keep_the_living_and_free_the_gone() {
     use crate::watch::{MAX_WATCHES, Sent, Watches};
+    // **Thirty-two, written down**, not `MAX_WATCHES`: a Files per Places pick and per launch each
+    // hold one for their lives (PR #366 review), so a bound of four — the wait set's — is the
+    // regression this guards.
+    assert_eq!(MAX_WATCHES, 32);
     let mut w = Watches::new();
-    for e in 0..MAX_WATCHES as u64 {
+    for e in 0..32 {
         assert_eq!(w.add(e, |_| panic!("not full yet: nobody is pinged")), Ok(std::vec![]));
     }
     let gone = |e: u64| if e % 10 == 3 { Sent::Gone } else if e % 2 == 0 { Sent::Full } else { Sent::Queued };

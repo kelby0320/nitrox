@@ -1529,7 +1529,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         report(d, &mounts, &s.devices);
     }
     if live {
-        kprint(b"storage-service: a live boot: the root is on a RAM disk, so the machine's disks mount read-only\n");
+        kprint(b"storage-service: a live boot: the root is on a RAM disk, so internal disks mount read-only\n");
     } else {
         kprint(b"storage-service: not a live boot\n");
     }

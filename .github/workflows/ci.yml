@@ -314,6 +314,15 @@ jobs:
       - name: cargo xtask check-storage --kvm
         run: cargo xtask check-storage --kvm
 
+      # **Removable media on the desktop a person uses** (Phase 6 Part F): the release live image
+      # as the boot stick beside a copy of the release disk, logged in at the graphical greeter.
+      # Files lists the internal disk in Drives with no eject button; a FAT stick plugged in over
+      # QMP appears there, read off the screen with nothing typed after the plug; the editor saves
+      # onto it through Save As; Files' eject button ejects it with no password; and with the
+      # machine stopped `fsck.fat -n` finds it clean and `mtype` reads back what was typed.
+      - name: cargo xtask check-media --kvm
+        run: cargo xtask check-media --kvm
+
       # **A shutdown, with the host holding the result** (administration Part E.4d): a copy of the
       # test disk, logged in on serial. A test program writes a pattern through a mapping and exits
       # without a sync, and the host sees the file there without it; `with power shutdown`, with no
