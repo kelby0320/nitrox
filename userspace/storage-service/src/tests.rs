@@ -481,7 +481,8 @@ fn a_boot_that_cannot_place_inits_mounts_mounts_nothing() {
     assert_eq!(automount(&devices(), &[], true, false), [], "a live boot neither");
 }
 
-/// **A live boot mounts read-only.**
+/// **A live boot mounts read-only** — every disk this fixture has being internal; a stick is
+/// writable there (Phase 6 Part F, `a_stick_mounts_writable_on_any_boot_…`).
 #[test]
 fn a_live_boot_mounts_read_only() {
     let plan = automount(&devices(), &[], true, true);
@@ -848,9 +849,10 @@ fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
     }
     let names: Vec<&str> = mounted.iter().filter_map(|m| m.at.strip_prefix("/storage/")).collect();
     assert_eq!(names, ["nitrox-live", "DATA", "DATA-2", "blk-8"], "the names the table's `mounted` column holds");
-    assert_eq!(eject(&ds, &mounted, "DATA"), Ok(21));
-    assert_eq!(eject(&ds, &mounted, "DATA-2"), Ok(30), "the second stick's own name, not its label");
-    assert_eq!(eject(&ds, &mounted, "blk-8"), Ok(40), "a stick with no label");
+    let names = |n: &[&str]| -> Result<Vec<String>, EjectRefusal> { Ok(n.iter().map(|s| String::from(*s)).collect()) };
+    assert_eq!(eject(&ds, &mounted, "DATA"), names(&["DATA"]));
+    assert_eq!(eject(&ds, &mounted, "DATA-2"), names(&["DATA-2"]), "the second stick's own name, not its label");
+    assert_eq!(eject(&ds, &mounted, "blk-8"), names(&["blk-8"]), "a stick with no label");
     assert_eq!(eject(&ds, &mounted, "nitrox-live"), Err(EjectRefusal::NotRemovable), "a RAM disk's partition");
     assert_eq!(eject(&ds, &mounted, "/"), Err(EjectRefusal::NotMounted), "init's root is not under /storage");
     assert_eq!(eject(&ds, &mounted, "NXFAT"), Err(EjectRefusal::NotMounted));
@@ -858,6 +860,30 @@ fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
     assert_eq!(eject(&ds, &by_init, "DATA"), Err(EjectRefusal::NotMounted), "`init`'s, wherever it put it");
     assert_eq!(EjectRefusal::NotRemovable.kerror(), libkern::KError::NoAccess);
     assert!(core::str::from_utf8(EjectRefusal::NotRemovable.why()).unwrap().contains("with admin disk --unmount"));
+}
+
+/// **An eject takes the whole stick** (PR #367 review, blocking): a stick with two partitions has
+/// both mounted, and ejecting either names both, in the order they were mounted — so neither is
+/// left mounted, its unwritten files lost, when the stick the reply says can be pulled is pulled.
+/// Another stick's mount is not among them; a stick holding a filesystem whole is its own drive.
+#[test]
+fn an_eject_takes_every_mount_on_the_stick() {
+    let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
+    let mut ds = with_a_stick(fat("ONE"));
+    let second = rec(22, DeviceKind::Partition, 7, 20, "partition 2 (unlabelled)", 4_096);
+    ds.push(Device { record: second, found: fat("TWO") });
+    ds.push(Device { record: on_usb(rec(30, DeviceKind::Disk, 8, 29, "another stick", 65_536)), found: fat("OTHER") });
+    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
+    let mut mounted: Vec<Mounted> = init.to_vec();
+    for p in automount(&ds, &init, true, true) {
+        mounted.push(Mounted { device: p.device, at: at(&p.label), by: By::Storage, mode: p.mode });
+    }
+    let both = Ok(std::vec![String::from("ONE"), String::from("TWO")]);
+    assert_eq!(eject(&ds, &mounted, "ONE"), both);
+    assert_eq!(eject(&ds, &mounted, "TWO"), both, "either partition names the stick");
+    assert_eq!(eject(&ds, &mounted, "OTHER"), Ok(std::vec![String::from("OTHER")]));
+    let without_one: Vec<Mounted> = mounted.iter().filter(|m| m.at != at("ONE")).cloned().collect();
+    assert_eq!(eject(&ds, &without_one, "TWO"), Ok(std::vec![String::from("TWO")]), "what is left of it");
 }
 
 /// **The table says what is removable**: a stick and its partition, not the internal disk's.

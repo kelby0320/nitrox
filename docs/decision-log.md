@@ -34662,3 +34662,40 @@ internal mount fails it at `nitrox-root`'s refusal; the held check skipped for a
 fails it at `test-pattern --eject-held`; no ping on a change fails `boot-probe` at the unmount's;
 Files not waiting on its watch fails `check-media` at the plug, the row never drawn; the watch
 bounded at four fails the watch-list host test; an eject button on every drive fails Files'.
+
+## 2026-10-07 — PR #367, reviewed: an eject takes the whole stick
+
+One blocking finding, two worth fixing and three optional, all taken. Each was checked against the
+code first; the blocking one with the reviewer's own scenario as a host test, which failed.
+
+1. **An eject said the stick could be pulled while another partition of it was still mounted.**
+   `Eject` unmounted the one filesystem named, and the service, Files and `disk` all said the
+   stick could be removed. On a stick with two servable partitions, pulling it then left the other
+   mounted writable: its unwritten files lost, its filesystem marked in use. **`Eject` now takes
+   the drive**: every filesystem the service mounted on the same disk, or none. Each is written
+   back and asked whether a file is held before any is unmounted, so a file held on one partition
+   refuses the eject with both still mounted; then each runs the chain. The reply names everything
+   unmounted, a name per line (`librsproto::storage::ejected_names`), and Files and `disk` say so.
+   This is what desktop systems mean by eject: a stick is pulled whole, and an eject per
+   filesystem would have needed every message rewritten to say "this filesystem" while the person
+   holding the stick still could not pull it. `check-storage`'s MBR stick has two partitions now:
+   a file held on the second refuses an eject named for the first, both stay mounted, and one
+   `disk --eject` takes both, each carved clean on the host.
+2. **With no watch, a new window refreshed the cache but not the windows already open.** Files
+   now gives a changed table to every window, from whichever path read it.
+3. **Two spec sentences and three comments** still said a live boot mounts everything read-only,
+   or that `Storage` is only mounting and unmounting on an admin session. Corrected.
+
+**Optional, all taken:**
+- **Files opens its window before it asks the storage service anything**, so a service busy in an
+  unmount chain cannot hold the window back. Reading the table after a ping, and an eject, still
+  wait on Files' one thread: filed as `files-storage-wait`, with the fix (the resolve and the
+  request as pending operations in its wait) and a trigger.
+- **The watch is drained only when the wait says it is ready**, into a buffer held for the run,
+  rather than with an allocation and a receive on every turn of the loop.
+- **A short window keeps a drive row under the Drives heading**: the places give way and scroll.
+
+Controls: the eject naming only its own mount fails the library's test; Files keeping only the name
+asked for fails its test; the codec not splitting fails its test; the reserve removed fails the
+short-window test; and the all-or-nothing check removed would leave `check-storage`'s first
+partition unmounted, which the gate now asserts against.

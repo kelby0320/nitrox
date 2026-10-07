@@ -255,13 +255,14 @@ sync**. The host reads the disk mid-run and finds the file without the pattern, 
 after `with admin disk --unmount`, the unmount put there. With the machine stopped, the host carves
 the partition out: `e2fsck -fn` clean, the superblock's `s_state` clean, and the file holding the
 pattern, read with `debugfs` rather than the library that wrote it. **Since Phase 6 Part D it plugs
-sticks in over QMP** after that: the boot stick passed over; an MBR stick with one ext4 partition,
-auto-mounted **writable** (Part F), written without a sync, an eject refused while `test-pattern
---eject-held` holds a file on it, then ejected with `disk --eject` and no password, and pulled; a
+sticks in over QMP** after that: the boot stick passed over; an MBR stick with two ext4 partitions,
+each auto-mounted **writable** (Part F) and written without a sync, an eject of the first refused
+while `test-pattern --eject-held` holds a file on the second, both left mounted, then both ejected
+by one `disk --eject` with no password, and pulled; a
 whole-disk ext4 stick **pulled while mounted**, whose teardown's I/O must all come back at once —
 the kernel letting the dirty file go, the server unable to record the filesystem clean, the label
 gone and the shell still answering; and that stick again, at a new index. The host then carves the
-first's partition out by its MBR and requires it clean with the pattern, and finds the second —
+first's partitions out by its MBR and requires each clean with its pattern, and finds the second —
 copied as the pull left it — still marked in use. **Since Part E it holds `fs-server-fat`**: the
 disk copy carries a third partition, an internal FAT reported not removable and left unmounted,
 beside an ESP refused for its clusters; and a 300 MiB FAT32 stick whose data region is off a 4 KiB

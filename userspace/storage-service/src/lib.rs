@@ -206,7 +206,8 @@ pub mod sources {
     //!
     //! **A live boot is one whose root is on a RAM disk**: the root's partition belongs to one, or
     //! the root is one. That is what makes the machine's own disks the install target, so the
-    //! service auto-mounts read-only there.
+    //! service auto-mounts an internal disk read-only there (a removable one writable, since
+    //! Phase 6 Part F).
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -585,7 +586,8 @@ pub mod mounts {
         pub device: u32,
         /// Its label, unique among the plan's.
         pub label: String,
-        /// `ro` on a live boot, `rw` otherwise.
+        /// `ro` for an internal disk on a live boot, `rw` otherwise (Phase 6 Part F; every mount of
+        /// a live boot was `ro` until then).
         pub mode: Mode,
         /// The server for what it holds.
         pub server: Server,
@@ -788,13 +790,18 @@ pub mod mounts {
         }
     }
 
-    /// **A session's eject of the mount named `name`**: the device to unmount, if the service
-    /// mounted something under `/storage/<name>` on a removable disk. **The name is the mount's**,
-    /// what [`at`] made of a [`Plan`]'s label — the table's `mounted` column — never the
-    /// filesystem's own label, which two sticks can share and a stick can lack. An internal disk's
-    /// mount is the `storage` grant's to unmount, as it always was; `init`'s mounts are not under
-    /// `/storage` at all.
-    pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<u32, EjectRefusal> {
+    /// **A session's eject of the drive holding the mount named `name`**: the names of every mount
+    /// this service made on that disk, in the order they were made — `name` among them — if
+    /// something is mounted under `/storage/<name>` on a removable disk.
+    ///
+    /// **The drive, not the one filesystem** (PR #367 review): a stick is pulled whole, so an
+    /// eject that unmounted one partition and said the stick could be pulled left its other
+    /// partitions mounted, their unwritten files lost and their filesystems marked in use — the
+    /// outcome an eject exists to prevent. **The name is the mount's**, what [`at`] made of a
+    /// [`Plan`]'s label — the table's `mounted` column — never the filesystem's own label, which
+    /// two sticks can share and a stick can lack. An internal disk's mount is the `storage`
+    /// grant's to unmount, as it always was; `init`'s mounts are not this service's.
+    pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<Vec<String>, EjectRefusal> {
         use crate::table::By;
         let want = at(name);
         let m = mounted.iter().find(|m| m.by == By::Storage && m.at == want).ok_or(EjectRefusal::NotMounted)?;
@@ -802,7 +809,15 @@ pub mod mounts {
         if !removable(d, devices) {
             return Err(EjectRefusal::NotRemovable);
         }
-        Ok(m.device)
+        // The disk: the device itself when a filesystem fills it, else the partition's parent.
+        let partition = d.record.kind() == libkern::device::DeviceKind::Partition;
+        let disk = if partition { d.record.parent } else { d.record.id };
+        let on_disk = |id: u32| devices.iter().any(|x| x.record.id == id && (id == disk || x.record.parent == disk));
+        Ok(mounted
+            .iter()
+            .filter(|m| m.by == By::Storage && on_disk(m.device))
+            .filter_map(|m| m.at.strip_prefix("/storage/").map(String::from))
+            .collect())
     }
 
     /// **Whether `d` is on a removable disk** (Phase 6 Part E.5): a disk behind USB mass storage

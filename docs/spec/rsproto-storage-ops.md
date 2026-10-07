@@ -65,8 +65,8 @@ echoing its `request_id`. A refusal is the standard
 A body whose lengths do not account for it exactly is refused with `InvalidArgument`. The reply's
 body is the label the filesystem was mounted under, and it appears at `/svc/storage/fs/<label>`.
 
-**Always writable, on a live boot too.** The automatic mount of a live boot is read-only because
-nobody chose it; an administrator's mount is a choice.
+**Always writable, on a live boot too.** The automatic mount of an internal disk on a live boot is
+read-only because nobody chose it; an administrator's mount is a choice.
 
 | Refusal | When |
 |---|---|
@@ -124,20 +124,26 @@ answered.
 
 ### `Eject` (`0x1003`)
 
-**Unmount a removable disk's filesystem, for a session** (Phase 6 Part F). Sent on a media session.
-Body: **the name the filesystem is mounted under**, `<name>` of `/storage/<name>` — the tables'
-`mounted` column, never their `label`, which two sticks can share and one can lack. Reply body:
-empty, sent once the stick can be pulled.
+**Unmount a removable disk, for a session** (Phase 6 Part F). Sent on a media session. Body: **the
+name a filesystem on it is mounted under**, `<name>` of `/storage/<name>` — the tables' `mounted`
+column, never their `label`, which two sticks can share and one can lack. Reply body: **the names
+of every filesystem it unmounted**, one per line, sent once the stick can be pulled.
 
-It is `Unmount`'s chain, held check included, on a mount the service made of a **removable** disk
-— one behind USB mass storage, or a partition of one ([`storage.md`](../architecture/storage.md)
-§6). Eject sends nothing further to the device: the chain's flush is what a stick needs.
+**The drive goes whole** (PR #367 review). A stick is pulled whole, so every filesystem the service
+mounted on the same disk — the named one's partition siblings, or the one filesystem that fills it
+— goes, or none does. Each is written back and asked whether a file is held **before any is
+unmounted**, so a file held on one partition refuses the eject with every partition still mounted.
+Then each runs `Unmount`'s chain; a file opened between the check and its chain refuses there,
+leaving the ones before it unmounted, and the refusal still says the stick cannot be pulled. The
+disk must be **removable** — behind USB mass storage, or a partition of one
+([`storage.md`](../architecture/storage.md) §6). Eject sends nothing further to the device: the
+chain's flush is what a stick needs.
 
 | Refusal | When |
 |---|---|
 | `NotFound` | nothing the service mounted has that name — `init`'s mounts included, wherever they are |
 | `NoAccess` | the disk is not removable: an internal disk's mount is `Unmount`'s, on an admin session (`with admin disk --unmount`) |
-| `WouldBlock` | a file on it is still open or mapped |
+| `WouldBlock` | a file on any filesystem of the stick is still open or mapped |
 | `IoError` | as for `Unmount` |
 | `Unsupported` | any other request on a media session |
 | `InvalidArgument` | the name is not UTF-8 |

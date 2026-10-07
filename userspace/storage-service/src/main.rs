@@ -242,6 +242,46 @@ fn reply_with_handle(serve_end: u64, request_id: u64, body: &[u8], handle: u64) 
     false
 }
 
+/// **Every dirty file of the mount whose namespace is `ns` written back** (`sys_ns_sync`), whether
+/// or not anything still holds it. `false` if a write-back failed.
+fn sync_mount(ns: u64) -> bool {
+    let root = b"/";
+    // SAFETY: a namespace handle this process holds, and a valid path.
+    unsafe { syscall3(SYS_NS_SYNC, ns, root.as_ptr() as u64, root.len() as u64) >= 0 }
+}
+
+/// **How many of the mount's files something still holds** (`sys_ns_held`), asked after a sync,
+/// which let go of every dirty pin a write-back could clean — so what is left is someone's, **once
+/// a finished IRP has let go of its file too**. The kernel frees finished IRPs before it counts,
+/// but one whose completion is still running on another CPU holds its file for that moment
+/// (`sys_ns_held`, `syscall-abi.md`), so a count is asked again after a short park before it is
+/// believed. A real holder is still holding a few milliseconds later. A count other than zero is
+/// said, naming `label`.
+fn held_files(label: &str, ns: u64) -> i64 {
+    let root = b"/";
+    let mut held = 0;
+    for attempt in 0..HELD_ASKS {
+        if attempt > 0 {
+            park(HELD_PARK_NS);
+        }
+        // SAFETY: a namespace handle this process holds, and a valid path.
+        held = unsafe { syscall3(SYS_NS_HELD, ns, root.as_ptr() as u64, root.len() as u64) };
+        if held == 0 {
+            break;
+        }
+    }
+    if held != 0 {
+        Line::new()
+            .s(b"storage-service: ")
+            .untrusted(label.as_bytes())
+            .s(b" is in use: ")
+            .i(held as i64)
+            .s(b" file(s) still open or mapped")
+            .end();
+    }
+    held
+}
+
 /// Make a channel pair of `depth`. `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     let (mut a, mut b) = (0u64, 0u64);
@@ -927,16 +967,34 @@ impl Service {
         let Ok(name) = core::str::from_utf8(&m.body) else {
             return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
         };
-        if let Err(r) = storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
-            return refuse(r.kerror(), r.why());
-        }
-        match self.unmount(name, true) {
-            Ok(()) => {
-                Line::new().s(b"storage-service: ejected ").untrusted(name.as_bytes()).s(b", safe to remove").end();
-                let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &[], &[]);
+        let names = match storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
+            Ok(names) => names,
+            Err(r) => return refuse(r.kerror(), r.why()),
+        };
+        // **The whole stick or none of it** (PR #367 review): every mount on it is written back and
+        // asked whether a file is held before any is unmounted, so a held file on one partition
+        // leaves the others mounted too rather than half a stick ejected.
+        for n in &names {
+            let Some(ns) = self.mounted.iter().find(|x| &x.label == n).map(|x| x.ns) else { continue };
+            if !sync_mount(ns) {
+                return refuse(KError::IoError, b"its files could not all be written back");
             }
-            Err((err, why)) => refuse(err, why),
+            if held_files(n, ns) != 0 {
+                return refuse(KError::WouldBlock, b"a file on it is still open or mapped");
+            }
         }
+        for n in &names {
+            // A file opened since the check refuses here, and what was unmounted before it stays
+            // unmounted: the refusal says the stick cannot be pulled, which is what matters.
+            if let Err((err, why)) = self.unmount(n, true) {
+                return refuse(err, why);
+            }
+        }
+        let said = names.join(", ");
+        Line::new().s(b"storage-service: ejected ").untrusted(said.as_bytes()).s(b", safe to remove").end();
+        // **The reply names what was unmounted**, a name per line: the drive's, not only the one
+        // asked about (`rsproto-storage-ops.md` § `Eject`).
+        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
     }
 
     /// A resolve on an admin endpoint: whatever its suffix, answer with an admin session. `false`
@@ -1060,40 +1118,15 @@ impl Service {
         //    thread, so nothing is answered in between anyway; taking it out says what the chain
         //    assumes.
         let x = self.mounted.remove(i);
-        let root = b"/";
         // 2. **Every dirty file written back**, whether or not anything still holds it.
-        // SAFETY: a namespace handle this process holds, and a valid path.
-        let synced = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
-        if synced < 0 {
+        if !sync_mount(x.ns) {
             self.mounted.insert(i, x);
             return Err((KError::IoError, b"its files could not all be written back"));
         }
         // 3. **Refused while a file is held**: a mapping or a handle could write after the
-        //    filesystem is marked clean. Asked after the sync, which let go of every dirty pin a
-        //    write-back could clean, so what is left is someone's — **once a finished IRP has let
-        //    go of its file too**. The kernel frees finished IRPs before it counts, but one whose
-        //    completion is still running on another CPU holds its file for that moment
-        //    (`sys_ns_held`, `syscall-abi.md`), so a count is asked again after a short park
-        //    before it is believed. A real holder is still holding a few milliseconds later.
-        let mut held = 0;
-        for attempt in 0..if held_check { HELD_ASKS } else { 0 } {
-            if attempt > 0 {
-                park(HELD_PARK_NS);
-            }
-            // SAFETY: as above.
-            held = unsafe { syscall3(SYS_NS_HELD, x.ns, root.as_ptr() as u64, root.len() as u64) };
-            if held == 0 {
-                break;
-            }
-        }
+        //    filesystem is marked clean ([`held_files`]).
+        let held = if held_check { held_files(&x.label, x.ns) } else { 0 };
         if held != 0 {
-            Line::new()
-                .s(b"storage-service: ")
-                .untrusted(x.label.as_bytes())
-                .s(b" is in use: ")
-                .i(held as i64)
-                .s(b" file(s) still open or mapped")
-                .end();
             self.mounted.insert(i, x);
             return Err((KError::WouldBlock, b"a file on it is still open or mapped"));
         }

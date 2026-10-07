@@ -104,10 +104,11 @@ fn open_watch(ns: u64) -> Option<u64> {
     Some(watch)
 }
 
-/// **Take every ping queued on the watch**: `Ok(true)` if there was one, `Err` once the service's
-/// end has gone. A ping carries nothing, so how many there were does not matter.
-fn drain_pings(watch: u64) -> Result<bool, ()> {
-    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+/// **Take every ping queued on the watch**, into `buf` — one message's room, held for the browser's
+/// run: `Ok(true)` if there was one, `Err` once the service's end has gone. A ping carries
+/// nothing, so how many there were does not matter. Called only when a wait said the watch was
+/// ready, not on every turn of the loop (PR #367 review).
+fn drain_pings(watch: u64, buf: &mut [u8]) -> Result<bool, ()> {
     let mut pinged = false;
     loop {
         let mut handles = [0u64; 8];
@@ -141,9 +142,11 @@ fn drain_pings(watch: u64) -> Result<bool, ()> {
 }
 
 /// **Eject the drive mounted as `name`**: a media session opened for the one `Eject`, and closed.
-/// `Ok` once the service says it can be pulled, or the reason it gave — or this end's, put for the
-/// person reading the strip.
-fn eject(ns: u64, name: &str) -> Result<(), String> {
+/// It waits for the service, on the browser's one thread — `TODO(files-storage-wait)`.
+/// `Ok` once the service says it can be pulled, with the names of every mount it unmounted on that
+/// stick — the drive goes whole — or the reason it gave, or this end's, put for the person reading
+/// the strip.
+fn eject(ns: u64, name: &str) -> Result<Vec<String>, String> {
     use librsproto::storage::OP_STORAGE_EJECT;
     let (st, session) = libfs::lookup_wait(ns, STORAGE_MEDIA, librsproto::session::DIR_SESSION_RIGHTS);
     if st == libkern::KError::WouldBlock.as_i32() {
@@ -169,7 +172,7 @@ fn eject(ns: u64, name: &str) -> Result<(), String> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| String::from("the storage service refused")));
     }
-    Ok(())
+    Ok(librsproto::storage::ejected_names(msg.body).map(|n| String::from_utf8_lossy(n).into_owned()).collect())
 }
 
 
@@ -434,13 +437,14 @@ fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static st
 /// One handle until the drives: a browser read a directory when it was told to and otherwise
 /// waited on the session channel alone. A watch is the second source of work — a stick plugged
 /// in is drawn with no key pressed and no pointer moved — and a browser the service refused one
-/// waits as before.
-fn wait_for(h: u64, watch: Option<u64>) {
+/// waits as before. **Whether the watch was among what woke it**: a record names each handle ready,
+/// first word.
+fn wait_for(h: u64, watch: Option<u64>) -> bool {
     let handles = [h, watch.unwrap_or(0)];
     let n = if watch.is_some() { 2 } else { 1 };
     let mut results = [0u8; 48];
     // SAFETY: a valid handle array of `n` and a result buffer sized for two records.
-    unsafe {
+    let woke = unsafe {
         libkern::syscall4(
             libkern::SYS_WAIT,
             handles.as_ptr() as u64,
@@ -449,6 +453,12 @@ fn wait_for(h: u64, watch: Option<u64>) {
             u64::MAX,
         )
     };
+    let Some(w) = watch else { return false };
+    (0..woke.clamp(0, 2) as usize).any(|i| {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&results[i * 24..i * 24 + 8]);
+        u64::from_le_bytes(word) == w
+    })
 }
 
 /// Tell the compositor what a newly created window of this browser is.
@@ -516,11 +526,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     let mut app = App::new(&home);
     navigate(&mut app, root_ns, &start);
-    // **The drives, before the first frame**, so a window opens with its sidebar whole.
-    let mut watch = open_watch(root_ns);
-    let mut drives = read_drives(root_ns).unwrap_or_default();
-    say_drives(&drives);
-    app.set_drives(drives.clone());
 
     let size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
@@ -632,6 +637,19 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         })
     }
 
+    /// **The drives as read now, given to every window** when they changed — never to one alone,
+    /// or the others go on showing what was (PR #367 review: a New Window with no watch updated
+    /// itself and the cache, so the windows already open never saw the change).
+    fn renew_drives(wins: &mut [Win], drives: &mut Vec<Drive>, now: Vec<Drive>) {
+        if now != *drives {
+            say_drives(&now);
+            for w in wins.iter_mut() {
+                w.app.set_drives(now.clone());
+            }
+            *drives = now;
+        }
+    }
+
     let mut quit_pending = false;
     // **The drives are to be read again**: a ping, an eject, or — with no watch — a focus.
     let mut refresh_drives = false;
@@ -650,6 +668,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         reported_loc,
     }];
 
+    // **The drives, once the window is up** (PR #367 review): opening the watch and reading the
+    // table each wait for the storage service, which is one thread and may be in an unmount chain
+    // for seconds, and a browser that asked first would show no window until it answered. The
+    // first frame has no Drives; the loop's first turn draws them.
+    let mut watch = open_watch(root_ns);
+    let mut drives = Vec::new();
+    if let Some(now) = read_drives(root_ns) {
+        renew_drives(&mut wins, &mut drives, now);
+    }
+    // One message's room for the watch's pings, held for the browser's run.
+    let mut ping_buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+
     loop {
         // **Every window this process owns, each serviced exactly as one used to be.**
         //
@@ -659,13 +689,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let mut redraw_now = false;
         if core::mem::take(&mut refresh_drives)
             && let Some(now) = read_drives(root_ns)
-            && now != drives
         {
-            say_drives(&now);
-            for w in wins.iter_mut() {
-                w.app.set_drives(now.clone());
-            }
-            drives = now;
+            renew_drives(&mut wins, &mut drives, now);
         }
         for wi in 0..wins.len() {
         let Win {
@@ -1049,13 +1074,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if let Some(name) = app.take_eject() {
             let answer = eject(root_ns, &name);
             let mut l = libkern::debug::Line::new();
-            l.s(b"nxfiles: ").untrusted(name.as_bytes());
+            l.s(b"nxfiles: ");
             match &answer {
-                Ok(()) => l.s(b" ejected"),
-                Err(why) => l.s(b" not ejected: ").untrusted(why.as_bytes()),
+                Ok(names) if !names.is_empty() => l.untrusted(names.join(", ").as_bytes()).s(b" ejected"),
+                Ok(_) => l.untrusted(name.as_bytes()).s(b" ejected"),
+                Err(why) => l.untrusted(name.as_bytes()).s(b" not ejected: ").untrusted(why.as_bytes()),
             };
             l.end();
-            app.ejected(&name, answer.as_ref().map(|_| ()).map_err(|why| why.as_str()));
+            app.ejected(&name, answer.as_deref().map_err(|why| why.as_str()));
             refresh_drives = true;
             redraw_now = true;
             continue;
@@ -1102,7 +1128,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             if watch.is_none()
                 && let Some(now) = read_drives(root_ns)
             {
-                drives = now;
+                renew_drives(&mut wins, &mut drives, now);
             }
             let mut fresh = App::new(&home);
             fresh.set_drives(drives.clone());
@@ -1151,14 +1177,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
 
         // ---- events ----
-        if win.events_pending() == 0 {
-            wait_for(ev, watch);
-        }
+        let watch_ready = win.events_pending() == 0 && wait_for(ev, watch);
         // **A ping, or several**: the drives are read again once, before the next frame. A watch
         // whose service end has gone is let go, and the browser reads the table as one refused a
-        // watch does.
-        if let Some(w) = watch {
-            match drain_pings(w) {
+        // watch does. A ping left queued while events were pending keeps the watch ready, so the
+        // next wait returns at once and says so.
+        if watch_ready
+            && let Some(w) = watch
+        {
+            match drain_pings(w, &mut ping_buf) {
                 Ok(pinged) => refresh_drives |= pinged,
                 Err(()) => {
                     kprint(b"nxfiles: the drives' watch closed, so they are read at focus\n");

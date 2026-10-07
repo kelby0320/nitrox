@@ -1639,6 +1639,15 @@ it serves appears nowhere but the service's log line. The table has no column fo
 **Trigger**: Part G's formatting, which is what would make such a stick usable, and which needs a
 place to be offered.
 
+**Files waiting on the storage service — `TODO(files-storage-wait)`.** Files reads the storage
+table after each watch ping, and sends an `Eject` and waits for its answer, on its one thread
+(Phase 6 Part F). The service is one thread too, and may be in an unmount chain — a flush, a
+server's answer bounded at thirty seconds — so a Files that reads or ejects meanwhile repaints
+nothing until it answers. Since PR #367's review a window opens before Files asks the service
+anything. The fix is the resolve and the request as pending operations in Files' wait, beside the
+compositor's channel and the watch. **Trigger**: an eject or a table read slow enough that a
+person sees the window stop.
+
 **Drives in the chooser and the shell's Places menu (`chooser-drives`).** The editor's Save As and
 Open reach a stick by Up to `/`, `storage`, then its name, and the shell's Places menu lists Home,
 the home folders and Root. Phase 6 Part F kept both as they were — the chooser by the maintainer's

@@ -296,12 +296,15 @@ no trash.
 
 **The file browser's sidebar has Drives below its places** (Phase 6 Part F), and this menu does
 not: every filesystem mounted under `/storage`, by the name it is mounted under, with an eject
-button (⏏) on a removable drive's row — a press sends `Eject` on a media session, and the window's
-strip says what the storage service answered ([`storage.md`](storage.md) §8a). Files follows them
-through the storage service's **watch**, waited on beside its compositor channel, so a stick plugged
-in is drawn with nothing pressed; a Files refused a watch reads the table when a window opens and
-when one takes focus. A drive that goes, ejected or pulled, takes every tab inside it home. Drives
-in this menu and in the editor's chooser are filed
+button (⏏) on a removable drive's row — a press sends `Eject` on a media session, which takes every
+filesystem on that stick, and the window's strip names what the storage service unmounted
+([`storage.md`](storage.md) §8a). Files follows them through the storage service's **watch**,
+waited on beside its compositor channel, so a stick plugged in is drawn with nothing pressed; a
+Files refused a watch reads the table when a window opens and when one takes focus, giving the
+drives to every window it has. A drive that goes, ejected or pulled, takes every tab inside it home.
+**A window opens before Files asks the storage service anything**, so a service busy in an unmount
+chain cannot hold it back; reading the table after a ping, and an eject, still wait for the service
+(`files-storage-wait`). Drives in this menu and in the editor's chooser are filed
 ([`deferred-decisions.md`](../rationale/deferred-decisions.md)).
 
 **The desktop-name prompt** (`Super+R`) is a popup of its own above the bottom bar's right-hand

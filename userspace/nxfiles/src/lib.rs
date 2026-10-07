@@ -620,9 +620,12 @@ pub struct App {
     drive_list: ListState,
     /// A drive the binary owes an `Eject` for, by the name it is mounted under.
     eject: Option<String>,
-    /// The drive last asked to eject, so that its going is said as an eject and not as a stick
+    /// The mounts an eject took — the one asked for until the service answers, then every one it
+    /// unmounted on that stick — so that their going is said as an eject and not as a stick
     /// pulled out.
-    ejecting: Option<String>,
+    ejecting: Vec<String>,
+    /// What an eject that took several mounts said, to be said again as they leave the table.
+    eject_said: Option<String>,
     /// What the strip says once the listing that a drive's going asked for arrives — which
     /// clears the notice, as every listing does.
     arrival_notice: Option<String>,
@@ -977,7 +980,8 @@ impl App {
             drives: Vec::new(),
             drive_list: ListState::default(),
             eject: None,
-            ejecting: None,
+            ejecting: Vec::new(),
+            eject_said: None,
             arrival_notice: None,
             properties: None,
             location: None,
@@ -1413,7 +1417,7 @@ impl App {
                     if let Some(d) = self.drives.iter().find(|d| d.block == n && d.removable) {
                         self.notice = Some(alloc::format!("ejecting {}\u{2026}", d.name));
                         self.eject = Some(d.name.clone());
-                        self.ejecting = Some(d.name.clone());
+                        self.ejecting = alloc::vec![d.name.clone()];
                     }
                 } else if let Some(n) = key.checked_sub(DRIVE_ROW_KEY)
                     && let Some(d) = self.drives.iter().find(|d| d.block == n)
@@ -1839,12 +1843,11 @@ impl App {
                     others += 1;
                 }
             }
-            let ejected = self.ejecting.as_deref() == Some(d.name.as_str());
-            if ejected {
-                self.ejecting = None;
-            }
+            let ejected = self.ejecting.iter().position(|n| *n == d.name).map(|i| self.ejecting.remove(i)).is_some();
             let said = match (ejected, current, others) {
-                (true, ..) => alloc::format!("{} ejected: it can be removed", d.name),
+                (true, ..) => {
+                    self.eject_said.clone().unwrap_or_else(|| alloc::format!("{} ejected: it can be removed", d.name))
+                }
                 (false, true, _) => alloc::format!("{} is gone, so this tab went home", d.name),
                 (false, false, 1) => alloc::format!("{} is gone, so a tab on it went home", d.name),
                 (false, false, n) if n > 1 => alloc::format!("{} is gone, so the tabs on it went home", d.name),
@@ -1868,15 +1871,26 @@ impl App {
         self.eject.take()
     }
 
-    /// What the storage service answered an `Eject` of `name`: `Ok`, or its reason. A drive
-    /// ejected is said so here, and again when the table no longer lists it.
-    pub fn ejected(&mut self, name: &str, answer: Result<(), &str>) {
+    /// What the storage service answered an `Eject` of `name`: the names of every mount it
+    /// unmounted on that stick — the drive goes whole — or its reason. A drive ejected is said so
+    /// here, and again when the table no longer lists it.
+    pub fn ejected(&mut self, name: &str, answer: Result<&[String], &str>) {
         match answer {
-            Ok(()) => self.notice = Some(alloc::format!("{name} ejected: it can be removed")),
-            Err(why) => {
-                if self.ejecting.as_deref() == Some(name) {
-                    self.ejecting = None;
+            Ok(names) => {
+                let said = match names {
+                    [] => alloc::format!("{name} ejected: it can be removed"),
+                    [one] => alloc::format!("{one} ejected: it can be removed"),
+                    many => alloc::format!("{} ejected: the drive can be removed", many.join(", ")),
+                };
+                if !names.is_empty() {
+                    self.ejecting = names.to_vec();
                 }
+                self.eject_said = Some(said.clone());
+                self.notice = Some(said);
+            }
+            Err(why) => {
+                self.ejecting.clear();
+                self.eject_said = None;
                 self.notice = Some(alloc::format!("{name} not ejected: {why}"));
             }
         }
@@ -2823,7 +2837,13 @@ impl App {
         let side_h = (h + HEADER_H).saturating_sub(2 * SIDEBAR_PAD);
         // **The places take the whole column until there is a drive** (Phase 6 Part F), and then
         // as many rows as they have, with the drives under a heading below them.
-        let places_h = if self.drives.is_empty() { side_h } else { (side_rows.len() as u32 * ROW_H).min(side_h) };
+        // **And never all of it**: in a short window the places give way, scrolling, so a drive row
+        // stays under its heading rather than the heading standing over nothing (PR #367 review).
+        let places_h = if self.drives.is_empty() {
+            side_h
+        } else {
+            (side_rows.len() as u32 * ROW_H).min(side_h.saturating_sub(DRIVES_HEADING_H + ROW_H))
+        };
         let places = list_view(
             &side_rows,
             // The places have a name and a dot and nothing else to line up.
@@ -5079,12 +5099,31 @@ mod tests {
         a.show("/storage/DATA", alloc::vec![]);
         a.update(Msg::Drive(DRIVE_EJECT_KEY + 5));
         let _ = a.take_eject();
-        a.ejected("DATA", Ok(()));
+        a.ejected("DATA", Ok(&[String::from("DATA")]));
         assert_eq!(a.notice.as_deref(), Some("DATA ejected: it can be removed"));
         a.set_drives(drives(&storage_table()).into_iter().filter(|d| d.name != "DATA").collect());
         assert_eq!(a.take_goto().as_deref(), Some("/home"), "the tab on it goes home");
         a.show("/home", alloc::vec![]);
         assert_eq!(a.notice.as_deref(), Some("DATA ejected: it can be removed"), "said past the listing");
+    }
+
+    /// **An eject that took a stick's two mounts says both, and says it again as they go**: the
+    /// service unmounts every filesystem on the stick (PR #367 review), so a tab on the other one
+    /// goes home as ejected, not as a stick pulled out.
+    #[test]
+    fn an_eject_that_takes_two_mounts_says_both() {
+        let mut a = with_drives();
+        a.show("/storage/DATA-2", alloc::vec![]);
+        a.update(Msg::Drive(DRIVE_EJECT_KEY + 5));
+        assert_eq!(a.take_eject().as_deref(), Some("DATA"));
+        let both = [String::from("DATA"), String::from("DATA-2")];
+        a.ejected("DATA", Ok(&both));
+        let said = "DATA, DATA-2 ejected: the drive can be removed";
+        assert_eq!(a.notice.as_deref(), Some(said));
+        a.set_drives(drives(&storage_table()).into_iter().filter(|d| !both.contains(&d.name)).collect());
+        assert_eq!(a.take_goto().as_deref(), Some("/home"), "the tab on DATA-2 goes home");
+        a.show("/home", alloc::vec![]);
+        assert_eq!(a.notice.as_deref(), Some(said), "as ejected, not as pulled");
     }
 
     /// **A drive that goes takes every tab inside it home**: the current one by a listing now, with
@@ -5129,6 +5168,28 @@ mod tests {
         a.notice = None;
         a.set_drives(alloc::vec![]);
         assert_eq!(a.notice, None);
+    }
+
+    /// **A short window still shows a drive**: the places give way and scroll, so the Drives heading
+    /// never stands over an empty list (PR #367 review: below about 305 px it did). At the window's
+    /// start size the places are whole, which is where `check-media` aims.
+    #[test]
+    fn a_short_window_still_shows_a_drive() {
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let first = |h: u32| {
+            let mut a = with_drives();
+            a.resize(Size::new(START_SIZE.w, h));
+            let size = a.window_size();
+            let e = a.view(&UiTheme::default(), None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            let row = libui::layout::locate(&e, &l, DRIVE_ROW_KEY + 3);
+            let last_place = libui::layout::locate(&e, &l, SIDEBAR_ROW_KEY + a.places().len() as u64 - 1);
+            (row, last_place)
+        };
+        for h in [240, 260, 280, 300] {
+            assert!(first(h).0.is_some(), "a {h} px window lays out no drive row");
+        }
+        assert!(first(START_SIZE.h).1.is_some(), "at the start size every place is laid out");
     }
 
     /// The drives' keys share nothing with the places', the listing's, the tabs' or the chrome's —

@@ -4,7 +4,7 @@
 //! disk --list                        # every block device, its filesystem, where it is mounted
 //! disk --mount /dev/blk/1 [LABEL]    # mount it writable at /storage/<label>
 //! disk --unmount LABEL               # unmount it, leaving the filesystem clean
-//! disk --eject NAME                  # unmount a stick from /storage/<name>, so it can be pulled
+//! disk --eject NAME                  # unmount the stick holding /storage/<name>, to pull it
 //! ```
 //!
 //! ## Two endpoints, two authorities
@@ -15,8 +15,9 @@
 //!
 //! **So does `--eject`** (Phase 6 Part F): a **media session**, `/dev/storage/media` on the same
 //! endpoint, carries `Eject` by the name a stick is mounted under — the table's `mounted` column,
-//! not its `label`. The service runs the unmount chain on a removable drive's mount alone; an
-//! internal disk's is refused, naming `--unmount`, which still needs the grant.
+//! not its `label`. The service runs the unmount chain on **every** filesystem it mounted on that
+//! removable drive, or on none, since a stick is pulled whole; an internal disk's is refused,
+//! naming `--unmount`, which still needs the grant.
 //!
 //! **`--mount` and `--unmount` need the `storage` grant.** They speak `Storage`
 //! (`rsproto-storage-ops.md`) on `/dev/storage/admin`, which the view broker binds only into a
@@ -78,8 +79,8 @@ const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LA
     \x20                   the label the storage service chooses\n\
     --unmount LABEL     write back every file, flush the drive, and unmount; refused while a\n\
     \x20                   file on it is open\n\
-    --eject NAME        the same for the removable drive at /storage/NAME, after which it can\n\
-    \x20                   be pulled out\n\
+    --eject NAME        the same for every filesystem on the removable drive holding\n\
+    \x20                   /storage/NAME, after which the drive can be pulled out\n\
     \n\
     Mounting and unmounting need the storage grant: run them with `with admin`. Ejecting a\n\
     removable drive does not.\n\
@@ -317,21 +318,33 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
 
 /// `disk --eject NAME`: a media session's `Eject`, answered once the stick can be pulled. `NAME`
 /// may be given as its path, `/storage/NAME`, as `--list` shows it.
+///
+/// **The drive goes whole**: the service unmounts every filesystem it mounted on the same stick,
+/// and answers with their names, a row each — two partitions are two rows, whichever was named.
 fn eject(stage: &Stage, name: &str) -> i64 {
     let name = name.strip_prefix("/storage/").unwrap_or(name);
-    if let Err(f) = ask(stage, MEDIA, OP_STORAGE_EJECT, name.as_bytes()) {
-        return failed(stage, "eject", name, f);
+    let reply = match ask(stage, MEDIA, OP_STORAGE_EJECT, name.as_bytes()) {
+        Ok(r) => r,
+        Err(f) => return failed(stage, "eject", name, f),
+    };
+    let mut names: Vec<String> =
+        librsproto::storage::ejected_names(&reply).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+    if names.is_empty() {
+        names.push(String::from(name));
     }
+    let said = names.join(", ");
     match stage.streams.stdout {
         Some(h) => {
             let schema = Schema::new()
                 .field("name", TypeTag::String, TypeModifiers::NONE)
                 .field("ejected", TypeTag::Bool, TypeModifiers::NONE);
-            write_table(stage, h, &schema, &[alloc::vec![Value::Str(String::from(name)), Value::Bool(true)]]);
+            let rows: Vec<Vec<Value>> =
+                names.iter().map(|n| alloc::vec![Value::Str(n.clone()), Value::Bool(true)]).collect();
+            write_table(stage, h, &schema, &rows);
         }
-        None => stage.note(format!("{name} ejected: it can be removed\n").as_bytes()),
+        None => stage.note(format!("{said} ejected: the drive can be removed\n").as_bytes()),
     }
-    Line::new().s(b"disk: ejected ").untrusted(name.as_bytes()).end();
+    Line::new().s(b"disk: ejected ").untrusted(said.as_bytes()).end();
     EXIT_OK
 }
 

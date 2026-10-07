@@ -4518,7 +4518,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     // **Two sticks to plug in** (Phase 6 Part D): an MBR one holding an ext4 partition, which is
     // ejected and read on the host, and a whole-disk ext4, which is pulled while mounted.
     let stick_mbr = work.join("stick-mbr.img");
-    mbr_ext4_stick(&stick_mbr, 32, STICK_MBR_LABEL)?;
+    mbr_ext4_stick(&stick_mbr, 48, [STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
     let stick_whole = work.join("stick-whole.img");
     whole_ext4_stick(&stick_whole, 16, STICK_WHOLE_LABEL)?;
     // **And a FAT stick** (Phase 6 Part E.6), for `fs-server-fat`.
@@ -4581,6 +4581,11 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
 
 /// The labels of `check-storage`'s two sticks (Phase 6 Part D).
 const STICK_MBR_LABEL: &str = "nxstick";
+/// The MBR stick's second partition's label (PR #367 review): an eject takes the whole stick.
+const STICK_MBR_LABEL_2: &str = "nxstick2";
+/// The MBR stick's two partitions, as sectors: the first 31 MiB from 1 MiB, the second 15 MiB from
+/// 32 MiB, on a 48 MiB stick.
+const STICK_MBR_PARTS: [(u32, u32); 2] = [(2048, 63_488), (65_536, 30_720)];
 const STICK_WHOLE_LABEL: &str = "nxwhole";
 
 /// `mke2fs`'s features for a filesystem `fs-server-ext4` serves: the live image's root's.
@@ -4600,16 +4605,22 @@ fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
 
 /// **A stick with an MBR naming one Linux partition**, `mib` MiB, the partition from 1 MiB to the
 /// end holding an ext4 labelled `label` (Phase 6 Part D).
-fn mbr_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
+///
+/// **Two partitions since PR #367's review**, an ext4 in each of [`STICK_MBR_PARTS`], so an eject
+/// named for one is seen to take the other.
+fn mbr_ext4_stick(path: &Path, mib: u64, labels: [&str; 2]) -> R<()> {
     let f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     f.set_len(mib * 1024 * 1024)?;
     drop(f);
-    let count = (mib * 2048 - 2048) as u32;
-    write_mbr(path, 2048, count, 0x83)?;
-    let fs_img = path.with_extension("ext4");
-    let _ = fs::remove_file(&fs_img);
-    served_ext4(&fs_img, count as u64 * 512 / 4096, label)?;
-    splice_into(path, 1024 * 1024, &fs_img)
+    let parts = STICK_MBR_PARTS.map(|(first, count)| (first, count, 0x83));
+    write_mbr_parts(path, &parts)?;
+    for ((first, count), label) in STICK_MBR_PARTS.into_iter().zip(labels) {
+        let fs_img = path.with_extension(format!("{label}.ext4"));
+        let _ = fs::remove_file(&fs_img);
+        served_ext4(&fs_img, count as u64 * 512 / 4096, label)?;
+        splice_into(path, first as u64 * 512, &fs_img)?;
+    }
+    Ok(())
 }
 
 /// **A stick that is a filesystem**: `mib` MiB of ext4 labelled `label`, with no table at all.
@@ -5071,23 +5082,34 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.line_since(from, "mbr:  partition 1 lba 2048..", any, secs(60))?;
     let mounted = line_of(s, from, &format!("(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}'; mounted at /storage/{STICK_MBR_LABEL} (rw)"))?;
     let index = blk_of(&mounted)?;
-    println!("  ok: an MBR stick plugged in: its partition read, its ext4 mounted writable at /storage/{STICK_MBR_LABEL} on a live boot");
-    let at = format!("/storage/{STICK_MBR_LABEL}/{STORAGE_PATTERN_FILE}");
-    s.send(&format!("test-pattern --write {at}"))?;
-    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
-    s.expect("/home>")?;
-    // **Refused while a file on it is held** (Phase 6 Part F): a session's eject runs the chain's
-    // held check as an administrator's does. `test-pattern` holds the file and asks, since a
-    // shell with no background jobs cannot hold one while it runs `disk`.
-    s.send(&format!("test-pattern --eject-held {at} {STICK_MBR_LABEL}"))?;
-    s.expect(&format!("storage-service: {STICK_MBR_LABEL} is in use: 1 file(s) still open or mapped"))?;
+    line_of(s, from, &format!("(partition partition 2 (unlabelled)): ext4 '{STICK_MBR_LABEL_2}'; mounted at /storage/{STICK_MBR_LABEL_2} (rw)"))?;
+    println!("  ok: an MBR stick plugged in: its two partitions read, each ext4 mounted writable on a live boot");
+    // A pattern on each, written through a mapping and not synced, for the eject to write back.
+    let ats = [STICK_MBR_LABEL, STICK_MBR_LABEL_2].map(|l| format!("/storage/{l}/{STORAGE_PATTERN_FILE}"));
+    for at in &ats {
+        s.send(&format!("test-pattern --write {at}"))?;
+        s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+        s.expect("/home>")?;
+    }
+    // **Refused while a file on the stick is held** — on its *other* partition (PR #367 review):
+    // a session's eject takes the whole stick, so a file held on either refuses it, and both stay
+    // mounted. `test-pattern` holds the file and asks, since a shell with no background jobs
+    // cannot hold one while it runs `disk`.
+    s.send(&format!("test-pattern --eject-held {} {STICK_MBR_LABEL}", ats[1]))?;
+    s.expect(&format!("storage-service: {STICK_MBR_LABEL_2} is in use: 1 file(s) still open or mapped"))?;
     s.expect(&format!(
-        "test-pattern: eject of {STICK_MBR_LABEL} with {at} held: refused, a file on it is still open or mapped ok"
+        "test-pattern: eject of {STICK_MBR_LABEL} with {} held: refused, a file on it is still open or mapped ok",
+        ats[1]
     ))?;
     s.expect("/home>")?;
-    println!("  ok: an eject while a file on it is held is refused");
-    eject_stick(s, STICK_MBR_LABEL)?;
-    println!("  ok: written without a sync, and ejected with `disk --eject`, no password asked");
+    // **And nothing was ejected**: the partition named is still mounted, not unmounted before the
+    // other one refused. A token the typed line does not hold, so the match is the answer.
+    s.send(&format!("format(\"still-mounted={{}}\", (list /storage | filter name == \"{STICK_MBR_LABEL}\" | count))"))?;
+    s.expect("still-mounted=1")?;
+    s.expect("/home>")?;
+    println!("  ok: an eject of one partition while a file on the other is held is refused, and leaves both mounted");
+    eject_stick(s, &[STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
+    println!("  ok: written without a sync, and both partitions ejected by one `disk --eject`, no password asked");
     let from = s.transcript().len();
     pull(qmp, "stickmbr")?;
     s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
@@ -5228,7 +5250,7 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     println!("  ok: a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping");
 
     // 7. **Ejected and pulled**: the eject writes back and records the filesystem clean.
-    eject_stick(s, STICK_FAT_LABEL)?;
+    eject_stick(s, &[STICK_FAT_LABEL])?;
     let from = s.transcript().len();
     pull(qmp, "stickfat")?;
     s.line_since(from, &format!("storage-service: blk-{fat} departed"), any, secs(30))?;
@@ -5239,16 +5261,23 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
 /// **`disk --eject NAME`, as a session runs it** (Phase 6 Part F): no `with`, and no password asked.
 /// The chain writes back and records the filesystem clean before the service says the stick can
 /// be pulled, and `disk` says so after.
-fn eject_stick(s: &mut Session, name: &str) -> R<()> {
+///
+/// **The drive goes whole** (PR #367 review): `names` are every filesystem on the stick, the first
+/// the one named, and each is unmounted, in the order mounted, before the service and `disk` name
+/// them all.
+fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
     let from = s.transcript().len();
-    s.send(&format!("disk --eject {name}"))?;
-    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
-    s.expect(&format!("storage-service: unmounted {name}, left clean"))?;
-    s.expect(&format!("storage-service: ejected {name}, safe to remove"))?;
-    s.expect(&format!("disk: ejected {name}"))?;
+    s.send(&format!("disk --eject {}", names[0]))?;
+    for name in names {
+        s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+        s.expect(&format!("storage-service: unmounted {name}, left clean"))?;
+    }
+    let all = names.join(", ");
+    s.expect(&format!("storage-service: ejected {all}, safe to remove"))?;
+    s.expect(&format!("disk: ejected {all}"))?;
     s.expect("/home>")?;
     if s.transcript()[from..].contains("password:") {
-        return Err(format!("`disk --eject {name}` asked for a password").into());
+        return Err(format!("`disk --eject {}` asked for a password", names[0]).into());
     }
     Ok(())
 }
@@ -5259,19 +5288,21 @@ fn eject_stick(s: &mut Session, name: &str) -> R<()> {
 /// without an eject leaves.
 fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let part = work.join("stick-mbr-part.ext4");
-    let mut f = fs::File::open(mbr)?;
-    let len = f.metadata()?.len() - 1024 * 1024;
-    f.seek(SeekFrom::Start(1024 * 1024))?;
-    let mut buf = vec![0u8; len as usize];
-    f.read_exact(&mut buf)?;
-    fs::write(&part, buf)?;
-    check_ext4_clean(&part, &format!("the ejected stick's {STICK_MBR_LABEL}"))?;
+    // **Each partition, carved by its MBR entry**: one eject took both (PR #367 review).
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
-    match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
-        Some(b) if b == pattern => println!("  ok: the ejected stick holds the pattern, read with debugfs"),
-        Some(b) => return Err(format!("the ejected stick's file is {} bytes and not the pattern", b.len()).into()),
-        None => return Err("the ejected stick has no pattern file: the eject did not write it back".into()),
+    for ((first, count), label) in STICK_MBR_PARTS.into_iter().zip([STICK_MBR_LABEL, STICK_MBR_LABEL_2]) {
+        let part = work.join(format!("stick-mbr-{label}.ext4"));
+        let mut f = fs::File::open(mbr)?;
+        f.seek(SeekFrom::Start(first as u64 * 512))?;
+        let mut buf = vec![0u8; count as usize * 512];
+        f.read_exact(&mut buf)?;
+        fs::write(&part, buf)?;
+        check_ext4_clean(&part, &format!("the ejected stick's {label}"))?;
+        match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
+            Some(b) if b == pattern => println!("  ok: the ejected stick's {label} holds the pattern, read with debugfs"),
+            Some(b) => return Err(format!("the ejected stick's {label} file is {} bytes and not the pattern", b.len()).into()),
+            None => return Err(format!("the ejected stick's {label} has no pattern file: the eject did not write it back").into()),
+        }
     }
     let state = ext4_s_state(whole)?;
     if state & EXT4_VALID_FS != 0 {
@@ -14293,12 +14324,19 @@ fn mbr_fat_stick(path: &Path, mib: u64, label: &str) -> R<()> {
 /// **Write an MBR into `img`'s first block** (Phase 6 Part D): one entry, of MBR type `kind`, for
 /// `count` blocks from `first`, and the signature. The other three entries are left empty.
 fn write_mbr(img: &Path, first: u32, count: u32, kind: u8) -> R<()> {
+    write_mbr_parts(img, &[(first, count, kind)])
+}
+
+/// An MBR naming each of `parts` — first sector, sector count, type — in its own entry, up to four.
+fn write_mbr_parts(img: &Path, parts: &[(u32, u32, u8)]) -> R<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut mbr = [0u8; 512];
-    let e = &mut mbr[0x1BE..0x1CE];
-    e[4] = kind;
-    e[8..12].copy_from_slice(&first.to_le_bytes());
-    e[12..16].copy_from_slice(&count.to_le_bytes());
+    for (i, &(first, count, kind)) in parts.iter().take(4).enumerate() {
+        let e = &mut mbr[0x1BE + i * 16..0x1CE + i * 16];
+        e[4] = kind;
+        e[8..12].copy_from_slice(&first.to_le_bytes());
+        e[12..16].copy_from_slice(&count.to_le_bytes());
+    }
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
     let mut f = fs::OpenOptions::new().write(true).open(img).map_err(|e| format!("open {}: {e}", img.display()))?;
