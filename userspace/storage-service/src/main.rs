@@ -9,14 +9,15 @@
 //!    device's node, then `Settled`. `service-mgr` spawns this service straight after the manager,
 //!    so it is the class's owner from boot on and nothing else can take the disks.
 //! 2. **Read what is there.** Each device is probed as its server would read it: ext4 through
-//!    `fs-server-ext4`'s own checks, FAT from its boot sector, or nothing. Each disk's partition
-//!    table is read too, for `init.toml`'s UUID sources.
+//!    `fs-server-ext4`'s own checks, FAT through `fs-server-fat`'s, or nothing. Each disk's
+//!    partition table is read too, for `init.toml`'s UUID sources.
 //! 3. **Read `init.toml`**, and match each of `init`'s mounts to the device it is on. Those are
 //!    reported and never mounted here. Whether the root is on a RAM disk decides whether this is
 //!    a live boot.
-//! 4. **Mount what it can serve** (C.5b): every ext4 `init` did not mount, read-only on a live
-//!    boot. Each gets an `fs-server-ext4` spawned over it and a namespace of its own with that
-//!    server bound at `/`, and is named by its label.
+//! 4. **Mount what it can serve** (C.5b): every ext4 `init` did not mount, and a FAT on a
+//!    removable disk (Phase 6 Part E.5), read-only on a live boot. Each gets the server for its
+//!    kind spawned over it and a namespace of its own with that server bound at `/`, and is named
+//!    by its label.
 //! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/storage`. `info` is a directory session, `info/<name>.tsm` a table as a fresh
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
@@ -58,7 +59,7 @@ use librsproto::namespace::{
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use librsproto::storage::{OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use, parse_mount};
-use storage_service::mounts::{self, Plan, automount, explicit, in_use};
+use storage_service::mounts::{self, Plan, Server, automount, explicit, in_use};
 use storage_service::probe::{Found, probe};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
@@ -92,8 +93,6 @@ const MAX_ADMIN_SESSIONS: usize = 4;
 /// channel, and every other kind's bound.
 const MAX_DIRS: usize =
     MAX_WAIT_HANDLES - 3 - MAX_SESSION_ENDPOINTS - MAX_MOUNTS - MAX_ADMIN_ENDPOINTS - MAX_ADMIN_SESSIONS;
-/// Where a filesystem server is spawned from: the store's copy, since the root is mounted by now.
-const FS_SERVER: &[u8] = b"/bin/fs-server-ext4";
 /// How long a filesystem server may take to answer `Meta::Ready`: `init`'s bound for its own.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 /// How many times an unmount asks whether a file is held before it believes the answer, and how
@@ -597,14 +596,14 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
         close(device);
         return Err(b"no control channel");
     };
-    let Some(process) = spawn(root_ns, FS_SERVER, server_end) else {
+    let Some(process) = spawn(root_ns, plan.server.path(), server_end) else {
         close(device);
         close(control);
-        return Err(b"fs-server-ext4 would not spawn");
+        return Err(b"its server would not spawn");
     };
     // **From here a failure lets the server go** (PR #336 review, finding 3): its control channel
     // and its handle closed. **That, not the terminate, is what ends it** (PR #362 review): a
-    // terminate is a request, which `fs-server-ext4` does not read. A server that refused `Ready`
+    // terminate is a request, which neither filesystem server reads. A server that refused `Ready`
     // has exited already; one that had not answered finds its control channel closed when it does,
     // and exits; and one that answered and is then let go here exits when its forwarding endpoint
     // loses its peer (Phase 6 Part D.4). The terminate stays, for a server that does listen.
@@ -1004,7 +1003,7 @@ impl Service {
         // 6. The namespace went with the handle closed above. **What is said of the filesystem is
         //    what the device says**, read again now: a read-only mount wrote nothing, so one it
         //    found not clean is not clean still, whatever its server answered.
-        let clean = matches!(self.read_found(x.device), Some(Found::Ext4 { clean: Some(true), .. }));
+        let clean = self.read_found(x.device).and_then(|f| f.clean()) == Some(true);
         let mut l = Line::new();
         l.s(b"storage-service: unmounted ").untrusted(x.label.as_bytes());
         l.s(if clean { b", left clean".as_slice() } else { b", not left clean" });
@@ -1229,8 +1228,10 @@ impl Service {
     }
 }
 
-/// Say what one device holds, and whose it is. How an ext4 was left is not said while it is
+/// Say what one device holds, and whose it is. How a filesystem was left is not said while it is
 /// mounted writable, for the reason the table's `clean` is `Null` then: its state says "in use".
+/// **A FAT that is not mounted says why** (Phase 6 Part E.5): what its server would refuse it for,
+/// or that its disk is not removable.
 fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     let r = &d.record;
     let mount = mounts.iter().find(|m| m.device == r.id);
@@ -1247,23 +1248,17 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     }
     line.s(b"): ");
     match &d.found {
-        Found::Ext4 { label, clean } => {
-            line.s(b"ext4");
+        Found::Ext4 { label, .. } | Found::Fat { label, .. } => {
+            line.s(d.found.filesystem().unwrap_or("").as_bytes());
             if !label.is_empty() {
                 line.s(b" '").untrusted(label.as_bytes()).s(b"'");
             }
             if !mount.is_some_and(|m| m.mode == Mode::Rw) {
-                line.s(match clean {
+                line.s(match d.found.clean() {
                     Some(true) => b", left clean".as_slice(),
                     Some(false) => b", not left clean",
                     None => b", state unreadable",
                 });
-            }
-        }
-        Found::Fat { label } => {
-            line.s(b"fat");
-            if !label.is_empty() {
-                line.s(b" '").untrusted(label.as_bytes()).s(b"'");
             }
         }
         Found::Nothing => {
@@ -1273,6 +1268,8 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     if let Some(m) = mount {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
+    } else if let Found::Fat { refused: Some(why), .. } = &d.found {
+        line.s(b"; not served: ").s(why.as_bytes());
     } else if storage_service::mounts::is_install_source(d) {
         // **Said, not left to an absence** (administration Part G.1): a gate can then match the
         // reason the pristine root was passed over, rather than only fail to find its mount.
@@ -1280,6 +1277,9 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     } else if storage_service::mounts::on_boot_medium(d, all) {
         // And the disk the machine started from (Phase 6 Part D), for the same reason.
         line.s(b"; on the disk the machine started from, passed over");
+    } else if d.found.server() == Some(Server::Fat) && !storage_service::mounts::removable(d, all) {
+        // And a FAT an administrator may mount, but that nothing mounts by itself (Part E.5).
+        line.s(b"; not removable, so not mounted");
     }
     line.end();
 }
