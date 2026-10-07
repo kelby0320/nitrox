@@ -101,6 +101,34 @@ pub(crate) fn put(img: &Path, dest: &str, bytes: &[u8]) {
     let _ = std::fs::remove_file(&src);
 }
 
+/// Remove the file `path` from `img` with `mdel`.
+pub(crate) fn mdel(img: &Path, path: &str) {
+    mtools("mdel", img, &[&format!("::{path}")]);
+}
+
+/// **A file's bytes as `mtype` reads them** off `img`.
+pub(crate) fn mtype(img: &Path, path: &str) -> Vec<u8> {
+    mtools("mtype", img, &[&format!("::{path}")]).stdout
+}
+
+/// **Every file and directory on `img`**, as `mdir -/ -b` lists them: paths from the root, a
+/// directory's with a trailing `/`.
+pub(crate) fn mdir_all(img: &Path) -> std::collections::BTreeSet<String> {
+    let out = mtools("mdir", img, &["-/", "-b", "::"]).stdout;
+    String::from_utf8(out).unwrap().lines().filter_map(|l| l.strip_prefix("::/")).map(str::to_string).collect()
+}
+
+/// **`fsck.fat -n` on `img`**: its exit status and what it said. `0` is clean.
+pub(crate) fn fsck(img: &Path) -> (i32, String) {
+    let out = Command::new("fsck.fat")
+        .arg("-n")
+        .arg(img)
+        .output()
+        .expect("fsck.fat must be installed (dosfstools) to run fs-server-fat's tests");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    (out.status.code().unwrap_or(-1), said)
+}
+
 /// Bytes a test can tell apart: position-dependent, and different per `seed`.
 pub(crate) fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(24) as u8 ^ seed).collect()

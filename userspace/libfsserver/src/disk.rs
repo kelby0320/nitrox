@@ -172,3 +172,154 @@ impl BlockWriter for Disk {
         Ok(())
     }
 }
+
+/// The [`SectorDisk`]'s largest transfer: 64 KiB, sixteen pages, within every block driver's
+/// fragment bound (AHCI's 248, USB storage's 64).
+pub const SPAN: usize = 64 * 1024;
+/// A sector: the unit [`SectorDisk`] aligns to.
+const SECTOR: u64 = 512;
+
+/// **The block device in sectors, many to a submit** (Phase 6 Part E.3): a [`BlockReader`] and
+/// [`BlockWriter`] that moves any 512-byte-aligned range in one `sys_io_submit` of up to [`SPAN`]
+/// bytes, through a 64 KiB scratch `MemoryObject`.
+///
+/// **For `fs-server-fat`**, whose structures are sector-aligned rather than 4 KiB-aligned, whose
+/// partition's last sectors need not fill a 4 KiB block, and whose write path batches — a grow
+/// zeroes what it adds 64 KiB at a time, and the FAT's dirty sectors go out a run at a time. A
+/// write that is not sector-aligned reads its edge sectors first. **`fs-server-ext4` keeps
+/// [`Disk`]**, so Phase 6 Part H measures it as it is.
+pub struct SectorDisk {
+    device: u64,
+    scratch: u64,
+    scratch_addr: u64,
+}
+
+impl SectorDisk {
+    /// **A disk over `device`**, with its 64 KiB scratch made and mapped; or why it could not be.
+    pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
+        // SAFETY: register-only syscall.
+        let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, SPAN as u64, 0, 0, 0) };
+        if scratch < 0 {
+            return Err(b"fs-server: scratch create failed\n");
+        }
+        let scratch = scratch as u64;
+        // SAFETY: register-only syscall; `scratch` is ours.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, SPAN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+        if addr < 0 {
+            return Err(b"fs-server: scratch map failed\n");
+        }
+        Ok(SectorDisk { device, scratch, scratch_addr: addr as u64 })
+    }
+
+    /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
+    pub fn device(&self) -> u64 {
+        self.device
+    }
+
+    /// Move `len` bytes, sector-aligned and at most [`SPAN`], between device byte `at` and the
+    /// scratch's start, in one submit.
+    fn transfer(&self, opcode: u32, at: u64, len: usize) -> Result<(), FsError> {
+        let op = IoOp { opcode, flags: 0, buffer: self.scratch, buf_offset: 0, offset: at, length: len as u64 };
+        // SAFETY: `device` is a block DeviceNode with READ (and WRITE for a write); `&op` is valid.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
+        if po < 0 {
+            return Err(FsError::Io);
+        }
+        let (status, result) = po_wait(po as u64);
+        if status != 0 || result != len as u64 {
+            return Err(FsError::Io);
+        }
+        Ok(())
+    }
+
+    /// Copy scratch bytes `[from, from + dst.len())` out into `dst`.
+    fn copy_out(&self, from: usize, dst: &mut [u8]) {
+        assert!(from + dst.len() <= SPAN);
+        // SAFETY: `scratch_addr` maps `SPAN` bytes R/W for this process's life, and the range is
+        // within it; `dst` is a distinct buffer of the caller's.
+        unsafe { core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len()) };
+    }
+
+    /// Copy `src` into scratch bytes `[from, from + src.len())`.
+    fn copy_in(&self, from: usize, src: &[u8]) {
+        assert!(from + src.len() <= SPAN);
+        // SAFETY: as for `copy_out`, the other way.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.scratch_addr as *mut u8).add(from), src.len()) };
+    }
+
+    /// **The sector-aligned chunks covering `[offset, offset + len)`**, each at most [`SPAN`]:
+    /// `(chunk start, chunk length, where the request's bytes begin in it, how many)`.
+    fn chunks(
+        offset: u64,
+        len: usize,
+        mut each: impl FnMut(u64, usize, usize, usize) -> Result<(), FsError>,
+    ) -> Result<(), FsError> {
+        let end = offset + len as u64;
+        let mut at = offset - offset % SECTOR;
+        while at < end {
+            let span = (end - at).div_ceil(SECTOR) * SECTOR;
+            let n = (span as usize).min(SPAN);
+            let from = (offset.max(at) - at) as usize;
+            let take = ((at + n as u64).min(end) - offset.max(at)) as usize;
+            each(at, n, from, take)?;
+            at += n as u64;
+        }
+        Ok(())
+    }
+}
+
+impl BlockReader for SectorDisk {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        let mut done = 0usize;
+        SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
+            self.transfer(IO_OPCODE_READ, at, n)?;
+            self.copy_out(from, &mut buf[done..done + take]);
+            done += take;
+            Ok(())
+        })
+    }
+}
+
+impl BlockWriter for SectorDisk {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        let mut done = 0usize;
+        SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
+            // A chunk the request does not cover whole keeps the bytes it does not write.
+            if from != 0 || take != n {
+                self.transfer(IO_OPCODE_READ, at, n)?;
+            }
+            self.copy_in(from, &buf[done..done + take]);
+            self.transfer(IO_OPCODE_WRITE, at, n)?;
+            done += take;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The chunks a request moves in** cover it exactly: sector-aligned, contiguous, none over
+    /// [`SPAN`], and the request's bytes within each — for aligned and unaligned starts and ends,
+    /// one sector, and a request just over a span.
+    #[test]
+    fn a_request_is_covered_by_aligned_chunks_of_at_most_a_span() {
+        for (offset, len) in [(0, 512), (100, 70_000), (512, SPAN), (511, 2), (1000, SPAN + 1), (4096, 3 * SPAN), (7, 1)] {
+            let mut next = offset - offset % SECTOR;
+            let mut covered = 0usize;
+            SectorDisk::chunks(offset, len, |at, n, from, take| {
+                assert_eq!(at, next, "contiguous");
+                assert_eq!(at % SECTOR, 0);
+                assert_eq!(n as u64 % SECTOR, 0);
+                assert!(n <= SPAN && from + take <= n && take > 0);
+                assert_eq!(at + from as u64, offset + covered as u64, "the request's bytes in order");
+                covered += take;
+                next = at + n as u64;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(covered, len, "({offset}, {len})");
+        }
+    }
+}

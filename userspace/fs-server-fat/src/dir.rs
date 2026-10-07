@@ -1,5 +1,6 @@
 //! **Directories** (Phase 6 Part E.2): their 32-byte entries, long names assembled from the entries
-//! before a short one, and paths resolved.
+//! before a short one, and paths resolved; and (E.3) entries written, a name's short form made
+//! unique, and free slots found.
 //!
 //! **A directory is FAT12 and FAT16's fixed root**, a run of sectors after the FATs, **or a chain
 //! of clusters**, as every other directory is and FAT32's root too. Its entries are numbered from
@@ -8,7 +9,7 @@
 use crate::bpb::{Geometry, Kind, SECTOR};
 use crate::names::{self, UNITS_PER_ENTRY};
 use crate::table::Cache;
-use crate::{BlockReader, FsError};
+use crate::{BlockReader, BlockWriter, FsError};
 
 /// One entry's length.
 pub const ENTRY: u32 = 32;
@@ -21,6 +22,13 @@ pub const ATTR_DIR: u8 = 0x10;
 pub const ATTR_ARCHIVE: u8 = 0x20;
 /// A long-name entry's attributes: read-only, hidden, system and volume together.
 pub const ATTR_LONG: u8 = 0x0F;
+/// The most entries a name takes: twenty long-name entries, 260 units, and its short entry.
+pub const MAX_NAME_SLOTS: usize = 21;
+/// The most slots a directory may have, by the specification: 2 MiB of entries.
+pub const MAX_SLOTS: u32 = 65_536;
+/// A directory's first two entries' names.
+pub const DOT: &[u8; 11] = b".          ";
+pub const DOTDOT: &[u8; 11] = b"..         ";
 
 /// **A directory**: FAT12 and FAT16's fixed root, or the chain from a cluster.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -72,6 +80,19 @@ pub fn walk_slots<R: BlockReader>(
     cache: &mut Cache,
     dir: Dir,
     from: u32,
+    each: impl FnMut(u32, &[u8; 32]) -> bool,
+) -> Result<(), FsError> {
+    walk(r, g, cache, dir, from, true, each)
+}
+
+/// [`walk_slots`], and past an entry beginning `0` too when `stop_at_end` is not set.
+fn walk<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    from: u32,
+    stop_at_end: bool,
     mut each: impl FnMut(u32, &[u8; 32]) -> bool,
 ) -> Result<(), FsError> {
     let mut sector = [0u8; SECTOR as usize];
@@ -85,7 +106,7 @@ pub fn walk_slots<R: BlockReader>(
                 continue;
             }
             let e: &[u8; 32] = sector[(k * ENTRY) as usize..((k + 1) * ENTRY) as usize].try_into().unwrap();
-            if e[0] == 0 || !each(slot, e) {
+            if (stop_at_end && e[0] == 0) || !each(slot, e) {
                 return Ok(false);
             }
         }
@@ -280,7 +301,7 @@ fn found(kind: Kind, dir: Dir, slot: u32, e: &[u8; 32], long: Option<(&[u16], u3
 
 /// Whether a short entry is `.` or `..`.
 fn is_dot(e: &[u8; 32]) -> bool {
-    &e[..11] == b".          " || &e[..11] == b"..         "
+    &e[..11] == DOT || &e[..11] == DOTDOT
 }
 
 /// **Walk `dir`'s files and directories from slot `from`**, handing each to `each` until it
@@ -379,4 +400,253 @@ pub fn resolve_dir<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, path:
         Node::Root => Ok(Dir::root(g)),
         Node::Entry(f) => subdir(g, &f),
     }
+}
+
+/// **Set an entry's first cluster.** The high half is FAT32's alone; FAT12 and FAT16 keep what
+/// those bytes hold.
+pub fn set_cluster(kind: Kind, e: &mut [u8; 32], c: u32) {
+    if kind == Kind::Fat32 {
+        e[20..22].copy_from_slice(&((c >> 16) as u16).to_le_bytes());
+    }
+    e[26..28].copy_from_slice(&(c as u16).to_le_bytes());
+}
+
+/// **Stamp an entry written at `now`**: its write time and date, and its access date.
+pub fn stamp(e: &mut [u8; 32], now: i64) {
+    let (date, time) = crate::time::to_fat(now);
+    e[18..20].copy_from_slice(&date.to_le_bytes());
+    e[22..24].copy_from_slice(&time.to_le_bytes());
+    e[24..26].copy_from_slice(&date.to_le_bytes());
+}
+
+/// **A short entry**: `short`, with `attr`, its first cluster and size, made and written at `now`.
+/// A name beginning `0xE5`, which would read as deleted, is stored beginning `0x05`.
+pub fn short_entry(kind: Kind, short: &[u8; 11], attr: u8, cluster: u32, size: u32, now: i64) -> [u8; 32] {
+    let mut e = [0u8; 32];
+    e[..11].copy_from_slice(short);
+    if e[0] == DELETED {
+        e[0] = 0x05;
+    }
+    e[11] = attr;
+    let (date, time) = crate::time::to_fat(now);
+    e[14..16].copy_from_slice(&time.to_le_bytes());
+    e[16..18].copy_from_slice(&date.to_le_bytes());
+    stamp(&mut e, now);
+    set_cluster(kind, &mut e, cluster);
+    e[28..32].copy_from_slice(&size.to_le_bytes());
+    e
+}
+
+/// **The long-name entries for `units`**, tied to the short name whose checksum is `sum`, into
+/// `out` in the order they are written — the last part first. How many.
+fn long_entries(units: &[u16], sum: u8, out: &mut [[u8; 32]]) -> usize {
+    let parts = units.len().div_ceil(UNITS_PER_ENTRY);
+    for p in 0..parts {
+        let mut e = [0u8; 32];
+        e[0] = (p + 1) as u8 | if p + 1 == parts { 0x40 } else { 0 };
+        e[11] = ATTR_LONG;
+        e[13] = sum;
+        let mut k = 0;
+        for range in [1..11, 14..26, 28..32] {
+            for at in range.step_by(2) {
+                // The name, its terminating zero if there is room, then padding.
+                let i = p * UNITS_PER_ENTRY + k;
+                let u = match i.cmp(&units.len()) {
+                    core::cmp::Ordering::Less => units[i],
+                    core::cmp::Ordering::Equal => 0,
+                    core::cmp::Ordering::Greater => 0xFFFF,
+                };
+                e[at..at + 2].copy_from_slice(&u.to_le_bytes());
+                k += 1;
+            }
+        }
+        out[parts - 1 - p] = e;
+    }
+    parts
+}
+
+/// **The entries that name a file `name` in `dir`**: a short entry alone for an upper-case 8.3
+/// name, else long-name entries and a short name made unique in `dir` — `LONGNA~1.TXT`, or the
+/// next free tail. `short` fills in the short entry's other fields given its name. Into `out`;
+/// how many. `InvalidName` for a name a FAT cannot hold.
+pub fn name_entries<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    name: &[u8],
+    short: impl FnOnce(&[u8; 11]) -> [u8; 32],
+    out: &mut [[u8; 32]; MAX_NAME_SLOTS],
+) -> Result<usize, FsError> {
+    if !names::valid(name) {
+        return Err(FsError::InvalidName);
+    }
+    if let Some(exact) = names::short_exact(name) {
+        out[0] = short(&exact);
+        return Ok(1);
+    }
+    let mut units = [0u16; names::MAX_UNITS];
+    let n = names::to_utf16(name, &mut units).ok_or(FsError::InvalidName)?;
+    let s = unique_short(r, g, cache, dir, name)?;
+    let parts = long_entries(&units[..n], names::checksum(&s), &mut out[..]);
+    out[parts] = short(&s);
+    Ok(parts + 1)
+}
+
+/// **A short name for `name` no entry of `dir` has**: its basis with the lowest numeric tail free.
+/// Found a thousand tails a pass, so a directory is read once for any but a crowded basis.
+fn unique_short<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    name: &[u8],
+) -> Result<[u8; 11], FsError> {
+    const WINDOW: u32 = 1024;
+    let (b, bn, e, en) = names::basis(name);
+    let (base, ext) = (&b[..bn], &e[..en]);
+    let mut lo = 1;
+    while lo < 1_000_000 {
+        let mut used = [0u64; (WINDOW / 64) as usize];
+        walk_slots(r, g, cache, dir, 0, |_, ent| {
+            if ent[0] != DELETED && ent[11] & 0x3F != ATTR_LONG {
+                let short: &[u8; 11] = ent[..11].try_into().unwrap();
+                if let Some(n) = tail_of(short, base, ext)
+                    && (lo..lo + WINDOW).contains(&n)
+                {
+                    used[((n - lo) / 64) as usize] |= 1 << ((n - lo) % 64);
+                }
+            }
+            true
+        })?;
+        if let Some(k) = (0..WINDOW).find(|&k| used[(k / 64) as usize] & (1 << (k % 64)) == 0) {
+            return Ok(names::with_tail(base, ext, lo + k));
+        }
+        lo += WINDOW;
+    }
+    Err(FsError::TooLarge)
+}
+
+/// **The tail `n` for which `short` is `base` and `ext` with that tail**, if it is one.
+fn tail_of(short: &[u8; 11], base: &[u8], ext: &[u8]) -> Option<u32> {
+    let tilde = short[..8].iter().rposition(|&c| c == b'~')?;
+    let digits = &short[tilde + 1..8];
+    let len = digits.iter().position(|&c| c == b' ').unwrap_or(digits.len());
+    let digits = &digits[..len];
+    if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let n = digits.iter().fold(0u32, |n, &d| n * 10 + (d - b'0') as u32);
+    (names::with_tail(base, ext, n) == *short).then_some(n)
+}
+
+/// **Where `need` free slots in a row are in `dir`**: deleted entries, or any at or past the one
+/// that ends it. `Ok` with the first; else `Err` with how many free slots end the directory and
+/// how many slots it has, for a caller that grows it.
+pub fn free_run<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    need: u32,
+) -> Result<Result<u32, (u32, u32)>, FsError> {
+    let (mut ended, mut start, mut len, mut total) = (false, 0, 0, 0);
+    let mut hit = None;
+    walk(r, g, cache, dir, 0, false, |slot, e| {
+        total = slot + 1;
+        ended |= e[0] == 0;
+        if ended || e[0] == DELETED {
+            if len == 0 {
+                start = slot;
+            }
+            len += 1;
+            if len == need {
+                hit = Some(start);
+                return false;
+            }
+        } else {
+            len = 0;
+        }
+        true
+    })?;
+    Ok(hit.ok_or((len, total)))
+}
+
+/// **Rewrite slots `first..=last` of `dir`** — at most a name's [`MAX_NAME_SLOTS`] — through
+/// `f`, each stretch of them contiguous on the device read once and written once.
+pub fn rewrite<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    first: u32,
+    last: u32,
+    mut f: impl FnMut(u32, &mut [u8; 32]),
+) -> Result<(), FsError> {
+    if last < first || last - first >= MAX_NAME_SLOTS as u32 {
+        return Err(FsError::Corrupt);
+    }
+    let mut buf = [0u8; MAX_NAME_SLOTS * ENTRY as usize];
+    let mut s = first;
+    while s <= last {
+        let at = slot_byte(rw, g, cache, dir, s)?.ok_or(FsError::Corrupt)?;
+        let mut k = 1;
+        while s + k <= last && slot_byte(rw, g, cache, dir, s + k)? == Some(at + (k * ENTRY) as u64) {
+            k += 1;
+        }
+        let bytes = &mut buf[..(k * ENTRY) as usize];
+        rw.read_at(at, bytes)?;
+        for (j, e) in bytes.chunks_exact_mut(ENTRY as usize).enumerate() {
+            f(s + j as u32, e.try_into().unwrap());
+        }
+        rw.write_at(at, bytes)?;
+        s += k;
+    }
+    Ok(())
+}
+
+/// **The cluster a directory's `..` names for `parent`**: `0` for the root, FAT32's included.
+pub fn dotdot_cluster(g: &Geometry, parent: Dir) -> u32 {
+    match parent {
+        Dir::Chain(c) if !(g.kind == Kind::Fat32 && c == g.root_cluster) => c,
+        _ => 0,
+    }
+}
+
+/// **The directory `dir`'s `..` names**: its parent. `Corrupt` if its second entry is not `..`.
+pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) -> Result<Dir, FsError> {
+    let Dir::Chain(_) = dir else {
+        return Ok(Dir::Root);
+    };
+    if dir == Dir::root(g) {
+        return Ok(dir);
+    }
+    let at = slot_byte(r, g, cache, dir, 1)?.ok_or(FsError::Corrupt)?;
+    let mut e = [0u8; 32];
+    r.read_at(at, &mut e)?;
+    if &e[..11] != DOTDOT {
+        return Err(FsError::Corrupt);
+    }
+    let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
+    match (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32 {
+        0 => Ok(Dir::root(g)),
+        c if g.valid_cluster(c) => Ok(Dir::Chain(c)),
+        _ => Err(FsError::Corrupt),
+    }
+}
+
+/// **Whether `dir` is the directory whose chain begins `ancestor`, or within it**: its `..`
+/// followed to the root, bounded as a chain is.
+pub fn within<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir, ancestor: u32) -> Result<bool, FsError> {
+    let mut d = dir;
+    for _ in 0..g.clusters {
+        if d == Dir::Chain(ancestor) {
+            return Ok(true);
+        }
+        if d == Dir::root(g) {
+            return Ok(false);
+        }
+        d = parent(r, g, cache, d)?;
+    }
+    Err(FsError::Corrupt)
 }

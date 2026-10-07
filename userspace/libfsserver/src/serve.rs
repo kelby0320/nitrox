@@ -288,6 +288,7 @@ pub fn kerror(e: FsError) -> KError {
         FsError::NotEmpty => KError::NotEmpty,
         FsError::Corrupt | FsError::Io => KError::IoError,
         FsError::ReadOnly => KError::NoAccess,
+        FsError::InvalidName => KError::InvalidArgument,
     }
 }
 

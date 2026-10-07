@@ -5,7 +5,7 @@
 //! See `docs/planning/phase-6-usb.md` § *Part E in detail*.
 //!
 //! - [`bpb`]: the boot sector — the FAT's type and geometry, and what a server refuses.
-//! - [`table`]: the file allocation table, read through a cache of its sectors.
+//! - [`table`]: the file allocation table, read and written through a cache of its sectors.
 //! - [`names`]: long names in UTF-16, short names in 8.3, and the rules for both.
 //! - [`dir`]: directories — their entries, long names assembled, and paths resolved.
 //! - [`time`]: FAT's dates and times, in UTC.

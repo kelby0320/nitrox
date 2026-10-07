@@ -42,6 +42,10 @@ pub enum FsError {
     /// A write to a **read-only mount** ([`ReadOnly`], administration Part C.3). What the
     /// server answers is `NoAccess`.
     ReadOnly,
+    /// **A name the filesystem cannot hold** (Phase 6 Part E.3): FAT's forbidden characters, say.
+    /// What the server answers is `InvalidArgument`. ext4 answers its own bad names `Unsupported`,
+    /// as it always has.
+    InvalidName,
 }
 
 /// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
