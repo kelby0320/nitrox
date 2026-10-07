@@ -2631,7 +2631,33 @@ pub struct ListRow<'a> {
     pub cells: &'a [&'a str],
     /// A small shape before the label — the browser's folder-or-file mark, or a place's dot.
     pub swatch: Option<Swatch>,
+    /// A control at the row's trailing end — a drive's eject (Phase 6 Part F) — or `None`.
+    pub button: Option<RowButton<'a>>,
 }
+
+/// A control at a row's trailing end: a glyph that does something to the row's subject rather
+/// than opening it, as a tab's `×` closes its tab (Phase 6 Part F).
+///
+/// **Pressed through the list's own `activate`, with a key of its own**, so a list with buttons
+/// takes no more parameters than one without: the caller tells a press on the button from one on
+/// the row by the key, as it tells rows apart. The key must differ from every row's key in the
+/// list, the row's own included.
+///
+/// **Over the button is still over the row**: the row stays lit while the pointer is on its
+/// button, as a tab does over its `×`. And a press on the button is not a grab of the row, by the
+/// router's rule that a nearer `on_press` shadows an `on_press_down`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RowButton<'a> {
+    /// Its key — what `activate` is handed when it is pressed, and what `hovered` names over it.
+    pub key: u64,
+    /// What it shows: one glyph, drawn dim and in full ink under the pointer.
+    pub glyph: &'a str,
+}
+
+/// How wide a row's button is, in pixels.
+pub const ROW_BUTTON_W: u32 = 24;
+/// The face behind a row's button under the pointer: the tab close box's.
+const ROW_BUTTON_HOVER: u32 = TAB_CLOSE_HOVER + 2;
 
 /// The shape drawn before a row's label. See [`ListRow::swatch`].
 ///
@@ -2800,8 +2826,9 @@ impl ListState {
     }
 }
 
-/// How much space a row's label gets around it.
-const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
+/// How much space a row's label gets around it — public so a heading over a list's rows can
+/// start where they do (Files' Drives, Phase 6 Part F).
+pub const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
 impl ListState {
     /// Scroll by a turn of the wheel, `dz` detents, positive **down**.
@@ -2941,11 +2968,13 @@ pub fn list_view<Msg>(
         // I act now", and where there is no keyboard selection to compete with, the pointer's is
         // not competing. The applications modal is exactly that list — it keeps no selection at
         // all, so every hover landed on the quiet branch and the menu highlighted in grey.
-        let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
+        // Over a row's button is over the row (see [`RowButton`]).
+        let over = hovered == Some(r.key) || r.button.is_some_and(|b| hovered == Some(b.key));
+        let primary = selected || (over && state.selected.is_none());
         let mut layers = alloc::vec![fill(ground)];
         if primary {
             layers.push(wash(theme.accent, libdraw::theme::SELECTION_COVERAGE));
-        } else if hovered == Some(r.key) {
+        } else if over {
             layers.push(wash(theme.accent, hover));
         }
         // **The label, then whatever trailing cells the list declares** (desktop refresh,
@@ -2957,7 +2986,7 @@ pub fn list_view<Msg>(
         // it. Every list in the system but the browser's has no columns and no swatch, and
         // wrapping those in a `Row` would put a node per row in every window list and launcher
         // result for nothing.
-        if columns.is_empty() && r.swatch.is_none() {
+        if columns.is_empty() && r.swatch.is_none() && r.button.is_none() {
             layers.push(padding(ROW_PAD, text(r.label)));
             let row_el = stack(layers);
             let mut item =
@@ -2995,7 +3024,30 @@ pub fn list_view<Msg>(
                 },
             ));
         }
-        layers.push(padding(ROW_PAD, row(cells)));
+        let body = padding(ROW_PAD, row(cells));
+        match r.button {
+            None => layers.push(body),
+            // **Both halves keyed**, since the diff wants a container's children all keyed or none
+            // and the button needs a key for hover to name it: the body takes the row's own, as a
+            // tab's label takes its tab's, so `hovered` over it still names the row.
+            Some(b) => {
+                let mut face = alloc::vec::Vec::with_capacity(2);
+                let glyph_ink = if hovered == Some(b.key) {
+                    face.push(center(sized(
+                        Size::new(ROW_BUTTON_HOVER, ROW_BUTTON_HOVER),
+                        rounded_fill(theme.face_pressed, TITLE_BUTTON_RADIUS),
+                    )));
+                    theme.foreground
+                } else {
+                    theme.foreground_dim
+                };
+                face.push(center(ink(glyph_ink, text(b.glyph))));
+                layers.push(row(alloc::vec![
+                    body.flex(1).key(r.key),
+                    sized(Size::new(ROW_BUTTON_W, 0), stack(face).on_press(activate(b.key))).key(b.key),
+                ]));
+            }
+        }
         let row_el = stack(layers);
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -3184,6 +3236,7 @@ mod list_view_tests {
                     marked: false,
                     cells: &["848"],
                     swatch: None,
+                    button: None,
                 })
                 .collect();
             let scrolls = list_scrolls(rows.len(), h, row_h);
@@ -3209,6 +3262,89 @@ mod list_view_tests {
             "scrolling: row ends at {long_row}, heading at {long_head}"
         );
         assert!(long_row < short_row, "and a scrolling list gave up the scrollbar's width");
+    }
+
+    /// **A row's button is a target of its own** (Phase 6 Part F): a press on it is `activate`
+    /// with its key, not the row's, and not a grab of the row; a press beside it is the row's. The
+    /// row stays lit while the pointer is over its button, the glyph is drawn at the row's trailing
+    /// end — and a row without one draws nothing there.
+    #[test]
+    fn a_rows_button_is_its_own_target_and_keeps_the_row_lit() {
+        use crate::diff::Tree;
+        use crate::route::Router;
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+        const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+        let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
+        let t = Theme::default();
+        let (w, h) = (200u32, 25u32);
+        #[derive(Clone, PartialEq, Debug)]
+        enum M {
+            Open(u64),
+            Grab(u64),
+        }
+        let build = |button: Option<RowButton<'static>>, hovered: Option<u64>| {
+            let row = ListRow {
+                key: 7,
+                label: "NXFAT",
+                swatch: Some(Swatch::dot(t.ok)),
+                button,
+                ..Default::default()
+            };
+            let mut st = ListState::default();
+            list_view(&[row], &[], &mut st, h, h, M::Open, Some(M::Grab), None, hovered, None, &t)
+        };
+        let eject = Some(RowButton { key: 8, glyph: "\u{23CF}" });
+        let all = libdraw::geom::Rect::new(0, 0, w, h);
+        let metrics = crate::paint::FontMetrics::new(&font, t.font_px);
+
+        let e = build(eject, None);
+        let l = crate::layout::layout(&e, all, &metrics);
+        let mut tree = Tree::new();
+        tree.update(&e, &l).expect("a clean frame: the row's halves are both keyed");
+        let at = |x: i32, pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x,
+            y: h as i32 / 2,
+            ..Default::default()
+        };
+        let click = |x: i32| {
+            let mut r = Router::new();
+            let down = r.pointer(&tree, &e, &l, at(x, true)).0;
+            let up = r.pointer(&tree, &e, &l, at(x, false)).0;
+            (down, up, r.hovered_key(&tree))
+        };
+        let button_x = (w - ROW_BUTTON_W / 2) as i32;
+        assert_eq!(click(button_x), (alloc::vec![], alloc::vec![M::Open(8)], Some(8)), "the button: no grab");
+        assert_eq!(click(60), (alloc::vec![M::Grab(7)], alloc::vec![M::Open(7)], Some(7)), "the row");
+
+        let paint = |e: &Element<M>| {
+            let l = crate::layout::layout(e, all, &metrics);
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
+            fb.clear(t.background);
+            crate::paint::paint(&mut fb, &font, &t, e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
+            fb
+        };
+        let ink_at_end = |fb: &MemFramebuffer| {
+            (w - ROW_BUTTON_W..w)
+                .flat_map(|x| (0..h).map(move |y| (x, y)))
+                .filter(|&(x, y)| fb.get_pixel(x, y) != fb.get_pixel(w - 1, 0))
+                .count()
+        };
+        assert!(ink_at_end(&paint(&build(eject, None))) > 10, "the glyph is drawn at the row's end");
+        assert_eq!(ink_at_end(&paint(&build(None, None))), 0, "and nothing is without a button");
+        let ground_at = |fb: &MemFramebuffer| fb.get_pixel(30, 1);
+        let unlit = ground_at(&paint(&build(eject, None)));
+        assert_ne!(ground_at(&paint(&build(eject, Some(8)))), unlit, "over the button lights the row");
+        assert_eq!(
+            ground_at(&paint(&build(eject, Some(8)))),
+            ground_at(&paint(&build(eject, Some(7)))),
+            "as over the row itself"
+        );
     }
 
     /// A row's columns are where the list declares them, and its swatch is drawn.
@@ -3237,6 +3373,7 @@ mod list_view_tests {
             marked: false,
             cells: &["848", "toml"],
             swatch: Some(Swatch::block(mark)),
+            button: None,
         };
         let mut st = ListState::default();
         let e: Element<u64> =

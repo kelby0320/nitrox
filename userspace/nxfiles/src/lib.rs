@@ -37,7 +37,7 @@ use libui::element::{
     with_spacing,
 };
 use libui::widget::{
-    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, STATUS_BAR_H, Swatch,
+    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch,
     TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextFieldState, Theme as UiTheme, TitleButtons,
     WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view, popup_frame, resize_grip,
     status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
@@ -184,6 +184,80 @@ pub const SIDEBAR_KEY: u64 = 26;
 /// 1000 *was* the sidebar's first row and hovering either lit both. A directory with a thousand
 /// entries is ordinary; one with `1 << 62` is not (PR #285 review, worth fixing 4).
 pub const SIDEBAR_ROW_KEY: u64 = 1 << 62;
+
+/// Where the sidebar's **drive** rows are keyed from (Phase 6 Part F): `DRIVE_ROW_KEY + n` for the
+/// drive on block device `n`.
+///
+/// **Keyed by the device, not by the row's position**, because the drives change under a person's
+/// pointer: a stick pulled between a frame and the click on the row below it would otherwise make
+/// that click land on whatever moved up into its place — and on an eject button, eject another
+/// stick. A device's index is never reused while its record is in the table. Inside the sidebar's
+/// range, clear of the places below it by bit 61, which no place index reaches.
+pub const DRIVE_ROW_KEY: u64 = SIDEBAR_ROW_KEY | (1 << 61);
+/// Where their eject buttons are keyed from, by the same `n`: clear of the rows by bit 60, which
+/// no device index reaches ([`drives`] drops one that would).
+pub const DRIVE_EJECT_KEY: u64 = DRIVE_ROW_KEY | (1 << 60);
+/// The element key on the places, inside the sidebar.
+pub const PLACES_KEY: u64 = 27;
+/// The element key on the Drives heading.
+pub const DRIVES_HEADING_KEY: u64 = 28;
+/// The element key on the drives' list.
+pub const DRIVES_KEY: u64 = 29;
+/// The Drives heading's height: a row's, so a drive's row is a whole number of rows down.
+pub const DRIVES_HEADING_H: u32 = ROW_H;
+/// What an eject button shows: the eject symbol, which DejaVu Sans carries.
+pub const EJECT_GLYPH: &str = "\u{23CF}";
+
+/// `Msg::Drive` for the row or button a key names.
+fn drive_row(key: u64) -> Msg {
+    Msg::Drive(key)
+}
+
+/// A drive the sidebar lists (Phase 6 Part F): a filesystem the storage service mounted under
+/// `/storage`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Drive {
+    /// **The name it is mounted under**, `/storage/<name>` — the table's `mounted` column, never
+    /// its `label`: a filesystem with no label is mounted under its partition's name, and the
+    /// second of two labelled alike under `<label>-2`. It is what `Eject` names.
+    pub name: String,
+    /// The block device it is on: `n` of the table's `blk-<n>`, and its row's identity.
+    pub block: u64,
+    /// Whether it is on a removable disk, and so has an eject button.
+    pub removable: bool,
+}
+
+impl Drive {
+    /// Where it is: `/storage/<name>`.
+    pub fn path(&self) -> String {
+        alloc::format!("/storage/{}", self.name)
+    }
+}
+
+/// **The drives a storage table lists**: every row mounted under `/storage`, in the table's order.
+/// `init`'s mounts are elsewhere and are not drives; nor is a device with nothing mounted.
+///
+/// A table without the columns this needs lists nothing, which is what a Files given an older
+/// service's table should show rather than guess.
+pub fn drives(t: &libstream::wire::Table) -> Vec<Drive> {
+    use libstream::Value;
+    let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let (Some(name), Some(mounted)) = (col("name"), col("mounted")) else {
+        return Vec::new();
+    };
+    let removable = col("removable");
+    t.rows
+        .iter()
+        .filter_map(|r| {
+            let Some(Value::Str(at)) = r.get(mounted) else { return None };
+            let mount = at.strip_prefix("/storage/").filter(|m| !m.is_empty() && !m.contains('/'))?;
+            let Some(Value::Str(device)) = r.get(name) else { return None };
+            let block: u64 = device.strip_prefix("blk-")?.parse().ok().filter(|&n: &u64| n < 1 << 60)?;
+            let removable = removable.and_then(|c| r.get(c)) == Some(&Value::Bool(true));
+            Some(Drive { name: String::from(mount), block, removable })
+        })
+        .collect()
+}
 
 /// The place a sidebar key names, or `None` if it is not a sidebar row's.
 fn place_of(key: u64) -> Option<usize> {
@@ -502,6 +576,10 @@ pub struct Pane {
     /// "not part of what this directory is for", and a browser that ignored it would put a
     /// person's configuration in front of them every time they opened their home.
     show_hidden: bool,
+    /// **Moved while it was not current**, so what it holds is not where it is: read again when
+    /// its tab is chosen. A drive going takes its tabs home (Phase 6 Part F), and a listing is
+    /// read for the current pane alone.
+    relist: bool,
 }
 
 /// Everything the browser is.
@@ -535,6 +613,19 @@ pub struct App {
     /// The sidebar's scroll and highlight. Its *selection* is derived from where the tab is
     /// rather than remembered, so the two cannot disagree.
     sidebar: ListState,
+    /// **The drives**, listed below the places (Phase 6 Part F): as the binary last read the
+    /// storage service's table, which it reads again whenever its watch says the mounts changed.
+    drives: Vec<Drive>,
+    /// The drives' scroll and highlight; its selection derived as the places' is.
+    drive_list: ListState,
+    /// A drive the binary owes an `Eject` for, by the name it is mounted under.
+    eject: Option<String>,
+    /// The drive last asked to eject, so that its going is said as an eject and not as a stick
+    /// pulled out.
+    ejecting: Option<String>,
+    /// What the strip says once the listing that a drive's going asked for arrives — which
+    /// clears the notice, as every listing does.
+    arrival_notice: Option<String>,
     /// The entry whose properties are being shown, and the directory it was in.
     ///
     /// **A snapshot taken when the row was chosen**, for [`Target`]'s reason: the listing and the
@@ -783,6 +874,9 @@ pub enum Msg {
     CopyFiles,
     /// Act on whatever paths are on the clipboard, here.
     PasteFiles,
+    /// A drive's row or its eject button was pressed (Phase 6 Part F): go there, or eject it. One
+    /// press, as for a place.
+    Drive(u64),
     /// A sidebar row was pressed — go to that place.
     ///
     /// **One press, not two.** The listing needs a double click because a single one has to be
@@ -871,6 +965,7 @@ impl App {
                 list: ListState::default(),
                 order: libfs::Order::default(),
                 show_hidden: false,
+                relist: false,
             }],
             current: TAB_KEY_BASE,
             clip_push: None,
@@ -879,6 +974,11 @@ impl App {
             anchor: None,
             home: String::from(path),
             sidebar: ListState::default(),
+            drives: Vec::new(),
+            drive_list: ListState::default(),
+            eject: None,
+            ejecting: None,
+            arrival_notice: None,
             properties: None,
             location: None,
             search: None,
@@ -1072,8 +1172,9 @@ impl App {
         // of a second ago. Three fast clicks is a thing people do.
         self.clicks.reset();
         self.click_run = 1;
-        // A listing supersedes whatever the last row press had to say about itself.
-        self.notice = None;
+        // A listing supersedes whatever the last row press had to say about itself — unless what
+        // asked for it was a drive going, which is said once the tab it moved has arrived.
+        self.notice = self.arrival_notice.take();
         // **And a question about a directory you have left is not a question worth keeping**
         // (PR #268 review, blocking 2 and 3). Resolving the target at `choose` time is what
         // makes the *operation* correct; this is what stops the browser sitting in a mode whose
@@ -1234,8 +1335,11 @@ impl App {
             Msg::Quit => self.quit = true,
             Msg::Choose(a) => self.choose(a),
             Msg::SelectTab(k) => {
-                if self.panes.iter().any(|p| p.key == k) {
+                if let Some(p) = self.panes.iter_mut().find(|p| p.key == k) {
                     self.current = k;
+                    if core::mem::take(&mut p.relist) {
+                        self.goto = Some(p.path.clone());
+                    }
                 }
             }
             // **A new tab opens where you are**, not at `HOME`. Opening a second view of the
@@ -1252,6 +1356,7 @@ impl App {
                     list: ListState::default(),
                     order: libfs::Order::default(),
                     show_hidden: false,
+                    relist: false,
                 });
                 self.current = key;
                 // The listing is a syscall, so the new pane starts empty and asks for one.
@@ -1298,6 +1403,22 @@ impl App {
             Msg::Place(key) => {
                 if let Some(p) = place_of(key).and_then(|i| self.places().into_iter().nth(i)) {
                     self.goto = Some(p.path);
+                }
+            }
+            // **The button before the row**, since its range is above the rows'. An eject is the
+            // binary's to send; a removable drive's alone, which is the only kind drawn with a
+            // button, and asked again here because a key is a number anything could send.
+            Msg::Drive(key) => {
+                if let Some(n) = key.checked_sub(DRIVE_EJECT_KEY) {
+                    if let Some(d) = self.drives.iter().find(|d| d.block == n && d.removable) {
+                        self.notice = Some(alloc::format!("ejecting {}\u{2026}", d.name));
+                        self.eject = Some(d.name.clone());
+                        self.ejecting = Some(d.name.clone());
+                    }
+                } else if let Some(n) = key.checked_sub(DRIVE_ROW_KEY)
+                    && let Some(d) = self.drives.iter().find(|d| d.block == n)
+                {
+                    self.goto = Some(d.path());
                 }
             }
             Msg::CutFiles | Msg::CopyFiles => {
@@ -1693,6 +1814,72 @@ impl App {
     pub fn picked_name(&self) -> Option<String> {
         let p = self.pane();
         p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone())
+    }
+
+    /// **The drives, as the storage service's table now lists them** (Phase 6 Part F). A drive
+    /// that has gone takes every tab inside it home: the current one by a listing the binary
+    /// owes, the rest when chosen. If it went because this window ejected it, that is what the
+    /// strip says; otherwise that it is gone, when a tab was on it.
+    pub fn set_drives(&mut self, drives: Vec<Drive>) {
+        let gone: Vec<Drive> =
+            self.drives.iter().filter(|d| !drives.iter().any(|n| n.name == d.name)).cloned().collect();
+        self.drives = drives;
+        for d in gone {
+            let at = d.path();
+            let inside = |p: &str| p == at || p.strip_prefix(at.as_str()).is_some_and(|rest| rest.starts_with('/'));
+            let (mut current, mut others) = (false, 0);
+            for p in self.panes.iter_mut().filter(|p| inside(&p.path)) {
+                p.path = self.home.clone();
+                p.entries.clear();
+                p.list = ListState::default();
+                if p.key == self.current {
+                    current = true;
+                } else {
+                    p.relist = true;
+                    others += 1;
+                }
+            }
+            let ejected = self.ejecting.as_deref() == Some(d.name.as_str());
+            if ejected {
+                self.ejecting = None;
+            }
+            let said = match (ejected, current, others) {
+                (true, ..) => alloc::format!("{} ejected: it can be removed", d.name),
+                (false, true, _) => alloc::format!("{} is gone, so this tab went home", d.name),
+                (false, false, 1) => alloc::format!("{} is gone, so a tab on it went home", d.name),
+                (false, false, n) if n > 1 => alloc::format!("{} is gone, so the tabs on it went home", d.name),
+                _ => continue,
+            };
+            if current {
+                self.goto = Some(self.home.clone());
+                self.arrival_notice = Some(said.clone());
+            }
+            self.notice = Some(said);
+        }
+    }
+
+    /// The drives the sidebar lists.
+    pub fn drives(&self) -> &[Drive] {
+        &self.drives
+    }
+
+    /// The drive the binary owes an `Eject` for, by its mount name. Clears the record.
+    pub fn take_eject(&mut self) -> Option<String> {
+        self.eject.take()
+    }
+
+    /// What the storage service answered an `Eject` of `name`: `Ok`, or its reason. A drive
+    /// ejected is said so here, and again when the table no longer lists it.
+    pub fn ejected(&mut self, name: &str, answer: Result<(), &str>) {
+        match answer {
+            Ok(()) => self.notice = Some(alloc::format!("{name} ejected: it can be removed")),
+            Err(why) => {
+                if self.ejecting.as_deref() == Some(name) {
+                    self.ejecting = None;
+                }
+                self.notice = Some(alloc::format!("{name} not ejected: {why}"));
+            }
+        }
     }
 
     /// The common locations the sidebar offers — `libfs::places` for this window's home.
@@ -2590,6 +2777,7 @@ impl App {
                 cells: &cells[n][..],
                 // **The design's mark**: a folder in the accent, a file in the line colour.
                 swatch: Some(Swatch::block(if entry.is_dir { ui.accent } else { ui.border })),
+                button: None,
             });
         }
         let h = self.list_h();
@@ -2625,6 +2813,7 @@ impl App {
                 // which is the only warning a person gets before walking out of their own home
                 // directory into the system's.
                 swatch: Some(Swatch::dot(if p.path == "/" { ui.deny } else { ui.ok })),
+                button: None,
             })
             .collect();
         self.sidebar.selected = here;
@@ -2632,12 +2821,15 @@ impl App {
         // margin on each side — the obligation `list_view` states, and the one thing a margin
         // around a scrolling widget is easy to get wrong.
         let side_h = (h + HEADER_H).saturating_sub(2 * SIDEBAR_PAD);
-        let sidebar = list_view(
+        // **The places take the whole column until there is a drive** (Phase 6 Part F), and then
+        // as many rows as they have, with the drives under a heading below them.
+        let places_h = if self.drives.is_empty() { side_h } else { (side_rows.len() as u32 * ROW_H).min(side_h) };
+        let places = list_view(
             &side_rows,
             // The places have a name and a dot and nothing else to line up.
             &[],
             &mut self.sidebar,
-            side_h,
+            places_h,
             ROW_H,
             place_row,
             None,
@@ -2649,6 +2841,49 @@ impl App {
             Some(ui.sidebar),
             &ui,
         );
+        let mut side = alloc::vec![sized(Size::new(0, places_h), places).key(PLACES_KEY)];
+        if !self.drives.is_empty() {
+            // **Every mount under `/storage`, by the name it is mounted under**, a removable one
+            // with an eject button — as a tab carries its `×`. Highlighted where the tab is, as a
+            // place is.
+            let here_drive = self.drives.iter().position(|d| d.path() == self.pane().path);
+            let drive_rows: Vec<ListRow<'_>> = self
+                .drives
+                .iter()
+                .map(|d| ListRow {
+                    key: DRIVE_ROW_KEY + d.block,
+                    label: d.name.as_str(),
+                    swatch: Some(Swatch::dot(ui.ok)),
+                    button: d.removable.then_some(RowButton { key: DRIVE_EJECT_KEY + d.block, glyph: EJECT_GLYPH }),
+                    ..Default::default()
+                })
+                .collect();
+            self.drive_list.selected = here_drive;
+            let drives_h = side_h.saturating_sub(places_h + DRIVES_HEADING_H);
+            let drives = list_view(
+                &drive_rows,
+                &[],
+                &mut self.drive_list,
+                drives_h,
+                ROW_H,
+                drive_row,
+                None,
+                None,
+                hovered,
+                Some(ui.sidebar),
+                &ui,
+            );
+            let heading = padding(
+                Insets { left: libui::widget::ROW_PAD.left, ..Insets::all(0) },
+                center_v(ink(
+                    ui.foreground_dim,
+                    libui::element::scaled(libui::element::TextSize::Small, text("Drives")),
+                )),
+            );
+            side.push(sized(Size::new(0, DRIVES_HEADING_H), heading).key(DRIVES_HEADING_KEY));
+            side.push(sized(Size::new(0, drives_h), drives).key(DRIVES_KEY));
+        }
+        let sidebar = libui::element::stack(alloc::vec![libui::element::fill(ui.sidebar), column(side)]);
 
         // **Into the widget's space, and back out again** (PR #320 review, blocking 1). The pane
         // holds an entries index; `list_view` means a row position by `selected`, highlights by
@@ -4688,6 +4923,243 @@ mod tests {
         }
         // And a tab's base is above the sidebar's, which is the third range in this namespace.
         assert!(TAB_KEY_BASE > SIDEBAR_ROW_KEY, "tabs must stay clear of the sidebar too");
+    }
+
+    // --- drives (Phase 6 Part F) ----------------------------------------------
+
+    /// A storage table as the service writes one, column for column: a disk with nothing on it;
+    /// `init`'s root; the internal root on a live boot; **two sticks labelled `DATA`, mounted
+    /// `DATA` and `DATA-2`**; a stick with no label, mounted under its partition's name; and a
+    /// stick refused, so mounted nowhere (PR #366 review).
+    fn storage_table() -> libstream::wire::Table {
+        use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+        let mut schema = Schema::new();
+        for (name, tag) in [
+            ("name", TypeTag::String),
+            ("kind", TypeTag::String),
+            ("description", TypeTag::String),
+            ("size", TypeTag::Int),
+            ("filesystem", TypeTag::String),
+            ("label", TypeTag::String),
+            ("mounted", TypeTag::String),
+            ("by", TypeTag::String),
+            ("mode", TypeTag::String),
+            ("clean", TypeTag::Bool),
+            ("removable", TypeTag::Bool),
+        ] {
+            schema = schema.field(name, tag, TypeModifiers::NONE);
+        }
+        let s = |v: &str| Value::Str(String::from(v));
+        let row = |n: &str, fs: Value, label: Value, at: Value, removable: bool| {
+            alloc::vec![
+                s(n), s("partition"), Value::Null, Value::Int(1 << 20), fs, label, at,
+                Value::Null, Value::Null, Value::Null, Value::Bool(removable),
+            ]
+        };
+        let rows = alloc::vec![
+            row("blk-0", Value::Null, Value::Null, Value::Null, false),
+            row("blk-2", s("ext4"), Value::Null, s("/"), false),
+            row("blk-3", s("ext4"), s("nitrox-root"), s("/storage/nitrox-root"), false),
+            row("blk-5", s("fat"), s("DATA"), s("/storage/DATA"), true),
+            row("blk-7", s("fat"), s("DATA"), s("/storage/DATA-2"), true),
+            row("blk-9", s("fat"), Value::Null, s("/storage/partition 1"), true),
+            row("blk-11", s("fat"), s("SMALL"), Value::Null, true),
+        ];
+        libstream::wire::Table { flags: StreamFlags::NONE, schema, rows }
+    }
+
+    /// **The drives are every mount under `/storage`, by the name it is mounted under** — not
+    /// `init`'s root, not a device with nothing mounted, and never by the filesystem's label, which
+    /// two sticks share here and one lacks.
+    #[test]
+    fn the_drives_are_every_mount_under_storage_by_its_mount_name() {
+        let d = |name: &str, block, removable| Drive { name: String::from(name), block, removable };
+        assert_eq!(
+            drives(&storage_table()),
+            alloc::vec![
+                d("nitrox-root", 3, false),
+                d("DATA", 5, true),
+                d("DATA-2", 7, true),
+                d("partition 1", 9, true),
+            ]
+        );
+        assert_eq!(drives(&storage_table())[1].path(), "/storage/DATA");
+        let mut old = storage_table();
+        old.schema.fields.retain(|f| f.name != "mounted");
+        assert_eq!(drives(&old), alloc::vec![], "a table without the column lists nothing");
+    }
+
+    /// A browser with the fixture's drives, laid out as the binary lays one out.
+    fn with_drives() -> App {
+        let mut a = app();
+        a.set_drives(drives(&storage_table()));
+        a
+    }
+
+    /// **An eject button on a removable drive's row, and on no other** — not on the internal
+    /// disk's, and never on a place's.
+    #[test]
+    fn a_removable_drive_has_an_eject_button_and_an_internal_one_none() {
+        let mut a = with_drives();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let e = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+        for n in [3, 5, 7, 9] {
+            assert!(libui::layout::locate(&e, &l, DRIVE_ROW_KEY + n).is_some(), "drive {n} has a row");
+        }
+        for n in [5, 7, 9] {
+            assert!(libui::layout::locate(&e, &l, DRIVE_EJECT_KEY + n).is_some(), "drive {n} has a button");
+        }
+        assert!(libui::layout::locate(&e, &l, DRIVE_EJECT_KEY + 3).is_none(), "the internal disk has none");
+        assert_eq!(libui::layout::locate(&e, &l, DRIVE_ROW_KEY + 11), None, "a stick mounted nowhere is no drive");
+    }
+
+    /// Route a click at the centre of whatever is keyed `key`, through the real tree and router,
+    /// and hand what it produced to the browser.
+    fn click_key(a: &mut App, key: u64) {
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let e = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let at = libui::layout::locate(&e, &l, key).expect("keyed");
+        let mut r = libui::route::Router::new();
+        for pressed in [true, false] {
+            let ev = librsproto::surface::PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { librsproto::surface::POINTER_PRESSED } else { 0 },
+                x: at.origin.x + at.size.w as i32 / 2,
+                y: at.origin.y + at.size.h as i32 / 2,
+                ..Default::default()
+            };
+            for m in r.pointer(&tree, &e, &l, ev).0 {
+                a.update(m);
+            }
+        }
+    }
+
+    /// **A press on a drive's button ejects that drive, by its mount name; a press on its row
+    /// opens it** — through the real tree and router, so the wiring is what is tested. `DATA-2`'s
+    /// button ejects `DATA-2`, not the other `DATA`.
+    #[test]
+    fn a_press_on_a_drives_button_ejects_it_and_on_its_row_opens_it() {
+        let mut a = with_drives();
+        click_key(&mut a, DRIVE_EJECT_KEY + 7);
+        assert_eq!(a.take_eject().as_deref(), Some("DATA-2"));
+        assert_eq!(a.take_goto(), None, "and goes nowhere");
+        assert_eq!(a.notice.as_deref(), Some("ejecting DATA-2\u{2026}"));
+        click_key(&mut a, DRIVE_EJECT_KEY + 9);
+        assert_eq!(a.take_eject().as_deref(), Some("partition 1"), "an unlabelled stick, by its mount name");
+        click_key(&mut a, DRIVE_ROW_KEY + 5);
+        assert_eq!(a.take_goto().as_deref(), Some("/storage/DATA"));
+        assert_eq!(a.take_eject(), None);
+        // **The internal disk's key, sent anyway**, is refused here as well as by the service.
+        a.update(Msg::Drive(DRIVE_EJECT_KEY + 3));
+        assert_eq!(a.take_eject(), None);
+        // The tab is highlighted in Drives when it is on one, as a place is.
+        a.show("/storage/DATA", alloc::vec![]);
+        let _ = a.view(&UiTheme::default(), None);
+        assert_eq!((a.drive_list.selected, a.sidebar.selected), (Some(1), None));
+    }
+
+    /// **An eject refused says why; one done says the drive can be removed**, and says it still
+    /// when the table no longer lists the drive and the tab that was on it has gone home.
+    #[test]
+    fn an_eject_is_answered_in_the_strip() {
+        let mut a = with_drives();
+        a.update(Msg::Drive(DRIVE_EJECT_KEY + 5));
+        let _ = a.take_eject();
+        a.ejected("DATA", Err("a file on it is still open or mapped"));
+        assert_eq!(a.notice.as_deref(), Some("DATA not ejected: a file on it is still open or mapped"));
+
+        a.show("/storage/DATA", alloc::vec![]);
+        a.update(Msg::Drive(DRIVE_EJECT_KEY + 5));
+        let _ = a.take_eject();
+        a.ejected("DATA", Ok(()));
+        assert_eq!(a.notice.as_deref(), Some("DATA ejected: it can be removed"));
+        a.set_drives(drives(&storage_table()).into_iter().filter(|d| d.name != "DATA").collect());
+        assert_eq!(a.take_goto().as_deref(), Some("/home"), "the tab on it goes home");
+        a.show("/home", alloc::vec![]);
+        assert_eq!(a.notice.as_deref(), Some("DATA ejected: it can be removed"), "said past the listing");
+    }
+
+    /// **A drive that goes takes every tab inside it home**: the current one by a listing now, with
+    /// a notice that outlives that listing; another when it is chosen. A tab on `DATA-2` is not
+    /// inside `DATA`, nor is one at home.
+    #[test]
+    fn a_drive_that_goes_takes_its_tabs_home() {
+        let mut a = with_drives();
+        let tab_at = |a: &mut App, path: &str| {
+            a.update(Msg::NewTab);
+            let _ = a.take_goto();
+            a.show(path, alloc::vec![Entry::file("x")]);
+            a.current_tab()
+        };
+        let at_home = a.current_tab();
+        let inside = tab_at(&mut a, "/storage/DATA");
+        let other = tab_at(&mut a, "/storage/DATA-2");
+        let current = tab_at(&mut a, "/storage/DATA/deeper");
+        a.set_drives(drives(&storage_table()).into_iter().filter(|d| d.name != "DATA").collect());
+        assert_eq!(a.take_goto().as_deref(), Some("/home"), "the current tab is read at home");
+        assert_eq!(a.path(), "/home");
+        a.show("/home", alloc::vec![Entry::file("notes.txt")]);
+        assert_eq!(a.notice.as_deref(), Some("DATA is gone, so this tab went home"));
+        assert_eq!(a.current_tab(), current);
+        // The other tab inside it, home when chosen — and read then, once.
+        a.update(Msg::SelectTab(inside));
+        assert_eq!(a.path(), "/home");
+        assert_eq!(a.take_goto().as_deref(), Some("/home"));
+        a.update(Msg::SelectTab(current));
+        a.update(Msg::SelectTab(inside));
+        assert_eq!(a.take_goto(), None, "read once");
+        // Not a tab on DATA-2, nor one at home.
+        a.update(Msg::SelectTab(other));
+        assert_eq!(a.take_goto(), None);
+        assert_eq!(a.path(), "/storage/DATA-2");
+        a.update(Msg::SelectTab(at_home));
+        assert_eq!(a.take_goto(), None);
+        // **A stick pulled with no tab on it** says nothing.
+        a.notice = None;
+        a.set_drives(drives(&storage_table()).into_iter().filter(|d| d.name == "nitrox-root").collect());
+        assert_eq!(a.notice.as_deref(), Some("DATA-2 is gone, so a tab on it went home"));
+        a.notice = None;
+        a.set_drives(alloc::vec![]);
+        assert_eq!(a.notice, None);
+    }
+
+    /// The drives' keys share nothing with the places', the listing's, the tabs' or the chrome's —
+    /// as ranges, for a device index up to the bound [`drives`] keeps.
+    #[test]
+    fn a_drive_lights_nothing_else() {
+        let top = (1u64 << 60) - 1;
+        for base in [DRIVE_ROW_KEY, DRIVE_EJECT_KEY] {
+            assert!(base > SIDEBAR_ROW_KEY + (1 << 40), "clear of every place");
+            assert!(base + top < TAB_KEY_BASE, "and below the tabs");
+            assert!(place_of(base).is_none_or(|i| i >= 1 << 40), "a drive is no place");
+        }
+        assert!(DRIVE_ROW_KEY + top < DRIVE_EJECT_KEY, "rows and buttons never meet");
+        for k in [PLACES_KEY, DRIVES_HEADING_KEY, DRIVES_KEY] {
+            for chrome in [LIST_KEY, UP_KEY, TITLE_KEY, GRIP_KEY, STRIP_KEY, PATH_KEY, NOTICE_KEY, SIDEBAR_KEY,
+                PROPS_KEY, HEADER_KEY, STATUS_KEY, LIST_PANE_KEY, SEARCH_KEY, TAB_STRIP_KEY, BAR_KEY, PROMPT_KEY,
+                STRIP_INNER_KEY]
+            {
+                assert_ne!(k, chrome);
+            }
+        }
+        let mut a = with_drives();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let mut tree = libui::diff::Tree::new();
+        for drives in [alloc::vec![], drives(&storage_table()), alloc::vec![]] {
+            a.set_drives(drives);
+            let e = a.view(&UiTheme::default(), None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).expect("the sidebar diffs as drives come and go");
+        }
     }
 
     // --- properties (M14 Part D) ---------------------------------------------

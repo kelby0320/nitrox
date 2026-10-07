@@ -116,12 +116,12 @@ pub enum Msg {
 /// that keyed by index would still look right here and a *diff* test elsewhere would catch it;
 /// this gate is about pixels.
 const ROWS: [ListRow<'static>; 6] = [
-    ListRow { key: 41, label: "alpha", marked: false, cells: &[], swatch: None },
-    ListRow { key: 42, label: "beta", marked: false, cells: &[], swatch: None },
-    ListRow { key: 43, label: "gamma", marked: false, cells: &[], swatch: None },
-    ListRow { key: 44, label: "delta", marked: false, cells: &[], swatch: None },
-    ListRow { key: 45, label: "epsilon", marked: false, cells: &[], swatch: None },
-    ListRow { key: 46, label: "zeta", marked: false, cells: &[], swatch: None },
+    ListRow { key: 41, label: "alpha", marked: false, cells: &[], swatch: None, button: None },
+    ListRow { key: 42, label: "beta", marked: false, cells: &[], swatch: None, button: None },
+    ListRow { key: 43, label: "gamma", marked: false, cells: &[], swatch: None, button: None },
+    ListRow { key: 44, label: "delta", marked: false, cells: &[], swatch: None, button: None },
+    ListRow { key: 45, label: "epsilon", marked: false, cells: &[], swatch: None, button: None },
+    ListRow { key: 46, label: "zeta", marked: false, cells: &[], swatch: None, button: None },
 ];
 
 /// How tall each list row is, and how tall the list is — three rows of six visible.
