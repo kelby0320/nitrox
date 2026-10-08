@@ -1730,6 +1730,19 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > stick are timed on the laptop; what dominates is fixed; and only then does the phase's Definition
 > of Done get its number. `fs-server-fat`'s write path batches from its first version, so the new
 > server is not one more suspect.
+>
+> **Detailed** (2026-10-08, [`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*):
+> `time` and I/O counters, the laptop measured beside Linux on the same machine, and the cost that
+> dominates fixed and measured again — below the syscall surface.
+
+**A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
+whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
+only, and unmapping leaves a file's pages with its page-cache object until the object drops, so a
+windowed copy would still hold every page. A stick's photos and videos are over it. **Scheduled**
+(2026-10-08, the maintainer's call): the syscall consolidation between Phases 6 and 7, where a
+copy is `sys_io_submit` on two files and the kernel streams it a window at a time
+([`syscall-surface.md`](../planning/syscall-surface.md)). A `SYS_FILE_COPY` for Part H was turned
+down: named for files, a special case, and code the consolidation would replace.
 
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 

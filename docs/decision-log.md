@@ -34879,3 +34879,53 @@ test — 23 mutations, 4 survived — and every finding stood.
   a character boundary, and declines only a buffer too short for its prefix; every server had
   sent what it returned or nothing, and `service-mgr` passes reasons it builds into a 160-byte
   buffer. The storage service also sizes each refusal to its reason.
+
+## 2026-10-08 — Phase 6 Part H, detailed: copy throughput, and the syscall surface reviewed
+
+Part H's detail pass (`docs/planning/phase-6-usb.md` § *Part H in detail*): **copy throughput,
+found by measurement on the laptop, fixed where it is worst, and a number.** It builds `time` and
+I/O counters, says how the laptop and Linux on it are measured, and how the measurement picks the
+fix. It guesses at no cause.
+
+**What the pass found, by reading:**
+- **A one-file copy is about twenty syscalls**: the source resolved twice, the destination's
+  existence asked, a create that grows it, two whole-file mappings, a `memcpy`, two unmaps and a
+  blocking sync.
+- **Underneath, each 4 KiB is several waited-for device round trips**: the page cache fills a page
+  per fault and writes back a page per IRP; `fs-server-ext4` allocates and frees block by block,
+  each block reading and writing its descriptor, bitmap and superblock and zeroed on the device;
+  and a destination page is, as read, filled from those zeroes before the copy overwrites it.
+- **`copy` refuses a file over 8 MiB**, and lifting it needs kernel work: `sys_memory_map` maps a
+  file from offset 0 only, and unmapping leaves a file's pages with its page-cache object.
+
+**The maintainer's calls:**
+- **`time` and I/O counters** to measure with — per block device by its driver, commands, bytes
+  and busy time; the page cache's fills and write-backs — read by a session as
+  `/dev/devices/io.tsm`. Not counters in the servers; not `time` alone.
+- **The number is set against Linux on the same laptop and stick**, as a ratio chosen once both
+  are measured.
+- **Fix what dominates, measure again, and repeat** while one cost dominates and the number is not
+  met; each fix held by a count, never a time.
+- **The 8 MiB limit is not Part H's.** The first answer was to lift it here. When the kernel work
+  showed, a `SYS_FILE_COPY` was proposed — a range between two handles — and the maintainer pointed
+  out that **its name still said it worked on files only**: a special case dressed as a general
+  call. A copy through `sys_io_submit`, with a file as resource and as buffer, was the orthogonal
+  alternative, and it belongs to a change of the syscall surface, which the maintainer would not
+  bring inside a performance investigation. Code replaced as soon as written was the other cost.
+  So Part H stays **below the syscall surface**, measures files of up to 8 MiB — which the 180 MB
+  of 2026-09-17 was made of — and hands whatever only the surface can fix to the consolidation.
+- **The syscall surface is reviewed now and consolidated between Phase 6 and Phase 7**
+  (`docs/planning/syscall-surface.md`). The maintainer suspected drift from the original design's
+  "~30 entries … all I/O goes through `sys_io_submit`", and the review found it: forty-two
+  numbered calls, of which **`file_create`, `file_grow`, `file_truncate` and `file_rename` are one
+  call** — each `sys_ns_lookup` with a different `ResolveOp` in the kernel's dispatch; **two
+  syncs block** inside the syscall under a documented exemption from async-first; **entropy is
+  reachable twice**, a create beside `/dev/entropy` and a read of its own beside `io_submit`;
+  and **`ns_derive` and `ns_held` fold** into a create and a flush. About thirty-two after, and a
+  copy then needs no new number. The maintainer's other question — which syscall paths are
+  heaviest — is part of that plan.
+
+**Calls made in this pass:** `time` prints the counters' deltas with the time, so a run is one
+line on the screen; counting at the driver, so busy time is the device's own; a tree written by
+`cargo xtask throughput-stick` — 8 MiB files, sixteen-kilobyte files four thousand to a directory,
+and a home's shape — the same every run; and no gate holds a time, only counts.
