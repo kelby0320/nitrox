@@ -62,10 +62,10 @@ use librsproto::namespace::{
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use librsproto::storage::{
-    OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_in_use,
-    parse_mount,
+    OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT,
+    build_in_use, parse_mount,
 };
-use storage_service::mounts::{self, Plan, Server, automount, explicit, in_use};
+use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
@@ -651,6 +651,23 @@ fn flush(node: u64) -> bool {
     po >= 0 && po_wait(po as u64).0 == 0
 }
 
+/// **Have the kernel read a disk's partition table again** (`IoOpcode::Rescan`, Phase 6 Part G):
+/// its partitions depart and those its table now holds are published, as arrivals this service
+/// reads from its subscription after. How many were published, or the kernel's refusal —
+/// `Unsupported` for every disk but a USB disk's. Needs `WRITE` on the node, as `Flush` does.
+fn rescan(node: u64) -> Result<u64, KError> {
+    let op = IoOp { opcode: IO_OPCODE_RESCAN, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
+    if po < 0 {
+        return Err(KError::from_i32(po as i32));
+    }
+    match po_wait(po as u64) {
+        (0, published) => Ok(published),
+        (status, _) => Err(KError::from_i32(status as i32)),
+    }
+}
+
 /// Mount `plan`'s device, whose node is `node`: spawn a server over it, and build its namespace.
 /// The server gets a duplicate of the node; this service keeps its own, for the flush that ends an
 /// unmount and for a later mount of the same device.
@@ -938,9 +955,12 @@ impl Service {
         self.watches.changed(ping).into_iter().for_each(close);
     }
 
-    /// The names mounted under `/storage`, in order: what a watch is told has changed.
-    fn mount_names(&self) -> Vec<String> {
-        self.mounted.iter().map(|m| m.label.clone()).collect()
+    /// **What a watch is told has changed**: the names mounted under `/storage`, in order, and the
+    /// devices there are — since Phase 6 Part G, when a partition a rescan published holding
+    /// nothing changes no mount, and `disk --partition` waits for its row.
+    fn watched(&self) -> (Vec<String>, Vec<u32>) {
+        let names = self.mounted.iter().map(|m| m.label.clone()).collect();
+        (names, self.devices.iter().map(|d| d.record.id).collect())
     }
 
     /// One `Eject` on media session `i` (Phase 6 Part F): the unmount chain, held check included,
@@ -1068,6 +1088,17 @@ impl Service {
                     Err((err, why)) => refuse(err, why),
                 }
             }
+            OP_STORAGE_REREAD => {
+                let Ok(name) = core::str::from_utf8(&m.body) else {
+                    return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
+                };
+                match self.reread(name) {
+                    Ok(names) => {
+                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
+                    }
+                    Err((err, why)) => refuse(err, why),
+                }
+            }
             OP_STORAGE_IN_USE => {
                 // **Not answered unless `init`'s mounts are known**: an answer would leave out a
                 // root it could not place, and the view broker would hand that disk over raw. The
@@ -1102,6 +1133,58 @@ impl Service {
         Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(b" (rw), as asked").end();
         self.mounted.push(m);
         Ok(plan.label)
+    }
+
+    /// **An administrator's `Reread`** (Phase 6 Part G): the device called `name` read again after
+    /// `disk` wrote it, and mounted by an arrival's rules; the names it was mounted under, or why
+    /// not. **A disk is rescanned first**, and its new partitions are mounted when they arrive, after
+    /// the reply: the kernel publishes them, and the device manager passes them on.
+    fn reread(&mut self, name: &str) -> Result<Vec<String>, (KError, &'static [u8])> {
+        let what = mounts::reread(&self.devices, &self.all_mounts(), self.init_known, name)
+            .map_err(|r| (r.kerror(), r.why()))?;
+        let (Reread::Partition(id) | Reread::Disk(id)) = what;
+        let Some(&(_, node)) = self.nodes.iter().find(|(d, _)| *d == id) else {
+            return Err((KError::NotFound, b"this service holds no node for it"));
+        };
+        if let Reread::Disk(_) = what {
+            match rescan(node) {
+                Ok(n) => Line::new().s(b"storage-service: ").s(name.as_bytes()).s(b" rescanned, as asked: ").u(n).s(b" partition(s)").end(),
+                Err(KError::Unsupported) => {
+                    let r = RereadRefusal::CannotRescan;
+                    return Err((r.kerror(), r.why()));
+                }
+                Err(err) => return Err((err, b"the kernel could not read its partition table again")),
+            }
+        }
+        self.refresh(id);
+        let Some(d) = self.devices.iter().find(|d| d.record.id == id).cloned() else {
+            return Err((KError::NotFound, b"it departed as it was read"));
+        };
+        let names = self.mount_as_arrival(&d, node);
+        report(&d, &self.all_mounts(), &self.devices);
+        Ok(names)
+    }
+
+    /// **Mount `d` by an arrival's rules** beside the mounts there are — a device that arrived, or
+    /// one read again — through `node`; the names it was mounted under. A mount that fails is said.
+    fn mount_as_arrival(&mut self, d: &Device, node: u64) -> Vec<String> {
+        let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
+        let plan = mounts::arrival(core::slice::from_ref(d), &self.devices, &self.all_mounts(), &taken, self.live, self.init_known);
+        let mut names = Vec::new();
+        for p in plan {
+            if self.mounted.len() >= MAX_MOUNTS {
+                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: every mount slot is in use").end();
+                break;
+            }
+            match mount(self.root_ns, &p, node) {
+                Ok(m) => {
+                    names.push(m.label.clone());
+                    self.mounted.push(m);
+                }
+                Err(why) => Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end(),
+            }
+        }
+        names
     }
 
     /// **Unmount `label`: the chain**, each link only once the one before it held. An `Err` names
@@ -1320,25 +1403,7 @@ impl Service {
         let d = Device { found, record };
         self.devices.push(d.clone());
         self.nodes.push((record.id, node));
-        let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
-        let plan = storage_service::mounts::arrival(
-            core::slice::from_ref(&d),
-            &self.devices,
-            &self.all_mounts(),
-            &taken,
-            self.live,
-            self.init_known,
-        );
-        for p in plan {
-            if self.mounted.len() >= MAX_MOUNTS {
-                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: every mount slot is in use").end();
-                break;
-            }
-            match mount(self.root_ns, &p, node) {
-                Ok(m) => self.mounted.push(m),
-                Err(why) => Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end(),
-            }
-        }
+        self.mount_as_arrival(&d, node);
         report(&d, &self.all_mounts(), &self.devices);
     }
 
@@ -1388,8 +1453,8 @@ impl Service {
 
 /// Say what one device holds, and whose it is. How a filesystem was left is not said while it is
 /// mounted writable, for the reason the table's `clean` is `Null` then: its state says "in use".
-/// **A FAT that is not mounted says why** (Phase 6 Part E.5): what its server would refuse it for,
-/// or that its disk is not removable.
+/// **A device not mounted says why** (Phase 6 Part E.5; [`mounts::unmounted_why`] since Part G):
+/// what its server would refuse a FAT for, that its disk is not removable, and the rest.
 fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     let r = &d.record;
     let mount = mounts.iter().find(|m| m.device == r.id);
@@ -1426,18 +1491,11 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     if let Some(m) = mount {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
-    } else if let Found::Fat { refused: Some(why), .. } = &d.found {
-        line.s(b"; not served: ").s(why.as_bytes());
-    } else if storage_service::mounts::is_install_source(d) {
+    } else if let Some(why) = mounts::unmounted_why(d, all) {
         // **Said, not left to an absence** (administration Part G.1): a gate can then match the
-        // reason the pristine root was passed over, rather than only fail to find its mount.
-        line.s(b"; the installer's source, left unmounted");
-    } else if storage_service::mounts::on_boot_medium(d, all) {
-        // And the disk the machine started from (Phase 6 Part D), for the same reason.
-        line.s(b"; on the disk the machine started from, passed over");
-    } else if d.found.server() == Some(Server::Fat) && !storage_service::mounts::removable(d, all) {
-        // And a FAT an administrator may mount, but that nothing mounts by itself (Part E.5).
-        line.s(b"; not removable, so not mounted");
+        // reason a device was passed over, rather than only fail to find its mount. The table's
+        // `note` gives the same words (Phase 6 Part G).
+        line.s(b"; ").s(why.as_bytes());
     }
     line.end();
 }
@@ -1615,10 +1673,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             }
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
-        // **What a watch is told** (Phase 6 Part F): the names mounted before this turn, against
-        // after it. Compared here, once, rather than at each place that mounts or unmounts, so no
-        // path — an arrival, an eject, an administrator's request, a departure — can miss a ping.
-        let before = s.mount_names();
+        // **What a watch is told** (Phase 6 Part F): the names mounted and the devices there are
+        // before this turn, against after it. Compared here, once, rather than at each place that
+        // mounts, unmounts or follows a device, so no path — an arrival, an eject, an
+        // administrator's request, a departure — can miss a ping.
+        let before = s.watched();
         for j in 0..waited.max(0) as usize {
             // SAFETY: `waited` records were written; the handle is the first word of each.
             let h = unsafe {
@@ -1663,7 +1722,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                 s.serve_dir(i);
             }
         }
-        if s.mount_names() != before {
+        if s.watched() != before {
             s.mounts_changed();
         }
     }

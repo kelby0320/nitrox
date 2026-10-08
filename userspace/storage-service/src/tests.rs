@@ -946,3 +946,107 @@ fn the_watches_keep_the_living_and_free_the_gone() {
     }), std::vec![] as std::vec::Vec<u64>);
     assert_eq!(pinged, MAX_WATCHES, "a change pings every watcher");
 }
+
+// --- read again, and why not mounted (Phase 6 Part G) -------------------------------------------
+
+/// **Each `Reread` refusal, at the device it is about**: a partition mounted, and a disk with
+/// anything on it mounted, `WouldBlock`; **a partition beside a mounted sibling taken** (PR #368
+/// review), as the `disks` grant gives it out; anything on the disk the machine started from
+/// `NoAccess` — but `WouldBlock` when something on it is mounted, which is asked first; a name
+/// nothing has `NotFound`; and `init`'s mounts unknown `NoAccess`.
+#[test]
+fn a_reread_is_refused_while_mounted_and_on_the_boot_disk() {
+    use crate::mounts::{Reread, RereadRefusal, reread};
+    use libkern::KError;
+    let ds = devices();
+    let root = init_root();
+    assert_eq!(reread(&ds, &root, true, "blk-3"), Err(RereadRefusal::Mounted), "init's root");
+    assert_eq!(reread(&ds, &root, true, "blk-0"), Err(RereadRefusal::Mounted), "the disk holding it");
+    assert_eq!(reread(&ds, &root, true, "blk-2"), Ok(Reread::Partition(6)), "the root's sibling");
+    assert_eq!(reread(&ds, &root, true, "blk-1"), Ok(Reread::Disk(5)), "a RAM disk is a disk");
+    assert_eq!(reread(&ds, &root, true, "blk-4"), Ok(Reread::Partition(8)));
+    let live = [Mounted { device: 8, at: String::from("/storage/nitrox-live"), by: By::Storage, mode: Mode::Ro }];
+    assert_eq!(reread(&ds, &live, true, "blk-1"), Err(RereadRefusal::Mounted), "its partition, mounted");
+    assert_eq!(reread(&ds, &live, true, "blk-4"), Err(RereadRefusal::Mounted));
+    assert_eq!(reread(&ds, &live, true, "blk-0"), Ok(Reread::Disk(3)), "nothing on it mounted");
+    assert_eq!(reread(&ds, &root, true, "blk-9"), Err(RereadRefusal::NoSuchDevice));
+    assert_eq!(reread(&ds, &[], false, "blk-4"), Err(RereadRefusal::InitUnknown));
+
+    let mut booted = devices();
+    booted[0].record.flags |= libkern::device::BOOT;
+    assert_eq!(reread(&booted, &[], true, "blk-0"), Err(RereadRefusal::BootDisk));
+    assert_eq!(reread(&booted, &[], true, "blk-2"), Err(RereadRefusal::BootDisk), "a partition of it");
+    assert_eq!(reread(&booted, &root, true, "blk-0"), Err(RereadRefusal::Mounted), "mounted is asked first");
+    assert_eq!(reread(&booted, &root, true, "blk-2"), Err(RereadRefusal::BootDisk), "a sibling still on it");
+    assert_eq!(reread(&booted, &[], true, "blk-1"), Ok(Reread::Disk(5)), "another disk");
+
+    let kerrors = [
+        (RereadRefusal::InitUnknown, KError::NoAccess),
+        (RereadRefusal::NoSuchDevice, KError::NotFound),
+        (RereadRefusal::Mounted, KError::WouldBlock),
+        (RereadRefusal::BootDisk, KError::NoAccess),
+        (RereadRefusal::CannotRescan, KError::Unsupported),
+    ];
+    for (r, k) in kerrors {
+        assert_eq!(r.kerror(), k, "{r:?}");
+    }
+}
+
+/// **A device read again is planned as an arrival**: a stick's partition that held nothing, and
+/// then a FAT `disk --format` made, is mounted writable by `fs-server-fat`; an internal disk's
+/// partition formatted FAT is not mounted, and says why.
+#[test]
+fn a_device_read_again_is_planned_as_an_arrival() {
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let fat = Found::Fat { label: String::from("NITROX"), clean: Some(true), refused: None };
+    let stick = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", 4_194_304));
+    let mut ds = std::vec![
+        dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
+        dev(rec(4, DeviceKind::Partition, 1, 3, "internal", 131_072), Found::Nothing),
+        dev(stick, Found::Nothing),
+        dev(rec(21, DeviceKind::Partition, 4, 20, "partition 1 (unlabelled)", 4_192_256), Found::Nothing),
+    ];
+    let arrival = |ds: &[Device], i: usize| crate::mounts::arrival(core::slice::from_ref(&ds[i]), ds, &[], &[], false, true);
+    assert_eq!(arrival(&ds, 3), [], "nothing on it yet");
+    ds[3].found = fat.clone();
+    assert_eq!(arrival(&ds, 3), [Plan { device: 21, label: String::from("NITROX"), mode: Mode::Rw, server: Server::Fat }]);
+    ds[1].found = fat;
+    assert_eq!(arrival(&ds, 1), []);
+    assert_eq!(crate::mounts::note(&ds[1], &ds, None).as_deref(), Some("not removable, so not mounted"));
+}
+
+/// **Each `note` is the log line's reason** (`unmounted-why`), and null for a mounted filesystem and
+/// for a device holding nothing — whose log line still gives its reason: the boot stick's disk is
+/// passed over in the log, and its row says it holds no filesystem.
+#[test]
+fn each_note_is_the_log_lines_reason_and_null_where_nothing_is_kept_from_anyone() {
+    use crate::mounts::{note, unmounted_why};
+    let ds = devices();
+    let t = decode(&table::all(&ds, &init_root()));
+    let notes: Vec<&Value> = (0..t.rows.len()).map(|i| column(&t, i, "note")).collect();
+    let esp = s(&std::format!("not served: {SMALL}"));
+    assert_eq!(notes, [&Value::Null, &Value::Null, &esp, &Value::Null, &Value::Null], "the ESP alone");
+
+    let dev = |record: DeviceRecord, found: Found| Device { record, found };
+    let ext4 = Found::Ext4 { label: String::from("data"), clean: Some(true) };
+    let fat = Found::Fat { label: String::from("INTERNAL"), clean: Some(true), refused: None };
+    let mut stick = rec(20, DeviceKind::Disk, 8, 19, "the boot stick", 65_536);
+    stick.flags |= libkern::device::BOOT;
+    let all = std::vec![
+        dev(stick, Found::Nothing),
+        dev(rec(22, DeviceKind::Partition, 10, 20, "data", 16_384), ext4.clone()),
+        dev(rec(4, DeviceKind::Partition, 1, 3, "internal", 131_072), fat),
+        dev(rec(10, DeviceKind::Partition, 6, 7, libgpt::INSTALL_SOURCE_LABEL, 20_480), ext4.clone()),
+        dev(rec(5, DeviceKind::Partition, 2, 3, "unmounted by hand", 131_072), ext4),
+    ];
+    let why = |i: usize| unmounted_why(&all[i], &all);
+    let noted = |i: usize| note(&all[i], &all, None);
+    let passed = "on the disk the machine started from, passed over";
+    assert_eq!((why(0).as_deref(), noted(0)), (Some(passed), None), "the boot disk, holding a table");
+    assert_eq!(noted(1).as_deref(), Some(passed), "an ext4 on it");
+    assert_eq!(noted(2).as_deref(), Some("not removable, so not mounted"));
+    assert_eq!(noted(3).as_deref(), Some("the installer's source, left unmounted"));
+    assert_eq!((why(4), noted(4)), (None, None), "nothing kept it from being mounted but a person");
+    let at = Mounted { device: 4, at: String::from("/storage/INTERNAL"), by: By::Storage, mode: Mode::Rw };
+    assert_eq!(note(&all[2], &all, Some(&at)), None, "mounted, by hand");
+}
