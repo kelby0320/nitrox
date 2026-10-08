@@ -3280,6 +3280,81 @@ mod tests {
         assert_eq!(r.expect("a name").render(), "4");
     }
 
+    /// **The throughput stick's script, as the maintainer runs it** (Phase 6 Part H.3):
+    /// `cargo xtask throughput-stick` puts `tools/xtask/src/throughput/h3.nx` on the stick, and a
+    /// laptop with no serial port `use`s it at a prompt — where a script that does not parse, or a
+    /// set that runs the wrong copy, costs a boot to find out. Each set: its commands, their
+    /// arguments, in order, each timed but set 4's last, which removes set 1's copies so the next
+    /// round starts where this one did; its answer; and a set out of range refused.
+    #[test]
+    fn the_throughput_sticks_script_runs_each_set_timed() {
+        const H3: &str = include_str!("../../../tools/xtask/src/throughput/h3.nx");
+        let (s, h) = ("/storage/THROUGHPUT", "/home");
+        let copies = |from: &str, to: &str, prefix: &str| -> Vec<Vec<String>> {
+            ["big", "small", "tree"]
+                .iter()
+                .map(|t| {
+                    let src = if from == s { alloc::format!("{s}/{t}") } else { alloc::format!("{from}/t-{t}") };
+                    alloc::vec!["copy".into(), src, alloc::format!("{to}/{prefix}-{t}")]
+                })
+                .collect()
+        };
+        let removes = |dir: &str, prefix: &str| -> Vec<Vec<String>> {
+            ["big", "small", "tree"]
+                .iter()
+                .map(|t| alloc::vec!["remove".into(), "-r".into(), alloc::format!("{dir}/{prefix}-{t}")])
+                .collect()
+        };
+        let round_end: Vec<Vec<String>> =
+            alloc::vec![["remove", "-r", "/home/t-big", "/home/t-small", "/home/t-tree"].map(String::from).to_vec()];
+        // (set, its timed commands, its untimed ones after them, its answer)
+        let sets = [
+            (1, copies(s, h, "t"), alloc::vec![], "set 1 done: photograph the lines, then restart for set 2."),
+            (2, copies(h, h, "u"), alloc::vec![], "set 2 done: photograph the lines, then restart for set 3."),
+            (
+                3,
+                copies(h, s, "c"),
+                alloc::vec![],
+                "set 3 done: photograph the lines. Its copies can be checked on the host now.",
+            ),
+            (
+                4,
+                [removes(h, "u"), removes(s, "c")].concat(),
+                round_end,
+                "set 4 done: photograph the lines, then disk --eject THROUGHPUT. The round is over.",
+            ),
+        ];
+        let host = || {
+            MockHost::new()
+                .with_file("/storage/THROUGHPUT/h3.nx", H3)
+                .with_program("copy", None)
+                .with_program("remove", None)
+                .with_clock(1_000_000_000)
+        };
+        // Two lines at a prompt, as the maintainer types them: the import has to outlive its line.
+        let prompt = |host: MockHost, line: &str| {
+            let mut interp = Interp::with_host(Box::new(host), Mode::Repl);
+            let import = interp.run_line("use \"/storage/THROUGHPUT/h3.nx\" { run }").expect("imports");
+            assert_eq!(import, None, "an import shows nothing");
+            interp.run_line(line).map(|shown| shown.map(|s| String::from(s.trim_end())))
+        };
+        for (set, timed, untimed, answer) in sets {
+            let host = host();
+            let log = host.log();
+            let shown = prompt(host, &alloc::format!("run({set})")).expect("the set runs");
+            assert_eq!(shown.as_deref(), Some(answer), "set {set}");
+            let ran: Vec<Vec<String>> = log.borrow().runs.iter().map(|chain| chain[0].argv.clone()).collect();
+            assert_eq!(ran, [timed.clone(), untimed].concat(), "set {set}'s commands");
+            let lines = alloc::vec!["time: 1.00 s\n"; timed.len()];
+            assert_eq!(log.borrow().diagnostics, lines, "set {set}: what is timed");
+        }
+
+        let host = host();
+        let log = host.log();
+        assert!(prompt(host, "run(5)").expect_err("no set 5").message.contains("the sets are 1 to 4"));
+        assert!(log.borrow().runs.is_empty());
+    }
+
     #[test]
     fn a_single_external_stage_runs_and_its_output_becomes_a_table() {
         let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3])));

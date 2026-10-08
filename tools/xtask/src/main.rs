@@ -4814,9 +4814,10 @@ fn throughput_pattern(name: &str, len: u64) -> Vec<u8> {
 
 /// **`cargo xtask throughput-stick`** (Phase 6 Part H.2): write `tools/build-cache/throughput-stick.img`
 /// — a GiB, sparse, an MBR naming one FAT32 partition from 1 MiB with 4 KiB clusters, holding
-/// [`throughput_files`] — to write to a stick. Half of it is free, for the run that copies the tree
-/// back onto the stick. **`--check IMAGE`** reads an image — or the stick read back into one, or its
-/// device, given the permission — and checks every pattern file on it, wherever it is.
+/// [`throughput_files`] and [`THROUGHPUT_SCRIPTS`] — to write to a stick. Half of it is free, for the
+/// run that copies the tree back onto the stick. **`--check PATH`** reads an image — or the stick
+/// read back into one, its device given the permission, or the stick mounted — and checks every
+/// pattern file on it, wherever it is.
 fn cmd_throughput_stick(args: &[String]) -> R<()> {
     if let Some(i) = args.iter().position(|a| a == "--check") {
         let path = args.get(i + 1).ok_or("`--check` takes the image or device to read")?;
@@ -4846,13 +4847,22 @@ fn cmd_throughput_stick(args: &[String]) -> R<()> {
         fs::create_dir_all(src.join(dir))?;
         fs::write(src.join(dir).join(name), throughput_pattern(name, *len))?;
     }
-    run(mtools_cmd("mcopy").arg("-s").arg("-i").arg(&at).arg(src.join("big")).arg(src.join("small")).arg(src.join("tree")).arg("::"))?;
+    for (name, body) in THROUGHPUT_SCRIPTS {
+        fs::write(src.join(name), body)?;
+    }
+    let mut mcopy = mtools_cmd("mcopy");
+    mcopy.arg("-s").arg("-i").arg(&at).arg(src.join("big")).arg(src.join("small")).arg(src.join("tree"));
+    for (name, _) in THROUGHPUT_SCRIPTS {
+        mcopy.arg(src.join(name));
+    }
+    run(mcopy.arg("::"))?;
     fs::remove_dir_all(&src)?;
     let total: u64 = files.iter().map(|f| f.2).sum();
     println!(
         "xtask: the throughput stick at {}: {} files, {} MiB — big/ 32 of 8 MiB, small/ 4,096 of 16 KiB, \
-         tree/ 16 directories of 64 of 64 KiB.\n  Write it to a stick with \
-         `sudo dd if={} of=/dev/sdX bs=4M conv=fsync,nocreat`, and check the device is a block device first.",
+         tree/ 16 directories of 64 of 64 KiB — and h3.nx and linux.sh, which run the sets.\n  Write it to a \
+         stick with `sudo dd if={} of=/dev/sdX bs=4M conv=fsync,nocreat`, and check the device is a block \
+         device first.",
         path.display(),
         files.len(),
         total / MIB,
@@ -4861,21 +4871,33 @@ fn cmd_throughput_stick(args: &[String]) -> R<()> {
     Ok(())
 }
 
+/// **The scripts the stick carries** (Phase 6 Part H.3), as `(name on the stick, text)`: `h3.nx`
+/// runs the laptop's sets in `nxsh`, one a boot, and `linux.sh` the same four under Linux on the
+/// same laptop, writing its times to `RESULTS/` on the stick. The check counts them among the other
+/// files and prints what `RESULTS/` holds.
+const THROUGHPUT_SCRIPTS: [(&str, &str); 2] =
+    [("h3.nx", include_str!("throughput/h3.nx")), ("linux.sh", include_str!("throughput/linux.sh"))];
+
 /// **Every pattern file on a throughput stick, checked** (Phase 6 Part H.2): `img`'s first MBR
 /// partition — or the whole of it, with no MBR — copied off by `mcopy`, every file whose name is
 /// the stick's checked against its pattern wherever it is, and the tree `throughput-stick` wrote
 /// required whole where it wrote it. Copies the laptop's runs made are checked too, and counted.
+/// **`img` may be the stick mounted** (Part H.3) — a directory, read where the desktop put it, so
+/// the check needs no `sudo` — and what `linux.sh` wrote to `RESULTS/` is printed either way.
 fn check_throughput_stick(img: &Path) -> R<()> {
     use std::io::Read;
-    require_tool("mcopy")?;
-    let mut mbr = [0u8; 512];
-    fs::File::open(img)?.read_exact(&mut mbr)?;
-    let first = u32::from_le_bytes([mbr[454], mbr[455], mbr[456], mbr[457]]) as u64;
-    let offset = if mbr[510..512] == [0x55, 0xAA] && mbr[450] != 0 && first != 0 { first * 512 } else { 0 };
-    let out = build_cache().join("throughput-check");
-    let _ = fs::remove_dir_all(&out);
-    fs::create_dir_all(&out)?;
-    run(mtools_cmd("mcopy").arg("-s").arg("-i").arg(format!("{}@@{offset}", img.display())).arg("::/*").arg(&out))?;
+    let extracted = !img.is_dir();
+    let out = if extracted { build_cache().join("throughput-check") } else { img.to_path_buf() };
+    if extracted {
+        require_tool("mcopy")?;
+        let mut mbr = [0u8; 512];
+        fs::File::open(img)?.read_exact(&mut mbr)?;
+        let first = u32::from_le_bytes([mbr[454], mbr[455], mbr[456], mbr[457]]) as u64;
+        let offset = if mbr[510..512] == [0x55, 0xAA] && mbr[450] != 0 && first != 0 { first * 512 } else { 0 };
+        let _ = fs::remove_dir_all(&out);
+        fs::create_dir_all(&out)?;
+        run(mtools_cmd("mcopy").arg("-s").arg("-i").arg(format!("{}@@{offset}", img.display())).arg("::/*").arg(&out))?;
+    }
     let mut found: Vec<PathBuf> = Vec::new();
     let mut stack = vec![out.clone()];
     while let Some(dir) = stack.pop() {
@@ -4908,7 +4930,17 @@ fn check_throughput_stick(img: &Path) -> R<()> {
         .map(|(dir, name, _)| format!("{dir}/{name}"))
         .filter(|path| !present.contains(&path.to_ascii_uppercase()))
         .collect();
-    let _ = fs::remove_dir_all(&out);
+    let mut results: Vec<&PathBuf> = found
+        .iter()
+        .filter(|p| p.parent().and_then(|d| d.file_name()).is_some_and(|d| d.eq_ignore_ascii_case("RESULTS")))
+        .collect();
+    results.sort();
+    for p in results {
+        println!("xtask: {}:\n{}", p.strip_prefix(&out).unwrap_or(p).display(), String::from_utf8_lossy(&fs::read(p)?));
+    }
+    if extracted {
+        let _ = fs::remove_dir_all(&out);
+    }
     if !bad.is_empty() || !missing.is_empty() {
         return Err(format!(
             "the throughput stick does not check: {} files differ from their patterns (first: {:?}), \

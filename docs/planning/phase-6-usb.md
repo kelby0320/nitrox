@@ -2842,6 +2842,15 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   six reads per data block copied in, and `small/`'s cost per file growing with its directory —
   782 reads a file out of the stick's 4,096-entry FAT directory against about 29 out of `tree/`'s
   64-entry ones, and 377 on ext4.
+- **The runs scripted** (2026-10-08, at the maintainer's ask), since they are many steps and H.4's
+  loop repeats them. `throughput-stick` puts two scripts on the stick, from
+  `tools/xtask/src/throughput/`: `h3.nx`, `use`d at a prompt and run as `run(1)` to `run(4)`, a boot
+  each, set 4 also removing set 1's copies so a round ends where it began; and `linux.sh`, the same
+  four sets under Linux from a live USB, each step timed with its `sync` after the page cache is
+  dropped, its times written to `RESULTS/` on the stick. `--check` takes the stick mounted, needing
+  no `sudo`, and prints `RESULTS/`. **`time`'s lines are photographed**: `nxsh FILE` sends what a
+  script says to `kprint`, which on the laptop reaches nobody, so the script is `use`d at a prompt,
+  whose terminal shows them. That gap is fixed in this part, after the laptop's runs.
 - **H.3 The laptop**, and Linux on it: the runs above, recorded.
 - **H.4 The fix**, and the laptop again, in the loop above; each fix with its count.
 - **H.5 The number, and the docs.**

@@ -76,7 +76,8 @@ cargo xtask check-storage  # that stick beside a copy of the release disk; the h
 cargo xtask check-media    # the live desktop: a stick plugged in, shown in Files, saved to, ejected
 cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
-cargo xtask throughput-stick # the stick Part H's copies are timed with; `--check IMAGE` reads it back
+cargo xtask throughput-stick # the stick Part H's copies are timed with, and the scripts that time them
+cargo xtask throughput-stick --check PATH # read it back: an image, or the stick where it is mounted
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a

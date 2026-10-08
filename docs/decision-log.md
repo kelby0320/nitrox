@@ -35108,3 +35108,44 @@ per-file work grows with the directory, and the stick was busy 489 s of the 625.
 fresh disk showed the same before it booted: the dry run's own preparation, a `dd conv=sparse`
 writing the grown filesystem back, skips all-zero sectors and so left the bitmap's padding from
 before the grow. Prepared without it, the disk checks clean.
+
+## 2026-10-08 — Phase 6 Part H.3: the runs scripted
+
+The maintainer asked whether H.3's runs could be scripted: four sets, a boot each, the same under
+Linux, and a check of the stick — dozens of typed steps, and H.4's loop repeats them. Most of it
+can. `cargo xtask throughput-stick` now puts two scripts on the stick beside the tree, from
+`tools/xtask/src/throughput/`. **`h3.nx`** is a module `use`d at a prompt —
+`use "/storage/THROUGHPUT/h3.nx" { run }`, then `run(1)` to `run(4)`, a boot each — each command
+timed and each set saying what comes next. **`linux.sh`** runs the same four sets under Linux on the
+same laptop, stick and partition, mounting the partition itself, dropping the page cache before each
+step and timing a `sync` inside it, and writes the times to `RESULTS/` on the stick. It refuses a
+stick or partition left mid-run and removes only what it made. **`--check` reads the stick mounted**
+as well as an image, so it needs no `sudo`, and prints what `RESULTS/` holds.
+
+**What stays by hand**: the reinstall, which asks its questions; a restart and a graphical login per
+set, as the plan has it — though the page cache keeps only files in use or dirty, and the first dry
+run, every set in one boot, read the same blocks in sets 2 to 4 as this one, a boot each, to within
+half a percent, so the restarts may go; and **photographing `time`'s lines**. A script run as
+`nxsh FILE` builds its host with no terminal, so everything it says — `time`'s line, `fail`, a parse
+error, a stage's failure — goes to `kprint`, which on the laptop reaches nobody once the display is
+handed out: a script that fails there fails silently. `nxsh --help` was moved to the terminal it was
+handed for exactly this reason (the laptop polish's Part E) and the rest of script mode was not. A
+module `use`d at a prompt speaks through the prompt's host, which has the terminal, so `h3.nx` is
+run that way. **The maintainer chose to fix the gap in this part, after the laptop's runs.**
+
+**Found on the way.** The first `h3.nx` computed its paths, and did not parse: `copy (…)` is a call
+whatever the whitespace, so a command's first argument cannot be computed (`shell-language.md` §
+8c-1). A host test, `the_throughput_sticks_script_runs_each_set_timed`, runs the real file at a mock
+prompt, two lines as typed, and holds each set's commands, which are timed, and its answer; the
+paths are now written out. `linux.sh`'s first cleanup was installed before its check for a scratch
+directory left by an earlier run, so refusing one would have deleted it. A `clean()` for set 1's
+copies read as a step between sets, so set 4 now removes them, untimed. And the names are lowercase,
+`.nx` not `.sh`: the tree's capitals are short names for `mcopy`'s sake, which two files do not
+need, and `nxsh` is not a POSIX shell.
+
+**Verified**: the host test, with controls (a wrong destination, and set 4's untimed removal timed,
+each fail it); `linux.sh` against stubbed `mount`, `blkid` and the like, through a full run and each
+refusal; `--check` of a directory, finding a copy one byte long; and the four sets under QEMU on the
+release image, a boot each, through `use` at the real prompt: every command returned, the stick
+checked whole after, the root's `e2fsck -fn` clean, and `/home` left as a fresh disk's. Removing
+`c-small` from the stick took 93 s, which the first dry run never measured.

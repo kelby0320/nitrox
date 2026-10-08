@@ -1,0 +1,43 @@
+# Phase 6 Part H.3: the laptop's runs, one set a boot (docs/planning/phase-6-usb.md, Part H).
+# `cargo xtask throughput-stick` puts this file on the stick as h3.nx. In a terminal:
+#
+#     use "/storage/THROUGHPUT/h3.nx" { run }
+#     run(1)
+#
+# then restart, and the same with run(2), run(3) and run(4): a fresh boot each, as the plan has
+# it, so every set starts as a boot leaves the machine. That is a round; set 4 leaves /home as set 1
+# found it, so run(1) can start another. Every copy and removal prints its `time:` line; photograph
+# them.
+#
+# The paths are written out rather than computed: an argument in parentheses is computed, but
+# `copy (…)` is a call, so a command's first argument cannot be (shell-language.md § 8c-1).
+
+pub def run(set: Int) -> String {
+    if set == 1 {
+        time copy /storage/THROUGHPUT/big /home/t-big
+        time copy /storage/THROUGHPUT/small /home/t-small
+        time copy /storage/THROUGHPUT/tree /home/t-tree
+    } else if set == 2 {
+        time copy /home/t-big /home/u-big
+        time copy /home/t-small /home/u-small
+        time copy /home/t-tree /home/u-tree
+    } else if set == 3 {
+        time copy /home/t-big /storage/THROUGHPUT/c-big
+        time copy /home/t-small /storage/THROUGHPUT/c-small
+        time copy /home/t-tree /storage/THROUGHPUT/c-tree
+        return "set 3 done: photograph the lines. Its copies can be checked on the host now."
+    } else if set == 4 {
+        time remove -r /home/u-big
+        time remove -r /home/u-small
+        time remove -r /home/u-tree
+        time remove -r /storage/THROUGHPUT/c-big
+        time remove -r /storage/THROUGHPUT/c-small
+        time remove -r /storage/THROUGHPUT/c-tree
+        # Set 1's copies, the sources of sets 2 and 3: not measured, since u-* was the same.
+        remove -r /home/t-big /home/t-small /home/t-tree
+        return "set 4 done: photograph the lines, then disk --eject THROUGHPUT. The round is over."
+    } else {
+        fail "the sets are 1 to 4"
+    }
+    format("set {} done: photograph the lines, then restart for set {}.", set, set + 1)
+}
