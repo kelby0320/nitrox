@@ -518,5 +518,8 @@ Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem
 refresh is first because the admin tools are UI surfaces. **The refresh is complete as of
 2026-09-22** — all eleven parts, A–K — and **administration as of 2026-09-30**, all seven parts,
 A–G, the last being an installer that runs in an ordinary session as the view broker's client.
-Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
-portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
+Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then
+**Phase 6 — USB**; then, before Phase 7, a **consolidation of the syscall surface**
+(`docs/planning/syscall-surface.md`, planned 2026-10-08); 7–9 are the portable runtime,
+networking, and the browser. See `docs/decision-log.md` for the current implementation phase and
+`docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

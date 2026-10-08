@@ -1696,13 +1696,16 @@ audit) — so they are mirrored here.
 
 - **Extent-tree splitting / index nodes (depth > 0).** `i_block` holds four inline leaf
   extents; a file or directory needing a fifth non-contiguous extent gets `Unsupported`.
-  Measured boundary on 4 KiB blocks (2026-07-29): creating **files** in one directory is
-  unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
+  Measured boundary on 4 KiB blocks (2026-07-29): creating **empty files** in one directory
+  is unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
   extent covers them), while creating **subdirectories** stops at **~814**, because each
-  `mkdir` allocates the child's own block between the parent's and so fragments it. Both
-  are far past anything the shell or desktop needs. Trigger: a directory or file that
-  genuinely needs a deeper tree — very large files, or a directory of thousands of
-  subdirectories.
+  `mkdir` allocates the child's own block between the parent's and so fragments it. **Files
+  with data stop there too**: host probes on a fresh filesystem (the PR #370 review's, and its
+  author's) were refused at about the 815th of 4,096 files of 16 KiB, since each file's data lands
+  between the directory's growth blocks as a subdirectory's block does. **Triggered** by Part H's
+  own fixture, and met by any folder of a thousand photos copied to `/home`. **Scheduled**
+  (2026-10-08, the maintainer's call): Phase 6 Part H, before the laptop's runs
+  ([`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*).
 - **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
@@ -1730,6 +1733,20 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > stick are timed on the laptop; what dominates is fixed; and only then does the phase's Definition
 > of Done get its number. `fs-server-fat`'s write path batches from its first version, so the new
 > server is not one more suspect.
+>
+> **Detailed** (2026-10-08, [`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*):
+> `time` and I/O counters, the laptop measured beside Linux on the same machine, and the cost that
+> dominates fixed and measured again — below the syscall surface. Extent trees in `fs-server-ext4`
+> come first (after the PR #370 review), since a directory of the files it copies needs them.
+
+**A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
+whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
+only, and unmapping leaves a file's pages with its page-cache object until the object drops, so a
+windowed copy would still hold every page. A stick's photos and videos are over it. **Scheduled**
+(2026-10-08, the maintainer's call): the syscall consolidation between Phases 6 and 7, where a
+copy is `sys_io_submit` on two files and the kernel streams it a window at a time
+([`syscall-surface.md`](../planning/syscall-surface.md)). A `SYS_FILE_COPY` for Part H was turned
+down: named for files, a special case, and code the consolidation would replace.
 
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 

@@ -34879,3 +34879,89 @@ test — 23 mutations, 4 survived — and every finding stood.
   a character boundary, and declines only a buffer too short for its prefix; every server had
   sent what it returned or nothing, and `service-mgr` passes reasons it builds into a 160-byte
   buffer. The storage service also sizes each refusal to its reason.
+
+## 2026-10-08 — Phase 6 Part H, detailed: copy throughput, and the syscall surface reviewed
+
+Part H's detail pass (`docs/planning/phase-6-usb.md` § *Part H in detail*): **copy throughput,
+found by measurement on the laptop, fixed where it is worst, and a number.** It builds `time` and
+I/O counters, says how the laptop and Linux on it are measured, and how the measurement picks the
+fix. It guesses at no cause.
+
+**What the pass found, by reading:**
+- **A one-file copy is about twenty syscalls**: the source resolved twice, the destination's
+  existence asked, a create that grows it, two whole-file mappings, a `memcpy`, two unmaps and a
+  blocking sync.
+- **Underneath, each 4 KiB is several waited-for device round trips**: the page cache fills a page
+  per fault and writes back a page per IRP; `fs-server-ext4` allocates and frees block by block,
+  each block reading and writing its descriptor, bitmap and superblock and zeroed on the device;
+  and a destination page is, as read, filled from those zeroes before the copy overwrites it.
+- **`copy` refuses a file over 8 MiB**, and lifting it needs kernel work: `sys_memory_map` maps a
+  file from offset 0 only, and unmapping leaves a file's pages with its page-cache object.
+
+**The maintainer's calls:**
+- **`time` and I/O counters** to measure with — per block device by its driver, commands, bytes
+  and busy time; the page cache's fills and write-backs — read by a session as
+  `/dev/devices/io.tsm`. Not counters in the servers; not `time` alone.
+- **The number is set against Linux on the same laptop and stick**, as a ratio chosen once both
+  are measured.
+- **Fix what dominates, measure again, and repeat** while one cost dominates and the number is not
+  met; each fix held by a count, never a time.
+- **The 8 MiB limit is not Part H's.** The first answer was to lift it here. When the kernel work
+  showed, a `SYS_FILE_COPY` was proposed — a range between two handles — and the maintainer pointed
+  out that **its name still said it worked on files only**: a special case dressed as a general
+  call. A copy through `sys_io_submit`, with a file as resource and as buffer, was the orthogonal
+  alternative, and it belongs to a change of the syscall surface, which the maintainer would not
+  bring inside a performance investigation. Code replaced as soon as written was the other cost.
+  So Part H stays **below the syscall surface**, measures files of up to 8 MiB — which the 180 MB
+  of 2026-09-17 was made of — and hands whatever only the surface can fix to the consolidation.
+- **The syscall surface is reviewed now and consolidated between Phase 6 and Phase 7**
+  (`docs/planning/syscall-surface.md`). The maintainer suspected drift from the original design's
+  "~30 entries … all I/O goes through `sys_io_submit`", and the review found it: forty-two
+  numbered calls, of which **`file_create`, `file_grow`, `file_truncate` and `file_rename` are one
+  call** — each `sys_ns_lookup` with a different `ResolveOp` in the kernel's dispatch; **two
+  syncs block** inside the syscall under a documented exemption from async-first; **entropy is
+  reachable twice**, a create beside `/dev/entropy` and a read of its own beside `io_submit`;
+  and **`ns_derive` and `ns_held` fold** into a create and a flush. About thirty-two after, and a
+  copy then needs no new number. The maintainer's other question — which syscall paths are
+  heaviest — is part of that plan.
+
+**Calls made in this pass:** `time` prints the counters' deltas with the time, so a run is one
+line on the screen; counting at the driver, so busy time is the device's own; a tree written by
+`cargo xtask throughput-stick` — 8 MiB files, sixteen-kilobyte files four thousand to a directory,
+and a home's shape — the same every run; and no gate holds a time, only counts.
+
+## 2026-10-08 — PR #370, reviewed: extent trees join Part H, and the surface counted again
+
+The review (one blocking finding, five worth fixing, two optional) checked every "checked
+2026-10-08" claim against the source; the decision-log entry above held, and the errors were in
+the two planning documents.
+
+- **Blocking: Part H's tree to copy could not be written to ext4.** `fs-server-ext4` refuses about
+  the 815th file of 16 KiB in one directory: each file's data lands between the directory's
+  growth blocks, so every directory block is an extent of its own, and an inode holds four. The
+  review's host probe found it, and the author's found the same. **The maintainer's call: extent
+  trees are Part H's**, as H.1, before the laptop's runs — not a tree kept under the ceiling, which
+  would have measured a directory scan a fifth the size the deferral describes. The pieces are
+  renumbered H.1–H.5. `deferred-decisions.md` and `dir_insert`'s comment said creating files in
+  one directory was unbounded: that held for empty files only, and both now say so.
+- **Checking it found four more, by host probes, in the code H.1 rewrites**, and H.1 fixes them:
+  removing a file with a tree — one Linux wrote — takes its name and frees nothing, leaving an
+  unattached inode holding its blocks; a grow that fails keeps every block it took — on a 16 MiB
+  filesystem, a grow past its size left all its free space allocated to nothing, the file still
+  empty — and the refused create left an unattached inode, each reported by `e2fsck -fn`; an extent
+  of the full 32,768 blocks, `ee_len` `0x8000`, read as a hole, where e2fsprogs maps it; and an
+  unwritten extent read as data, where ext4 reads zeros.
+- **`syscall-surface.md` corrected**: `io_submit` already serves character devices — a console,
+  the raw input nodes, `/dev/registry/changes`, a keyboard's lights — so files and entropy would be
+  its first resources that are not devices; **the blocking calls are more than the two syncs** —
+  `process_spawn`'s fills of a file-backed image, `power`'s flush, `debug_kprint` — so folding the
+  syncs does not restore async-first, and spawn's fills are an open question for the
+  consolidation; **the original's complete set is thirty-two**, not thirty, so the tightened
+  thirty-two is its count exactly; and **syscall numbers are not ABI-hash inputs** — renumbering
+  touches `abi-sync-check`'s constants and the spec's numbering, and the hash moves only with
+  `IoOp`'s layout or `IoOpcode`'s discriminants.
+- **`copy -r` is not a command**: `copy` takes a directory with no flag, and H.3's runs say so.
+- **Optional, taken**: `libfs::MAX_COPY`'s comment no longer says a windowed copy would lift it, and
+  points at `copy-limit`; Part H's owed docs drop the item this PR already did; and
+  `syscall-abi.md` no longer calls the syncs "the one documented exemption" from async-first,
+  naming spawn's fills, `power` and `debug_kprint` beside them.

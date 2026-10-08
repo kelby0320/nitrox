@@ -345,9 +345,11 @@ Requires `LOOKUP` on `ns`. It changes no file; it only makes what was already wr
 resolves to nothing. `IoError` if a write failed; the other files are still written, and a file
 whose write failed stays dirty.
 
-**It blocks** until the writes complete, as `sys_file_sync` does. That is the one documented
-exemption from async-first, for the same reason: a durability point is something the caller
-wants to know it has reached. (Syscall number `38`.)
+**It blocks** until the writes complete, as `sys_file_sync` does, and is outside async-first for
+the same reason: a durability point is something the caller wants to know it has reached. **The
+syncs are not the only calls outside it** (PR #370 review): `sys_process_spawn` reads a file-backed
+image's pages inside the call, a device round trip each; `sys_power` waits on its flush (below);
+and `sys_debug_kprint` completes at once. (Syscall number `38`.)
 
 **Its scope is the whole server, not the path.** A namespace that reaches only a subtree of a
 filesystem, such as a session's `/home`, writes back every dirty file that server holds, wherever

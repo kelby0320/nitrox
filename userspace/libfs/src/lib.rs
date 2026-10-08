@@ -77,8 +77,10 @@ pub enum FileError {
 /// A file maps whole (there is no offset argument to `sys_memory_map`), so a copy costs
 /// two mappings of the file's size in *address space* — the pages themselves are
 /// demand-paged, so this bounds VA, not RAM. 8 MiB is far above anything in the current
-/// image and far below anything that would strain a 47-bit user half; a windowed copy is
-/// the refinement if a real workload ever exceeds it.
+/// image and far below anything that would strain a 47-bit user half. **A windowed copy would
+/// not lift it**: unmapping leaves a file's pages with its page-cache object, so a window at a
+/// time still holds every page. The copy through `sys_io_submit` that the syscall
+/// consolidation plans is what lifts it (`copy-limit` in `deferred-decisions.md`).
 pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 
 /// Resolve `path` and return its size, or `None` if it does not resolve to a file.
