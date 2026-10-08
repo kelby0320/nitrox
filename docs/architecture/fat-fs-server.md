@@ -1,7 +1,8 @@
 # fs-server-fat
 
 **Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; a stick mounted
-writable on a live boot too, and ejected by a session, since Part F; last checked 2026-10-07.**
+writable on a live boot too, and ejected by a session, since Part F; a formatter, `mkfs`, since
+Part G; last checked 2026-10-07.**
 `userspace/fs-server-fat` serves FAT12, FAT16 and FAT32 read-write, with long names, over
 `libfsserver`'s protocol. The storage service spawns it for a FAT on a removable disk, and for any
 FAT an administrator mounts ([`storage.md`](storage.md) §6). Its host tests build images with
@@ -27,6 +28,7 @@ and the protocol know nothing about those.
 | Times | `userspace/fs-server-fat/src/time.rs` | FAT's dates and times, as UTC |
 | The volume | `userspace/fs-server-fat/src/volume.rs` | `Fat`: every operation, and its `Volume` impl for the loop |
 | The binary | `userspace/fs-server-fat/src/main.rs` | `_start`: the loop over `Fat`, through `ReadOnly` for a read-only mount |
+| The formatter | `userspace/fs-server-fat/src/mkfs.rs` | An empty FAT16 or FAT32, chosen by size — what `disk --format` writes (Part G, §8a) |
 
 The library is `no_std` with no `alloc`, as ext4's is. Every buffer is the caller's, or a bounded
 one on the stack.
@@ -197,11 +199,41 @@ too, rather than answered as if it could have been made.
 - **`check-media`** (Part F): an empty FAT32 stick plugged into the live desktop, a file saved onto
   it from the editor, ejected from Files; `fsck.fat -n` clean on the host, and `mtype` reads the
   file back.
+- **`check-storage`, formatted** (Part G): a blank stick's partition formatted FAT by
+  `with admin disk --format`, mounted, written and ejected; on the host a FAT32, `fsck.fat -n`
+  clean, holding what was written. A control making 2 KiB clusters fails it: the server refuses the
+  stick, and it is not mounted.
+
+## 8a. Making one
+
+*(Phase 6 Part G.)* **`mkfs` makes what the server serves**: `disk --format DEVICE fat` writes it,
+through `libfsserver`'s window onto a device. **Clusters are never under 4 KiB**, the server's
+floor, so a stick it makes is always served:
+- **FAT32** wherever 4 KiB clusters reach FAT32's 65,525 — from 525,264 sectors, about 256.5 MiB —
+  with Microsoft's steps: 4 KiB clusters up to 8 GiB, 8 up to 16, 16 up to 32, and 32 above.
+- **FAT16** below that, at 4 KiB clusters while they keep its count under 65,525 — and **at 8 KiB
+  in the quarter-mebibyte below FAT32's line**, from 524,752 sectors, where at 4 KiB neither type is
+  valid (PR #368 review).
+- **Refused under 16 MiB**, a round floor 8 KiB above where 4 KiB clusters stop making a FAT16, and
+  over FAT32's 32-bit sector count, 2 TiB.
+
+Two FATs, a 512-entry root for FAT16, and FAT32's FSInfo and backup boot sector at sectors 1, 6 and
+7, as `mkfs.fat` writes them. **The data region begins on a cluster**, the reserved region taking
+the padding, so a volume at 1 MiB has its clusters aligned on the disk. **The first mebibyte, the
+FATs and the root are zeroed first**, so no old boot sector or superblock outlives it, and **the
+boot sector is written last**: a format cut short at any write leaves no FAT for a reader to find.
+The label is uppercased, refused past 11 characters or for a byte a short name forbids, and is
+written in the boot sector and as the root's first entry. Its tests (`src/mkfs/tests.rs`) hold the
+type and cluster at every boundary's neighbours, the band's edges against the specification's
+counts, a sweep of 26,000 sizes parsed back through `bpb::parse`, eleven sparse images up to 32 GiB
+judged by `fsck.fat -n`, `mlabel`, `Fat` and `mtype` after a write, nothing old surviving the
+metadata, and a format stopped after each write.
 
 ## 9. Not built
 
-- **Clusters under 4 KiB.** Part G's `disk --format` makes such a stick servable. Serving one
-  needs a page filled from several runs, or a second data path, for a stick someone needs.
+- **Clusters under 4 KiB.** `disk --format` makes such a stick servable, by making it again (Part
+  G). Serving one needs a page filled from several runs, or a second data path, for a stick someone
+  needs.
 - **More than 64 fragments**, which `MapRange` would lift for both servers.
 - **Sectors other than 512 bytes**, which no stick this phase meets uses.
 - **Attributes beyond read-only and directory** — hidden, system, archive are kept, not shown.

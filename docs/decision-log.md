@@ -34771,3 +34771,111 @@ first was reproduced by the reviewer on a host image, the rest checked against t
 **Optional, both taken:** the FAT16/FAT32 line is a quarter-mebibyte band where neither is valid at
 4 KiB clusters, and FAT16 takes 8 KiB clusters there; and after a bare `--partition`, `disk` waits
 for the new partition's row and names its `blk-<n>`, rather than for a mount that never comes.
+
+## 2026-10-07 — Phase 6 Part G, built: formatting and partitioning
+
+**Built as detailed**: the USB storage driver reads a unit of 2³² blocks or more with the
+sixteen-byte commands, and answers `IoOpcode::Rescan` by retiring its partitions' windows, departing
+their records and publishing what its table now holds; `fs-server-fat` gains a formatter and
+`libgpt` an MBR builder; the storage service answers `Reread` and its table gains `note`; and
+`disk --partition` and `disk --format` write through the `disks` grant, ask for the `Reread`, and
+wait for a disk's new partition. `test-qemu` attaches a 3 TiB drive and writes past 2 TiB on it;
+`check-storage` formats a blank stick ext4 whole, partitions it MBR and formats that FAT.
+
+**Calls made on the way:**
+- **A watch is pinged when the devices change too**, not only the mounts. After a bare
+  `--partition` the new partition holds nothing, so no mount changes, and `disk` waits for its row.
+  **`check-storage` could not hold this**: with the ping removed it passed, the partition's arrival
+  usually reaching the service before `disk`'s first look at the table. `test-qemu` holds it
+  instead, deterministically: `boot-probe` reads its stick again, the kernel's rescan replaces its
+  partition, and the watch must be pinged though nothing is mounted on it.
+- **`note` and the log line come from one function**, `mounts::unmounted_why`, which `report()`
+  now calls for every device. The table's `note` is null for a device holding nothing, as the plan
+  said; the log still says the boot stick's disk is passed over, which three gates match.
+- **`disk` refuses a mounted target by name**, from the storage table, before it opens anything:
+  the grant would withhold it with no reason given, and the maintainer's procedure — unmount,
+  format, the service remounts it — is what the refusal names.
+- **A disk of other than 512-byte logical sectors is refused by `disk`**, from the device's own
+  info leaf, before anything is written: every count in the table builders and the formatters is in
+  512-byte sectors (`4k-sectors`, filed).
+- **A whole-disk `--format fat` types its partition by the FAT it makes**: `0x0E` for a FAT16,
+  `0x0C` for a FAT32. A bare `--partition` types for FAT32, as planned. A GPT partition `--format`
+  makes is named by the label; `--partition`'s is unnamed.
+- **The FAT formatter's floor is exactly 16 MiB**, 8 KiB above where 4 KiB clusters stop making a
+  FAT16, and its band edges are the specification's cluster counts, pinned by a host test that asks
+  each type's layout at each edge. **Its FATs are sized for every cluster the volume could hold**
+  before the FATs are taken from it, a few sectors more than needed and never short. **The boot
+  sector is written last**, so a format stopped after any write leaves no FAT, which a host test
+  checks write by write.
+- **`PartitionIo` makes and unmaps its own scratch** in `libfsserver`, so its constructor is safe;
+  and it, `Disk` and `SectorDisk` are `!Sync`, each moving every transfer through one mapping, now
+  that userspace has threads.
+- **`account`'s entropy reader moved to `coreutils::entropy`**, `disk` being its second consumer;
+  every ID `disk` writes is read from it before anything is written.
+- **`disk` waits 30 seconds** for a disk's new partition, the storage service's own bound on a
+  filesystem server's `Ready`.
+- **`test-qemu`'s 3 TiB drive is its sixth device, attached last**, so every device keeps its port.
+  Its test, and the taken `Reread`, pass with a line saying so on a machine without such a device,
+  since every `--selftest` gate runs `boot-probe`. **The boot disk's partition for `Reread`'s
+  refusal is found by its parent's flag**, not as "the first FAT", which on `check-storage`'s
+  machine is the internal disk's and would be read again.
+- **`check-storage` asks `/dev/devices` for the boot stick's partition**: the live test stick's one
+  partition is its ESP, whose report gives its clusters as its reason, not that it is on the boot
+  disk.
+
+**Controls, the nine planned and one more, each failing where it should**: the front wipe at one
+mebibyte (the old ext4 at 1 MiB came back, mounted, on `--partition`); `disk` without its boot
+check (it wrote a FAT over the live stick's ESP, and only the service's `Reread` refused, after the
+write); a rescan that departs nothing (the GPT's partition never departed); an MBR written with no
+wipes (the stale GPT read by the rescan); FAT clusters of 2 KiB (the server refused the stick);
+`Reread` allowed while mounted (`boot-probe`'s refusal); the sixteen-byte commands removed (the 3
+TiB drive unpublished); `note` empty and FAT16 one cluster past its line (host tests); and no ping
+for a device change (`test-qemu`, once it read a stick again — see above).
+
+## 2026-10-07 — PR #369, reviewed: a window's call sites, a rescan's queue, and a stranded device
+
+The review (one blocking finding, three worth fixing, six optional) broke the code under each new
+test — 23 mutations, 4 survived — and every finding stood.
+
+- **Blocking: nothing drove a partition window's two call sites.** The host test asked the predicate
+  `window_refusal` with the flag set by hand, so `partition_submit` could forward a `Rescan` and
+  `retire_window` could store nothing, with every gate green: no userspace sends a partition a
+  `Rescan`, and nothing read through an old partition's node after a rescan. Now **a host test
+  drives both through the window's own node** — a disk node recording what reaches it, a window
+  over it published as a node, IRPs handed to that node's backend, the boot's DPC queue reserved —
+  and **`boot-probe` holds the stick's old partition node across its `Reread`** in `test-qemu`: a
+  read through it before, a `Rescan` refused `Unsupported` by its window, a read refused
+  `PeerClosed` after. Each of the review's two mutations fails both.
+- **A device stranded while a rescan waited was never ended.** `rescan()` returned nothing when a
+  recovery failed, the next round found no fault to recover, and the rescan waited out its 35 s
+  with the stranded IRP held and every submit queued for good. `begin_rescan` now answers `Ended`
+  for a stranded device, `rescan()` returns `Recovered`, and the hub thread ends the device, whose
+  departure completes the rescan — a host test strands one under a waiting rescan.
+- **Queued IRPs outlived a rescan**, which `usb.md` said they did not. While a rescan waited the
+  device held its queue and issued it after the new table was published, so an IRP a window had
+  rebased before it was retired wrote at the old partition's offset on the repartitioned disk. **The
+  docs were right and the code was wrong**, so the rescan's order changed: the windows are retired
+  first and waited out — **each submit is counted through its window**, in before the retired check
+  and out after the forward, `SeqCst` against the retirement, so none is caught between — then the
+  device runs as ever until its queue drains, and only then is it taken to read the table. The
+  host test that asserted the old order now asserts the new one; a command queued with nothing in
+  flight keeps the rescan waiting by itself.
+- **`check_formatted_stick`'s "a second partition" check read entry 4**: entries are 128 bytes, four
+  to a sector. It now reads the whole array and refuses any entry after the first; `sgdisk` shows
+  the old check blind to a second partition and the new one finding it.
+- **Optional, taken**: a rescan whose table does not read completes `IoError`, not success with
+  nothing; `boot-probe` sends a `Rescan` straight to the SATA disk and the scratch RAM disk, each
+  refused `Unsupported`, and `Reread`s the unmounted scratch disk for the service's `Unsupported`;
+  `disk` refuses anything on a RAM disk — the live root and the installer's pristine copy were
+  formattable — and a label the storage service could not mount under, beginning with `.` or a
+  space or ending with a space, for FAT as for ext4; a doubled doc comment; the public items in
+  `coreutils::format` and `mbr::Partition` documented. The review's last surviving mutation,
+  `end_recovery`'s check of a waiting rescan, is gone with the hold it guarded.
+- **And the gate run on the fixes found a bug of its own.** `boot-probe`'s new `Reread` of the
+  unmounted scratch disk came back with no error at all: the service's admin refusal was built in a
+  buffer with room for 96 bytes of reason, `CannotRescan`'s is 108, and `librsproto::error::
+  error_body` declined a message that did not fit — so the reply went out flagged an error with an
+  empty body, its `KError` lost with its reason. **`error_body` now cuts a message to fit**, back to
+  a character boundary, and declines only a buffer too short for its prefix; every server had
+  sent what it returned or nothing, and `service-mgr` passes reasons it builds into a 160-byte
+  buffer. The storage service also sizes each refusal to its reason.

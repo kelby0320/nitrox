@@ -17,7 +17,8 @@ directory sessions, `File::Forget` and `File::Touch`, `Meta::Unmount`, and `Read
 `_start`, and keeps its 4 KiB `Disk`. PR #365's review (2026-10-07): **a removed directory is
 refused to a session still holding its inode**, since a removal keeps the inode's mode and extent
 and zeroes only its link count; every operation by inode now asks for a link counted. And a server
-that panics exits, rather than spinning with resolves waiting on it.
+that panics exits, rather than spinning with resolves waiting on it. Phase 6 Part G (2026-10-07):
+**its formatter has a second caller**, `disk --format DEVICE ext4` — § *Making one*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -122,6 +123,21 @@ without an unmount, as the storage service lets go of a USB disk that left — a
 answers `PeerClosed` for the rest of the boot. The server logs `fs-server: nothing can reach this
 server any more; exiting` and exits, rather than spinning a CPU on it, as `device-mgr` does in the
 same place. It writes nothing on the way out: its disk, if it left, takes nothing.
+
+## Making one
+
+**`fs_server_ext4::mkfs` lays out an empty filesystem** (Phase 5 Part H.2): superblock and its
+`sparse_super` backups, the group descriptors, each group's bitmaps and zeroed inode table, and a
+root directory — layout only, no journal and no `64bit`, so up to 16 TiB at 4 KiB blocks. `e2fsck
+-fn` is its oracle, and this crate's reader reads what it writes. **Two callers**, with the same
+parameters — 4 KiB blocks and an inode per 16 KiB:
+- **`nxinstall`**, for the root it installs, through a window onto the disk it holds
+  (`libfsserver::disk::PartitionIo`, `nxinstall`'s own until Part G);
+- **`disk --format DEVICE ext4`** (Phase 6 Part G), on a partition or in the one partition of a
+  whole removable disk, after zeroing the filesystem's first mebibyte so no older boot sector
+  outlives it; the label up to 16 characters, `nitrox` by default. `check-storage` formats a blank
+  stick so, and the host's `e2fsck -fn` finds the partition clean
+  ([`storage.md`](storage.md) §8b).
 
 ## Journaling (jbd2) — deferred
 

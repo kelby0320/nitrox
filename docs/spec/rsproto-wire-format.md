@@ -74,7 +74,7 @@ The 16-bit `op` field decomposes:
 | `Clipboard` | `0x0Dxx` | The kill ring, served by `clipboard-server` at `/dev/clipboard`. See [`clipboard.md`](../architecture/clipboard.md). |
 | `Views` | `0x0Exx` | Running a program in a view, served by `view-broker` at `/svc/views` and a session's `/dev/views`. See [Views operations spec](rsproto-views-ops.md). |
 | `Devices` | `0x0Fxx` | Devices handed to the owner of their class, served by `device-mgr` at `/svc/devices`. See [Devices operations spec](rsproto-devices-ops.md). |
-| `Storage` | `0x10xx` | Mounting and unmounting, on an admin session of the storage service's (`/svc/storage/admin-endpoint`); a session's `Eject`, on a media session, and the service's `Changed`, on a watch (Phase 6 Part F; both through a session endpoint). See [Storage operations spec](rsproto-storage-ops.md). |
+| `Storage` | `0x10xx` | Mounting and unmounting, and reading a device again (`Reread`, Phase 6 Part G), on an admin session of the storage service's (`/svc/storage/admin-endpoint`); a session's `Eject`, on a media session, and the service's `Changed`, on a watch (Phase 6 Part F; both through a session endpoint). See [Storage operations spec](rsproto-storage-ops.md). |
 | `Services` | `0x11xx` | Starting, stopping and restarting services, on an admin session of `service-mgr`'s (`/svc/services/admin-endpoint`). See [Services operations spec](rsproto-services-ops.md). |
 | (reserved) | `0x12xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
@@ -231,6 +231,11 @@ pub struct ErrorBody {
 ```
 
 `kerror` aligns with the system-wide `KError` enum so callers can map errors uniformly. `server_code` lets servers report finer-grained errors when needed.
+
+**A message too long for the sender's buffer is cut, never dropped with its body**
+(`librsproto::error::error_body`, PR #369 review): to the room there is, back to a UTF-8 character
+boundary. Until then the encoder declined, and a refusal went out flagged an error with an empty
+body — its `kerror` lost with its message.
 
 ## Body encoding rules
 

@@ -136,6 +136,18 @@ impl Registry {
         changed
     }
 
+    /// **The records under `id` still present**, in table order: a disk's partitions (Phase 6 Part
+    /// G), which a rescan departs one by one and publishes again. `None` if memory ran out.
+    pub fn children(&self, id: u32) -> Option<KVec<u32>> {
+        let mut out = KVec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.parent == id && i as u32 != id && !e.departed {
+                out.try_push(i as u32).ok()?;
+            }
+        }
+        Some(out)
+    }
+
     /// **Flag `disk` as the disk the machine started from** (Phase 6 Part D). One change, so one
     /// generation. Whether it changed anything: a node the table does not hold, or one flagged
     /// already, does not.
@@ -546,6 +558,12 @@ pub fn depart(id: u32) {
     if DEVICES.lock().depart(id) {
         announce();
     }
+}
+
+/// **The records under `id` still present** — a disk's partitions — for a rescan (Phase 6 Part G).
+/// Empty if memory ran out, which a rescan then says.
+pub fn children(id: u32) -> KVec<u32> {
+    DEVICES.lock().children(id).unwrap_or_default()
 }
 
 /// **Flag `disk` as the disk the machine started from** (Phase 6 Part D), as one change. Whether
@@ -1120,6 +1138,24 @@ mod tests {
         assert!(!r.depart(kbd), "departed already");
         assert_eq!(r.generation(), before + 1);
         assert!(!r.depart(99), "an id the table does not hold");
+    }
+
+    /// **A disk's children are its partitions still present** (Phase 6 Part G): what a rescan
+    /// departs one by one, leaving the disk; and a partition published after it is a child too.
+    #[test]
+    fn a_disks_children_are_its_present_partitions() {
+        init_global_heap();
+        let (mut r, disk, _) = booted();
+        let disk_id = 3;
+        assert_eq!(&r.children(disk_id).unwrap()[..], &[5], "the booted disk's one partition");
+        assert!(r.children(4).unwrap().is_empty(), "the RAM disk has none");
+        assert!(r.depart(5));
+        assert!(r.node(disk_id).is_some(), "departing a partition leaves its disk");
+        assert!(r.children(disk_id).unwrap().is_empty(), "a departed partition is no child");
+        assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"new", 1 << 18), &disk, "gpt"));
+        let after = r.children(disk_id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0] > 8, "published afresh, at a new id: {}", after[0]);
     }
 
     /// **A departed device's paths refuse it, and its served index is never reissued** (Phase 6 Part

@@ -5,6 +5,9 @@
 //!
 //! - [`stage`] — the Tier-0/Tier-1 startup prologue: streams, `argv`, `stderr`, exits.
 //! - [`args`] — GNU-style flag parsing (`--long`, `-f`, `--`, `--help`/`--version`).
+//! - [`entropy`] — random bytes from the kernel: `account`'s salts, `disk`'s IDs (Phase 6 Part G.4).
+//! - [`format`] — what `disk --partition` and `disk --format` write, decided before they write it
+//!   (Phase 6 Part G.4).
 //!
 //! **Asking a person on a terminal** is [`libprompt`], and the view broker's client [`libviews`] —
 //! each moved out when a program that is not a coreutil needed it (administration Parts F.3 and
@@ -25,6 +28,8 @@
 extern crate alloc;
 
 pub mod args;
+pub mod entropy;
+pub mod format;
 pub mod stage;
 /// Calendar arithmetic and duration parsing.
 ///

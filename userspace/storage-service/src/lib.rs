@@ -331,7 +331,8 @@ pub mod table {
     //! because it is, and says nothing about how it was left. What a device does not have is
     //! `Null`. And `removable` (Phase 6 Part F): whether the device is a disk behind USB mass
     //! storage, or a partition of one — what a session may eject, and what Files puts an eject
-    //! button on.
+    //! button on. And `note` (Phase 6 Part G): **why a filesystem found is not mounted**, in the
+    //! words the service's log line gives ([`note`](crate::mounts::note)).
 
     use alloc::format;
     use alloc::string::String;
@@ -412,6 +413,7 @@ pub mod table {
             .field("mode", TypeTag::String, nullable)
             .field("clean", TypeTag::Bool, nullable)
             .field("removable", TypeTag::Bool, TypeModifiers::NONE)
+            .field("note", TypeTag::String, nullable)
     }
 
     /// `d`'s row, mounted as `mount` says, among `all` the devices — which a partition's disk is
@@ -443,6 +445,7 @@ pub mod table {
             text(mount.map(|m| if m.mode == Mode::Ro { "ro" } else { "rw" })),
             clean,
             Value::Bool(crate::mounts::removable(d, all)),
+            text(crate::mounts::note(d, all, mount).as_deref()),
         ]
     }
 
@@ -546,12 +549,17 @@ pub mod mounts {
     //! back. **A removable disk mounts writable on any boot** (Phase 6 Part F): a stick is the
     //! session's, which may eject it ([`eject`]). An administrator's explicit mount (C.5c) is
     //! writable either way; it is the automatic one that has to be careful.
+    //!
+    //! **A device `disk` has written is read again** (Phase 6 Part G, [`reread`]) and mounted by an
+    //! arrival's rules; and **why a filesystem is not mounted** is said in one place,
+    //! [`unmounted_why`], which the log line and the table's `note` both give.
 
     use alloc::string::String;
     use alloc::vec::Vec;
     use libinittoml::manifest::Mode;
 
     use crate::labels;
+    use crate::probe::Found;
     use crate::table::{Device, Mounted};
 
     /// **The driver a disk behind USB mass storage is published by**, as its registry record names
@@ -818,6 +826,112 @@ pub mod mounts {
             .filter(|m| m.by == By::Storage && on_disk(m.device))
             .filter_map(|m| m.at.strip_prefix("/storage/").map(String::from))
             .collect())
+    }
+
+    /// **What a `Reread` reads again** (Phase 6 Part G), by registry id: a partition, probed again,
+    /// or a disk, which the kernel rescans first.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Reread {
+        /// A partition: its window is unchanged, so what is in it is read again.
+        Partition(u32),
+        /// A disk, a RAM disk among them: its table is read again by the kernel.
+        Disk(u32),
+    }
+
+    /// **Why a `Reread` was refused** (Phase 6 Part G).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum RereadRefusal {
+        /// `init`'s mounts are not all known, so nothing is mounted.
+        InitUnknown,
+        /// No block device has that name.
+        NoSuchDevice,
+        /// The partition is mounted, or something on the disk is.
+        Mounted,
+        /// It is on the disk the machine started from.
+        BootDisk,
+        /// The kernel cannot rescan the disk: the binary's, from the kernel's `Unsupported`.
+        CannotRescan,
+    }
+
+    impl RereadRefusal {
+        /// The error a client is answered with.
+        pub fn kerror(self) -> libkern::KError {
+            use libkern::KError;
+            match self {
+                RereadRefusal::InitUnknown | RereadRefusal::BootDisk => KError::NoAccess,
+                RereadRefusal::NoSuchDevice => KError::NotFound,
+                RereadRefusal::Mounted => KError::WouldBlock,
+                RereadRefusal::CannotRescan => KError::Unsupported,
+            }
+        }
+
+        /// The reason, as the refusal says it.
+        pub fn why(self) -> &'static [u8] {
+            match self {
+                RereadRefusal::InitUnknown => Refusal::InitUnknown.why(),
+                RereadRefusal::NoSuchDevice => Refusal::NoSuchDevice.why(),
+                RereadRefusal::Mounted => b"it is mounted, or something on its disk is: unmount it first",
+                RereadRefusal::BootDisk => b"it is on the disk the machine started from",
+                RereadRefusal::CannotRescan => {
+                    b"its partitions cannot be read again: only a USB disk's can, and an internal disk is partitioned by nxinstall"
+                }
+            }
+        }
+    }
+
+    /// **An administrator's `Reread` of the device called `name`** (Phase 6 Part G), once `disk` has
+    /// written it: what to read again, or why not. **Refused while mounted** — a partition while it
+    /// is, a disk while anything on it is, since its partitions are about to be replaced; a
+    /// partition beside a mounted sibling is read again, as the `disks` grant gave it (PR #368
+    /// review). **And anything on the disk the machine started from**, mounted or not; mounted is
+    /// asked first, so a boot disk holding `init`'s root says it is mounted.
+    pub fn reread(devices: &[Device], mounted: &[Mounted], init_known: bool, name: &str) -> Result<Reread, RereadRefusal> {
+        use libkern::device::DeviceKind;
+        if !init_known {
+            return Err(RereadRefusal::InitUnknown);
+        }
+        let d = devices.iter().find(|d| crate::table::name(&d.record) == name).ok_or(RereadRefusal::NoSuchDevice)?;
+        let id = d.record.id;
+        let partition = d.record.kind() == DeviceKind::Partition;
+        let on_it = |m: &Mounted| {
+            m.device == id || (!partition && devices.iter().any(|x| x.record.id == m.device && x.record.parent == id))
+        };
+        if mounted.iter().any(on_it) {
+            return Err(RereadRefusal::Mounted);
+        }
+        if on_boot_medium(d, devices) {
+            return Err(RereadRefusal::BootDisk);
+        }
+        Ok(if partition { Reread::Partition(id) } else { Reread::Disk(id) })
+    }
+
+    /// **Why `d`, not mounted, is not**, as the service's log line says it, or `None` for no reason
+    /// but that nothing mounted it: a FAT its server refuses, the installer's source, anything on the
+    /// disk the machine started from, and a FAT on an internal disk. In that order, the log's.
+    pub fn unmounted_why(d: &Device, all: &[Device]) -> Option<String> {
+        if let Found::Fat { refused: Some(why), .. } = &d.found {
+            return Some(alloc::format!("not served: {why}"));
+        }
+        let why = if is_install_source(d) {
+            "the installer's source, left unmounted"
+        } else if on_boot_medium(d, all) {
+            "on the disk the machine started from, passed over"
+        } else if d.found.server() == Some(Server::Fat) && !removable(d, all) {
+            "not removable, so not mounted"
+        } else {
+            return None;
+        };
+        Some(String::from(why))
+    }
+
+    /// **The table's `note`** (Phase 6 Part G, `unmounted-why`): [`unmounted_why`] for a filesystem
+    /// found and not mounted; `None` for a mounted one, and for a device holding nothing — a disk
+    /// holding a table, or a blank stick — whose row says so already.
+    pub fn note(d: &Device, all: &[Device], mount: Option<&Mounted>) -> Option<String> {
+        if mount.is_some() || d.found.filesystem().is_none() {
+            return None;
+        }
+        unmounted_why(d, all)
     }
 
     /// **Whether `d` is on a removable disk** (Phase 6 Part E.5): a disk behind USB mass storage

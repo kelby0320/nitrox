@@ -413,6 +413,37 @@ found both drivers building their fragment slice from the IRP's null buffer poin
 `test-qemu`'s probe flushes the root partition, which reaches the AHCI disk. A one-off QEMU trace
 of that boot (`-trace ide_bus_exec_cmd`) showed the drive executing exactly one `0xEA`.
 
+### Rescan, and a retired window
+
+*(Phase 6 Part G, 2026-10-07.)* `IoOpcode::Rescan` asks a disk to read its partition table again,
+after a holder of the disk has rewritten it ([`io-operation.md`](../spec/io-operation.md)). It is
+an IRP with no buffer and no range, as a flush is, built by `io::block::dispatch_block_control`,
+which builds both.
+- **A USB disk answers it on its hub thread** ([`usb.md`](usb.md) § *Mass storage*): the disk
+  waited quiet, its partitions' windows retired and their records departed, the table read and
+  what it holds published.
+- **A partition's window answers it itself, `Unsupported`**, before anything reaches its disk —
+  where a flush passes through. Forwarded, it would let the holder of one partition, which every
+  filesystem server is, retire its siblings' windows (PR #368 review).
+- **AHCI and the RAM disk refuse it**, `Unsupported`, as named ops they do not do: an internal
+  disk is partitioned by `nxinstall`, which reboots after.
+
+**A retired window refuses everything**, `PeerClosed`, at its own submit: a read, a write, a flush
+or a rescan. A window is a start and a length over its disk (`io::block::Partition`), so one left
+forwarding after its table changed would read and write where the old table said, which on a
+repartitioned stick is the middle of the new partition. Retiring is a flag the window checks before
+it forwards (`io::block::retire_window`); a handle to it stays valid, and answers nothing. The
+records depart as an unplugged device's do, so the storage service drops the device and its node.
+
+**A submit is counted through the window**, in before the flag's check and out after its forward,
+and a rescan waits for the count to reach zero after retiring (`io::block::window_busy`), with each
+side `SeqCst`: either a submit sees the window retired, or the rescan sees the submit and waits for
+it to reach the disk. **The rescan then lets the disk drain before it takes the device**, so every
+IRP a window let through is issued at the old table's offsets before the new table is published,
+never after (PR #369 review). Both halves are host-tested through the window's own node —
+`partition_submit` and `retire_window` driven, not only the predicate they consult — and
+`boot-probe` holds a partition's node across a rescan in `test-qemu`.
+
 **This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds
 `buf_offset + length` against the buffer's size and nothing else, so before 2026-09-11
 a caller holding a block `DeviceNode` handle could make the driver write PRDT entries

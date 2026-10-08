@@ -776,6 +776,18 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `disk` is the live published disk.
     let d = unsafe { &*disk };
 
+    // **A rescan is refused**: a SATA disk's table is read at boot, by polling, and nothing reads it
+    // again (Phase 6 Part G) — partitioning an internal disk is `nxinstall`'s, and a reboot follows.
+    // SAFETY: `irp` is a live block IRP during submit.
+    if unsafe { (*irp).op } == crate::io::irp::IrpOp::Rescan as u32 {
+        // SAFETY: `irp` is uniquely owned during submit; completing it releases its waiter.
+        unsafe {
+            (*irp).set_completion(crate::syscall::error::KError::Unsupported as i32, 0);
+            crate::dpc::enqueue(&(*irp).dpc);
+        }
+        return;
+    }
+
     // **More fragments than one command table can describe: refuse, before the lock.**
     // `dispatch_block_irp` already rejects this against the `max_frags` we publish, so
     // nothing in the tree reaches here — this is the backstop that makes the overflow

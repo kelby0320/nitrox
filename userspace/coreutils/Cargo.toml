@@ -30,6 +30,13 @@ libviews = { path = "../libviews" }
 # Asking a person on a terminal, and the plumbing a password crosses: `with` and `account` prompt
 # with it. It was this crate's `prompt` until `nxinstall` became a third consumer (Part G.2).
 libprompt = { path = "../libprompt" }
+# Partitioning and formatting (Phase 6 Part G.4): `disk --partition` writes an MBR or a GPT with
+# `libgpt`, and `disk --format` lays out a FAT or an ext4 with the formatters in those servers'
+# libraries — the same formats their servers serve — through `libfsserver`'s window onto a device.
+libgpt = { path = "../libgpt" }
+fs-server-fat = { path = "../fs-server-fat" }
+fs-server-ext4 = { path = "../fs-server-ext4" }
+libfsserver = { path = "../libfsserver" }
 
 [lib]
 name = "coreutils"

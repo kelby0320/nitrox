@@ -1501,6 +1501,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
         & registry_test(root_ns)
+        & past_two_tib_test(root_ns)
         & devices_test(root_ns)
         & storage_test(root_ns)
         & storage_mount_test(root_ns)
@@ -2838,10 +2839,21 @@ fn storage_mount_test(root_ns: u64) -> bool {
 ///    watch is pinged by the unmount and by the remount, and not by the unmount refused; the media
 ///    session's `Eject` of the scratch disk — a RAM disk, not removable — is refused `NoAccess`,
 ///    and of a name nothing is mounted under `NotFound`, both leaving the mount as it was.
+/// 8. **`Reread`'s refusals** (Phase 6 Part G): the mounted scratch disk, and the disk holding
+///    `init`'s root, `WouldBlock`; a partition of the disk the machine started from that nothing has
+///    mounted, `NoAccess`; a name nothing has, `NotFound`. None pings the watch.
+/// 9. **And one taken**, where a USB disk holding a partition and nothing mounted is attached —
+///    `test-qemu`'s stick: rescanned, its partition departed and published again, and **the watch
+///    pinged though no mount changed**, which is what `disk --partition` waits on. **Its old
+///    partition's node, held across it** (PR #369 review): read through before, a `Rescan` sent to it
+///    refused `Unsupported` by its window, and refused `PeerClosed` after, its window retired.
+/// 10. **Every other disk answers a `Rescan` `Unsupported`**: the SATA disk's node and the scratch
+///    RAM disk's, sent one directly; and the scratch disk, unmounted, refused a `Reread` for it.
 fn storage_admin_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::storage::{
-        OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_UNMOUNT, build_mount, is_changed, parse_in_use,
+        OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT, build_mount,
+        is_changed, parse_in_use,
     };
     use libstream::wire::{Table, Value};
     let fail = |what: &[u8]| {
@@ -3044,6 +3056,21 @@ fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"the unmounted filesystem was not left clean"));
     }
 
+    // 5b. **A `Reread` of the scratch disk, unmounted**: a RAM disk, which the kernel cannot rescan,
+    //     so `Unsupported` (Phase 6 Part G) — the one disk this boot can ask that of.
+    let reread = ask(OP_STORAGE_REREAD, names[0].as_bytes());
+    if !refused(&reread, KError::Unsupported) {
+        // What it was answered, for whoever reads the failure.
+        let said = reread.as_ref().and_then(|m| librsproto::error::parse_error(&m.body));
+        Line::new()
+            .s(b"boot-probe: storage admin: the scratch disk's Reread answered ")
+            .i(said.as_ref().map_or(0, |e| e.kerror as i64))
+            .s(b": ")
+            .untrusted(said.as_ref().map_or(&b""[..], |e| e.msg))
+            .end();
+        return finish(fail(b"a Reread of the unmounted scratch disk, a RAM disk, was not refused Unsupported"));
+    }
+
     // 6. Mounted again by name — once refused a hidden label, the one moment a mountable device
     //    exists to refuse it on.
     let mut body = [0u8; 64];
@@ -3124,8 +3151,219 @@ fn storage_admin_test(root_ns: u64) -> bool {
     if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode")))) != Some(Some(alloc::string::String::from("rw"))) {
         return finish(fail(b"a refused eject unmounted the scratch disk"));
     }
-    kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session, a watch pinged by the unmount and the remount and not by a refusal, a session's eject of a RAM disk refused NoAccess ok\n");
+
+    // 10. **`Reread`'s refusals** (Phase 6 Part G). The disk the machine started from is found by its
+    //     flag, and its partition by its parent: on `test-qemu` the SATA disk's ESP, on a live boot
+    //     the stick's — never "the first FAT", which on some machines is an internal disk's, that a
+    //     `Reread` would take.
+    let blk = |r: &libkern::device::DeviceRecord| alloc::format!("blk-{}", r.served);
+    let root_disk = registry.iter().find(|r| r.id == root_rec.parent);
+    let mounted_ids: alloc::vec::Vec<u32> = ids.clone();
+    let boot_part = registry.iter().find(|r| {
+        r.kind() == libkern::device::DeviceKind::Partition
+            && !r.is_departed()
+            && registry.iter().any(|d| d.id == r.parent && d.is_boot_medium())
+            && !mounted_ids.contains(&r.id)
+    });
+    let (Some(root_disk), Some(boot_part)) = (root_disk, boot_part) else {
+        return finish(fail(b"no disk holding init's root, or no unmounted partition of the boot disk, to ask Reread of"));
+    };
+    let rereads: [(&[u8], alloc::string::String, KError); 4] = [
+        (b"the mounted scratch disk", names[0].clone(), KError::WouldBlock),
+        (b"the disk holding init's root", blk(root_disk), KError::WouldBlock),
+        (b"a partition of the boot disk", blk(boot_part), KError::NoAccess),
+        (b"a name nothing has", alloc::string::String::from("blk-999"), KError::NotFound),
+    ];
+    for (what, name, err) in rereads {
+        if !refused(&ask(OP_STORAGE_REREAD, name.as_bytes()), err) {
+            Line::new().s(b"boot-probe: storage admin: a Reread of ").s(what).s(b" was not the right error").end();
+            return finish(fail(b"a Reread refusal"));
+        }
+    }
+    if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
+        return finish(fail(b"a refused Reread pinged the watch"));
+    }
+
+    // 11. **A disk read again**: its old partition record departs and a new one arrives, with no
+    //     mount on either — the change a watch is pinged for since Part G, the devices'.
+    let stick = registry.iter().find(|r| {
+        r.kind() == libkern::device::DeviceKind::Disk
+            && r.driver() == b"usb-storage"
+            && !r.is_boot_medium()
+            && !r.is_departed()
+            && registry.iter().any(|p| p.parent == r.id && p.kind() == libkern::device::DeviceKind::Partition && !p.is_departed())
+    });
+    // **And every other disk refuses a `Rescan` sent to it directly**: the SATA disk's AHCI and the
+    // scratch disk's RAM disk, whatever is mounted on them — a rescan is refused before it looks.
+    let rescan_of = |r: &libkern::device::DeviceRecord| {
+        let path = alloc::format!("/dev/blk/{}", r.served);
+        let (st, node) = ns_lookup(root_ns, path.as_bytes(), libkern::RIGHT_READ | libkern::RIGHT_WRITE);
+        let status = if st == 0 { block_op(node, libkern::abi::IO_OPCODE_RESCAN, 0, 0) } else { st as i64 };
+        close(node);
+        status
+    };
+    let sata = registry.iter().find(|r| r.kind() == libkern::device::DeviceKind::Disk && r.driver() == b"ahci" && !r.is_departed());
+    for (what, rec) in [(b"the SATA disk".as_slice(), sata), (b"the scratch RAM disk", Some(scratch_rec))] {
+        let Some(rec) = rec else {
+            return finish(fail(b"no SATA disk to send a Rescan to"));
+        };
+        if rescan_of(rec) != KError::Unsupported.as_i32() as i64 {
+            Line::new().s(b"boot-probe: storage admin: a Rescan of ").s(what).s(b" was not refused Unsupported").end();
+            return finish(fail(b"a Rescan of a disk that is not a USB one"));
+        }
+    }
+    match stick {
+        Some(stick) => {
+            // **Its old partition's node, held across the rescan** (PR #369 review): the window's own
+            // refusal of a `Rescan`, and its retirement, through the node a holder keeps.
+            let Some(old) = registry.iter().find(|p| {
+                p.parent == stick.id && p.kind() == libkern::device::DeviceKind::Partition && !p.is_departed()
+            }) else {
+                return finish(fail(b"the stick's partition has no record"));
+            };
+            let path = alloc::format!("/dev/blk/{}", old.served);
+            let (st, held) = ns_lookup(root_ns, path.as_bytes(), libkern::RIGHT_READ | libkern::RIGHT_WRITE);
+            if st != 0 || held == 0 {
+                return finish(fail(b"the stick's partition's node would not open"));
+            }
+            let before = block_op(held, IO_OPCODE_READ, 0, 512);
+            let refused_rescan = block_op(held, libkern::abi::IO_OPCODE_RESCAN, 0, 0);
+            if before != 0 || refused_rescan != KError::Unsupported.as_i32() as i64 {
+                close(held);
+                Line::new().s(b"boot-probe: storage admin: through the partition: a read ").i(before).s(b", a Rescan ").i(refused_rescan).end();
+                return finish(fail(b"a partition's node did not read, or did not refuse a Rescan Unsupported"));
+            }
+            let reply = ask(OP_STORAGE_REREAD, blk(stick).as_bytes());
+            if !reply.as_ref().is_some_and(|m| !m.error && m.body.is_empty()) {
+                return finish(fail(b"a Reread of a USB disk holding nothing mounted was not answered, with nothing mounted"));
+            }
+            if !pinged(clock_ns() + 10_000_000_000) {
+                return finish(fail(b"a Reread that replaced a disk's partition did not ping the watch"));
+            }
+            let Some(now) = registry_records(root_ns) else {
+                return finish(fail(b"the registry does not read after the Reread"));
+            };
+            let old: alloc::vec::Vec<u32> =
+                registry.iter().filter(|p| p.parent == stick.id && !p.is_departed()).map(|p| p.id).collect();
+            let replaced = old.iter().all(|&id| now.iter().any(|p| p.id == id && p.is_departed()))
+                && now.iter().any(|p| p.parent == stick.id && !p.is_departed() && !old.contains(&p.id));
+            if !replaced {
+                close(held);
+                return finish(fail(b"the Reread did not replace the disk's partition records"));
+            }
+            let after = block_op(held, IO_OPCODE_READ, 0, 512);
+            close(held);
+            if after != KError::PeerClosed.as_i32() as i64 {
+                Line::new().s(b"boot-probe: storage admin: a read through the old partition after the rescan gave ").i(after).end();
+                return finish(fail(b"the old partition's window was not retired by the rescan"));
+            }
+            Line::new()
+                .s(b"boot-probe: storage admin: a Reread of ")
+                .s(blk(stick).as_bytes())
+                .s(b" rescanned it: its partition replaced, the old one's node refused after, and the watch pinged with no mount changed ok")
+                .end();
+        }
+        None => kprint(b"boot-probe: storage admin: no USB disk holding a partition and nothing mounted here; test-qemu attaches one\n"),
+    }
+    kprint(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session, a watch pinged by the unmount and the remount and not by a refusal, a session's eject of a RAM disk refused NoAccess, each Reread refusal its own ok\n");
     finish(true)
+}
+
+/// **One block operation on `dev`, waited for** (Phase 6 Part G): its status — `0`, the error its
+/// completion carried, or the submit's own refusal. A page is made for the data of a read or a
+/// write of `length` bytes at `offset`; a `Rescan` or a `Flush` names none.
+fn block_op(dev: u64, opcode: u32, offset: u64, length: u64) -> i64 {
+    // SAFETY: register-only syscall.
+    let page = if length > 0 { unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) } } else { 0 };
+    if page < 0 {
+        return page;
+    }
+    let op = IoOp { opcode, flags: 0, buffer: page as u64, buf_offset: 0, offset, length };
+    // SAFETY: a valid `IoOp`; `dev` and `page` are handles this process holds, or `page` is none.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
+    let status = if po > 0 { po_wait(po as u64).0 as i64 } else { po };
+    if page > 0 {
+        close(page as u64);
+    }
+    status
+}
+
+/// **What `test-qemu` writes past 2 TiB** (Phase 6 Part G): a marker, then bytes no two of which a
+/// sector at another place would share. The host reads it back out of the image.
+const PAST_TWO_TIB: &[u8; 32] = b"nitrox: past two tebibytes, G.5\n";
+/// **The block it goes at**: seven past the last a ten-byte command can name.
+const PAST_TWO_TIB_BLOCK: u64 = (1 << 32) + 7;
+
+/// **A USB disk of more than 2^32 blocks** (Phase 6 Part G.1's sixteen-byte commands): a sector
+/// written through its node past 2 TiB — where a ten-byte command's block number would wrap — and
+/// read back, the page cleared between. **On a machine with no such disk it says so and passes**:
+/// every `--selftest` gate runs this, and only `test-qemu` attaches one, which holds this line.
+fn past_two_tib_test(root_ns: u64) -> bool {
+    use libkern::device::DeviceKind;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: past 2 TiB: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let Some(all) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let Some(r) = all.iter().find(|r| {
+        r.kind() == DeviceKind::Disk && !r.is_departed() && r.driver() == b"usb-storage" && r.block_count > u32::MAX as u64
+    }) else {
+        kprint(b"boot-probe: past 2 TiB: no USB disk of more than 2^32 blocks here; test-qemu attaches one\n");
+        return true;
+    };
+    let path = alloc::format!("/dev/blk/{}", r.served);
+    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), libkern::RIGHT_READ | libkern::RIGHT_WRITE);
+    if st != 0 || dev == 0 {
+        return fail(b"its node would not open writable");
+    }
+    // SAFETY: register-only syscall.
+    let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    // SAFETY: register-only syscall; `page` is ours.
+    let addr = if page > 0 { unsafe { syscall4(SYS_MEMORY_MAP, page as u64, 0, PAGE, RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) } } else { -1 };
+    if addr <= 0 {
+        close(dev);
+        if page > 0 {
+            close(page as u64);
+        }
+        return fail(b"no page to move it through");
+    }
+    let (page, addr) = (page as u64, addr as u64);
+    let want: alloc::vec::Vec<u8> = (0..512u32).map(|i| if (i as usize) < PAST_TWO_TIB.len() { PAST_TWO_TIB[i as usize] } else { (i * 31 + 7) as u8 }).collect();
+    // SAFETY: `addr` maps PAGE writable bytes, and 512 are written.
+    let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
+    let io = |opcode: u32| {
+        let op = IoOp { opcode, flags: 0, buffer: page, buf_offset: 0, offset: PAST_TWO_TIB_BLOCK * 512, length: 512 };
+        // SAFETY: a valid `IoOp`; `dev` and `page` are handles this process holds.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
+        po > 0 && po_wait(po as u64) == (0, 512)
+    };
+    buf.copy_from_slice(&want);
+    let wrote = io(libkern::abi::IO_OPCODE_WRITE);
+    buf.fill(0);
+    let read = wrote && io(IO_OPCODE_READ);
+    let same = read && buf == &want[..];
+    // SAFETY: unmapping this call's own mapping.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    close(page);
+    close(dev);
+    if !wrote {
+        return fail(b"the write past 2 TiB failed");
+    }
+    if !same {
+        return fail(b"what was read back past 2 TiB is not what was written");
+    }
+    Line::new()
+        .s(b"boot-probe: past 2 TiB: blk-")
+        .u(r.served as u64)
+        .s(b", ")
+        .u(r.block_count)
+        .s(b" blocks: a sector written and read back at block ")
+        .u(PAST_TWO_TIB_BLOCK)
+        .s(b" ok")
+        .end();
+    true
 }
 
 /// **One program in the admin view**, as `with admin` runs it: a request on the client channel at

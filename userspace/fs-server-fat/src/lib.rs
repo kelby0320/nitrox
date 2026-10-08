@@ -10,6 +10,7 @@
 //! - [`dir`]: directories — their entries, long names assembled, and paths resolved.
 //! - [`time`]: FAT's dates and times, in UTC.
 //! - [`volume`]: a FAT filesystem on a device, and what can be done with it.
+//! - [`mkfs`]: making an empty FAT (Phase 6 Part G.2), what `disk --format` writes.
 //!
 //! **No `alloc`**: every buffer is the caller's or a bounded one on the stack, as in
 //! `fs-server-ext4`'s library. **A FAT is anyone's bytes**: a stick from a shop, written by any
@@ -20,6 +21,7 @@
 
 pub mod bpb;
 pub mod dir;
+pub mod mkfs;
 pub mod names;
 pub mod table;
 pub mod time;

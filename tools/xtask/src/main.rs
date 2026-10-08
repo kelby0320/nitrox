@@ -2252,8 +2252,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
     s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    // Sixteen since Phase 6 Part F gave `--eject` its two lines and the grant's note a third.
-    s.expect("help-rows=16")?;
+    // Sixteen since Phase 6 Part F gave `--eject` its two lines and the grant's note a third;
+    // twenty-one since Part G gave the usage a second line and `--partition` and `--format` two each.
+    s.expect("help-rows=21")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
@@ -4524,6 +4525,10 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     // **And a FAT stick** (Phase 6 Part E.6), for `fs-server-fat`.
     let stick_fat = work.join("stick-fat.img");
     fat32_stick(&stick_fat, &work)?;
+    // **And a blank one** (Phase 6 Part G), 2 GiB and sparse, partitioned and formatted in the guest.
+    let stick_blank = work.join(BLANK_STICK);
+    let _ = fs::remove_file(&stick_blank);
+    fs::File::create(&stick_blank).and_then(|f| f.set_len(2 << 30))?;
     let qmp_sock = work.join("qmp.sock");
     let _ = fs::remove_file(&qmp_sock);
 
@@ -4560,7 +4565,8 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     let mut session = Session::spawn(cmd, "check-storage")?;
     let result = run_storage_steps(&mut session, &disk, &work).and_then(|()| {
         let mut qmp = Qmp::connect(&qmp_sock)?;
-        run_stick_steps(&mut session, &mut qmp)
+        run_stick_steps(&mut session, &mut qmp)?;
+        run_format_steps(&mut session, &mut qmp, &work)
     });
     let transcript = session.finish();
     if let Err(e) = result {
@@ -4572,6 +4578,8 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     println!("\nxtask: and the sticks:");
     check_sticks(&stick_mbr, &work.join("stick-whole-pulled.img"), &work)?;
     check_fat_stick(&stick_fat, &work)?;
+    println!("\nxtask: and the stick partitioned and formatted in the guest:");
+    check_formatted_stick(&work.join(BLANK_STICK_EXT4), &stick_blank, &work)?;
     println!(
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
          unmount, and the filesystem was left clean ✓"
@@ -5255,6 +5263,260 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     pull(qmp, "stickfat")?;
     s.line_since(from, &format!("storage-service: blk-{fat} departed"), any, secs(30))?;
     println!("  ok: ejected, recorded clean, and pulled");
+    Ok(())
+}
+
+/// **The blank stick `check-storage` partitions and formats** (Phase 6 Part G), and the copy of it
+/// taken once its ext4 was ejected, before an MBR replaced the GPT.
+const BLANK_STICK: &str = "stick-blank.img";
+const BLANK_STICK_EXT4: &str = "stick-blank-ext4.img";
+
+/// **The whole line holding `pat`** after `from`, waited for.
+fn line_after(s: &mut Session, from: usize, pat: &str) -> R<String> {
+    s.line_since(from, pat, |_: &str| true, std::time::Duration::from_secs(120))?;
+    let t = s.transcript();
+    t[from.min(t.len())..]
+        .lines()
+        .find(|l| l.contains(pat))
+        .map(|l| l.trim().to_string())
+        .ok_or_else(|| format!("no line holding {pat:?}").into())
+}
+
+/// The `<n>` of the first `blk-<n>` in `line`.
+fn blk_in(line: &str) -> R<String> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("blk-"))
+        .map(|n| n.trim_end_matches(|c: char| !c.is_ascii_digit()).to_string())
+        .ok_or_else(|| format!("no `blk-<n>` in {line:?}").into())
+}
+
+/// **Partitioning and formatting, through `with admin`** (Phase 6 Part G), after the sticks:
+///
+/// 4. **`disk --list`'s `note`** names the internal FAT's reason, `not removable, so not mounted`.
+/// 5. **`disk --format` of a partition of the boot stick** is refused before anything is written,
+///    naming the disk the machine started from.
+/// 1. **A blank 2 GiB stick plugged in, then `disk --format DISK ext4`**: a GPT — the default for
+///    ext4 — with one partition, which the kernel's rescan publishes, an ext4 in it, mounted
+///    writable, written and ejected. Copied then, for the host to read the GPT and the ext4.
+/// 2. **`disk --partition DISK`**: an MBR, the GPT's partition departed and a new one arrived,
+///    holding nothing — the old ext4 at 1 MiB wiped with the table.
+/// 3. **`disk --format PART fat`**: a FAT32, read again and mounted writable, written; the same
+///    command refused while it is mounted; ejected and pulled. The host checks it after the boot.
+///
+/// The note and the boot stick come first, since they need no stick of their own.
+fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
+    let secs = std::time::Duration::from_secs;
+    let any = |_: &str| true;
+    let boot = s.transcript();
+    let report = |part: &str| {
+        boot.lines().find(|l| l.contains("storage-service: blk-") && l.contains(part)).map(str::to_string)
+    };
+    let internal = report(&format!("(partition {INTERNAL_FAT_PARTLABEL}):")).ok_or("no report of the internal FAT")?;
+    let internal = blk_in(&internal)?;
+    // **A partition of the boot stick**, by its parent in `/dev/devices`: the report names the disk
+    // as passed over, and its partition by what is in it — the live stick's ESP, by its clusters.
+    let boot_disk = boot
+        .lines()
+        .find(|l| l.contains("storage-service: blk-") && l.contains("(disk ") && l.contains("; on the disk the machine started from, passed over"))
+        .ok_or("no report of the boot stick, passed over")?;
+    let boot_disk = blk_in(boot_disk)?;
+    s.send(&format!(
+        "open /dev/devices/all.tsm | filter parent == \"blk-{boot_disk}\" | map {{ |r| format(\"boot-part=<{{}}>\", r.name) }}"
+    ))?;
+    s.expect("boot-part=<blk-")?;
+    // Read once the prompt is back, so the line is whole.
+    s.expect("/home>")?;
+    let on_stick = {
+        let t = s.transcript();
+        let at = t.rfind("boot-part=<blk-").ok_or("no boot-part line")?;
+        t[at + "boot-part=<blk-".len()..].split('>').next().unwrap_or("").to_string()
+    };
+
+    // 4. The note.
+    s.send(&format!("disk --list | filter name == \"blk-{internal}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"))?;
+    s.expect("note-is=not removable, so not mounted")?;
+    s.expect("/home>")?;
+    println!("  ok: `disk --list`'s note says why the internal FAT is not mounted");
+
+    // 5. The boot stick, refused before anything is written.
+    let from = s.transcript().len();
+    with_admin_asked(s, &format!("disk --format blk-{on_stick} fat"))?;
+    s.expect(&format!("disk: blk-{on_stick} not formatted: it is on the disk the machine started from; nothing was written"))?;
+    s.expect("/home>")?;
+    if s.transcript()[from..].contains("disk: wrote ") {
+        return Err(format!("`disk --format blk-{on_stick}` wrote to the boot stick").into());
+    }
+    println!("  ok: a partition of the boot stick is refused before anything is written, naming the disk the machine started from");
+
+    // 1. The blank stick, formatted ext4 whole.
+    let blank = work.join(BLANK_STICK);
+    qmp.execute(&format!(
+        r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":"stickblank","file":{{"driver":"file","filename":"{}"}}}}}}"#,
+        blank.display()
+    ))?;
+    let from = s.transcript().len();
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"stickblank","bus":"xhci.0","drive":"stickblank"}}"#)?;
+    let disk_line = line_after(s, from, "\", 4194304 blocks of 512 bytes, record ")?;
+    let port = disk_line
+        .strip_prefix("usb: port ")
+        .and_then(|r| r.split(':').next())
+        .ok_or_else(|| format!("no port in {disk_line:?}"))?
+        .to_string();
+    let disk = blk_in(&line_after(s, from, "): no filesystem")?)?;
+    println!("  ok: a blank 2 GiB stick plugged in: blk-{disk}, holding nothing");
+    let from = s.transcript().len();
+    with_admin_asked(s, &format!("disk --format blk-{disk} ext4"))?;
+    s.line_since(from, &format!("disk: wrote blk-{disk} ext4 (gpt)"), any, secs(300))?;
+    s.line_since(from, &format!("usb: port {port}: LUN 0: rescanned: 0 partition(s) departed, 1 published"), any, secs(60))?;
+    let mounted = line_after(s, from, "(partition nitrox): ext4 'nitrox'; mounted at /storage/nitrox (rw)")?;
+    let gpt_part = blk_in(&mounted)?;
+    s.line_since(from, &format!("disk: blk-{disk} formatted ext4 (gpt): blk-{gpt_part}, mounted at /storage/nitrox"), any, secs(60))?;
+    s.expect("/home>")?;
+    println!("  ok: `disk --format blk-{disk} ext4`: a GPT, its partition published by a rescan, an ext4 mounted writable");
+    let at = format!("/storage/nitrox/{STORAGE_PATTERN_FILE}");
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+    s.expect("/home>")?;
+    eject_stick(s, &["nitrox"])?;
+    fs::copy(&blank, work.join(BLANK_STICK_EXT4))?;
+    println!("  ok: written without a sync, and ejected");
+
+    // 2. Partitioned again, MBR: the GPT's partition goes, and the new one holds nothing.
+    let from = s.transcript().len();
+    with_admin_asked(s, &format!("disk --partition blk-{disk}"))?;
+    s.line_since(from, &format!("disk: wrote blk-{disk} (mbr)"), any, secs(120))?;
+    s.line_since(from, &format!("usb: port {port}: LUN 0: rescanned: 1 partition(s) departed, 1 published"), any, secs(60))?;
+    s.line_since(from, &format!("storage-service: blk-{gpt_part} departed"), any, secs(60))?;
+    let arrived = line_after(s, from, "(partition partition 1 (unlabelled)): no filesystem")?;
+    let part = blk_in(&arrived)?;
+    s.line_since(from, &format!("disk: blk-{disk} partitioned (mbr): blk-{part}, holding nothing"), any, secs(60))?;
+    s.expect("/home>")?;
+    println!("  ok: `disk --partition blk-{disk}`: an MBR, the GPT's blk-{gpt_part} departed, blk-{part} arrived holding nothing");
+
+    // 3. The partition formatted FAT, written, refused while mounted, ejected, pulled.
+    let from = s.transcript().len();
+    with_admin_asked(s, &format!("disk --format blk-{part} fat"))?;
+    s.line_since(from, &format!("disk: wrote blk-{part} fat"), any, secs(300))?;
+    line_after(s, from, &format!("blk-{part} (partition partition 1 (unlabelled)): fat 'NITROX'; mounted at /storage/NITROX (rw)"))?;
+    s.line_since(from, &format!("disk: blk-{part} formatted fat: mounted at /storage/NITROX"), any, secs(60))?;
+    s.expect("/home>")?;
+    println!("  ok: `disk --format blk-{part} fat`: read again and mounted writable by fs-server-fat");
+    let at = format!("/storage/NITROX/{STORAGE_PATTERN_FILE}");
+    s.send(&format!("test-pattern --write {at}"))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+    s.expect("/home>")?;
+    let from = s.transcript().len();
+    with_admin_asked(s, &format!("disk --format blk-{part} fat"))?;
+    s.expect(&format!(
+        "disk: blk-{part} not formatted: it is mounted, as NITROX: unmount it first (with admin disk --unmount NAME); nothing was written"
+    ))?;
+    s.expect("/home>")?;
+    if s.transcript()[from..].contains("disk: wrote ") {
+        return Err(format!("`disk --format blk-{part}` wrote while it was mounted").into());
+    }
+    println!("  ok: the same command, while it is mounted, is refused before anything is written");
+    eject_stick(s, &["NITROX"])?;
+    let from = s.transcript().len();
+    qmp.execute(r#"{"execute":"device_del","arguments":{"id":"stickblank"}}"#)?;
+    s.line_since(from, &format!("storage-service: blk-{part} departed"), any, secs(30))?;
+    println!("  ok: written, ejected and pulled");
+    Ok(())
+}
+
+/// **`len` bytes of `from` at `at`, copied into `to`** — sparsely, since most of a stick is never
+/// written.
+fn carve_sparse(from: &Path, at: u64, len: u64, to: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const MIB: u64 = 1024 * 1024;
+    let mut src = fs::File::open(from)?;
+    src.seek(SeekFrom::Start(at))?;
+    let mut dst = fs::File::create(to)?;
+    let mut buf = vec![0u8; MIB as usize];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(MIB) as usize;
+        src.read_exact(&mut buf[..n])?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            dst.write_all(&buf[..n])?;
+        } else {
+            dst.seek(SeekFrom::Current(n as i64))?;
+        }
+        done += n as u64;
+    }
+    dst.set_len(len)?;
+    Ok(())
+}
+
+/// **The stick partitioned and formatted in the guest, on the host** (Phase 6 Part G):
+/// - **as its ext4 was ejected** (`ext4_copy`): a GPT whose one partition is a Linux filesystem from
+///   1 MiB to the last usable sector, holding an ext4 `e2fsck -fn` finds clean, with the pattern
+///   `debugfs` reads;
+/// - **as it was pulled** (`stick`): an MBR naming one FAT32 partition from 1 MiB to the end, **no
+///   GPT left** — neither header, front nor back — and the FAT `fsck.fat -n` finds clean, its
+///   pattern read by `mtype`.
+fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
+    use std::os::unix::fs::FileExt;
+    let sectors = fs::metadata(stick)?.len() / 512;
+    let sector = |path: &Path, lba: u64| -> R<[u8; 512]> {
+        let mut b = [0u8; 512];
+        fs::File::open(path)?.read_exact_at(&mut b, lba * 512)?;
+        Ok(b)
+    };
+    let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
+
+    let header = sector(ext4_copy, 1)?;
+    if &header[..8] != b"EFI PART" {
+        return Err("the stick formatted ext4 has no GPT at LBA 1".into());
+    }
+    let entry = sector(ext4_copy, 2)?;
+    let linux = [0xAFu8, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4];
+    let first = u64::from_le_bytes(entry[32..40].try_into()?);
+    let last = u64::from_le_bytes(entry[40..48].try_into()?);
+    if entry[..16] != linux || first != 2048 || last != sectors - 34 {
+        return Err(format!("the GPT's first entry is not a Linux filesystem from 2048 to {}: {first}..{last}", sectors - 34).into());
+    }
+    // **Every other entry unused** (PR #369 review): entries are 128 bytes, four to a sector, so the
+    // second is at LBA 2 + 128 — sixteen zero bytes at LBA 3 are the fifth's type.
+    let mut array = vec![0u8; 128 * 128];
+    fs::File::open(ext4_copy)?.read_exact_at(&mut array, 2 * 512)?;
+    if let Some(n) = (1..128).find(|&n| array[n * 128..n * 128 + 16] != [0u8; 16]) {
+        return Err(format!("the GPT has a partition in entry {n}, beside the one `disk --format` wrote").into());
+    }
+    println!("  ok: the ext4 format's table is a GPT, one Linux filesystem partition from 1 MiB to the last usable sector");
+    let part = work.join("stick-blank-ext4-part.img");
+    carve_sparse(ext4_copy, first * 512, (last - first + 1) * 512, &part)?;
+    check_ext4_clean(&part, "the stick's ext4")?;
+    match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
+        Some(b) if b == pattern => println!("  ok: its ext4 holds the pattern, read with debugfs"),
+        _ => return Err("the stick's ext4 does not hold the pattern: the eject did not write it back".into()),
+    }
+
+    let mbr = sector(stick, 0)?;
+    let e = &mbr[0x1BE..0x1CE];
+    let (kind, first, count) =
+        (e[4], u32::from_le_bytes(e[8..12].try_into()?) as u64, u32::from_le_bytes(e[12..16].try_into()?) as u64);
+    if mbr[510..512] != [0x55, 0xAA] || kind != 0x0C || first != 2048 || count != sectors - 2048 {
+        return Err(format!("the stick's MBR is not one FAT32 partition from 2048 to the end: type {kind:#04x}, {first}+{count}").into());
+    }
+    if mbr[0x1CE..0x1FE].iter().any(|&b| b != 0) {
+        return Err("the stick's MBR names more than one partition".into());
+    }
+    if &sector(stick, 1)?[..8] == b"EFI PART" || &sector(stick, sectors - 1)?[..8] == b"EFI PART" {
+        return Err("a GPT header outlived the MBR: the kernel could read the stale table".into());
+    }
+    println!("  ok: the stick's table is an MBR, one FAT32 partition from 1 MiB, and no GPT header is left at either end");
+    let fat = work.join("stick-blank-fat-part.img");
+    carve_fat_clean(stick, &fat, "the stick's FAT")?;
+    let out = mtools_cmd("mtype").arg("-i").arg(&fat).arg(format!("::{STORAGE_PATTERN_FILE}")).output()?;
+    if out.stdout != pattern {
+        return Err("mtype does not read the pattern off the stick's FAT: the eject did not write it back".into());
+    }
+    let info = mtools_cmd("minfo").arg("-i").arg(&fat).arg("::").output()?;
+    let info = String::from_utf8_lossy(&info.stdout);
+    if !info.contains("FAT32") {
+        return Err(format!("the stick's FAT is not a FAT32:\n{info}").into());
+    }
+    println!("  ok: its FAT32 holds the pattern, read with mtype");
     Ok(())
 }
 
@@ -14279,9 +14541,19 @@ const USB_INPUT_FACTS: &[&[&str]] = &[
 ///   review).
 /// - **The stick is a stick from a shop** (Phase 6 Part D): an MBR naming one FAT partition, which
 ///   the first round reads and the storage service reports and leaves unmounted, until Part E.
+/// - **And a drive past 2 TiB** (Phase 6 Part G): [`PAST_TWO_TIB_IMAGE`], 3 TiB, blank and sparse,
+///   last, so every other device keeps its port. The kernel reads it with the sixteen-byte
+///   commands, `boot-probe` writes a sector past 2 TiB through its node, and
+///   [`check_past_two_tib`] finds that sector in the image, where a block number cut to 32 bits
+///   would have put it 2 TiB lower.
 fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
     let stick = build_cache().join("test-qemu-usb-stick.img");
     mbr_fat_stick(&stick, 16, "NXSTICK")?;
+    let big = build_cache().join(PAST_TWO_TIB_IMAGE);
+    let _ = fs::remove_file(&big);
+    fs::File::create(&big)
+        .and_then(|f| f.set_len(3 << 40))
+        .map_err(|e| format!("a 3 TiB sparse image at {}: {e}", big.display()))?;
     cmd.arg("-device")
         .arg(format!("{XHCI_DEVICE},p2=8,p3=8"))
         .arg("-device")
@@ -14295,7 +14567,46 @@ fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
         .arg("-device")
         .arg("usb-hub,bus=xhci.0")
         .arg("-device")
-        .arg("usb-ccid,bus=xhci.0");
+        .arg("usb-ccid,bus=xhci.0")
+        .arg("-drive")
+        .arg(format!("if=none,id=usbbig,format=raw,file={}", big.display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=usbbig");
+    Ok(())
+}
+
+/// **The drive past 2 TiB `test-qemu` attaches** (Phase 6 Part G), in the build cache.
+const PAST_TWO_TIB_IMAGE: &str = "test-qemu-usb-3tib.img";
+/// The block `boot-probe` writes at: seven past the last a ten-byte command can name.
+const PAST_TWO_TIB_BLOCK: u64 = (1 << 32) + 7;
+/// What it writes there first; the rest of the sector is `(i * 31 + 7)`, as `boot-probe` makes it.
+const PAST_TWO_TIB_MARK: &[u8; 32] = b"nitrox: past two tebibytes, G.5\n";
+
+/// **The sector `boot-probe` wrote past 2 TiB, in the image** (Phase 6 Part G): where the guest
+/// asked for it. A guest that read back what it wrote proves only that the write and the read
+/// named the same block; a block number cut to 32 bits would name block 7 for both.
+fn check_past_two_tib() -> R<()> {
+    use std::os::unix::fs::FileExt;
+    let big = build_cache().join(PAST_TWO_TIB_IMAGE);
+    let mut got = [0u8; 512];
+    let read = fs::File::open(&big).and_then(|f| f.read_exact_at(&mut got, PAST_TWO_TIB_BLOCK * 512));
+    let low = fs::File::open(&big).and_then(|f| {
+        let mut b = [0u8; 512];
+        f.read_exact_at(&mut b, (PAST_TWO_TIB_BLOCK - (1 << 32)) * 512).map(|()| b)
+    });
+    let _ = fs::remove_file(&big);
+    read.map_err(|e| format!("the 3 TiB image would not read: {e}"))?;
+    let want: Vec<u8> =
+        (0..512u32).map(|i| PAST_TWO_TIB_MARK.get(i as usize).copied().unwrap_or((i * 31 + 7) as u8)).collect();
+    if got[..] != want[..] {
+        let wrapped = low.is_ok_and(|b| b[..32] == PAST_TWO_TIB_MARK[..]);
+        return Err(format!(
+            "the sector boot-probe wrote at block {PAST_TWO_TIB_BLOCK} is not there in the image{}",
+            if wrapped { ": it is at block 7, so the block number was cut to 32 bits" } else { "" }
+        )
+        .into());
+    }
+    println!("xtask: the sector boot-probe wrote past 2 TiB is in the 3 TiB image at block {PAST_TWO_TIB_BLOCK} ✓");
     Ok(())
 }
 
@@ -14502,6 +14813,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_hardware_facts(&transcript)?;
             check_hot_plug(&transcript, &hot)?;
             check_usb_listed(&transcript)?;
+            check_past_two_tib()?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -14569,14 +14881,16 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // takes a USB 3 port; the rest, USB 2 ones. The smart-card reader is the one whose default
     // endpoint is not its speed's, so its enumeration evaluates it.
     &["xhci: port 3 at start: connected, SuperSpeed, enabled"],
-    &["xhci: 5 of 16 ports connected at start"],
+    &["xhci: port 6 at start: connected, SuperSpeed, enabled"],
+    &["xhci: 6 of 16 ports connected at start"],
     &["usb: port 3: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
     &["usb: port 9: 0627:0001 class 03/01/01, high-speed, \"QEMU USB Keyboard (", "\": HID boot keyboard"],
     &["usb: port 10: 0627:0001 class 03/01/02, full-speed, \"QEMU USB Mouse (", "\": HID boot mouse"],
     &["usb: port 12: 0409:55aa class 09/00/00, full-speed, \"QEMU USB Hub (", "\": a hub, not supported"],
     &["usb: port 13: its default endpoint takes 64-byte packets, not 8; evaluated"],
     &["usb: port 13: 08e6:4433 class 0b/00/00, full-speed, \"QEMU USB CCID (", "\": nothing this kernel drives"],
-    &["usb: first round: 5 device(s) in "],
+    &["usb: port 6: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
+    &["usb: first round: 6 device(s) in "],
     // **The stick bound as a disk, its MBR read** (Phase 6 Part D): INQUIRY's strings and the
     // capacity QEMU gives a 16 MiB image, and the one FAT16 partition the gate wrote.
     &["usb: port 3: LUN 0: disk \"QEMU QEMU HARDDISK (", "\", 32768 blocks of 512 bytes, record "],
@@ -14584,6 +14898,20 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["mbr: 1 partition(s)"],
     &["boot-probe: registry: usb disk blk-", ", 32768 blocks of 512, under usb-"],
     &["boot-probe: registry: usb disk blk-", "'s partition blk-", ", by mbr"],
+    // **The drive past 2 TiB** (Phase 6 Part G): `READ CAPACITY(10)` cannot say its size, so it is
+    // asked again with `READ CAPACITY(16)` and read with the sixteen-byte commands; published with
+    // its size; and written past 2 TiB through its node, which `check_past_two_tib` finds on the
+    // host.
+    &["usb: port 6: LUN 0: 2 TiB or more: 6442450944 blocks, read with the sixteen-byte commands"],
+    &["usb: port 6: LUN 0: disk \"QEMU QEMU HARDDISK (", "\", 6442450944 blocks of 512 bytes, record "],
+    &["boot-probe: registry: usb disk blk-", ", 6442450944 blocks of 512, under usb-"],
+    &["boot-probe: past 2 TiB: blk-", ", 6442450944 blocks: a sector written and read back at block 4294967303 ok"],
+    // **A disk read again** (Phase 6 Part G): `boot-probe`'s `Reread` of the stick, which the
+    // kernel rescans — its one partition departed and published again — and which the watch is
+    // pinged for though nothing is mounted on it.
+    &["usb: port 3: LUN 0: rescanned: 1 partition(s) departed, 1 published"],
+    &["storage-service: blk-", " rescanned, as asked: 1 partition(s)"],
+    &["boot-probe: storage admin: a Reread of blk-", " rescanned it: its partition replaced, the old one's node refused after, and the watch pinged with no mount changed ok"],
     // **Reported, with its clusters, as not served** (Phase 6 Part E.6): 512-byte clusters, which
     // `fs-server-fat` refuses, so the boot's mounts — what `boot-probe` checks — are as they were.
     &[
@@ -14604,6 +14932,7 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["boot-probe: registry: usb port 10, 0627:0001 class 03/01/02, speed 1, under 00:03.0, \"QEMU USB Mouse ("],
     &["boot-probe: registry: usb port 12, 0409:55aa class 09/00/00, speed 1, under 00:03.0, \"QEMU USB Hub ("],
     &["boot-probe: registry: usb port 13, 08e6:4433 class 0b/00/00, speed 1, under 00:03.0, \"QEMU USB CCID ("],
+    &["boot-probe: registry: usb port 6, 46f4:0001 class 08/06/50, speed 4, under 00:03.0, \"QEMU USB HARDDRIVE ("],
     // **The keyboard and mouse bound** (Part B.2), each at the index after the i8042's two, and in
     // the registry under its device. That `input-server` was given them is `check_usb_listed`'s:
     // how many it was given depends on where the hot-plug lands.

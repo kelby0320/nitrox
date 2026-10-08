@@ -2151,7 +2151,8 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     let (dev_right, buf_right) = match opcode {
         IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
         IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
-        IoOpcode::Flush => return submit_flush(resource_h, &op, pid),
+        IoOpcode::Flush => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Flush),
+        IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
     };
     let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
     let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
@@ -2246,7 +2247,11 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 /// anything to make durable — and names no buffer and no range, so each of those fields must be
 /// `0`: a flush that seemed to cover a range would promise something it does not do. Not a
 /// zero-length transfer, so it never takes that path's pre-signalled no-op.
-fn submit_flush(resource_h: u64, op: &IoOp, pid: u32) -> SysResult {
+///
+/// **And its rescan** (Phase 6 Part G), `irp_op` saying which: a disk's table read again, with the
+/// same rules — `WRITE`, since a writer of the disk is who can have changed its table, and no buffer
+/// and no range. A partition and every disk but a USB one answer `Unsupported`, through the IRP.
+fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::IrpOp) -> SysResult {
     if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
         return Err(KError::InvalidArgument);
     }
@@ -2269,7 +2274,7 @@ fn submit_flush(resource_h: u64, op: &IoOp, pid: u32) -> SysResult {
             return Err(map_handle_err(e));
         }
     };
-    match crate::io::block::dispatch_block_flush(&dev_ok.object, &po_ref) {
+    match crate::io::block::dispatch_block_control(&dev_ok.object, &po_ref, irp_op) {
         Ok(()) => Ok(po_h.bits() as isize),
         Err(e) => {
             close_and_release(po_h, pid);

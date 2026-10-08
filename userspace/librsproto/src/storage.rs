@@ -41,11 +41,22 @@ pub const OP_STORAGE_IN_USE: u16 = 0x1002;
 /// drive goes whole**: every filesystem the service mounted on the same disk is unmounted, or none
 /// is (PR #367 review). Reply body: their mount names, one per line ([`ejected_names`]).
 pub const OP_STORAGE_EJECT: u16 = 0x1003;
-/// Service → client, on a **watch** (Phase 6 Part F): **the set of mounts changed**; read the table
-/// again. Body: empty. Not a reply, and nothing answers it. **A watch carries nothing else**, so a
-/// watch whose queue is full holds a ping already, and a client that reads one after many changes
-/// has missed none of them.
+/// Service → client, on a **watch** (Phase 6 Part F): **the set of mounts changed, or the set of
+/// devices** (Phase 6 Part G: a partition a rescan published holding nothing changes no mount, and
+/// `disk --partition` waits for its row); read the table again. Body: empty. Not a reply, and
+/// nothing answers it. **A watch carries nothing else**, so a watch whose queue is full holds a
+/// ping already, and a client that reads one after many changes has missed none of them.
 pub const OP_STORAGE_CHANGED: u16 = 0x1004;
+/// Client → service, on an admin session (Phase 6 Part G): **read a device again**, after `disk`
+/// has written it, and mount what it holds by the rules a device arriving meets. Body: the device's
+/// name as the tables name it (`blk-<n>`). **A partition** is probed again. **A disk** is first
+/// rescanned by the kernel (`IoOpcode::Rescan`): its partitions depart and those its table now
+/// holds arrive, and are probed and mounted as arrivals, after the reply. Refused `NotFound` for a
+/// name nothing has, `WouldBlock` while the partition is mounted or anything on the disk is,
+/// `NoAccess` for anything on the disk the machine started from, and `Unsupported` for a disk the
+/// kernel cannot rescan — every one but a USB disk's. Reply body: the names it was mounted under,
+/// one per line ([`ejected_names`] reads them), empty for none.
+pub const OP_STORAGE_REREAD: u16 = 0x1005;
 
 /// Whether a message on a watch is a ping: [`OP_STORAGE_CHANGED`] with no body. Anything else on a
 /// watch is not something the service sends, and a client ignores it.

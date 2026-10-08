@@ -26,6 +26,9 @@ libgpt = { path = "../libgpt" }
 # a syscall shim around. Part H.2's plan named these functions, so the dependency is the
 # design rather than a shortcut.
 fs-server-ext4 = { path = "../fs-server-ext4" }
+# The window onto a partition of a disk the filesystem is written through, `PartitionIo`: this
+# crate's own until `disk --format` needed it too (Phase 6 Part G.2).
+libfsserver = { path = "../libfsserver" }
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 # `ns_children`, to list the devices this namespace was given rather than probe for them

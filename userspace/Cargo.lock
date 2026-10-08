@@ -71,7 +71,11 @@ dependencies = [
 name = "coreutils"
 version = "0.1.0"
 dependencies = [
+ "fs-server-ext4",
+ "fs-server-fat",
  "libfs",
+ "libfsserver",
+ "libgpt",
  "libheap",
  "libkern",
  "libprompt",
@@ -413,6 +417,7 @@ version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
  "libfs",
+ "libfsserver",
  "libgpt",
  "libheap",
  "libkern",

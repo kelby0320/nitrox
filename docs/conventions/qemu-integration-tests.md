@@ -240,6 +240,23 @@ by its MBR where it has one — as it reads the SATA disk. A command in flight a
 unplug is the driver's host tests' alone: no gate can place an unplug inside one command's few
 milliseconds without depending on timing.
 
+**A drive past 2 TiB is a sparse file** (Phase 6 Part G). `test-qemu`'s sixth USB device is a 3 TiB
+image, `set_len` and nothing written, attached **last** so every other device keeps its port and
+every fact naming one stays true. It costs nothing on the host's disk: `boot-probe` writes one
+sector at block 2³² + 7, and the host reads that sector back out of the image after the run and
+then removes the file. **The host's read is the assertion**: the guest reading back what it wrote
+proves only that the write and the read named the same block, and a block number cut to 32 bits
+names block 7 for both. `boot-probe`'s test passes, saying so, on any machine without such a drive,
+since every `--selftest` gate runs it; `test-qemu` holds its line.
+
+**A stick the guest formats is checked twice** (Phase 6 Part G). `check-storage`'s blank stick is
+formatted ext4 whole, then partitioned again and formatted FAT, all in one boot, so the host copies
+the image once the ext4 is ejected — before the MBR replaces its GPT — and checks the copy and the
+final image after the machine stops, as it checks a stick pulled while mounted. **Which partition
+is the boot stick's is asked of `/dev/devices`** (`filter parent == "blk-<n>"`), not read off the
+report lines: the report gives a partition's reason, and the live stick's ESP's is its clusters, not
+that it is on the disk the machine started from.
+
 **`check-media` plugs a stick into a desktop and reads the result off the screen** (Phase 6 Part
 F). It boots the **release** live image beside a copy of the release disk and logs in at the
 graphical greeter, so what it drives is what a person has: Files, the editor, the eject button.
