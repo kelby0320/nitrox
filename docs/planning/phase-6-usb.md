@@ -2827,6 +2827,21 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   writes by **48** — eight pages of data, and forty of `fs-server-ext4`'s metadata, a block's
   bitmap, descriptor, superblock and zeroes for each block it grew — and `time list /dev/devices`
   on the release image said `35 ms; blk-0: 30 reads 120.0 KiB, busy 4 ms`.
+- **A dry run of H.3 under QEMU, before the laptop's** (2026-10-08), the runs typed on serial at a
+  copy of the release disk grown to 1.5 GiB with the stick attached, to find what would stop a run
+  rather than to time one. **It found a hang**: `copy` of `small/` never returned, and neither did
+  `list` of any FAT directory of 126 files or more. A directory reply's body was sized by the
+  page, not by what a message carries — the payload leaves room for eight handles — so a full page
+  of entries made a reply the kernel refused; the server ignored the failed send, and the client
+  waits with no deadline. **Fixed before the laptop's runs**: `librsproto::RS_MAX_BODY`, the one cap
+  every body buffer is sized by — five were wrong — and `encode` refusing anything longer; the
+  server answers a reply it cannot build with an error and says a send that fails. `boot-probe`
+  lists a directory whose pages fill to the brim. It was the server loop both filesystems share,
+  so a large ext4 directory would have hung its listing too. **With the fix it ran to the end**,
+  and its counters are H.4's first leads: every ext4 I/O one 4 KiB block, about five writes and
+  six reads per data block copied in, and `small/`'s cost per file growing with its directory —
+  782 reads a file out of the stick's 4,096-entry FAT directory against about 29 out of `tree/`'s
+  64-entry ones, and 377 on ext4.
 - **H.3 The laptop**, and Linux on it: the runs above, recorded.
 - **H.4 The fix**, and the laptop again, in the loop above; each fix with its count.
 - **H.5 The number, and the docs.**

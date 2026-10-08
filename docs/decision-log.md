@@ -35062,3 +35062,49 @@ counting nothing and `time` printing nothing, by their gates. **Gates**: `test-q
 `test-interactive`, `check-storage` under TCG and KVM, `check-live`, `check-media`, `check-shutdown`
 and `check-images` pass; the full set is left for the part's PR. Host tests: 3,334. ABI hash: no
 impact — the snapshot's records are `abi-sync-check`'s, and `DeviceNode`'s fields are no hash input.
+
+## 2026-10-08 — Phase 6 Part H: a dry run, and a listing that filled its page
+
+Before handing the laptop's runs to the maintainer, H.3 was dry-run under QEMU: the commands typed
+on serial at a copy of the release disk grown to 1.5 GiB, the throughput stick attached — to find
+what would stop a run, not to time one. **`copy` of `small/` never returned.** Bisected on sticks of
+generated directories, `list` of a FAT directory hung at 126 files and not at 120; probes on both
+sides of a page showed the server build a reply of 4,038 bytes of entries and the client never see
+it.
+
+**The cause**: `libfsserver` sized a directory reply's body as the page less the IPC and RS
+headers, 4,044 bytes, but a message's payload is the page less its header *and the room for eight
+handles*, 4,008 — so a body over 3,980 made a message the kernel refused. The send was `NOBLOCK`
+and its result ignored, and the client's round trip waits with no deadline, so the listing hung for
+good and Ctrl-C, a request to a process blocked in `sys_wait`, did nothing. 120 short names packed
+into 3,972 bytes and fit; 126 into 4,038. The loop is both filesystems', so an ext4 directory with
+a page of long names would have hung the same way; no gate listed one.
+
+**The class, fixed**: four more buffers subtracted the handles and forgot the envelope —
+`device-mgr`'s and `profile-server`'s directory replies, `tty-server`'s output chunks and `nxterm`'s
+input. `tty-server`'s comment said it left room for both headers, and by its code a full chunk of a
+program's output would have been dropped the same way: the send fails and nothing looks.
+`librsproto::RS_MAX_BODY` (3,980) is now the one cap every body is sized by, and **`encode` refuses
+a longer message**, so no buffer can build one the kernel would refuse. The file server answers a
+directory reply it cannot build with an error and logs a send that fails. Pinned by a codec test at
+the cap and one past it, and by `boot-probe` listing 200 files whose pages fill to the cap. The
+client's want of a deadline is the larger question the hang raised, and is left, recorded: a server
+that never answers still hangs its client — the shape of administration Part C.5b's first
+`SUBNAMESPACE` reply, whose failed send answered nothing and left a forwarded resolve waiting.
+
+**With the fix the dry run finished** — under KVM on the development machine with image files for
+disks, so a check of the runs' shape and not the number. Every command returned, the stick ejected
+and `--check` found every byte of it as written. Copying `big/` (256 MiB in 32 files), `small/` (64
+MiB in 4,096 files, one directory) and `tree/` (64 MiB in 1,024 files, 16 directories) took 71 s,
+625 s and 36 s from the stick to `/home`; 60 s, 135 s and 37 s within `/home`; 26 s, 685 s and 25 s
+from `/home` to the stick; and `remove -r` of the copies 40 s, 31 s and 13 s. **The counters point
+H.4 at two costs**, as counts and not yet causes. Every ext4 I/O is one 4 KiB block, and ext4 issues
+about five writes and six reads per data block copied in and three writes and five reads per block
+removed. And a file of `small/`, 4,096 to a directory, costs hundreds of reads where that directory
+is: 782 on the stick's FAT copying out of it, nearly all of them a sector, and 917 copying into it,
+against about 29 a file out of `tree/`'s 64-entry directories; and 377 on ext4 within `/home`. The
+per-file work grows with the directory, and the stick was busy 489 s of the 625. The root's
+`e2fsck -fn` afterwards found only 12,288 blocks of group 0 marked in use and counted free, and a
+fresh disk showed the same before it booted: the dry run's own preparation, a `dd conv=sparse`
+writing the grown filesystem back, skips all-zero sectors and so left the bitmap's padding from
+before the grow. Prepared without it, the disk checks clean.

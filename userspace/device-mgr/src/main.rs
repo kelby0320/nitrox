@@ -560,7 +560,7 @@ impl Manager {
             _ => return reply_error(ch, op, request_id, KError::Unsupported),
         };
         let names = table::entries(&self.records);
-        let mut out = [0u8; MSG_LEN - PAYLOAD_OFF - 64];
+        let mut out = [0u8; librsproto::RS_MAX_BODY];
         let Some(mut w) = DirReplyWriter::new(&mut out) else {
             return reply_error(ch, op, request_id, KError::KernelError);
         };

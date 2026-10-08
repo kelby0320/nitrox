@@ -26,6 +26,13 @@ Total header size: 28 bytes. Aligned to 4 bytes.
 
 The header is followed by `body_len` bytes of operation-specific body data, encoded as a packed C struct with fields specific to the operation. See per-operation specifications below.
 
+**A body is at most `RS_MAX_BODY`, 3,980 bytes**: an IPC message's payload, `IPC_PAYLOAD_SIZE`
+(4,008 — the page less its 24-byte header *and the room for eight handles*), less this 28-byte
+envelope. `librsproto::encode` refuses a longer one, and every buffer a body is built in is sized
+by it. Until Phase 6 Part H (2026-10-08) five were sized by the page instead, and a full one made
+a message the kernel refused: a directory listing's reply went nowhere and its client waited for
+good.
+
 ### Magic value
 
 `0x52534D47` reads as ASCII `"RSMG"` (Resource Server MesSaGe). Any IPC payload not beginning with this magic is rejected by both clients and servers as malformed. The magic catches channel confusion and helps diagnose mis-routed messages.

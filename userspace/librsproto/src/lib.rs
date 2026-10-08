@@ -58,6 +58,17 @@ pub const RS_MAX_PAYLOAD: usize = 4008;
 #[cfg(feature = "io")]
 const _: () = assert!(RS_MAX_PAYLOAD == libkern::abi::IPC_PAYLOAD_SIZE);
 
+/// **The largest body one message can carry**: [`RS_MAX_PAYLOAD`] less the envelope. What every
+/// buffer a body is built in is sized by.
+///
+/// **Not the page less its headers.** A message is a page, but its payload is the page less the
+/// IPC header *and the room for eight handles*, whether any are sent or not, and the kernel refuses
+/// a longer one. Five buffers missed one or the other — a directory reply's in `libfsserver`, which
+/// forgot the handles, and four others', which subtracted them and forgot the envelope — and a full
+/// one made a message no send could carry: the server's reply went nowhere and its client waited
+/// for good. A FAT directory of 126 files did it (Phase 6 Part H's dry run, 2026-10-08).
+pub const RS_MAX_BODY: usize = RS_MAX_PAYLOAD - RS_HEADER_LEN;
+
 /// `RsFlags` — message-envelope flags.
 pub const RS_FLAG_REPLY: u32 = 1 << 0;
 /// This reply is an error (body is an [`error::ErrorBody`]).
@@ -274,8 +285,10 @@ impl Message<'_> {
 }
 
 /// Encode a message header + `body` into `out`, returning the total byte length
-/// written (header + body), or `None` if `out` is too small. The caller sets
-/// `IpcMsg.header.payload_len` to the returned length and `handle_count` itself.
+/// written (header + body), or `None` if `out` is too small — **or the message too long to
+/// send**, a body over [`RS_MAX_BODY`], which the kernel would refuse with nothing to tell the
+/// receiver. The caller sets `IpcMsg.header.payload_len` to the returned length and
+/// `handle_count` itself.
 pub fn encode(
     out: &mut [u8],
     op: u16,
@@ -285,7 +298,7 @@ pub fn encode(
     handle_count: u16,
 ) -> Option<usize> {
     let total = RS_HEADER_LEN.checked_add(body.len())?;
-    if out.len() < total {
+    if out.len() < total || total > RS_MAX_PAYLOAD {
         return None;
     }
     put_u32(out, 0, RS_MAGIC);
@@ -383,5 +396,18 @@ mod tests {
     fn encode_refuses_small_buffer() {
         let mut buf = [0u8; 16]; // smaller than the header
         assert!(encode(&mut buf, OP_PING, 0, 0, &[], 0).is_none());
+    }
+
+    /// **A body one byte over what a message carries is refused, in a buffer with room for it**:
+    /// the page less its IPC header has room for 4,044 bytes of body, and the kernel takes 3,980.
+    /// Until Phase 6 Part H the codec built such a message and the kernel refused the send, with
+    /// nothing to tell the receiver.
+    #[test]
+    fn encode_refuses_a_body_longer_than_a_message_carries() {
+        let mut page = [0u8; 4096 - 24];
+        let body = [7u8; RS_MAX_BODY + 1];
+        assert_eq!(RS_MAX_BODY, 3980);
+        assert!(encode(&mut page, OP_PING, 0, 0, &body[..RS_MAX_BODY + 1], 0).is_none());
+        assert_eq!(encode(&mut page, OP_PING, 0, 0, &body[..RS_MAX_BODY], 0), Some(RS_MAX_PAYLOAD));
     }
 }

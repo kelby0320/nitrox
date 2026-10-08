@@ -1506,6 +1506,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & storage_test(root_ns)
         & storage_mount_test(root_ns)
         & io_counters_test(root_ns)
+        & long_listing_test(root_ns)
         & storage_admin_test(root_ns)
         & storage_grant_test(root_ns)
         & auth_admin_test(root_ns)
@@ -2962,6 +2963,59 @@ fn io_counters_test(root_ns: u64) -> bool {
         .s(b" disks in io.tsm, the root's ")
         .s(root_disk.as_bytes())
         .s(b" with reads ok")
+        .end();
+    true
+}
+
+/// **A directory whose listing fills its pages to the brim lists whole** (Phase 6 Part H): 200 files
+/// with names long enough that a page of entries reaches the most one message carries, made on the
+/// scratch disk and listed through a session, as `list` and `copy` list one. A directory reply was
+/// sized by the page rather than by what a message carries, so a full page made a reply the kernel
+/// refused, the server never knew, and the client waited for good — here, `test-qemu` timing out
+/// at this step. Found by Part H's dry run on a FAT stick; the server loop is both filesystems'.
+fn long_listing_test(root_ns: u64) -> bool {
+    use libkern::SYS_FILE_CREATE;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: long listing: ").s(what).s(b" FAIL").end();
+        false
+    };
+    const FILES: usize = 200;
+    const PREFIX: &str = "a-name-long-enough-to-fill-a-listing-page-";
+    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut scratch) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch", &mut buf) else {
+        return fail(b"the scratch disk would not open as a directory");
+    };
+    let made = scratch.mkdir(b"probe-many");
+    scratch.close();
+    if made.is_err() {
+        return fail(b"probe-many would not make");
+    }
+    for i in 0..FILES {
+        let path = alloc::format!("/svc/storage/fs/nitrox-scratch/probe-many/{PREFIX}{i:03}");
+        let Some(h) = file_resize(SYS_FILE_CREATE, root_ns, path.as_bytes(), 0) else {
+            return fail(b"a file would not create in probe-many");
+        };
+        close(h);
+    }
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch/probe-many", &mut buf) else {
+        return fail(b"probe-many would not open as a directory");
+    };
+    let mut listed = 0usize;
+    let read = dir.read_dir(|e| {
+        listed += e.name.starts_with(PREFIX.as_bytes()) as usize;
+        true
+    });
+    dir.close();
+    if read.is_err() || listed != FILES {
+        Line::new().s(b"boot-probe: long listing: ").u(listed as u64).s(b" of ").u(FILES as u64).s(b" listed FAIL").end();
+        return false;
+    }
+    Line::new()
+        .s(b"boot-probe: long listing: ")
+        .u(FILES as u64)
+        .s(b" files of ")
+        .u((PREFIX.len() + 3) as u64)
+        .s(b"-byte names listed whole, their pages filled to what a message carries ok")
         .end();
     true
 }

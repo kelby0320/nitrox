@@ -493,7 +493,7 @@ fn serve_session(root_ns: u64, packages: &[Package], session_ch: u64) {
         // SAFETY: single-threaded; `slot` is this session's, bound at mint time.
         let dir = unsafe { SESSION_DIR[slot] };
         let entries = index(root_ns, packages, dir);
-        let mut body = [0u8; MSG_LEN - PAYLOAD_OFF - 64];
+        let mut body = [0u8; librsproto::RS_MAX_BODY];
         let Some(blen) = pack_read_dir(&mut body, entries, cursor) else {
             reply_error(session_ch, request_id, op, KError::KernelError.as_i32());
             continue;

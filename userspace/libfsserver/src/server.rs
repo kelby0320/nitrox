@@ -99,8 +99,13 @@ fn session_capacity() -> usize {
 }
 
 /// Body scratch for a `File::ReadDir` reply (packed entries), before the rsproto header is
-/// prepended into `REPLY_MSG`. Bounded to one IPC payload minus the two headers.
-const DIR_BODY_CAP: usize = MSG_LEN - PAYLOAD_OFF - librsproto::RS_HEADER_LEN;
+/// prepended into `REPLY_MSG`: [`librsproto::RS_MAX_BODY`], what one message carries.
+///
+/// **It was the page less the two headers**, which forgot that a payload leaves room for eight
+/// handles: a page of entries over 3,980 bytes made a reply the kernel refused, the send's failure
+/// went unseen, and the client waited for good — a directory of 126 short names on a FAT stick
+/// (Phase 6 Part H's dry run).
+const DIR_BODY_CAP: usize = librsproto::RS_MAX_BODY;
 static mut DIR_BODY: [u8; DIR_BODY_CAP] = [0; DIR_BODY_CAP];
 
 /// Log `msg` and exit non-zero — the bootstrap failure path. (A server is not a
@@ -876,14 +881,16 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
     // SAFETY: DIR_BODY (read) and REPLY_MSG (write) are disjoint statics.
     unsafe {
         let body = core::slice::from_raw_parts((&raw const DIR_BODY) as *const u8, body_len);
-        let rs_len =
-            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_FILE_READ_DIR, request_id, RS_FLAG_REPLY, body, 0) {
-                Some(n) => n,
-                None => return,
-            };
+        // **Never a reply that goes nowhere**: one too long to send is answered with an error,
+        // and a send that fails is said, since its client is waiting for exactly this message.
+        let Some(rs_len) =
+            librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_FILE_READ_DIR, request_id, RS_FLAG_REPLY, body, 0)
+        else {
+            return reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32());
+        };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 0;
-        syscall5(
+        let sent = syscall5(
             SYS_CHANNEL_SEND,
             session_ch,
             (&raw const REPLY_MSG) as u64,
@@ -891,6 +898,9 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
             0,
             SENDMODE_NOBLOCK,
         );
+        if sent != 0 {
+            kprint(b"fs-server: a directory listing's reply would not send; its client waits\n");
+        }
     }
 }
 

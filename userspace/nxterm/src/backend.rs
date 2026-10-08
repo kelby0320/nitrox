@@ -28,8 +28,9 @@ use librsproto::{
 /// IPC payload starts after the 24-byte header.
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// The most terminal input one message carries. Keystrokes are small; this bounds the copy.
-const MAX_BODY: usize = MSG_LEN - PAYLOAD_OFF - 64;
+/// The most terminal input one message carries ([`librsproto::RS_MAX_BODY`]). Keystrokes are small;
+/// this bounds the copy — a paste is what reaches it.
+const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 static mut MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut HANDLES: [u64; 8] = [0; 8];
