@@ -162,7 +162,8 @@ pub fn dispatch_block_irp(
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
-        IoOpcode::Flush => return Err(KError::InvalidArgument), // not a transfer: `dispatch_block_flush`
+        // Not transfers: `dispatch_block_control`.
+        IoOpcode::Flush | IoOpcode::Rescan => return Err(KError::InvalidArgument),
     };
     let irp = Irp::new_block(
         op,
@@ -233,7 +234,7 @@ pub fn dispatch_block_irp_into_frame(
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
-        IoOpcode::Flush => return Err(KError::InvalidArgument), // not a transfer
+        IoOpcode::Flush | IoOpcode::Rescan => return Err(KError::InvalidArgument), // not transfers
     };
     let irp = Irp::new_block(
         op,
@@ -277,10 +278,17 @@ pub fn dispatch_block_irp_into_frame(
 /// once, and AHCI issues `FLUSH CACHE EXT`. `Err` before anything starts: `Unsupported` if the
 /// node has no block backend, `OutOfMemory` if the IRP cannot be allocated.
 pub fn dispatch_block_flush(device: &ObjectRef, po: &ObjectRef) -> Result<(), KError> {
+    dispatch_block_control(device, po, IrpOp::Flush)
+}
+
+/// Dispatch an IRP that moves no data — a [`Flush`](IrpOp::Flush), or since Phase 6 Part G a
+/// [`Rescan`](IrpOp::Rescan) of a disk's table — with no buffer and no range, completing `po`.
+/// Errors as [`dispatch_block_flush`]'s.
+pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
-    let irp = Irp::new_block(IrpOp::Flush, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_ptr(), 0);
+    let irp = Irp::new_block(op, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_ptr(), 0);
     let bx = KBox::try_new(IrpBox {
         irp,
         frags: KVec::new(),
@@ -460,6 +468,10 @@ pub struct Partition {
     start_lba: u64,
     block_count: u64,
     sector_size: u64,
+    /// **Retired** by a rescan of its disk (Phase 6 Part G): its record departed and a new table
+    /// published in its place, so every IRP is refused `PeerClosed` — a window still forwarding
+    /// after its partition has gone would reach whatever the new table put there.
+    retired: core::sync::atomic::AtomicBool,
 }
 
 // SAFETY: a `Partition` is set up once and accessed only on the CPU servicing the
@@ -474,6 +486,15 @@ unsafe impl Sync for Partition {}
 fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
     let p = unsafe { &*(ctx as *const Partition) };
+    // SAFETY: `irp` is in flight and uniquely owned during submit.
+    if let Some(e) = window_refusal(p, unsafe { (*irp).op }) {
+        // SAFETY: `irp` is in flight; set its status and queue its completion.
+        unsafe {
+            (*irp).set_completion(e as i32, 0);
+            crate::dpc::enqueue(&(*irp).dpc);
+        }
+        return;
+    }
     // **A flush names no range**: it is the disk's cache, not the partition's blocks, so it
     // goes down unchanged (administration Part C.2).
     // SAFETY: `irp` is in flight and uniquely owned during submit.
@@ -499,6 +520,20 @@ fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
                 crate::dpc::enqueue(&(*irp).dpc);
             }
         }
+    }
+}
+
+/// **What a partition's window refuses `op` with**, before anything is forwarded: everything once it
+/// is retired, `PeerClosed`; and a rescan always, `Unsupported` — **a rescan is the disk's alone**:
+/// forwarded, as a flush is, it would let the holder of one partition, as every filesystem server
+/// is, retire its siblings' windows (PR #368 review). `None` to forward it.
+fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
+    if p.retired.load(core::sync::atomic::Ordering::Acquire) {
+        Some(KError::PeerClosed)
+    } else if op == IrpOp::Rescan as u32 {
+        Some(KError::Unsupported)
+    } else {
+        None
     }
 }
 
@@ -562,6 +597,7 @@ impl Partition {
             start_lba,
             block_count,
             sector_size,
+            retired: core::sync::atomic::AtomicBool::new(false),
         })
         .ok()?;
         // Leak: the partition persists for the kernel's lifetime.
@@ -573,6 +609,22 @@ impl Partition {
     pub fn block_count(&self) -> u64 {
         self.block_count
     }
+}
+
+/// **Retire the partition window behind `node`** (Phase 6 Part G): every IRP refused from here, for a
+/// rescan that departs its record. Whether `node` is a partition's: a disk's node is left alone.
+pub fn retire_window(node: &ObjectRef) -> bool {
+    // SAFETY: `node` pins a live `DeviceNode`.
+    let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
+    let Some(backend) = dn.block_backend() else { return false };
+    if backend.submit as *const () != partition_submit as *const () {
+        return false;
+    }
+    // SAFETY: a backend whose `submit` is `partition_submit` has a leaked `'static` `Partition` as
+    // its context (`partition_backend`).
+    let p = unsafe { &*(backend.ctx as *const Partition) };
+    p.retired.store(true, core::sync::atomic::Ordering::Release);
+    true
 }
 
 #[cfg(test)]
@@ -598,6 +650,33 @@ mod tests {
         // One byte past the end is rejected.
         assert_eq!(partition_rebase((count - 1) * ss, ss + 1, start, count, ss), None);
         assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
+    }
+
+    /// **A partition's window refuses a rescan itself, and a retired one refuses everything**
+    /// (Phase 6 Part G): a read and a flush go down to the disk, a rescan does not — forwarded, a
+    /// holder of one partition could retire its siblings (PR #368 review) — and once the window is
+    /// retired, through [`retire_window`]'s flag, everything is refused `PeerClosed`.
+    #[test]
+    fn a_window_refuses_a_rescan_and_once_retired_everything() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        fn disk_submit(_: *mut Irp, _: *mut ()) {}
+        fn disk_poll(_: *mut ()) {}
+        let p = Partition {
+            disk: BlockBackend { submit: disk_submit, poll: disk_poll, ctx: core::ptr::null_mut(), max_frags: 8 },
+            start_lba: 2048,
+            block_count: 100,
+            sector_size: 512,
+            retired: AtomicBool::new(false),
+        };
+        let answer = |op: IrpOp| window_refusal(&p, op as u32);
+        assert_eq!(answer(IrpOp::Read), None, "a read goes down");
+        assert_eq!(answer(IrpOp::Write), None);
+        assert_eq!(answer(IrpOp::Flush), None, "and a flush");
+        assert_eq!(answer(IrpOp::Rescan), Some(KError::Unsupported), "a rescan is the disk's alone");
+        p.retired.store(true, Ordering::Release);
+        for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan] {
+            assert_eq!(answer(op), Some(KError::PeerClosed), "retired: {op:?}");
+        }
     }
 
     #[test]

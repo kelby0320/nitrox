@@ -87,6 +87,8 @@ pub enum IrpOp {
     Write = 1,
     /// Write the device's volatile cache to its medium. Carries no buffer and no range.
     Flush = 2,
+    /// Read a disk's partition table again (Phase 6 Part G). Carries no buffer and no range.
+    Rescan = 3,
 }
 
 /// `IrpStatus` — the in-flight sentinel and terminal status. A completed IRP
@@ -220,6 +222,7 @@ mod tests {
         // Kept numerically aligned with the userspace-facing opcode.
         use crate::libkern::io_op::IoOpcode;
         assert_eq!(IrpOp::Flush as u32, IoOpcode::Flush as u32);
+        assert_eq!(IrpOp::Rescan as u32, IoOpcode::Rescan as u32);
         assert_eq!(IrpStatus::Success as i32, 0);
         assert_eq!(IrpStatus::Pending as i32, 1);
     }

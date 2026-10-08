@@ -130,6 +130,14 @@ static XHCI: AtomicPtr<Xhci> = AtomicPtr::new(core::ptr::null_mut());
 /// The interrupt's deferred half: drain the event ring.
 static XHCI_DPC: Dpc = Dpc::new(xhci_dpc, core::ptr::null_mut());
 
+/// **The controller, once brought up**: for a storage submit to wake the hub thread through, with a
+/// rescan for it (Phase 6 Part G). `None` before then, when no USB disk exists to submit to.
+pub(super) fn controller() -> Option<&'static Xhci> {
+    let x = XHCI.load(Ordering::Acquire);
+    // SAFETY: a published controller is leaked to `'static` and never freed.
+    (!x.is_null()).then(|| unsafe { &*x })
+}
+
 /// A brought-up controller. Leaked to `'static` once published, as AHCI's disk is: a Tier 1
 /// controller lives as long as the kernel.
 pub struct Xhci {

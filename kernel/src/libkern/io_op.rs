@@ -30,6 +30,8 @@ pub const IO_OPCODE_READ: u32 = 0;
 pub const IO_OPCODE_WRITE: u32 = 1;
 /// [`IoOpcode::Flush`]'s value.
 pub const IO_OPCODE_FLUSH: u32 = 2;
+/// [`IoOpcode::Rescan`]'s value.
+pub const IO_OPCODE_RESCAN: u32 = 3;
 
 /// The operation selector. `#[repr(u32)]`; part of the ABI version hash. Each value is stated
 /// once, above, and the variants take it.
@@ -45,6 +47,12 @@ pub enum IoOpcode {
     /// `offset` and `length` are all `0`. Needs `WRITE` on the device, since only a writer
     /// has anything to make durable.
     Flush = IO_OPCODE_FLUSH,
+    /// **Read a disk's partition table again** and publish what it says now (Phase 6 Part G): its
+    /// old partitions' windows retired and their records departed, the new ones published as
+    /// arrivals. No buffer and no range, as for [`Flush`](Self::Flush), and needs `WRITE` on the
+    /// disk. **A partition answers `Unsupported`**, as does a disk whose driver cannot read its
+    /// table again — today every one but a USB disk.
+    Rescan = IO_OPCODE_RESCAN,
 }
 
 impl IoOpcode {
@@ -54,6 +62,7 @@ impl IoOpcode {
             IO_OPCODE_READ => Some(Self::Read),
             IO_OPCODE_WRITE => Some(Self::Write),
             IO_OPCODE_FLUSH => Some(Self::Flush),
+            IO_OPCODE_RESCAN => Some(Self::Rescan),
             _ => None,
         }
     }
@@ -80,6 +89,7 @@ mod tests {
         assert_eq!(IoOpcode::from_u32(0), Some(IoOpcode::Read));
         assert_eq!(IoOpcode::from_u32(1), Some(IoOpcode::Write));
         assert_eq!(IoOpcode::from_u32(2), Some(IoOpcode::Flush));
-        assert_eq!(IoOpcode::from_u32(3), None, "the first value no opcode has");
+        assert_eq!(IoOpcode::from_u32(3), Some(IoOpcode::Rescan));
+        assert_eq!(IoOpcode::from_u32(4), None, "the first value no opcode has");
     }
 }

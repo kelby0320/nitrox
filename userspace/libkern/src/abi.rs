@@ -349,6 +349,11 @@ pub const IO_OPCODE_WRITE: u32 = 1;
 /// written to its medium. No buffer and no range (`buffer`, `buf_offset`, `offset`, `length`
 /// all `0`), and needs `WRITE` on the device.
 pub const IO_OPCODE_FLUSH: u32 = 2;
+/// `IoOpcode::Rescan` — read a disk's partition table again and publish what it says now (Phase 6
+/// Part G): the old partitions departed, the new ones arriving. No buffer and no range, as for a
+/// flush, and needs `WRITE` on the disk. A partition, and every disk but a USB one, answers
+/// `Unsupported`.
+pub const IO_OPCODE_RESCAN: u32 = 3;
 
 /// The `sys_io_submit` operation descriptor — the userspace mirror of the
 /// kernel's `IoOp` (`docs/spec/io-operation.md`). 40 bytes, 8-byte aligned.

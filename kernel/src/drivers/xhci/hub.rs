@@ -209,7 +209,7 @@ pub(super) extern "C" fn main(_arg: usize) {
 }
 
 /// **The storage devices with a fault or a deadline passed** (Phase 6 Part D.3): each recovered, and
-/// one that does not recover ended as on an unplug.
+/// one that does not recover ended as on an unplug; then a rescan one holds (Part G).
 fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
     let now = crate::arch::Timer::read_ns();
     for (i, slot) in super::storage::due(now).into_iter().enumerate() {
@@ -221,7 +221,10 @@ fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
         if let super::storage::Recovered::Ended = super::storage::recover(x, i, &mut dev._mem) {
             crate::kprintln!("usb: port {port}: its storage did not recover from a failed command; it is ended");
             depart(x, port as u8, attached);
+            continue;
         }
+        // And a rescan its storage service asked for (Phase 6 Part G).
+        super::storage::rescan(x, i, port as u8, &mut dev._mem);
     }
 }
 
