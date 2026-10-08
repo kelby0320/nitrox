@@ -377,13 +377,24 @@ stopped the endpoints its TRBs are on.
 `Reread`, once a holder of the disk has rewritten its table
 ([`io-operation.md`](../spec/io-operation.md), [`storage.md`](storage.md) §8b). The IRP is the hub
 thread's, as everything off the I/O path is: the submit marks the device and wakes the thread, which
-**waits for the disk to go quiet** — no command in flight or queued, submits held back meanwhile —
-then **retires each of the disk's partition windows**, so a handle still holding one is refused
-`PeerClosed` rather than reading where the old table said; departs their records; reads the table as
-at the disk's arrival; publishes what it finds; and completes the IRP with the number published,
-logging `rescanned: <n> partition(s) departed, <m> published`. A disk that never goes quiet within
-the thread's bound, or departs meanwhile, completes it with an error. **A partition's window answers
-a `Rescan` itself, `Unsupported`**, rather than passing it to its disk
+in order:
+1. **retires each of the disk's partition windows**, so a handle still holding one is refused
+   `PeerClosed` rather than reading where the old table said, and waits until no submit is between
+   a window's check and its forward;
+2. **lets the device drain** — it runs as ever meanwhile, so what the windows forwarded before,
+   queued or in flight, reaches the disk at the old table's offsets now and **never after the new
+   table is published** (PR #369 review; until then the queue was held behind the rescan and issued
+   after it) — then takes it, holding every later submit;
+3. departs the partitions' records, reads the table as at the disk's arrival, publishes what it
+   finds, and completes the IRP with the number published, logging `rescanned: <n> partition(s)
+   departed, <m> published` — or `IoError`, the old partitions departed, if the table would not
+   read.
+
+A disk that never goes quiet within the thread's bound completes it `IoError`, its retired
+partitions departed; one that departs meanwhile completes it `PeerClosed`; and **one whose recovery
+fails meanwhile is ended**, as a failed recovery's device always is, its departure completing the
+rescan (PR #369 review: it was left recovering, every submit queued for good). **A partition's
+window answers a `Rescan` itself, `Unsupported`**, rather than passing it to its disk
 ([`drivers-and-irps.md`](drivers-and-irps.md)).
 
 **A departure**, before the records depart: the device out of the DPC's table, its queue completed

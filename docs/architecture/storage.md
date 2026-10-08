@@ -370,10 +370,10 @@ ext4 as at boot, an internal FAT not at all.
 - **A partition** is probed again: its window is unchanged, so what is in it is all that is new.
 - **A disk is rescanned first**: `IoOpcode::Rescan` on its node
   ([`io-operation.md`](../spec/io-operation.md)), which a USB disk answers by retiring its
-  partitions' windows, departing their records, reading its table as at its arrival, and publishing
-  what it finds ([`usb.md`](usb.md)). The new partitions reach this service as arrivals, **after
-  the reply**, and are mounted as arrivals are. Every other disk answers `Unsupported`: an internal
-  disk is partitioned by `nxinstall`, which reboots after.
+  partitions' windows, letting what they forwarded drain, departing their records, reading its table
+  as at its arrival, and publishing what it finds ([`usb.md`](usb.md)). The new partitions reach
+  this service as arrivals, **after the reply**, and are mounted as arrivals are. Every other disk
+  answers `Unsupported`: an internal disk is partitioned by `nxinstall`, which reboots after.
 - **The reply names what was mounted**, one per line, and nothing for a disk, whose partitions come
   later.
 
@@ -385,7 +385,8 @@ mounts it again, the procedure everywhere. `Reread` is refused:
 - `NoAccess` for anything on the disk the machine started from — mounted is asked first, so the
   disk holding `init`'s root says `WouldBlock`;
 - `NotFound` for a name nothing has, and `NoAccess` until `init`'s mounts are known (§5);
-- `Unsupported` where the kernel cannot rescan.
+- `Unsupported` where the kernel cannot rescan, and `IoError` where the rescan fails — the disk
+  never quiet, or its table unreadable, the old partitions departed either way.
 
 **`disk` waits for a disk's new partition on a watch** (§8a), bounded at 30 seconds, since the
 rescan's arrivals come after the reply: after `--format`, its row mounted or saying why not; after

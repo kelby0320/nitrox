@@ -223,8 +223,12 @@ fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
             depart(x, port as u8, attached);
             continue;
         }
-        // And a rescan its storage service asked for (Phase 6 Part G).
-        super::storage::rescan(x, i, port as u8, &mut dev._mem);
+        // And a rescan its storage service asked for (Phase 6 Part G) — which ends the device, as a
+        // recovery that fails does, when a recovery fails while it waits (PR #369 review).
+        if let super::storage::Recovered::Ended = super::storage::rescan(x, i, port as u8, &mut dev._mem) {
+            crate::kprintln!("usb: port {port}: its storage did not recover while a rescan waited; it is ended");
+            depart(x, port as u8, attached);
+        }
     }
 }
 

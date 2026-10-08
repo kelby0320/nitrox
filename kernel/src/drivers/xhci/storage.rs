@@ -11,8 +11,9 @@
 //! ten-byte ones, which every stick answers and older ones answer alone.
 //!
 //! **A rescan is the hub thread's too** ([`rescan`], Phase 6 Part G): a `Rescan` IRP on a disk's
-//! node wakes it, and it quiets the device, retires and departs the disk's partitions, reads the
-//! table again as at the disk's arrival, and publishes what it says.
+//! node wakes it, and it retires the disk's partitions' windows, lets what they forwarded drain,
+//! holds the device, departs the partitions, reads the table again as at the disk's arrival, and
+//! publishes what it says.
 //!
 //! **The I/O path is the DPC's**, as AHCI's is its interrupt's. A block IRP's `submit` queues it
 //! behind the one in flight, since bulk-only runs one command at a time. **A command goes on the
@@ -46,7 +47,7 @@ use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::printable::Printable;
-use crate::libkern::IrqSpinLock;
+use crate::libkern::{IrqSpinLock, KVec};
 use crate::mm::dma::DmaBuffer;
 use crate::object::device_node::{BlockGeometry, DeviceNode, ResourceDescriptor};
 use crate::syscall::error::KError;
@@ -428,7 +429,9 @@ pub(super) struct Dev {
     /// is completed only by the departure that follows, once the slot is disabled.
     stranded: Option<*mut Irp>,
     /// **A `Rescan` waiting for the hub thread** (Phase 6 Part G), and the unit it names: not a
-    /// command on the rings, so held here rather than queued.
+    /// command on the rings, so held here rather than queued. **The device goes on meanwhile**:
+    /// what is queued drains, so what the disk's windows forwarded before they were retired reaches
+    /// the disk before the new table is published (PR #369 review).
     rescan: Option<(*mut Irp, u8)>,
     queue: Queue,
 }
@@ -752,9 +755,10 @@ impl Disks {
             Ok(c) => c,
             Err(e) => return refuse(e),
         };
-        // **And while a rescan waits**, so the device drains to quiet for it rather than being kept
-        // busy by submits that arrive faster than it ends them (Phase 6 Part G).
-        if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering || dev.rescan.is_some() {
+        // **Not while a rescan waits** (PR #369 review): until the hub thread takes the device, it
+        // runs as ever, so what is queued drains before the table is read. Once taken, `recovering`
+        // holds it.
+        if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering {
             return if dev.queue.push(c) { Action::None } else { refuse(KError::IoError) };
         }
         dev.start(c, false, now);
@@ -820,11 +824,9 @@ impl Disks {
             }
             dev.inflight = None;
             dev.fault = None;
-            // **Not while the hub thread holds the device, nor while a rescan waits for it** — which
-            // waits for the command in flight to end and must find nothing started after it (Phase 6
-            // Part G).
+            // **Not while the hub thread holds the device.** A rescan waiting does not hold it: the
+            // queue drains for it, and it takes the device once nothing is left (PR #369 review).
             if !dev.recovering
-                && dev.rescan.is_none()
                 && let Some(next) = dev.queue.pop()
             {
                 dev.start(next, false, now);
@@ -1208,29 +1210,67 @@ fn read_table(
     }))
 }
 
-/// **Rescan a USB disk's table** (Phase 6 Part G), for the `Rescan` IRP device `i` holds: the device
-/// made quiet — the command in flight ended, a fault recovered, every later submit queued — then
-/// the disk's partitions' windows retired and their records departed, its table read again as at
-/// its arrival and published, and the IRP completed with how many partitions it found. From the
-/// hub thread, with the device's memory.
-pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) {
+/// **Rescan a USB disk's table** (Phase 6 Part G), for the `Rescan` IRP device `i` holds, from the
+/// hub thread with the device's memory:
+/// 1. **the disk's partitions' windows retired first**, so nothing more comes through them, and
+///    waited out until no submit is between a window's check and its forward ([`window_busy`]);
+/// 2. **the device left to drain** — what those windows forwarded before, queued or in flight,
+///    reaches the disk at the old table's offsets now, never after the new one is published (PR
+///    #369 review) — a fault recovered on the way; then taken, every later submit queued;
+/// 3. the partitions' records departed, the table read again as at the disk's arrival and
+///    published, and the IRP completed with how many partitions it found — or `IoError` if the
+///    table would not read.
+///
+/// **`Ended` for a device to end as on an unplug**: one whose recovery failed meanwhile, which
+/// nothing will make quiet (PR #369 review). Its departure completes the rescan.
+///
+/// [`window_busy`]: crate::io::block::window_busy
+pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) -> Recovered {
+    use crate::io::block::{retire_window, window_busy};
     let start = crate::arch::Timer::read_ns();
+    let late = || crate::arch::Timer::read_ns().wrapping_sub(start) > DEADLINE_NS + BIND_NS;
+    let Some(unit) = DISKS.rescan_unit(i) else { return Recovered::Done };
+    let gone = unit.record.map(crate::device::children).unwrap_or_default();
+    let mut windows = KVec::new();
+    for &child in gone.iter() {
+        if let Some(node) = crate::device::node(child)
+            && retire_window(&node)
+        {
+            // The window is retired whether or not it is kept to be waited out.
+            let _ = windows.try_push(node);
+        }
+    }
+    // **Giving up** — a device that never went quiet — leaves the retired windows' records departed,
+    // since they refuse everything: the disk then lists no partition until a rescan succeeds.
+    let give_up = |why: &str| {
+        if let Some(irp) = DISKS.drop_rescan(i) {
+            crate::kprintln!("usb: port {port}: its disk {why}; not rescanned");
+            complete(irp, KError::IoError as i32, 0);
+        }
+        for &child in gone.iter() {
+            crate::device::depart(child);
+        }
+        Recovered::Done
+    };
+    while windows.iter().any(window_busy) {
+        if late() {
+            return give_up("kept a window busy");
+        }
+        hub::sleep(1_000_000);
+    }
     let (irp, lun, unit) = loop {
         match DISKS.begin_rescan(i) {
-            BeginRescan::Nothing => return,
+            BeginRescan::Nothing => return Recovered::Done,
+            BeginRescan::Ended => return Recovered::Ended,
             BeginRescan::Ready { irp, lun, unit } => break (irp, lun, unit),
             BeginRescan::Busy => {
                 // A fault the DPC recorded is recovered first; a device that does not recover is
-                // ended by the next round, and its departure completes the rescan.
+                // ended by the caller, and its departure completes the rescan.
                 if let Recovered::Ended = recover(x, i, mem) {
-                    return;
+                    return Recovered::Ended;
                 }
-                if crate::arch::Timer::read_ns().wrapping_sub(start) > DEADLINE_NS + BIND_NS {
-                    if let Some(irp) = DISKS.drop_rescan(i) {
-                        crate::kprintln!("usb: port {port}: LUN ?: its disk never went quiet; not rescanned");
-                        complete(irp, KError::IoError as i32, 0);
-                    }
-                    return;
+                if late() {
+                    return give_up("never went quiet");
                 }
                 hub::sleep(1_000_000);
             }
@@ -1238,31 +1278,37 @@ pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) {
     };
     let found = match unit.record.and_then(crate::device::node) {
         Some(disk) => {
-            let record = unit.record.unwrap_or_default();
-            let gone = crate::device::children(record);
             for &child in gone.iter() {
-                if let Some(node) = crate::device::node(child) {
-                    crate::io::block::retire_window(&node);
-                }
                 crate::device::depart(child);
             }
-            let found = match read_table(x, i, port, lun, unit, mem) {
-                Some(table) => crate::drivers::gpt::publish(&disk, table, crate::drivers::gpt::Names::None),
-                None => 0,
+            use crate::drivers::partitions::Unread;
+            let table = read_table(x, i, port, lun, unit, mem);
+            let found = match table {
+                Some(Err(Unread::Io | Unread::NoMemory)) => None,
+                Some(t) => Some(crate::drivers::gpt::publish(&disk, t, crate::drivers::gpt::Names::None)),
+                None => Some(0),
             };
-            crate::kprintln!(
-                "usb: port {port}: LUN {lun}: rescanned: {} partition(s) departed, {found} published",
-                gone.len()
-            );
+            match found {
+                Some(n) => crate::kprintln!(
+                    "usb: port {port}: LUN {lun}: rescanned: {} partition(s) departed, {n} published",
+                    gone.len()
+                ),
+                None => crate::kprintln!(
+                    "usb: port {port}: LUN {lun}: rescanned: {} partition(s) departed, and its table would not read",
+                    gone.len()
+                ),
+            }
             Some(found)
         }
         None => None,
     };
     act(DISKS.end_rescan(i, crate::arch::Timer::read_ns()), Some(x));
     match found {
-        Some(n) => complete(irp, 0, n as u64),
+        Some(Some(n)) => complete(irp, 0, n as u64),
+        Some(None) => complete(irp, KError::IoError as i32, 0),
         None => complete(irp, KError::PeerClosed as i32, 0),
     }
+    Recovered::Done
 }
 
 /// **A USB disk's name**: its INQUIRY vendor and product, their padding trimmed, then the device's
@@ -1526,7 +1572,6 @@ impl Disks {
                 dev.recovering = false;
                 if dev.inflight.is_none()
                     && dev.fault.is_none()
-                    && dev.rescan.is_none()
                     && let Some(next) = dev.queue.pop()
                 {
                     dev.start(next, false, now);
@@ -1558,16 +1603,29 @@ impl Disks {
         true
     }
 
-    /// **Begin device `i`'s rescan** (Phase 6 Part G): once nothing is in flight and nothing is
+    /// **The unit device `i`'s waiting rescan names**, for the hub thread to retire its partitions'
+    /// windows by before it waits for the device to drain; `None` with no rescan waiting.
+    fn rescan_unit(&self, i: usize) -> Option<Lun> {
+        let d = self.devs[i].lock();
+        let dev = d.as_ref()?;
+        let (_, lun) = dev.rescan?;
+        dev.luns.get(lun as usize).copied()
+    }
+
+    /// **Begin device `i`'s rescan** (Phase 6 Part G): once nothing is in flight, queued or
     /// recovering, its `Rescan` taken and the device held — every submit queued — until
-    /// [`Disks::end_rescan`].
+    /// [`Disks::end_rescan`]. **`Ended` for a device a failed recovery stranded** (PR #369 review),
+    /// which nothing will make quiet: the hub thread ends it, and the departure completes the rescan.
     fn begin_rescan(&self, i: usize) -> BeginRescan {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else { return BeginRescan::Nothing };
         if dev.rescan.is_none() {
             return BeginRescan::Nothing;
         }
-        if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering {
+        if dev.stranded.is_some() {
+            return BeginRescan::Ended;
+        }
+        if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering || dev.queue.len > 0 {
             return BeginRescan::Busy;
         }
         let Some((irp, lun)) = dev.rescan.take() else { return BeginRescan::Nothing };
@@ -1653,8 +1711,10 @@ pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
 enum BeginRescan {
     /// No rescan is waiting, or the device has gone.
     Nothing,
-    /// One is waiting, behind a command in flight or a recovery.
+    /// One is waiting, behind a command in flight, one queued, or a recovery.
     Busy,
+    /// One is waiting on a device a failed recovery stranded, which is to be ended (PR #369 review).
+    Ended,
     /// It is the hub thread's, for unit `lun`, and the device is held.
     Ready { irp: *mut Irp, lun: u8, unit: Lun },
 }
@@ -1826,7 +1886,7 @@ mod tests {
         assert_eq!(rw_cdb(3 << 31, true, 5, 8).as_slice(), &scsi::rw16(true, 5, 8));
     }
 
-    /// A TD's packets still to come, clamped to 31.    /// A TD's packets still to come, clamped to 31.
+    /// A TD's packets still to come, clamped to 31.
     #[test]
     fn a_td_size_counts_the_packets_left() {
         assert_eq!(packets(0, 512), 0);
@@ -1987,13 +2047,16 @@ mod tests {
         assert_eq!(disks.on_transfer(8, 3, code::SUCCESS, at, 1), None, "another slot's event is not this driver's");
     }
 
-    /// **A rescan is held for the hub thread, which takes it only once the device is quiet** (Phase 6
-    /// Part G): the `Rescan` IRP wakes the thread rather than going on the rings; a second waits its
-    /// turn refused; a submit after it queues even with nothing in flight, so the device drains;
-    /// the command in flight ending starts nothing; and the rescan's end starts the queued command.
-    /// A unit not published is refused, and a departure hands the waiting rescan back.
+    /// **A rescan is held for the hub thread, which takes the device only once its queue has drained**
+    /// (Phase 6 Part G; PR #369 review): the `Rescan` IRP wakes the thread rather than going on the
+    /// rings, and a second waits its turn refused. **While it waits the device runs as ever** — the
+    /// command in flight ending starts the one queued behind it — so what the disk's windows forwarded
+    /// before they were retired reaches the disk at the old table's offsets, never after the new table
+    /// is published. Once nothing is in flight or queued the rescan takes the device, a submit then
+    /// queues, and the rescan's end starts it. A unit not published is refused, and a departure hands
+    /// the waiting rescan back.
     #[test]
-    fn a_rescan_waits_for_quiet_and_holds_the_device_while_it_runs() {
+    fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
         init_global_heap();
         let disks = Disks::new();
         let mut fake = Fake::new();
@@ -2002,6 +2065,8 @@ mod tests {
         let frags = [PhysFrag { base: 0x10_000, len: 512 }];
         let mut first = irp(IrpOp::Read, 0, 512, &frags);
         assert_eq!(disks.submit(&mut first, ctx, 0), Action::None, "started");
+        let mut later = irp(IrpOp::Write, 512, 512, &frags);
+        assert_eq!(disks.submit(&mut later, ctx, 0), Action::None, "queued behind the read");
         let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
         assert_eq!(disks.submit(&mut rescan, ctx, 0), Action::Wake, "held, and the hub thread woken");
         assert_eq!(disks.due(1)[i], Some(5), "the hub thread's to look at");
@@ -2010,29 +2075,46 @@ mod tests {
             disks.submit(&mut again, ctx, 0),
             Action::Complete { irp: &mut again, status: KError::WouldBlock as i32, transferred: 0 }
         );
-        let mut later = irp(IrpOp::Write, 512, 512, &frags);
-        assert_eq!(disks.submit(&mut later, ctx, 0), Action::None);
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().queue.len, 1, "queued behind the rescan");
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command is in flight");
-        // The read ends: completed, and nothing started after it.
+        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command in flight, and one queued");
+        // The read ends, and **the write queued before the rescan starts**, under it.
         disks.on_transfer(5, 3, code::SUCCESS, 0x10_000, 1);
         fake.answer(1, 0);
         let at = csw_trb(&disks, i);
         let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 1);
         assert_eq!(ended, Some(Action::Complete { irp: &mut first, status: 0, transferred: 512 }));
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "the queued write did not start");
-        let mut idle = irp(IrpOp::Read, 1024, 512, &frags);
-        assert_eq!(disks.submit(&mut idle, ctx, 1), Action::None);
-        let d = disks.devs[i].lock();
-        let dev = d.as_ref().unwrap();
-        assert!(dev.inflight.is_none() && dev.queue.len == 2, "nothing in flight, and a submit still queues");
-        drop(d);
+        {
+            let d = disks.devs[i].lock();
+            let dev = d.as_ref().unwrap();
+            assert!(dev.inflight.is_some() && dev.queue.len == 0, "the queued write started while the rescan waits");
+        }
+        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "the write is in flight");
+        disks.on_transfer(5, 4, code::SUCCESS, 0x10_000, 2);
+        fake.answer(2, 0);
+        let at = csw_trb(&disks, i);
+        let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 2);
+        assert_eq!(ended, Some(Action::Complete { irp: &mut later, status: 0, transferred: 512 }));
+        // **A command queued keeps it waiting by itself**, with nothing in flight: no path here leaves
+        // one so, and a rescan taking the device over it would issue it after the new table.
+        let mut stuck = irp(IrpOp::Read, 2048, 512, &frags);
+        {
+            let mut d = disks.devs[i].lock();
+            let dev = d.as_mut().unwrap();
+            let c = dev.command_for(&mut stuck, 0).unwrap();
+            assert!(dev.queue.push(c));
+        }
+        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command queued, nothing in flight");
+        assert!(disks.devs[i].lock().as_mut().unwrap().queue.pop().is_some());
+        // Nothing left: the rescan takes the device, and a submit then queues for its end.
         let unit = Lun { blocks: 2048, block_len: 512, record: Some(7) };
+        assert_eq!(disks.rescan_unit(i), Some(unit), "the unit the hub thread retires the windows of");
         assert_eq!(disks.begin_rescan(i), BeginRescan::Ready { irp: &mut rescan, lun: 0, unit });
         assert!(disks.devs[i].lock().as_ref().unwrap().recovering, "the device is held");
         assert_eq!(disks.begin_rescan(i), BeginRescan::Nothing, "taken");
-        assert_eq!(disks.end_rescan(i, 2), Action::None);
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some(), "the queued write starts at the end");
+        let mut held = irp(IrpOp::Read, 1024, 512, &frags);
+        assert_eq!(disks.submit(&mut held, ctx, 3), Action::None);
+        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "queued while the rescan runs");
+        assert_eq!(disks.end_rescan(i, 4), Action::None);
+        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some(), "and started at its end");
         // A unit nothing was published for.
         let mut stray = irp(IrpOp::Rescan, 0, 0, &[]);
         assert_eq!(
@@ -2044,6 +2126,32 @@ mod tests {
         disks.submit(&mut waiting, ctx, 0);
         let (_, held) = disks.depart(i);
         assert_eq!(held[2], Some(&mut waiting as *mut Irp));
+    }
+
+    /// **A rescan waiting on a device a failed recovery stranded ends the device** (PR #369 review):
+    /// nothing will make that device quiet — its stranded command keeps it recovering — so
+    /// `begin_rescan` says `Ended`, for the hub thread to end it as on an unplug, whose departure
+    /// completes the rescan, rather than waiting out its deadline with every submit queued behind it.
+    #[test]
+    fn a_rescan_on_a_stranded_device_ends_it() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+        let ctx = context(i, 0, epoch);
+        let frags = [PhysFrag { base: 0x10_000, len: 512 }];
+        let mut read = irp(IrpOp::Read, 0, 512, &frags);
+        disks.submit(&mut read, ctx, 0);
+        let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
+        assert_eq!(disks.submit(&mut rescan, ctx, 0), Action::Wake);
+        // The command wrapper stalls, and reset recovery fails.
+        assert_eq!(disks.on_transfer(5, 4, code::STALL, 0, 1), Some(Action::Wake));
+        let (_, cmd, _) = disks.begin_recovery(i).unwrap();
+        assert_eq!(disks.end_recovery(i, cmd, End::Stranded, 2), Action::None);
+        assert_eq!(disks.begin_rescan(i), BeginRescan::Ended, "to be ended, not waited for");
+        let (_, held) = disks.depart(i);
+        assert_eq!(held[1], Some(&mut read as *mut Irp), "the departure completes the stranded read");
+        assert_eq!(held[2], Some(&mut rescan as *mut Irp), "and the rescan");
     }
 
     /// **A command that goes wrong is the hub thread's**: a failed status or a stall leaves it in

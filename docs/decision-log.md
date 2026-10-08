@@ -34831,3 +34831,51 @@ wipes (the stale GPT read by the rescan); FAT clusters of 2 KiB (the server refu
 `Reread` allowed while mounted (`boot-probe`'s refusal); the sixteen-byte commands removed (the 3
 TiB drive unpublished); `note` empty and FAT16 one cluster past its line (host tests); and no ping
 for a device change (`test-qemu`, once it read a stick again — see above).
+
+## 2026-10-07 — PR #369, reviewed: a window's call sites, a rescan's queue, and a stranded device
+
+The review (one blocking finding, three worth fixing, six optional) broke the code under each new
+test — 23 mutations, 4 survived — and every finding stood.
+
+- **Blocking: nothing drove a partition window's two call sites.** The host test asked the predicate
+  `window_refusal` with the flag set by hand, so `partition_submit` could forward a `Rescan` and
+  `retire_window` could store nothing, with every gate green: no userspace sends a partition a
+  `Rescan`, and nothing read through an old partition's node after a rescan. Now **a host test
+  drives both through the window's own node** — a disk node recording what reaches it, a window
+  over it published as a node, IRPs handed to that node's backend, the boot's DPC queue reserved —
+  and **`boot-probe` holds the stick's old partition node across its `Reread`** in `test-qemu`: a
+  read through it before, a `Rescan` refused `Unsupported` by its window, a read refused
+  `PeerClosed` after. Each of the review's two mutations fails both.
+- **A device stranded while a rescan waited was never ended.** `rescan()` returned nothing when a
+  recovery failed, the next round found no fault to recover, and the rescan waited out its 35 s
+  with the stranded IRP held and every submit queued for good. `begin_rescan` now answers `Ended`
+  for a stranded device, `rescan()` returns `Recovered`, and the hub thread ends the device, whose
+  departure completes the rescan — a host test strands one under a waiting rescan.
+- **Queued IRPs outlived a rescan**, which `usb.md` said they did not. While a rescan waited the
+  device held its queue and issued it after the new table was published, so an IRP a window had
+  rebased before it was retired wrote at the old partition's offset on the repartitioned disk. **The
+  docs were right and the code was wrong**, so the rescan's order changed: the windows are retired
+  first and waited out — **each submit is counted through its window**, in before the retired check
+  and out after the forward, `SeqCst` against the retirement, so none is caught between — then the
+  device runs as ever until its queue drains, and only then is it taken to read the table. The
+  host test that asserted the old order now asserts the new one; a command queued with nothing in
+  flight keeps the rescan waiting by itself.
+- **`check_formatted_stick`'s "a second partition" check read entry 4**: entries are 128 bytes, four
+  to a sector. It now reads the whole array and refuses any entry after the first; `sgdisk` shows
+  the old check blind to a second partition and the new one finding it.
+- **Optional, taken**: a rescan whose table does not read completes `IoError`, not success with
+  nothing; `boot-probe` sends a `Rescan` straight to the SATA disk and the scratch RAM disk, each
+  refused `Unsupported`, and `Reread`s the unmounted scratch disk for the service's `Unsupported`;
+  `disk` refuses anything on a RAM disk — the live root and the installer's pristine copy were
+  formattable — and a label the storage service could not mount under, beginning with `.` or a
+  space or ending with a space, for FAT as for ext4; a doubled doc comment; the public items in
+  `coreutils::format` and `mbr::Partition` documented. The review's last surviving mutation,
+  `end_recovery`'s check of a waiting rescan, is gone with the hold it guarded.
+- **And the gate run on the fixes found a bug of its own.** `boot-probe`'s new `Reread` of the
+  unmounted scratch disk came back with no error at all: the service's admin refusal was built in a
+  buffer with room for 96 bytes of reason, `CannotRescan`'s is 108, and `librsproto::error::
+  error_body` declined a message that did not fit — so the reply went out flagged an error with an
+  empty body, its `KError` lost with its reason. **`error_body` now cuts a message to fit**, back to
+  a character boundary, and declines only a buffer too short for its prefix; every server had
+  sent what it returned or nothing, and `service-mgr` passes reasons it builds into a 160-byte
+  buffer. The storage service also sizes each refusal to its reason.

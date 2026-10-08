@@ -183,4 +183,4 @@ under**, one per line — `Eject`'s form — and empty for none.
 | `NoAccess` | it is on the disk the machine started from — asked after `WouldBlock`, so the disk holding `init`'s root says it is mounted; or `init`'s mounts are not all known |
 | `Unsupported` | the kernel cannot rescan the disk: every disk but a USB one's |
 | `InvalidArgument` | the name is not UTF-8 |
-| `IoError` | the rescan failed |
+| `IoError` | the rescan failed: the disk never went quiet, or its table would not read |

@@ -435,6 +435,15 @@ repartitioned stick is the middle of the new partition. Retiring is a flag the w
 it forwards (`io::block::retire_window`); a handle to it stays valid, and answers nothing. The
 records depart as an unplugged device's do, so the storage service drops the device and its node.
 
+**A submit is counted through the window**, in before the flag's check and out after its forward,
+and a rescan waits for the count to reach zero after retiring (`io::block::window_busy`), with each
+side `SeqCst`: either a submit sees the window retired, or the rescan sees the submit and waits for
+it to reach the disk. **The rescan then lets the disk drain before it takes the device**, so every
+IRP a window let through is issued at the old table's offsets before the new table is published,
+never after (PR #369 review). Both halves are host-tested through the window's own node —
+`partition_submit` and `retire_window` driven, not only the predicate they consult — and
+`boot-probe` holds a partition's node across a rescan in `test-qemu`.
+
 **This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds
 `buf_offset + length` against the buffer's size and nothing else, so before 2026-09-11
 a caller holding a block `DeviceNode` handle could make the driver write PRDT entries

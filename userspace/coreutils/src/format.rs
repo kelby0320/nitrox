@@ -8,7 +8,9 @@
 //!   the `disks` grant withholds that disk and not its partitions (PR #368 review).
 //! - **A disk must be removable** to be partitioned, or formatted whole: an internal disk is
 //!   partitioned by `nxinstall`, which reboots after, since only a USB disk's table is read again.
-//!   A partition of an internal disk may be formatted.
+//!   A partition of an internal disk may be formatted. **Nothing on a RAM disk is**: it is a
+//!   module the bootloader loaded — the live root, or the installer's pristine copy (PR #369
+//!   review).
 //! - **The table follows the filesystem**: an MBR for FAT, which every camera and television
 //!   reads, and a GPT for ext4; **a GPT for either from 2 TiB**, where an MBR cannot count, and
 //!   `--mbr` there is refused, naming `--gpt` (PR #368 review). `--partition` alone types its
@@ -29,17 +31,21 @@ pub const START: u64 = 2048;
 pub const FRONT_WIPE: u64 = 2 << 20;
 /// What it wipes at the back: where a GPT keeps its backup.
 pub const BACK_WIPE: u64 = 1 << 20;
-/// Bytes a block of the ext4 `disk` makes, and of filesystem per inode — `nxinstall`'s.
+/// Bytes a block of the ext4 `disk` makes — `nxinstall`'s.
 pub const EXT4_BLOCK: u32 = 4096;
+/// Bytes of the ext4 `disk` makes per inode — `nxinstall`'s.
 pub const EXT4_BYTES_PER_INODE: u32 = 16384;
-/// The labels a filesystem gets when none is given.
+/// The label a FAT gets when none is given.
 pub const FAT_LABEL: &str = "NITROX";
+/// The label an ext4 gets when none is given.
 pub const EXT4_LABEL: &str = "nitrox";
 
 /// A filesystem `disk --format` makes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Fs {
+    /// A FAT16 or FAT32, by size: `fs_server_fat::mkfs`.
     Fat,
+    /// An ext4: `fs_server_ext4::mkfs`.
     Ext4,
 }
 
@@ -57,15 +63,20 @@ impl Fs {
 /// A partition table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Scheme {
+    /// A master boot record: `libgpt::mbr`.
     Mbr,
+    /// A GUID partition table: `libgpt::table`.
     Gpt,
 }
 
 /// What a block device is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// A whole disk.
     Disk,
+    /// A partition of a disk or a RAM disk.
     Partition,
+    /// A module the bootloader loaded, published as a disk.
     RamDisk,
 }
 
@@ -82,6 +93,8 @@ pub struct Target {
     /// Whether it is on the disk the machine started from — a partition's disk's flag for a
     /// partition.
     pub boot: bool,
+    /// Whether it is in memory: a RAM disk, or a partition of one.
+    pub in_memory: bool,
     /// Its logical sector's bytes: 512 from [`target`], which the binary corrects from the
     /// device's own info before [`check`].
     pub sector_bytes: u32,
@@ -90,11 +103,17 @@ pub struct Target {
 /// **The words a row has**, by the `/dev/devices` column names, for [`target`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
+    /// `blk-<n>`, or another device's name.
     pub name: String,
+    /// `disk`, `partition`, `ramdisk`, or another device's kind.
     pub kind: String,
+    /// Its size in bytes, if it has one.
     pub size: Option<i64>,
+    /// The name of the device it belongs to.
     pub parent: Option<String>,
+    /// The driver that published it.
     pub driver: Option<String>,
+    /// Whether it is the disk the machine started from.
     pub boot: bool,
 }
 
@@ -119,6 +138,7 @@ pub fn target(rows: &[Row], name: &str) -> Option<Target> {
         sectors: r.size.unwrap_or(0).max(0) as u64 / SECTOR,
         removable: usb(r) || disk.is_some_and(usb),
         boot: r.boot || disk.is_some_and(|d| d.boot),
+        in_memory: kind == Kind::RamDisk || disk.is_some_and(|d| d.kind == "ramdisk"),
         sector_bytes: SECTOR as u32,
     })
 }
@@ -133,6 +153,8 @@ pub fn partitions_of(rows: &[Row], disk: &str) -> Vec<String> {
 pub enum Refusal {
     /// It, or its disk, is the disk the machine started from.
     BootDisk,
+    /// It is a RAM disk, or on one.
+    InMemory,
     /// A disk not behind USB mass storage, for a table.
     NotRemovable,
     /// `--partition` of a partition.
@@ -155,6 +177,7 @@ impl core::fmt::Display for Refusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Refusal::BootDisk => write!(f, "it is on the disk the machine started from"),
+            Refusal::InMemory => write!(f, "it is in memory, a module the bootloader loaded, not a disk"),
             Refusal::NotRemovable => write!(
                 f,
                 "it is not a removable disk: only a USB disk's table is read again, and an internal disk is partitioned by nxinstall"
@@ -202,15 +225,33 @@ pub fn wipes(sectors: u64) -> [(u64, u64); 2] {
     [(0, front), (bytes - back, back)]
 }
 
+/// **What the storage service can name a mount by** (PR #369 review): a label beginning with `.` or
+/// a space, or ending with a space, would be passed over for a fallback name, so it is refused here,
+/// before anything is written, rather than met as a surprise in `/storage`. Its rule is
+/// `storage_service::labels::valid`; an empty label is none, and named by the partition.
+fn mount_name(text: &str) -> Result<(), Refusal> {
+    let bad = text.starts_with('.') || text.starts_with(' ') || text.ends_with(' ');
+    if bad {
+        return Err(Refusal::Label(String::from(
+            "a label is what the stick is mounted under, so it cannot begin with '.' or a space, or end with a space",
+        )));
+    }
+    Ok(())
+}
+
 /// **A FAT label** as `fs-server-fat`'s formatter keeps it, the default for none.
 pub fn fat_label(given: Option<&str>) -> Result<[u8; 11], Refusal> {
-    fs_server_fat::mkfs::label(given.unwrap_or(FAT_LABEL).as_bytes()).map_err(|e| Refusal::Label(alloc::format!("{e}")))
+    let text = given.unwrap_or(FAT_LABEL);
+    mount_name(text)?;
+    fs_server_fat::mkfs::label(text.as_bytes()).map_err(|e| Refusal::Label(alloc::format!("{e}")))
 }
 
 /// **An ext4 label**, NUL-padded to its 16 bytes, the default for none: printable ASCII a person
 /// can type and no `/`, as the storage service names a mount by it — refused past 16 bytes.
 pub fn ext4_label(given: Option<&str>) -> Result<[u8; 16], Refusal> {
-    let text = given.unwrap_or(EXT4_LABEL).as_bytes();
+    let text = given.unwrap_or(EXT4_LABEL);
+    mount_name(text)?;
+    let text = text.as_bytes();
     if text.len() > 16 {
         return Err(Refusal::Label(String::from("an ext4 label is at most 16 characters")));
     }
@@ -227,11 +268,14 @@ pub fn ext4_label(given: Option<&str>) -> Result<[u8; 16], Refusal> {
 }
 
 /// **May `t` be written, by `--partition` or a `--format`?** The disk the machine started from
-/// never, nor a disk of other than 512-byte sectors; a table only on a removable disk, and only on
-/// a disk.
+/// never, nor anything in memory, nor a disk of other than 512-byte sectors; a table only on a
+/// removable disk, and only on a disk.
 pub fn check(t: &Target, table: bool) -> Result<(), Refusal> {
     if t.boot {
         return Err(Refusal::BootDisk);
+    }
+    if t.in_memory {
+        return Err(Refusal::InMemory);
     }
     if t.sector_bytes != SECTOR as u32 {
         return Err(Refusal::SectorSize(t.sector_bytes));
@@ -258,7 +302,9 @@ pub struct Plan {
 /// A filesystem's label, in its own form.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Label {
+    /// A FAT's, uppercased and space-padded.
     Fat([u8; 11]),
+    /// An ext4's, NUL-padded.
     Ext4([u8; 16]),
 }
 

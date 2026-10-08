@@ -5475,8 +5475,12 @@ fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
     if entry[..16] != linux || first != 2048 || last != sectors - 34 {
         return Err(format!("the GPT's first entry is not a Linux filesystem from 2048 to {}: {first}..{last}", sectors - 34).into());
     }
-    if sector(ext4_copy, 3)?[..16] != [0u8; 16] {
-        return Err("the GPT has a second partition".into());
+    // **Every other entry unused** (PR #369 review): entries are 128 bytes, four to a sector, so the
+    // second is at LBA 2 + 128 — sixteen zero bytes at LBA 3 are the fifth's type.
+    let mut array = vec![0u8; 128 * 128];
+    fs::File::open(ext4_copy)?.read_exact_at(&mut array, 2 * 512)?;
+    if let Some(n) = (1..128).find(|&n| array[n * 128..n * 128 + 16] != [0u8; 16]) {
+        return Err(format!("the GPT has a partition in entry {n}, beside the one `disk --format` wrote").into());
     }
     println!("  ok: the ext4 format's table is a GPT, one Linux filesystem partition from 1 MiB to the last usable sector");
     let part = work.join("stick-blank-ext4-part.img");
@@ -14907,7 +14911,7 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // pinged for though nothing is mounted on it.
     &["usb: port 3: LUN 0: rescanned: 1 partition(s) departed, 1 published"],
     &["storage-service: blk-", " rescanned, as asked: 1 partition(s)"],
-    &["boot-probe: storage admin: a Reread of blk-", " rescanned it: its partition replaced, and the watch pinged with no mount changed ok"],
+    &["boot-probe: storage admin: a Reread of blk-", " rescanned it: its partition replaced, the old one's node refused after, and the watch pinged with no mount changed ok"],
     // **Reported, with its clusters, as not served** (Phase 6 Part E.6): 512-byte clusters, which
     // `fs-server-fat` refuses, so the boot's mounts — what `boot-probe` checks — are as they were.
     &[

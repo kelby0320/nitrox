@@ -977,9 +977,7 @@ impl Service {
             }
         };
         let refuse = |err: KError, why: &[u8]| {
-            let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 128];
-            let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
-            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
+            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &error_reply(err, why), &[]);
         };
         if m.op != OP_STORAGE_EJECT {
             return refuse(KError::Unsupported, b"a media session carries Eject alone");
@@ -1058,9 +1056,7 @@ impl Service {
             }
         };
         let refuse = |err: KError, why: &[u8]| {
-            let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 96];
-            let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
-            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
+            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &error_reply(err, why), &[]);
         };
         match m.op {
             OP_STORAGE_MOUNT => {
@@ -1512,10 +1508,19 @@ fn send_ready(control: u64, client_end: u64) -> bool {
 /// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `init` prints
 /// `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
 fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
-    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 96];
-    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
-    let _ = send(control, librsproto::OP_READY, 0, RS_FLAG_ERROR, &body[..n], &[]);
+    let _ = send(control, librsproto::OP_READY, 0, RS_FLAG_ERROR, &error_reply(err, why), &[]);
     exit(1);
+}
+
+/// **A refusal's body, sized to its reason** (PR #369 review's gate run). Each was built in a fixed
+/// buffer, and a reason longer than it made `error_body` decline: the reply went out flagged an
+/// error with no body, its code and its reason both lost — which `Reread`'s 108-byte `CannotRescan`
+/// did, and which `boot-probe` caught as an answer of no error at all.
+fn error_reply(err: KError, why: &[u8]) -> Vec<u8> {
+    let mut body = alloc::vec![0u8; librsproto::error::ERROR_BODY_LEN + why.len()];
+    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
+    body.truncate(n);
+    body
 }
 
 /// Bootstrap registers: `rdi` = notification channel, `rsi` = the inherited root namespace,

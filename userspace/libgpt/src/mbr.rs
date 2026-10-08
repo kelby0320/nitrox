@@ -28,8 +28,11 @@ const ENTRIES: usize = 0x1BE;
 /// One partition: its type byte, its first sector and how many.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Partition {
+    /// Its type byte: [`TYPE_FAT32_LBA`], [`TYPE_LINUX`], …; `0` marks an unused entry.
     pub kind: u8,
+    /// Its first sector.
     pub first_lba: u64,
+    /// How many sectors it holds.
     pub blocks: u64,
 }
 

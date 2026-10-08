@@ -472,6 +472,10 @@ pub struct Partition {
     /// published in its place, so every IRP is refused `PeerClosed` — a window still forwarding
     /// after its partition has gone would reach whatever the new table put there.
     retired: core::sync::atomic::AtomicBool,
+    /// **Submits between the retired check and the forward** (PR #369 review): a rescan retires
+    /// the window, then waits for this to reach zero ([`window_busy`]) before it lets its disk go
+    /// quiet, so no IRP that passed the check reaches the disk after the new table is published.
+    entering: core::sync::atomic::AtomicU32,
 }
 
 // SAFETY: a `Partition` is set up once and accessed only on the CPU servicing the
@@ -484,8 +488,19 @@ unsafe impl Sync for Partition {}
 /// parent disk's backend. This is the two-layer block IRP stack (partition → disk)
 /// realised by backend delegation. `ctx` is the `*const Partition`.
 fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
+    use core::sync::atomic::Ordering::SeqCst;
     // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
     let p = unsafe { &*(ctx as *const Partition) };
+    // **Counted in before the retired check, out after the forward**, each `SeqCst` as
+    // `retire_window`'s store and `window_busy`'s load are: either this sees the window retired,
+    // or the rescan retiring it sees this submit and waits for it to reach the disk first.
+    p.entering.fetch_add(1, SeqCst);
+    forward(p, irp);
+    p.entering.fetch_sub(1, SeqCst);
+}
+
+/// [`partition_submit`]'s body, between its count in and out: refuse, or rebase and forward.
+fn forward(p: &Partition, irp: *mut Irp) {
     // SAFETY: `irp` is in flight and uniquely owned during submit.
     if let Some(e) = window_refusal(p, unsafe { (*irp).op }) {
         // SAFETY: `irp` is in flight; set its status and queue its completion.
@@ -528,7 +543,7 @@ fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
 /// forwarded, as a flush is, it would let the holder of one partition, as every filesystem server
 /// is, retire its siblings' windows (PR #368 review). `None` to forward it.
 fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
-    if p.retired.load(core::sync::atomic::Ordering::Acquire) {
+    if p.retired.load(core::sync::atomic::Ordering::SeqCst) {
         Some(KError::PeerClosed)
     } else if op == IrpOp::Rescan as u32 {
         Some(KError::Unsupported)
@@ -598,6 +613,7 @@ impl Partition {
             block_count,
             sector_size,
             retired: core::sync::atomic::AtomicBool::new(false),
+            entering: core::sync::atomic::AtomicU32::new(0),
         })
         .ok()?;
         // Leak: the partition persists for the kernel's lifetime.
@@ -611,20 +627,34 @@ impl Partition {
     }
 }
 
-/// **Retire the partition window behind `node`** (Phase 6 Part G): every IRP refused from here, for a
-/// rescan that departs its record. Whether `node` is a partition's: a disk's node is left alone.
-pub fn retire_window(node: &ObjectRef) -> bool {
+/// The partition window behind `node`, if `node` is one: a disk's node is not.
+fn window_of(node: &ObjectRef) -> Option<&'static Partition> {
     // SAFETY: `node` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-    let Some(backend) = dn.block_backend() else { return false };
+    let backend = dn.block_backend()?;
     if backend.submit as *const () != partition_submit as *const () {
-        return false;
+        return None;
     }
     // SAFETY: a backend whose `submit` is `partition_submit` has a leaked `'static` `Partition` as
     // its context (`partition_backend`).
-    let p = unsafe { &*(backend.ctx as *const Partition) };
-    p.retired.store(true, core::sync::atomic::Ordering::Release);
+    Some(unsafe { &*(backend.ctx as *const Partition) })
+}
+
+/// **Retire the partition window behind `node`** (Phase 6 Part G): every IRP refused from here, for a
+/// rescan that departs its record. Whether `node` is a partition's: a disk's node is left alone.
+/// **A submit already past the retired check may still be forwarding**: [`window_busy`] says when
+/// none is.
+pub fn retire_window(node: &ObjectRef) -> bool {
+    let Some(p) = window_of(node) else { return false };
+    p.retired.store(true, core::sync::atomic::Ordering::SeqCst);
     true
+}
+
+/// **Whether a submit is between `node`'s window's retired check and its forward** (PR #369 review):
+/// what a rescan waits out after [`retire_window`], so every IRP the window let through is at its
+/// disk — queued or in flight, and drained before the table is read — and none arrives after.
+pub fn window_busy(node: &ObjectRef) -> bool {
+    window_of(node).is_some_and(|p| p.entering.load(core::sync::atomic::Ordering::SeqCst) != 0)
 }
 
 #[cfg(test)]
@@ -667,6 +697,7 @@ mod tests {
             block_count: 100,
             sector_size: 512,
             retired: AtomicBool::new(false),
+            entering: core::sync::atomic::AtomicU32::new(0),
         };
         let answer = |op: IrpOp| window_refusal(&p, op as u32);
         assert_eq!(answer(IrpOp::Read), None, "a read goes down");
@@ -677,6 +708,70 @@ mod tests {
         for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan] {
             assert_eq!(answer(op), Some(KError::PeerClosed), "retired: {op:?}");
         }
+    }
+
+    /// **The window's own submit and retirement, driven** (PR #369 review): a disk node whose backend
+    /// records what reaches it, a partition window over it published as a node of its own, and IRPs
+    /// handed to that node's backend — `partition_submit` itself, not the predicate it consults. A
+    /// read reaches the disk rebased and a rescan does not; [`retire_window`] on the window's node,
+    /// and on nothing else, then refuses everything, with nothing more reaching the disk; and no
+    /// submit is left counted in, so [`window_busy`] says the window is quiet.
+    #[test]
+    fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
+        use crate::libkern::block::BlockKind;
+        use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
+        use core::cell::RefCell;
+        init_global_heap();
+        // The global queue's reserve, as the boot makes it: a refusal completes through a DPC.
+        crate::dpc::init().unwrap();
+        /// What reached the disk: each IRP's op and disk-absolute offset.
+        struct Seen(RefCell<std::vec::Vec<(u32, u64)>>);
+        fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
+            // SAFETY: `ctx` is the test's `Seen`; `irp` is the test's live IRP.
+            unsafe { (*(ctx as *const Seen)).0.borrow_mut().push(((*irp).op, (*irp).offset)) };
+        }
+        fn disk_poll(_: *mut ()) {}
+        let seen = Seen(RefCell::new(std::vec::Vec::new()));
+        let adopt = |node: KBox<DeviceNode>| {
+            // SAFETY: `into_raw` yields the single creation reference, which the test adopts.
+            unsafe {
+                ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), crate::libkern::handle::KObjectType::DeviceNode)
+            }
+        };
+        let geometry = |blocks| BlockGeometry { logical_block_size: 512, block_count: blocks };
+        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let disk = adopt(
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
+        );
+        let window = Partition::new(&disk, 2048, 100, 512).unwrap();
+        let wb = partition_backend(window);
+        let part = adopt(
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(100), BlockKind::Partition, b"p", wb).unwrap(),
+        );
+        // An IRP through the partition node's backend: its status after the submit, any refusal's
+        // completion run.
+        let submit = |op: IrpOp, offset: u64| {
+            let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+            // SAFETY: `part` pins the node; its backend's context is the leaked window.
+            let b = unsafe { &*(part.as_ptr() as *const DeviceNode) }.block_backend().unwrap();
+            (b.submit)(&mut irp, b.ctx);
+            crate::dpc::run_pending();
+            irp.status
+        };
+        let pending = crate::io::irp::IrpStatus::Pending as i32;
+        assert_eq!(submit(IrpOp::Read, 512), pending, "forwarded, for the disk to complete");
+        assert_eq!(seen.0.borrow().as_slice(), &[(IrpOp::Read as u32, 2049 * 512)], "rebased to the disk");
+        assert_eq!(submit(IrpOp::Rescan, 0), KError::Unsupported as i32, "a rescan is the disk's alone");
+        assert_eq!(seen.0.borrow().len(), 1, "and it did not reach the disk");
+
+        assert!(!retire_window(&disk), "a disk's node is no window");
+        assert!(retire_window(&part));
+        for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan] {
+            assert_eq!(submit(op, 0), KError::PeerClosed as i32, "retired: {op:?}");
+        }
+        assert_eq!(seen.0.borrow().len(), 1, "nothing more reached the disk");
+        assert!(!window_busy(&part), "every submit counted out");
+        assert!(!window_busy(&disk));
     }
 
     #[test]

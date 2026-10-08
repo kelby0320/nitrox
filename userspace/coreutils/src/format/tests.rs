@@ -30,6 +30,7 @@ fn rows() -> Vec<Row> {
         row("blk-4", "disk", 2 << 30, None, usb, false),
         row("blk-5", "partition", (2 << 30) - (1 << 20), Some("blk-4"), None, false),
         row("blk-6", "ramdisk", 64 << 20, None, None, false),
+        row("blk-7", "partition", 60 << 20, Some("blk-6"), Some("gpt"), false),
     ]
 }
 
@@ -48,7 +49,8 @@ fn a_partition_is_removable_and_on_the_boot_disk_as_its_disk_is() {
     assert_eq!(t("blk-6").kind, Kind::RamDisk);
     assert_eq!(target(&rows(), "blk-9"), None);
     assert_eq!(partitions_of(&rows(), "blk-4"), ["blk-5"]);
-    assert_eq!(partitions_of(&rows(), "blk-6"), [] as [&str; 0]);
+    assert_eq!(partitions_of(&rows(), "blk-6"), ["blk-7"], "a RAM disk's too");
+    assert_eq!(partitions_of(&rows(), "blk-5"), [] as [&str; 0], "a partition has none");
 }
 
 /// **The default table follows the filesystem, and is a GPT from 2 TiB** — at its neighbours, for
@@ -108,7 +110,9 @@ fn what_is_refused_is_refused_before_anything_is_written() {
     assert_eq!(format(&t("blk-3"), Fs::Fat, None, false, false), Err(Refusal::BootDisk), "its partition");
     assert_eq!(partition(&t("blk-0"), false, false), Err(Refusal::NotRemovable));
     assert_eq!(format(&t("blk-0"), Fs::Ext4, None, false, false), Err(Refusal::NotRemovable), "whole");
-    assert_eq!(partition(&t("blk-6"), false, false), Err(Refusal::NotRemovable), "a RAM disk");
+    assert_eq!(partition(&t("blk-6"), false, false), Err(Refusal::InMemory), "a RAM disk");
+    assert_eq!(format(&t("blk-7"), Fs::Ext4, None, false, false), Err(Refusal::InMemory), "a RAM disk's partition");
+    assert!(t("blk-7").in_memory && !t("blk-5").in_memory);
     assert_eq!(partition(&t("blk-5"), false, false), Err(Refusal::NotADisk));
     assert_eq!(format(&t("blk-5"), Fs::Fat, None, true, false), Err(Refusal::TableOnPartition));
     let mut wide = t("blk-4");
@@ -145,6 +149,12 @@ fn a_filesystem_too_small_or_a_bad_label_is_refused_before_a_table() {
     assert_eq!(ext4("seventeen-chars-x").unwrap_err().to_string(), "an ext4 label is at most 16 characters");
     assert_eq!(ext4("a/b").unwrap_err().to_string(), "an ext4 label here cannot hold '/'");
     assert_eq!(ext4("é").unwrap_err().to_string(), "an ext4 label here cannot hold the byte 0xc3");
+    // **What the storage service could not name a mount by** (PR #369 review), for either.
+    for bad in [".data", " data", "data "] {
+        assert!(matches!(ext4(bad), Err(Refusal::Label(_))), "ext4 {bad:?}");
+        assert!(matches!(fat(bad), Err(Refusal::Label(_))), "FAT {bad:?}");
+    }
+    assert!(ext4("my.data").is_ok() && fat("MY DATA").is_ok(), "a dot or a space within is a label");
 }
 
 /// **What each verb plans**: `--partition`, an MBR typed for FAT; `--format DISK`, the table the

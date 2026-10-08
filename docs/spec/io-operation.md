@@ -248,10 +248,12 @@ IDENTIFY does not list the 48-bit form for. *(Administration Part C.2; it resolv
 disk has rewritten it: the disk's partitions depart, and those its table now holds are published,
 as a disk's are when it arrives. It names no buffer and no range, as `Flush` does, and its PO
 completes, `result` the number of partitions published, once the new ones are in the registry.
-- **A USB disk answers it**: its hub thread waits for the disk to be quiet, **retires each
-  partition's window** — a retired window refuses I/O, `PeerClosed` — departs their records, reads
-  the table through SCSI and publishes what it finds ([`usb.md`](../architecture/usb.md)). A disk
-  departing meanwhile completes it `PeerClosed`.
+- **A USB disk answers it**: its hub thread **retires each partition's window** — a retired window
+  refuses I/O, `PeerClosed` — lets what the windows forwarded before drain to the disk, takes the
+  device, departs their records, reads the table through SCSI and publishes what it finds
+  ([`usb.md`](../architecture/usb.md)). Nothing that came through an old window reaches the disk
+  after the new table is published. A table that will not read completes it `IoError`; a disk
+  departing meanwhile, `PeerClosed`.
 - **A partition answers it itself, `Unsupported`**, where it passes a `Flush` down: forwarded, it
   would let a holder of one partition — every filesystem server holds one — retire its siblings'
   windows (PR #368 review).

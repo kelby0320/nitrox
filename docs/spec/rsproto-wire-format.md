@@ -232,6 +232,11 @@ pub struct ErrorBody {
 
 `kerror` aligns with the system-wide `KError` enum so callers can map errors uniformly. `server_code` lets servers report finer-grained errors when needed.
 
+**A message too long for the sender's buffer is cut, never dropped with its body**
+(`librsproto::error::error_body`, PR #369 review): to the room there is, back to a UTF-8 character
+boundary. Until then the encoder declined, and a refusal went out flagged an error with an empty
+body — its `kerror` lost with its message.
+
 ## Body encoding rules
 
 Operation bodies are packed C-style structs (`#[repr(C, packed)]`). Fixed field offsets per operation. No schema in the message — the `op` is the schema discriminant.
