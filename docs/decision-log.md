@@ -34965,3 +34965,57 @@ the two planning documents.
   points at `copy-limit`; Part H's owed docs drop the item this PR already did; and
   `syscall-abi.md` no longer calls the syncs "the one documented exemption" from async-first,
   naming spawn's fills, `power` and `debug_kprint` beside them.
+
+## 2026-10-08 — Phase 6 Part H.1, built: extent trees
+
+`fs-server-ext4` writes, cuts and frees an extent tree at any depth (`extent.rs`), where it wrote
+only the inode's four extents: a fifth was refused, about 815 files with data filled a directory on
+4 KiB blocks, and a file with a tree — which Linux writes — was read here and never freed.
+
+- **Appends leave the shape ext4's own appends leave.** A full leaf in the inode moves into a block
+  below it *before* the extent is added (`ext4_ext_grow_indepth`'s order), giving one leaf of five
+  rather than one of four and one of one; a full leaf below gains a sibling to its right holding the
+  new extent alone; a full index the same. So every node but the last at its level is full, and
+  `e2fsck`, which offers to narrow or shorten a tree that could be, finds nothing to offer — its
+  prompts are what the host tests' helper fails on. An append is atomic: on an error it has
+  written nothing reachable and gives back every tree block it took. A tree block's goal is the
+  first data block, so it fills an early gap rather than the block a file's next data continues
+  into.
+- **A cut folds.** Truncating frees every block from a logical block on and each tree block left
+  empty, then folds what is left back into the inode while it fits — `e2fsck` otherwise offers
+  to, and undoing a failed grow needs it, since the grow may have deepened the tree before it
+  failed. A file is freed whole by cutting at `0`; a failed grow is undone by cutting where it began
+  and writing the inode to match.
+- **A lookup reads a leaf once.** `Lookup` keeps the leaf a walk is in, so a block map, a directory
+  scan or a read costs a read per leaf rather than a descent per block; the block map is built a
+  segment of the tree at a time.
+- **An extent's length is ext4's**: `ee_len` up to 32,768 written, above it unwritten. The masked
+  top bit made a full 32,768-block extent read as a hole and an unwritten one read its blocks' old
+  contents. **An unwritten extent maps as a hole**, so a write into one is not written back, as
+  into any hole: the data path's existing contract rather than a new one, now written down in
+  `filesystem-data-path.md`. Converting unwritten extents on a writable mount, or allocating holes
+  at a write, is what would change that, and nothing writes into either yet.
+- **What fails takes nothing with it.** The plan's three — a failed grow, a create whose directory
+  cannot grow, the 815th file's unattached inode — and two more found writing them: **a rename**
+  in a directory that could not take the new name removed the old one first and left the file with
+  none, and now puts it back, its record's room still free; and **`mkdir` counted every directory
+  in group 0's `bg_used_dirs_count`** wherever its inode came from, which `e2fsck` reports once
+  group 0's inodes are gone — now its own group's. A failed `mkdir` gives back its inode, its
+  block and that count.
+
+**Tested against e2fsprogs**: every map compared with `debugfs`' reading of the same image, and
+`e2fsck -fn` clean, for 4,096 files of 16 KiB in one directory, created and removed; two files
+grown a block at a time in turn to two levels at 1 and 4 KiB, cut back through each level, grown
+and emptied; a two-level tree `mke2fs -d` wrote, read, cut and removed; `ee_len` `0x8000` and an
+unwritten extent on bytes this server did not write; a 32,768-block append; a full index below the
+inode, built with two-entry nodes since one of ext4's is 7,056 extents away, read back through
+`Lookup`; blocks past `i_size`; and each failure. Twenty-one controls, each against the code it
+guards; twenty fail. The survivor is a cut emptying a child it descended into, which only a tree
+whose index key is below its child's first extent reaches — `e2fsck` calls that invalid — and the
+branch is kept, commented, to free such a node rather than leave it. **The 4,096-file test costs
+about 30 s in a debug build** (1.3 s in release): its directory scans are the cost Part H measures,
+and it stays at the tree to copy's size.
+
+**Gates**: the eight that write ext4 — `test-qemu` and `check-storage` under TCG and KVM,
+`check-install`, `check-recovery`, `check-shutdown` and `test-interactive` — pass on the new server,
+the full set left for the part's PR. Host tests: 3,320. ABI hash: no impact.

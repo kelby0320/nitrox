@@ -6,7 +6,7 @@ current status, the full phase list, and the cross-cutting workstreams.
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
 E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed and built
-2026-10-07; Part H detailed 2026-10-08, not built.** This
+2026-10-07; Part H detailed 2026-10-08, H.1 built 2026-10-08.** This
 replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
 decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
 when it is next, as administration's parts did; what is here is the phase's shape, the design each
@@ -2777,6 +2777,28 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   against `debugfs`; a grow refused for space, and a create refused because its directory cannot
   grow. Controls: the split removed (the 815th file refused), a leaf not freed (`e2fsck`), the
   length mask restored, the give-back removed.
+- **H.1 built 2026-10-08.** Calls on the way (the decision log's "Phase 6 Part H.1, built" has the
+  reasoning):
+  - **a full leaf in the inode moves below it before the append**, as ext4's own
+    `ext4_ext_grow_indepth` does, so it becomes one leaf of five rather than one of four and one of
+    one; a full leaf below gains a sibling holding the new extent alone, so the leaves an append
+    fills stay full and `e2fsck` never offers to narrow them;
+  - **every cut folds** what is left back into the inode while it fits, which `e2fsck` otherwise
+    offers to do, and which undoing a failed grow needs, since the grow may have deepened the tree;
+  - **a grow appends a run at a time**, and cuts blocks past `i_size` before it appends;
+  - **a tree block's allocation goal is the first data block**, so it fills an early gap rather
+    than the block a file's next data would continue into;
+  - **an unwritten extent maps as a hole**, so a write into one is not written back, as into any
+    hole — the data path's contract, written into `filesystem-data-path.md`;
+  - **two more failures that took something with them**, found writing the give-backs: a rename in
+    a directory that could not grow removed the old name and left the file none, and `mkdir`
+    counted every new directory in group 0, which `e2fsck` reports once group 0's inodes are gone;
+  - **a full index below the inode is tested with nodes of two entries** — one with ext4's own is
+    7,056 extents away at 1 KiB — read back through `Lookup`, since `e2fsck` refuses such nodes;
+  - **the 4,096-file test costs about 30 s in a debug build** and 1.3 s in release: the
+    directory scans this part measures. One control survived: a cut that empties a child it
+    descended into, which only a tree whose index key is below its child's first extent reaches —
+    `e2fsck` calls that invalid. The branch frees it rather than leave an empty node, commented.
 - **H.2 The instruments.** `time`; the drivers' and the page cache's counters, `/dev/registry/io`,
   `/dev/devices/io.tsm`; `cargo xtask throughput-stick`.
 
@@ -2813,10 +2835,10 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
 - **`device-manager.md`**: `io.tsm`. **`device-node.md`**: `/dev/registry/io`.
 - **`drivers-and-irps.md`** and **`usb.md`**: the drivers' counters.
 - **`filesystem-data-path.md`**: the page cache's counters, and whatever the fix changes there.
-- **`ext4-fs-server-rw.md`**: extent trees, an extent's length, and a failed grow's give-back;
-  and with **`fat-fs-server.md`**, whatever the fix changes there.
+- **`ext4-fs-server-rw.md`**: extent trees, an extent's length, and a failed grow's give-back
+  (done with H.1); and with **`fat-fs-server.md`**, whatever the fix changes there.
 - **`deferred-decisions.md`**: `TODO(fs-throughput)` resolved or narrowed; the extent-tree entry
-  resolved; the directory scan's entry, if the fix reaches it.
+  resolved (done with H.1); the directory scan's entry, if the fix reaches it.
 - **`qemu-integration-tests.md`** and the root **`CLAUDE.md`**: `test-interactive`'s new step.
 - **The Definition of Done**: the number.
 

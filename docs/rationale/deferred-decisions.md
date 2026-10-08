@@ -1694,18 +1694,6 @@ these are the pieces still missing. They were previously recorded only in the cr
 `CLAUDE.md` — which is precisely how three other deferrals went unreviewed (the 2026-07-24
 audit) — so they are mirrored here.
 
-- **Extent-tree splitting / index nodes (depth > 0).** `i_block` holds four inline leaf
-  extents; a file or directory needing a fifth non-contiguous extent gets `Unsupported`.
-  Measured boundary on 4 KiB blocks (2026-07-29): creating **empty files** in one directory
-  is unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
-  extent covers them), while creating **subdirectories** stops at **~814**, because each
-  `mkdir` allocates the child's own block between the parent's and so fragments it. **Files
-  with data stop there too**: host probes on a fresh filesystem (the PR #370 review's, and its
-  author's) were refused at about the 815th of 4,096 files of 16 KiB, since each file's data lands
-  between the directory's growth blocks as a subdirectory's block does. **Triggered** by Part H's
-  own fixture, and met by any folder of a thousand photos copied to `/home`. **Scheduled**
-  (2026-10-08, the maintainer's call): Phase 6 Part H, before the laptop's runs
-  ([`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*).
 - **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
@@ -2290,6 +2278,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Extent-tree splitting and index nodes (`fs-server-ext4`) | 2026-10-08 | **Phase 6 Part H.1**, `userspace/fs-server-ext4/src/extent.rs`: a tree appended to, split and deepened as ext4's own appends leave one, cut and folded back into the inode, and freed whole, at any depth; held to `debugfs`' reading of every map and to `e2fsck -fn`. **The trigger arrived on review**: the entry said creating *files* in one directory was unbounded, which held for empty files only — with data, the PR #370 review's probe and its author's stopped at about the 815th, and Part H's tree to copy holds 4,096. Checking it found four more in the same code, fixed with it: a removed file with a tree freed nothing, a failed grow kept every block it took, a 32,768-block extent read as a hole, and an unwritten extent as its blocks' old contents ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md) § *The extent tree*). |
 | Saying why a stick did not mount (`unmounted-why`) | 2026-10-07 | **The storage table's `note` column, Phase 6 Part G** — why a filesystem found is not mounted, in the words of the service's log line, which comes from the same function; `disk --list` shows it. Files does not: its Drives lists mounts, and a stick that needs formatting is formatted with `with admin disk --format`. [`storage.md`](../architecture/storage.md) §9. |
 | Read-write FAT | 2026-10-06 | **`fs-server-fat`, Phase 6 Part E** — FAT12, FAT16 and FAT32 read-write with long names, on `libfsserver`'s protocol beside `fs-server-ext4`. The trigger arrived from another direction than the one the entry named, a USB stick rather than an ESP update (2026-09-10), and the read-only first step was skipped, since a stick is written to. Files are mapped in 512-byte sectors and named by their first cluster; clusters under a page are refused, so no Nitrox ESP is served (`TODO(fat-small-clusters)`); the storage service mounts a FAT on a removable disk alone. [`fat-fs-server.md`](../architecture/fat-fs-server.md). |
 | A grace period for `with` (`view-grace`) | 2026-10-01 | **Remembered per session, terminal and view, for five minutes** — the laptop polish's Part A. `with` sends a one-time `Tty::Token` from its terminal and the broker redeems it with `tty-server` over its own channel, so a caller cannot claim another terminal; a refused password, `with --forget` and the session's end forget it. `boot-probe` holds the forgery control. |

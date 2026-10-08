@@ -13,11 +13,12 @@
 //!
 //! No `alloc`: [`read_file`] reads into a caller-provided buffer (the fs-server
 //! passes a bounded scratch ≤ 64 KiB; see [`ext4::MAX_FILE`]). Parsing uses
-//! bounded stack scratch (≤ one filesystem block).
+//! bounded stack scratch: a filesystem block, and one per level of an extent tree.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod ext4;
+mod extent;
 pub mod mkfs;
 pub mod volume;
 
@@ -161,12 +162,57 @@ pub(crate) mod test_support {
         let _ = std::fs::remove_dir_all(&dir);
         bytes
     }
+
+    /// **`e2fsck -fn` finds nothing** in the image `img`.
+    pub(crate) fn assert_e2fsck_clean(img: &[u8], tag: &str) {
+        let dir = std::env::temp_dir()
+            .join(format!("nitrox-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, img).unwrap();
+        assert_e2fsck_clean_path(&p, tag);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
+    /// want in memory, or one a gate carved out of an image.
+    ///
+    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
+    /// how the status-only check below survived being noticed; a third copy would be the same
+    /// mistake with the ink still wet (PR #310 review).
+    pub(crate) fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // **The exit status is not the oracle; the output is.** Measured against e2fsck
+        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
+        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
+        // helper trusted the status from the day it was written (2026-07-24), so every test
+        // using it was blind to the whole class of summary-information corruption — which is
+        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
+        //
+        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
+        // prompt is what to look for. The summary line is the other half: without it e2fsck
+        // stopped early and found nothing because it checked nothing.
+        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
+        assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
+        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture, fixture_blocks};
+    use crate::test_support::{
+        ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path, fixture,
+        fixture_blocks,
+    };
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -1019,6 +1065,84 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "inodes-cross-group");
     }
 
+    /// **A directory made past group 0's inodes is counted in its own group** (Phase 6 Part H.1):
+    /// `mkdir` bumped group 0's count of directories wherever the inode came from, which `e2fsck`
+    /// reports once group 0's inodes are gone. Made and removed, clean after each.
+    #[test]
+    fn a_directory_made_past_group_0s_inodes_is_counted_in_its_own_group() {
+        use std::cell::RefCell;
+        let img = fixture_blocks(1024, 24576, 65536, b"x\n");
+        let per_group = rd_u32(&img[1024..2048], 40);
+        let rw = RwImage(RefCell::new(img));
+        let root = ext4::resolve_dir(&rw, b"/").unwrap();
+        for i in 0..per_group {
+            ext4::create_file(&rw, b"/", std::format!("f{i:04}").as_bytes(), TEST_NOW).unwrap();
+        }
+        ext4::mkdir_at(&rw, root, b"late", TEST_NOW).unwrap();
+        let late = ext4::resolve_dir(&rw, b"/late").unwrap();
+        assert!(late > per_group, "the directory's inode {late} is past group 0's {per_group}");
+        assert_e2fsck_clean(&rw.0.borrow(), "mkdir-group-1");
+        ext4::rmdir_at(&rw, root, b"late", TEST_NOW).unwrap();
+        assert_e2fsck_clean(&rw.0.borrow(), "rmdir-group-1");
+    }
+
+    /// **A create, a rename and a `mkdir` that need a directory block the filesystem cannot give
+    /// take nothing with them** (Phase 6 Part H.1). The create once left its inode allocated and
+    /// unattached; the rename removed the old name before the new one failed, and the file had
+    /// none; the `mkdir`, given the last block for its own, kept it and its inode. A full block of
+    /// 200-byte names on a full filesystem, `e2fsck` clean after each.
+    #[test]
+    fn what_a_full_directory_refuses_takes_nothing_with_it() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"x\n")));
+        let free = |rw: &RwImage| (free_blocks(rw), free_inodes(rw));
+        let root = ext4::resolve_dir(&rw, b"/").unwrap();
+        ext4::mkdir_at(&rw, root, b"d", TEST_NOW).unwrap();
+        let d = ext4::resolve_dir(&rw, b"/d").unwrap();
+        let long = |i: usize| {
+            let mut n = std::format!("n{i:02}");
+            while n.len() < 200 {
+                n.push('x');
+            }
+            n
+        };
+        // Records of 208 bytes: nineteen beside `.` and `..` leave 120 of the block.
+        for i in 0..19 {
+            ext4::create_file(&rw, b"/d", long(i).as_bytes(), TEST_NOW).unwrap();
+        }
+        let sb = ext4::read_superblock(&rw).unwrap();
+        let (_, dir) = ext4::resolve_path_ino(&rw, &sb, b"/d").unwrap();
+        assert_eq!(rd_u32(&dir, 4), 4096, "one block of entries");
+        // Every block taken, a block at a time, by a file of one extent.
+        ext4::create_file(&rw, b"/", b"filler", TEST_NOW).unwrap();
+        let mut size = 0;
+        while ext4::grow_file(&rw, b"/filler", size + 4096, TEST_NOW).is_ok() {
+            size += 4096;
+        }
+        let full = free(&rw);
+        assert_eq!(full.0, 0, "the filesystem is full");
+
+        assert_eq!(ext4::create_file(&rw, b"/d", long(19).as_bytes(), TEST_NOW), Err(FsError::TooLarge));
+        assert_eq!(free(&rw), full, "the create gave its inode back");
+        // 220 bytes: no record has the room, and the removed one's is 208.
+        let longer = std::format!("{}{}", long(0), "y".repeat(20));
+        assert_eq!(
+            ext4::rename_at(&rw, d, long(0).as_bytes(), longer.as_bytes(), TEST_NOW),
+            Err(FsError::TooLarge)
+        );
+        assert_eq!(ext4::stat_file(&rw, std::format!("/d/{}", long(0)).as_bytes()), Ok(0), "the old name");
+        assert_eq!(ext4::stat_file(&rw, std::format!("/d/{longer}").as_bytes()), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.borrow(), "full-create-rename");
+
+        // One block free: the `mkdir` takes it for its own block, then cannot link the directory.
+        ext4::truncate_file(&rw, b"/filler", size - 4096, TEST_NOW).unwrap();
+        let one = free(&rw);
+        assert_eq!(one.0, 1);
+        assert_eq!(ext4::mkdir_at(&rw, d, long(19).as_bytes(), TEST_NOW), Err(FsError::TooLarge));
+        assert_eq!(free(&rw), one, "the mkdir gave its block and its inode back");
+        assert_e2fsck_clean(&rw.0.borrow(), "full-mkdir");
+    }
+
     /// **`e2fsck -fn` on a filesystem we laid out ourselves**, which is the whole point of
     /// `mkfs`: the oracle is somebody else's implementation of the format, and agreeing only
     /// with our own reader would prove nothing.
@@ -1239,47 +1363,6 @@ mod tests {
             "e2fsck could not use the backup in group 3:\n{}",
             String::from_utf8_lossy(&out.stdout)
         );
-    }
-
-    fn assert_e2fsck_clean(img: &[u8], tag: &str) {
-        let dir = std::env::temp_dir()
-            .join(std::format!("nitrox-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("img.ext4");
-        std::fs::write(&p, img).unwrap();
-        assert_e2fsck_clean_path(&p, tag);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
-    /// want in memory, or one a gate carved out of an image.
-    ///
-    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
-    /// how the status-only check below survived being noticed; a third copy would be the same
-    /// mistake with the ink still wet (PR #310 review).
-    fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", p.to_str().unwrap()])
-            .output()
-            .unwrap();
-        let text = std::format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // **The exit status is not the oracle; the output is.** Measured against e2fsck
-        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
-        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
-        // helper trusted the status from the day it was written (2026-07-24), so every test
-        // using it was blind to the whole class of summary-information corruption — which is
-        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
-        //
-        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
-        // prompt is what to look for. The summary line is the other half: without it e2fsck
-        // stopped early and found nothing because it checked nothing.
-        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
-        assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
-        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
     }
 
     /// The inode number of a directory path (for the name-addressed mutation ops).

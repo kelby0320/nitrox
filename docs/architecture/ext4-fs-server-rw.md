@@ -18,7 +18,10 @@ directory sessions, `File::Forget` and `File::Touch`, `Meta::Unmount`, and `Read
 refused to a session still holding its inode**, since a removal keeps the inode's mode and extent
 and zeroes only its link count; every operation by inode now asks for a link counted. And a server
 that panics exits, rather than spinning with resolves waiting on it. Phase 6 Part G (2026-10-07):
-**its formatter has a second caller**, `disk --format DEVICE ext4` — § *Making one*.
+**its formatter has a second caller**, `disk --format DEVICE ext4` — § *Making one*. Phase 6 Part
+H.1 (2026-10-08): **extent trees** — written, cut and freed at any depth; an extent's length as
+ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes nothing with it —
+§ *The extent tree*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -34,7 +37,8 @@ per-user namespace → write files to a home directory* (auth/session, item 5, f
 ## Starting point (the read-only reader)
 
 `userspace/fs-server-ext4/` parses, read-only: the superblock, group descriptors, inodes,
-the **extent tree** (`ext4.rs::extent_find`), and directory entries. It **never reads the
+the **extent tree** (`extent_find`, a lookup per block, until Phase 6 Part H.1), and directory
+entries. It **never reads the
 block or inode bitmaps** and mutates nothing. Fixtures are built journalless and
 checksumless — `mke2fs … -O ^has_journal,^64bit,^metadata_csum,^resize_inode` — which bounds
 this slice (below). It serves `File::ReadRange` today (Model B); this slice moves it to
@@ -43,12 +47,13 @@ Model A.
 ## ext4's realization of the Model A ops
 
 - **`MapRange` ← the extent tree.** ext4 already stores a file as extents (`ext4_extent` leaves
-  under an `ext4_extent_header`, walked by `extent_find`). Producing a `BlockRun` list for a
-  range is that walk, re-exposed as the op: each ext4 extent → one `BlockRun`
-  (`file_block = ee_block`, `device_lba = 48-bit start`, `length = ee_len`); a sparse hole →
-  `device_lba = 0`. Read-only; the reader's logic, lifted into a served op. *(A FAT32 server
-  would instead produce the same `BlockRun`s from its cluster chain — the wire result is
-  identical; that is the point of the neutral contract.)*
+  under an `ext4_extent_header`, walked by `extent.rs`'s `Lookup`, which reads each leaf once).
+  Producing a `BlockRun` list for a range is that walk, re-exposed as the op: each ext4 extent → one
+  `BlockRun` (`file_block = ee_block`, `device_lba = 48-bit start`, `length` from `ee_len`), extents
+  that continue each other on the device merged; a sparse hole, and an **unwritten** extent, →
+  `device_lba = 0`. Read-only; the reader's logic, lifted into a served op. *(A FAT32 server would
+  instead produce the same `BlockRun`s from its cluster chain — the wire result is identical; that
+  is the point of the neutral contract.)*
 - **`AllocRange` ← block bitmap + extent insertion.** To back a hole / grow a file, ext4:
   allocates device blocks from the **block bitmap** (new machinery — the reader never touches
   bitmaps), **inserts** them into the file's extent tree (splitting leaves / adding index
@@ -64,7 +69,7 @@ read-write device handle** (`sys_io_submit` Write), never by the kernel:
 |---|---|---|
 | Block bitmap | *not read* | allocate/free device blocks |
 | Inode bitmap | *not read* | allocate an inode (file creation) |
-| Extent tree | walk (`extent_find`) | insert / split on growth |
+| Extent tree | walk (`Lookup`) | append, split and deepen on growth; cut and fold on a truncate (`extent.rs`) |
 | Inode | read mode/size/flags/`i_block` | update size (off 4/108), mtime/ctime, block count |
 | Directory block | linear lookup (`dir_lookup`) | insert an `ext4_dir_entry_2` (split `rec_len` / new dir block) |
 | Group desc + superblock | read a few fields | update free-block / free-inode counts |
@@ -84,6 +89,56 @@ be asked, the inode is not freed: a leaked block can be repaired, a block claime
 **No checksums.** The fixtures are `^metadata_csum`, so there is nothing to maintain. Enabling
 `metadata_csum` (group-desc / inode / extent / dir / bitmap checksums across every write above)
 is a feature-gated later addition.
+
+## The extent tree
+
+*(Phase 6 Part H.1, 2026-10-08; `userspace/fs-server-ext4/src/extent.rs`.)* An inode's `i_block`
+holds four extents. A file with more is a tree: the inode an index over blocks of `(block_size -
+12) / 12` entries — 340 at 4 KiB — and up to five levels. **Until H.1 this server wrote only the
+inode's four**: a fifth was refused `Unsupported`, which on 4 KiB blocks stopped a directory at
+about 815 files with data or 814 subdirectories (each file's data, each `mkdir`'s block, lands
+between the directory's own blocks, so every directory block is an extent); free and truncate
+refused a tree, so a file Linux wrote with one was read here and never freed — its removal took
+the name and left an unattached inode holding its blocks.
+
+- **Appending** (`extent::append`) adds an extent at the file's end, merged into the last when it
+  continues it. A full leaf gains a sibling to its right holding the new extent alone, so the
+  leaves an append fills stay full, as ext4's own appends leave them; a full inode moves its
+  entries into a block below it, one level deeper, as `ext4_ext_grow_indepth` does. An append is
+  **atomic**: on an error nothing it wrote is reachable and every tree block it took is given
+  back. A tree block's allocation goal is the first data block, so it fills the earliest gap
+  rather than the block a file's next data would continue into.
+- **Growing** appends **a run at a time** — the blocks the allocator hands out contiguously, up
+  to the 32,768 an extent can hold — so a tree changes once a run rather than once a block.
+  Blocks past `i_size` (an `fallocate` that kept the size leaves them) are cut first.
+- **Cutting** (`extent::truncate`) frees every block from a logical block on, drops the extents
+  that held them, shortens the one across it, frees each tree block left empty, and **folds**
+  what is left back into the inode while it fits: an index over one child of four entries or fewer
+  takes them in its place. Without the fold a cut leaves a tree `e2fsck` calls a level too deep.
+  A file is freed whole by cutting at `0`.
+- **Looking up** (`extent::Lookup`) reads a leaf when a walk reaches it and keeps it while the walk
+  stays inside, so a block map, a directory scan or a read costs a read per leaf, not a descent
+  per block.
+- **An extent's length is ext4's**: an `ee_len` up to 32,768 is a written extent of that many
+  blocks, and above it an *unwritten* extent of `ee_len - 32768` — allocated and never written —
+  which reads as zeroes. Until H.1 the reader masked the top bit, so a full 32,768-block extent,
+  which Linux writes for a large file and this server for a file that grows through 32,768
+  contiguous free blocks, read as a hole, and an unwritten one read its blocks' old contents. **An
+  unwritten extent maps as a hole**, so the kernel writes back no page over one, as over any hole
+  ([`filesystem-data-path.md`](filesystem-data-path.md)).
+
+**What fails takes nothing with it** (H.1, found by host probes while the tree was planned). A
+grow that fails cuts the tree where it began and writes the inode to match — until then every
+block it had taken stayed in use, on a filesystem the grow did not fit all of its free space. A
+create whose directory cannot grow gives its inode back; a `mkdir` gives back its inode, its block
+and its group's count of directories, which is now **its own group's** — it was always group 0's;
+and a rename within a directory that cannot take the new name puts the old one back, where the
+file had been left with none.
+
+The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
+-fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both
+block sizes and cut back through each; a two-level tree `mke2fs -d` wrote, read, cut and removed;
+`ee_len` `0x8000` and an unwritten extent; and every failure above.
 
 ## Read-only mounts, and how a filesystem was left
 
@@ -212,12 +267,14 @@ Each part builds on proven machinery and is independently verifiable.
   made a root the size of a 931 GiB disk and found it held about 112 MiB. Directory growth — a
   new directory block when the last has no slack — landed 2026-07-29.
 
-**Deferred**: extent-tree splitting / index nodes (depth > 0); jbd2 journaling +
-replay-on-mount (needs `has_journal` fixtures); `metadata_csum` checksums; a periodic
-writeback daemon; per-page dirty tracking; read-ahead / clustered fill; the standalone
-`MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
-open-file cookie; and inode **locality** — a new inode goes in the first group with a free
-one rather than near its parent, which is correct and worse for a seek pattern.
+**Deferred**: jbd2 journaling + replay-on-mount (needs `has_journal` fixtures); `metadata_csum`
+checksums; a periodic writeback daemon; per-page dirty tracking; read-ahead / clustered fill; the
+standalone `MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
+open-file cookie; and inode **locality** — a new inode goes in the first group with a free one
+rather than near its parent, which is correct and worse for a seek pattern.
+
+Extent-tree splitting and index nodes left this list with Phase 6 Part H.1 (2026-10-08) — §
+*The extent tree*.
 
 **Five things this list claimed were deferred and were not** (corrected 2026-09-17):
 truncate (2026-07-24), delete and rename, new-directory-block growth (2026-07-29), and

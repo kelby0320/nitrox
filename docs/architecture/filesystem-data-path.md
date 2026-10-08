@@ -8,7 +8,8 @@ code never had corrected 2026-09-24. **One object per file, dirty objects kept u
 `File::Forget` for a file its server frees. A dirty file whose device has gone is let go (Phase 6
 Part D, 2026-10-06). **A second implementer, `fs-server-fat`**, maps in 512-byte sectors and names a
 file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 Part E, 2026-10-06,
-§ *A page within one run*).
+§ *A page within one run*). An ext4 **unwritten extent** maps as a hole (Phase 6 Part H.1,
+2026-10-08).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -122,7 +123,10 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   state in the code.
 - **Writeback**: `FileObject::writeback` flushes **every resident page** by a block **write** IRP
   from the cache frame to its `device_lba`, dirty or not, since it cannot tell. A page over a hole
-  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **Two triggers:
+  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **An ext4 unwritten
+  extent is a hole here** (Phase 6 Part H.1): allocated by `fallocate` and never written, it reads
+  as zeroes, so `fs-server-ext4` maps it as one — and a write into it, as into any hole, is not
+  written back. **Two triggers:
   `sys_file_sync`** on one file, an `msync`-style syscall, and **`sys_ns_sync`** on every dirty
   file of a mount. Unmapping a `MAP_WRITE` VMA does *not* write back. After it, the kernel sends
   the server `File::Touch` with the file's id, since an in-place write never reaches the server
