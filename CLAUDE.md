@@ -113,7 +113,12 @@ laptop's, with MSI and no MSI-X — `nec-usb-xhci`, since CI's QEMU 8.2 cannot g
 (`docs/architecture/usb.md`). Since Part D **the stick is an MBR with one FAT16 partition**: it is
 bound as a disk under its `UsbDevice`, its table read, the partition reported FAT and not mounted —
 since Part E **with the reason, its 512-byte clusters**, which `fs-server-fat` refuses — and the
-SATA disk the image boots from is the one record flagged `boot`.
+SATA disk the image boots from is the one record flagged `boot`. Since Part G **a sixth device, a
+3 TiB sparse drive**, last so the others keep their ports: read with the sixteen-byte commands,
+published with its size, and written past 2 TiB by `boot-probe` — the host finds the sector in the
+image, where a block number cut to 32 bits would have put it 2 TiB lower; and `boot-probe`'s
+`Reread`s, refused for a mounted device and the boot disk, and taken for the stick, whose partition
+the kernel's rescan replaces with the watch pinged though no mount changed.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 36 steps,
@@ -269,10 +274,16 @@ beside an ESP refused for its clusters; and a 300 MiB FAT32 stick whose data reg
 boundary — asserted before the boot — is auto-mounted writable, its host names (Unicode among them)
 listed, written to (a directory, a copy to a long Unicode name, a rename, a removal, a file through
 a mapping), ejected with `disk --eject` and pulled. On the host `fsck.fat -n` finds it clean and
-mtools reads what the guest wrote. **It logs in only once `boot-probe` has exited**, whatever its
-verdict, which on that machine is a FAIL by the machine's shape: its later tests install a policy
-and fill the view broker's clients, and the sticks made the gate long enough to meet them. It runs
-in CI's QEMU job.
+mtools reads what the guest wrote. **Since Part G it formats**, through `with admin`: `disk
+--list`'s `note` naming the internal FAT's reason, a partition of the boot stick refused before any
+write, then a blank 2 GiB stick formatted ext4 whole (a GPT, its partition published by the kernel's
+rescan, mounted, written, ejected and copied), partitioned again (an MBR, the GPT's partition
+departed, a new one holding nothing) and that partition formatted FAT (mounted, written, the same
+command refused while mounted, ejected). The host reads the GPT and its ext4 in the copy, and the
+MBR, no GPT header at either end, and the FAT in the stick. **It logs in only once `boot-probe` has
+exited**, whatever its verdict, which on that machine is a FAIL by the machine's shape: its later
+tests install a policy and fill the view broker's clients, and the sticks made the gate long enough
+to meet them. It runs in CI's QEMU job.
 
 `cargo xtask check-media` is the **removable-media gate** (Phase 6 Part F), on the desktop a person
 uses: the **release** live image as the boot stick beside a copy of the release disk, logged in at

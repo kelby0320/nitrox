@@ -1600,8 +1600,10 @@ ESP is refused this way** — 512-byte clusters on the release disk and what `nx
 on the live stick — as is a small stick formatted with the defaults. A stick of 4 GiB or more
 formatted by another system has clusters of 4 to 32 KiB. The ways to serve one: through
 `File::ReadRange`, read-only, a second data path in the server; or a page filled from several runs,
-real kernel work with a partial-failure case. Part G's `disk --format` makes such a stick servable
-meanwhile. **Trigger**: a stick someone needs that cannot be reformatted.
+real kernel work with a partial-failure case. **`disk --format` remakes such a stick servable**
+meanwhile (Phase 6 Part G): its FAT formatter never makes clusters under 4 KiB, and the table's
+`note` says why a stick was not mounted. **Trigger**: a stick someone needs that cannot be
+reformatted.
 
 **A file in more runs than a reply holds — `TODO(map-range)`.** A block-file reply carries at most
 64 runs (`MAX_RUNS` in `libfsserver`), and a file in more fragments is refused `TooLarge`, by both
@@ -1633,12 +1635,6 @@ removable disk would be a second way to mount, beside the admin session's, with 
 what a session may take. **Trigger**: a person who ejected by mistake and could not pull the stick
 out to plug it in again.
 
-**Saying why a stick did not mount (`unmounted-why`).** Files' Drives lists mounts (Phase 6 Part F),
-so a stick the storage service refused — a FAT with clusters under a page, say — or holding nothing
-it serves appears nowhere but the service's log line. The table has no column for the reason.
-**Trigger**: Part G's formatting, which is what would make such a stick usable, and which needs a
-place to be offered.
-
 **Files waiting on the storage service — `TODO(files-storage-wait)`.** Files reads the storage
 table after each watch ping, and sends an `Eject` and waits for its answer, on its one thread
 (Phase 6 Part F). The service is one thread too, and may be in an unmount chain — a flush, a
@@ -1654,6 +1650,25 @@ the home folders and Root. Phase 6 Part F kept both as they were — the chooser
 call in its detail pass — and gave the drives to Files' sidebar alone. A chooser listing places and
 drives is a toolkit change; a name field taking an absolute path is a smaller one. **Trigger**:
 saving to a stick being a thing people do often enough to find the walk slow.
+
+**Several partitions, with sizes (`partition-sizes`).** `disk --partition` writes one partition
+spanning the disk, and `disk --format` of a whole disk the same (Phase 6 Part G, the maintainer's
+call: one spanning partition for now). Several, each with a size, is the granular path's next step;
+the table builders already take several. **Trigger**: a person who wants two filesystems on one
+drive.
+
+**Disks of 4096-byte logical sectors (`4k-sectors`).** Some enclosures for large drives present
+4096-byte logical sectors. The USB storage driver publishes such a unit but reads no table on it,
+`disk` refuses to write one, and both filesystem servers serve 512-byte sectors alone (Phase 6 Part
+G). Every count in `libgpt`, the formatters and the kernel's table reader is in 512-byte sectors.
+**Trigger**: such a drive.
+
+**Partitioning an internal disk at runtime (`internal-partition`).** Only a USB disk answers
+`IoOpcode::Rescan`; AHCI's and a RAM disk's answer `Unsupported`, and `disk` refuses a table on a
+disk that is not removable. An internal disk is partitioned by `nxinstall`, which reboots after
+(Phase 6 Part G). A second internal disk partitioned while the machine runs needs AHCI to read its
+table again, as the hub thread does a stick's. **Trigger**: a second internal disk someone wants to
+use without a reboot.
 
 **ext4 with blocks smaller than a page — `TODO(ext4-subpage-runs)`.** The kernel fills a page as one
 device range from the page's first block, so a page must lie within one run. FAT's server makes
@@ -2258,6 +2273,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Saying why a stick did not mount (`unmounted-why`) | 2026-10-07 | **The storage table's `note` column, Phase 6 Part G** — why a filesystem found is not mounted, in the words of the service's log line, which comes from the same function; `disk --list` shows it. Files does not: its Drives lists mounts, and a stick that needs formatting is formatted with `with admin disk --format`. [`storage.md`](../architecture/storage.md) §9. |
 | Read-write FAT | 2026-10-06 | **`fs-server-fat`, Phase 6 Part E** — FAT12, FAT16 and FAT32 read-write with long names, on `libfsserver`'s protocol beside `fs-server-ext4`. The trigger arrived from another direction than the one the entry named, a USB stick rather than an ESP update (2026-09-10), and the read-only first step was skipped, since a stick is written to. Files are mapped in 512-byte sectors and named by their first cluster; clusters under a page are refused, so no Nitrox ESP is served (`TODO(fat-small-clusters)`); the storage service mounts a FAT on a removable disk alone. [`fat-fs-server.md`](../architecture/fat-fs-server.md). |
 | A grace period for `with` (`view-grace`) | 2026-10-01 | **Remembered per session, terminal and view, for five minutes** — the laptop polish's Part A. `with` sends a one-time `Tty::Token` from its terminal and the broker redeems it with `tty-server` over its own channel, so a caller cannot claim another terminal; a refused password, `with --forget` and the session's end forget it. `boot-probe` holds the forgery control. |
 | A new user's folders (`home-folders`) | 2026-09-30 | **Whoever makes a home makes its folders**, from `libfs::HOME_FOLDERS`, the list `nxfiles`' sidebar and the shell's Places menu read — the maintainer's call in administration Part D's detail pass, over a session making missing folders at each login and over a skeleton directory. The view broker made them for every account `account --add` adds from Part D.3, and **Part G.2's installer makes them for the first**: it writes the new machine's one account, its policy and `/home/<name>` with the three folders onto the installed root, where it used to copy the build's demo home. `check-install` reads them off the installed disk on the host. |

@@ -79,7 +79,8 @@ Field offsets, types, and sizes of:
   e.g. a namespace lookup's resolved handle; the earlier `handle`/`status`/
   `reserved` offsets are unchanged). Any change to `IoResult` invalidates the hash.
 - `IoOpcode` enum — `Read = 0`, `Write = 1` (Phase 2), `Flush = 2`
-  (administration Part C.2); see [`io-operation.md`](io-operation.md).
+  (administration Part C.2), `Rescan = 3` (Phase 6 Part G); see
+  [`io-operation.md`](io-operation.md).
 
 ### KError enum layout
 

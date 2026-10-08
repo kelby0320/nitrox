@@ -5,8 +5,8 @@ current status, the full phase list, and the cross-cutting workstreams.
 
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
-E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed 2026-10-07;
-Parts G–H not built.** This
+E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed and built
+2026-10-07; Part H not built.** This
 replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
 decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
 when it is next, as administration's parts did; what is here is the phase's shape, the design each
@@ -2531,6 +2531,21 @@ a person reading it learns that a stick needs formatting. Files is unchanged.
 - **G.4 `disk --partition` and `disk --format`**, with the boot-disk refusal before any write.
 - **G.5 The gates.** Below.
 - **G.6 Docs.** Below.
+- **G.1–G.6 built 2026-10-07.** Calls on the way (the decision log's "Phase 6 Part G, built" has
+  the reasoning):
+  - **a watch is pinged when the devices change too**, which a bare `--partition`'s wait needs;
+    `test-qemu` holds it, since in `check-storage` the arrival usually wins the race;
+  - **`note` and the log line come from one function**, and `note` is null for a device holding
+    nothing while the log still names the boot stick's disk passed over;
+  - **`disk` refuses a mounted target by name**, and a disk of other than 512-byte sectors, before
+    opening anything;
+  - **a whole-disk `--format fat` types its partition by the FAT it makes**, `0x0E` or `0x0C`;
+  - **the FAT formatter's floor is exactly 16 MiB**, and its boot sector is written last;
+  - **`PartitionIo` makes its own scratch** in `libfsserver`, and the three device types there are
+    `!Sync`; `account`'s entropy reader is `coreutils::entropy`;
+  - **`test-qemu`'s 3 TiB drive is attached last**, its test passing with a line where there is
+    none; the boot disk's partition is found by its parent's flag, in `boot-probe` and, through
+    `/dev/devices`, in `check-storage`.
 
 ### Gates
 

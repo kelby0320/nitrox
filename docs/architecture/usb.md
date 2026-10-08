@@ -1,7 +1,8 @@
 # USB
 
 **Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05),
-Part C's arrivals and departures (2026-10-05), and Part D's mass storage (D.1–D.6, 2026-10-06)**
+Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06), and
+Part G's sixteen-byte commands and rescan (2026-10-07)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
@@ -10,8 +11,9 @@ is attached**, at boot and after it, logging each device and matching it against
 B.3), a keyboard's lights set by a `SET_REPORT` (B.5); and **a device that leaves departs** (C):
 what its keyboards and mice held is released, their nodes retire and their slots are given back,
 and its records are marked departed, which `device-mgr` follows; and **a bulk-only stick is a disk**
-(D), its partition table read where it arrives and its I/O driven by the controller's DPC. The
-design ahead is
+(D), its partition table read where it arrives and its I/O driven by the controller's DPC, **read
+again when a holder rewrites it** (G), and **a disk of 2 TiB or more read with the sixteen-byte
+commands** (G). The design ahead is
 [`phase-6-usb.md`](../planning/phase-6-usb.md); this document grows with each part.
 
 ## The controller
@@ -319,8 +321,18 @@ enumeration and in the hub thread: `GET MAX LUN` (a stall means one unit), then 
 `INQUIRY` — a direct-access device, or it is left alone — `TEST UNIT READY` with `REQUEST SENSE`
 between tries for up to five seconds, and `READ CAPACITY(10)`. **Every command at binding is the
 hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. A unit
-that is not ready (an empty card reader's slot), of 2 TiB or more, or not a block device is said and
-left alone.
+that is not ready (an empty card reader's slot), or not a block device, is said and left alone.
+
+**A unit of 2³² blocks or more** (Part G): `READ CAPACITY(10)` answers that it cannot say —
+`0xFFFFFFFF` — and the unit is asked again with **`READ CAPACITY(16)`**, its size logged as `2 TiB
+or more: <n> blocks, read with the sixteen-byte commands`. **Such a unit's reads and writes are
+`READ(16)` and `WRITE(16)`**, with 64-bit block numbers; every other unit keeps the ten-byte
+commands, which every stick supports and some older ones answer alone. One that does not answer
+`READ CAPACITY(16)` is said and left alone, as every unit of that size was until Part G. `test-qemu`
+attaches a 3 TiB drive, writes past 2 TiB through its node, and finds the sector in the image on the
+host, where a block number cut to 32 bits would have put it 2 TiB lower. **A table is read only on a
+unit of 512-byte blocks**: one of 4096-byte logical blocks is published and its partitions are not
+read (filed).
 
 **The table is read before the disk is published** — its first two blocks, then a GPT's entries
 where its header puts them — through `drivers::partitions`, the parser the boot's polled read uses
@@ -361,6 +373,19 @@ not charged to the next. A device that does not recover is ended as on an unplug
 completed by the departure**, once the slot is disabled, since a reset that failed may never have
 stopped the endpoints its TRBs are on.
 
+**A rescan** (Part G): `IoOpcode::Rescan` on a USB disk's node — what the storage service sends for
+`Reread`, once a holder of the disk has rewritten its table
+([`io-operation.md`](../spec/io-operation.md), [`storage.md`](storage.md) §8b). The IRP is the hub
+thread's, as everything off the I/O path is: the submit marks the device and wakes the thread, which
+**waits for the disk to go quiet** — no command in flight or queued, submits held back meanwhile —
+then **retires each of the disk's partition windows**, so a handle still holding one is refused
+`PeerClosed` rather than reading where the old table said; departs their records; reads the table as
+at the disk's arrival; publishes what it finds; and completes the IRP with the number published,
+logging `rescanned: <n> partition(s) departed, <m> published`. A disk that never goes quiet within
+the thread's bound, or departs meanwhile, completes it with an error. **A partition's window answers
+a `Rescan` itself, `Unsupported`**, rather than passing it to its disk
+([`drivers-and-irps.md`](drivers-and-irps.md)).
+
 **A departure**, before the records depart: the device out of the DPC's table, its queue completed
 `PeerClosed`, and any later submit refused so; the command in flight completed `PeerClosed` once the
 slot is disabled, since until then the controller may still move its data. **The devices are eight
@@ -394,8 +419,9 @@ supervises.
   speed, name and driver, under the controller found by its address, and no parent when the table
   has no function there.
 - **`test-qemu`** boots the controller with a keyboard at high speed, a mouse at full speed, a
-  stick at SuperSpeed, a hub, and a smart-card reader — the device nothing matches, and the one
-  whose default endpoint is not its speed's, so its enumeration evaluates it. On the host it
+  stick at SuperSpeed, a hub, a smart-card reader — the device nothing matches, and the one
+  whose default endpoint is not its speed's, so its enumeration evaluates it — and, last, a 3 TiB
+  drive (Part G). On the host it
   asserts the controller's facts, the No Op's answer, the claim over MSI, each device's line, the
   evaluation, and the first round **ending before `init` is spawned**. Over QMP it plugs a keyboard
   in once the first round is logged; once it has arrived, **pauses the machine and swaps it for a
@@ -410,7 +436,7 @@ supervises.
   endpoint answering nothing until it is recovered.
 - **The records, in `test-qemu`** (A.3): `boot-probe` prints a line per `UsbDevice` record it reads
   through `/dev/registry`, after checking it is under a claimed `0c/03/30` function and carries a
-  port, a speed, a name and its driver. The host holds each of the five to its port, IDs, class,
+  port, a speed, a name and its driver. The host holds each of the six to its port, IDs, class,
   speed and name. `boot-probe` also holds `device-mgr` to the registry: the manager's devices are
   the registry's first records, every record after them is a USB device, and each USB device the
   manager read is listed as `usb-<id>.tsm`. Where the hot-plug lands against the manager's read
@@ -466,15 +492,25 @@ supervises.
   waited behind it; a stranded command held for the departure; a hub command the DPC reached
   waited for; a transfer that would straddle the Link put after it; and a short read's last data
   event not taken for its status. Each has a control that fails it, the epoch's bump and check
-  among them, which PR #361 found untested in the input nodes'.
+  among them, which PR #361 found untested in the input nodes'. **Part G**: the sixteen-byte CDBs
+  as SBC-3 lays them out and `READ CAPACITY(16)`'s answer; a unit taking the sixteen-byte commands
+  from 2³² blocks plus one, at its neighbours; and a rescan waiting for quiet and holding submits
+  back while it runs.
 - **`drivers::partitions`** — GPT with its disk's GUID, MBR's entries by slot, a filesystem's boot
   sector and a block whose status bytes no MBR has as no table, entries off the disk dropped — one
   spanning every LBA there could be among them, which overflowed until PR #363's review — a GPT
   whose entries are off the disk refused, and the boot disk by its GUID.
 - **`test-qemu`**'s stick is an MBR stick with one FAT partition: the host holds the disk's line,
   its partition and the storage service's report, and `boot-probe` the disk under its device, the
-  partition under it, and the boot flag on the one disk the image booted from.
+  partition under it, and the boot flag on the one disk the image booted from. **Since Part G
+  `boot-probe` reads it again** through the storage service's `Reread`: the kernel's rescan
+  replaces its partition, the old record departed and a new one published. **And its 3 TiB drive**
+  is read with the sixteen-byte commands, published with its size, and written past 2 TiB, the
+  sector found in the image on the host. Removing the sixteen-byte path leaves it unpublished, and
+  the gate fails.
 - **`check-storage`** plugs an MBR ext4 stick in over QMP, ejects it and checks it on the host, and
-  pulls a whole-disk one while mounted with a file dirty, asserting each line of the teardown;
+  pulls a whole-disk one while mounted with a file dirty, asserting each line of the teardown; and
+  since Part G formats a blank stick ext4 whole, partitions it MBR and formats that FAT, each
+  table read again by a rescan — a rescan that departs nothing fails it;
   `check-live`, `check-install` and `check-report` hold the boot stick as a disk, passed over and
   refused ([`storage.md`](storage.md) §11).

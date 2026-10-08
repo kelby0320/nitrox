@@ -155,7 +155,10 @@ the medium, and a device node does not publish it. See
 
 *(Phase 6 Part D.1.)* **A disk's table is parsed by `drivers::partitions`**, from its 512-byte
 blocks, whoever reads them: the boot's polled read for a SATA disk or a RAM disk, and a USB disk's
-binding, which reads before the disk is published.
+binding, which reads before the disk is published — **and its rescan** (Phase 6 Part G), which
+reads a USB disk's table again after a holder has rewritten it: its partitions' windows retired and
+their records departed first, then what the table now holds published as at its arrival
+([`io-operation.md`](io-operation.md) § *IoOpcode*).
 - **GPT** first: a header at block 1 signed `EFI PART`, its entries where it says, at most 128. Each
   entry in use is a partition, numbered by its place among those in use and named by its label, or
   `partition <n> (unlabelled)`. The header's disk GUID is kept.

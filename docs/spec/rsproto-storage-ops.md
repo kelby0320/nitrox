@@ -1,12 +1,15 @@
 # rsproto — Storage operations (`0x10xx`)
 
 **Status: normative for what is built (2026-09-25; `InUse` and the boot medium 2026-10-06; the media
-session, `Eject`, the watch and `Changed` 2026-10-07).** `Mount`, `Unmount` and `InUse` are
+session, `Eject`, the watch and `Changed` 2026-10-07; `Reread`, and `Changed` for the devices too,
+2026-10-07).** `Mount`, `Unmount` and `InUse` are
 implemented in `userspace/storage-service/` and encoded by `userspace/librsproto/src/storage.rs`
 (administration Part C.5c). The view broker's `storage` grant binds the admin endpoint into a view
 (C.6), and `disk --mount` and `disk --unmount` speak these requests there (C.7). **`Eject` and
 `Changed`** (Phase 6 Part F) are a session's: `disk --eject` and Files speak them through the
-session endpoint every login binds. See [`storage.md`](../architecture/storage.md) for the service,
+session endpoint every login binds. **`Reread`** (Phase 6 Part G) is the admin session's again:
+`disk --partition` and `disk --format` send it once they have written a device. See
+[`storage.md`](../architecture/storage.md) for the service,
 and [`administration.md`](../planning/administration.md) § *Part C in detail* for the design and its
 reasons.
 
@@ -22,7 +25,7 @@ this category but a session's `Eject`, on a media session, and the service's `Ch
 |---|---|---|---|
 | forwarding endpoint | `/svc/storage`, bound by `service-mgr` | — | `Namespace::Resolve` |
 | admin endpoint | `/svc/storage/admin-endpoint`, from the root namespace | `admin-endpoint` | a forwarding endpoint of the service's own |
-| admin session | any resolve on an admin endpoint — the view broker's `/dev/storage/admin` | any | a channel carrying `Mount`, `Unmount` and `InUse` |
+| admin session | any resolve on an admin endpoint — the view broker's `/dev/storage/admin` | any | a channel carrying `Mount`, `Unmount`, `InUse` and `Reread` |
 | media session | `/dev/storage/media`, through a session endpoint or `/svc/storage` | `info/media` | a channel carrying `Eject` (Phase 6 Part F) |
 | watch | `/dev/storage/watch`, likewise | `info/watch` | a channel the service sends `Changed` on, and nothing else (Phase 6 Part F) |
 
@@ -150,10 +153,34 @@ chain's flush is what a stick needs.
 
 ### `Changed` (`0x1004`)
 
-**The mounts changed** (Phase 6 Part F). Sent by the service on a watch, never by a client: a bare
-message, `request_id` 0 and an empty body, whenever the names mounted under `/storage` differ after
-a turn of its loop from before it. **The client reads the tables again**; a `Changed` says nothing
-about which mount, and the table is the one answer to what is mounted.
+**The mounts changed, or the devices** (Phase 6 Parts F and G). Sent by the service on a watch,
+never by a client: a bare message, `request_id` 0 and an empty body, whenever the names mounted
+under `/storage`, or the devices the service knows, differ after a turn of its loop from before it.
+The devices since Part G: a partition a rescan published holding nothing changes no mount, and
+`disk --partition` waits for its row. **The client reads the tables again**; a `Changed` says
+nothing about which mount or device, and the table is the one answer.
 
 **A full queue is a ping already waiting**, so the service drops a send that finds one full and
 nothing is lost. A watch whose client has gone is let go when a send to it fails `PeerClosed`.
+
+### `Reread` (`0x1005`)
+
+**Read a device again**, once `disk` has written it (Phase 6 Part G). Sent on an admin session.
+Body: the device's name as the tables name it, `blk-<n>`. Reply body: **the names it was mounted
+under**, one per line — `Eject`'s form — and empty for none.
+
+- **A partition** is probed again, and mounted by the rules an arriving device meets
+  ([`storage.md`](../architecture/storage.md) §6a): its window is unchanged.
+- **A disk** — a RAM disk among them — is first **rescanned by the kernel**, `IoOpcode::Rescan` on
+  its node ([`io-operation.md`](io-operation.md)): its partitions depart and those its table now
+  holds are published. **They reach the service as arrivals after the reply**, and are mounted as
+  arrivals are; the reply names only the disk's own mount, if it holds a filesystem whole.
+
+| Refusal | When |
+|---|---|
+| `NotFound` | no block device has that name |
+| `WouldBlock` | the partition is mounted; or, for a disk, anything on it is, since its partitions are about to be replaced. A partition beside a mounted sibling is read again |
+| `NoAccess` | it is on the disk the machine started from — asked after `WouldBlock`, so the disk holding `init`'s root says it is mounted; or `init`'s mounts are not all known |
+| `Unsupported` | the kernel cannot rescan the disk: every disk but a USB one's |
+| `InvalidArgument` | the name is not UTF-8 |
+| `IoError` | the rescan failed |
