@@ -133,6 +133,9 @@ pub enum Expr {
     Parse(Box<Expr>, TypeExpr),
     /// `assert (predicate)` — a content check, deliberately not folded into `expect` (§6).
     Assert(Box<Expr>),
+    /// `time PIPELINE` (Phase 6 Part H.2): the pipeline's value, and a line on `stderr` when it
+    /// ends saying how long it took and what the disks and the page cache did meanwhile (§3).
+    Time(Box<Expr>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

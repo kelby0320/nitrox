@@ -28,8 +28,9 @@ use device_mgr::classes::{Class, Owners, replay};
 use device_mgr::follow::{Change, diff};
 use device_mgr::suffix::{self, Asked};
 use device_mgr::table;
+use device_mgr::io as io_table;
 use libkern::debug::Line;
-use libkern::device::{DeviceRecord, records};
+use libkern::device::{CacheCounts, DeviceRecord, IoRecord, io, records};
 use libkern::*;
 use librsproto::devices::{
     OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed, build_settled,
@@ -197,6 +198,30 @@ fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
     out
 }
 
+/// **What the disks and the page cache have done**, from one read of `/dev/registry/io` (Phase 6
+/// Part H.2): read afresh for each `io.tsm`, since the counts move with every command.
+fn read_io(root_ns: u64) -> Option<(CacheCounts, Vec<IoRecord>)> {
+    let snap = lookup(root_ns, b"/dev/registry/io", RIGHT_MAP_READ | RIGHT_INSPECT);
+    if snap == 0 {
+        return None;
+    }
+    let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
+    // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    close(snap);
+    if addr < 0 {
+        return None;
+    }
+    // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
+    let out = io(bytes).ok().map(|snap| (snap.cache, snap.iter().collect()));
+    // SAFETY: unmapping what was mapped above; `out` holds copies.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    out
+}
+
 /// Reply to a resolve with a fresh read-only memory object holding `bytes`.
 fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) {
     // SAFETY: a plain anonymous object of `bytes.len()`.
@@ -273,7 +298,11 @@ impl Manager {
             Asked::InfoEndpoint => self.mint_info_endpoint(from, request_id),
             Asked::Directory => self.open_dir(from, request_id),
             Asked::File(name) => {
-                let bytes = if name == "all" { Some(table::all(&self.records)) } else { table::one(&self.records, name) };
+                let bytes = match name {
+                    "all" => Some(table::all(&self.records)),
+                    "io" => self.io_table(),
+                    _ => table::one(&self.records, name),
+                };
                 match bytes {
                     Some(b) => reply_with_object(from, request_id, &b),
                     None => reply_error(from, OP_NS_RESOLVE, request_id, KError::NotFound),
@@ -282,6 +311,12 @@ impl Manager {
             Asked::Unknown => reply_error(from, OP_NS_RESOLVE, request_id, KError::NotFound),
         }
         true
+    }
+
+    /// `io.tsm`'s bytes, from a fresh read of `/dev/registry/io`; `None` if it would not read.
+    fn io_table(&self) -> Option<Vec<u8>> {
+        let (cache, disks) = read_io(self.root_ns)?;
+        Some(io_table::table(cache, &disks, &self.records))
     }
 
     /// Answer with a forwarding endpoint of the manager's own, on which only the information is
@@ -532,7 +567,11 @@ impl Manager {
         let mut i = cursor;
         while i < names.len() {
             let stem = names[i].strip_suffix(".tsm").unwrap_or(&names[i]);
-            let size = if stem == "all" { table::all(&self.records).len() } else { table::one(&self.records, stem).map_or(0, |b| b.len()) };
+            let size = match stem {
+                "all" => table::all(&self.records).len(),
+                "io" => self.io_table().map_or(0, |b| b.len()),
+                _ => table::one(&self.records, stem).map_or(0, |b| b.len()),
+            };
             if !w.push(i as u32 + 1, DIRENT_KIND_FILE, 0, size as u64, 0, names[i].as_bytes()) {
                 break;
             }

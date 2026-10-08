@@ -9,7 +9,8 @@ code never had corrected 2026-09-24. **One object per file, dirty objects kept u
 Part D, 2026-10-06). **A second implementer, `fs-server-fat`**, maps in 512-byte sectors and names a
 file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 Part E, 2026-10-06,
 § *A page within one run*). An ext4 **unwritten extent** maps as a hole (Phase 6 Part H.1,
-2026-10-08).
+2026-10-08). The page cache's write-backs are counted, and the cache's counters served at
+`/dev/registry/io` (Phase 6 Part H.2, 2026-10-08).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -126,7 +127,11 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **An ext4 unwritten
   extent is a hole here** (Phase 6 Part H.1): allocated by `fallocate` and never written, it reads
   as zeroes, so `fs-server-ext4` maps it as one — and a write into it, as into any hole, is not
-  written back. **Two triggers:
+  written back.
+- **What the cache does is counted** (`file_object::fill_stats`): fills that read the device and
+  their time, fills over a hole, hits, and — since Phase 6 Part H.2 — write-backs: the pages, the
+  IRPs that carried them (one a page today) and their time. `/dev/registry/io` serves them beside
+  the disks' counters, and the device manager's `io.tsm` as its `page-cache` row. **Two triggers:
   `sys_file_sync`** on one file, an `msync`-style syscall, and **`sys_ns_sync`** on every dirty
   file of a mount. Unmapping a `MAP_WRITE` VMA does *not* write back. After it, the kernel sends
   the server `File::Touch` with the file's id, since an in-place write never reaches the server

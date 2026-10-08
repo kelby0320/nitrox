@@ -76,6 +76,7 @@ cargo xtask check-storage  # that stick beside a copy of the release disk; the h
 cargo xtask check-media    # the live desktop: a stick plugged in, shown in Files, saved to, ejected
 cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
+cargo xtask throughput-stick # the stick Part H's copies are timed with; `--check IMAGE` reads it back
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -118,11 +119,14 @@ SATA disk the image boots from is the one record flagged `boot`. Since Part G **
 published with its size, and written past 2 TiB by `boot-probe` — the host finds the sector in the
 image, where a block number cut to 32 bits would have put it 2 TiB lower; and `boot-probe`'s
 `Reread`s, refused for a mounted device and the boot disk, and taken for the stick, whose partition
-the kernel's rescan replaces with the watch pinged though no mount changed.
+the kernel's rescan replaces with the watch pinged though no mount changed. Since Part H.2
+`boot-probe` holds the **I/O counters** to a write: a file synced on the scratch disk moves its
+writes and the page cache's write-backs in `/dev/devices/io.tsm` by at least the file's pages.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 36 steps,
-expect-driven rather than sleep-driven.
+the real prompt over the serial console and matches on what comes back — 37 steps,
+expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
+line, of its shape, before the value it passes through.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
 a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell

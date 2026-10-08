@@ -35019,3 +35019,46 @@ and it stays at the tree to copy's size.
 **Gates**: the eight that write ext4 — `test-qemu` and `check-storage` under TCG and KVM,
 `check-install`, `check-recovery`, `check-shutdown` and `test-interactive` — pass on the new server,
 the full set left for the part's PR. Host tests: 3,320. ABI hash: no impact.
+
+## 2026-10-08 — Phase 6 Part H.2, built: the instruments
+
+What Part H measures with, built: `time PIPELINE` in `nxsh`, the block drivers' and the page cache's
+counters behind it, served at `/dev/registry/io` and as the device manager's `io.tsm`, and `cargo
+xtask throughput-stick`, the tree the laptop's runs copy.
+
+- **The counters are on the device's node, not in its driver** (`kernel/src/io/stats.rs`). The
+  plan said "kept by the driver", and the driver is what counts — AHCI where slot 0 issues and
+  retires, USB storage where a command goes on the rings and where its status wrapper arrives, the
+  RAM disk around its copy — but a USB driver's slot goes to the next device to arrive, so
+  counters kept there would have carried one stick's totals into the next. A driver holds its
+  node's (`Counted`), attached once the node is registered, which the table keeps for the boot.
+- **A command's time is its time on the device**: stamped at issue, taken at retirement, so an
+  IRP's wait in a driver's queue is not in it, and with one command at a time each disk's sum is
+  its busy time — which is what H.4 reads to call a run device-bound. A USB command the hub
+  thread recovers counts as its outcome with none of the recovery's time, that being the hub
+  thread's own commands, which are not counted; nor is the table read where a disk arrives.
+- **`io.tsm` is a row per present disk and the page cache's**, the cache's fills and write-backs in
+  a disk's columns and their time in `busy_ns`, which overlaps the disks' time rather than adding
+  to it. Read afresh at every resolve, since the counts move with every command; the directory
+  lists it after `all.tsm`, which `boot-probe`'s device check now counts.
+- **`time` is a prefix keyword**, at a head and followed by an argument, so `time list /home |
+  count` times both stages; alone or before `=` it is a name. Its line goes to `stderr`, plain
+  ASCII, since it is read off a screen and off a serial console that drops anything else — which is
+  why it says `us`. The host gained a monotonic clock (`Host::now_ns`).
+- **The stick's files are named as a camera names its photos**, `B00.BIN`, `S0000.BIN`,
+  `T0000.BIN`: with long names alike `mcopy` searched for a `~N` alias for each, scanning the
+  directory for every candidate, and writing the image ran past ten minutes; with short names it
+  takes nineteen seconds. Every name is unique, so a file's pattern is its name's and `--check`
+  verifies a copy wherever it was put.
+
+**The first numbers**, from the gates rather than the laptop: `boot-probe`'s file of eight pages
+moved the scratch disk's writes by 48 — eight pages and forty of `fs-server-ext4`'s metadata — and
+`time list /dev/devices` on the release image took 35 ms, 30 reads on `blk-0`. Tests: `boot-probe`
+holds the counters to a synced write on every `--selftest` gate's machine, and `test-interactive`
+`time`'s line on the release image; host tests for each driver's counting, the snapshot, the table,
+the reader and the line; `--check` run against an image with a file changed, one gone and a
+directory copied. Twelve controls, every one failing — the two gate-level ones, the RAM disk
+counting nothing and `time` printing nothing, by their gates. **Gates**: `test-qemu`,
+`test-interactive`, `check-storage` under TCG and KVM, `check-live`, `check-media`, `check-shutdown`
+and `check-images` pass; the full set is left for the part's PR. Host tests: 3,334. ABI hash: no
+impact — the snapshot's records are `abi-sync-check`'s, and `DeviceNode`'s fields are no hash input.

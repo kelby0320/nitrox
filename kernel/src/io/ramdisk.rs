@@ -42,8 +42,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::ArchIrqInstall;
+use crate::arch::timer::ArchTimer;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
+use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, NameBuf, MAX_DEVICE_NAME};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
@@ -73,6 +75,8 @@ pub struct RamDisk {
     block_size: u32,
     /// Held across each transfer. See the module docs § Concurrency.
     busy: IrqSpinLock<()>,
+    /// The disk node's counters, attached once it is registered (Phase 6 Part H.2).
+    counted: Counted,
 }
 
 // SAFETY: the backing is either owned by this device or bootloader memory handed to it
@@ -105,6 +109,7 @@ impl RamDisk {
             backing: Backing::Owned(backing),
             block_size: RAMDISK_BLOCK,
             busy: IrqSpinLock::new(LockRank::Leaf, ()),
+            counted: Counted::new(),
         })
     }
 
@@ -120,6 +125,7 @@ impl RamDisk {
             backing: Backing::Borrowed { base, len },
             block_size: RAMDISK_BLOCK,
             busy: IrqSpinLock::new(LockRank::Leaf, ()),
+            counted: Counted::new(),
         })
     }
 
@@ -141,6 +147,21 @@ impl RamDisk {
     /// Logical block size.
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// **Serve one IRP, counted** (Phase 6 Part H.2): the transfer, timed by `clock` in nanoseconds —
+    /// a RAM disk's command is a copy, so its time on the device is the copy's — and recorded into
+    /// the node's counters. Returns `(status, transferred)`, as [`transfer`](Self::transfer).
+    fn serve(&self, irp: &Irp, clock: impl Fn() -> u64) -> (i32, u64) {
+        let started = clock();
+        let (status, transferred) = self.transfer(irp);
+        self.counted.record(irp.op, status == IrpStatus::Success as i32, transferred, clock() - started);
+        (status, transferred)
+    }
+
+    /// The disk's hold on its node's counters, for whoever registers the node to attach.
+    pub fn counted(&self) -> &Counted {
+        &self.counted
     }
 
     /// Perform the IRP's transfer against the backing, returning `(status, transferred)`. A
@@ -216,7 +237,7 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     // outlives the IRP.
     let rd = unsafe { &*(ctx as *const RamDisk) };
     // SAFETY: `irp` is the live in-flight IRP from `dispatch_block_irp`.
-    let (status, transferred) = rd.transfer(unsafe { &*irp });
+    let (status, transferred) = rd.serve(unsafe { &*irp }, crate::arch::Timer::read_ns);
     // SAFETY: as above; record the outcome before queuing completion.
     unsafe { (*irp).set_completion(status, transferred) };
     // SAFETY: the inline DPC was armed in `dispatch_block_irp`; the IRP outlives
@@ -360,7 +381,9 @@ pub fn publish_modules() {
         let node_ref = unsafe {
             ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
         };
-        crate::device::register(node_ref, "ramdisk");
+        crate::device::register(node_ref.clone(), "ramdisk");
+        // SAFETY: `node_ref` was just registered, and the table holds it for the kernel's lifetime.
+        unsafe { rd.counted().attach(&node_ref) };
         crate::kprintln!(
             "ramdisk: module {} ({}), {} bytes, as a block device",
             disk.index,
@@ -409,6 +432,32 @@ mod tests {
         drop(rd);
         assert!(module[512..1024].iter().all(|&x| x == 0xAB), "the write landed in the module");
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
+    }
+
+    /// **A RAM disk counts what it serves** (Phase 6 Part H.2): each transfer by its op, the bytes
+    /// it moved, and the clock's time across the copy; a transfer past the end as an error; and a
+    /// rescan, which is no command, not at all.
+    #[test]
+    fn a_ram_disk_counts_what_it_serves() {
+        static IO: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
+        init_global_heap();
+        let mut module = vec![0u8; 4 * 512];
+        // SAFETY: `module` outlives `rd` and nothing else touches it while `rd` is used.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
+        rd.counted().attach_static(&IO);
+        let ticks = core::cell::Cell::new(0u64);
+        let clock = || {
+            ticks.set(ticks.get() + 5);
+            ticks.get()
+        };
+        let mut buf = [0u8; 1024];
+        assert_eq!(rd.serve(&irp(IrpOp::Write, 0, &[frag(&mut buf)]), clock), (IrpStatus::Success as i32, 1024));
+        assert_eq!(rd.serve(&irp(IrpOp::Read, 512, &[frag(&mut buf[..512])]), clock).1, 512);
+        assert_eq!(rd.serve(&irp(IrpOp::Read, 2048, &[frag(&mut buf[..512])]), clock).1, 0, "past the end");
+        rd.serve(&irp(IrpOp::Rescan, 0, &[]), clock);
+        let r = IO.record_for(0, 0);
+        assert_eq!((r.writes, r.written_bytes, r.reads, r.read_bytes), (1, 1024, 1, 512));
+        assert_eq!((r.errors, r.busy_ns), (1, 15), "three commands of 5 ticks each; the rescan none");
     }
 
     /// **A flush completes at once and writes nothing** — a RAM disk's memory is its medium

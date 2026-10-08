@@ -4,8 +4,8 @@
 since Part C.5a, 2026-09-25; started and bound by `service-mgr` since Part E.1a, the info-only
 endpoint reached through its route since E.1b; the installer session's rebinding gone since Part
 G.3; USB devices named since Phase 6 Part A.3, 2026-10-02; the table followed since Phase 6 Part C,
-2026-10-05; the `boot` column since Phase 6 Part D, 2026-10-06; last checked 2026-10-06.** What
-exists:
+2026-10-05; the `boot` column since Phase 6 Part D, 2026-10-06; `io.tsm` since Phase 6 Part H.2,
+2026-10-08; last checked 2026-10-08.** What exists:
 - the kernel's device table, readable at `/dev/registry` (B.1);
 - `device-mgr`, handing each device to the owner of its class and serving the table as TSM1
   tables (B.2);
@@ -14,7 +14,9 @@ exists:
 - every enumeration of block devices reading the registry or its namespace's own bindings (B.5);
 - `storage-service` as the owner of `block` ([`storage.md`](storage.md), administration Part C.5a);
 - **the manager following the table** (Phase 6 Part C): a read waiting on `/dev/registry/changes`,
-  a diff of each new snapshot, and a later `Arrived` or a `Departed` to each class's owner.
+  a diff of each new snapshot, and a later `Arrived` or a `Departed` to each class's owner;
+- **`io.tsm`** (Phase 6 Part H.2): what the disks and the page cache have done since boot, from
+  `/dev/registry/io` — § 5.
 
 The design, and why each piece is shaped as it is, is
 [`administration.md`](../planning/administration.md) § *Part B in detail*. The contracts are
@@ -168,6 +170,19 @@ kernel flags by the GPT GUID Limine loaded the modules from (Phase 6 Part D,
 which shares the GUID — not of their partitions. A USB disk's `driver` is `usb-storage` and its
 `parent` its USB device's name; an MBR partition's `driver` is `mbr`. A table is minted as a fresh
 read-only memory object per resolve and is page-sized, and `Table::decode` stops at its terminator.
+
+**`io.tsm` is what the disks and the page cache have done** (Phase 6 Part H.2), read from
+`/dev/registry/io` afresh at each resolve, since the counts move with every command: a row per
+present disk and RAM disk, named as above, then one named `page-cache`. Its columns are `name`;
+`reads`, `writes`, `flushes` and `errors`, the commands a disk's driver issued and saw retire —
+a partition's I/O is its disk's, so a partition has no row; `read_bytes` and `written_bytes`;
+`busy_ns`, the time commands were on the device, which one command at a time makes the device's
+busy time; and the page cache's own `hits` and `holes`, `Null` for a disk. **The page cache's row**
+counts its fills as `reads` and their pages as `read_bytes`, its write-back IRPs as `writes` and
+their pages as `written_bytes`, and the time both took as `busy_ns` — waiting on the devices, so
+it overlaps their time rather than adding to it. `nxsh`'s `time` reads it before and after a
+pipeline and prints the difference ([`shell-language.md`](../spec/shell-language.md) § 3); `open
+/dev/devices/io.tsm | save` takes it off the machine whole. The directory lists it after `all.tsm`.
 
 **A session reaches the tables through an info-only endpoint.** Resolving
 `/svc/devices/info-endpoint` answers a channel that is itself a forwarding endpoint, and on it the

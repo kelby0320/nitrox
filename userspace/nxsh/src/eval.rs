@@ -958,6 +958,7 @@ impl Interp {
                 }
             }
             Expr::Pipeline(stages) => self.pipeline(stages),
+            Expr::Time(timed) => self.time(timed),
             Expr::Call(c) => {
                 // D4: a **local binding wins** over a command name for a bare,
                 // argument-less reference. That is what stops the operator set behaving
@@ -1432,6 +1433,30 @@ impl Interp {
         self.pop_scope();
         self.scopes = saved;
         boundary_value(r?)
+    }
+
+    /// **`time PIPELINE`** (Phase 6 Part H.2, §3): the pipeline evaluated as ever, its value — or its
+    /// failure — passed through, and one line on `stderr` when it ends: the time it took by the
+    /// host's monotonic clock, and what the disks and the page cache did meanwhile, from
+    /// `/dev/devices/io.tsm` read before and after ([`crate::timing`]). Reading the table is a
+    /// resolve the device manager answers from the kernel's counters, so it touches no disk.
+    fn time(&mut self, timed: &Expr) -> Result<Val> {
+        let before = self.io_rows();
+        let started = self.host.now_ns();
+        let result = self.eval(timed);
+        let ended = self.host.now_ns();
+        let after = self.io_rows();
+        let wall = started.zip(ended).map(|(s, e)| e.saturating_sub(s));
+        let mut line = crate::timing::line(wall, before.as_deref(), after.as_deref());
+        line.push('\n');
+        self.host.diag(&line);
+        result
+    }
+
+    /// `io.tsm`'s rows, or `None` where it is not bound or does not read.
+    fn io_rows(&mut self) -> Option<Vec<crate::timing::IoRow>> {
+        let bytes = self.host.read_file(crate::timing::IO_TABLE).ok()?;
+        crate::timing::rows(&bytes)
     }
 
     /// §3's shell-state builtins: they mutate *this* process, which an external program
@@ -3215,6 +3240,44 @@ mod tests {
         let mut interp = Interp::with_host(Box::new(host), Mode::Script);
         let r = interp.run(&script);
         (r, log)
+    }
+
+    /// **`time PIPELINE`** (Phase 6 Part H.2): the whole pipeline after it is timed — both stages
+    /// here, the value `count` gives coming through — and its line goes to `stderr`: the time
+    /// between the host's two clock reads, then, where `io.tsm` reads, what moved, which here is
+    /// nothing. A failure comes through too, with its line said first. And `time` that is not a
+    /// prefix — alone, or assigned to — is an ordinary name.
+    #[test]
+    fn time_passes_a_pipelines_value_through_and_says_how_long_it_took() {
+        let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3]))).with_clock(250_000_000);
+        let (r, log) = run_with(host, "time list /home | count");
+        assert_eq!(r.expect("runs").render(), "3");
+        assert_eq!(log.borrow().runs[0][0].argv, alloc::vec!["list", "/home"]);
+        assert_eq!(log.borrow().diagnostics, ["time: 250 ms\n"], "no io.tsm: the time alone");
+
+        let mut host = MockHost::new().with_program("list", Some(stream("n", &[1]))).with_clock(2_000_000_000);
+        let io = {
+            use libstream::wire::{StreamFlags, Table, TypeTag};
+            let schema = Schema::new()
+                .field("name", TypeTag::String, TypeModifiers::NONE)
+                .field("reads", TypeTag::Int, TypeModifiers::NONE);
+            let rows = alloc::vec![alloc::vec![Value::Str("blk-0".into()), Value::Int(5)]];
+            let mut buf = alloc::vec::Vec::new();
+            Table { flags: StreamFlags::NONE, schema, rows }.encode(&mut buf).expect("encodes");
+            buf
+        };
+        host.files.push((alloc::string::String::from(crate::timing::IO_TABLE), io));
+        let (r, log) = run_with(host, "time list");
+        assert_eq!(r.expect("runs").render(), "<table 1 row [n]>");
+        assert_eq!(log.borrow().diagnostics, ["time: 2.00 s; no disk I/O\n"]);
+
+        let host = MockHost::new().with_failing("list", 2).with_clock(1_000);
+        let (r, log) = run_with(host, "time list");
+        assert!(r.is_err(), "the pipeline's failure is time's");
+        assert_eq!(log.borrow().diagnostics[0], "time: 1 us\n");
+
+        let (r, _) = run_with(MockHost::new(), "let time = 4\ntime");
+        assert_eq!(r.expect("a name").render(), "4");
     }
 
     #[test]

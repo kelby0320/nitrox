@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`. This is the language
-reference: grammar, operators and semantics. Sections describing `form` and the display
-integration are **not built** and are tracked in
+**Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
+(2026-10-08), §3. This is the language reference: grammar, operators and semantics. Sections
+describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
 Working capture of shell design decisions. Semantics (execution model, error handling, type
@@ -262,10 +262,28 @@ for scripts that want it.
 
   | Category | Examples | Why |
   |---|---|---|
-  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail` | Pure syntax, not commands at all |
+  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail`, and `time` as a prefix | Pure syntax, not commands at all |
   | Shell-state builtins | `cd`, `exit` | Must mutate the shell's own process state; an external process structurally can't reach back and do this |
   | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `parse`, `format`, `last`, `skip`, `dedupe`, and the §10b families | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
+
+  **`time PIPELINE`** (Phase 6 Part H.2, 2026-10-08) times a pipeline: it runs as ever and yields
+  its value — or its failure — and when it ends a line goes to `stderr` saying how long it took, by
+  the kernel's monotonic clock, and what each disk and the page cache did meanwhile, from the device
+  manager's `/dev/devices/io.tsm` read before and after
+  ([`device-manager.md`](../architecture/device-manager.md) § 5):
+
+  ```text
+  time: 12.34 s; blk-0: 1,200 reads 4.8 MiB, 300 writes 5.0 MiB, busy 3.21 s; page-cache: 1,200 fills 4.7 MiB, 300 write-backs 1.2 MiB
+  ```
+
+  A device whose counts did not move is left out, and so is a count that did not; with no table
+  bound, the line is the time alone; with nothing moved, `no disk I/O`. **It is a prefix, not a
+  command**: at a statement's or a stage's head and followed by an argument, `time` takes the
+  whole pipeline after it — `time list /home | count` times both stages. Alone, or before `=`,
+  it is an ordinary name (D9), and `^time` reaches a program of that name. The line is plain
+  ASCII, since it is read off a screen during a measurement and off a serial console by
+  `test-interactive`.
 
   **`with` is taken, by an external program** (administration Part A, 2026-09-23): `with VIEW
   PROGRAM ARGS…` runs a program in a view, through the view broker. It is recorded here so that a

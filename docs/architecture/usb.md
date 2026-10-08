@@ -1,8 +1,8 @@
 # USB
 
 **Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05),
-Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06), and
-Part G's sixteen-byte commands and rescan (2026-10-07)**
+Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06),
+Part G's sixteen-byte commands and rescan (2026-10-07), and Part H.2's counters (2026-10-08)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
@@ -403,6 +403,13 @@ slot is disabled, since until then the controller may still move its data. **The
 slots under an epoch**, as the input nodes are: a handle to a departed stick's node is refused
 rather than served the next stick's. Each publish leaks its partition windows, as at boot
 (`TODO(usb-departed-records)`).
+
+**A disk's commands are counted** (Part H.2) into its node's counters: each stamped as it goes on
+the rings and counted at its status wrapper, so a command's time is the stick's, not its wait in the
+queue; a command the hub thread recovers counts as its outcome, with none of the recovery's time. A
+unit's counters are attached as it is published, and are the node's, so the next device in the
+slot starts its own ([`drivers-and-irps.md`](drivers-and-irps.md) § *What a disk has done*). The
+hub thread's own commands — the table read where a disk arrives — are not counted.
 
 **A stick pulled while mounted**, end to end: its I/O fails `PeerClosed` at once; the storage
 service, told by the device manager, tears its mount down ([`storage.md`](storage.md) §6a); the

@@ -11,7 +11,8 @@ slice 5). PCI(e) is the only discovery source in Phase 2; partitions became
 DeviceNodes in slice 6, and `Char` nodes arrived with the console and the i8042.
 USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, and a record's
 `port` and `speed`. USB disks, MBR partitions and the `BOOT` flag arrived with Phase 6 Part D
-(2026-10-06).
+(2026-10-06). `/dev/registry/io` and a node's I/O counters arrived with Phase 6 Part H.2
+(2026-10-08).
 
 ## The DeviceNode object
 
@@ -274,6 +275,8 @@ kernel in **the root namespace only**, with `/dev/blk`'s rights. (Administration
 - **`/dev/registry/<id>`** — node `id` itself, the handle `/dev/blk/<n>` or
   `/dev/input/raw/<n>` would give for the same device. `NotFound` for a departed device.
 - **`/dev/registry/changes`** — the change node (Phase 6 Part C), below.
+- **`/dev/registry/io`** — what the disks and the page cache have done since boot (Phase 6 Part
+  H.2), below.
 
 ```rust
 #[repr(C)]
@@ -392,6 +395,27 @@ is the only char node that reads `offset` (`io-operation.md`).
 
 It replaced the notification the phase's scoping planned, because the kernel has no way to name
 the reader a notification would go to (`docs/planning/phase-6-usb.md` § *Part C in detail*).
+
+### What the disks have done: `/dev/registry/io`
+
+*(Phase 6 Part H.2.)* A fresh read-only `MemoryObject`: an `IoHeader` — `IO_MAGIC`, `"DIOS"`
+little-endian; `IO_VERSION`, 1; `count`; `record_size`, 64 — carrying the page cache's counters
+(`CacheCounts`: its fills and their time, its fills over a hole, its hits, and its write-backs'
+pages, IRPs and time), then `count` `IoRecord`s, then zero padding to the page
+(`kernel/src/libkern/device.rs`; `userspace/libkern/src/device.rs`, whose `io` is the reader). **A
+record per disk and RAM disk**, in table order, departed ones flagged `DEPARTED` with their counts
+kept; a partition has none, since its window forwards to its disk's driver, which counts it there.
+
+A record's `id` is the device's registry id. Its counts are cumulative since the node was
+registered: the reads, writes and flushes that succeeded, the commands that failed, the bytes the
+reads and writes moved, and `busy_ns`, the nanoseconds commands were on the device — **counted by
+the driver** where it issues a command and where the command retires (`kernel/src/io/stats.rs`),
+so time a command waited in the driver's queue is not in it. Each driver this kernel has runs one
+command at a time, so the sum is the device's busy time. A USB disk's command the hub thread
+recovers counts as its outcome, with none of the recovery's time. **The counters are kept on the
+node**, never in a driver's slot, which the next USB device to arrive takes. Authority is the
+binding, the root namespace only; a session reads the same counts through the device manager's
+`io.tsm` ([`device-manager.md`](../architecture/device-manager.md) § 5).
 
 ## Discovery and driver matching (Phase 2)
 

@@ -18,12 +18,13 @@
 
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
+use crate::io::stats::Counted;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{IrqSpinLock, KBox};
 use crate::mm::dma::DmaBuffer;
@@ -211,6 +212,11 @@ pub struct AhciDisk {
     /// The controller's IRQ object, signalled by the ISR (exercises the
     /// signal-from-real-ISR path; no waiter in Phase 2).
     intr: *mut (),
+    /// When slot 0's command was issued, for its time on the device (Phase 6 Part H.2). Written
+    /// under [`pending`] as the command issues; read once it retires, before the next issues.
+    issued_at: AtomicU64,
+    /// The disk node's counters, attached once it is registered ([`crate::io::stats`]).
+    counted: Counted,
 }
 
 // SAFETY: the disk state is set up once at boot and is immutable thereafter except
@@ -390,6 +396,8 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         inflight: AtomicPtr::new(core::ptr::null_mut()),
         pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
         intr: intr_ptr,
+        issued_at: AtomicU64::new(0),
+        counted: Counted::new(),
     };
     let disk = match KBox::try_new(disk) {
         Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
@@ -759,7 +767,10 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
                     KObjectType::DeviceNode,
                 )
             };
-            crate::device::register(r, "ahci");
+            crate::device::register(r.clone(), "ahci");
+            // SAFETY: `disk` is the live published state; `r` was just registered, and the table
+            // holds it for the kernel's lifetime.
+            unsafe { (*disk).counted.attach(&r) };
             true
         }
         Err(_) => false,
@@ -864,8 +875,32 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
     } else {
         build_command(d, command, lba, count, frags, write);
     }
+    d.issued_at.store(crate::arch::Timer::read_ns(), Ordering::Relaxed);
     issue(d);
     true
+}
+
+/// **Complete the IRP slot 0 retired, and count it** (Phase 6 Part H.2): its status, the bytes it
+/// moved, and its time on the device since [`issue_locked`] stamped it — read before the next
+/// command can issue, which only the drain after this does.
+///
+/// # Safety
+/// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
+/// until its DPC runs.
+unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool) {
+    let ns = crate::arch::Timer::read_ns().saturating_sub(d.issued_at.load(Ordering::Relaxed));
+    // SAFETY: as the contract says.
+    unsafe {
+        let status = if err {
+            crate::syscall::error::KError::IoError as i32
+        } else {
+            IrpStatus::Success as i32
+        };
+        let transferred = if err { 0 } else { (*irp).length };
+        d.counted.record((*irp).op, !err, transferred, ns);
+        (*irp).set_completion(status, transferred);
+        crate::dpc::enqueue(&(*irp).dpc);
+    }
 }
 
 /// Slot 0 has retired: under the port lock, take the completed IRP out of flight
@@ -942,16 +977,7 @@ extern "C" fn isr() {
         let (irp, err) = take_retired(d);
         if !irp.is_null() {
             // SAFETY: `irp` is the retired request; set status + queue its DPC.
-            unsafe {
-                let status = if err {
-                    crate::syscall::error::KError::IoError as i32
-                } else {
-                    IrpStatus::Success as i32
-                };
-                let transferred = if err { 0 } else { (*irp).length };
-                (*irp).set_completion(status, transferred);
-                crate::dpc::enqueue(&(*irp).dpc);
-            }
+            unsafe { retire(d, irp, err) };
             // Issue the next queued command from a DPC (not here in the ISR).
             crate::dpc::enqueue(&AHCI_DRAIN_DPC);
         }
@@ -1009,15 +1035,7 @@ pub fn poll_complete_inflight() -> bool {
         return false;
     }
     // SAFETY: `irp` is the retired request.
-    unsafe {
-        let status = if err {
-            crate::syscall::error::KError::IoError as i32
-        } else {
-            IrpStatus::Success as i32
-        };
-        (*irp).set_completion(status, if err { 0 } else { (*irp).length });
-        crate::dpc::enqueue(&(*irp).dpc);
-    }
+    unsafe { retire(d, irp, err) };
     drain_queue(d);
     crate::dpc::run_pending();
     true

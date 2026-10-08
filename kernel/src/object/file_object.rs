@@ -248,9 +248,10 @@ pub enum Forgotten {
 /// Page-cache fill counters — the measurement behind the read-ahead decision (Slice B2).
 ///
 /// Two atomic adds per fill, which is nothing beside the block read they bracket, so these
-/// are always on rather than feature-gated: the same numbers are what a `/proc` page-cache
-/// surface would report, and a decision to cluster fills should rest on measurement rather
-/// than on the stale ~325 ms/page figure from the Model-B era (`deferred-decisions.md`).
+/// are always on rather than feature-gated: a decision to cluster fills should rest on
+/// measurement rather than on the stale ~325 ms/page figure from the Model-B era
+/// (`deferred-decisions.md`). **Served since Phase 6 Part H.2**, with the write-backs', at
+/// `/dev/registry/io` and as `io.tsm`'s `page-cache` row.
 /// What starting a fill actually did — the caller needs to tell a real device round trip
 /// from a hole that completed synchronously, both to account for it and (for a hole) to
 /// know no I/O latency was involved.
@@ -286,6 +287,12 @@ pub mod fill_stats {
     /// Faults that found the page mid-fill and `yield_now`-spun waiting for it — the
     /// number that says whether B3 (block the second faulter) is theoretical or real.
     pub static SPINS: AtomicU64 = AtomicU64::new(0);
+    /// Pages written back to their files' blocks (Phase 6 Part H.2).
+    pub static WRITEBACK_PAGES: AtomicU64 = AtomicU64::new(0);
+    /// The write IRPs that carried them: one a page, until write-back clusters.
+    pub static WRITEBACK_IRPS: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds those IRPs took, from submission to completion.
+    pub static WRITEBACK_NS: AtomicU64 = AtomicU64::new(0);
 
     /// A snapshot of the counters.
     #[derive(Copy, Clone, Debug, Default)]
@@ -296,6 +303,9 @@ pub mod fill_stats {
         pub fill_max_ns: u64,
         pub hits: u64,
         pub spins: u64,
+        pub writeback_pages: u64,
+        pub writeback_irps: u64,
+        pub writeback_ns: u64,
     }
 
     /// Read the counters. Relaxed throughout: these are statistics, and a torn read
@@ -308,6 +318,9 @@ pub mod fill_stats {
             fill_max_ns: FILL_MAX_NS.load(Ordering::Relaxed),
             hits: HITS.load(Ordering::Relaxed),
             spins: SPINS.load(Ordering::Relaxed),
+            writeback_pages: WRITEBACK_PAGES.load(Ordering::Relaxed),
+            writeback_irps: WRITEBACK_IRPS.load(Ordering::Relaxed),
+            writeback_ns: WRITEBACK_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -316,6 +329,14 @@ pub mod fill_stats {
         FILLS.fetch_add(1, Ordering::Relaxed);
         FILL_NS.fetch_add(ns, Ordering::Relaxed);
         FILL_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// Record one write-back IRP, carrying `pages` pages, that took `ns` from submission to
+    /// completion.
+    pub(crate) fn record_writeback(pages: u64, ns: u64) {
+        WRITEBACK_PAGES.fetch_add(pages, Ordering::Relaxed);
+        WRITEBACK_IRPS.fetch_add(1, Ordering::Relaxed);
+        WRITEBACK_NS.fetch_add(ns, Ordering::Relaxed);
     }
 }
 
@@ -909,6 +930,7 @@ impl FileObject {
                 WriteStep::Dead => return WriteBack::Written,
             };
             let dev_offset = dev_block * block_size as u64;
+            let started = crate::arch::Timer::read_ns();
             if crate::io::block::dispatch_block_irp_into_frame(
                 &device,
                 frame,
@@ -924,6 +946,7 @@ impl FileObject {
                 return WriteBack::Failed;
             }
             let status = wait_status(&po);
+            fill_stats::record_writeback(1, crate::arch::Timer::read_ns().saturating_sub(started));
             fo.finish_io();
             match WriteBack::of(status) {
                 WriteBack::Written => {}

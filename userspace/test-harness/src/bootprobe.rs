@@ -1505,6 +1505,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & devices_test(root_ns)
         & storage_test(root_ns)
         & storage_mount_test(root_ns)
+        & io_counters_test(root_ns)
         & storage_admin_test(root_ns)
         & storage_grant_test(root_ns)
         & auth_admin_test(root_ns)
@@ -2581,10 +2582,12 @@ fn devices_test(root_ns: u64) -> bool {
             return fail(b"/svc/devices/info is not a directory");
         };
         let (mut names, mut has_all, mut usb_named, mut departed_named) = (0usize, false, 0usize, false);
+        let mut has_io = false;
         let listed = dir.read_dir(|e| {
             if e.name != b"." && e.name != b".." {
                 names += 1;
                 has_all |= e.name == b"all.tsm";
+                has_io |= e.name == b"io.tsm";
                 let id = e
                     .name
                     .strip_prefix(b"usb-")
@@ -2607,8 +2610,10 @@ fn devices_test(root_ns: u64) -> bool {
         // The object is page-sized; the decoder stops at the table's terminator.
         let rows = tbytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
         let present_usb = present.iter().filter(|r| usb(r)).count();
+        // `all.tsm` and `io.tsm` (Phase 6 Part H.2), then a file per device.
         let agree = has_all
-            && names == present.len() + 1
+            && has_io
+            && names == present.len() + 2
             && rows == Some(present.len())
             && usb_named == present_usb
             && !departed_named;
@@ -2820,6 +2825,144 @@ fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"a label nothing is mounted under was not NotFound");
     }
     kprint(b"boot-probe: storage mount: nitrox-scratch listed, its README read and a new file written to the device through /svc/storage, the same through a session endpoint bound at /storage and /dev/storage, which minted nothing, and an unknown label NotFound ok\n");
+    true
+}
+
+/// **What the disks and the page cache did, as `io.tsm` says** (Phase 6 Part H.2), read before and
+/// after a file of eight pages is made on the scratch disk through the storage service and synced:
+/// 1. **the scratch disk's writes and written bytes moved by at least its pages, and its busy time
+///    moved** — the RAM disk's driver counted them where it served them;
+/// 2. **the page cache's write-backs moved by as much**;
+/// 3. every present disk and RAM disk has a row, and the page cache one;
+/// 4. **the disk `init`'s root is on has read something** — at boot, through whichever driver it
+///    has: AHCI on an installed disk, a RAM disk on the live stick.
+///
+/// Each holds on every machine this runs on, which is every `--selftest` gate's, so none names a
+/// device by position: the scratch disk by its label, the root's by what is mounted at `/`.
+fn io_counters_test(root_ns: u64) -> bool {
+    use libkern::SYS_FILE_CREATE;
+    use libstream::wire::{Table, Value};
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: io counters: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let table = |path: &[u8]| {
+        let (st, h) = ns_lookup(root_ns, path, RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let bytes = if st == 0 { read_all(h) } else { None };
+        close(h);
+        bytes.and_then(|b| Table::decode(&b).ok())
+    };
+    let col = |t: &Table, name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let cell = |t: &Table, row: usize, name: &str| col(t, name).map(|c| t.rows[row][c].clone());
+    let row_named = |t: &Table, name: &str| (0..t.rows.len()).find(|&r| cell(t, r, "name") == Some(Value::Str(name.into())));
+    let num = |t: &Table, name: &str, column: &str| match row_named(t, name).and_then(|r| cell(t, r, column)) {
+        Some(Value::Int(v)) => Some(v.max(0) as u64),
+        _ => None,
+    };
+    let text = |v: Option<Value>| match v {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    };
+
+    // The scratch disk by its label, and the disk the root is on by what is mounted at `/`.
+    let (Some(storage), Some(devices)) = (table(b"/svc/storage/info/all.tsm"), table(b"/svc/devices/info/all.tsm")) else {
+        return fail(b"the storage or device table would not read");
+    };
+    let named_where = |column: &str, value: &str| {
+        (0..storage.rows.len()).find(|&r| text(cell(&storage, r, column)).as_deref() == Some(value)).and_then(|r| text(cell(&storage, r, "name")))
+    };
+    let (Some(scratch), Some(root)) = (named_where("label", "nitrox-scratch"), named_where("mounted", "/")) else {
+        return fail(b"the storage table has no scratch disk or root");
+    };
+    let root_disk = match row_named(&devices, &root) {
+        Some(r) if text(cell(&devices, r, "kind")).as_deref() == Some("partition") => text(cell(&devices, r, "parent")),
+        Some(_) => Some(root.clone()),
+        None => None,
+    };
+    let Some(root_disk) = root_disk else {
+        return fail(b"the root's device is not in the device table");
+    };
+    let disks = (0..devices.rows.len())
+        .filter(|&r| matches!(text(cell(&devices, r, "kind")).as_deref(), Some("disk") | Some("ramdisk")))
+        .count();
+
+    let Some(before) = table(b"/svc/devices/info/io.tsm") else {
+        return fail(b"io.tsm would not read");
+    };
+    const PAGES: u64 = 8;
+    let len = PAGES * PAGE;
+    let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, b"/svc/storage/fs/nitrox-scratch/probe-io", len) else {
+        return fail(b"a file would not create on the scratch disk");
+    };
+    let Some(addr) = map_file(fh, len, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
+        close(fh);
+        return fail(b"the file would not map writable");
+    };
+    for i in 0..len {
+        // SAFETY: `len` bytes are mapped writable at `addr`.
+        unsafe { ((addr + i) as *mut u8).write_volatile((i % 251) as u8) };
+    }
+    // SAFETY: unmapping this call's own mapping, before the sync, as `libfs` does.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    // SAFETY: register-only syscall on a file handle this process holds.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
+    close(fh);
+    if synced != 0 {
+        return fail(b"the file would not sync");
+    }
+    let Some(after) = table(b"/svc/devices/info/io.tsm") else {
+        return fail(b"io.tsm would not read after the sync");
+    };
+    let moved = |name: &str, column: &str| Some(num(&after, name, column)?.saturating_sub(num(&before, name, column)?));
+
+    let (Some(writes), Some(written), Some(busy)) =
+        (moved(&scratch, "writes"), moved(&scratch, "written_bytes"), moved(&scratch, "busy_ns"))
+    else {
+        return fail(b"the scratch disk has no row in io.tsm");
+    };
+    if writes < PAGES || written < len || busy == 0 {
+        Line::new()
+            .s(b"boot-probe: io counters: the scratch disk moved ")
+            .u(writes)
+            .s(b" writes of ")
+            .u(written)
+            .s(b" bytes, busy ")
+            .u(busy)
+            .s(b" ns, for a file of ")
+            .u(PAGES)
+            .s(b" pages FAIL")
+            .end();
+        return false;
+    }
+    let (Some(wb), Some(wb_bytes)) = (moved("page-cache", "writes"), moved("page-cache", "written_bytes")) else {
+        return fail(b"io.tsm has no page-cache row");
+    };
+    if wb < PAGES || wb_bytes < len {
+        return fail(b"the page cache's write-backs did not move by the file's pages");
+    }
+    if after.rows.len() != disks + 1 {
+        return fail(b"io.tsm is not a row per present disk and RAM disk, and the page cache's");
+    }
+    if num(&after, &root_disk, "reads").unwrap_or(0) == 0 {
+        return fail(b"the disk init's root is on has no reads counted");
+    }
+    Line::new()
+        .s(b"boot-probe: io counters: ")
+        .s(scratch.as_bytes())
+        .s(b" moved ")
+        .u(writes)
+        .s(b" writes of ")
+        .u(written)
+        .s(b" bytes and ")
+        .u(wb)
+        .s(b" page-cache write-backs for a file of ")
+        .u(PAGES)
+        .s(b" pages; ")
+        .u(disks as u64)
+        .s(b" disks in io.tsm, the root's ")
+        .s(root_disk.as_bytes())
+        .s(b" with reads ok")
+        .end();
     true
 }
 

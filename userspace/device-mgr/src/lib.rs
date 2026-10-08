@@ -337,10 +337,92 @@ pub mod table {
         Some(encode(vec![row(r, records)]))
     }
 
-    /// The directory's entries: `all.tsm`, then each present device's, in table order.
+    /// The directory's entries: `all.tsm` and `io.tsm`, then each present device's, in table order.
     pub fn entries(records: &[DeviceRecord]) -> Vec<String> {
-        let mut out = vec![String::from("all.tsm")];
+        let mut out = vec![String::from("all.tsm"), String::from("io.tsm")];
         out.extend(records.iter().filter(|r| !r.is_departed()).map(|r| format!("{}.tsm", names::name(r))));
+        out
+    }
+}
+
+pub mod io {
+    //! **`io.tsm`: what the disks and the page cache have done since boot** (Phase 6 Part H.2), from
+    //! `/dev/registry/io`, read afresh for each resolve. A row per present disk and RAM disk, named
+    //! as in `all.tsm`, then one named `page-cache`. `nxsh`'s `time` reads it before and after a
+    //! pipeline and prints the difference; `open /dev/devices/io.tsm | save` takes it off the
+    //! machine whole.
+    //!
+    //! Columns: `name`; `reads`, `writes`, `flushes` and `errors`, the commands the device's driver
+    //! saw retire; `read_bytes` and `written_bytes`; `busy_ns`, the nanoseconds commands were on the
+    //! device; and the page cache's own `hits` and `holes`. **The page cache's row** counts its fills
+    //! as `reads` and their pages as `read_bytes`, its write-back IRPs as `writes` and their pages
+    //! as `written_bytes`, and the time both took as `busy_ns` — time spent waiting on the devices,
+    //! so it overlaps theirs rather than adding to it. What a row does not have is `Null`.
+
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use libkern::device::{CacheCounts, DeviceKind, DeviceRecord, IoRecord};
+    use libstream::wire::{Schema, StreamFlags, Table, TypeModifiers, TypeTag, Value};
+
+    use crate::names;
+
+    /// The page size the cache fills and writes back in.
+    const PAGE: u64 = 4096;
+
+    /// `io.tsm`'s columns.
+    pub fn schema() -> Schema {
+        let int = |s: Schema, n: &str| s.field(n, TypeTag::Int, TypeModifiers::NULLABLE);
+        let s = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE);
+        ["reads", "writes", "flushes", "errors", "read_bytes", "written_bytes", "busy_ns", "hits", "holes"]
+            .into_iter()
+            .fold(s, int)
+    }
+
+    /// A count as a cell: an `Int`, saturating at `i64::MAX`.
+    fn n(v: u64) -> Value {
+        Value::Int(v.min(i64::MAX as u64) as i64)
+    }
+
+    /// **The table**: `disks`' counters for each present disk and RAM disk among `devices`, by id,
+    /// then the page cache's. A record whose id `devices` does not name — a disk that arrived after
+    /// the manager last read the table — has no row until it does.
+    pub fn table(cache: CacheCounts, disks: &[IoRecord], devices: &[DeviceRecord]) -> Vec<u8> {
+        let mut rows = Vec::new();
+        for d in disks.iter().filter(|d| !d.is_departed()) {
+            let Some(r) = devices.iter().find(|r| r.id == d.id) else { continue };
+            if r.is_departed() || !matches!(r.kind(), DeviceKind::Disk | DeviceKind::RamDisk) {
+                continue;
+            }
+            rows.push(vec![
+                Value::Str(names::name(r)),
+                n(d.reads),
+                n(d.writes),
+                n(d.flushes),
+                n(d.errors),
+                n(d.read_bytes),
+                n(d.written_bytes),
+                n(d.busy_ns),
+                Value::Null,
+                Value::Null,
+            ]);
+        }
+        rows.push(vec![
+            Value::Str(String::from("page-cache")),
+            n(cache.fills),
+            n(cache.writeback_irps),
+            Value::Null,
+            Value::Null,
+            n(cache.fills.saturating_mul(PAGE)),
+            n(cache.writeback_pages.saturating_mul(PAGE)),
+            n(cache.fill_ns.saturating_add(cache.writeback_ns)),
+            n(cache.hits),
+            n(cache.hole_fills),
+        ]);
+        let table = Table { flags: StreamFlags::NONE, schema: schema(), rows };
+        let mut out = Vec::new();
+        // A `Vec` sink cannot fail, and every row has the schema's shape by construction.
+        let _ = table.encode(&mut out);
         out
     }
 }
@@ -655,14 +737,53 @@ mod tests {
         assert!(table::one(&b, "blk-9").is_none());
     }
 
-    /// **`all.tsm` first, then a file per device** — so `list /dev/devices` names every device.
+    /// **`all.tsm` and `io.tsm` first, then a file per device** — so `list /dev/devices` names every
+    /// device.
     #[test]
     fn the_directory_lists_all_then_each_device() {
         let b = boot();
         let e = table::entries(&b);
-        assert_eq!(e[0], "all.tsm");
-        assert_eq!(e.len(), 9);
+        assert_eq!((e[0].as_str(), e[1].as_str()), ("all.tsm", "io.tsm"));
+        assert_eq!(e.len(), 10);
         assert!(e.contains(&"input-1.tsm".to_string()));
+    }
+
+    /// **`io.tsm`: a row per present disk and RAM disk, by its name, then the page cache's** (Phase 6
+    /// Part H.2). No row for a departed disk, nor for one the manager has not read a record of yet;
+    /// the cache's fills and write-backs in a disk's columns, in their pages' bytes, and its hits and
+    /// holes in columns a disk has as `Null`.
+    #[test]
+    fn io_has_a_row_per_present_disk_and_one_for_the_page_cache() {
+        use libkern::device::{CacheCounts, DEPARTED, IoRecord};
+        let mut b = boot();
+        let disk = IoRecord { id: 2, reads: 10, read_bytes: 40960, writes: 3, written_bytes: 1536, busy_ns: 999, ..Default::default() };
+        let ram = IoRecord { id: 4, reads: 1, read_bytes: 512, ..Default::default() };
+        let late = IoRecord { id: 9, reads: 5, ..Default::default() };
+        let cache = CacheCounts {
+            fills: 7,
+            fill_ns: 70,
+            hole_fills: 2,
+            hits: 100,
+            writeback_pages: 3,
+            writeback_irps: 3,
+            writeback_ns: 30,
+        };
+        let t = Table::decode(&super::io::table(cache, &[disk, ram, late], &b)).unwrap();
+        let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name).unwrap();
+        let cell = |row: usize, name: &str| t.rows[row][col(name)].clone();
+        assert_eq!(t.rows.len(), 3, "the disk, the RAM disk and the page cache; not the late one");
+        assert_eq!((cell(0, "name"), cell(0, "reads"), cell(0, "read_bytes")), (Value::Str("blk-0".into()), Value::Int(10), Value::Int(40960)));
+        assert_eq!((cell(0, "written_bytes"), cell(0, "busy_ns"), cell(0, "hits")), (Value::Int(1536), Value::Int(999), Value::Null));
+        assert_eq!(cell(1, "name"), Value::Str("blk-2".into()));
+        assert_eq!(cell(2, "name"), Value::Str("page-cache".into()));
+        assert_eq!((cell(2, "reads"), cell(2, "read_bytes"), cell(2, "writes")), (Value::Int(7), Value::Int(7 * 4096), Value::Int(3)));
+        assert_eq!((cell(2, "busy_ns"), cell(2, "hits"), cell(2, "holes"), cell(2, "flushes")), (Value::Int(100), Value::Int(100), Value::Int(2), Value::Null));
+
+        // The disk departs: its row goes, whichever side says so.
+        b[2].flags = DEPARTED;
+        assert_eq!(Table::decode(&super::io::table(cache, &[disk, ram], &b)).unwrap().rows.len(), 2);
+        let gone = IoRecord { flags: DEPARTED as u32, ..ram };
+        assert_eq!(Table::decode(&super::io::table(cache, &[gone], &boot())).unwrap().rows.len(), 1);
     }
 
     /// **What a session can reach is the information and nothing else**: its base is `/info`, so
@@ -740,6 +861,6 @@ mod tests {
         assert_eq!(replay(&t, Class::Input).len(), 2);
         assert_eq!(Table::decode(&table::all(&t)).unwrap().rows.len(), 8, "the boot's eight");
         assert!(table::one(&t, &name(&t[kbd as usize])).is_none());
-        assert_eq!(table::entries(&t).len(), 9);
+        assert_eq!(table::entries(&t).len(), 10, "all, io, and the boot's eight");
     }
 }

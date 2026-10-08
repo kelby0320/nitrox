@@ -197,6 +197,12 @@ pub trait Host {
     fn interrupted(&mut self) -> bool {
         false
     }
+
+    /// **Nanoseconds on a clock that only goes forward**, for `time` (Phase 6 Part H.2): the
+    /// kernel's monotonic clock. `None` from a host with no clock, and `time` then says so.
+    fn now_ns(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// A host that cannot do anything, for evaluating pure expressions.
@@ -267,6 +273,8 @@ pub struct MockHost {
     /// evaluator asks: an interrupt that only ever arrives before the first statement
     /// would prove nothing about a loop.
     interrupt_after: Option<u32>,
+    /// A clock for `time`: what it reads now, and how far each read moves it. `None`, no clock.
+    clock_ns: Option<(u64, u64)>,
 }
 
 /// What a [`MockHost`] was asked to do.
@@ -301,7 +309,14 @@ impl MockHost {
             commands: Vec::new(),
             log: Rc::new(RefCell::new(MockLog::default())),
             interrupt_after: None,
+            clock_ns: None,
         }
+    }
+
+    /// A clock that starts at nothing and moves on `step_ns` each time it is read, for `time`.
+    pub fn with_clock(mut self, step_ns: u64) -> MockHost {
+        self.clock_ns = Some((0, step_ns));
+        self
     }
 
     /// Interrupt the evaluation once `n` checkpoints have passed (§11h).
@@ -378,6 +393,12 @@ impl Host for MockHost {
             }
             None => false,
         }
+    }
+
+    fn now_ns(&mut self) -> Option<u64> {
+        let (now, step) = self.clock_ns?;
+        self.clock_ns = Some((now + step, step));
+        Some(now)
     }
 
     fn run(

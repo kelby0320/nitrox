@@ -6,7 +6,7 @@ current status, the full phase list, and the cross-cutting workstreams.
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
 E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed and built
-2026-10-07; Part H detailed 2026-10-08, H.1 built 2026-10-08.** This
+2026-10-07; Part H detailed 2026-10-08, H.1 and H.2 built 2026-10-08.** This
 replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
 decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
 when it is next, as administration's parts did; what is here is the phase's shape, the design each
@@ -2806,6 +2806,27 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   storage's `Disks`, the RAM disk); the device manager's table. A `boot-probe` step writes a known
   file on the scratch disk, syncs it, and requires the scratch disk's writes and bytes, and the
   page cache's write-backs, to have moved by at least that much.
+- **H.2 built 2026-10-08.** Calls on the way (the decision log's "Phase 6 Part H.2, built" has the
+  reasoning):
+  - **the counters are on the device's node**, not in a driver's state, since a USB driver's slot
+    goes to the next device to arrive and a node never does; a driver holds its node's, attached
+    once the node is registered;
+  - **a command's time is from its issue to its retirement**, never its wait in a driver's queue;
+    a USB command the hub thread recovers counts as its outcome, with none of the recovery's time,
+    and the hub thread's own commands — a table read where a disk arrives — are not counted;
+  - **`io.tsm`'s page-cache row** puts its fills and write-backs in a disk's columns, and their
+    time in `busy_ns`, which overlaps the disks' rather than adding to them;
+  - **`time` is a prefix**, taking the whole pipeline after it, and its line plain ASCII on
+    `stderr`, for a serial console that drops anything else;
+  - **the stick's names are FAT short names**, as a camera's are: with four thousand long names
+    alike, `mcopy` searched for a `~N` alias for each and writing the image ran past ten minutes,
+    where it takes nineteen seconds. The image is a GiB, half free for the run that copies the tree
+    back onto the stick.
+
+  **The first numbers**, from the gates: `boot-probe`'s file of eight pages moved the scratch disk's
+  writes by **48** — eight pages of data, and forty of `fs-server-ext4`'s metadata, a block's
+  bitmap, descriptor, superblock and zeroes for each block it grew — and `time list /dev/devices`
+  on the release image said `35 ms; blk-0: 30 reads 120.0 KiB, busy 4 ms`.
 - **H.3 The laptop**, and Linux on it: the runs above, recorded.
 - **H.4 The fix**, and the laptop again, in the loop above; each fix with its count.
 - **H.5 The number, and the docs.**

@@ -31,10 +31,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libkern::abi::{HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
+use libkern::abi::{CLOCK_MONOTONIC, HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_DUPLICATE, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
+    SYS_CLOCK_READ, SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
     SYS_MEMORY_MAP,
     SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE,
     SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2,
@@ -736,9 +736,11 @@ impl Host for NitroxHost {
 
     fn diag(&mut self, text: &str) {
         // **Not painted, and the reason is worth keeping** (PR #324 review, blocking 1). Every
-        // caller of this is in `run` — script mode — which builds its host with `tty: 0`, and a
-        // script's output is plain text by design. A first version painted here and coloured
+        // caller of this but one is in `run` — script mode — which builds its host with `tty: 0`,
+        // and a script's output is plain text by design. A first version painted here and coloured
         // nothing anybody could see, while the docs claimed the shell coloured its diagnostics.
+        // The one is `time`'s line (Phase 6 Part H.2), which reaches a terminal at a prompt too and
+        // is plain there on purpose: it is read off a laptop's screen and off a serial console.
         //
         // It also arrives in fragments: `run` calls this three times for one message
         // (`"nxsh: "`, the message, `"\n"`), so there is no whole run here to bracket even if
@@ -800,6 +802,14 @@ impl Host for NitroxHost {
             (&raw mut INTERRUPTED).write(false);
             hit || (&raw const STOP_ASKED).read()
         }
+    }
+
+    /// The kernel's monotonic clock, for `time` (Phase 6 Part H.2).
+    fn now_ns(&mut self) -> Option<u64> {
+        let mut ns = 0u64;
+        // SAFETY: `ns` is a writable `u64`, which is what the kernel writes the clock's value into.
+        let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut ns) as u64) };
+        (r == 0).then_some(ns)
     }
 
     /// **`display`'s output goes to the terminal when there is one** (Phase 5 Part H.1).
