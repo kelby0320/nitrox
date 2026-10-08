@@ -41,6 +41,11 @@ pub const TYPE_EFI_SYSTEM: [u8; 16] = [
 pub const TYPE_LINUX_FS: [u8; 16] = [
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
+/// Microsoft basic data, `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` — what a FAT on a GPT is typed, by
+/// Windows, macOS and Linux alike (Phase 6 Part G.2).
+pub const TYPE_BASIC_DATA: [u8; 16] = [
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+];
 
 /// Why a table could not be read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -567,6 +572,17 @@ mod tests {
         let out = String::from_utf8_lossy(&print.stdout);
         assert!(out.contains("EF00  NITROX_ESP"), "the ESP's type or label: {out}");
         assert!(out.contains("8300  nitrox-root"), "the root's type or label: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The basic data type is the one `sgdisk` calls Microsoft basic data**, code `0700`.
+    #[test]
+    fn sgdisk_names_the_basic_data_type() {
+        let path = scratch("basic");
+        std::fs::write(&path, build_disk(&[Partition::new(TYPE_BASIC_DATA, [0x44; 16], 2048, DISK - 40, b"NITROX")])).unwrap();
+        let info = sgdisk(&["-i", "1"], &path);
+        let out = String::from_utf8_lossy(&info.stdout);
+        assert!(out.contains("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 (Microsoft basic data)"), "{out}");
         let _ = std::fs::remove_file(&path);
     }
 

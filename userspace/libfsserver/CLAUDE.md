@@ -19,7 +19,10 @@ servers speak one protocol and a fix to it is a fix to both:
   **through each server's volume**, in that server's crate, against an image its own tools built.
 - **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
   server uses; and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
-  FAT's uses. A server hands `server::bootstrap` the one it wants.
+  FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
+  Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
+  holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
+  **None of the three is `Sync`**: each moves every transfer through one scratch mapping.
 - **`server.rs`** — the bootstrap and the loop: the setup message, `Ready` or a refusal, the
   forwarding endpoint, directory sessions and their wait slots, a rename resolved ahead of a
   session, `File::Forget` before a file is freed, `File::Touch` by id, and `Meta::Unmount`.

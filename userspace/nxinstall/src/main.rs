@@ -52,13 +52,12 @@
 
 extern crate alloc;
 
-mod device;
-
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use fs_server_ext4::mkfs;
+use libfsserver::disk::PartitionIo;
 use libgpt::table::{self, BACK_BYTES, BLOCK, FRONT_BYTES};
 use libkern::abi::{
     BlockDeviceInfo, BlockKind, IO_OPCODE_FLUSH, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
@@ -67,7 +66,7 @@ use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
     SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
     SYS_MEMORY_CREATE,
-    SYS_CHANNEL_SEND, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
+    SYS_CHANNEL_SEND, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
     syscall2, syscall4, syscall6,
 };
 use libkern::{exit, kprint};
@@ -126,10 +125,6 @@ const FS_BLOCK: u64 = 4096;
 /// Bytes of filesystem per inode — `mke2fs -i`'s default. `mkfs` caps the total, so this
 /// governs small filesystems and the cap governs large ones.
 const BYTES_PER_INODE: u32 = 16384;
-
-/// The scratch each filesystem window transfers through. Larger than the 64 KiB `copy_tree`
-/// hands over at once, so a file's data crosses in one transfer rather than two.
-const FS_SCRATCH: u64 = 128 * 1024;
 
 /// `sys_wait` scratch for a single pending operation.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
@@ -574,11 +569,7 @@ fn install(
     // space around it and nothing could grow it.
     let root_bytes_dst = layout.root_blocks() * block;
     say(&format!("making a filesystem of {}", human(root_bytes_dst)));
-    let (dst, _dst_scratch) = match partition_io(
-        target.handle,
-        layout.root_first * BLOCK as u64,
-        root_bytes_dst,
-    ) {
+    let dst = match PartitionIo::new(target.handle, layout.root_first * BLOCK as u64, root_bytes_dst) {
         Some(p) => p,
         None => return Err(String::from("could not allocate a transfer buffer for the target")),
     };
@@ -614,7 +605,7 @@ fn install(
 
     // The source is the pristine root's partition *inside* its RAM disk, read as the bytes on the
     // device, since nothing mounts it — see `nxinstall::copy`'s module doc.
-    let (src, _src_scratch) = match partition_io(
+    let src = match PartitionIo::new(
         srcs.root.handle,
         srcs.root_extent.0 * BLOCK as u64,
         srcs.root_extent.1 * BLOCK as u64,
@@ -685,37 +676,6 @@ fn wall_clock_seconds() -> i64 {
         syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64)
     };
     if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
-}
-
-/// A [`PartitionIo`] over `[base, base + len)` of `device`, with a scratch object of its own.
-///
-/// The scratch handle comes back beside it because closing it would unmap the buffer every
-/// transfer goes through; the caller holds it for as long as the window is used.
-fn partition_io(device: u64, base: u64, len: u64) -> Option<(device::PartitionIo, Scratch)> {
-    let (mem, addr) = scratch(FS_SCRATCH)?;
-    // SAFETY: `scratch` just created `mem` and mapped it read-write at `addr` for exactly
-    // `FS_SCRATCH` bytes, which is a multiple of a sector; the `Scratch` returned beside the
-    // window keeps both alive until the caller drops it.
-    let io = unsafe {
-        device::PartitionIo::new(device, base, len, mem, addr, FS_SCRATCH as usize)
-    };
-    Some((io, Scratch { mem, addr }))
-}
-
-/// A mapped scratch object, unmapped and closed when it goes out of scope.
-struct Scratch {
-    mem: u64,
-    addr: u64,
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // SAFETY: our own mapping and handle, made by `scratch`.
-        unsafe {
-            syscall4(SYS_MEMORY_UNMAP, self.addr, FS_SCRATCH, 0, 0);
-            syscall1(SYS_HANDLE_CLOSE, self.mem);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------

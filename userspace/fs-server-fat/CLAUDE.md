@@ -22,6 +22,10 @@ loop.
 - **`src/names.rs`**, **`src/dir.rs`**, **`src/time.rs`** — names, directory entries, times as UTC.
 - **`src/volume.rs`** — `Fat`: every operation, and its `Volume` impl. **`change` wraps every
   mutation**: read-only refused first, the cache flushed at the end, after a failure too.
+- **`src/mkfs.rs`** (Phase 6 Part G.2) — making an empty FAT, what `disk --format` writes: FAT16
+  or FAT32 by size, **never with clusters under a page**, so the server serves everything it makes.
+  The boot sector is written last. Its tests hold each type and cluster size at its boundary's
+  neighbours to `fsck.fat -n`, mtools and `Fat`.
 - **`src/main.rs`** — the `[[bin]]`: `server::bootstrap` with `SectorDisk::new`, then `server::run`
   over a `Fat`, through `ReadOnly` for a read-only mount. Alloc-free.
 
