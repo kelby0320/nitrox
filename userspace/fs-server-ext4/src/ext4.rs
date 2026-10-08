@@ -1175,15 +1175,16 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
 /// extents, and depth > 0 (an index node) is deferred. Whether that bites depends on
 /// fragmentation, and the two cases differ sharply — measured on a 4 KiB-block fixture:
 ///
-/// - **Creating files**: unbounded in practice (2000+ tested). Nothing allocates between
-///   the parent's growth blocks, so they are contiguous and one extent covers them all.
-/// - **Creating subdirectories**: **~814**. Each `mkdir` allocates the child's own data
-///   block *between* the parent's, so every parent block starts a new extent and the
-///   fourth exhausts the header.
+/// - **Creating empty files**: unbounded in practice (2000+ tested). Nothing allocates
+///   between the parent's growth blocks, so they are contiguous and one extent covers them.
+/// - **Creating files with data, or subdirectories**: **~815**. Each file's data — each
+///   `mkdir`'s own block — is allocated *between* the parent's growth blocks, so every
+///   parent block starts a new extent and the fifth finds no room beside the inode's four.
+///   (Until PR #370's review this said files were unbounded; that held for empty ones only.)
 ///
-/// Both are far beyond anything on the path to a shell or a desktop, so the extent-tree
-/// split stays deferred — but the number is recorded rather than left as "some limit".
-/// See `deferred-decisions.md`.
+/// A folder of a thousand photos copied to `/home` meets it, so Phase 6 Part H builds the
+/// extent tree (`docs/planning/phase-6-usb.md` § *Part H in detail*). See
+/// `deferred-decisions.md`.
 fn dir_insert<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,

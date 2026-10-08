@@ -315,7 +315,7 @@ Ordered by dependency. Each has its detail pass before it is built.
 | **E** | **`fs-server-fat`**, read-write, and the storage service spawning by kind. | Host tests against `mformat` images, `fsck.fat -n` clean after every write. The storage gate with a FAT stick: mounted, written, unmounted, and the host reads the file back with `mcopy`. *(Detailed 2026-10-06: the protocol moves into `libfsserver` first, clusters under 4 KiB are refused, and FAT auto-mounts on removable disks only — the maintainer's calls, § Part E in detail.)* |
 | **F** | **Removable media for a session**: writable auto-mount on a live boot too, `Eject`, `disk --eject`, the mount watch, Files' Drives and eject button. | A desktop gate: a FAT stick plugged in appears in Files, a file saved onto it from `nxedit`, ejected from Files; the host reads it back. *(Detailed 2026-10-07: a media session at `/dev/storage/media` carries `Eject`, and a watch at `/dev/storage/watch` bare pings, Files re-reading the table; Drives lists every mount under `/storage`; the chooser is unchanged; a new desktop gate, `check-media`, on the live image — the maintainer's calls, § Part F in detail.)* |
 | **G** | **Formatting and partitioning**: `disk --partition`, `disk --format`. | A blank stick partitioned and formatted FAT through `with admin`, then mounted and written; refused while mounted. *(Detailed 2026-10-07: `disk` writes and the storage service reads the device again and mounts it; a kernel rescan of a USB disk whose table changed; GPT beside MBR, the default following the filesystem; the sixteen-byte commands; a `note` column — the maintainer's calls, § Part G in detail.)* |
-| **H** | **Copy throughput**: `time`, the measurements on the laptop, the fix for what dominates, and the number. | The number, measured on the laptop and recorded. No QEMU gate holds a time, since TCG's is not the machine's. *(Detailed 2026-10-08: `time` and I/O counters, the laptop measured beside Linux, fix what dominates and measure again; below the syscall surface, the 8 MiB copy limit left to the consolidation between Phases 6 and 7 — the maintainer's calls, § Part H in detail.)* |
+| **H** | **Copy throughput**: `time`, the measurements on the laptop, the fix for what dominates, and the number. | The number, measured on the laptop and recorded. No QEMU gate holds a time, since TCG's is not the machine's. *(Detailed 2026-10-08: extent trees in `fs-server-ext4` first, after the PR #370 review; `time` and I/O counters, the laptop measured beside Linux, fix what dominates and measure again; below the syscall surface, the 8 MiB copy limit left to the consolidation between Phases 6 and 7 — the maintainer's calls, § Part H in detail.)* |
 
 **Parts A–C give the input half of the Definition of Done, D–G the storage half, and H the
 number.** The order puts the first boot of the laptop with a USB driver as early as it can be:
@@ -2611,7 +2611,9 @@ a person reading it learns that a stick needs formatting. Files is unchanged.
 worst, and a number.** The deferral it answers, `TODO(fs-throughput)`, was filed on 2026-09-17 —
 180 MB copied and removed under `/home` on the laptop, both slower than the disk accounts for and
 worse with larger directories — and guesses at no cause. Neither does this pass: it builds what to
-measure with, says how the laptop is measured, and how the measurement picks the fix.
+measure with, says how the laptop is measured, and how the measurement picks the fix. **First it
+gives `fs-server-ext4` extent trees** (the maintainer's call after the PR #370 review), since a
+directory of the files the measurement copies cannot be written without them.
 
 **Below the syscall surface throughout** (the maintainer's call, after a discussion). Part H adds
 no syscall and changes no ABI-hash input. A cost the measurement finds that only the surface can
@@ -2642,10 +2644,42 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   answer once the kernel work it needs was found): there a copy is `sys_io_submit` on two files, a
   window at a time. Part H measures files of up to 8 MiB — which the 180 MB of 2026-09-17 was
   made of, since nothing larger could be copied.
+- **`fs-server-ext4` writes only the four extents an inode holds** (`append_block`): a fifth is
+  refused `Unsupported`, and free and truncate refuse a tree outright. So a file with one — Linux
+  writes them — is read here (`extent_find` follows a tree) and cannot be shortened, and its
+  removal takes its name and frees nothing: `release_inode` refuses the tree after `unlink_at` has
+  removed the entry, leaving an unattached inode that holds its blocks (a probe, below). **About
+  815 files with data fit in one directory**: each file's data lands between the directory's
+  growth blocks, and the directory's fifth block finds no room — the PR #370 review's host probe
+  found it, and this pass's found the same. The tree to copy, below, holds 4,096 to a directory.
+- **Found while checking that, by host probes on 2026-10-08** (temporary, removed), in the code a
+  tree replaces — besides the removal above, which a probe of a tree `mke2fs -d` wrote confirmed:
+  - **a grow that fails keeps what it took.** The block a refused append allocated stays marked
+    used and owned by nothing, and a grow that runs out of space leaves *every* block it took so —
+    on a 16 MiB filesystem, all its free space, with the file still empty. The refused 815th create
+    leaves an unattached inode too. `e2fsck -fn` reports each.
+  - **an extent of the full 32,768 blocks reads as a hole.** ext4 stores a written extent's length
+    up to 32,768, so `ee_len` `0x8000` is 32,768 blocks; the reader masks it to 0, and blocks
+    e2fsprogs maps read as zeros here. Linux writes such extents for large files where free space
+    allows, and by reading, this server writes one itself when a file grows through 32,768
+    contiguous free blocks.
+  - **an unwritten extent reads as data.** An `ee_len` over 32,768 marks blocks allocated and never
+    written (`fallocate`'s), which ext4 reads as zeros; this reader returns what the blocks last
+    held.
 
 ### The shape
 
-**Instruments first, then the laptop, then the fix — in a loop.**
+**Extent trees first, then the instruments, then the laptop, then the fix — in a loop.**
+- **Extent trees in `fs-server-ext4`** (H.1). An append to an inode whose four extents are full
+  moves them into a new leaf block and makes the inode an index over it, one level deep; a full
+  leaf splits where the insertion falls — for an append, at the end, so the leaves an append fills
+  stay full — with an index entry for the new leaf; a full index in the inode deepens the tree a
+  level. Free and truncate walk the tree and give back each leaf and index block they empty. The
+  block map the kernel is handed is built by walking the extents in order, each leaf read once —
+  `map_file` and `map_range` look a block up at a time, which over a tree would read a leaf a
+  block. `i_blocks` counts the tree's own blocks, as `e2fsck` checks. **The three findings above
+  go with it**, being the same code: an extent's length decoded in one place as ext4 defines it,
+  an unwritten extent reading as zeros, and a grow or create that fails giving back what it took.
 - **`time PIPELINE`** in `nxsh`: the pipeline runs as ever and yields its value, and when it ends
   `time` prints its wall-clock time, from the monotonic clock — **and what it cost**: for each
   block device whose counters moved, its commands, bytes each way and busy time, and the page
@@ -2669,8 +2703,9 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
     directory scan;
   - `tree/`: 16 directories of 64 files of 64 KiB, 64 MiB — a home's shape.
   Each file's bytes are a pattern named by its path, so a copy can be checked on the host.
-- **The laptop's runs** (H.2, the maintainer's). Each set from a fresh boot, the stick plugged in:
-  1. the stick to `/home`: `time copy -r /storage/<stick>/big /home/t-big`, and `small`, `tree`;
+- **The laptop's runs** (H.3, the maintainer's). Each set from a fresh boot, the stick plugged in:
+  1. the stick to `/home`: `time copy /storage/<stick>/big /home/t-big`, and `small`, `tree`
+     (`copy` takes a directory with no flag);
   2. `/home` to `/home`: each of the three copied again;
   3. `/home` to the stick;
   4. `time remove -r` of each, under `/home` and on the stick.
@@ -2678,7 +2713,7 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   `rm -r`, each followed by `sync` and timed with it, the page cache dropped before each, the
   internal copies into a scratch directory on the same ext4 partition. The stick is checked on a
   host after each set.
-- **The fix** (H.3): the counters say whether a run was **device-bound** — busy time near the wall
+- **The fix** (H.4): the counters say whether a run was **device-bound** — busy time near the wall
   time, so fewer and larger commands help — or not, so the time is in the servers, the kernel or
   the copy's chain of calls. **The cost that dominates is fixed, the laptop measures again, and
   the loop repeats while one cost still dominates and the number is not met** (the maintainer's
@@ -2693,7 +2728,7 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
     server marks, which is the block-run protocol's, not a syscall's;
   - **a directory insert that does not rescan** every block;
   - **more than one command in flight** (AHCI's NCQ) — the largest.
-- **The number** (H.4): **set against Linux on the same laptop and stick** — the ratio the
+- **The number** (H.5): **set against Linux on the same laptop and stick** — the ratio the
   maintainer chooses once both are measured — and written into the Definition of Done, with every
   run's numbers recorded here and in the decision log.
 
@@ -2712,6 +2747,9 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   ([`syscall-surface.md`](syscall-surface.md)): four `file_*` numbers that are one resolve with
   an op, two blocking syncs, entropy twice over, two namespace calls that fold — forty-two to
   about thirty-two. Part H keeps out of it.
+- **Extent trees are Part H's** (after the PR #370 review), as a piece before the laptop's runs,
+  rather than a tree to copy kept under the ceiling — which would have measured a directory scan
+  a fifth the size the deferral describes.
 
 ### Calls made in this pass, without the maintainer
 
@@ -2723,19 +2761,32 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   thousand to a directory for the per-file cost and the scan.
 - **No gate holds a time.** TCG's times are not the machine's, and KVM's are not the laptop's.
   Gates hold the counters' movement and, after each fix, its counts.
+- **The probes' findings are fixed in H.1**, not filed: each is in the code H.1 rewrites, and
+  the leak is one a copy that does not fit would make on the laptop's own disk.
 
 ### Pieces
 
-- **H.1 The instruments.** `time`; the drivers' and the page cache's counters, `/dev/registry/io`,
+- **H.1 Extent trees**, as above.
+
+  Host tests, each ending in `e2fsck -fn` clean: `small/`'s shape — 4,096 files of 16 KiB created in
+  one directory, listed, looked up and removed; two files grown a block at a time in turn, so every
+  block is an extent of its own, past 1,360 extents — four leaves of 340, a full depth 1 — into
+  depth 2, then truncated to a point inside each level and removed; a tree e2fsprogs wrote, by
+  `mke2fs -d` from a file whose every other block is zero, which it writes sparse, read, truncated
+  and removed, its blocks and inode freed; an extent of 32,768 blocks and an unwritten one, read
+  against `debugfs`; a grow refused for space, and a create refused because its directory cannot
+  grow. Controls: the split removed (the 815th file refused), a leaf not freed (`e2fsck`), the
+  length mask restored, the give-back removed.
+- **H.2 The instruments.** `time`; the drivers' and the page cache's counters, `/dev/registry/io`,
   `/dev/devices/io.tsm`; `cargo xtask throughput-stick`.
 
   Host tests: `time`'s parse and its line; the counters in the drivers' host-tested paths (USB
   storage's `Disks`, the RAM disk); the device manager's table. A `boot-probe` step writes a known
   file on the scratch disk, syncs it, and requires the scratch disk's writes and bytes, and the
   page cache's write-backs, to have moved by at least that much.
-- **H.2 The laptop**, and Linux on it: the runs above, recorded.
-- **H.3 The fix**, and the laptop again, in the loop above; each fix with its count.
-- **H.4 The number, and the docs.**
+- **H.3 The laptop**, and Linux on it: the runs above, recorded.
+- **H.4 The fix**, and the laptop again, in the loop above; each fix with its count.
+- **H.5 The number, and the docs.**
 
 ### Gates
 
@@ -2743,8 +2794,11 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   on the release image, where the laptop will run it.
 - **`test-qemu`**: `boot-probe`'s counter step, above, and each fix's count.
 - **No new gate**: the set stays at 44.
-- **Controls**, planned: the counters not kept by a driver (the `boot-probe` step fails); `time`
-  printing nothing (`test-interactive`); each fix removed (its count).
+- **H.1 is held by host tests** against `e2fsck`, above; on hardware, by the laptop's `small/`
+  runs. A gate copying four thousand files under TCG would cost minutes and see nothing the host
+  tests do not.
+- **Controls**, planned: H.1's, above; the counters not kept by a driver (the `boot-probe` step
+  fails); `time` printing nothing (`test-interactive`); each fix removed (its count).
 
 ### Not in Part H
 
@@ -2759,9 +2813,10 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
 - **`device-manager.md`**: `io.tsm`. **`device-node.md`**: `/dev/registry/io`.
 - **`drivers-and-irps.md`** and **`usb.md`**: the drivers' counters.
 - **`filesystem-data-path.md`**: the page cache's counters, and whatever the fix changes there.
-- **`ext4-fs-server-rw.md`** or **`fat-fs-server.md`**: whatever the fix changes there.
-- **`deferred-decisions.md`**: `TODO(fs-throughput)` resolved or narrowed; the directory scan's
-  entry, if the fix reaches it; `MAX_COPY` pointed at the consolidation.
+- **`ext4-fs-server-rw.md`**: extent trees, an extent's length, and a failed grow's give-back;
+  and with **`fat-fs-server.md`**, whatever the fix changes there.
+- **`deferred-decisions.md`**: `TODO(fs-throughput)` resolved or narrowed; the extent-tree entry
+  resolved; the directory scan's entry, if the fix reaches it.
 - **`qemu-integration-tests.md`** and the root **`CLAUDE.md`**: `test-interactive`'s new step.
 - **The Definition of Done**: the number.
 

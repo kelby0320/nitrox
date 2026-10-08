@@ -34929,3 +34929,39 @@ fix. It guesses at no cause.
 line on the screen; counting at the driver, so busy time is the device's own; a tree written by
 `cargo xtask throughput-stick` — 8 MiB files, sixteen-kilobyte files four thousand to a directory,
 and a home's shape — the same every run; and no gate holds a time, only counts.
+
+## 2026-10-08 — PR #370, reviewed: extent trees join Part H, and the surface counted again
+
+The review (one blocking finding, five worth fixing, two optional) checked every "checked
+2026-10-08" claim against the source; the decision-log entry above held, and the errors were in
+the two planning documents.
+
+- **Blocking: Part H's tree to copy could not be written to ext4.** `fs-server-ext4` refuses about
+  the 815th file of 16 KiB in one directory: each file's data lands between the directory's
+  growth blocks, so every directory block is an extent of its own, and an inode holds four. The
+  review's host probe found it, and the author's found the same. **The maintainer's call: extent
+  trees are Part H's**, as H.1, before the laptop's runs — not a tree kept under the ceiling, which
+  would have measured a directory scan a fifth the size the deferral describes. The pieces are
+  renumbered H.1–H.5. `deferred-decisions.md` and `dir_insert`'s comment said creating files in
+  one directory was unbounded: that held for empty files only, and both now say so.
+- **Checking it found four more, by host probes, in the code H.1 rewrites**, and H.1 fixes them:
+  removing a file with a tree — one Linux wrote — takes its name and frees nothing, leaving an
+  unattached inode holding its blocks; a grow that fails keeps every block it took — on a 16 MiB
+  filesystem, a grow past its size left all its free space allocated to nothing, the file still
+  empty — and the refused create left an unattached inode, each reported by `e2fsck -fn`; an extent
+  of the full 32,768 blocks, `ee_len` `0x8000`, read as a hole, where e2fsprogs maps it; and an
+  unwritten extent read as data, where ext4 reads zeros.
+- **`syscall-surface.md` corrected**: `io_submit` already serves character devices — a console,
+  the raw input nodes, `/dev/registry/changes`, a keyboard's lights — so files and entropy would be
+  its first resources that are not devices; **the blocking calls are more than the two syncs** —
+  `process_spawn`'s fills of a file-backed image, `power`'s flush, `debug_kprint` — so folding the
+  syncs does not restore async-first, and spawn's fills are an open question for the
+  consolidation; **the original's complete set is thirty-two**, not thirty, so the tightened
+  thirty-two is its count exactly; and **syscall numbers are not ABI-hash inputs** — renumbering
+  touches `abi-sync-check`'s constants and the spec's numbering, and the hash moves only with
+  `IoOp`'s layout or `IoOpcode`'s discriminants.
+- **`copy -r` is not a command**: `copy` takes a directory with no flag, and H.3's runs say so.
+- **Optional, taken**: `libfs::MAX_COPY`'s comment no longer says a windowed copy would lift it, and
+  points at `copy-limit`; Part H's owed docs drop the item this PR already did; and
+  `syscall-abi.md` no longer calls the syncs "the one documented exemption" from async-first,
+  naming spawn's fills, `power` and `debug_kprint` beside them.

@@ -19,8 +19,9 @@ surface, and what it finds that only the surface can fix comes here
 ## The original design's rules
 
 [`os-design-v5.1.md`](../archive/os-design-v5.1.md) § *Syscall Interface*, checked 2026-10-08:
-- **"Syscall table is small (~30 entries)."** Thirty, and a two-call I/O ring as a purely additive
-  optimisation.
+- **"Syscall table is small (~30 entries)."** Its complete set lists **thirty-two**, and a two-call
+  I/O ring as a purely additive optimisation (counted in the PR #370 review; the tables below
+  agree: twenty-eight built as designed, four never built).
 - **"No `sys_read`, `sys_write`, `sys_open` — all I/O goes through `sys_io_submit`."** An `IoOp`
   names a resource and a buffer; its spec calls the pair resource-agnostic "so future resource
   kinds … reuse them" ([`io-operation.md`](../spec/io-operation.md)).
@@ -43,7 +44,7 @@ Forty-two numbered syscalls, and two debug ones (`0xFFFF_0000` `debug_kprint`, `
 | Channels | `channel_create` (12), `channel_send` (13), `channel_recv` (14) | as designed |
 | Processes and threads | `process_spawn` (15), `process_exit` (16), `thread_exit` (17), `thread_set_affinity` (18), `thread_create` (19), `thread_get_registers` (20), `exception_resume` (21) | as designed |
 | Namespaces | `ns_create` (22), `ns_lookup` (23), `ns_bind` (24), `ns_unbind` (25) | as designed |
-| I/O | `io_submit` (28), `io_cancel` (29) | as designed; `io_submit` takes block devices only |
+| I/O | `io_submit` (28), `io_cancel` (29) | as designed; `io_submit` takes devices only — block, and character (a console, the raw input nodes and `/dev/registry/changes` read; a keyboard's lights written) |
 | **Added: entropy** | `entropy_create` (26), `entropy_read` (27) | drift — finding 3 |
 | **Added: namespaces** | `ns_enumerate` (30), `ns_derive` (37), `ns_sync` (38), `ns_held` (39) | `ns_enumerate` sound; the rest drift — findings 2 and 4 |
 | **Added: files** | `file_sync` (31), `file_grow` (32), `file_create` (33), `file_truncate` (34), `file_rename` (35) | drift — findings 1 and 2 |
@@ -59,10 +60,18 @@ Forty-two numbered syscalls, and two debug ones (`0xFFFF_0000` `debug_kprint`, `
    are each `sys_ns_lookup` in the kernel's dispatch, with a different `ResolveOp`
    (`kernel/src/syscall/table.rs`): a namespace resolve that carries an operation to the
    filesystem's server. Four numbers, named for files, for one call with a mode.
-2. **Two blocking syncs.** `file_sync` and `ns_sync` block inside the syscall: "the one documented
-   exemption from async-first … a durability point is something the caller wants to know it has
-   reached" ([`syscall-abi.md`](../spec/syscall-abi.md)). A `PendingOperation` says when it has
-   been reached as well as a return does. `IoOpcode::Flush` already exists, for block devices.
+2. **Two blocking syncs.** `file_sync` and `ns_sync` block inside the syscall: "a durability point
+   is something the caller wants to know it has reached"
+   ([`syscall-abi.md`](../spec/syscall-abi.md)). A `PendingOperation` says when it has been reached
+   as well as a return does. `IoOpcode::Flush` already exists, for block devices. **They are not the
+   only calls that block** (PR #370 review):
+   - **`process_spawn`** reads a file-backed image's pages inside the call, a device round trip
+     each (`FileObject::read_to_kvec`, from `kernel/src/syscall/table.rs`) — every launch of a
+     program from the root filesystem;
+   - **`power`** waits on its flush before it acts;
+   - **`debug_kprint`** writes to the console and returns, by design.
+
+   Folding the syncs leaves spawn's fills, and `power`'s wait, which is the machine going down.
 3. **Entropy twice over.** `entropy_create` mints the same `EntropyObject` a resolve of
    `/dev/entropy` returns (`kernel/src/object/kernel_server.rs`), and `entropy_read` is a read of
    its own that answers with data or with a `PendingOperation`, as the pool is seeded or not —
@@ -84,22 +93,27 @@ of a whole file, and refuses one over 8 MiB (`MAX_COPY`) — the limit Part H's 
 | Change | Syscalls |
 |---|---|
 | **One resolve that carries an operation**: `ns_lookup` with an op — create, grow, truncate, rename — in place of the four `file_*` numbers | −4 |
-| **Files and namespaces as `io_submit` resources**: `Flush` on a file is `file_sync`, on a namespace `ns_sync`, each answering through a `PendingOperation` — async-first restored | −2 |
+| **Files and namespaces as `io_submit` resources**: `Flush` on a file is `file_sync`, on a namespace `ns_sync`, each answering through a `PendingOperation` — the two syncs brought under async-first; spawn's fills remain (finding 2) | −2 |
 | **Entropy by lookup and `io_submit`**: `/dev/entropy` resolved, and a `Read` into a memory object | −2 |
 | **`ns_held` in the flush's answer**, or in `handle_stat` of a binding | −1 |
 | **`ns_derive` as `ns_create(from)`** | −1 |
 
-Forty-two to thirty-two, back near the original thirty.
+Forty-two to thirty-two: **the original's own count**, though not its set — `ns_enumerate`,
+`process_terminate`, `power` and `clock_set` are in it, and the four never built are not.
 
 **A copy is then no new syscall**: `sys_io_submit(destination file, Write, buffer = source file,
 offsets, length)` — one more use of the entry point the original built for every kind of I/O, and
 the end of the 8 MiB limit, since the kernel streams it a window at a time and lets each window's
-pages go. Part H's fixes — clustered fills and write-backs, if the measurement points there — are
-the engine it would run on.
+pages go. **Files and entropy would be its first resources that are not devices.** Part H's fixes —
+clustered fills and write-backs, if the measurement points there — are the engine it would run on.
 
 ## What it touches
 
-- **The ABI hash**: syscall numbers, and `IoOp`'s meaning with new resource and buffer kinds.
+- **The syscall numbers**, which are **not** ABI-hash inputs
+  ([`syscall-abi.md`](../spec/syscall-abi.md),
+  [`abi-version-hash.md`](../spec/abi-version-hash.md)): renumbering touches `abi-sync-check`'s
+  kernel-to-`libkern` constants and the spec's numbering. **The hash** changes only if `IoOp`'s
+  layout or `IoOpcode`'s discriminants do — new resource kinds need neither, new opcodes would.
 - **Every caller**: `libfs`, the storage service, the coreutils, `nxinstall`, both filesystem
   servers' setup, `boot-probe`, and every test that makes these calls.
 - **The specs**: [`syscall-abi.md`](../spec/syscall-abi.md),
@@ -108,8 +122,11 @@ the engine it would run on.
 ## Open, for its detail pass
 
 - **What `io_submit` means for a file**: the rights each side needs (a file handle carries
-  `MAP_*` rights, a device `READ` and `WRITE`), and what a `Write` to a file promises about
-  durability — written back when it completes, or dirty until a `Flush`.
+  `MAP_*` rights, a device — block or character — `READ` and `WRITE`), and what a `Write` to a file
+  promises about durability — written back when it completes, or dirty until a `Flush`.
+- **`process_spawn`'s fills**: whether a launch from a filesystem answers through a
+  `PendingOperation`, as every other call that waits on a device would, or stays outside
+  async-first with a reason written down.
 - **How a resolve carries its op**: a code and an argument in registers, or a small struct by
   pointer, as `IoOp` is.
 - **Whether `ns_held` folds into the flush's answer or into `handle_stat`.**
