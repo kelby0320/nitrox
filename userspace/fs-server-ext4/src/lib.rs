@@ -76,6 +76,48 @@ pub(crate) mod test_support {
         }
     }
 
+    /// **Commands as `libfsserver::disk::Disk` sends them** (Phase 6 Part H.4), over an
+    /// [`RwImage`]: a read is one command a 4 KiB block it touches, and a write one a block — and
+    /// a read first for each block it writes only part of, which the `Disk` reads to keep the
+    /// rest. What Part H.4's fixes are held by: a count of commands, never a time.
+    pub(crate) struct Counting {
+        pub image: RwImage,
+        pub reads: std::cell::Cell<u64>,
+        pub writes: std::cell::Cell<u64>,
+    }
+    impl Counting {
+        const IO_BLOCK: u64 = 4096;
+        pub(crate) fn new(image: Vec<u8>) -> Counting {
+            Counting { image: RwImage(RefCell::new(image)), reads: 0.into(), writes: 0.into() }
+        }
+        /// `(reads, writes)` so far, and back to nothing.
+        pub(crate) fn take(&self) -> (u64, u64) {
+            (self.reads.take(), self.writes.take())
+        }
+        /// The 4 KiB blocks `[offset, offset + len)` touches, each with whether it is touched whole.
+        fn blocks(offset: u64, len: usize) -> impl Iterator<Item = bool> {
+            let end = offset + len as u64;
+            let first = offset / Self::IO_BLOCK;
+            let last = if len == 0 { first } else { (end - 1) / Self::IO_BLOCK + 1 };
+            (first..last).map(move |b| offset <= b * Self::IO_BLOCK && (b + 1) * Self::IO_BLOCK <= end)
+        }
+    }
+    impl BlockReader for Counting {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.reads.set(self.reads.get() + Self::blocks(offset, buf.len()).count() as u64);
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Counting {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            for whole in Self::blocks(offset, buf.len()) {
+                self.reads.set(self.reads.get() + !whole as u64);
+                self.writes.set(self.writes.get() + 1);
+            }
+            self.image.write_at(offset, buf)
+        }
+    }
+
     /// A `BlockReader` over an in-memory image. Its writes are refused, so a test reading through
     /// a server's [`crate::Ext4`] volume, which takes a writer, cannot change it.
     pub(crate) struct ImageReader(pub Vec<u8>);
@@ -210,8 +252,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::test_support::{
-        ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path, fixture,
-        fixture_blocks,
+        Counting, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path,
+        fixture, fixture_blocks,
     };
 
     #[test]
@@ -1426,6 +1468,103 @@ mod tests {
         assert_eq!(ext4::mkdir_at(&rw, sys, b".", TEST_NOW), Err(FsError::Unsupported));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "mkdir");
+    }
+
+    /// **An 8 MiB grow and its removal cost commands a run, not a block** (Phase 6 Part H.4), on
+    /// the device as `libfsserver::disk::Disk` drives it. The laptop's copies spent eight of every
+    /// twelve commands a block allocating — the bitmap, the descriptor and the superblock read and
+    /// written for each — and removing a file the same, eight a block. Measured one block at a
+    /// time, this grow was 10,251 reads and 8,193 writes and the removal 10,271 and 6,150; in runs
+    /// 26 and 2,058, and 61 commands. What a grow still writes a block is its zeroes.
+    #[test]
+    fn an_eight_mebibyte_grow_and_its_removal_cost_commands_a_run_not_a_block() {
+        const BLOCKS: u64 = 2048;
+        let rw = Counting::new(fixture(4096, b"seed\n"));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"big", TEST_NOW).unwrap();
+        rw.take();
+
+        ext4::grow_file(&rw, b"/system/big", (BLOCKS * 4096) as usize, TEST_NOW).unwrap();
+        let (reads, writes) = rw.take();
+        assert!(reads <= 32, "{reads} reads to grow {BLOCKS} blocks");
+        assert!((BLOCKS..=BLOCKS + 16).contains(&writes), "{writes} writes to grow {BLOCKS} blocks");
+        // In the fixture's free stretches — three of them, as one block at a time placed it.
+        let mut runs = [BlockRun::default(); 4];
+        let mapped = ext4::map_file(&rw, b"/system/big", &mut runs).unwrap();
+        let mapped_blocks: u64 = runs[..mapped.runs].iter().map(|r| r.length as u64).sum();
+        assert_eq!((mapped.runs, mapped_blocks), (3, BLOCKS));
+
+        assert_eq!(ext4::unlink_at(&rw, sys, b"big", TEST_NOW), Ok(Some(ino)));
+        ext4::release_inode(&rw, ino, TEST_NOW).unwrap();
+        let (reads, writes) = rw.take();
+        assert!(reads + writes <= 96, "{reads} reads and {writes} writes to remove {BLOCKS} blocks");
+        assert_e2fsck_clean(&rw.image.0.borrow(), "grow-run-remove");
+    }
+
+    /// **A run lands where a block at a time put each of its blocks** (Phase 6 Part H.4):
+    /// [`ext4::alloc_run`] called until it has as many blocks as [`ext4::alloc_block`] called once a
+    /// block, each from the last one's end, takes the same blocks in the same order and leaves the
+    /// image byte for byte the same — across a bitmap with holes of one, two and five, through a
+    /// run cut short by `want`, and over a group's end into the next. And [`ext4::free_run`] of
+    /// runs crossing that end leaves the image as `free_block` of each block does.
+    #[test]
+    fn a_run_lands_where_a_block_at_a_time_put_each_of_its_blocks() {
+        use std::cell::RefCell;
+        // Three groups of 8,192 one-KiB blocks, group 0 given holes: 900 blocks taken, then some
+        // given back — every seventh and the one after it, and every thirteenth's fifth.
+        let base = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"seed\n")));
+        let sb = ext4::read_superblock(&base).unwrap();
+        let first = sb.first_data_block as u64;
+        let taken: Vec<u64> = (0..900).map(|_| ext4::alloc_block(&base, &sb, first).unwrap()).collect();
+        for (i, &blk) in taken.iter().enumerate() {
+            if i % 7 < 2 || i % 13 == 5 {
+                ext4::free_block(&base, &sb, blk).unwrap();
+            }
+        }
+        let image = base.0.borrow().clone();
+        let free_0 = {
+            let mut gd = [0u8; 32];
+            // At one KiB a block the descriptor table starts at block 2.
+            base.read_at(2 * 1024, &mut gd).unwrap();
+            rd_u16(&gd, 12) as u64
+        };
+        let want = free_0 + 600; // past group 0's free blocks, into group 1's
+
+        let (a, b) = (RwImage(RefCell::new(image.clone())), RwImage(RefCell::new(image)));
+        let (mut by_run, mut goal) = (Vec::new(), first + 100);
+        while (by_run.len() as u64) < want {
+            let (phys, len) = ext4::alloc_run(&a, &sb, goal, (want - by_run.len() as u64).min(37)).unwrap();
+            assert!(len >= 1);
+            by_run.extend(phys..phys + len);
+            goal = phys + len;
+        }
+        let (mut by_block, mut goal) = (Vec::new(), first + 100);
+        for _ in 0..want {
+            let phys = ext4::alloc_block(&b, &sb, goal).unwrap();
+            by_block.push(phys);
+            goal = phys + 1;
+        }
+        assert_eq!(by_run, by_block, "the same blocks, in the same order");
+        assert!(by_run.iter().any(|&p| p >= first + 8192), "the runs reached group 1");
+        assert!(*a.0.borrow() == *b.0.borrow(), "the same bitmaps and counts");
+
+        // Freed again in runs that cross group 0's end, and a block at a time.
+        let end_0 = first + 8192;
+        let runs = [(end_0 - 300, 900), (first + 120, 40)];
+        for (phys, len) in runs {
+            ext4::free_run(&a, &sb, phys, len).unwrap();
+            for blk in phys..phys + len {
+                ext4::free_block(&b, &sb, blk).unwrap();
+            }
+        }
+        // Byte for byte is the oracle: `e2fsck` is not, on blocks taken for no file and freed
+        // from the filesystem's own.
+        assert!(*a.0.borrow() == *b.0.borrow(), "freed alike");
+        // Not on the filesystem: refused before anything is written.
+        let before = a.0.borrow().clone();
+        assert_eq!(ext4::free_run(&a, &sb, sb.blocks_count - 2, 5), Err(FsError::Corrupt));
+        assert_eq!(ext4::free_run(&a, &sb, 0, 1).is_err(), first > 0);
+        assert!(*a.0.borrow() == before);
     }
 
     #[test]

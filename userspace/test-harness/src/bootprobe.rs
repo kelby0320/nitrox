@@ -2830,9 +2830,13 @@ fn storage_mount_test(root_ns: u64) -> bool {
 }
 
 /// **What the disks and the page cache did, as `io.tsm` says** (Phase 6 Part H.2), read before and
-/// after a file of eight pages is made on the scratch disk through the storage service and synced:
+/// after a file of 64 pages is made on the scratch disk through the storage service and synced:
 /// 1. **the scratch disk's writes and written bytes moved by at least its pages, and its busy time
-///    moved** — the RAM disk's driver counted them where it served them;
+///    moved** — the RAM disk's driver counted them where it served them — **and by no more than a
+///    run's worth of allocating** (Part H.4): two writes a page, its zeroes and its data, and four
+///    dozen besides, and a read a page, the page cache filling it, and a hundred besides. Measured,
+///    145 writes and 122 reads; a block at a time the allocator read and wrote the bitmap,
+///    descriptor and superblock for each block, and the same file took 328 and 427;
 /// 2. **the page cache's write-backs moved by as much**;
 /// 3. every present disk and RAM disk has a row, and the page cache one;
 /// 4. **the disk `init`'s root is on has read something** — at boot, through whichever driver it
@@ -2890,7 +2894,7 @@ fn io_counters_test(root_ns: u64) -> bool {
     let Some(before) = table(b"/svc/devices/info/io.tsm") else {
         return fail(b"io.tsm would not read");
     };
-    const PAGES: u64 = 8;
+    const PAGES: u64 = 64;
     let len = PAGES * PAGE;
     let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, b"/svc/storage/fs/nitrox-scratch/probe-io", len) else {
         return fail(b"a file would not create on the scratch disk");
@@ -2916,14 +2920,17 @@ fn io_counters_test(root_ns: u64) -> bool {
     };
     let moved = |name: &str, column: &str| Some(num(&after, name, column)?.saturating_sub(num(&before, name, column)?));
 
-    let (Some(writes), Some(written), Some(busy)) =
-        (moved(&scratch, "writes"), moved(&scratch, "written_bytes"), moved(&scratch, "busy_ns"))
-    else {
+    let (Some(reads), Some(writes)) = (moved(&scratch, "reads"), moved(&scratch, "writes")) else {
         return fail(b"the scratch disk has no row in io.tsm");
     };
-    if writes < PAGES || written < len || busy == 0 {
+    let (Some(written), Some(busy)) = (moved(&scratch, "written_bytes"), moved(&scratch, "busy_ns")) else {
+        return fail(b"the scratch disk has no row in io.tsm");
+    };
+    if writes < PAGES || written < len || busy == 0 || writes > 2 * PAGES + 48 || reads > PAGES + 96 {
         Line::new()
             .s(b"boot-probe: io counters: the scratch disk moved ")
+            .u(reads)
+            .s(b" reads and ")
             .u(writes)
             .s(b" writes of ")
             .u(written)
@@ -2951,6 +2958,8 @@ fn io_counters_test(root_ns: u64) -> bool {
         .s(b"boot-probe: io counters: ")
         .s(scratch.as_bytes())
         .s(b" moved ")
+        .u(reads)
+        .s(b" reads and ")
         .u(writes)
         .s(b" writes of ")
         .u(written)

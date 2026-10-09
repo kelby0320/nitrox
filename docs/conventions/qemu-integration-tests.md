@@ -178,9 +178,11 @@ the mount manifest, and the `test` store package.
 module, which the kernel publishes as a RAM disk. It is what the storage service finds to
 auto-mount, since the boot disk holds only `init`'s root and the FAT ESP, and so what lets
 `boot-probe` mount, read and write through `/svc/storage` on every run — and, since Phase 6 Part
-H.2, hold the I/O counters to a write: a file of eight pages synced there must move the scratch
+H.2, hold the I/O counters to a write: a file of 64 pages synced there must move the scratch
 disk's writes and bytes and the page cache's write-backs by at least as much in `io.tsm`, and the
-disk `init`'s root is on must have read something. `test-interactive` holds `nxsh`'s `time` on the
+disk `init`'s root is on must have read something — and since Part H.4 move the scratch disk by no
+more than a read and two writes a page and a fixed allowance, which ext4 allocating a block at a
+time exceeds by more than a hundred of each. `test-interactive` holds `nxsh`'s `time` on the
 release image: its line, of its shape, before the value it passes through. The programs are the
 release programs, and a release boot simply has one disk fewer. **The cost is the block devices'
 order**: a RAM disk is published before any partition, so a test image's ESP is `/dev/blk/2` where a

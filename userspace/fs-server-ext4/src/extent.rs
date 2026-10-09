@@ -671,7 +671,8 @@ fn free_tree<RW: BlockReader + BlockWriter>(
     Ok(())
 }
 
-/// Free `len` blocks from `phys`, refusing a run that is not all on the filesystem.
+/// Free `len` blocks from `phys`, refusing a run that is not all on the filesystem: one
+/// [`ext4::free_run`], a bitmap pass a group (Phase 6 Part H.4), where it was one a block.
 fn free_run<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
@@ -682,10 +683,8 @@ fn free_run<RW: BlockReader + BlockWriter>(
     if !on_device(sb, phys, len) {
         return Err(FsError::Corrupt);
     }
-    for blk in phys..phys + len {
-        free_block(rw, sb, blk)?;
-        *freed += 1;
-    }
+    crate::ext4::free_run(rw, sb, phys, len)?;
+    *freed += len;
     Ok(())
 }
 

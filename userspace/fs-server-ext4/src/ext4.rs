@@ -903,12 +903,30 @@ pub(crate) fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> 
     Ok(inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64)
 }
 
-/// Allocate one free filesystem block, preferring `goal` for contiguity.
+/// Allocate one free filesystem block, preferring `goal` for contiguity: [`alloc_run`] of one.
+pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    goal: u64,
+) -> Result<u64, FsError> {
+    alloc_run(rw, sb, goal, 1).map(|(phys, _)| phys)
+}
+
+/// **Allocate a run of up to `want` free blocks**, contiguous, preferring `goal`: where it starts
+/// is where [`alloc_block`] would put one block, and it goes on while the next block is free, in
+/// that group, up to `want`. `(first block, length)`, the length at least one.
 ///
 /// Tries `goal`'s own group first — the goal bit itself, then any free bit in that group —
-/// and then **every other group in turn**, wrapping round. Sets the bitmap bit and decrements
-/// the group-descriptor and superblock free-block counts. `TooLarge` only when the whole
-/// filesystem is full.
+/// and then **every other group in turn**, wrapping round. Sets the run's bitmap bits and
+/// decrements the group-descriptor and superblock free-block counts by its length. `TooLarge`
+/// only when the whole filesystem is full.
+///
+/// **A run, not a block** (Phase 6 Part H.4). The bitmap, the descriptor and the superblock are
+/// read and written once a run: one block at a time they were five reads and three writes a
+/// block — the descriptor's and the superblock's writes are each part of a block, which the
+/// device layer reads first — and a copy to an ext4 disk spent eight of its twelve commands a
+/// block here (the laptop's runs, 2026-10-09). The placement is the one-block allocator's
+/// repeated: a run ends at the first block in use, where the next call starts as before.
 ///
 /// **Cross-group since Phase 5 Part H.2**, and the reason is the installer: `nxinstall` makes a
 /// filesystem the size of the disk, and confined to group 0 that filesystem held about 112 MiB
@@ -921,11 +939,12 @@ pub(crate) fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> 
 ///
 /// `metadata_csum` is off (the fixtures and our images are built `^metadata_csum`), so there
 /// are no bitmap or descriptor checksums to maintain, and no group is `BLOCK_UNINIT`.
-pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
+pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     goal: u64,
-) -> Result<u64, FsError> {
+    want: u64,
+) -> Result<(u64, u64), FsError> {
     let bs = sb.block_size as usize;
     let groups = sb.group_count();
     let first = goal
@@ -942,7 +961,8 @@ pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
         let gd_off = sb.group_desc_offset(group);
         rw.read_at(gd_off, &mut gd[..dsz])?;
         // bg_free_blocks_count_lo @12. Zero means skip — see the doc comment.
-        if rd_u16(&gd, 12) == 0 {
+        let gfree = rd_u16(&gd, 12);
+        if gfree == 0 {
             continue;
         }
         let capacity = sb.blocks_in_group(group);
@@ -952,7 +972,7 @@ pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
         let group_start = sb.group_start(group);
         // The goal bit is only a preference, and only in the group it belongs to.
         let goal_idx = goal.checked_sub(group_start).unwrap_or(u64::MAX) as usize;
-        let idx = if n == 0 && goal_idx < capacity && bit_clear(&bitmap, goal_idx) {
+        let start = if n == 0 && goal_idx < capacity && bit_clear(&bitmap, goal_idx) {
             goal_idx
         } else {
             match (0..capacity).find(|&i| bit_clear(&bitmap, i)) {
@@ -962,21 +982,26 @@ pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
                 None => continue,
             }
         };
-        bit_set(&mut bitmap, idx);
+        // No more than the descriptor says is free, so its count cannot wrap below zero.
+        let most = want.max(1).min(gfree as u64) as usize;
+        let mut len = 0;
+        while len < most && start + len < capacity && bit_clear(&bitmap, start + len) {
+            bit_set(&mut bitmap, start + len);
+            len += 1;
+        }
         rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
         // Decrement free-block counts: group descriptor (bg_free_blocks_count_lo @12, u16)
         // and superblock (s_free_blocks_count_lo @12, u32).
-        let gfree = rd_u16(&gd, 12).wrapping_sub(1);
-        gd[12..14].copy_from_slice(&gfree.to_le_bytes());
+        gd[12..14].copy_from_slice(&(gfree - len as u16).to_le_bytes());
         rw.write_at(gd_off, &gd[..dsz])?;
         let mut sbbuf = [0u8; 1024];
         rw.read_at(1024, &mut sbbuf)?;
-        let sfree = rd_u32(&sbbuf, 12).wrapping_sub(1);
+        let sfree = rd_u32(&sbbuf, 12).wrapping_sub(len as u32);
         sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
         rw.write_at(1024, &sbbuf)?;
 
-        return Ok(group_start + idx as u64);
+        return Ok((group_start + start as u64, len as u64));
     }
     Err(FsError::TooLarge)
 }
@@ -1059,6 +1084,9 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
 /// tree **a run at a time**: blocks the allocator hands out contiguously become one extent, up to
 /// the longest ext4 has, so a tree changes once a run rather than once a block.
 ///
+/// **And allocated a run at a time** (Phase 6 Part H.4): [`alloc_run`] takes as many as are free
+/// in a row, so the bitmap, descriptor and superblock are written once a run, not once a block.
+///
 /// On an error the run in hand is given back here; the runs already appended are the caller's to
 /// give back, by cutting the tree where they began.
 fn grow_blocks<RW: BlockReader + BlockWriter>(
@@ -1069,47 +1097,51 @@ fn grow_blocks<RW: BlockReader + BlockWriter>(
     to: u64,
 ) -> Result<(), FsError> {
     let bs = sb.block_size as usize;
-    let give_back = |run: Option<Extent>| {
-        if let Some(r) = run {
-            for blk in r.phys..r.phys + r.len {
-                let _ = free_block(rw, sb, blk);
-            }
+    let give_back = |runs: &[Option<Extent>]| {
+        for r in runs.iter().flatten() {
+            let _ = free_run(rw, sb, r.phys, r.len);
         }
     };
     let mut goal = extent::last_end(rw, sb, inode)?.unwrap_or(sb.first_data_block as u64);
     let mut run: Option<Extent> = None;
-    for lb in from..to {
-        let phys = match alloc_block(rw, sb, goal) {
-            Ok(phys) => phys,
+    let mut lb = from;
+    while lb < to {
+        let (phys, len) = match alloc_run(rw, sb, goal, (to - lb).min(extent::MAX_LEN)) {
+            Ok(got) => got,
             Err(e) => {
-                give_back(run);
+                give_back(&[run]);
                 return Err(e);
             }
         };
-        if let Err(e) = rw.write_at(phys * bs as u64, &ZERO_BLOCK[..bs]) {
-            give_back(run);
-            give_back(Some(Extent::written(lb, phys, 1)));
-            return Err(e);
-        }
-        if run.is_some_and(|r| r.phys + r.len == phys && r.len < extent::MAX_LEN) {
-            if let Some(r) = run.as_mut() {
-                r.len += 1;
+        let mut got = Extent::written(lb, phys, len);
+        for blk in phys..phys + len {
+            if let Err(e) = rw.write_at(blk * bs as u64, &ZERO_BLOCK[..bs]) {
+                give_back(&[run, Some(got)]);
+                return Err(e);
             }
-        } else {
+        }
+        // What continues the run in hand joins it, up to an extent's longest; the rest starts the
+        // next, so the extents come out as long as one block at a time made them.
+        if let Some(r) = run.as_mut().filter(|r| r.phys + r.len == phys && r.len < extent::MAX_LEN) {
+            let joins = got.len.min(extent::MAX_LEN - r.len);
+            r.len += joins;
+            got = Extent::written(got.lblock + joins, got.phys + joins, got.len - joins);
+        }
+        if got.len > 0 {
             if let Some(r) = run {
                 if let Err(e) = extent::append(rw, sb, inode, r) {
-                    give_back(run);
-                    give_back(Some(Extent::written(lb, phys, 1)));
+                    give_back(&[run, Some(got)]);
                     return Err(e);
                 }
             }
-            run = Some(Extent::written(lb, phys, 1));
+            run = Some(got);
         }
-        goal = phys + 1;
+        lb += len;
+        goal = phys + len;
     }
     if let Some(r) = run {
         if let Err(e) = extent::append(rw, sb, inode, r) {
-            give_back(run);
+            give_back(&[run]);
             return Err(e);
         }
     }
@@ -1433,37 +1465,68 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     Ok(())
 }
 
-/// Free filesystem block `block`: clear its block-bitmap bit and increment the
-/// group-descriptor + superblock free-block counts. The inverse of the allocation in
-/// [`alloc_block`], generic over the block's group.
+/// Free filesystem block `block`: [`free_run`] of one.
 pub(crate) fn free_block<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     block: u64,
 ) -> Result<(), FsError> {
+    free_run(rw, sb, block, 1)
+}
+
+/// **Free `len` blocks from `phys`**: clear their block-bitmap bits and increment the
+/// group-descriptor and superblock free-block counts by as many as were set. The inverse of
+/// [`alloc_run`], a group at a time where the run crosses one. `Corrupt` for a run not all on
+/// the filesystem, before anything is written.
+///
+/// **A group's bitmap, descriptor and superblock once a run** (Phase 6 Part H.4), where a block
+/// at a time they were five reads and three writes each: removing an 8 MiB file cost 16,421
+/// commands here, and 16,430 a file on the laptop. A bit already clear is not counted, so a run
+/// freed twice does not count its blocks free twice.
+pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    phys: u64,
+    len: u64,
+) -> Result<(), FsError> {
     let bs = sb.block_size as usize;
-    let rel = block - sb.first_data_block as u64;
-    let group = (rel / sb.blocks_per_group as u64) as u32;
-    let index = (rel % sb.blocks_per_group as u64) as usize;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let per_group = sb.blocks_per_group as u64;
+    let end = phys.checked_add(len).ok_or(FsError::Corrupt)?;
+    if phys < sb.first_data_block as u64 || end > sb.blocks_count {
+        return Err(FsError::Corrupt);
+    }
     let dsz = (sb.desc_size as usize).min(64);
     let mut gd = [0u8; 64];
-    rw.read_at(gd_off, &mut gd[..dsz])?;
-    let bitmap_block = rd_u32(&gd, 0) as u64;
-
     let mut bitmap = [0u8; MAX_BLOCK];
-    rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
-    bit_unset(&mut bitmap, index);
-    rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+    let mut blk = phys;
+    while blk < end {
+        let rel = blk - sb.first_data_block as u64;
+        let group = (rel / per_group) as u32;
+        let index = (rel % per_group) as usize;
+        let n = (end - blk).min(per_group - index as u64) as usize;
+        let gd_off = sb.group_desc_offset(group);
+        rw.read_at(gd_off, &mut gd[..dsz])?;
+        let bitmap_block = rd_u32(&gd, 0) as u64;
+        rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        let mut cleared = 0u16;
+        for i in index..index + n {
+            if !bit_clear(&bitmap, i) {
+                bit_unset(&mut bitmap, i);
+                cleared += 1;
+            }
+        }
+        rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
-    let gfree = rd_u16(&gd, 12).wrapping_add(1);
-    gd[12..14].copy_from_slice(&gfree.to_le_bytes());
-    rw.write_at(gd_off, &gd[..dsz])?;
-    let mut sbbuf = [0u8; 1024];
-    rw.read_at(1024, &mut sbbuf)?;
-    let sfree = rd_u32(&sbbuf, 12).wrapping_add(1);
-    sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
-    rw.write_at(1024, &sbbuf)?;
+        let gfree = rd_u16(&gd, 12).wrapping_add(cleared);
+        gd[12..14].copy_from_slice(&gfree.to_le_bytes());
+        rw.write_at(gd_off, &gd[..dsz])?;
+        let mut sbbuf = [0u8; 1024];
+        rw.read_at(1024, &mut sbbuf)?;
+        let sfree = rd_u32(&sbbuf, 12).wrapping_add(cleared as u32);
+        sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
+        rw.write_at(1024, &sbbuf)?;
+        blk += n as u64;
+    }
     Ok(())
 }
 

@@ -21,7 +21,8 @@ that panics exits, rather than spinning with resolves waiting on it. Phase 6 Par
 **its formatter has a second caller**, `disk --format DEVICE ext4` — § *Making one*. Phase 6 Part
 H.1 (2026-10-08): **extent trees** — written, cut and freed at any depth; an extent's length as
 ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes nothing with it —
-§ *The extent tree*.
+§ *The extent tree*. Phase 6 Part H.4 (2026-10-09): **blocks are allocated and freed a run at a
+time** — § *Part D*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -254,6 +255,17 @@ Each part builds on proven machinery and is independently verifiable.
   grow, it could be a deleted file's contents. A boot showed it on a freshly created file's
   blocks. The cost is a write per block grown, which a writer then overwrites; unwritten extents
   would avoid it, and nothing yet needs to.
+
+  **Blocks are allocated and freed a run at a time** (Phase 6 Part H.4, 2026-10-09). `alloc_run`
+  takes as many free blocks in a row as a grow wants from one pass over a group's bitmap, and writes
+  the bitmap, the descriptor and the superblock once for the run; `free_run` clears a run a group at
+  a time, counting only bits that were set. One block at a time each was five reads and three writes
+  — the descriptor's and the superblock's writes are part of a block, which `Disk` reads first — and
+  on the laptop that was eight of a copy's twelve commands a block and all of a removal's. Where a
+  run starts and ends is where the one-block allocator, called again from each block's end, put each
+  block; `alloc_block` and `free_block` are runs of one. Held by a count:
+  `an_eight_mebibyte_grow_and_its_removal_cost_commands_a_run_not_a_block`, through a test device
+  that charges commands as `Disk` sends them.
 - **Part E — file creation** ✅. `create_file` (inode allocation via the inode bitmap +
   `ext4_dir_entry_2` insertion by splitting an existing entry's slack in the parent
   directory, then inode init as an extents regular file) — **`e2fsck`-verified**. Triggered
@@ -261,7 +273,7 @@ Each part builds on proven machinery and is independently verifiable.
   creates the file (idempotent — an existing name returns its inode), grows it to the
   requested size, then replies its map; the client writes + syncs, and a subsequent plain
   `sys_ns_lookup` of the new path resolves (proving the directory entry is on disk).
-  **Allocation reaches every block group** since Phase 5 Part H.2 (2026-09-17): `alloc_block`
+  **Allocation reaches every block group** since Phase 5 Part H.2 (2026-09-17): `alloc_run`
   scans outward from the goal's group and `alloc_inode` takes the first group with a free
   inode, each clamped to the last group's short tail. It was group 0 only until the installer
   made a root the size of a 931 GiB disk and found it held about 112 MiB. Directory growth — a

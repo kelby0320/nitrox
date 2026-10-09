@@ -1726,6 +1726,11 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > `time` and I/O counters, the laptop measured beside Linux on the same machine, and the cost that
 > dominates fixed and measured again — below the syscall surface. Extent trees in `fs-server-ext4`
 > come first (after the PR #370 review), since a directory of the files it copies needs them.
+>
+> **Measured** (2026-10-09, Part H.3): 6.7 times Linux's time on the laptop over fifteen runs, 12 to
+> 67 times on its hard drive — device-bound, one 4 KiB command at a time, ext4 spending twelve a
+> block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
+> those twelve gone. Open while Part H's loop runs.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0

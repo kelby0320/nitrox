@@ -35149,3 +35149,114 @@ refusal; `--check` of a directory, finding a copy one byte long; and the four se
 release image, a boot each, through `use` at the real prompt: every command returned, the stick
 checked whole after, the root's `e2fsck -fn` clean, and `/home` left as a fresh disk's. Removing
 `c-small` from the stick took 93 s, which the first dry run never measured.
+
+## 2026-10-09 — Phase 6 Part H.3: the laptop, beside Linux
+
+**The runs.** The maintainer reinstalled the laptop from `07cb7b94` and ran `h3.nx`'s four sets on
+it, then `linux.sh` from an Ubuntu 26.04.1 live session on the same laptop, stick and partition. The
+internal disk is a Seagate ST1000LM035, a 1 TB **hard drive**; the stick a 16 GB Patriot on USB 3.
+**One stick served both**: the maintainer's only USB 3 stick took Ubuntu, and its `writable`
+partition was replaced by the throughput tree's FAT, copied byte for byte out of
+`throughput-stick.img` — the layout booted under QEMU with `linux.sh` run in it first, against the
+dry run's disk. The stick checked whole after each half. Every Nitrox set started from a fresh boot,
+and Linux dropped its page cache before each step and timed a `sync` with it.
+
+| Set | Nitrox | Linux | Nitrox ÷ Linux |
+|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 22.24 s | 12.4 |
+| 1, stick → disk: `small` | 1,364.22 s | 36.52 s | 37.4 |
+| 1, stick → disk: `tree` | 132.99 s | 8.72 s | 15.3 |
+| 2, disk → disk: `big` | 317.75 s | 5.59 s | 56.8 |
+| 2, disk → disk: `small` | 393.57 s | 9.13 s | 43.1 |
+| 2, disk → disk: `tree` | 146.73 s | 7.08 s | 20.7 |
+| 3, disk → stick: `big` | 385.14 s | 37.36 s | 10.3 |
+| 3, disk → stick: `small` | 2,094.19 s | 518.63 s | 4.0 |
+| 3, disk → stick: `tree` | 186.32 s | 137.21 s | 1.4 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.68 s | 66.7 |
+| 4, remove on the disk: `u-small` | 117.36 s | 2.79 s | 42.1 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 2.26 s | 21.4 |
+| 4, remove on the stick: `c-big` | 1.02 s | 1.15 s | 0.9 |
+| 4, remove on the stick: `c-small` | 320.24 s | 76.24 s | 4.2 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 22.26 s | 1.1 |
+| **All fifteen** | **5,919 s** | **889 s** | **6.7** |
+
+**What the counters say.** Nearly every Nitrox run is device-bound — the disk's or the stick's busy
+time within a few percent of the wall time — and every command is one 4 KiB block, or one 512-byte
+sector where FAT reads a directory, one at a time. Four costs, in the order the counts put them:
+**ext4 spends twelve commands a block copied** and eight a block removed — the allocator reading and
+writing the bitmap, descriptor and superblock for every block, five reads and three writes; a
+zeroing write; the page cache filling the new page from the device before it is overwritten; and the
+copy's own read and write. **A file's directory work grows with its directory**: `small/` costs 782
+reads a file out of the stick's FAT, 917 into it and 432 within ext4, against about 29 out of
+`tree/`'s 64-entry directories. **A copy onto the FAT stick moves its bytes twice**: 512.6 MiB
+written and 256.6 MiB read to copy 256 MiB. And under all of it, **one command at a time**: the disk
+answered one in about 0.4 ms, so even a copy of `big` at two commands a block would take about 50 s
+against Linux's 5.6.
+
+**Found on the way, and left for after Part H** — the maintainer's call: none blocks the performance
+work, and they join a list of the same kind. Twice after a **restart** the xHCI saw no USB device at
+all, neither one present at the boot nor one plugged in later, until a full power-off — though set 2
+ran after one; `kernel/src/power.rs` resets the machine with the controller still running, which
+Linux stops first, but that is a suspect and not a cause. A script run as `nxsh FILE` says
+everything — `time`'s line, `fail`, a parse error — through `kprint`, which on the laptop reaches
+nobody; a session cannot read the kernel log at all; `use "./h3.nx"` does not resolve against the
+working directory; and `cd -` is not a thing. The first of these the maintainer had agreed to fix in
+this part; it now waits with the rest.
+
+## 2026-10-09 — Phase 6 Part H.4, the first fix: ext4 allocates and frees a run at a time
+
+**Why this first.** The maintainer's call, between the two costs H.3 put on top. FAT's directory
+work is the larger in seconds — about 3,060 of the stick's busy time across sets 1, 3 and 4 — but a
+stick Linux finds slow too; ext4's allocator is where Nitrox is furthest from Linux, 12 to 67 times
+on the laptop's disk, and eight of the twelve commands a block copied.
+
+**What it was.** `alloc_block` took one block a call: it read the group descriptor, the block bitmap
+and the superblock, and wrote all three back. The descriptor's and the superblock's writes are each
+part of a block, which `libfsserver::disk::Disk` reads first, so a block cost five reads and three
+writes, and `grow_file` called it for every block it added. `free_block` was its mirror, and the
+extent tree freed an extent a block at a time — removing an 8 MiB file was 16,421 commands, 16,430 a
+file on the laptop.
+
+**What it is.** `alloc_run(goal, want)` takes as many free blocks in a row as it is asked for in one
+pass over a group's bitmap and writes the three once; `free_run` clears a run a group at a time.
+`alloc_block` and `free_block` are runs of one, so every single-block caller is unchanged.
+`grow_file` asks for runs, joining a run that continues the last into its extent up to ext4's
+longest, and the extent tree frees an extent with one call. **Where blocks land is unchanged**: a
+run starts where one block would have and ends at the first block in use, where the next call starts
+as before — held byte for byte against the one-block allocator across a bitmap with holes and a
+group's end. One difference inside a grow: an extent-tree block a grow needs is now taken after a
+whole run, where it was taken after the run's first block, so it no longer lands inside a run. And a
+freed run counts only the bits it found set, so a run freed twice is not counted free twice.
+
+**Held by counts**, as the plan has every fix: a host test through a device that charges commands as
+`Disk` sends them, in which growing a file by 8 MiB costs at most 32 reads and 2,064 writes — 2,048
+of them its zeroes; measured, 26 and 2,058, where a block at a time cost 10,251 and 8,193 — and
+removing it at most 96 commands, measured 61 where it was 16,421; and `boot-probe`'s file on the
+scratch disk, now 64 pages, which must move the disk by no more than a read and two writes a page
+and 96 and 48 besides — 115 reads and 144 writes, where a block at a time made 427 and 328 and fails
+it. Four controls each fail a test: asking for runs of one, freeing an extent a block at a time, a
+run that runs past a block in use, and a free that does not stop at a group's end.
+
+**Under QEMU**, the four sets again on the same disk, before and after — counts are what to read
+here, not the times:
+
+| Under QEMU, the disk's counts | A block at a time: reads, writes, time | A run at a time |
+|---|---|---|
+| Set 1, `big` from the stick | 397,003, 327,948, 66.2 s | 69,487, 131,441, 31.8 s |
+| Set 2, `big` | 465,614, 327,948, 55.7 s | 138,099, 131,441, 19.5 s |
+| Set 2, `tree` | 373,172, 90,315, 39.1 s | 296,379, 44,236, 23.8 s |
+| Set 2, `small` | 1,535,645, 114,801, 129.3 s | 1,474,203, 77,939, 107.6 s |
+| Set 4, remove `u-big` | 328,956, 196,810, 43.0 s | 1,446, 304, 0.16 s |
+| Set 4, remove `u-small` | 316,256, 73,801, 41.5 s | 254,821, 36,940, 19.9 s |
+| Set 4, remove `u-tree` | 123,046, 55,466, 18.6 s | 46,246, 9,386, 3.8 s |
+
+A copy of `big` now writes exactly two commands a block, its zeroes and its data; removing a large
+file costs almost nothing. What `small` still spends is its directories, and set 3 writes only the
+stick, so it is unchanged. The root checked clean after the four sets.
+
+**Next**, from what is left on the disk: **the zeroes and the fill** — a grow writes zeroes over
+every block, and the page cache reads them back before the writer overwrites them, two of the four
+commands a copied block still costs. Ending them changes what the kernel and a server agree a new
+block holds, which is the block-run protocol's, so it gets a short detail pass before it is built.
+Then FAT's and ext4's directory work, and one command in flight. The laptop measures again when a
+batch of these has changed the picture, rather than after each.

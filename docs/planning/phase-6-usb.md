@@ -2852,7 +2852,21 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   script says to `kprint`, which on the laptop reaches nobody, so the script is `use`d at a prompt,
   whose terminal shows them. That gap is fixed in this part, after the laptop's runs.
 - **H.3 The laptop**, and Linux on it: the runs above, recorded.
+- **H.3 measured** (2026-10-09). Nitrox took **5,919 s for the fifteen runs against Linux's 889 s,
+  6.7 times as long**, unevenly: 12 to 67 times on the laptop's hard drive, 1 to 10 times writing to
+  the stick. Device-bound almost throughout, one 4 KiB command at a time. The costs, as the counters
+  order them: ext4's allocator, eight of the twelve commands a block copied and all eight of a block
+  removed; directory work per file that grows with the directory; FAT moving a copy's bytes twice;
+  and one command in flight. The table and the counts are in the decision log, beside what the runs
+  found that waits for after Part H.
 - **H.4 The fix**, and the laptop again, in the loop above; each fix with its count.
+- **H.4, the first fix: ext4 allocates and frees a run at a time** (2026-10-09), the maintainer's
+  pick over FAT's directory work. One pass over a group's bitmap a run, and the bitmap, descriptor
+  and superblock written once, where they were read and written for every block. Under QEMU a copy
+  of `big` within the disk went from 465,614 reads and 327,948 writes to 138,099 and 131,441 — two
+  writes a block, its zeroes and its data — and removing it from 328,956 and 196,810 to 1,446 and
+  304. Held by a host count and by `boot-probe`'s 64-page file. Next: the zeroes a grow writes and
+  the fill that reads them back, after a short detail pass, since that is the block-run protocol's.
 - **H.5 The number, and the docs.**
 
 ### Gates
