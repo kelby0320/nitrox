@@ -1730,7 +1730,10 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > **Measured** (2026-10-09, Part H.3): 6.7 times Linux's time on the laptop over fifteen runs, 12 to
 > 67 times on its hard drive — device-bound, one 4 KiB command at a time, ext4 spending twelve a
 > block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
-> those twelve gone. Open while Part H's loop runs.
+> those twelve gone. **The second**: what a grow adds is not read back (`UNWRITTEN`). **The third**:
+> each server caches its metadata (`libfsserver::cache`), so a directory is read once — under QEMU
+> the four sets went from about 1,645 s to 186. Open while Part H's loop runs; the laptop measures
+> next.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0

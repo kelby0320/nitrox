@@ -1567,6 +1567,161 @@ mod tests {
         assert!(*a.0.borrow() == before);
     }
 
+    /// **Nothing the metadata cache holds goes stale** (Phase 6 Part H.4). Through a cache of eight
+    /// blocks, so it evicts all the time: files made, grown and given data the way the kernel writes
+    /// it — to the device, behind the server — then renamed, removed and released, a directory
+    /// filled, emptied and removed so its blocks become new files' data, and files cut and grown back
+    /// over the bytes the kernel wrote. Every file then reads what it should, the directories list
+    /// what they should, and `e2fsck` finds the filesystem clean.
+    #[test]
+    fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
+        use libfsserver::cache::{MetaCache, Store};
+        use std::cell::RefCell;
+        const SIZE: usize = 6000;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let mut store = Box::new(Store::<8>::new());
+        let c = MetaCache::new(&rw, &mut store);
+        // The kernel's write-back: straight to the image, over the blocks the file's map names.
+        let kernel_writes = |path: &[u8], byte: u8| {
+            let mut runs = [BlockRun::default(); 8];
+            let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+            let mut img = rw.0.borrow_mut();
+            let mut left = m.size;
+            for r in &runs[..m.runs] {
+                for b in 0..r.length as u64 {
+                    let (at, n) = (((r.device_lba + b) * 4096) as usize, left.min(4096));
+                    img[at..at + n].fill(byte);
+                    left -= n;
+                }
+            }
+        };
+        let path = |dir: &str, name: &str| format!("/system/{dir}/{name}").into_bytes();
+
+        let sys = ext4::resolve_dir(&c, b"/system").unwrap();
+        ext4::mkdir_at(&c, sys, b"d1", TEST_NOW).unwrap();
+        for i in 0..200u8 {
+            let name = format!("f{i:03}");
+            ext4::create_file(&c, b"/system/d1", name.as_bytes(), TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &name), SIZE, TEST_NOW).unwrap();
+            kernel_writes(&path("d1", &name), i);
+        }
+        for i in 0..50 {
+            ext4::rename_path(&c, &path("d1", &format!("f{i:03}")), &path("d1", &format!("g{i:03}")), false, TEST_NOW)
+                .unwrap();
+        }
+        let d1 = ext4::resolve_dir(&c, b"/system/d1").unwrap();
+        for i in 50..100 {
+            let ino = ext4::unlink_at(&c, d1, format!("f{i:03}").as_bytes(), TEST_NOW).unwrap().unwrap();
+            ext4::release_inode(&c, ino, TEST_NOW).unwrap();
+        }
+        // A directory of a hundred names, emptied and removed: its blocks are free for data.
+        ext4::mkdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
+        let d2 = ext4::resolve_dir(&c, b"/system/d2").unwrap();
+        for i in 0..100 {
+            let name = format!("a-long-name-to-fill-blocks-{i:03}");
+            ext4::create_file(&c, b"/system/d2", name.as_bytes(), TEST_NOW).unwrap();
+        }
+        for i in 0..100 {
+            let name = format!("a-long-name-to-fill-blocks-{i:03}");
+            let ino = ext4::unlink_at(&c, d2, name.as_bytes(), TEST_NOW).unwrap().unwrap();
+            ext4::release_inode(&c, ino, TEST_NOW).unwrap();
+        }
+        ext4::rmdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
+        for i in 0..20 {
+            let name = format!("n{i:02}");
+            ext4::create_file(&c, b"/system/d1", name.as_bytes(), TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &name), SIZE, TEST_NOW).unwrap();
+            kernel_writes(&path("d1", &name), 0xEE);
+        }
+        // Cut and grown back: what the kernel wrote before the cut stays, and the rest reads zero.
+        for i in 150..160 {
+            ext4::truncate_file(&c, &path("d1", &format!("f{i:03}")), 1000, TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &format!("f{i:03}")), SIZE, TEST_NOW).unwrap();
+        }
+        let mut want: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..50u8 {
+            want.push((format!("g{i:03}"), vec![i; SIZE]));
+        }
+        for i in 100..200u8 {
+            let cut = (150..160).contains(&i);
+            let bytes = (0..SIZE).map(|at| if cut && at >= 1000 { 0 } else { i }).collect();
+            want.push((format!("f{i:03}"), bytes));
+        }
+        for i in 0..20 {
+            want.push((format!("n{i:02}"), vec![0xEE; SIZE]));
+        }
+        let mut out = vec![0u8; ext4::MAX_FILE];
+        for (name, bytes) in &want {
+            let n = ext4::read_file(&c, &path("d1", name), &mut out).unwrap();
+            assert!(out[..n] == bytes[..], "{name} reads what was written");
+        }
+        let mut names = names_of(&rw, b"/system/d1");
+        names.retain(|n| n != "." && n != "..");
+        names.sort();
+        let mut expected: Vec<String> = want.iter().map(|(n, _)| n.clone()).collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert!(!names_of(&rw, b"/system").iter().any(|n| n == "d2"));
+        drop(c);
+        assert_e2fsck_clean(&rw.0.borrow(), "meta-cache");
+
+        // **A file's data is never answered from the cache**: read through one large enough to keep
+        // it, written again by the kernel, and read at once — the new bytes, not the ones read.
+        let mut store = Box::new(Store::<64>::new());
+        let c = MetaCache::new(&rw, &mut store);
+        for i in 0..5u8 {
+            let p = path("d1", &format!("g{i:03}"));
+            ext4::read_file(&c, &p, &mut out).unwrap();
+            kernel_writes(&p, 0xA0 + i);
+            let n = ext4::read_file(&c, &p, &mut out).unwrap();
+            assert!(out[..n].iter().all(|&b| b == 0xA0 + i), "g{i:03} reads what the kernel wrote last");
+        }
+    }
+
+    /// **A directory is read from the device once** (Phase 6 Part H.4). Through a server's cache, a
+    /// lookup that misses in a directory of 4,096 names reads the directory, twenty blocks; one that
+    /// finds a file then reads at most that file's inode-table block; and every lookup again reads
+    /// nothing. Uncached, each of them scanned the directory from the device.
+    #[test]
+    fn a_directory_is_read_from_the_device_once_through_the_cache() {
+        use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
+        let rw = Counting::new(fixture_blocks(4096, 16384, 0, b"seed\n"));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::mkdir_at(&rw, sys, b"big", TEST_NOW).unwrap();
+        for i in 0..4096 {
+            ext4::create_file(&rw, b"/system/big", format!("S{i:04}.BIN").as_bytes(), TEST_NOW).unwrap();
+        }
+        // SAFETY: a `Store` of all zeroes is an empty one, and a megabyte is too much to build on a
+        // test's stack, as `Box::new` would.
+        let mut store = unsafe { Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init() };
+        let c = MetaCache::new(&rw, &mut store);
+        let mut runs = [BlockRun::default(); 4];
+        let lookups = ["S1000.BIN", "S3000.BIN", "S4095.BIN"];
+        let uncached = || {
+            rw.take();
+            ext4::map_file(&rw, b"/system/big/S3000.BIN", &mut [BlockRun::default(); 4]).unwrap();
+            rw.take().0
+        };
+        let scan = uncached();
+
+        rw.take();
+        assert_eq!(ext4::map_file(&c, b"/system/big/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+        let (missed, _) = rw.take();
+        for name in lookups {
+            ext4::map_file(&c, format!("/system/big/{name}").as_bytes(), &mut runs).unwrap();
+            let (found, _) = rw.take();
+            assert!(found <= 1, "{name}: {found} reads, its inode's block at most");
+        }
+        for _ in 0..3 {
+            assert_eq!(ext4::map_file(&c, b"/system/big/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+            for name in lookups {
+                ext4::map_file(&c, format!("/system/big/{name}").as_bytes(), &mut runs).unwrap();
+            }
+        }
+        assert_eq!(rw.take().0, 0, "every lookup again reads nothing");
+        assert!(missed >= 20 && scan >= 15, "a miss read the directory ({missed}); uncached, a hit did too ({scan})");
+    }
+
     #[test]
     fn unlink_at_removes_a_file_and_stays_e2fsck_clean() {
         use std::cell::RefCell;

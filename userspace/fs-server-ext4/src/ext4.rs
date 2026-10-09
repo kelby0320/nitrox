@@ -324,7 +324,7 @@ pub fn block_size<R: BlockReader>(r: &R) -> Result<u32, FsError> {
 
 pub(crate) fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
     let mut sb = [0u8; 1024];
-    r.read_at(1024, &mut sb)?;
+    r.read_meta(1024, &mut sb)?;
     parse_superblock(&sb).map_err(Unservable::fs_error)
 }
 
@@ -357,12 +357,12 @@ fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 2
     let gd_off =
         sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
     let mut gd = [0u8; 32];
-    r.read_at(gd_off, &mut gd)?;
+    r.read_meta(gd_off, &mut gd)?;
     let inode_table = rd_u32(&gd, 8) as u64;
     let off = inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
-    r.read_at(off, &mut inode[..n])?;
+    r.read_meta(off, &mut inode[..n])?;
     Ok(inode)
 }
 
@@ -405,7 +405,7 @@ fn dir_lookup<R: BlockReader>(
         if phys == 0 {
             continue;
         }
-        r.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        r.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
         while off + 8 <= bs {
             let e_ino = rd_u32(&buf, off);
@@ -565,7 +565,7 @@ fn read_dir_inner<R: BlockReader>(
                 pos = (lb + 1) * bs;
                 continue;
             }
-            r.read_at(phys * bs, &mut buf[..bs as usize])?;
+            r.read_meta(phys * bs, &mut buf[..bs as usize])?;
             loaded_block = lb;
         }
         // Bounds: an entry needs at least its 8-byte header within the block.
@@ -808,7 +808,7 @@ pub fn mark_clean<RW: BlockReader + BlockWriter>(rw: &RW) -> Result<(), FsError>
 fn set_state<RW: BlockReader + BlockWriter>(rw: &RW, f: impl Fn(u16) -> u16) -> Result<(), FsError> {
     read_superblock(rw)?;
     let mut s = [0u8; 2];
-    rw.read_at(S_STATE_AT, &mut s)?;
+    rw.read_meta(S_STATE_AT, &mut s)?;
     rw.write_at(S_STATE_AT, &f(u16::from_le_bytes(s)).to_le_bytes())
 }
 
@@ -898,7 +898,7 @@ pub(crate) fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> 
     let index = (ino - 1) % sb.inodes_per_group;
     let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
     let mut gd = [0u8; 32];
-    r.read_at(gd_off, &mut gd)?;
+    r.read_meta(gd_off, &mut gd)?;
     let inode_table = rd_u32(&gd, 8) as u64;
     Ok(inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64)
 }
@@ -959,7 +959,7 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
     for n in 0..groups {
         let group = (first + n) % groups;
         let gd_off = sb.group_desc_offset(group);
-        rw.read_at(gd_off, &mut gd[..dsz])?;
+        rw.read_meta(gd_off, &mut gd[..dsz])?;
         // bg_free_blocks_count_lo @12. Zero means skip — see the doc comment.
         let gfree = rd_u16(&gd, 12);
         if gfree == 0 {
@@ -967,7 +967,7 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
         }
         let capacity = sb.blocks_in_group(group);
         let bitmap_block = rd_u32(&gd, 0) as u64; // bg_block_bitmap_lo
-        rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        rw.read_meta(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
 
         let group_start = sb.group_start(group);
         // The goal bit is only a preference, and only in the group it belongs to.
@@ -996,7 +996,7 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
         gd[12..14].copy_from_slice(&(gfree - len as u16).to_le_bytes());
         rw.write_at(gd_off, &gd[..dsz])?;
         let mut sbbuf = [0u8; 1024];
-        rw.read_at(1024, &mut sbbuf)?;
+        rw.read_meta(1024, &mut sbbuf)?;
         let sfree = rd_u32(&sbbuf, 12).wrapping_sub(len as u32);
         sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
         rw.write_at(1024, &sbbuf)?;
@@ -1186,14 +1186,14 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
     let mut bitmap = [0u8; MAX_BLOCK];
     for group in 0..sb.group_count() {
         let gd_off = sb.group_desc_offset(group);
-        rw.read_at(gd_off, &mut gd[..dsz])?;
+        rw.read_meta(gd_off, &mut gd[..dsz])?;
         // bg_free_inodes_count_lo @14. Zero means skip without reading the bitmap.
         if rd_u16(&gd, 14) == 0 {
             continue;
         }
         let capacity = sb.inodes_in_group(group);
         let ibitmap_block = rd_u32(&gd, 4) as u64; // bg_inode_bitmap_lo
-        rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        rw.read_meta(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
         let Some(idx) = (0..capacity).find(|&i| bit_clear(&bitmap, i)) else {
             continue; // the count disagreed with the bitmap; try the next group
         };
@@ -1206,7 +1206,7 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
         gd[14..16].copy_from_slice(&gfree.to_le_bytes());
         rw.write_at(gd_off, &gd[..dsz])?;
         let mut sbbuf = [0u8; 1024];
-        rw.read_at(1024, &mut sbbuf)?;
+        rw.read_meta(1024, &mut sbbuf)?;
         let sfree = rd_u32(&sbbuf, 16).wrapping_sub(1);
         sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
         rw.write_at(1024, &sbbuf)?;
@@ -1258,7 +1258,7 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
         if phys == 0 {
             continue;
         }
-        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
         while off + 8 <= bs {
             let e_ino = rd_u32(&buf, off);
@@ -1433,7 +1433,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
     let dsz = (sb.desc_size as usize).min(64);
     let mut gd = [0u8; 64];
-    rw.read_at(gd_off, &mut gd[..dsz])?;
+    rw.read_meta(gd_off, &mut gd[..dsz])?;
     let ibitmap_block = rd_u32(&gd, 4) as u64;
 
     // Mark the inode itself deleted: `e2fsck` decides an inode is in use from its
@@ -1444,7 +1444,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     let ioff = inode_offset(rw, sb, ino)?;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
-    rw.read_at(ioff, &mut inode[..n])?;
+    rw.read_meta(ioff, &mut inode[..n])?;
     // `i_dtime` doubles as the orphan-list "next" pointer while `i_links_count == 0`; a
     // small value looks like an inode number and `e2fsck` reads it as a corrupted orphan
     // chain. The real deletion time is both correct and unambiguously not an inode ref;
@@ -1455,7 +1455,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     rw.write_at(ioff, &inode[..n])?;
 
     let mut bitmap = [0u8; MAX_BLOCK];
-    rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    rw.read_meta(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
     bit_unset(&mut bitmap, index);
     rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
@@ -1469,7 +1469,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     rw.write_at(gd_off, &gd[..dsz])?;
     // Superblock free-inode count (@16, u32).
     let mut sbbuf = [0u8; 1024];
-    rw.read_at(1024, &mut sbbuf)?;
+    rw.read_meta(1024, &mut sbbuf)?;
     let sfree = rd_u32(&sbbuf, 16).wrapping_add(1);
     sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
     rw.write_at(1024, &sbbuf)?;
@@ -1506,6 +1506,9 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
     if phys < sb.first_data_block as u64 || end > sb.blocks_count {
         return Err(FsError::Corrupt);
     }
+    // What is freed may next be a file's, which the kernel writes behind this server's back: a
+    // metadata cache lets it go (Phase 6 Part H.4).
+    rw.forget(phys * bs as u64, len * bs as u64);
     let dsz = (sb.desc_size as usize).min(64);
     let mut gd = [0u8; 64];
     let mut bitmap = [0u8; MAX_BLOCK];
@@ -1516,9 +1519,9 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
         let index = (rel % per_group) as usize;
         let n = (end - blk).min(per_group - index as u64) as usize;
         let gd_off = sb.group_desc_offset(group);
-        rw.read_at(gd_off, &mut gd[..dsz])?;
+        rw.read_meta(gd_off, &mut gd[..dsz])?;
         let bitmap_block = rd_u32(&gd, 0) as u64;
-        rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        rw.read_meta(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
         let mut cleared = 0u16;
         for i in index..index + n {
             if !bit_clear(&bitmap, i) {
@@ -1532,7 +1535,7 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
         gd[12..14].copy_from_slice(&gfree.to_le_bytes());
         rw.write_at(gd_off, &gd[..dsz])?;
         let mut sbbuf = [0u8; 1024];
-        rw.read_at(1024, &mut sbbuf)?;
+        rw.read_meta(1024, &mut sbbuf)?;
         let sfree = rd_u32(&sbbuf, 12).wrapping_add(cleared as u32);
         sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
         rw.write_at(1024, &sbbuf)?;
@@ -1576,7 +1579,7 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
         if phys == 0 {
             continue;
         }
-        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
         let mut prev: Option<usize> = None;
         while off + 8 <= bs {
@@ -1623,7 +1626,7 @@ fn adjust_links<RW: BlockReader + BlockWriter>(
     let off = inode_offset(rw, sb, ino)?;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
-    rw.read_at(off, &mut inode[..n])?;
+    rw.read_meta(off, &mut inode[..n])?;
     let links = (rd_u16(&inode, 26) as i32 + delta) as u16;
     inode[26..28].copy_from_slice(&links.to_le_bytes());
     rw.write_at(off, &inode[..n])?;
@@ -1706,7 +1709,7 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
         let gd_off = sb.group_desc_offset((new_ino - 1) / sb.inodes_per_group);
         let dsz = (sb.desc_size as usize).min(64);
         let mut gd = [0u8; 64];
-        rw.read_at(gd_off, &mut gd[..dsz])?;
+        rw.read_meta(gd_off, &mut gd[..dsz])?;
         let used = rd_u16(&gd, 16).wrapping_add(1);
         gd[16..18].copy_from_slice(&used.to_le_bytes());
         rw.write_at(gd_off, &gd[..dsz])?;
@@ -1875,7 +1878,7 @@ fn dir_repoint<RW: BlockReader + BlockWriter>(
         if phys == 0 {
             continue;
         }
-        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
         while off + 8 <= bs {
             let e_ino = rd_u32(&buf, off);

@@ -26,6 +26,10 @@ servers speak one protocol and a fix to it is a fix to both:
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
   **None of the three is `Sync`**: each moves every transfer through one scratch mapping.
+- **`cache.rs`** — **`MetaCache`** (Phase 6 Part H.4), the metadata cache each server serves its
+  filesystem through: a fixed store of 4 KiB blocks, filled only by `BlockReader::read_meta`, every
+  write through to the device and into any copy it holds, `BlockWriter::forget` letting freed blocks
+  go. A server keeps its `Store` in a `static` (`SERVER_BLOCKS`, 1 MiB, `.bss`).
 - **`server.rs`** — the bootstrap and the loop: the setup message, `Ready` or a refusal, the
   forwarding endpoint, directory sessions and their wait slots, a rename resolved ahead of a
   session, `File::Forget` before a file is freed, `File::Touch` by id, and `Meta::Unmount`.
@@ -45,6 +49,13 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
+- **`read_meta` is for what only the server writes**: directories, inode tables, bitmaps,
+  descriptors, superblocks, extent nodes, the FAT. **Never a file's data**, which the kernel writes
+  to the device behind the server's back — a cached copy of it would be stale. A read left as
+  `read_at` is only slower; one wrongly made `read_meta` returns old bytes. **And whatever a library
+  frees it `forget`s**, so a block that may next be a file's leaves the cache. Each server's crate
+  holds this in a test that writes data the kernel's way under a cache that evicts all the time, and
+  reads it back.
 - **The device layer's granularity is a measured question** (`TODO(fs-throughput)`, Phase 6 Part H).
   Change what `Disk` moves per submit with a number from the laptop, not a guess.
 

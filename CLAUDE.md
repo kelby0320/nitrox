@@ -124,7 +124,7 @@ the kernel's rescan replaces with the watch pinged though no mount changed. Sinc
 `boot-probe` holds the **I/O counters** to a write: a file synced on the scratch disk moves its
 writes and the page cache's write-backs in `/dev/devices/io.tsm` by at least the file's pages —
 and, since Part H.4, by no more than ext4 allocating a run at a time costs, with no read a page:
-what a grow added fills as zero without one.
+what a grow added fills as zero without one, and the server reads its metadata once.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
 the real prompt over the serial console and matches on what comes back — 37 steps,

@@ -23,7 +23,8 @@ H.1 (2026-10-08): **extent trees** — written, cut and freed at any depth; an e
 ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes nothing with it —
 § *The extent tree*. Phase 6 Part H.4 (2026-10-09): **blocks are allocated and freed a run at a
 time**, and **a grow's reply marks what it added `UNWRITTEN`**, so its zeroes are not read back —
-§ *Part D*.
+§ *Part D* — and the server reads its metadata through **a cache**, so a directory is read from the
+device once (`libfsserver::cache`).
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**

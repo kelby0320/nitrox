@@ -12,7 +12,8 @@ file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 P
 2026-10-08). The page cache's write-backs are counted, and the cache's counters served at
 `/dev/registry/io` (Phase 6 Part H.2, 2026-10-08). **A grow's reply marks what it added
 `UNWRITTEN`**, and the kernel fills such a page without reading the device (Phase 6 Part H.4,
-2026-10-09).
+2026-10-09). **A server caches its metadata and never a file's data**, which the kernel writes to
+the device behind it (`libfsserver::cache`, the same part).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first

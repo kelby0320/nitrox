@@ -185,7 +185,7 @@ fn read_node<R: BlockReader>(
         return Err(FsError::Corrupt);
     }
     let bs = sb.block_size as usize;
-    r.read_at(blk * bs as u64, &mut buf[..bs])?;
+    r.read_meta(blk * bs as u64, &mut buf[..bs])?;
     let h = header(&buf[..bs], block_cap(sb))?;
     if h.depth != depth {
         return Err(FsError::Corrupt);
@@ -325,7 +325,7 @@ impl Lookup {
                 return Err(FsError::Corrupt);
             }
             let bs = sb.block_size as usize;
-            r.read_at(child * bs as u64, &mut self.leaf[..bs])?;
+            r.read_meta(child * bs as u64, &mut self.leaf[..bs])?;
             (bytes, cap) = (bs, block_cap(sb));
             depth -= 1;
         }

@@ -35314,3 +35314,59 @@ source's own reads within the disk — and a copy onto the FAT stick reads nothi
 copied block costs three commands on ext4 — the zeroes, the data, and the source's read — and the
 directories are what `small` spends. The stick checked whole and the root clean after the round, its
 bitmap the same as a freshly prepared disk's.
+
+## 2026-10-09 — Phase 6 Part H.4, the third fix: each server caches its metadata
+
+**What dominated.** With the allocator and the read-back gone, a copy's time was its directories.
+Measured on the host through each server's own code, every operation re-walked its path and
+re-scanned its directory from the device: in a directory of 4,096 names, ext4 spent about 21 reads
+to find a file, 50 to create one and 29 to grow it, and FAT 127 commands to find a file — a
+directory read a sector a command — and 260 to create one. A copied file is about eight such
+operations (`libfs`'s copy asks whether the source is a directory, its size, whether the destination
+exists, opens the source, then creates the destination and grows it), which is the 356 to 782 reads
+a file the runs counted.
+
+**What it is.** `libfsserver::cache::MetaCache`, a store of 4 KiB blocks in front of each server's
+device — 1 MiB, a `static` in `.bss` — least recently used goes. **Only what the server alone writes
+goes in it**: `BlockReader` gains `read_meta`, which the libraries call for their own structures —
+ext4's directories, inode tables, bitmaps, descriptors, superblock and extent nodes; FAT's
+directories, FAT and FSInfo — and every other read, a file's data above all, stays `read_at` and
+reaches the device, since the kernel writes data there behind the server's back. A missed call site
+is only slower; a data read made `read_meta` would answer old bytes. **Every write goes to the
+device and into any cached copy**, a failed one letting the copy go; and `BlockWriter` gains
+`forget`, which ext4's `free_run` and FAT's `free_chain` call, so a freed block — which may next be
+a file's — leaves the cache. The default methods keep every other reader and writer as it was, the
+installer's among them. A directory is now read from the device once, in whole blocks.
+
+**Held by**: the cache's own tests (a metadata block read once, data every time; a write updating
+the copy, a failed one dropping it, `forget` dropping it; the oldest going; a partition's ragged end
+read as asked); a test through each filesystem under a cache of eight blocks, so it evicts all the
+time — files made, grown and written the kernel's way, renamed, removed and released, a directory's
+blocks freed into new files' data, files cut and grown back — after which every file reads what was
+written, the directory lists what it should, and `e2fsck` or `fsck.fat -n` is clean; then, through a
+larger cache, a file read, rewritten by the kernel and read at once must read the new bytes; a
+lookup count in each, a directory read once and every lookup after it reading nothing; and
+`boot-probe`'s 64-page file, now at most 32 reads — 12, where the uncached servers made 51 to 58.
+Controls: a cache that does not update its copies on a write fails both filesystems' tests, a file's
+data read with `read_meta` fails each of them at the re-read, and a server whose cache answers
+nothing fails `test-qemu`.
+
+**Under QEMU**, the four sets again on the same disk:
+
+| Under QEMU | Before: time, the device's reads | After |
+|---|---|---|
+| Set 1, `small` from the stick: the stick | 613.5 s, 3,202,635 | 46.5 s, 16,443 |
+| Set 1, `tree` from the stick | 25.7 s | 8.7 s |
+| Set 2, `small` within the disk | 105.9 s, 1,457,826 | 14.1 s, 50,065 |
+| Set 2, `tree` within the disk | 22.4 s, 279,992 | 5.3 s, 24,880 |
+| Set 3, `small` to the stick: the stick | 683.3 s, 3,741,159 | 41.5 s, 12,369 |
+| Set 4, remove `u-small` on the disk | 19.8 s | 4.9 s |
+| Set 4, remove `c-small` on the stick | 68.8 s | 2.7 s |
+| The four sets, as the driver timed them | 663 + 143 + 721 + 118 s | 75 + 34 + 61 + 16 s |
+
+The stick checked whole and the root clean after the round, its bitmap the same as a freshly
+prepared disk's. **Also seen on the way, and left alone**: a FAT create in a large directory is
+CPU-heavy in a debug build — 1,024 of them took 17 seconds in the host suite — and 50 times faster
+in release, which is what runs; and `libfs`'s copy asks the servers more than it needs to, the
+source's size and handle separately and whether a listed child is a directory, which the cache now
+makes cheap. The laptop measures next, the three fixes in.

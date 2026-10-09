@@ -54,8 +54,9 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
   `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
   `MemoryObject`, a write smaller than a block reading the block first (this said
-  "sector-at-a-time" until 2026-10-06). **Alloc-free** — fixed `.bss` buffers, no
-  `#[global_allocator]`.
+  "sector-at-a-time" until 2026-10-06) — **served through `libfsserver::cache::MetaCache`** since
+  Phase 6 Part H.4, so a directory, an inode-table block or a bitmap is read from the device once.
+  **Alloc-free** — fixed `.bss` buffers, the cache's 1 MiB among them, no `#[global_allocator]`.
 
 ## Scope
 
@@ -110,6 +111,9 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
   buffer-based only.
   The list names every module because a rules file that enumerates three of four is one that
   permits the fourth by omission (PR #310 review).
+- Reading **file data with `read_meta`** — the kernel writes it behind the server's back, so a
+  cached copy goes stale. Everything else this library reads is metadata, and reads it with
+  `read_meta`; `read_file` and `read_file_range` read data with `read_at` (Phase 6 Part H.4).
 - Touching **file data** — the kernel owns the data path (Model A); the server writes
   only metadata (bitmaps, extent tree, inode, superblock). **One exception, deliberate**
   (administration Part C.1): `grow_file` writes zeroes over what it adds — the old last block's

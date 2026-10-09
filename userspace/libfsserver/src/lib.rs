@@ -21,6 +21,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod block;
+pub mod cache;
 pub mod disk;
 pub mod serve;
 pub mod server;

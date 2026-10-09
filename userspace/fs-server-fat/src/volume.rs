@@ -179,7 +179,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
             return Err(FsError::NotFound);
         }
         let mut e = [0u8; 32];
-        self.r.read_at(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
+        self.r.read_meta(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
         let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
         let named = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
         if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || named != c {
@@ -205,7 +205,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
     fn raw_entry(&self, g: &Geometry, cache: &mut Cache, dir: Dir, slot: u32) -> Result<[u8; 32], FsError> {
         let at = dir::slot_byte(self.r, g, cache, dir, slot)?.ok_or(FsError::Corrupt)?;
         let mut e = [0u8; 32];
-        self.r.read_at(at, &mut e)?;
+        self.r.read_meta(at, &mut e)?;
         Ok(e)
     }
 
@@ -420,7 +420,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             return Ok(None);
         }
         let mut s = [0u8; SECTOR as usize];
-        self.r.read_at(g.fsinfo as u64 * SECTOR as u64, &mut s)?;
+        self.r.read_meta(g.fsinfo as u64 * SECTOR as u64, &mut s)?;
         let sig = |at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
         Ok((sig(0) == 0x4161_5252 && sig(484) == 0x6141_7272 && sig(508) == 0xAA55_0000).then_some(s))
     }

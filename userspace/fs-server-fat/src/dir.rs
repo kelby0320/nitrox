@@ -99,7 +99,7 @@ fn walk<R: BlockReader>(
     let per_sector = SECTOR / ENTRY;
     // Every sector of the directory from the one holding `from`, as (its byte, its first slot).
     let mut visit = |at: u64, first: u32, sector: &mut [u8; SECTOR as usize]| -> Result<bool, FsError> {
-        r.read_at(at, sector)?;
+        r.read_meta(at, sector)?;
         for k in 0..per_sector {
             let slot = first + k;
             if slot < from {
@@ -610,7 +610,7 @@ pub fn rewrite<RW: BlockReader + BlockWriter>(
             k += 1;
         }
         let bytes = &mut buf[..(k * ENTRY) as usize];
-        rw.read_at(at, bytes)?;
+        rw.read_meta(at, bytes)?;
         for (j, e) in bytes.chunks_exact_mut(ENTRY as usize).enumerate() {
             f(s + j as u32, e.try_into().unwrap());
         }
@@ -638,7 +638,7 @@ pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) 
     }
     let at = slot_byte(r, g, cache, dir, 1)?.ok_or(FsError::Corrupt)?;
     let mut e = [0u8; 32];
-    r.read_at(at, &mut e)?;
+    r.read_meta(at, &mut e)?;
     if &e[..11] != DOTDOT {
         return Err(FsError::Corrupt);
     }

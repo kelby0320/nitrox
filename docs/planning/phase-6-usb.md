@@ -2873,6 +2873,14 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   blocks of the disk where it read 69,487, and a copy of it to the stick 1,298 of the stick where it
   read 66,835. Held by host tests in the kernel and both servers and by `boot-probe`'s 64-page file,
   now at most 80 reads. Piece 2, the zeroes, waits for a measurement.
+- **H.4, the third fix: each server caches its metadata** (2026-10-09). `libfsserver`'s `MetaCache`,
+  1 MiB of 4 KiB blocks in front of each server's device, filled by `read_meta` — directories,
+  inodes, bitmaps, the FAT, what only the server writes — never by a file's data, which the kernel
+  writes behind it; writes go through, and freed blocks are forgotten. Under QEMU `small/` from the
+  stick went from 613 s to 46, within the disk from 106 s to 14, and to the stick from 683 s to 42;
+  the four sets from about 1,645 s to 186. Held by a test through each filesystem under a cache that
+  evicts all the time, lookup counts, and `boot-probe`'s 64-page file, now at most 32 reads. **Next:
+  the laptop measures again**, with the three fixes in.
 - **H.5 The number, and the docs.**
 
 ### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back

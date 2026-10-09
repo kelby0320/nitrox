@@ -2,8 +2,8 @@
 
 **Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; a stick mounted
 writable on a live boot too, and ejected by a session, since Part F; a formatter, `mkfs`, since
-Part G; a grow's reply marking what it added `UNWRITTEN` since Phase 6 Part H.4, 2026-10-09; last
-checked 2026-10-09.**
+Part G; a grow's reply marking what it added `UNWRITTEN`, and its directories read through a
+metadata cache, since Phase 6 Part H.4, 2026-10-09; last checked 2026-10-09.**
 `userspace/fs-server-fat` serves FAT12, FAT16 and FAT32 read-write, with long names, over
 `libfsserver`'s protocol. The storage service spawns it for a FAT on a removable disk, and for any
 FAT an administrator mounts ([`storage.md`](storage.md) §6). Its host tests build images with

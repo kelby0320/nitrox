@@ -533,3 +533,188 @@ fn a_read_with_every_slot_dirty_is_refused_and_loses_nothing() {
     assert_eq!(cache.next(&disk, &g, beyond), Err(FsError::Io));
     assert_eq!(cache.flush(&disk, &g).unwrap(), 2, "all 64 still dirty: one run, to each copy");
 }
+
+/// **Nothing the metadata cache holds goes stale** (Phase 6 Part H.4), as `fs-server-ext4`'s test
+/// holds it for ext4. Through a cache of eight blocks, so it evicts all the time: files made, grown
+/// and given data the way the kernel writes it — to the device, behind the server — then renamed,
+/// removed and released, a directory filled, emptied and removed so its clusters become new files'
+/// data, and files cut and grown back. Every file then reads what it should, its directory lists
+/// what it should, and `fsck.fat -n` finds the volume clean.
+#[test]
+fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
+    use libfsserver::cache::{MetaCache, Store};
+    const SIZE: usize = 6000;
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    let mut store = Box::new(Store::<8>::new());
+    let cached = MetaCache::new(&disk, &mut store);
+    let fat = Fat::new(&cached);
+    // The kernel's write-back: straight to the image, over the sectors the file's map names.
+    let kernel_writes = |path: &[u8], byte: u8| {
+        let mut runs = [BlockRun::default(); 64];
+        let m = fat.map_file(path, &mut runs).unwrap();
+        for r in &runs[..m.runs] {
+            let from = r.file_block as usize * 512;
+            let to = (from + r.length as usize * 512).min(m.size);
+            if from < to {
+                disk.write_at(r.device_lba * 512, &vec![byte; to - from]).unwrap();
+            }
+        }
+    };
+    let path = |dir: &str, name: &str| format!("/{dir}/{name}").into_bytes();
+
+    let root = fat.resolve_dir(b"/").unwrap();
+    fat.mkdir_at(root, b"d1", NOW).unwrap();
+    for i in 0..150u8 {
+        let name = format!("f{i:03}.bin");
+        fat.create_file(b"/d1", name.as_bytes(), NOW).unwrap();
+        fat.grow_file(&path("d1", &name), SIZE, NOW).unwrap();
+        kernel_writes(&path("d1", &name), i);
+    }
+    for i in 0..30 {
+        let (from, to) = (path("d1", &format!("f{i:03}.bin")), path("d1", &format!("g{i:03}.bin")));
+        fat.rename_path(&from, &to, false, NOW).unwrap();
+    }
+    let d1 = fat.resolve_dir(b"/d1").unwrap();
+    for i in 30..60 {
+        if let Some(id) = fat.unlink_at(d1, format!("f{i:03}.bin").as_bytes(), NOW).unwrap() {
+            fat.release(id, NOW).unwrap();
+        }
+    }
+    // A directory of eighty long names, emptied and removed: its clusters are free for data.
+    fat.mkdir_at(root, b"d2", NOW).unwrap();
+    let d2 = fat.resolve_dir(b"/d2").unwrap();
+    for i in 0..80 {
+        fat.create_file(b"/d2", format!("a long name to fill a directory {i:03}.txt").as_bytes(), NOW).unwrap();
+    }
+    for i in 0..80 {
+        let name = format!("a long name to fill a directory {i:03}.txt");
+        if let Some(id) = fat.unlink_at(d2, name.as_bytes(), NOW).unwrap() {
+            fat.release(id, NOW).unwrap();
+        }
+    }
+    fat.rmdir_at(root, b"d2", NOW).unwrap();
+    for i in 0..20 {
+        let name = format!("n{i:02}.bin");
+        fat.create_file(b"/d1", name.as_bytes(), NOW).unwrap();
+        fat.grow_file(&path("d1", &name), SIZE, NOW).unwrap();
+        kernel_writes(&path("d1", &name), 0xEE);
+    }
+    // Cut and grown back: what the kernel wrote before the cut stays, and the rest reads zero.
+    for i in 120..130 {
+        if let Some(id) = fat.truncate_file(&path("d1", &format!("f{i:03}.bin")), 1000, NOW).unwrap() {
+            fat.release(id, NOW).unwrap();
+        }
+        fat.grow_file(&path("d1", &format!("f{i:03}.bin")), SIZE, NOW).unwrap();
+    }
+    let mut want: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..30u8 {
+        want.push((format!("g{i:03}.bin"), vec![i; SIZE]));
+    }
+    for i in 60..150u8 {
+        let cut = (120..130).contains(&i);
+        want.push((format!("f{i:03}.bin"), (0..SIZE).map(|at| if cut && at >= 1000 { 0 } else { i }).collect()));
+    }
+    for i in 0..20 {
+        want.push((format!("n{i:02}.bin"), vec![0xEE; SIZE]));
+    }
+    let mut out = vec![0u8; libfsserver::serve::MAX_FILE];
+    for (name, bytes) in &want {
+        let n = fat.read_file(&path("d1", name), &mut out).unwrap();
+        assert!(out[..n] == bytes[..], "{name} reads what was written");
+    }
+    let mut names = Vec::new();
+    fat.read_dir(d1, 0, |e| {
+        names.push(String::from_utf8_lossy(e.name).into_owned());
+        true
+    })
+    .unwrap();
+    let mut names: BTreeSet<String> = names.into_iter().filter(|n| n != "." && n != "..").collect();
+    let expected: BTreeSet<String> = want.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, expected);
+    names.clear();
+    fat.mark_clean().unwrap();
+    let (code, said) = fsck(&img);
+    assert_eq!(code, 0, "fsck.fat -n said\n{said}");
+
+    // **A file's data is never answered from the cache**: read through one large enough to keep it,
+    // written again by the kernel, and read at once — the new bytes, not the ones read.
+    let mut big = Box::new(Store::<64>::new());
+    let cached = MetaCache::new(&disk, &mut big);
+    let fat = Fat::new(&cached);
+    for i in 0..5u8 {
+        let p = path("d1", &format!("g{i:03}.bin"));
+        fat.read_file(&p, &mut out).unwrap();
+        let mut runs = [BlockRun::default(); 64];
+        let m = fat.map_file(&p, &mut runs).unwrap();
+        for r in &runs[..m.runs] {
+            let from = r.file_block as usize * 512;
+            let to = (from + r.length as usize * 512).min(m.size);
+            if from < to {
+                disk.write_at(r.device_lba * 512, &vec![0xA0 + i; to - from]).unwrap();
+            }
+        }
+        let n = fat.read_file(&p, &mut out).unwrap();
+        assert!(out[..n].iter().all(|&b| b == 0xA0 + i), "g{i:03}.bin reads what the kernel wrote last");
+    }
+}
+
+/// **A directory is read from the device once** (Phase 6 Part H.4), as ext4's test holds it. FAT
+/// read a directory a sector a command, and every lookup read it again: in a directory of 4,096
+/// names, 127 commands to find a file half way, measured. Through a server's cache, a lookup that
+/// misses reads the directory in 4 KiB blocks, and every lookup after it reads nothing — here in a
+/// directory of 1,024, which a debug build makes in seconds rather than minutes.
+#[test]
+fn a_directory_is_read_from_the_device_once_through_the_cache() {
+    use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
+    use std::cell::Cell;
+    /// The image, counting the commands that reach it.
+    struct Counted<'a>(&'a FileImage, Cell<u32>);
+    impl BlockReader for Counted<'_> {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.1.set(self.1.get() + 1);
+            self.0.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Counted<'_> {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.0.write_at(offset, buf)
+        }
+    }
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    {
+        // SAFETY: a `Store` of all zeroes is an empty one, and a megabyte is too much to build on a
+        // test's stack, as `Box::new` would.
+        let mut store = unsafe { Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init() };
+        let cached = MetaCache::new(&disk, &mut store);
+        let fat = Fat::new(&cached);
+        let root = fat.resolve_dir(b"/").unwrap();
+        fat.mkdir_at(root, b"small", NOW).unwrap();
+        for i in 0..1024 {
+            fat.create_file(b"/small", format!("S{i:04}.BIN").as_bytes(), NOW).unwrap();
+        }
+        fat.mark_clean().unwrap();
+    }
+    let counted = Counted(&disk, Cell::new(0));
+    let mut runs = [BlockRun::default(); 64];
+    let uncached = Fat::new(&counted);
+    uncached.map_file(b"/small/S0900.BIN", &mut runs).unwrap();
+    let scan = counted.1.take();
+
+    // SAFETY: a `Store` of all zeroes is an empty one, and a megabyte is too much to build on a
+    // test's stack, as `Box::new` would.
+    let mut store = unsafe { Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init() };
+    let cached = MetaCache::new(&counted, &mut store);
+    let fat = Fat::new(&cached);
+    assert_eq!(fat.map_file(b"/small/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+    let missed = counted.1.take();
+    for _ in 0..3 {
+        assert_eq!(fat.map_file(b"/small/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+        for name in ["S0000.BIN", "S0500.BIN", "S1023.BIN"] {
+            fat.map_file(format!("/small/{name}").as_bytes(), &mut runs).unwrap();
+        }
+    }
+    assert_eq!(counted.1.take(), 0, "every lookup again reads nothing");
+    assert!(scan >= 50 && missed <= 16, "uncached, a lookup took {scan} commands; cached, the first read {missed}");
+}
