@@ -92,3 +92,9 @@ pub struct BlockRun {
     pub length: u32,
     pub flags: u32,
 }
+
+/// [`BlockRun::flags`] bit 0, **`UNWRITTEN`**: the run's blocks read as zero, so the kernel fills a
+/// page of them without reading the device, and writes it back to them as to any other. The server
+/// loop sets it on what a grow just added, in that grow's reply only (Phase 6 Part H.4,
+/// `docs/spec/rsproto-block-ops.md`).
+pub const RUN_UNWRITTEN: u32 = 1 << 0;

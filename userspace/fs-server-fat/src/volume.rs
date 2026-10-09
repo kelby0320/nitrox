@@ -563,12 +563,13 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Grow the file at `path` to `size` bytes**, what it adds reading as zeroes on the device:
     /// what its own clusters held past its end, and every cluster taken — as near its last one as
     /// the free space allows, so it stays in few runs. A size at or below the file's is nothing to
-    /// do; one past FAT's 4 GiB less a byte, or more than the volume has free, is `TooLarge`.
-    pub fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+    /// do; one past FAT's 4 GiB less a byte, or more than the volume has free, is `TooLarge`. **The
+    /// size the file had**, from which it reads as zero (Phase 6 Part H.4).
+    pub fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
         self.change(|g, cache| {
             let f = self.file(g, cache, path)?;
             if size <= f.size as usize {
-                return Ok(());
+                return Ok(f.size as u64);
             }
             let size = u32::try_from(size).map_err(|_| FsError::TooLarge)?;
             let (old, new_end) = (f.size as u64, size as u64);
@@ -616,7 +617,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if first != f.cluster {
                 self.ids.borrow_mut().put(first, f.dir, f.slot);
             }
-            Ok(())
+            Ok(old)
         })
     }
 
@@ -907,7 +908,7 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
         Fat::create_file(self, parent, name, now)
     }
 
-    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
         Fat::grow_file(self, path, size, now)
     }
 

@@ -2867,7 +2867,86 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   writes a block, its zeroes and its data — and removing it from 328,956 and 196,810 to 1,446 and
   304. Held by a host count and by `boot-probe`'s 64-page file. Next: the zeroes a grow writes and
   the fill that reads them back, after a short detail pass, since that is the block-run protocol's.
+- **H.4, the second fix, piece 1: a grow's blocks are not read back** (2026-10-09), the detail pass
+  below with the maintainer's answers. A grow's reply marks what it added `UNWRITTEN` and the kernel
+  fills such a page without reading the device. Under QEMU a copy of `big` from the stick read 3,953
+  blocks of the disk where it read 69,487, and a copy of it to the stick 1,298 of the stick where it
+  read 66,835. Held by host tests in the kernel and both servers and by `boot-probe`'s 64-page file,
+  now at most 80 reads. Piece 2, the zeroes, waits for a measurement.
 - **H.5 The number, and the docs.**
+
+### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back
+
+**Detail pass, 2026-10-09**, reviewed by the maintainer the same day: **piece 1 built**, piece 2
+waiting for a measurement, the flag keeping its spec name, and piece 2 without extent splitting
+(below). It changes what the kernel and a server agree a new block holds.
+
+**What it costs.** After the first fix a block copied to an ext4 file costs four commands: the
+grow's write of zeroes over it, the page cache's fill reading those zeroes back before the writer
+overwrites them, and the copy's own read and write. FAT does the same on the stick: copying `big` to
+it wrote 512.6 MiB and read 256.6 MiB for 256 MiB.
+
+**Why both exist** (administration Part C.1): the kernel fills a page it does not hold from the
+blocks the map names, so a new range must be zero on the device, or a reader sees what its blocks
+last held — a deleted file's bytes; and nothing tells the kernel which blocks are new, so it reads
+them like any other. Two pieces, separable, each ending one of the two:
+
+**Piece 1: the fill — `UNWRITTEN`, honoured.** `rsproto-block-ops.md` has specified the flag since
+the read-write slice — bit 0 of a `BlockRun`, "allocated but never written — reads as zero; the
+kernel zero-fills the page rather than reading the device" — on the `BlockRun` the `FILE_BLOCKS`
+reply carries, which is live. Nothing sets it and nothing reads it.
+
+- **A server sets it on the runs a grow just allocated, in that grow's reply and no other**:
+  `fs-server-ext4`'s `grow_file` and `fs-server-fat`'s grow know exactly which blocks they took, and
+  no byte of the file has reached them. A map that is not a grow's reply flags nothing.
+
+- **The kernel zero-fills a page over an `UNWRITTEN` run without reading, and writes it back like
+  any other.** So a fill's lookup and a write-back's part ways: one `device_block_in` serves both
+  today, and a hole there is a write-back skipped — the flag read as a hole would lose the data.
+
+- **Why it is safe**: a live object never gives a ready page back — a frame goes with the object or
+  a truncate, and only a fill that failed loses its page early — so a page filled as zero stays
+  until it is written back, and the flag only says what a block holds before the object's first
+  write. A later reply, from another resolve, maps those blocks without the flag, and the device
+  then holds zeroes or what was written: right either way, only slower.
+
+- **The zeroes stay on the device**, so a crash between the grow and the write-back reads zero and
+  never a deleted file's bytes.
+
+- **What it saves**: the fill, one of the four commands a block on ext4, and FAT's 256 MiB of reads
+  copying `big` to the stick. Kernel and both servers change, and the spec says who sets the flag
+  and when.
+
+- **Held by**: kernel host tests — a fill over `UNWRITTEN` issues no IRP and reads zero, a
+  write-back of that page writes it, a run without the flag fills from the device; server host tests
+  — a grow's reply flags what it allocated and nothing else, a plain map flags nothing; and
+  `boot-probe`'s bound brought down to the fill gone, which today's kernel then fails.
+
+**Piece 2: the zeroes — ext4's unwritten extents.** The grow writes its new extents unwritten,
+ext4's own mark, which Part H.1 reads as a hole and `e2fsck` accepts, and writes no zeroes; the
+server's map reports them with their blocks and the flag, never as holes, or a write-back would skip
+them. An extent becomes written only once its data is on the device, which needs the kernel to say
+which blocks it wrote — a new kernel-to-server message, or more on `File::Touch`. **No extent
+splitting**: the server converts whole extents at a sync, a close or an unmount, first zeroing
+whatever blocks of one the kernel did not write — none, for a copy, and for a writer that grew
+further than it wrote, exactly the zeroes it pays today. A crash before the conversion reads the
+unsynced data as zero, as it would read any unsynced write. FAT has no such mark and keeps its
+zeroes. It saves one more command a block, on ext4 only, at the price of a new message and an
+ordering to get right.
+
+**Extent splitting** — one extent made two or three when part of its range changes and the rest does
+not — is not needed for this. H.1 appends at a file's end and cuts from it, and never touches an
+extent's middle; its "split" is a full node's. Splitting is what keeping never-written blocks
+unwritten for good would take: preallocation (`fallocate`), punching a hole, or writing into the
+middle of a sparse or preallocated file Linux made. None is a goal of Phase 6 (the maintainer's
+question, 2026-10-09).
+
+**Recommended: piece 1 now, piece 2 only if a measurement asks for it.** After piece 1 the zeroes
+are one command of three a block, beside the copy's own two, and one command in flight and 4 KiB a
+command — the candidates still on the list — may well cost more. **Questions for the maintainer**:
+piece 1 now, and piece 2 deferred until measured? And the flag keeps its spec name, `UNWRITTEN`,
+though on ext4 the blocks are written, with zeroes — its meaning, "reads as zero; do not read the
+device", is what the kernel acts on.
 
 ### Gates
 

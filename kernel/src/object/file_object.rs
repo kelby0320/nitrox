@@ -103,6 +103,13 @@ pub struct BlockRun {
     pub flags: u32,
 }
 
+/// [`BlockRun::flags`] bit 0, **`UNWRITTEN`**: the run's blocks read as zero — a grow's reply marks
+/// what it just allocated, which no byte of the file has reached — so a fill of a page that is all
+/// such blocks, or holes, reads nothing (Phase 6 Part H.4). The blocks are still the file's: a
+/// write-back writes them as any other's, which is why a fill and a write-back look a block up
+/// differently ([`fill_block_in`], [`device_block_in`]).
+pub const RUN_UNWRITTEN: u32 = 1 << 0;
+
 /// **Why [`FileObject::cache_in`] refused a block-file reply.**
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CacheInError {
@@ -563,15 +570,16 @@ impl FileObject {
         }
     }
 
-    /// **A fill is about to read file block `file_block`**: its device block, counted in flight
-    /// — or `0`, counting nothing, for a hole, a block past the map, or a forgotten file,
+    /// **A fill is about to read the page whose `blocks` begin at file block `file_block`**: the
+    /// first one's device block, counted in flight — or `0`, counting nothing, for a hole, a block
+    /// past the map, a page of blocks that read as zero ([`fill_block_in`]), or a forgotten file,
     /// whose blocks may already be another file's.
-    fn begin_read(&self, file_block: u64) -> u64 {
+    fn begin_read(&self, file_block: u64, blocks: u64) -> u64 {
         let mut g = self.inner.lock();
         if g.dead {
             return 0;
         }
-        let block = device_block_in(&g.runs, file_block);
+        let block = fill_block_in(&g.runs, file_block, blocks);
         if block != 0 {
             g.io_in_flight += 1;
         }
@@ -1082,9 +1090,10 @@ impl FileObject {
         // so this is `index`; the general form handles bs | PAGE where a page's blocks are
         // contiguous within one run).
         let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
-        // Locate the run covering `file_block` → its device block (0 = hole, or a forgotten
-        // file). A block to read is counted in flight until the faulter ends it.
-        match self.begin_read(file_block) {
+        // Locate the run covering `file_block` → its device block (0 = hole, a page of blocks
+        // that read as zero, or a forgotten file). A block to read is counted in flight until
+        // the faulter ends it.
+        match self.begin_read(file_block, (PAGE_SIZE as u64 / block_size as u64).max(1)) {
             0 => {
                 // Hole or unmapped: the zeroed frame is already correct. Complete the PO
                 // synchronously so the parked faulter wakes at once (no IRP).
@@ -1334,6 +1343,23 @@ pub(crate) fn device_block_in(runs: &KVec<BlockRun>, file_block: u64) -> u64 {
             }
         })
         .unwrap_or(0)
+}
+
+/// **The device block a fill of `blocks` file blocks from `file_block` reads** — the first one's
+/// — or `0` when it reads nothing: the first is a hole or past the map, or **every one is a hole
+/// or `UNWRITTEN`** ([`RUN_UNWRITTEN`]), which reads as zero. A page with one block a server has
+/// not promised is zero is read whole, as before.
+pub(crate) fn fill_block_in(runs: &KVec<BlockRun>, file_block: u64, blocks: u64) -> u64 {
+    let first = device_block_in(runs, file_block);
+    if first == 0 {
+        return 0;
+    }
+    let zero = |b: u64| {
+        runs.iter()
+            .find(|r| b >= r.file_block && b < r.file_block + r.length as u64)
+            .is_none_or(|r| r.device_lba == 0 || r.flags & RUN_UNWRITTEN != 0)
+    };
+    if (file_block..file_block + blocks.max(1)).all(zero) { 0 } else { first }
 }
 
 /// Zero the resident page holding byte `end` from `end` to the page's end — the bytes past a
@@ -1710,6 +1736,50 @@ mod tests {
         f
     }
 
+    /// **A page of blocks a grow just allocated fills as zero without a read, and is written back
+    /// to them** (Phase 6 Part H.4). `UNWRITTEN` is a server's promise that the blocks read as zero,
+    /// so a fill of a page that is all such blocks issues no IRP. They are still the file's, so a
+    /// write-back of that page goes to them: one lookup for both would read the flag as a hole and
+    /// skip the write. A page holding one block the server did not promise is read whole, as before;
+    /// a page of grown blocks and holes reads nothing.
+    #[test]
+    fn a_page_a_grow_just_allocated_fills_as_zero_without_a_read_and_is_written_back() {
+        init_global_heap();
+        let reg = registration();
+        let run = |file_block, device_lba, length, flags| BlockRun { file_block, device_lba, length, flags };
+        // Four-KiB blocks: page 0 the file's old block, pages 1 and 2 a grow's.
+        let f = resolve(&reg, 7, 3 * PAGE_SIZE);
+        let mut runs = KVec::new();
+        runs.try_push(run(0, 100, 1, 0)).unwrap();
+        runs.try_push(run(1, 101, 2, RUN_UNWRITTEN)).unwrap();
+        file_of(&f).resize(3 * PAGE_SIZE, runs).unwrap();
+        assert_eq!(file_of(&f).begin_read(0, 1), 100, "the old block is read");
+        file_of(&f).end_io();
+        assert_eq!(file_of(&f).begin_read(1, 1), 0, "a grown block is not");
+        assert_eq!(file_of(&f).begin_read(2, 1), 0);
+        fill(file_of(&f), 1, 0xB1);
+        assert!(matches!(file_of(&f).begin_write(1, 4096), WriteStep::Go(_, 101)), "but is written back");
+        file_of(&f).end_io();
+
+        // One-KiB blocks, four to a page: page 0 holds the old block and three of the grow's, page 1
+        // four of the grow's.
+        let g = FileObject::cache_in(&reg, candidate_in(&reg, 8, 2 * PAGE_SIZE, 1024)).unwrap();
+        let mut runs = KVec::new();
+        runs.try_push(run(0, 200, 1, 0)).unwrap();
+        runs.try_push(run(1, 201, 7, RUN_UNWRITTEN)).unwrap();
+        file_of(&g).resize(2 * PAGE_SIZE, runs).unwrap();
+        assert_eq!(file_of(&g).begin_read(0, 4), 200, "a page with one old block is read whole");
+        file_of(&g).end_io();
+        assert_eq!(file_of(&g).begin_read(4, 4), 0, "a page of grown blocks is not");
+
+        // Grown blocks beside a hole in one page read nothing; the flag alone does not make a hole.
+        let mut runs = KVec::new();
+        runs.try_push(run(0, 300, 2, RUN_UNWRITTEN)).unwrap();
+        runs.try_push(run(2, 0, 2, 0)).unwrap();
+        assert_eq!(fill_block_in(&runs, 0, 4), 0);
+        assert_eq!(device_block_in(&runs, 1), 301, "a write-back's lookup ignores the flag");
+    }
+
     /// **A forgotten file is never written back**, is out of the cache — so the next resolve
     /// of its id, which after an unlink may be another file, gets a new object — and lets go
     /// of its dirty pin, so it goes with its users.
@@ -1730,7 +1800,7 @@ mod tests {
         assert!(file_of(&a).is_dead());
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
         assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Dead));
-        assert_eq!(file_of(&a).begin_read(0), 0, "a fill reads a hole, not a freed block");
+        assert_eq!(file_of(&a).begin_read(0, 1), 0, "a fill reads a hole, not a freed block");
         assert_eq!(FileObject::touch_target(&a).map(|(_, id)| id), None, "and no touch names it");
         let again = resolve(&reg, 7, PAGE_SIZE);
         assert_ne!(again.as_ptr(), first, "a new object for the id");
@@ -1791,7 +1861,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        assert_eq!(file_of(&a).begin_read(1), 101);
+        assert_eq!(file_of(&a).begin_read(1, 1), 101);
         let answer = po();
         assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
         assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 0, "no sync sees it");
@@ -1817,10 +1887,10 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert_eq!(fo.begin_read(1), 101);
+        assert_eq!(fo.begin_read(1, 1), 101);
         let answer = po();
         assert!(matches!(fo.forget(&answer), Forgotten::Later(_)));
-        assert_eq!(fo.begin_read(0), 0, "no read starts after it");
+        assert_eq!(fo.begin_read(0, 1), 0, "no read starts after it");
         assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
     }
 
@@ -1855,7 +1925,7 @@ mod tests {
         assert_eq!(count(), 1, "cleaned, it goes");
 
         // Forgotten with a read in flight, so the entry stays — marked, and not counted.
-        assert_eq!(file_of(&held).begin_read(1), 101);
+        assert_eq!(file_of(&held).begin_read(1, 1), 101);
         let answer = po();
         assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
         assert_eq!(reg_of(&reg).cached_files(), 1, "the entry stays while the read is in flight");
@@ -1882,7 +1952,7 @@ mod tests {
         assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
         assert!(!file_of(&a).is_dead(), "but not forgotten");
-        assert_ne!(file_of(&a).begin_read(1), 0, "a fill still reads its block, not a hole");
+        assert_ne!(file_of(&a).begin_read(1, 1), 0, "a fill still reads its block, not a hole");
     }
 
     /// No sync writes a forgotten object, so a writable mapping must not pin it: nothing would

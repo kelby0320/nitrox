@@ -25,7 +25,7 @@
 //! A server never holds `BIND_NAMESPACE` (its supervisor binds its endpoint) and receives only the
 //! handles it needs at spawn — see `docs/rationale/why-supervisor-registration.md`.
 
-use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve};
+use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use librsproto::file::{
     DirReplyWriter, forget_request, parse_name_request, parse_read_dir_request, parse_rename_request,
@@ -348,22 +348,23 @@ fn send_reply(serve_end: u64, count: usize) {
 /// create the file first. Best-effort — any parse / create / grow error is ignored and the
 /// subsequent `serve` maps the file at its current size (the reply reflects that, so a failed
 /// create surfaces as `NotFound`). A truncate that ends a file's id has it forgotten and released
-/// before the reply.
-fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsError> {
+/// before the reply. **The size a grow took the file from**, if one grew it, which the reply marks
+/// past (Phase 6 Part H.4, [`crate::serve::serve_grown`]).
+fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<Option<u64>, FsError> {
     let Ok(m) = librsproto::decode(req) else {
-        return Ok(());
+        return Ok(None);
     };
     if m.op != OP_NS_RESOLVE {
-        return Ok(());
+        return Ok(None);
     }
     let Some(r) = parse_resolve_request(m.body) else {
-        return Ok(());
+        return Ok(None);
     };
     if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
-        return Ok(());
+        return Ok(None);
     }
     let Some(new_size) = parse_resolve_grow_size(m.body) else {
-        return Ok(());
+        return Ok(None);
     };
     // **A read-only mount's refusal is the one failure reported** (administration Part C.3).
     // Every other one falls through, as it always has, and the reply shows the size the file
@@ -386,6 +387,7 @@ fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsEr
         note(vol.create_file(parent, name, now_secs()));
     }
 
+    let mut grown = None;
     if r.flags & RESOLVE_TRUNCATE != 0 {
         // Shrink: free what is past the new end. Never combined with GROW — the two
         // move the allocator in opposite directions, so the flags are exclusive.
@@ -395,9 +397,13 @@ fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsEr
             Err(e) => note(Err(e)),
         }
     } else {
-        note(vol.grow_file(path, new_size as usize, now_secs()));
+        match vol.grow_file(path, new_size as usize, now_secs()) {
+            Ok(was) if was < new_size as u64 => grown = Some(was),
+            Ok(_) => {}
+            Err(e) => note(Err(e)),
+        }
     }
-    if refused { Err(FsError::ReadOnly) } else { Ok(()) }
+    if refused { Err(FsError::ReadOnly) } else { Ok(grown) }
 }
 
 /// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:
@@ -1114,7 +1120,8 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             Err(e) => Served::Error {
                 reply_len: encode_error(reply, request_id, kerror(e).as_i32(), OP_NS_RESOLVE, reason(e)),
             },
-            Ok(()) => serve(vol, req, content, reply),
+            Ok(Some(was)) => serve_grown(vol, req, content, reply, was),
+            Ok(None) => serve(vol, req, content, reply),
         }
     };
 

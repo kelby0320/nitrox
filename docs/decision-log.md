@@ -35260,3 +35260,57 @@ commands a copied block still costs. Ending them changes what the kernel and a s
 block holds, which is the block-run protocol's, so it gets a short detail pass before it is built.
 Then FAT's and ext4's directory work, and one command in flight. The laptop measures again when a
 batch of these has changed the picture, rather than after each.
+
+## 2026-10-09 — Phase 6 Part H.4, the second fix: a grow's blocks are not read back
+
+**The detail pass**, in `phase-6-usb.md` § *H.4's second fix, in detail*, split the zeroes a grow
+writes from the read that brought them back. The maintainer took piece 1, the read, now, and left
+piece 2, the zeroes, for a measurement to ask for; asked what extent splitting buys, the answer is
+recorded there too — piece 2 converts whole extents and needs none, and splitting is for
+preallocation, punching holes, and writing into a sparse or preallocated file Linux made, none of
+them Phase 6's.
+
+**What it is.** `rsproto-block-ops.md` had specified a `BlockRun` flag, `UNWRITTEN` — "reads as
+zero; the kernel zero-fills the page rather than reading the device" — since the read-write slice,
+on the run map the `FILE_BLOCKS` reply carries; nothing set it and nothing read it. Now the server
+loop sets it, in `libfsserver` for both filesystems: `Volume::grow_file` answers the size the file
+grew from, its contract already being that everything past that reads as zero, and `serve_grown`
+marks every run from the first block wholly past it, splitting a run across that block, in the
+grow's reply only. The kernel fills a page **all of whose blocks** are `UNWRITTEN` or holes without
+an IRP (`fill_block_in`), and writes such a page back as any other — the write-back keeps
+`device_block_in`, which ignores the flag, since one lookup for both would read the flag as a hole
+and skip the write.
+
+**Why it is safe.** A live object never gives a ready page back — a frame goes with the object or a
+truncate, and only a failed fill loses its page early — so a page filled as zero stays until it is
+written back, and the flag only describes what a block holds before the object's first write. A
+later reply maps the same blocks unmarked, and the device holds the zeroes or what was written over
+them: slower, never wrong. The zeroes stay on the device, so a crash before the write-back reads
+zero, never another file's bytes.
+
+**Held by**: a kernel test (a grown page reads nothing and is written back; at 1 KiB blocks, a page
+with one old block is read whole, and grown blocks beside a hole read nothing); a unit test of the
+marking (a run across the old end split, a hole left, no room to split leaving the run whole and
+unmarked); one through each server's volume — ext4 grown from 4,196 bytes marks blocks 2 to 4, FAT
+grown from 1,000 bytes marks sectors 2 to 23, each read zero on the device, and a plain resolve
+marks nothing; and `boot-probe`'s 64-page file, now at most 80 reads in all — 58, where filling each
+page made 115 to 122. Five controls each fail a test: a write-back through the fill's lookup, a page
+zero-filled when any block of it is marked rather than every one, the marking not stopping at the
+old end, a plain resolve marked, and a kernel that ignores the flag, which `test-qemu` fails at 122
+reads.
+
+**Under QEMU**, the four sets again on the same disk; the counts are what to read:
+
+| Under QEMU, the device's reads | Before: reads, time | After: reads, time |
+|---|---|---|
+| Set 1, `big` from the stick: the disk | 69,487, 31.8 s | 3,953, 23.2 s |
+| Set 2, `big` within the disk | 138,099, 19.5 s | 72,564, 15.0 s |
+| Set 2, `tree` | 296,379, 23.8 s | 279,992, 22.4 s |
+| Set 3, `big` to the stick: the stick | 66,835, 26.0 s | 1,298, 15.1 s |
+| Set 3, `tree` to the stick: the stick | 58,773, 24.5 s | 42,389, 22.4 s |
+
+A copy of `big` into ext4 now reads almost nothing from the disk it writes — what is left is the
+source's own reads within the disk — and a copy onto the FAT stick reads nothing back from it. A
+copied block costs three commands on ext4 — the zeroes, the data, and the source's read — and the
+directories are what `small` spends. The stick checked whole and the root clean after the round, its
+bitmap the same as a freshly prepared disk's.

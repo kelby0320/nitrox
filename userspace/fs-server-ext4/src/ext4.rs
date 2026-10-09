@@ -1028,6 +1028,17 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     new_size: usize,
     now: i64,
 ) -> Result<usize, FsError> {
+    grow_file_from(rw, path, new_size, now).map(|(_, size)| size)
+}
+
+/// [`grow_file`], answering **the size the file had and the size it has**: everything from the
+/// first reads as zero, which the server tells the kernel (Phase 6 Part H.4).
+pub fn grow_file_from<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    path: &[u8],
+    new_size: usize,
+    now: i64,
+) -> Result<(usize, usize), FsError> {
     let sb = read_superblock(rw)?;
     let bs = sb.block_size as usize;
     let (ino, mut inode) = resolve_path_ino(rw, &sb, path)?;
@@ -1041,7 +1052,7 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
     let cur_size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
     if new_size <= cur_size {
-        return Ok(cur_size);
+        return Ok((cur_size, cur_size));
     }
     let cur_blocks = cur_size.div_ceil(bs) as u64;
     let new_blocks = new_size.div_ceil(bs) as u64;
@@ -1077,7 +1088,7 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     // A size change is a content change.
     stamp(&mut inode, now, sb.inode_size, Stamp::Modified);
     rw.write_at(off, &inode[..isize])?;
-    Ok(new_size)
+    Ok((cur_size, new_size))
 }
 
 /// Allocate logical blocks `from..to` of a file, zero each on the device, and append them to its

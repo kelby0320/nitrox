@@ -2834,9 +2834,10 @@ fn storage_mount_test(root_ns: u64) -> bool {
 /// 1. **the scratch disk's writes and written bytes moved by at least its pages, and its busy time
 ///    moved** — the RAM disk's driver counted them where it served them — **and by no more than a
 ///    run's worth of allocating** (Part H.4): two writes a page, its zeroes and its data, and four
-///    dozen besides, and a read a page, the page cache filling it, and a hundred besides. Measured,
-///    145 writes and 122 reads; a block at a time the allocator read and wrote the bitmap,
-///    descriptor and superblock for each block, and the same file took 328 and 427;
+///    dozen besides — measured, 145; a block at a time the allocator read and wrote the bitmap,
+///    descriptor and superblock for each block, and the same file took 328 — **and no read a page**,
+///    80 in all: a page a grow just allocated fills as zero without reading it (`UNWRITTEN`, the
+///    second fix). Measured, 58; filling each page from the device made 115 to 122;
 /// 2. **the page cache's write-backs moved by as much**;
 /// 3. every present disk and RAM disk has a row, and the page cache one;
 /// 4. **the disk `init`'s root is on has read something** — at boot, through whichever driver it
@@ -2926,7 +2927,7 @@ fn io_counters_test(root_ns: u64) -> bool {
     let (Some(written), Some(busy)) = (moved(&scratch, "written_bytes"), moved(&scratch, "busy_ns")) else {
         return fail(b"the scratch disk has no row in io.tsm");
     };
-    if writes < PAGES || written < len || busy == 0 || writes > 2 * PAGES + 48 || reads > PAGES + 96 {
+    if writes < PAGES || written < len || busy == 0 || writes > 2 * PAGES + 48 || reads > 80 {
         Line::new()
             .s(b"boot-probe: io counters: the scratch disk moved ")
             .u(reads)

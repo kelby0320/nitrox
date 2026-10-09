@@ -22,7 +22,8 @@ that panics exits, rather than spinning with resolves waiting on it. Phase 6 Par
 H.1 (2026-10-08): **extent trees** — written, cut and freed at any depth; an extent's length as
 ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes nothing with it —
 § *The extent tree*. Phase 6 Part H.4 (2026-10-09): **blocks are allocated and freed a run at a
-time** — § *Part D*.
+time**, and **a grow's reply marks what it added `UNWRITTEN`**, so its zeroes are not read back —
+§ *Part D*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -247,14 +248,18 @@ Each part builds on proven machinery and is independently verifiable.
   (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
   client writes the new region + syncs. The fs-server now holds a read-write device handle.
 
-  **A grow zeroes, on the device, everything it adds**: the old last block past the old size,
-  and every block it allocates (administration Part C.1). The kernel fills a page it does not
-  hold from the blocks the map names, so the device is what a reader of the new range sees.
-  Until then it saw whatever those blocks last held. After a truncate and a grow, that was the
-  file's own cut bytes, since the allocator's goal is the block the truncate just freed. On any
-  grow, it could be a deleted file's contents. A boot showed it on a freshly created file's
-  blocks. The cost is a write per block grown, which a writer then overwrites; unwritten extents
-  would avoid it, and nothing yet needs to.
+  **A grow zeroes, on the device, everything it adds**: the old last block past the old size, and
+  every block it allocates (administration Part C.1). The kernel fills a page it does not hold from
+  the blocks the map names, so the device is what a reader of the new range sees. Until then it saw
+  whatever those blocks last held. After a truncate and a grow, that was the file's own cut bytes,
+  since the allocator's goal is the block the truncate just freed. On any grow, it could be a
+  deleted file's contents. A boot showed it on a freshly created file's blocks. The cost is a write
+  per block grown, which a writer then overwrites; unwritten extents would avoid it, and nothing yet
+  needs to. **The read that followed it is gone** (Phase 6 Part H.4): the grow's reply marks those
+  blocks `UNWRITTEN`, so the kernel fills them as zero without reading the zeroes back. The zeroes
+  stay, so a crash before the write-back reads zero and never another file's bytes, until a
+  measurement asks for unwritten extents ([`phase-6-usb.md`](../planning/phase-6-usb.md) § *H.4's
+  second fix, in detail*).
 
   **Blocks are allocated and freed a run at a time** (Phase 6 Part H.4, 2026-10-09). `alloc_run`
   takes as many free blocks in a row as a grow wants from one pass over a group's bitmap, and writes

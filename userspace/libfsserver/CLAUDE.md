@@ -17,6 +17,9 @@ servers speak one protocol and a fix to it is a fix to both:
 - **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, generic over
   `Volume`, and the one `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
   **through each server's volume**, in that server's crate, against an image its own tools built.
+  A grow's reply marks what the grow added `UNWRITTEN` (`serve_grown`, Phase 6 Part H.4), which
+  `Volume::grow_file` makes true by answering the size it grew from, past which everything reads
+  as zero.
 - **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
   server uses; and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
   FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6

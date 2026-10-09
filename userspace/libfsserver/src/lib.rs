@@ -26,5 +26,5 @@ pub mod serve;
 pub mod server;
 pub mod volume;
 
-pub use block::{BlockReader, BlockRun, BlockWriter, FsError, ReadOnly};
+pub use block::{BlockReader, BlockRun, BlockWriter, FsError, RUN_UNWRITTEN, ReadOnly};
 pub use volume::{DirEntry, Mapped, Refusal, Volume};

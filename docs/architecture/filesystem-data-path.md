@@ -10,7 +10,9 @@ Part D, 2026-10-06). **A second implementer, `fs-server-fat`**, maps in 512-byte
 file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 Part E, 2026-10-06,
 § *A page within one run*). An ext4 **unwritten extent** maps as a hole (Phase 6 Part H.1,
 2026-10-08). The page cache's write-backs are counted, and the cache's counters served at
-`/dev/registry/io` (Phase 6 Part H.2, 2026-10-08).
+`/dev/registry/io` (Phase 6 Part H.2, 2026-10-08). **A grow's reply marks what it added
+`UNWRITTEN`**, and the kernel fills such a page without reading the device (Phase 6 Part H.4,
+2026-10-09).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -109,13 +111,16 @@ refuses a reply in another, whose runs were checked against a size the object wi
 
 Also fs-agnostic — the kernel never knows which filesystem backs a file.
 
-- **`FileObject` producer** (`kernel/src/object/file_object.rs`): the seam that selects the
-  data path. The **Model A** producer carries a **device reference, the file's identity, and its
-  `BlockRun` map** — the map arrives in the resolve reply (`OBJECT_KIND_FILE_BLOCKS`), and is
-  kept under the object's lock, since a size change replaces it. A page fault translates the
-  page's `file_block → device_lba` and issues a block **read** IRP into the cache frame. The
-  **Model B** producer carries `{server, file-suffix}` and fills via `ReadRange` — the variant a
-  non-block fs-server uses. A file has one producer, fixed by its filesystem's class.
+- **`FileObject` producer** (`kernel/src/object/file_object.rs`): the seam that selects the data
+  path. The **Model A** producer carries a **device reference, the file's identity, and its
+  `BlockRun` map** — the map arrives in the resolve reply (`OBJECT_KIND_FILE_BLOCKS`), and is kept
+  under the object's lock, since a size change replaces it. A page fault translates the page's
+  `file_block → device_lba` and issues a block **read** IRP into the cache frame — **unless the
+  page's blocks read as zero**: a hole, or since Phase 6 Part H.4 blocks every one of which is
+  `UNWRITTEN`, which a grow's reply marks over what it added (`fill_block_in`). Then the zeroed
+  frame is the fill, and no IRP is issued. The **Model B** producer carries `{server, file-suffix}`
+  and fills via `ReadRange` — the variant a non-block fs-server uses. A file has one producer, fixed
+  by its filesystem's class.
 - **Writable mappings, and dirty per object**: `sys_memory_map` grants `MAP_WRITE` on a
   `FileObject` when requested and permitted, and a store faults in a writable PTE. The object
   counts its writable mappings, and one mapped writable is **dirty** (§ *One object per file*).
@@ -124,10 +129,12 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   state in the code.
 - **Writeback**: `FileObject::writeback` flushes **every resident page** by a block **write** IRP
   from the cache frame to its `device_lba`, dirty or not, since it cannot tell. A page over a hole
-  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **An ext4 unwritten
-  extent is a hole here** (Phase 6 Part H.1): allocated by `fallocate` and never written, it reads
-  as zeroes, so `fs-server-ext4` maps it as one — and a write into it, as into any hole, is not
-  written back.
+  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **A page over
+  `UNWRITTEN` blocks is not**: it is written to them like any other, since a write-back looks blocks
+  up by `device_block_in`, which ignores the flag — the flag read as a hole would skip the write.
+  **An ext4 unwritten extent is a different thing, and is a hole here** (Phase 6 Part H.1):
+  allocated by `fallocate` and never written, it reads as zeroes, so `fs-server-ext4` maps it as one
+  — and a write into it, as into any hole, is not written back.
 - **What the cache does is counted** (`file_object::fill_stats`): fills that read the device and
   their time, fills over a hole, hits, and — since Phase 6 Part H.2 — write-backs: the pages, the
   IRPs that carried them (one a page today) and their time. `/dev/registry/io` serves them beside

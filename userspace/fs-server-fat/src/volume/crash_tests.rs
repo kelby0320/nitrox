@@ -168,13 +168,13 @@ fn a_crash_anywhere_in_a_grow_leaves_its_file_whole_and_its_new_bytes_zero() {
     let base = with_garbage_in_free_clusters(&img);
     let writes = crash_everywhere(
         &base,
-        |fat| fat.grow_file(b"/f.bin", 20_000, NOW).unwrap(),
+        |fat| { fat.grow_file(b"/f.bin", 20_000, NOW).unwrap(); },
         |img| consistent(img).and_then(|()| zero_past(img, b"/f.bin", 6000)),
     );
     assert!(writes >= 3, "{writes} writes");
     crash_everywhere(
         &base,
-        |fat| fat.grow_file(b"/empty.bin", 20_000, NOW).unwrap(),
+        |fat| { fat.grow_file(b"/empty.bin", 20_000, NOW).unwrap(); },
         |img| consistent(img).and_then(|()| zero_past(img, b"/empty.bin", 0)),
     );
 }

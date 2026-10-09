@@ -500,9 +500,9 @@ fn a_change_bigger_than_the_fat_cache_evicts_and_stays_clean() {
     let free = Cache::count_free(&disk, &g).unwrap();
     make(&fat, "/", "big.bin", b"");
     let steps: [(&str, &dyn Fn()); 3] = [
-        ("a 100 MiB grow", &|| fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap()),
+        ("a 100 MiB grow", &|| { fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap(); }),
         ("a shrink to 10 MiB", &|| assert_eq!(fat.truncate_file(b"/big.bin", 10 << 20, NOW), Ok(None))),
-        ("a regrow", &|| fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap()),
+        ("a regrow", &|| { fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap(); }),
     ];
     for (what, step) in steps {
         step();
