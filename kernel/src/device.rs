@@ -667,6 +667,7 @@ pub fn io_snapshot() -> Result<KVec<u8>, AllocError> {
         writeback_pages: s.writeback_pages,
         writeback_irps: s.writeback_irps,
         writeback_ns: s.writeback_ns,
+        fill_pages: s.fill_pages,
     };
     io_bytes(&records, cache)
 }
@@ -1281,13 +1282,14 @@ mod tests {
         let recs = r.io_records().unwrap();
         assert_eq!((recs[0].flags, recs[0].reads), (DEPARTED as u32, 1), "departed, its counts kept");
 
-        let cache = CacheCounts { fills: 7, writeback_pages: 3, ..CacheCounts::default() };
+        let cache = CacheCounts { fills: 7, writeback_pages: 3, fill_pages: 40, ..CacheCounts::default() };
         let bytes = io_bytes(&recs, cache).unwrap();
         let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         assert_eq!((word(0), word(4), word(8), word(12)), (IO_MAGIC, IO_VERSION, 2, 64));
-        assert_eq!(bytes.len(), 72 + 2 * 64);
+        assert_eq!(bytes.len(), 80 + 2 * 64);
         assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 7, "the cache's fills");
-        assert_eq!(&bytes[72..136], recs[0].as_bytes());
+        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 40, "and the pages they brought in");
+        assert_eq!(&bytes[80..144], recs[0].as_bytes());
     }
 
     /// **The boot disk is flagged, once, and nothing else is** (Phase 6 Part D): the disk's record

@@ -232,14 +232,51 @@ struct Inner {
     forget_answer: Option<ObjectRef>,
 }
 
-/// What [`FileObject::begin_write`] says to do with one page of a write-back.
+/// What [`FileObject::begin_write`] says to do with a run of a write-back.
+#[derive(Debug)]
 enum WriteStep {
-    /// Write `frame` to this device block; the IRP is counted in flight.
-    Go(PhysAddr, u64),
-    /// Nothing to write for this page — gone from the cache, past the end, or over a hole.
+    /// Write this many pages, whose frames it left in the caller's list, from this device block;
+    /// the IRP is counted in flight.
+    Go(u64, usize),
+    /// Nothing to write for the run's first page — gone from the cache, past the end, or over a
+    /// hole.
     Skip,
     /// The file is being freed: write nothing more of it.
     Dead,
+    /// The list of frames could not be made.
+    NoMemory,
+}
+
+/// **The most pages one write-back IRP carries**, whatever the device takes (Phase 6 Part H.4):
+/// 1 MiB, about what Linux sends a SATA disk in one command (its `max_sectors_kb`, 1,280). A
+/// device's own limit is usually lower — AHCI's 248 fragments, USB storage's 64 — and governs;
+/// this bounds the one with none, the RAM disk.
+pub const RUN_MAX_PAGES: usize = 256;
+
+/// **How many pages a run may hold on a device that describes `max_frags` fragments a command**
+/// — a page each — at most [`RUN_MAX_PAGES`], and at least one.
+fn run_pages(max_frags: Option<u32>) -> usize {
+    max_frags.map_or(1, |m| (m as usize).clamp(1, RUN_MAX_PAGES))
+}
+
+/// **The most pages a Model A fill reads**, the faulted page and those after it (Phase 6 Part
+/// H.4): 128 KiB, Linux's default read-ahead. A file read through — a copy's source, an image
+/// being loaded — reads in commands of this size rather than a page; a reader that wanted one page
+/// pays for the rest in memory and one longer command. Within every device's limit, as
+/// [`run_pages`] bounds it anyway.
+pub const READ_AHEAD_PAGES: usize = 32;
+const _: () = assert!(READ_AHEAD_PAGES >= 1 && READ_AHEAD_PAGES <= 64, "the resident pages' mask is a u64");
+
+/// What [`FileObject::begin_fill`] says a fill reads.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadStep {
+    /// This many pages from this device block, their frames in the caller's list, the IRP counted
+    /// in flight.
+    Go(u64, usize),
+    /// Nothing: the page reads as zero, or the file is forgotten.
+    Hole,
+    /// The list of frames could not be made.
+    NoMemory,
 }
 
 /// The outcome of [`FileObject::forget`].
@@ -267,8 +304,9 @@ enum FillStart {
     /// A producer request was issued; the faulter will park until it completes.
     Io,
     /// A Model A block IRP was issued and **counted in the object's I/O in flight**, so the
-    /// faulter that issued it ends it ([`FileObject::finish_io`]) once it completes.
-    DeviceIo,
+    /// faulter that issued it ends it ([`FileObject::finish_io`]) once it completes. It reads this
+    /// many pages, the faulted one and those read ahead of it, each `Loading` on the fill's PO.
+    DeviceIo(usize),
     /// A hole / unmapped range: the zeroed frame is already correct and the PO was
     /// completed synchronously.
     Hole,
@@ -281,6 +319,9 @@ pub mod fill_stats {
 
     /// Fills that issued a real producer request (a block IRP under Model A).
     pub static FILLS: AtomicU64 = AtomicU64::new(0);
+    /// The pages those fills brought in: one a fill, and under Model A the pages it read ahead
+    /// besides (Phase 6 Part H.4).
+    pub static FILL_PAGES: AtomicU64 = AtomicU64::new(0);
     /// Fills that resolved to a hole / unmapped range — the zeroed frame was already
     /// correct, so the PO completed synchronously with no device I/O. Counted apart
     /// because averaging them in would flatter the real cost.
@@ -296,7 +337,8 @@ pub mod fill_stats {
     pub static SPINS: AtomicU64 = AtomicU64::new(0);
     /// Pages written back to their files' blocks (Phase 6 Part H.2).
     pub static WRITEBACK_PAGES: AtomicU64 = AtomicU64::new(0);
-    /// The write IRPs that carried them: one a page, until write-back clusters.
+    /// The write IRPs that carried them: one for each run of pages on the device, up to the
+    /// device's limit (Phase 6 Part H.4).
     pub static WRITEBACK_IRPS: AtomicU64 = AtomicU64::new(0);
     /// Nanoseconds those IRPs took, from submission to completion.
     pub static WRITEBACK_NS: AtomicU64 = AtomicU64::new(0);
@@ -305,6 +347,7 @@ pub mod fill_stats {
     #[derive(Copy, Clone, Debug, Default)]
     pub struct Snapshot {
         pub fills: u64,
+        pub fill_pages: u64,
         pub hole_fills: u64,
         pub fill_ns: u64,
         pub fill_max_ns: u64,
@@ -320,6 +363,7 @@ pub mod fill_stats {
     pub fn snapshot() -> Snapshot {
         Snapshot {
             fills: FILLS.load(Ordering::Relaxed),
+            fill_pages: FILL_PAGES.load(Ordering::Relaxed),
             hole_fills: HOLE_FILLS.load(Ordering::Relaxed),
             fill_ns: FILL_NS.load(Ordering::Relaxed),
             fill_max_ns: FILL_MAX_NS.load(Ordering::Relaxed),
@@ -331,9 +375,10 @@ pub mod fill_stats {
         }
     }
 
-    /// Record one completed fill that issued I/O.
-    pub(crate) fn record_fill(ns: u64) {
+    /// Record one completed fill that issued I/O, bringing in `pages` pages.
+    pub(crate) fn record_fill(ns: u64, pages: u64) {
         FILLS.fetch_add(1, Ordering::Relaxed);
+        FILL_PAGES.fetch_add(pages, Ordering::Relaxed);
         FILL_NS.fetch_add(ns, Ordering::Relaxed);
         FILL_MAX_NS.fetch_max(ns, Ordering::Relaxed);
     }
@@ -498,7 +543,7 @@ impl FileObject {
     /// A retired frame is freed only with the object, since no reverse map says which page
     /// tables still point at it (`TODO(retired-frames)` in `deferred-decisions.md`).
     ///
-    /// A write-back decides each page as it issues the page's IRP, so every IRP after this
+    /// A write-back decides each run of pages as it issues the run's IRP, so every IRP after this
     /// respects the new size. An IRP already in flight is not stopped, and can land in a block
     /// the truncate freed (`TODO(truncate-inflight-writeback)`).
     ///
@@ -570,50 +615,123 @@ impl FileObject {
         }
     }
 
-    /// **A fill is about to read the page whose `blocks` begin at file block `file_block`**: the
-    /// first one's device block, counted in flight — or `0`, counting nothing, for a hole, a block
-    /// past the map, a page of blocks that read as zero ([`fill_block_in`]), or a forgotten file,
-    /// whose blocks may already be another file's.
-    fn begin_read(&self, file_block: u64, blocks: u64) -> u64 {
+    /// **A fill is about to read page `index`, into the `frame` its fault reserved**: the pages it
+    /// reads from the page's first device block, counted as one IRP in flight — or
+    /// [`Hole`](ReadStep::Hole), counting nothing, for a hole, a block past the map, a page of
+    /// blocks that read as zero ([`fill_block_in`]), or a forgotten file, whose blocks may already
+    /// be another file's.
+    ///
+    /// **And it reads ahead** (Phase 6 Part H.4): up to `ahead` pages after the faulted one, each
+    /// not resident, inside the file, and on the device right after the one before, none of them
+    /// reading as zero — reserved here, `Loading` on the fault's `po`, so a fault on one of them
+    /// waits on this fill as a second faulter of the page does, and settles it. A resident page
+    /// ends the run, whatever its state. Their frames follow `frame` in `frames`. They are not
+    /// zeroed: the read fills each whole, and a page whose read fails leaves the cache unmapped.
+    fn begin_fill(
+        &self,
+        index: usize,
+        frame: PhysAddr,
+        block_size: u32,
+        ahead: usize,
+        po: &ObjectRef,
+        frames: &mut KVec<PhysAddr>,
+    ) -> ReadStep {
+        let ahead = ahead.min(READ_AHEAD_PAGES - 1);
+        frames.clear();
+        if frames.try_reserve(1 + ahead).is_err() {
+            return ReadStep::NoMemory;
+        }
+        let bs = block_size as u64;
+        let per_page = (PAGE_SIZE as u64 / bs).max(1);
+        let first_block = |i: usize| (i * PAGE_SIZE) as u64 / bs;
         let mut g = self.inner.lock();
         if g.dead {
-            return 0;
+            return ReadStep::Hole;
         }
-        let block = fill_block_in(&g.runs, file_block, blocks);
-        if block != 0 {
-            g.io_in_flight += 1;
+        let first = fill_block_in(&g.runs, first_block(index), per_page);
+        if first == 0 {
+            return ReadStep::Hole;
         }
-        block
+        // `try_reserve` above guarantees these pushes do not allocate.
+        let _ = frames.try_push(frame);
+        // The pages after it that are resident, found in one pass over the cache.
+        let ahead = ahead.min(self.npages().saturating_sub(index + 1));
+        let mut resident = 0u64;
+        for p in g.pages.iter().filter(|p| p.index > index && p.index <= index + ahead) {
+            resident |= 1 << (p.index - index - 1);
+        }
+        // A page reading as zero has no block (`0`), so it ends the run as a page elsewhere does.
+        let mut n = 1;
+        while n <= ahead && resident & (1 << (n - 1)) == 0 {
+            let block = fill_block_in(&g.runs, first_block(index + n), per_page);
+            if block * bs != first * bs + (n * PAGE_SIZE) as u64 || g.pages.try_reserve(1).is_err() {
+                break;
+            }
+            let Some(f) = heap::buddy_alloc(0) else { break };
+            g.pages
+                .try_push(CachePage { index: index + n, frame: f, state: PageState::Loading, fill: Some(po.clone()) })
+                .expect("slot reserved above");
+            let _ = frames.try_push(f);
+            n += 1;
+        }
+        g.io_in_flight += 1;
+        ReadStep::Go(first, n)
     }
 
-    /// **A write-back is about to write page `index`**, decided afresh under the lock for each
-    /// page, so a `Forget` or a resize that lands mid-write-back governs every page after it.
-    /// A page to write is counted in flight.
-    fn begin_write(&self, index: usize, block_size: u32) -> WriteStep {
+    /// **A write-back is about to write the run of pages from `start`**, decided afresh under the
+    /// lock for each run, so a `Forget` or a resize that lands mid-write-back governs every run
+    /// after it. The run is page `start` and each page after it that is resident and `Ready`,
+    /// inside the file, and on the device right after the one before — at most `max`, the most the
+    /// device takes in one command (Phase 6 Part H.4) — their frames left in `frames`, in order.
+    /// A run to write is one IRP, counted in flight.
+    fn begin_write(&self, start: usize, block_size: u32, max: usize, frames: &mut KVec<PhysAddr>) -> WriteStep {
+        frames.clear();
+        if frames.try_reserve(max).is_err() {
+            return WriteStep::NoMemory;
+        }
         let mut g = self.inner.lock();
         if g.dead {
             return WriteStep::Dead;
         }
-        let Some(frame) = g
-            .pages
-            .iter()
-            .find(|p| p.index == index && p.state == PageState::Ready)
-            .map(|p| p.frame)
-        else {
+        let npages = self.npages();
+        let bs = block_size as u64;
+        // Page `index`'s position in the cache, frame and device block, or `None` if it has nothing
+        // to write: gone from the cache, still filling, past the end, or over a hole — growth goes
+        // through a resolve, not write-back. Position `from` is looked at first: pages enter the
+        // cache in the order they were faulted, which for a file read or written through is the
+        // order of their indices, so a run is found without a scan a page.
+        let target = |g: &Inner, index: usize, from: usize| -> Option<(usize, PhysAddr, u64)> {
+            if index >= npages {
+                return None;
+            }
+            let at = match g.pages.get(from) {
+                Some(p) if p.index == index => from,
+                _ => g.pages.iter().position(|p| p.index == index)?,
+            };
+            let p = &g.pages[at];
+            let block = device_block_in(&g.runs, (index * PAGE_SIZE) as u64 / bs);
+            (p.state == PageState::Ready && block != 0).then_some((at, p.frame, block))
+        };
+        let Some((mut at, frame, first)) = target(&g, start, 0) else {
             return WriteStep::Skip;
         };
-        if index >= self.npages() {
-            return WriteStep::Skip;
-        }
-        let block = device_block_in(&g.runs, (index * PAGE_SIZE) as u64 / block_size as u64);
-        if block == 0 {
-            return WriteStep::Skip; // a hole: growth goes through a resolve, not write-back
+        // `try_reserve` above guarantees these pushes do not allocate.
+        let _ = frames.try_push(frame);
+        while frames.len() < max {
+            let k = frames.len();
+            match target(&g, start + k, at + 1) {
+                Some((next, frame, block)) if block * bs == first * bs + (k * PAGE_SIZE) as u64 => {
+                    let _ = frames.try_push(frame);
+                    at = next;
+                }
+                _ => break,
+            }
         }
         g.io_in_flight += 1;
-        WriteStep::Go(frame, block)
+        WriteStep::Go(first, frames.len())
     }
 
-    /// **An IRP counted by [`begin_read`](Self::begin_read) or
+    /// **An IRP counted by [`begin_fill`](Self::begin_fill) or
     /// [`begin_write`](Self::begin_write) has completed.** If it was the last in flight of a
     /// forgotten file, the `Forget` answer comes back for the caller to complete — outside
     /// this lock, since completing takes the scheduler's.
@@ -632,7 +750,7 @@ impl FileObject {
 
     /// **The file's server is about to free it** (`File::Forget`, administration Part C.1b).
     /// From now on no device I/O of the object starts: a write-back stops before its next
-    /// page, and a fill reads as a hole — the `dead` mark alone decides both, so the run map is
+    /// run, and a fill reads as a hole — the `dead` mark alone decides both, so the run map is
     /// left as it was. The dirty pin is released, so the object goes when its users do, its
     /// pages unwritten. Its registration has already marked its cache entry forgotten
     /// ([`UserspaceServerReg::forget_file`]), so a later resolve of the id gets a new object.
@@ -827,13 +945,17 @@ impl FileObject {
     /// page, so no waiter spins on a completed fill whose filler has not run yet.
     ///
     /// A failed fill fails every faulter that waited on it, and leaves the page out of the
-    /// cache for the next fault to try again. A faulter that cannot register on a PO — at
+    /// cache for the next fault to try again. **One that read ahead is first tried again for the
+    /// faulted page alone** (Phase 6 Part H.4), as Linux does: the error may have been on a page
+    /// after it, which this fault never asked for. A faulter that cannot register on a PO — at
     /// `PendingOperation::MAX_WAITERS` — parks a millisecond and looks again, rather than
     /// spinning.
     pub fn fault_in_page(file_obj: &ObjectRef, index: usize) -> Option<PhysAddr> {
         debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        // Whether this fault's fill may read ahead: not again after one that did and failed.
+        let mut read_ahead = true;
         loop {
             match fo.reserve_fault(index) {
                 Fault::Hit(frame) => {
@@ -845,7 +967,7 @@ impl FileObject {
                     // `Ready`: the whole park → I/O → wake → resume round trip a faulting
                     // thread actually waits through.
                     let started = crate::arch::Timer::read_ns();
-                    let started_kind = fo.start_fill(file_obj, index, frame, &po);
+                    let started_kind = fo.start_fill(file_obj, index, frame, &po, read_ahead);
                     if started_kind == FillStart::Failed {
                         // Could not start the fill (allocation failure); roll the reserved
                         // page back so a retry is clean. Nothing will complete `po`, so
@@ -859,10 +981,21 @@ impl FileObject {
                         return None;
                     }
                     let ok = wait_for_fill(&po);
-                    if started_kind == FillStart::DeviceIo {
-                        fo.finish_io();
+                    // The faulted page, and any read ahead of it on the same PO.
+                    let pages = match started_kind {
+                        FillStart::DeviceIo(pages) => {
+                            fo.finish_io();
+                            pages
+                        }
+                        _ => 1,
+                    };
+                    for k in 0..pages {
+                        fo.settle(index + k, &po, ok);
                     }
-                    fo.settle(index, &po, ok);
+                    if !ok && pages > 1 {
+                        read_ahead = false;
+                        continue;
+                    }
                     if !ok {
                         return None;
                     }
@@ -874,6 +1007,7 @@ impl FileObject {
                     } else {
                         fill_stats::record_fill(
                             crate::arch::Timer::read_ns().saturating_sub(started),
+                            pages as u64,
                         );
                     }
                     // Loop: the page is now `Ready` → return its frame.
@@ -893,11 +1027,13 @@ impl FileObject {
     }
 
     /// Flush every resident, block-backed page to the device (the **Model A** overwrite
-    /// writeback). For each `Ready` cache page, translate its block via the producer's run
-    /// map and issue a block **write** IRP from the frame to that LBA, blocking on each.
-    /// Pages over a hole (`device_lba == 0`, unallocated) are skipped — growing a file is
-    /// Part D. `file_obj` is this object's reference (pins the frames across the IRPs). Runs
-    /// in a syscall thread (it blocks). [`WriteBack::Written`] when every write succeeded,
+    /// writeback). The `Ready` cache pages, in order of index, are translated through the
+    /// producer's run map and written **a run of them a block write IRP** — pages next to each
+    /// other in the file and on the device, up to the most the device takes in one command
+    /// ([`begin_write`](Self::begin_write), Phase 6 Part H.4) — blocking on each. Pages over a
+    /// hole (`device_lba == 0`, unallocated) are skipped — growing a file is Part D. `file_obj`
+    /// is this object's reference (pins the frames across the IRPs). Runs in a syscall thread
+    /// (it blocks). [`WriteBack::Written`] when every write succeeded,
     /// [`WriteBack::Gone`] when the device refused one `PeerClosed` — it has left, and no later
     /// write-back can do better — and [`WriteBack::Failed`] for a non-block producer or any
     /// other I/O or allocation failure.
@@ -910,12 +1046,44 @@ impl FileObject {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
             _ => return WriteBack::Failed,
         };
-        // Which pages are resident, under the lock; each is then looked at again as its IRP is
-        // issued ([`begin_write`](Self::begin_write)), so a `Forget` stops the write-back
-        // before its next page and a resize redirects it.
+        let max = run_pages(crate::io::block::max_frags(&device));
+        fo.write_runs(block_size, max, |frames, dev_offset, length| {
+            let po = match PendingOperation::try_new() {
+                // SAFETY: adopt the single creation reference.
+                Ok(p) => unsafe {
+                    ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
+                },
+                Err(_) => return crate::syscall::error::KError::OutOfMemory as i32,
+            };
+            let started = crate::arch::Timer::read_ns();
+            if let Err(e) = crate::io::block::dispatch_block_irp_into_frames(
+                &device,
+                frames,
+                file_obj.clone(),
+                &po,
+                crate::libkern::io_op::IoOpcode::Write,
+                dev_offset,
+                length,
+            ) {
+                return e as i32;
+            }
+            let status = wait_status(&po);
+            fill_stats::record_writeback(frames.len() as u64, crate::arch::Timer::read_ns().saturating_sub(started));
+            status
+        })
+    }
+
+    /// **[`writeback`](Self::writeback)'s loop**, with the IRP left to `issue`: each run of pages
+    /// [`begin_write`](Self::begin_write) decides, at most `max`, handed over as its frames, the
+    /// device byte offset and the length, `issue` answering the IRP's completion status. Apart so a
+    /// host test can drive it with a device that records what reached it.
+    fn write_runs(&self, block_size: u32, max: usize, mut issue: impl FnMut(&[PhysAddr], u64, u64) -> i32) -> WriteBack {
+        // Which pages are resident, under the lock, in order; each run is then decided afresh as
+        // its IRP is issued, so a `Forget` stops the write-back before its next run and a resize
+        // redirects it.
         let mut indices: KVec<usize> = KVec::new();
         {
-            let inner = fo.inner.lock();
+            let inner = self.inner.lock();
             if indices.try_reserve(inner.pages.len()).is_err() {
                 return WriteBack::Failed;
             }
@@ -923,42 +1091,31 @@ impl FileObject {
                 let _ = indices.try_push(p.index);
             }
         }
-        for index in indices.iter().copied() {
-            let po = match PendingOperation::try_new() {
-                // SAFETY: adopt the single creation reference.
-                Ok(p) => unsafe {
-                    ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
-                },
-                Err(_) => return WriteBack::Failed,
-            };
-            let (frame, dev_block) = match fo.begin_write(index, block_size) {
-                WriteStep::Go(frame, dev_block) => (frame, dev_block),
-                WriteStep::Skip => continue,
+        indices.sort_unstable();
+        let mut frames: KVec<PhysAddr> = KVec::new();
+        let mut at = 0;
+        while at < indices.len() {
+            let start = indices[at];
+            let (dev_block, pages) = match self.begin_write(start, block_size, max, &mut frames) {
+                WriteStep::Go(dev_block, pages) => (dev_block, pages),
+                WriteStep::Skip => {
+                    at += 1;
+                    continue;
+                }
                 // Forgotten: what is unwritten stays so — its blocks are about to be freed.
                 WriteStep::Dead => return WriteBack::Written,
+                WriteStep::NoMemory => return WriteBack::Failed,
             };
-            let dev_offset = dev_block * block_size as u64;
-            let started = crate::arch::Timer::read_ns();
-            if crate::io::block::dispatch_block_irp_into_frame(
-                &device,
-                frame,
-                file_obj.clone(),
-                &po,
-                crate::libkern::io_op::IoOpcode::Write,
-                dev_offset,
-                PAGE_SIZE as u64,
-            )
-            .is_err()
-            {
-                fo.finish_io();
-                return WriteBack::Failed;
-            }
-            let status = wait_status(&po);
-            fill_stats::record_writeback(1, crate::arch::Timer::read_ns().saturating_sub(started));
-            fo.finish_io();
+            let status = issue(&frames, dev_block * block_size as u64, (pages * PAGE_SIZE) as u64);
+            self.finish_io();
             match WriteBack::of(status) {
                 WriteBack::Written => {}
                 w => return w,
+            }
+            // Past the pages the run wrote. It may have taken pages faulted in since the list was
+            // made, which is only an earlier write of them.
+            while at < indices.len() && indices[at] < start + pages {
+                at += 1;
             }
         }
         WriteBack::Written
@@ -1042,7 +1199,7 @@ impl FileObject {
 
     /// Start an asynchronous fill of `frame` for page `index`, completing `po` when
     /// done (the producer also marks the page `Ready`). Dispatches on the object's
-    /// [`Producer`]. `file_obj` is this object's reference (the deferred fill clones
+    /// [`Producer`]; a Model A fill reads pages ahead of it if `read_ahead`. `file_obj` is this object's reference (the deferred fill clones
     /// it to stay alive). Returns `false` if the fill could not be started. The stub
     /// producer enqueues a DPC; the fs-server producer (Part 3) sends a range-read.
     fn start_fill(
@@ -1051,6 +1208,7 @@ impl FileObject {
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
+        read_ahead: bool,
     ) -> FillStart {
         match &self.producer {
             Producer::Stub { base } => {
@@ -1068,15 +1226,16 @@ impl FileObject {
                 }
             }
             Producer::FsServerBlocks { device, block_size, .. } => {
-                self.model_a_start_fill(file_obj, index, frame, po, device, *block_size)
+                self.model_a_start_fill(file_obj, index, frame, po, device, *block_size, read_ahead)
             }
         }
     }
 
     /// Model A fill: read page `index`'s device block **zero-copy** into `frame` via a block
-    /// IRP (completing `po`), or — for a hole / block past the map — complete `po` at once
-    /// (the reserved frame is already zeroed). `false` only on an allocation failure. The
-    /// page is marked `Ready` by the fault path after the wait.
+    /// IRP (completing `po`), with the pages read ahead of it ([`begin_fill`](Self::begin_fill)),
+    /// or — for a hole / block past the map — complete `po` at once (the reserved frame is
+    /// already zeroed). `Failed` only on an allocation failure, the pages read ahead let go. The
+    /// pages are marked `Ready` by the fault path after the wait.
     fn model_a_start_fill(
         &self,
         file_obj: &ObjectRef,
@@ -1085,37 +1244,43 @@ impl FileObject {
         po: &ObjectRef,
         device: &ObjectRef,
         block_size: u32,
+        read_ahead: bool,
     ) -> FillStart {
-        // The page's first filesystem block (block_size == PAGE_SIZE for slice-1 fixtures,
-        // so this is `index`; the general form handles bs | PAGE where a page's blocks are
-        // contiguous within one run).
-        let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
-        // Locate the run covering `file_block` → its device block (0 = hole, a page of blocks
-        // that read as zero, or a forgotten file). A block to read is counted in flight until
-        // the faulter ends it.
-        match self.begin_read(file_block, (PAGE_SIZE as u64 / block_size as u64).max(1)) {
-            0 => {
+        // The page's first filesystem block is `index * PAGE / block_size`; the general form
+        // handles bs | PAGE where a page's blocks are contiguous within one run. Its device block
+        // (none for a hole, a page of blocks that read as zero, or a forgotten file) and the pages
+        // read ahead of it are one IRP, counted in flight until the faulter ends it.
+        let ahead = match read_ahead {
+            true => READ_AHEAD_PAGES.min(run_pages(crate::io::block::max_frags(device))) - 1,
+            false => 0,
+        };
+        let mut frames = KVec::new();
+        match self.begin_fill(index, frame, block_size, ahead, po, &mut frames) {
+            ReadStep::Hole => {
                 // Hole or unmapped: the zeroed frame is already correct. Complete the PO
                 // synchronously so the parked faulter wakes at once (no IRP).
                 crate::sched::complete_pending_op(po.as_ptr(), 0, 0);
                 FillStart::Hole
             }
-            dev_block => {
-                let dev_offset = dev_block * block_size as u64;
-                // One page of data (one block when block_size == PAGE). `file_obj` pins the
-                // FileObject (hence the frame) for the IRP's lifetime.
-                match crate::io::block::dispatch_block_irp_into_frame(
+            ReadStep::NoMemory => FillStart::Failed,
+            ReadStep::Go(dev_block, pages) => {
+                // `file_obj` pins the FileObject (hence the frames) for the IRP's lifetime.
+                match crate::io::block::dispatch_block_irp_into_frames(
                     device,
-                    frame,
+                    &frames,
                     file_obj.clone(),
                     po,
                     crate::libkern::io_op::IoOpcode::Read,
-                    dev_offset,
-                    PAGE_SIZE as u64,
+                    dev_block * block_size as u64,
+                    (pages * PAGE_SIZE) as u64,
                 ) {
-                    Ok(()) => FillStart::DeviceIo,
+                    Ok(()) => FillStart::DeviceIo(pages),
                     Err(_) => {
                         self.finish_io(); // never issued, so never in flight
+                        // The pages read ahead go now; the faulted one, the caller settles.
+                        for k in 1..pages {
+                            self.settle(index + k, po, false);
+                        }
                         FillStart::Failed
                     }
                 }
@@ -1725,6 +1890,16 @@ mod tests {
         }
     }
 
+    /// [`FileObject::begin_fill`] of page `index` in blocks of `block_size`, reading nothing ahead:
+    /// the device block it reads, or `0` for none.
+    fn read_one(f: &FileObject, index: usize, block_size: u32) -> u64 {
+        match f.begin_fill(index, PhysAddr(0), block_size, 0, &po(), &mut KVec::new()) {
+            ReadStep::Go(block, 1) => block,
+            ReadStep::Hole => 0,
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// File `id` of `reg`, two pages over device blocks 100 and 101, both resident and ready.
     fn two_block_file(reg: &ObjectRef, id: u64) -> ObjectRef {
         let f = resolve(reg, id, 2 * PAGE_SIZE);
@@ -1753,12 +1928,12 @@ mod tests {
         runs.try_push(run(0, 100, 1, 0)).unwrap();
         runs.try_push(run(1, 101, 2, RUN_UNWRITTEN)).unwrap();
         file_of(&f).resize(3 * PAGE_SIZE, runs).unwrap();
-        assert_eq!(file_of(&f).begin_read(0, 1), 100, "the old block is read");
+        assert_eq!(read_one(file_of(&f), 0, 4096), 100, "the old block is read");
         file_of(&f).end_io();
-        assert_eq!(file_of(&f).begin_read(1, 1), 0, "a grown block is not");
-        assert_eq!(file_of(&f).begin_read(2, 1), 0);
+        assert_eq!(read_one(file_of(&f), 1, 4096), 0, "a grown block is not");
+        assert_eq!(read_one(file_of(&f), 2, 4096), 0);
         fill(file_of(&f), 1, 0xB1);
-        assert!(matches!(file_of(&f).begin_write(1, 4096), WriteStep::Go(_, 101)), "but is written back");
+        assert!(matches!(file_of(&f).begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Go(101, 1)), "but is written back");
         file_of(&f).end_io();
 
         // One-KiB blocks, four to a page: page 0 holds the old block and three of the grow's, page 1
@@ -1768,9 +1943,9 @@ mod tests {
         runs.try_push(run(0, 200, 1, 0)).unwrap();
         runs.try_push(run(1, 201, 7, RUN_UNWRITTEN)).unwrap();
         file_of(&g).resize(2 * PAGE_SIZE, runs).unwrap();
-        assert_eq!(file_of(&g).begin_read(0, 4), 200, "a page with one old block is read whole");
+        assert_eq!(read_one(file_of(&g), 0, 1024), 200, "a page with one old block is read whole");
         file_of(&g).end_io();
-        assert_eq!(file_of(&g).begin_read(4, 4), 0, "a page of grown blocks is not");
+        assert_eq!(read_one(file_of(&g), 1, 1024), 0, "a page of grown blocks is not");
 
         // Grown blocks beside a hole in one page read nothing; the flag alone does not make a hole.
         let mut runs = KVec::new();
@@ -1778,6 +1953,334 @@ mod tests {
         runs.try_push(run(2, 0, 2, 0)).unwrap();
         assert_eq!(fill_block_in(&runs, 0, 4), 0);
         assert_eq!(device_block_in(&runs, 1), 301, "a write-back's lookup ignores the flag");
+    }
+
+    /// File `id` of `reg`, `pages` pages in blocks of `block_size`, mapped by `map` — `(file block,
+    /// device block, length)` — with each page of `resident` filled and ready, in that order. The
+    /// frames by page index.
+    fn mapped_file(
+        reg: &ObjectRef,
+        id: u64,
+        pages: usize,
+        block_size: u32,
+        map: &[(u64, u64, u32)],
+        resident: impl Iterator<Item = usize>,
+    ) -> (ObjectRef, std::collections::BTreeMap<usize, PhysAddr>) {
+        let f = FileObject::cache_in(reg, candidate_in(reg, id, pages * PAGE_SIZE, block_size)).unwrap();
+        let mut runs = KVec::new();
+        for &(file_block, device_lba, length) in map {
+            runs.try_push(BlockRun { file_block, device_lba, length, flags: 0 }).unwrap();
+        }
+        file_of(&f).resize(pages * PAGE_SIZE, runs).unwrap();
+        let frames = resident.map(|i| (i, fill(file_of(&f), i, i as u8))).collect();
+        (f, frames)
+    }
+
+    /// One IRP a write-back issued: its frames, device byte offset and length.
+    type Irp = (std::vec::Vec<PhysAddr>, u64, u64);
+
+    /// [`FileObject::write_runs`] over a device that takes each IRP, and what reached it.
+    fn write_runs(f: &FileObject, block_size: u32, max: usize) -> (WriteBack, std::vec::Vec<Irp>) {
+        let mut irps = std::vec::Vec::new();
+        let w = f.write_runs(block_size, max, |frames, offset, length| {
+            irps.push((frames.to_vec(), offset, length));
+            0
+        });
+        (w, irps)
+    }
+
+    /// The IRP that writes pages `pages` from device block `block` of `block_size` bytes.
+    fn irp(frames: &std::collections::BTreeMap<usize, PhysAddr>, pages: core::ops::Range<usize>, block: u64, block_size: u64) -> Irp {
+        let length = (pages.len() * PAGE_SIZE) as u64;
+        (pages.map(|i| frames[&i]).collect(), block * block_size, length)
+    }
+
+    /// **A write-back sends a run of pages an IRP, up to the device's limit** (Phase 6 Part H.4): a
+    /// hundred pages next to each other in the file and on the device go as an IRP of 64 and one
+    /// of 36 to a device taking 64, and as one of 100 to a device taking more — the frames in the
+    /// order of the file whatever order the pages were faulted in, here the reverse. And nothing is
+    /// left in flight, so a `Forget` after it is answered at once.
+    #[test]
+    fn a_write_back_sends_a_run_of_pages_an_irp_up_to_the_devices_limit() {
+        init_global_heap();
+        let reg = registration();
+        let (f, frames) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 100)], (0..100).rev());
+        let (w, irps) = write_runs(file_of(&f), 4096, 64);
+        assert_eq!(w, WriteBack::Written);
+        assert_eq!(irps, [irp(&frames, 0..64, 1000, 4096), irp(&frames, 64..100, 1064, 4096)]);
+        let (_, irps) = write_runs(file_of(&f), 4096, RUN_MAX_PAGES);
+        assert_eq!(irps, [irp(&frames, 0..100, 1000, 4096)]);
+        assert!(matches!(file_of(&f).forget(&po()), Forgotten::Now), "nothing in flight");
+    }
+
+    /// **A run ends where the next page has nothing to write beside it**: a gap on the device, a
+    /// hole, a page not in the cache, a page still filling, and the file's end — pages a mapping
+    /// faulted in past it are never written. The pages after each are written as runs of their
+    /// own.
+    #[test]
+    fn a_run_ends_at_a_gap_on_the_device_a_hole_a_missing_or_filling_page_and_the_end() {
+        init_global_heap();
+        let reg = registration();
+        // Pages 0-9 at device block 1000, 10-19 at 2000, 20-23 a hole, 24-39 at 3000.
+        let map = [(0, 1000, 10), (10, 2000, 10), (20, 0, 4), (24, 3000, 16)];
+        let (f, mut frames) = mapped_file(&reg, 7, 40, 4096, &map, (0..40).filter(|&i| i != 30 && i != 33));
+        let fo = file_of(&f);
+        assert!(matches!(fo.reserve(33), Reserve::New(_)), "page 33 filling");
+        // The file cut to 38 pages, and pages 38 and 39 faulted in again past its end.
+        let mut runs = KVec::new();
+        for &(file_block, device_lba, length) in &map {
+            runs.try_push(BlockRun { file_block, device_lba, length, flags: 0 }).unwrap();
+        }
+        fo.resize(38 * PAGE_SIZE, runs).unwrap();
+        frames.insert(38, fill(fo, 38, 38));
+        frames.insert(39, fill(fo, 39, 39));
+        let (w, irps) = write_runs(fo, 4096, 64);
+        assert_eq!(w, WriteBack::Written);
+        assert_eq!(
+            irps,
+            [
+                irp(&frames, 0..10, 1000, 4096),
+                irp(&frames, 10..20, 2000, 4096),
+                irp(&frames, 24..30, 3000, 4096),
+                irp(&frames, 31..33, 3007, 4096),
+                irp(&frames, 34..38, 3010, 4096),
+            ]
+        );
+    }
+
+    /// **A `Forget` mid-write-back stops it before its next run, and a refusal ends it**: the run in
+    /// flight is the last written, and the `Forget` is answered when it ends; a device gone
+    /// (`PeerClosed`) or failing ends the write-back with that run.
+    #[test]
+    fn a_forget_or_a_refusal_mid_write_back_stops_it_at_the_next_run() {
+        init_global_heap();
+        let reg = registration();
+        let (f, _) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 100)], 0..100);
+        let fo = file_of(&f);
+        let (mut issued, mut forgotten) = (0, None);
+        let w = fo.write_runs(4096, 10, |_, _, _| {
+            issued += 1;
+            if issued == 2 {
+                forgotten = Some(fo.forget(&po()));
+            }
+            0
+        });
+        assert_eq!((w, issued), (WriteBack::Written, 2));
+        assert!(matches!(forgotten, Some(Forgotten::Later(_))), "the second run was in flight");
+        assert!(matches!(fo.forget(&po()), Forgotten::Now), "and its end answered it");
+
+        for (id, status, outcome) in [
+            (8, crate::syscall::error::KError::PeerClosed as i32, WriteBack::Gone),
+            (9, crate::syscall::error::KError::InvalidArgument as i32, WriteBack::Failed),
+        ] {
+            let (g, _) = mapped_file(&reg, id, 100, 4096, &[(0, 2000, 100)], 0..100);
+            let mut issued = 0;
+            let w = file_of(&g).write_runs(4096, 10, |_, _, _| {
+                issued += 1;
+                if issued == 2 { status } else { 0 }
+            });
+            assert_eq!((w, issued), (outcome, 2));
+            assert!(matches!(file_of(&g).forget(&po()), Forgotten::Now), "the refused run ended");
+        }
+    }
+
+    /// **In blocks smaller than a page a run is still pages next to each other on the device**:
+    /// eight pages of four 1 KiB blocks each, mapped by one run, go as one IRP; mapped by two runs
+    /// apart, as one each.
+    #[test]
+    fn a_run_of_pages_in_one_kib_blocks_is_one_irp_while_the_device_is_contiguous() {
+        init_global_heap();
+        let reg = registration();
+        let (f, frames) = mapped_file(&reg, 7, 8, 1024, &[(0, 400, 32)], 0..8);
+        assert_eq!(write_runs(file_of(&f), 1024, 64).1, [irp(&frames, 0..8, 400, 1024)]);
+        let (g, frames) = mapped_file(&reg, 8, 8, 1024, &[(0, 400, 16), (16, 900, 16)], 0..8);
+        assert_eq!(write_runs(file_of(&g), 1024, 64).1, [irp(&frames, 0..4, 400, 1024), irp(&frames, 4..8, 900, 1024)]);
+    }
+
+    /// **A run holds as many pages as the device takes fragments**, a page a fragment, never more
+    /// than [`RUN_MAX_PAGES`] and never none: USB storage's 64, AHCI's 248, the RAM disk's no
+    /// limit.
+    #[test]
+    fn a_run_holds_the_devices_fragments_at_most_run_max_pages_and_at_least_one() {
+        assert_eq!(run_pages(Some(64)), 64);
+        assert_eq!(run_pages(Some(248)), 248);
+        assert_eq!(run_pages(Some(RUN_MAX_PAGES as u32)), RUN_MAX_PAGES);
+        assert_eq!(run_pages(Some(RUN_MAX_PAGES as u32 + 1)), RUN_MAX_PAGES);
+        assert_eq!(run_pages(Some(u32::MAX)), RUN_MAX_PAGES);
+        assert_eq!(run_pages(Some(0)), 1);
+        assert_eq!(run_pages(None), 1);
+    }
+
+    /// The fault's half of a fill of page `index`: its reservation, as [`FileObject::reserve_fault`]
+    /// makes it — the frame and the fill's PO.
+    fn miss(f: &FileObject, index: usize) -> (PhysAddr, ObjectRef) {
+        match f.reserve_fault(index) {
+            Fault::Fill(frame, po) => (frame, po),
+            _ => panic!("page {index} was not a miss"),
+        }
+    }
+
+    /// A fill of page `index` reading up to `ahead` pages after it: what [`FileObject::begin_fill`]
+    /// said, and the frames it read into. Every page of it is then settled ready and the IRP ended,
+    /// as the fault path does once the read completes.
+    fn fill_ahead(f: &FileObject, index: usize, block_size: u32, ahead: usize) -> (ReadStep, std::vec::Vec<PhysAddr>) {
+        let (frame, fill_po) = miss(f, index);
+        let mut frames = KVec::new();
+        let step = f.begin_fill(index, frame, block_size, ahead, &fill_po, &mut frames);
+        let pages = match step {
+            ReadStep::Go(_, pages) => {
+                f.end_io();
+                pages
+            }
+            _ => 1,
+        };
+        for k in 0..pages {
+            f.settle(index + k, &fill_po, true);
+        }
+        (step, frames.to_vec())
+    }
+
+    /// **A fill reads ahead the pages after it, in one IRP, until the device or the file stops it**
+    /// (Phase 6 Part H.4): from page 0 the 31 after it, each reserved `Loading` on the fault's PO —
+    /// so a fault on one waits on that fill — and its frame after the faulted page's; from page 32
+    /// eight, to where the file's blocks jump on the device; from page 96 the four left in the file,
+    /// though its blocks run on past its end.
+    #[test]
+    fn a_fill_reads_ahead_in_one_irp_until_the_device_or_the_file_stops_it() {
+        init_global_heap();
+        let reg = registration();
+        let (f, _) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 40), (40, 5000, 60)], 0..0);
+        let fo = file_of(&f);
+        let (frame, fill_po) = miss(fo, 0);
+        let mut frames = KVec::new();
+        assert_eq!(fo.begin_fill(0, frame, 4096, 31, &fill_po, &mut frames), ReadStep::Go(1000, 32));
+        assert_eq!(frames[0], frame, "the faulted page's frame first");
+        for (k, &fr) in frames.iter().enumerate().skip(1) {
+            assert_eq!(fo.lookup(k), Some((fr, PageState::Loading)), "page {k} reserved into its frame");
+        }
+        assert!(matches!(fo.reserve_fault(5), Fault::Wait(w) if w.as_ptr() == fill_po.as_ptr()), "a fault on one waits on the fill");
+        assert!(matches!(fo.forget(&po()), Forgotten::Later(_)), "one IRP in flight");
+        let (f, _) = mapped_file(&reg, 8, 100, 4096, &[(0, 1000, 40), (40, 5000, 64)], 0..0);
+        let fo = file_of(&f);
+        assert_eq!(fill_ahead(fo, 0, 4096, 31).0, ReadStep::Go(1000, 32));
+        assert_eq!(fo.lookup(31).map(|(_, s)| s), Some(PageState::Ready), "settled with the faulted page");
+        assert_eq!(fill_ahead(fo, 32, 4096, 31).0, ReadStep::Go(1032, 8), "to the jump on the device");
+        assert_eq!(fill_ahead(fo, 40, 4096, 31).0, ReadStep::Go(5000, 32));
+        assert_eq!(fill_ahead(fo, 96, 4096, 31).0, ReadStep::Go(5056, 4), "to the file's end");
+        assert!(matches!(fo.forget(&po()), Forgotten::Now), "each fill one IRP, each ended");
+    }
+
+    /// **Read-ahead stops at a page already in the cache, at blocks that read as zero, and at the
+    /// map's end**, and a fill with nothing to read ahead reads its page alone: a resident page,
+    /// whatever its state, is never read over; a run a grow just allocated (`UNWRITTEN`) or a hole
+    /// fills without a read when its own page faults; a device taking one fragment gets one page.
+    #[test]
+    fn read_ahead_stops_at_a_resident_page_blocks_that_read_as_zero_and_the_maps_end() {
+        init_global_heap();
+        let reg = registration();
+        let f = resolve(&reg, 7, 40 * PAGE_SIZE);
+        let run = |file_block, device_lba, length, flags| BlockRun { file_block, device_lba, length, flags };
+        let mut runs = KVec::new();
+        for r in [run(0, 1000, 20, 0), run(20, 1020, 4, RUN_UNWRITTEN), run(24, 0, 4, 0), run(28, 1028, 10, 0)] {
+            runs.try_push(r).unwrap();
+        }
+        let fo = file_of(&f);
+        fo.resize(40 * PAGE_SIZE, runs).unwrap();
+        fill(fo, 5, 5);
+        assert!(matches!(fo.reserve(9), Reserve::New(_)), "page 9 filling, by another path");
+        assert_eq!(fill_ahead(fo, 0, 4096, 31).0, ReadStep::Go(1000, 5), "to the ready page 5");
+        assert_eq!(fill_ahead(fo, 6, 4096, 31).0, ReadStep::Go(1006, 3), "to the loading page 9");
+        assert_eq!(fill_ahead(fo, 10, 4096, 31).0, ReadStep::Go(1010, 10), "to the grown blocks");
+        assert_eq!(fill_ahead(fo, 20, 4096, 31).0, ReadStep::Hole, "which fill without a read");
+        assert_eq!(fill_ahead(fo, 24, 4096, 31).0, ReadStep::Hole, "as a hole does");
+        assert_eq!(fill_ahead(fo, 28, 4096, 31).0, ReadStep::Go(1028, 10), "to the map's end");
+        assert_eq!(fill_ahead(fo, 38, 4096, 31).0, ReadStep::Hole, "past it");
+        let (g, _) = mapped_file(&reg, 8, 10, 4096, &[(0, 2000, 10)], 0..0);
+        assert_eq!(fill_ahead(file_of(&g), 0, 4096, 0).0, ReadStep::Go(2000, 1), "nothing ahead");
+    }
+
+    /// **In blocks smaller than a page, read-ahead is pages next to each other on the device**:
+    /// sixteen pages of four 1 KiB blocks, mapped by one run, read in one IRP; a forgotten file
+    /// reads nothing, ahead or not.
+    #[test]
+    fn read_ahead_in_one_kib_blocks_and_never_for_a_forgotten_file() {
+        init_global_heap();
+        let reg = registration();
+        let (f, _) = mapped_file(&reg, 7, 16, 1024, &[(0, 400, 64)], 0..0);
+        assert_eq!(fill_ahead(file_of(&f), 0, 1024, 31).0, ReadStep::Go(400, 16));
+        let (g, _) = mapped_file(&reg, 8, 16, 1024, &[(0, 400, 64)], 0..0);
+        let _ = file_of(&g).forget(&po());
+        let (step, frames) = fill_ahead(file_of(&g), 0, 1024, 31);
+        assert_eq!((step, frames.len()), (ReadStep::Hole, 0));
+        assert_eq!(file_of(&g).resident_pages(), 1, "nothing reserved ahead");
+    }
+
+    /// **A Model A fill goes to the device as one IRP of its page and those read ahead, as many as
+    /// the device takes**: through `start_fill`, on a device describing eight fragments a command,
+    /// a fault on page 0 of a 20-page file reads eight pages from its first block — offset, length
+    /// and a fragment a frame, in order — and its completion completes the fault's PO. A fill told
+    /// not to read ahead, as a fault retrying after a failed one is, reads its page alone.
+    #[test]
+    fn a_fill_reads_its_page_and_those_ahead_in_one_irp_within_the_devices_limit() {
+        use crate::io::block::BlockBackend;
+        use crate::io::irp::{Irp, PhysFrag};
+        use crate::libkern::block::BlockKind;
+        use core::cell::RefCell;
+        init_global_heap();
+        /// Each IRP that reached the device, with its fragments.
+        struct Seen(RefCell<std::vec::Vec<(*mut Irp, std::vec::Vec<PhysFrag>)>>);
+        fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
+            // SAFETY: `ctx` is the test's `Seen`; `irp` is a live IRP whose buffer describes `count`
+            // fragments.
+            unsafe {
+                let b = (*irp).buffer;
+                let frags = core::slice::from_raw_parts(b.frags as *const PhysFrag, b.count as usize).to_vec();
+                (*(ctx as *const Seen)).0.borrow_mut().push((irp, frags));
+            }
+        }
+        fn disk_poll(_: *mut ()) {}
+        let seen = Seen(RefCell::new(std::vec::Vec::new()));
+        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
+        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let reg = registration();
+        let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
+        let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
+        // SAFETY: as above.
+        let cand = unsafe { ObjectRef::from_raw(KBox::into_raw(cand).as_ptr() as *mut (), KObjectType::FileObject) };
+        let f = FileObject::cache_in(&reg, cand).unwrap();
+        let mut runs = KVec::new();
+        runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
+        file_of(&f).resize(20 * PAGE_SIZE, runs).unwrap();
+
+        let (frame, fill_po) = miss(file_of(&f), 0);
+        assert_eq!(file_of(&f).start_fill(&f, 0, frame, &fill_po, true), FillStart::DeviceIo(8));
+        let (irp, frags) = seen.0.borrow_mut().pop().expect("one IRP");
+        assert!(seen.0.borrow().is_empty());
+        // SAFETY: the IRP is live until it is completed below.
+        let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
+        assert_eq!((op, offset, length), (crate::io::irp::IrpOp::Read as u32, 1000 * 4096, 8 * PAGE_SIZE as u64));
+        let expected: std::vec::Vec<u64> = (0..8).map(|i| file_of(&f).lookup(i).unwrap().0.as_u64()).collect();
+        assert_eq!(frags.iter().map(|fr| fr.base).collect::<std::vec::Vec<_>>(), expected, "a fragment a page, in order");
+        assert_eq!(expected[0], frame.as_u64());
+        // SAFETY: as above; the device's side of a completion, a success of the whole length.
+        unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
+        crate::io::block::complete_for_test(irp);
+        assert_eq!(crate::sched::pending_op_completion(fill_po.as_ptr()), (0, length), "the fault's PO completed");
+
+        let (frame, fill_po) = miss(file_of(&f), 8);
+        assert_eq!(file_of(&f).start_fill(&f, 8, frame, &fill_po, false), FillStart::DeviceIo(1));
+        let (irp, frags) = seen.0.borrow_mut().pop().expect("one IRP");
+        // SAFETY: the IRP is live until it is completed below.
+        let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
+        assert_eq!((offset, length, frags.len()), (1008 * 4096, PAGE_SIZE as u64, 1), "page 8 alone");
+        assert_eq!(file_of(&f).lookup(9), None, "nothing reserved after it");
+        // SAFETY: as above.
+        unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
+        crate::io::block::complete_for_test(irp);
+        crate::io::block::reclaim_completed();
     }
 
     /// **A forgotten file is never written back**, is out of the cache — so the next resolve
@@ -1792,15 +2295,15 @@ mod tests {
         FileObject::writable_mapped(&a);
         FileObject::writable_unmapped(a.as_ptr());
         assert!(file_of(&a).is_dirty());
-        assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Go(_, 100)));
+        assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)));
         assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
 
         assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "nothing in flight");
         assert_eq!(reg_of(&reg).cached_files(), 0, "so its entry went at once");
         assert!(file_of(&a).is_dead());
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
-        assert!(matches!(file_of(&a).begin_write(0, 4096), WriteStep::Dead));
-        assert_eq!(file_of(&a).begin_read(0, 1), 0, "a fill reads a hole, not a freed block");
+        assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Dead));
+        assert_eq!(read_one(file_of(&a), 0, 4096), 0, "a fill reads a hole, not a freed block");
         assert_eq!(FileObject::touch_target(&a).map(|(_, id)| id), None, "and no touch names it");
         let again = resolve(&reg, 7, PAGE_SIZE);
         assert_ne!(again.as_ptr(), first, "a new object for the id");
@@ -1817,11 +2320,11 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert!(matches!(fo.begin_write(0, 4096), WriteStep::Go(_, 100)), "page 0's IRP is issued");
+        assert!(matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)), "page 0's IRP is issued");
         let answer = po();
         let Forgotten::Later(wait_on) = fo.forget(&answer) else { panic!("an IRP is in flight") };
         assert_eq!(wait_on.as_ptr(), answer.as_ptr());
-        assert!(matches!(fo.begin_write(1, 4096), WriteStep::Dead), "page 1 is not written");
+        assert!(matches!(fo.begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Dead), "page 1 is not written");
         // A second `Forget` of the file waits on the same answer.
         let Forgotten::Later(second) = fo.forget(&po()) else { panic!() };
         assert_eq!(second.as_ptr(), answer.as_ptr());
@@ -1840,7 +2343,7 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert!(matches!(fo.begin_write(0, 4096), WriteStep::Go(_, 100)), "page 0's IRP is issued");
+        assert!(matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)), "page 0's IRP is issued");
         let answer = po();
         let Forgotten::Later(first) = reg_of(&reg).forget_file(7, &answer) else { panic!("an IRP is in flight") };
         assert_eq!(first.as_ptr(), answer.as_ptr());
@@ -1861,7 +2364,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        assert_eq!(file_of(&a).begin_read(1, 1), 101);
+        assert_eq!(read_one(file_of(&a), 1, 4096), 101);
         let answer = po();
         assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
         assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 0, "no sync sees it");
@@ -1887,10 +2390,10 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert_eq!(fo.begin_read(1, 1), 101);
+        assert_eq!(read_one(fo, 1, 4096), 101);
         let answer = po();
         assert!(matches!(fo.forget(&answer), Forgotten::Later(_)));
-        assert_eq!(fo.begin_read(0, 1), 0, "no read starts after it");
+        assert_eq!(read_one(fo, 0, 4096), 0, "no read starts after it");
         assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
     }
 
@@ -1925,7 +2428,7 @@ mod tests {
         assert_eq!(count(), 1, "cleaned, it goes");
 
         // Forgotten with a read in flight, so the entry stays — marked, and not counted.
-        assert_eq!(file_of(&held).begin_read(1, 1), 101);
+        assert_eq!(read_one(file_of(&held), 1, 4096), 101);
         let answer = po();
         assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
         assert_eq!(reg_of(&reg).cached_files(), 1, "the entry stays while the read is in flight");
@@ -1952,7 +2455,7 @@ mod tests {
         assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
         assert!(!file_of(&a).is_dead(), "but not forgotten");
-        assert_ne!(file_of(&a).begin_read(1, 1), 0, "a fill still reads its block, not a hole");
+        assert_ne!(read_one(file_of(&a), 1, 4096), 0, "a fill still reads its block, not a hole");
     }
 
     /// No sync writes a forgotten object, so a writable mapping must not pin it: nothing would

@@ -24,7 +24,7 @@ ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes no
 § *The extent tree*. Phase 6 Part H.4 (2026-10-09): **blocks are allocated and freed a run at a
 time**, and **a grow's reply marks what it added `UNWRITTEN`**, so its zeroes are not read back —
 § *Part D* — and the server reads its metadata through **a cache**, so a directory is read from the
-device once (`libfsserver::cache`).
+device once (`libfsserver::cache`). And (2026-10-10) **a grow writes its zeroes 64 KiB a command**.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -254,9 +254,12 @@ Each part builds on proven machinery and is independently verifiable.
   the blocks the map names, so the device is what a reader of the new range sees. Until then it saw
   whatever those blocks last held. After a truncate and a grow, that was the file's own cut bytes,
   since the allocator's goal is the block the truncate just freed. On any grow, it could be a
-  deleted file's contents. A boot showed it on a freshly created file's blocks. The cost is a write
-  per block grown, which a writer then overwrites; unwritten extents would avoid it, and nothing yet
-  needs to. **The read that followed it is gone** (Phase 6 Part H.4): the grow's reply marks those
+  deleted file's contents. A boot showed it on a freshly created file's blocks. The cost is the
+  blocks' bytes written once more, which a writer then overwrites: **a write a run's 64 KiB** since
+  Phase 6 Part H.4 (2026-10-10) — `BlockWriter::write_zeroes`, which `libfsserver::disk::Disk`
+  answers from a zeroed 64 KiB memory object in commands of up to 64 KiB, where it was a 4 KiB
+  `write_at` a block. Unwritten extents would avoid it, and nothing yet needs to. **The read that
+  followed it is gone** (Phase 6 Part H.4): the grow's reply marks those
   blocks `UNWRITTEN`, so the kernel fills them as zero without reading the zeroes back. The zeroes
   stay, so a crash before the write-back reads zero and never another file's bytes, until a
   measurement asks for unwritten extents ([`phase-6-usb.md`](../planning/phase-6-usb.md) § *H.4's
@@ -286,13 +289,13 @@ Each part builds on proven machinery and is independently verifiable.
   new directory block when the last has no slack — landed 2026-07-29.
 
 **Deferred**: jbd2 journaling + replay-on-mount (needs `has_journal` fixtures); `metadata_csum`
-checksums; a periodic writeback daemon; per-page dirty tracking; read-ahead / clustered fill; the
-standalone `MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
+checksums; a periodic writeback daemon; per-page dirty tracking; the standalone `MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
 open-file cookie; and inode **locality** — a new inode goes in the first group with a free one
 rather than near its parent, which is correct and worse for a seek pattern.
 
 Extent-tree splitting and index nodes left this list with Phase 6 Part H.1 (2026-10-08) — §
-*The extent tree*.
+*The extent tree*; read-ahead and clustered write-back with Part H.4 (2026-10-10), in the kernel's
+page cache ([`filesystem-data-path.md`](filesystem-data-path.md)).
 
 **Five things this list claimed were deferred and were not** (corrected 2026-09-17):
 truncate (2026-07-24), delete and rename, new-directory-block growth (2026-07-29), and

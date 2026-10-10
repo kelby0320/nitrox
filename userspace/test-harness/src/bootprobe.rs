@@ -2831,18 +2831,26 @@ fn storage_mount_test(root_ns: u64) -> bool {
 
 /// **What the disks and the page cache did, as `io.tsm` says** (Phase 6 Part H.2), read before and
 /// after a file of 64 pages is made on the scratch disk through the storage service and synced:
-/// 1. **the scratch disk's writes and written bytes moved by at least its pages, and its busy time
-///    moved** — the RAM disk's driver counted them where it served them — **and by no more than a
-///    run's worth of allocating** (Part H.4): two writes a page, its zeroes and its data, and four
-///    dozen besides — measured, 145; a block at a time the allocator read and wrote the bitmap,
-///    descriptor and superblock for each block, and the same file took 328 — **and no read a page**,
-///    32 in all: a page a grow just allocated fills as zero without reading it (`UNWRITTEN`, the
-///    second fix), and the server reads its directories, inodes and bitmaps once, through its
-///    metadata cache (the third). Measured, 12; uncached, 58; filling each page as well, 115 to 122;
-/// 2. **the page cache's write-backs moved by as much**;
+/// 1. **the scratch disk's writes moved, its written bytes by at least the file's, and its busy
+///    time** — the RAM disk's driver counted them where it served them — **and by no more than
+///    a few dozen commands** (Part H.4): 40 writes, the file's data in a write-back IRP a run of
+///    pages, its zeroes in 64 KiB writes, and the metadata — measured, 25. A page a command, the
+///    data and the zeroes took two writes a page and the file 145; a block at a time the allocator
+///    read and wrote the bitmap, descriptor and superblock for each block, and it took 328 — **and
+///    no read a page**, 32 in all: a page a grow just allocated fills as zero without reading it
+///    (`UNWRITTEN`, the second fix), and the server reads its directories, inodes and bitmaps
+///    once, through its metadata cache (the third). Measured, 12; uncached, 58; filling each page
+///    as well, 115 to 122;
+/// 2. **the page cache's write-backs moved, by at least the file's bytes** — bounded below only,
+///    since every file's write-backs count there;
 /// 3. every present disk and RAM disk has a row, and the page cache one;
 /// 4. **the disk `init`'s root is on has read something** — at boot, through whichever driver it
-///    has: AHCI on an installed disk, a RAM disk on the live stick.
+///    has: AHCI on an installed disk, a RAM disk on the live stick;
+/// 5. **a file of 64 pages the build wrote reads back as written, in at most eight reads** (Part
+///    H.4): nothing has opened it, so its pages fill from the device, each fill reading up to 31
+///    pages ahead of its own in the same IRP, to where its blocks jump on the device — measured,
+///    4, for the three extents `mke2fs` laid it in — where a page a fill took 64; and the page
+///    cache filled at least its bytes.
 ///
 /// Each holds on every machine this runs on, which is every `--selftest` gate's, so none names a
 /// device by position: the scratch disk by its label, the root's by what is mounted at `/`.
@@ -2928,7 +2936,7 @@ fn io_counters_test(root_ns: u64) -> bool {
     let (Some(written), Some(busy)) = (moved(&scratch, "written_bytes"), moved(&scratch, "busy_ns")) else {
         return fail(b"the scratch disk has no row in io.tsm");
     };
-    if writes < PAGES || written < len || busy == 0 || writes > 2 * PAGES + 48 || reads > 32 {
+    if writes == 0 || written < len || busy == 0 || writes > 40 || reads > 32 {
         Line::new()
             .s(b"boot-probe: io counters: the scratch disk moved ")
             .u(reads)
@@ -2947,7 +2955,7 @@ fn io_counters_test(root_ns: u64) -> bool {
     let (Some(wb), Some(wb_bytes)) = (moved("page-cache", "writes"), moved("page-cache", "written_bytes")) else {
         return fail(b"io.tsm has no page-cache row");
     };
-    if wb < PAGES || wb_bytes < len {
+    if wb == 0 || wb_bytes < len {
         return fail(b"the page cache's write-backs did not move by the file's pages");
     }
     if after.rows.len() != disks + 1 {
@@ -2955,6 +2963,53 @@ fn io_counters_test(root_ns: u64) -> bool {
     }
     if num(&after, &root_disk, "reads").unwrap_or(0) == 0 {
         return fail(b"the disk init's root is on has no reads counted");
+    }
+
+    // The file the build wrote, read through a mapping: nothing has opened it, so each page comes
+    // from the device, a fill and the pages it reads ahead an IRP.
+    let (st, ah) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/ahead", RIGHT_MAP_READ);
+    if st != 0 {
+        close(ah);
+        return fail(b"the build's file would not open");
+    }
+    let Some(at) = map_file(ah, len, RIGHT_MAP_READ) else {
+        close(ah);
+        return fail(b"the build's file would not map");
+    };
+    let mut wrong = 0u64;
+    for i in 0..len {
+        // SAFETY: `len` bytes are mapped readable at `at`.
+        if unsafe { ((at + i) as *const u8).read_volatile() } != (i % 251) as u8 {
+            wrong += 1;
+        }
+    }
+    // SAFETY: unmapping this call's own mapping.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, at, 0) };
+    close(ah);
+    let Some(read) = table(b"/svc/devices/info/io.tsm") else {
+        return fail(b"io.tsm would not read after the read-back");
+    };
+    let since = |name: &str, column: &str| Some(num(&read, name, column)?.saturating_sub(num(&after, name, column)?));
+    let (Some(ahead_reads), Some(ahead_bytes), Some(filled)) =
+        (since(&scratch, "reads"), since(&scratch, "read_bytes"), since("page-cache", "read_bytes"))
+    else {
+        return fail(b"io.tsm lost a row");
+    };
+    if wrong != 0 || ahead_bytes < len || ahead_reads > 8 || filled < len {
+        Line::new()
+            .s(b"boot-probe: io counters: the build's file of ")
+            .u(PAGES)
+            .s(b" pages read back with ")
+            .u(wrong)
+            .s(b" bytes wrong in ")
+            .u(ahead_reads)
+            .s(b" reads of ")
+            .u(ahead_bytes)
+            .s(b" bytes, the page cache filling ")
+            .u(filled)
+            .s(b" FAIL")
+            .end();
+        return false;
     }
     Line::new()
         .s(b"boot-probe: io counters: ")
@@ -2967,9 +3022,15 @@ fn io_counters_test(root_ns: u64) -> bool {
         .u(written)
         .s(b" bytes and ")
         .u(wb)
-        .s(b" page-cache write-backs for a file of ")
+        .s(b" page-cache write-backs of ")
+        .u(wb_bytes)
+        .s(b" bytes for a file of ")
         .u(PAGES)
-        .s(b" pages; ")
+        .s(b" pages, and read the build's back in ")
+        .u(ahead_reads)
+        .s(b" reads of ")
+        .u(ahead_bytes)
+        .s(b" bytes; ")
         .u(disks as u64)
         .s(b" disks in io.tsm, the root's ")
         .s(root_disk.as_bytes())

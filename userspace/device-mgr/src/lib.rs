@@ -413,7 +413,7 @@ pub mod io {
             n(cache.writeback_irps),
             Value::Null,
             Value::Null,
-            n(cache.fills.saturating_mul(PAGE)),
+            n(cache.fill_pages.saturating_mul(PAGE)),
             n(cache.writeback_pages.saturating_mul(PAGE)),
             n(cache.fill_ns.saturating_add(cache.writeback_ns)),
             n(cache.hits),
@@ -767,6 +767,7 @@ mod tests {
             writeback_pages: 3,
             writeback_irps: 3,
             writeback_ns: 30,
+            fill_pages: 40,
         };
         let t = Table::decode(&super::io::table(cache, &[disk, ram, late], &b)).unwrap();
         let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name).unwrap();
@@ -776,7 +777,7 @@ mod tests {
         assert_eq!((cell(0, "written_bytes"), cell(0, "busy_ns"), cell(0, "hits")), (Value::Int(1536), Value::Int(999), Value::Null));
         assert_eq!(cell(1, "name"), Value::Str("blk-2".into()));
         assert_eq!(cell(2, "name"), Value::Str("page-cache".into()));
-        assert_eq!((cell(2, "reads"), cell(2, "read_bytes"), cell(2, "writes")), (Value::Int(7), Value::Int(7 * 4096), Value::Int(3)));
+        assert_eq!((cell(2, "reads"), cell(2, "read_bytes"), cell(2, "writes")), (Value::Int(7), Value::Int(40 * 4096), Value::Int(3)));
         assert_eq!((cell(2, "busy_ns"), cell(2, "hits"), cell(2, "holes"), cell(2, "flushes")), (Value::Int(100), Value::Int(100), Value::Int(2), Value::Null));
 
         // The disk departs: its row goes, whichever side says so.

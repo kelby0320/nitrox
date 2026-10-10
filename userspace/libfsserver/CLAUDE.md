@@ -21,7 +21,8 @@ servers speak one protocol and a fix to it is a fix to both:
   `Volume::grow_file` makes true by answering the size it grew from, past which everything reads
   as zero.
 - **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
-  server uses; and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
+  server uses — but zeroes up to 64 KiB a submit, from a zeroed memory object of its own
+  (`BlockWriter::write_zeroes`, Phase 6 Part H.4); and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
   FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
@@ -57,7 +58,8 @@ servers speak one protocol and a fix to it is a fix to both:
   holds this in a test that writes data the kernel's way under a cache that evicts all the time, and
   reads it back.
 - **The device layer's granularity is a measured question** (`TODO(fs-throughput)`, Phase 6 Part H).
-  Change what `Disk` moves per submit with a number from the laptop, not a guess.
+  Change what `Disk` moves per submit with a number from the laptop, not a guess. Its zeroes moved
+  to 64 KiB on one: ext4's grows wrote a block a command, 65,536 for a 256 MiB copy.
 
 ## Capability discipline
 

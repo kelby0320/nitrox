@@ -2887,6 +2887,13 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   stick 353 s against 37, within the disk 77 s against 5.6, from the stick 100 s against 22. The
   table is in the decision log. Next, the maintainer's call: the number (H.5), or the loop on to
   clustered fills and write-backs, larger zero writes and more than one command in flight.
+- **H.4, the fourth fix: more than a page a command** (2026-10-10). The page cache writes back a run
+  of pages an IRP, up to each device's `max_frags` and 256 pages; a fault reads up to 31 pages ahead
+  of its own in the same IRP; and ext4's grow writes its zeroes 64 KiB a command
+  (`BlockWriter::write_zeroes`). `/dev/registry/io` goes to version 2, counting the pages its fills
+  bring in. Under QEMU the four sets went from 186 s to 124; `boot-probe`'s 64-page file from 145
+  writes to 25, and a 64-page file read back in 4 reads. **Next: the laptop measures again**, with
+  the four fixes in.
 - **H.5 The number, and the docs.**
 
 ### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back
@@ -2961,6 +2968,96 @@ command — the candidates still on the list — may well cost more. **Questions
 piece 1 now, and piece 2 deferred until measured? And the flag keeps its spec name, `UNWRITTEN`,
 though on ext4 the blocks are written, with zeroes — its meaning, "reads as zero; do not read the
 device", is what the kernel acts on.
+
+### H.4's fourth fix, in detail: more than a page a command
+
+**Detail pass, 2026-10-10**, reviewed by the maintainer the same day against what Linux does: **all
+three pieces**, and **each device's own limit**, as Linux's requests are bounded by the device's —
+the right call, too, for device kinds still to come, such as NVMe. It changes how the kernel's page
+cache talks to the drivers. **Built the same day** — § *As built*, at the end.
+
+**What it is for.** After three fixes the laptop's fifteen runs take 1,362 s against Linux's 889,
+and three runs are 530 s of it against Linux's 65: copying `big` within the disk (77 s against 5.6),
+to the stick (353 against 37) and from it (100 against 22). In each the device was busy for almost
+the whole run, and every command moved 4 KiB: the page cache fills a page a command and writes one
+back a command, and ext4's grow writes its zeroes a block a command. The disk answered a command in
+0.38 ms, the stick a write in 4.8. **The hypothesis this tests**: those runs are bound by the number
+of commands, not their bytes — so moving a run of pages in one command cuts their time by near the
+drop in commands, until the device's bandwidth is what is left. If the stick is slow per byte rather
+than per command, its time will barely move, and that too is the answer the number is set with.
+
+**What the hardware allows.** The IRP already carries a fragment list, a page a fragment, and each
+device publishes the most it describes in one command: AHCI 248, USB storage 64, the RAM disk no
+limit. **A command of as many pages as the device takes** — 248 on the laptop's disk, 64 on the
+stick — is that many of the commands the laptop paid for one by one. Three pieces, each held by a
+count:
+
+**Piece 1: write-back in runs.** `FileObject::writeback` sends a page and waits, a page at a time.
+It would send **one IRP for each run of resident pages contiguous on the device**, up to the
+device's own limit — the same pages, in the same order, to the same blocks. A run is decided under
+the object's lock as one page is today (`begin_write` for a run): a page gone, past the end or over
+a hole ends the run before it, and a `Forget` stops the write-back before the next run rather than
+the next page — an IRP already issued was never stoppable. One `PendingOperation` and one count in
+flight per IRP; the frames are pinned by the object, as a page's is. **Saves**: a copy of `big`
+writes its data in about 265 commands on the disk and 1,024 on the stick, instead of 65,536.
+
+**Piece 2: a fill that reads ahead.** A fault on page `i` of a Model A file would reserve, beside
+it, the pages after it that are not resident and lie contiguous on the device, up to the window, and
+fill them with **one IRP and one `PendingOperation`** — every page reserved `Loading` against that
+operation, so a fault on any of them waits on it, as a second faulter waits today, and settles it.
+Pages a grow just allocated (`UNWRITTEN`) and holes take no read, as now; a run ends where they
+start. The window is 32 pages, Linux's default, within the file's size and the device's limit; a
+reader that wanted one page has paid for up to 31 more in memory and in one longer command, and a
+file read through — a copy's source, an ELF — reads in 32-page commands. **Saves**: a copy of `big`
+reads its source in 2,048 commands instead of 65,536, on the disk or the stick.
+
+**Piece 3: ext4's zeroes in large writes.** `grow_file` zeroes each block it allocates with a write
+of its own, through `Disk`'s 4 KiB transfer. It would write a run's zeroes in **64 KiB writes**, as
+FAT's server already does: `BlockWriter` gains a `write_zeroes`, a loop of `write_at` by default,
+which `Disk` answers from a zero-filled 64 KiB scratch of its own. Server-internal, no contract.
+**Saves**: a grow of `big` writes its zeroes in 4,096 commands instead of 65,536. Piece 2 of the
+second fix, not zeroing at all, stays waiting for a measurement; this is the cheap half.
+
+**Held by counts**, as every fix: kernel host tests that a write-back of 100 contiguous resident
+pages issues two IRPs of 64 and 36 pages on a device that takes 64, that a gap, a hole or a `Forget`
+ends a run where it should, and that a fault reads ahead the run after it and stops at a hole or an
+`UNWRITTEN` run; a host test through `Disk`'s command model that a grow's zeroes take one write per
+64 KiB; and `boot-probe`'s 64-page file, whose 145 writes become a few dozen — with a control each
+that puts back a page a command and fails it. Then the four sets under QEMU, and the laptop once.
+
+**Not in it**: more than one command in flight (AHCI's NCQ), deferred again — with commands this
+size it may not be needed, and the laptop will say; and the per-file metadata `small/` still writes,
+about eleven writes a file, a different cost.
+
+**What Linux does**, the reference the maintainer asked for. **It reads ahead** on every read, a
+page fault on a mapping included — a window around the faulting page of the device's read-ahead
+size, 128 KiB (32 pages) by default and raised where a device reports a preferred transfer size: the
+Patriot stick gets 2 MiB on the development machine (`read_ahead_kb`). **It writes back contiguous
+dirty pages as large requests**, merged up to the device's limit (`max_sectors_kb`): 1 MiB for that
+stick, about 1.25 MiB for a SATA disk by default. **And ext4 writes no zeroes**: it allocates at
+write-back and orders data before the metadata naming it through its journal, and preallocated space
+is unwritten extents — so Linux's answer to piece 3 is the second fix's piece 2, and large zero
+writes are the cheap half until a measurement asks for more.
+
+**So, as built**: write-back runs up to **each device's own limit** — AHCI's 248 pages, the USB
+driver's 64, and 256 (1 MiB, Linux's request size) for a device with none, the RAM disk; a
+read-ahead window of **32 pages**, Linux's default; and ext4's zeroes in **64 KiB** writes. The USB
+driver's 64 is below the 1 MiB Linux gives the same stick; raising it is a driver change, left out
+unless the laptop shows the stick still bound by its commands.
+
+**As built** (2026-10-10), beside the above. The read-ahead's pages are reserved under the object's
+lock with the faulted one and not zeroed, since the read fills each whole and a page whose read
+fails leaves the cache unmapped; the faulter settles them all, and any it does not reach a second
+faulter settles. A fill that read ahead and failed is tried again for its own page alone, as Linux
+does — the review of the diff found that otherwise a bad block after the faulted page would fail its
+fault. **`/dev/registry/io` went to version 2**: it served a fill's bytes as a page's, which a fill
+reading ahead makes wrong, so it counts the pages too. The write-back's loop is apart from its IRPs
+(`write_runs`) so a host test drives the real loop; a fill is driven through `start_fill` to a
+recording device. **`boot-probe` reads back a file the build wrote**, `ahead` on the scratch
+filesystem, because a file the probe itself wrote stays cached until its write-back's IRPs are
+reclaimed, and a read of it would reach no device. Counts: the probe's file 145 writes, 86 with the
+zeroes, 25 with the runs; `ahead`'s 64 pages in 4 reads, for the three extents `mke2fs` laid it in;
+the four sets under QEMU 186 s, then 124.
 
 ### Gates
 

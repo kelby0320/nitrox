@@ -116,6 +116,16 @@ pub(crate) mod test_support {
             }
             self.image.write_at(offset, buf)
         }
+        /// As `Disk` writes them: a block's part at each end by `write_at`, whole blocks a
+        /// [`libfsserver::disk::SPAN`] a command.
+        fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+            let (head, whole, tail) = libfsserver::disk::split_zeroes(offset, len);
+            self.write_at(head.start, &vec![0; (head.end - head.start) as usize])?;
+            let n = whole.end - whole.start;
+            self.writes.set(self.writes.get() + n.div_ceil(libfsserver::disk::SPAN as u64));
+            self.image.write_at(whole.start, &vec![0; n as usize])?;
+            self.write_at(tail.start, &vec![0; (tail.end - tail.start) as usize])
+        }
     }
 
     /// A `BlockReader` over an in-memory image. Its writes are refused, so a test reading through
@@ -1475,7 +1485,8 @@ mod tests {
     /// twelve commands a block allocating — the bitmap, the descriptor and the superblock read and
     /// written for each — and removing a file the same, eight a block. Measured one block at a
     /// time, this grow was 10,251 reads and 8,193 writes and the removal 10,271 and 6,150; in runs
-    /// 26 and 2,058, and 61 commands. What a grow still writes a block is its zeroes.
+    /// 26 and 2,058, and 61 commands. **And its zeroes 64 KiB a command** (H.4's fourth fix): 2,048
+    /// writes of them were 128 and a write for each run's last part.
     #[test]
     fn an_eight_mebibyte_grow_and_its_removal_cost_commands_a_run_not_a_block() {
         const BLOCKS: u64 = 2048;
@@ -1487,7 +1498,8 @@ mod tests {
         ext4::grow_file(&rw, b"/system/big", (BLOCKS * 4096) as usize, TEST_NOW).unwrap();
         let (reads, writes) = rw.take();
         assert!(reads <= 32, "{reads} reads to grow {BLOCKS} blocks");
-        assert!((BLOCKS..=BLOCKS + 16).contains(&writes), "{writes} writes to grow {BLOCKS} blocks");
+        // A sixteenth of the blocks' zeroes, a command for each run's ragged end, and the metadata.
+        assert!((BLOCKS / 16..=BLOCKS / 16 + 3 + 16).contains(&writes), "{writes} writes to grow {BLOCKS} blocks");
         // In the fixture's free stretches — three of them, as one block at a time placed it.
         let mut runs = [BlockRun::default(); 4];
         let mapped = ext4::map_file(&rw, b"/system/big", &mut runs).unwrap();

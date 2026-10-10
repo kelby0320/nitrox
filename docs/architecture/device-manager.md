@@ -178,8 +178,9 @@ present disk and RAM disk, named as above, then one named `page-cache`. Its colu
 a partition's I/O is its disk's, so a partition has no row; `read_bytes` and `written_bytes`;
 `busy_ns`, the time commands were on the device, which one command at a time makes the device's
 busy time; and the page cache's own `hits` and `holes`, `Null` for a disk. **The page cache's row**
-counts its fills as `reads` and their pages as `read_bytes`, its write-back IRPs as `writes` and
-their pages as `written_bytes`, and the time both took as `busy_ns` — waiting on the devices, so
+counts its fills as `reads` — an IRP each, since Phase 6 Part H.4 a page and those read ahead of
+it — and their pages as `read_bytes`, its write-back IRPs as `writes` and their pages as
+`written_bytes`, and the time both took as `busy_ns` — waiting on the devices, so
 it overlaps their time rather than adding to it. `nxsh`'s `time` reads it before and after a
 pipeline and prints the difference ([`shell-language.md`](../spec/shell-language.md) § 3); `open
 /dev/devices/io.tsm | save` takes it off the machine whole. The directory lists it after `all.tsm`.

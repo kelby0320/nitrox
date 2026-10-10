@@ -13,7 +13,8 @@ file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 P
 `/dev/registry/io` (Phase 6 Part H.2, 2026-10-08). **A grow's reply marks what it added
 `UNWRITTEN`**, and the kernel fills such a page without reading the device (Phase 6 Part H.4,
 2026-10-09). **A server caches its metadata and never a file's data**, which the kernel writes to
-the device behind it (`libfsserver::cache`, the same part).
+the device behind it (`libfsserver::cache`, the same part). **A fill reads ahead, and a write-back
+writes a run of pages an IRP**, each up to the device's limit (Phase 6 Part H.4, 2026-10-10).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
@@ -119,7 +120,16 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   `file_block → device_lba` and issues a block **read** IRP into the cache frame — **unless the
   page's blocks read as zero**: a hole, or since Phase 6 Part H.4 blocks every one of which is
   `UNWRITTEN`, which a grow's reply marks over what it added (`fill_block_in`). Then the zeroed
-  frame is the fill, and no IRP is issued. The **Model B** producer carries `{server, file-suffix}`
+  frame is the fill, and no IRP is issued. **The read reads ahead** (Phase 6 Part H.4): the same
+  IRP fills up to `READ_AHEAD_PAGES` − 1 pages after the faulted one, 31, each not resident,
+  inside the file, and on the device right after the one before, none reading as zero, and
+  never more than the device describes in one command (its `max_frags`, a page a fragment). Each
+  is reserved `Loading` on the fault's `PendingOperation`, so a fault on one waits on that fill
+  as a second faulter of a page does, and the faulter settles them all (`FileObject::begin_fill`).
+  A file read through — a copy's source, an image being loaded — reads in 128 KiB commands, Linux's
+  default read-ahead, rather than a page each. A fill that read ahead and failed is tried again for
+  the faulted page alone before the fault fails, as Linux does: the error may have been on a page it
+  never asked for. The **Model B** producer carries `{server, file-suffix}`
   and fills via `ReadRange` — the variant a non-block fs-server uses. A file has one producer, fixed
   by its filesystem's class.
 - **Writable mappings, and dirty per object**: `sys_memory_map` grants `MAP_WRITE` on a
@@ -128,8 +138,12 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   There is no per-page dirty bit (`TODO(page-dirty-tracking)`). This bullet said a store "marks
   the `CachePage` dirty" until 2026-09-24, when the administration Part C detail pass found no such
   state in the code.
-- **Writeback**: `FileObject::writeback` flushes **every resident page** by a block **write** IRP
-  from the cache frame to its `device_lba`, dirty or not, since it cannot tell. A page over a hole
+- **Writeback**: `FileObject::writeback` flushes **every resident page** by block **write** IRPs
+  from the cache frames to their `device_lba`s, dirty or not, since it cannot tell — **a run of
+  pages an IRP** since Phase 6 Part H.4: pages next to each other in the file and on the device, in
+  the file's order, up to the device's `max_frags` and at most `RUN_MAX_PAGES`, 256. Each run is
+  decided under the object's lock as its IRP is issued (`begin_write`), so a `Forget` stops the
+  write-back before its next run and a resize governs every run after it. A page over a hole
   is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **A page over
   `UNWRITTEN` blocks is not**: it is written to them like any other, since a write-back looks blocks
   up by `device_block_in`, which ignores the flag — the flag read as a hole would skip the write.
@@ -138,7 +152,8 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   — and a write into it, as into any hole, is not written back.
 - **What the cache does is counted** (`file_object::fill_stats`): fills that read the device and
   their time, fills over a hole, hits, and — since Phase 6 Part H.2 — write-backs: the pages, the
-  IRPs that carried them (one a page today) and their time. `/dev/registry/io` serves them beside
+  IRPs that carried them and their time. Since Part H.4 an IRP carries a run of pages either way,
+  so the fills count the pages they brought in as well (`/dev/registry/io` version 2). `/dev/registry/io` serves them beside
   the disks' counters, and the device manager's `io.tsm` as its `page-cache` row. **Two triggers:
   `sys_file_sync`** on one file, an `msync`-style syscall, and **`sys_ns_sync`** on every dirty
   file of a mount. Unmapping a `MAP_WRITE` VMA does *not* write back. After it, the kernel sends

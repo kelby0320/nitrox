@@ -338,14 +338,15 @@ pub fn records(bytes: &[u8]) -> Result<Records<'_>, SnapshotError> {
 
 /// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
 pub const IO_MAGIC: u32 = 0x534F_4944;
-/// The I/O snapshot layout this build reads.
-pub const IO_VERSION: u32 = 1;
+/// The I/O snapshot layout this build reads: 2 since the page cache counts the pages its fills
+/// bring in (Phase 6 Part H.4).
+pub const IO_VERSION: u32 = 2;
 
 /// The page cache's counters, since boot.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CacheCounts {
-    /// Fills that read the device, one IRP each.
+    /// Fills that read the device, one IRP each — a page and those read ahead of it.
     pub fills: u64,
     /// Nanoseconds those fills took.
     pub fill_ns: u64,
@@ -359,9 +360,11 @@ pub struct CacheCounts {
     pub writeback_irps: u64,
     /// Nanoseconds those IRPs took.
     pub writeback_ns: u64,
+    /// The pages the fills brought in (version 2).
+    pub fill_pages: u64,
 }
 
-const _: () = assert!(size_of::<CacheCounts>() == 56);
+const _: () = assert!(size_of::<CacheCounts>() == 64);
 
 /// The start of an I/O snapshot: then `count` [`IoRecord`]s.
 #[repr(C)]
@@ -379,7 +382,7 @@ pub struct IoHeader {
     pub cache: CacheCounts,
 }
 
-const _: () = assert!(size_of::<IoHeader>() == 72);
+const _: () = assert!(size_of::<IoHeader>() == 80);
 const _: () = assert!(align_of::<IoHeader>() == 8);
 const _: () = assert!(offset_of!(IoHeader, cache) == 16);
 
@@ -501,6 +504,7 @@ pub fn io(bytes: &[u8]) -> Result<IoSnapshot<'_>, SnapshotError> {
         writeback_pages: q(48),
         writeback_irps: q(56),
         writeback_ns: q(64),
+        fill_pages: q(72),
     };
     Ok(IoSnapshot { cache, bytes, count })
 }
@@ -633,11 +637,11 @@ mod tests {
         put32(&mut page, 4, IO_VERSION);
         put32(&mut page, 8, 2);
         put32(&mut page, 12, 64);
-        for (k, v) in [11u64, 12, 13, 14, 15, 16, 17].iter().enumerate() {
+        for (k, v) in [11u64, 12, 13, 14, 15, 16, 17, 18].iter().enumerate() {
             put64(&mut page, 16 + 8 * k, *v);
         }
         for (n, id) in [(0usize, 3u32), (1, 4)] {
-            let at = 72 + n * 64;
+            let at = 80 + n * 64;
             put32(&mut page, at, id);
             put32(&mut page, at + 4, if n == 1 { DEPARTED as u32 } else { 0 });
             for k in 0..7 {
@@ -646,7 +650,7 @@ mod tests {
         }
         let snap = io(&page).unwrap();
         assert_eq!(snap.len(), 2, "two, though the page holds room for sixty");
-        assert_eq!((snap.cache.fills, snap.cache.writeback_ns), (11, 17));
+        assert_eq!((snap.cache.fills, snap.cache.writeback_ns, snap.cache.fill_pages), (11, 17, 18));
         let r: [IoRecord; 2] = [snap.get(0).unwrap(), snap.get(1).unwrap()];
         assert_eq!((r[0].id, r[0].reads, r[0].busy_ns, r[0].is_departed()), (3, 300, 306, false));
         assert_eq!((r[1].id, r[1].read_bytes, r[1].is_departed()), (4, 404, true));
@@ -658,9 +662,9 @@ mod tests {
             io(&p).err()
         };
         assert_eq!(refused(0, REGISTRY_MAGIC), Some(SnapshotError::BadMagic), "a registry snapshot is not one");
-        assert_eq!(refused(4, 2), Some(SnapshotError::BadVersion));
+        assert_eq!(refused(4, 1), Some(SnapshotError::BadVersion), "the layout before fill_pages");
         assert_eq!(refused(12, 144), Some(SnapshotError::BadRecordSize));
         assert_eq!(refused(8, 64), Some(SnapshotError::Truncated), "more than the page holds");
-        assert_eq!(io(&page[..71]).err(), Some(SnapshotError::Short));
+        assert_eq!(io(&page[..79]).err(), Some(SnapshotError::Short));
     }
 }

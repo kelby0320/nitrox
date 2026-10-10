@@ -65,6 +65,20 @@ pub enum FsError {
 pub trait BlockWriter {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
 
+    /// **Write `len` zeroes from `offset`** — what a grow writes over the blocks it allocates. A
+    /// device that can moves them in large commands ([`crate::disk::Disk`]: 64 KiB a command, Phase
+    /// 6 Part H.4); by default, a 4 KiB `write_at` at a time.
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        static ZERO: [u8; 4096] = [0; 4096];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(ZERO.len() as u64) as usize;
+            self.write_at(offset + done, &ZERO[..n])?;
+            done += n as u64;
+        }
+        Ok(())
+    }
+
     /// **`len` bytes from `offset` are no longer metadata** — freed, so they may become a file's
     /// data, which the kernel writes behind the server's back: a cache lets them go (Phase 6 Part
     /// H.4). By default, nothing.

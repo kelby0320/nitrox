@@ -35423,3 +35423,76 @@ in large writes (or piece 2, no zeroes), and one command in flight. Whether the 
 where the number is set, is the maintainer's call (H.5).
 
 **Seen on the way**: `clear` is not a program — one more for the list after Part H.
+
+## 2026-10-10 — Phase 6 Part H.4, the fourth fix: more than a page a command
+
+**What dominated.** After three fixes the laptop's copies of `big` were bound by commands of 4 KiB:
+the page cache filled a page a command and wrote one back a command, and ext4's grow wrote its
+zeroes a block a command — 65,811 reads and 131,442 writes to copy 256 MiB within the disk. The
+detail pass (`phase-6-usb.md` § *H.4's fourth fix, in detail*) took Linux as the reference, at the
+maintainer's asking, and the maintainer chose all three pieces and each device's own limit, since a
+device kind still to come, NVMe say, publishes its own.
+
+**What it is.** **Write-back in runs**: `FileObject::writeback` writes the resident pages in the
+file's order, a run of them an IRP — pages next to each other in the file and on the device, up to
+the device's `max_frags`, a page a fragment, and at most `RUN_MAX_PAGES`, 256 (1 MiB, about Linux's
+request to a SATA disk). Each run is decided under the object's lock as its IRP is issued, so a
+`Forget` stops the write-back before its next run, as it stopped one before its next page. **A fill
+that reads ahead**: a fault on a Model A page reserves up to 31 pages after it — not resident,
+inside the file, next on the device, none reading as zero — `Loading` on the fault's
+`PendingOperation`, and one IRP fills them all, 128 KiB as Linux's default; a fault on one of them
+waits on that fill, as a second faulter of a page does. A fill that read ahead and failed is tried
+again for the faulted page alone before the fault fails, as Linux does, since the error may have
+been on a page it never asked for. **ext4's zeroes in 64 KiB writes**: `BlockWriter::write_zeroes`,
+a loop of `write_at` by default, which `libfsserver::disk::Disk` answers from a zeroed 64 KiB memory
+object of its own, unmapped. The kernel's block layer gained `dispatch_block_irp_into_frames`,
+refusing more frames than the device describes as `dispatch_block_irp` refuses more fragments, and
+`max_frags` to size a run by.
+
+**And one format change the detail pass did not foresee.** `/dev/registry/io` counted the page
+cache's fills and served `fills × 4 KiB` as their bytes; a fill now reads many pages, so it gains
+`fill_pages` and goes to **version 2** (`docs/spec/device-node.md`), and `io.tsm`'s `page-cache` row
+reports `read_bytes` from it. The kernel and `libkern` of one image agree on it; no syscall and no
+ABI-hash input changed — the kernel exports no symbols, and `Irp`, `IoOp` and `KError` are as they
+were.
+
+**Held by**: kernel host tests driving the real write-back loop (`write_runs`, with the IRP left to
+a closure that records it) — 100 contiguous pages as IRPs of 64 and 36 on a device taking 64, in the
+file's order though faulted in reverse; a run ended by a gap on the device, a hole, a page missing
+or still filling, and the file's end; a `Forget` mid-way stopping it at the next run, a refusal
+ending it; 1 KiB blocks — and read-ahead tests through `begin_fill`: its run reserved on the fault's
+PO, stopped by a jump on the device, a resident page in either state, `UNWRITTEN` blocks, a hole,
+the map's end and the file's end, nothing for a forgotten file; a fill driven through `start_fill`
+to a recording device taking eight fragments, read as one IRP of eight pages; the frames dispatch
+refusing nine frames to that device, and a length past the frames. In `libfsserver`, how `Disk`
+splits zeroes, and the metadata cache zeroing its copies or, on a failed write, letting them go; in
+ext4, the 8 MiB grow's writes, whose 2,048 of zeroes are now 128 and a shorter one ending each run.
+**Controls**, each failing its test: for write-back, no limit, no contiguity, a filling page
+written, no sort, no skip past a run, no file-size bound, `dead` ignored, the IRP not ended, the
+lookup's fallback gone; for read-ahead, none at all, the resident mask ignored, no contiguity, no
+file-size bound, the pages not on the PO, the device's limit ignored, `dead` ignored; the dispatch's
+two refusals gone; the cache's copies not zeroed, kept on a failed write, or zeroed by the default
+loop; ext4 zeroing a block a write. A fill told not to read ahead reads its page alone, and ignoring
+the flag fails that test; but the fault path's own retry, which sets it, waits on the scheduler,
+which no host test has, and a read-ahead's rollback when its IRP cannot be built is an allocation
+failure — those two paths have no control. **`boot-probe`** now bounds the scratch disk's writes at
+40 — a page a write-back IRP put back fails it, at 86 — and reads back `ahead`, a 64-page file the
+build puts on the scratch filesystem for it, which nothing opens first: as written, in at most eight
+reads — no read-ahead fails it, at 64.
+
+**Under QEMU**, the four sets on the same disk, the stick checked whole and the root clean after the
+round:
+
+| Under QEMU, the same disk | After the third fix | After the fourth |
+|---|---|---|
+| The four sets, as the driver timed them | 75 + 34 + 61 + 16 s | 48 + 16 + 44 + 16 s |
+| Copy `big` within the disk: the disk's commands | — | 2,332 reads, 4,755 writes |
+| Copy `big` to the stick: the stick's writes, the page cache's write-backs | — | 5,284, 1,024 |
+| `boot-probe`'s 64-page file: the scratch disk's writes | 145 | 25 (16 once `ahead` moved the layout) |
+| `boot-probe` reading back `ahead`, 64 pages in three extents | — | 4 reads |
+
+The laptop measures next, the four fixes in: the hypothesis is that those runs were bound by the
+number of commands, and if the stick is slow per byte rather than per command its time will barely
+move — which is the answer the number is set with too. **Left out, as planned**: more than one
+command in flight (NCQ), and raising the USB driver's 64 fragments, which is below the 1 MiB Linux
+gives the same stick — each waits for the laptop to show the need.

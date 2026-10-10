@@ -1125,11 +1125,11 @@ fn grow_blocks<RW: BlockReader + BlockWriter>(
             }
         };
         let mut got = Extent::written(lb, phys, len);
-        for blk in phys..phys + len {
-            if let Err(e) = rw.write_at(blk * bs as u64, &ZERO_BLOCK[..bs]) {
-                give_back(&[run, Some(got)]);
-                return Err(e);
-            }
+        // The run's zeroes in one call, which the device may move in large commands (Phase 6
+        // Part H.4).
+        if let Err(e) = rw.write_zeroes(phys * bs as u64, len * bs as u64) {
+            give_back(&[run, Some(got)]);
+            return Err(e);
         }
         // What continues the run in hand joins it, up to an extent's longest; the rest starts the
         // next, so the extents come out as long as one block at a time made them.

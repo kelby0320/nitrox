@@ -12,7 +12,8 @@ DeviceNodes in slice 6, and `Char` nodes arrived with the console and the i8042.
 USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, and a record's
 `port` and `speed`. USB disks, MBR partitions and the `BOOT` flag arrived with Phase 6 Part D
 (2026-10-06). `/dev/registry/io` and a node's I/O counters arrived with Phase 6 Part H.2
-(2026-10-08).
+(2026-10-08); its version 2, with the pages the page cache's fills bring in, with Part H.4
+(2026-10-10).
 
 ## The DeviceNode object
 
@@ -399,10 +400,13 @@ the reader a notification would go to (`docs/planning/phase-6-usb.md` § *Part C
 ### What the disks have done: `/dev/registry/io`
 
 *(Phase 6 Part H.2.)* A fresh read-only `MemoryObject`: an `IoHeader` — `IO_MAGIC`, `"DIOS"`
-little-endian; `IO_VERSION`, 1; `count`; `record_size`, 64 — carrying the page cache's counters
-(`CacheCounts`: its fills and their time, its fills over a hole, its hits, and its write-backs'
-pages, IRPs and time), then `count` `IoRecord`s, then zero padding to the page
-(`kernel/src/libkern/device.rs`; `userspace/libkern/src/device.rs`, whose `io` is the reader). **A
+little-endian; `IO_VERSION`, 2; `count`; `record_size`, 64 — carrying the page cache's counters
+(`CacheCounts`: its fills and their time, its fills over a hole, its hits, its write-backs' pages,
+IRPs and time, and last the pages its fills brought in), then `count` `IoRecord`s, then zero
+padding to the page
+(`kernel/src/libkern/device.rs`; `userspace/libkern/src/device.rs`, whose `io` is the reader).
+**Version 2** (Phase 6 Part H.4) added `fill_pages`, making `CacheCounts` 64 bytes and the header
+80: a fill reads ahead, so its pages are no longer its count; a reader of version 1 is refused. **A
 record per disk and RAM disk**, in table order, departed ones flagged `DEPARTED` with their counts
 kept; a partition has none, since its window forwards to its disk's driver, which counts it there.
 

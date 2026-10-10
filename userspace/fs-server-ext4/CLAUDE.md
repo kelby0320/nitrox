@@ -54,7 +54,8 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
   `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
   `MemoryObject`, a write smaller than a block reading the block first (this said
-  "sector-at-a-time" until 2026-10-06) — **served through `libfsserver::cache::MetaCache`** since
+  "sector-at-a-time" until 2026-10-06), and a grow's zeroes up to 64 KiB a submit
+  (`write_zeroes`, Phase 6 Part H.4) — **served through `libfsserver::cache::MetaCache`** since
   Phase 6 Part H.4, so a directory, an inode-table block or a bitmap is read from the device once.
   **Alloc-free** — fixed `.bss` buffers, the cache's 1 MiB among them, no `#[global_allocator]`.
 

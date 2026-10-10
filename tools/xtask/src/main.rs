@@ -19023,9 +19023,15 @@ const SCRATCH_ESP_PATH: &str = "/boot/scratch.img";
 const SCRATCH_README: &str = "nitrox-scratch: a test image's second filesystem, mounted by the storage service\n";
 /// Its size: room for the probe's writes, and little to load.
 const SCRATCH_MIB: u64 = 8;
+/// **A file of [`SCRATCH_AHEAD_PAGES`] pages on the scratch filesystem**, byte `i` being `i % 251`,
+/// which `boot-probe` reads through a mapping to see fills read ahead (Phase 6 Part H.4): nothing
+/// opens it before then, so its pages come from the device.
+const SCRATCH_AHEAD: &str = "ahead";
+/// Its length in pages: two fills' worth at 32 pages a fill.
+const SCRATCH_AHEAD_PAGES: usize = 64;
 
 /// Build the test image's scratch filesystem at `out`: an ext4 labelled [`SCRATCH_LABEL`] holding a
-/// `README`, with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
+/// `README` and [`SCRATCH_AHEAD`], with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
 /// table, so its label is its own.
 fn build_scratch_fs(out: &Path) -> R<()> {
     let staging = out.with_extension("staging");
@@ -19034,6 +19040,7 @@ fn build_scratch_fs(out: &Path) -> R<()> {
     }
     fs::create_dir_all(&staging)?;
     fs::write(staging.join("README"), SCRATCH_README)?;
+    fs::write(staging.join(SCRATCH_AHEAD), (0..SCRATCH_AHEAD_PAGES * 4096).map(|i| (i % 251) as u8).collect::<Vec<u8>>())?;
     let _ = fs::remove_file(out);
     fs::File::create(out)?.set_len(SCRATCH_MIB * 1024 * 1024)?;
     run(Command::new("mke2fs")

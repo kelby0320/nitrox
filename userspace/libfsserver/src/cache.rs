@@ -150,6 +150,22 @@ impl<D: BlockReader + BlockWriter, const N: usize> BlockWriter for MetaCache<'_,
         written
     }
 
+    /// **To the device**, which may move them in large commands, then zeroes in any copy the cache
+    /// holds — or, if the write failed, the copies let go.
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        let written = self.dev.write_zeroes(offset, len);
+        let mut s = self.store.borrow_mut();
+        for (block, within, n) in Store::<N>::spans(offset, len as usize) {
+            if let Some(i) = s.slot_of(block) {
+                match written {
+                    Ok(()) => s.blocks[i][within..within + n].fill(0),
+                    Err(_) => s.tags[i] = EMPTY,
+                }
+            }
+        }
+        written
+    }
+
     fn forget(&self, offset: u64, len: u64) {
         let mut s = self.store.borrow_mut();
         let (first, end) = (offset / BLOCK as u64, (offset + len).div_ceil(BLOCK as u64));
@@ -203,6 +219,11 @@ mod tests {
             v.get_mut(offset as usize..end).ok_or(FsError::Io)?.copy_from_slice(buf);
             Ok(())
         }
+        /// One write, however long — as `Disk`'s large commands, so a test can tell them from the
+        /// default's 4 KiB at a time.
+        fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+            self.write_at(offset, &vec![0; len as usize])
+        }
     }
 
     /// **A block read as metadata is read from the device once**, whole, and every later read of it
@@ -253,6 +274,34 @@ mod tests {
         dev.bytes.borrow_mut()[BLOCK] = 42; // the kernel, writing what is now a file's block
         c.read_meta(BLOCK as u64, &mut b).unwrap();
         assert_eq!((b[0], dev.taken()), (42, (1, 0)), "a forgotten block is read afresh");
+    }
+
+    /// **Zeroes go to the device as the device writes them**, and then into any copy the cache holds
+    /// — the parts of a block at either end as well as a whole one; zeroes the device refused let
+    /// the copies go.
+    #[test]
+    fn zeroes_reach_the_device_in_its_own_writes_and_then_the_copies() {
+        let dev = Device::new(8 * BLOCK);
+        let mut store = Box::new(Store::<4>::new());
+        let c = MetaCache::new(&dev, &mut store);
+        let mut b = [0u8; 8];
+        c.read_meta(BLOCK as u64, &mut b).unwrap();
+        c.read_meta(3 * BLOCK as u64, &mut b).unwrap();
+        dev.taken();
+        c.write_zeroes(BLOCK as u64 + 100, 2 * BLOCK as u64).unwrap();
+        assert_eq!(dev.taken(), (0, 1), "one write of the device's, not the default's two");
+        c.read_meta(BLOCK as u64 + 96, &mut b).unwrap();
+        assert_eq!(b, [1, 1, 1, 1, 0, 0, 0, 0]);
+        c.read_meta(3 * BLOCK as u64 + 96, &mut b).unwrap();
+        assert_eq!((b, dev.taken()), ([0, 0, 0, 0, 3, 3, 3, 3], (0, 0)), "from the copies");
+        assert_eq!(&dev.bytes.borrow()[3 * BLOCK + 96..3 * BLOCK + 104], &b, "as on the device");
+
+        dev.fail_writes.set(true);
+        assert_eq!(c.write_zeroes(3 * BLOCK as u64 + 200, 8), Err(FsError::Io));
+        dev.fail_writes.set(false);
+        dev.taken();
+        c.read_meta(3 * BLOCK as u64 + 96, &mut b).unwrap();
+        assert_eq!(dev.taken(), (1, 0), "a failed write's block is read again");
     }
 
     /// **The block used longest ago goes**, so a working set the size of the cache stays in it; and

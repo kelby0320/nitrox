@@ -309,7 +309,8 @@ per-fault re-resolution showing up in profiles. The page cache is built behind a
 **fill-producer seam** so the **Model-A** extent fill (Phase 3, zero-copy block reads)
 slots in *alongside* `ReadRange` without a redesign.
 
-**Demand-fault fill: one page per fault, no read-ahead.** The kernel fills **exactly one
+**Demand-fault fill: one page per fault, no read-ahead** — implemented for Model A by Phase 6
+Part H.4 (below). The kernel filled **exactly one
 4 KiB page per fault** (`FileObject::fault_in_page` reserves a single index). What that
 costs depends on which data path the filesystem uses, and the two are very different:
 
@@ -373,6 +374,13 @@ most of what read-ahead would buy here and is the thing to do first. **New trigg
 read-ahead: after demand-paged program text lands**, when what remains is genuinely fill cost.
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
 scheduling rather than a trigger.
+
+> **Implemented for Model A** (2026-10-10, Phase 6 Part H.4), on Part H's measurement rather than
+> boot's: a copy of a 256 MiB file on the laptop read it a page a command, 65,536 of them. A fault
+> now reads up to 31 pages ahead of its own in the same IRP — not resident, inside the file, next on
+> the device, within the device's fragment limit — each reserved on the fault's `PendingOperation`
+> (`FileObject::begin_fill`), and a write-back writes a run of pages an IRP. Model B still fills a
+> page a `ReadRange`, and has no consumer.
 
 **A departed USB device keeps its record — `TODO(usb-departed-records)`.** Phase 6 Part A registers
 a node and a record for every arrival, and a record's id is its place, which `/dev/registry/<id>`
@@ -1732,8 +1740,11 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
 > those twelve gone. **The second**: what a grow adds is not read back (`UNWRITTEN`). **The third**:
 > each server caches its metadata (`libfsserver::cache`), so a directory is read once — under QEMU
-> the four sets went from about 1,645 s to 186. Open while Part H's loop runs; the laptop measures
-> next.
+> the four sets went from about 1,645 s to 186. **Measured again** (2026-10-10): 1,362 s against
+> Linux's 889 over the fifteen runs, 1.53 times; what was left was a big file's bytes, 4 KiB a
+> command. **The fourth**: more than a page a command — fills read ahead, a write-back writes a run
+> of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
+> 124. Open while Part H's loop runs; the laptop measures next.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0

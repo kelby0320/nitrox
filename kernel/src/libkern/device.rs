@@ -269,14 +269,16 @@ impl DeviceRecord {
 
 /// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
 pub const IO_MAGIC: u32 = 0x534F_4944;
-/// The I/O snapshot layout this kernel writes.
-pub const IO_VERSION: u32 = 1;
+/// The I/O snapshot layout this kernel writes: 2 since the page cache counts the pages its fills
+/// bring in (Phase 6 Part H.4).
+pub const IO_VERSION: u32 = 2;
 
 /// The page cache's counters, since boot (`file_object::fill_stats`).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CacheCounts {
-    /// Fills that read the device: a page faulted in from its file's blocks, one IRP each.
+    /// Fills that read the device: a page faulted in from its file's blocks and the pages read
+    /// ahead of it, one IRP each.
     pub fills: u64,
     /// Nanoseconds those fills took, from the fault to the page's arrival.
     pub fill_ns: u64,
@@ -290,9 +292,11 @@ pub struct CacheCounts {
     pub writeback_irps: u64,
     /// Nanoseconds those IRPs took, from submission to completion.
     pub writeback_ns: u64,
+    /// The pages the fills brought in (version 2).
+    pub fill_pages: u64,
 }
 
-const _: () = assert!(size_of::<CacheCounts>() == 56);
+const _: () = assert!(size_of::<CacheCounts>() == 64);
 const _: () = assert!(align_of::<CacheCounts>() == 8);
 
 /// The start of an I/O snapshot: then `count` [`IoRecord`]s.
@@ -311,7 +315,7 @@ pub struct IoHeader {
     pub cache: CacheCounts,
 }
 
-const _: () = assert!(size_of::<IoHeader>() == 72);
+const _: () = assert!(size_of::<IoHeader>() == 80);
 const _: () = assert!(align_of::<IoHeader>() == 8);
 const _: () = assert!(offset_of!(IoHeader, magic) == 0);
 const _: () = assert!(offset_of!(IoHeader, count) == 8);
