@@ -35371,7 +35371,7 @@ in release, which is what runs; and `libfs`'s copy asks the servers more than it
 source's size and handle separately and whether a listed child is a directory, which the cache now
 makes cheap. The laptop measures next, the three fixes in.
 
-## 2026-10-10 — Phase 6 Part H.4: the laptop again, the three fixes in
+## 2026-10-09 — Phase 6 Part H.4: the laptop again, the three fixes in
 
 **The runs.** The maintainer reinstalled the laptop from `51c70d25` — the Patriot stick serving
 first as the live image and then, rewritten, as the throughput stick in H.3's layout — and ran
@@ -35424,7 +35424,7 @@ where the number is set, is the maintainer's call (H.5).
 
 **Seen on the way**: `clear` is not a program — one more for the list after Part H.
 
-## 2026-10-10 — Phase 6 Part H.4, the fourth fix: more than a page a command
+## 2026-10-09 — Phase 6 Part H.4, the fourth fix: more than a page a command
 
 **What dominated.** After three fixes the laptop's copies of `big` were bound by commands of 4 KiB:
 the page cache filled a page a command and wrote one back a command, and ext4's grow wrote its

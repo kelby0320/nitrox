@@ -14,7 +14,7 @@ file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 P
 `UNWRITTEN`**, and the kernel fills such a page without reading the device (Phase 6 Part H.4,
 2026-10-09). **A server caches its metadata and never a file's data**, which the kernel writes to
 the device behind it (`libfsserver::cache`, the same part). **A fill reads ahead, and a write-back
-writes a run of pages an IRP**, each up to the device's limit (Phase 6 Part H.4, 2026-10-10).
+writes a run of pages an IRP**, each up to the device's limit (Phase 6 Part H.4, 2026-10-09).
 
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first

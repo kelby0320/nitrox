@@ -24,7 +24,7 @@ ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes no
 § *The extent tree*. Phase 6 Part H.4 (2026-10-09): **blocks are allocated and freed a run at a
 time**, and **a grow's reply marks what it added `UNWRITTEN`**, so its zeroes are not read back —
 § *Part D* — and the server reads its metadata through **a cache**, so a directory is read from the
-device once (`libfsserver::cache`). And (2026-10-10) **a grow writes its zeroes 64 KiB a command**.
+device once (`libfsserver::cache`). And (2026-10-09) **a grow writes its zeroes 64 KiB a command**.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -256,7 +256,7 @@ Each part builds on proven machinery and is independently verifiable.
   since the allocator's goal is the block the truncate just freed. On any grow, it could be a
   deleted file's contents. A boot showed it on a freshly created file's blocks. The cost is the
   blocks' bytes written once more, which a writer then overwrites: **a write a run's 64 KiB** since
-  Phase 6 Part H.4 (2026-10-10) — `BlockWriter::write_zeroes`, which `libfsserver::disk::Disk`
+  Phase 6 Part H.4 (2026-10-09) — `BlockWriter::write_zeroes`, which `libfsserver::disk::Disk`
   answers from a zeroed 64 KiB memory object in commands of up to 64 KiB, where it was a 4 KiB
   `write_at` a block. Unwritten extents would avoid it, and nothing yet needs to. **The read that
   followed it is gone** (Phase 6 Part H.4): the grow's reply marks those
@@ -294,7 +294,7 @@ open-file cookie; and inode **locality** — a new inode goes in the first group
 rather than near its parent, which is correct and worse for a seek pattern.
 
 Extent-tree splitting and index nodes left this list with Phase 6 Part H.1 (2026-10-08) — §
-*The extent tree*; read-ahead and clustered write-back with Part H.4 (2026-10-10), in the kernel's
+*The extent tree*; read-ahead and clustered write-back with Part H.4 (2026-10-09), in the kernel's
 page cache ([`filesystem-data-path.md`](filesystem-data-path.md)).
 
 **Five things this list claimed were deferred and were not** (corrected 2026-09-17):

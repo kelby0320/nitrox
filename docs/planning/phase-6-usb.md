@@ -2881,13 +2881,13 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   the four sets from about 1,645 s to 186. Held by a test through each filesystem under a cache that
   evicts all the time, lookup counts, and `boot-probe`'s 64-page file, now at most 32 reads. **Next:
   the laptop measures again**, with the three fixes in.
-- **H.4 measured again on the laptop** (2026-10-10), the three fixes in: **1,362 s for the fifteen
+- **H.4 measured again on the laptop** (2026-10-09), the three fixes in: **1,362 s for the fifteen
   runs, where H.3 took 5,919, and 1.53 times Linux's 889**. `small/` on the stick is now as quick as
   Linux's or quicker; what is left is a big file's bytes, 4 KiB a command — copying `big` to the
   stick 353 s against 37, within the disk 77 s against 5.6, from the stick 100 s against 22. The
   table is in the decision log. Next, the maintainer's call: the number (H.5), or the loop on to
   clustered fills and write-backs, larger zero writes and more than one command in flight.
-- **H.4, the fourth fix: more than a page a command** (2026-10-10). The page cache writes back a run
+- **H.4, the fourth fix: more than a page a command** (2026-10-09). The page cache writes back a run
   of pages an IRP, up to each device's `max_frags` and 256 pages; a fault reads up to 31 pages ahead
   of its own in the same IRP; and ext4's grow writes its zeroes 64 KiB a command
   (`BlockWriter::write_zeroes`). `/dev/registry/io` goes to version 2, counting the pages its fills
@@ -2971,7 +2971,7 @@ device", is what the kernel acts on.
 
 ### H.4's fourth fix, in detail: more than a page a command
 
-**Detail pass, 2026-10-10**, reviewed by the maintainer the same day against what Linux does: **all
+**Detail pass, 2026-10-09**, reviewed by the maintainer the same day against what Linux does: **all
 three pieces**, and **each device's own limit**, as Linux's requests are bounded by the device's —
 the right call, too, for device kinds still to come, such as NVMe. It changes how the kernel's page
 cache talks to the drivers. **Built the same day** — § *As built*, at the end.
@@ -3045,7 +3045,7 @@ read-ahead window of **32 pages**, Linux's default; and ext4's zeroes in **64 Ki
 driver's 64 is below the 1 MiB Linux gives the same stick; raising it is a driver change, left out
 unless the laptop shows the stick still bound by its commands.
 
-**As built** (2026-10-10), beside the above. The read-ahead's pages are reserved under the object's
+**As built** (2026-10-09), beside the above. The read-ahead's pages are reserved under the object's
 lock with the faulted one and not zeroed, since the read fills each whole and a page whose read
 fails leaves the cache unmapped; the faulter settles them all, and any it does not reach a second
 faulter settles. A fill that read ahead and failed is tried again for its own page alone, as Linux

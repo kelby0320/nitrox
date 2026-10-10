@@ -34,7 +34,7 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > reversed. § "A kernel thread that waits" added the same day, with Phase 6 Part A.2's hub thread.
 > § "A block driver behind a bus" added 2026-10-06, with Phase 6 Part D's USB disks. § "What a disk
 > has done" added 2026-10-08, with Phase 6 Part H.2's counters. The DMA section re-checked
-> 2026-10-10, when Part H.4 made the page cache read and write runs of pages sized by `max_frags`.
+> 2026-10-09, when Part H.4 made the page cache read and write runs of pages sized by `max_frags`.
 
 ## Three concepts, kept distinct
 

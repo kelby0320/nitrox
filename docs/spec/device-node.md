@@ -13,7 +13,7 @@ USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, an
 `port` and `speed`. USB disks, MBR partitions and the `BOOT` flag arrived with Phase 6 Part D
 (2026-10-06). `/dev/registry/io` and a node's I/O counters arrived with Phase 6 Part H.2
 (2026-10-08); its version 2, with the pages the page cache's fills bring in, with Part H.4
-(2026-10-10).
+(2026-10-09).
 
 ## The DeviceNode object
 

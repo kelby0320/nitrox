@@ -375,7 +375,7 @@ read-ahead: after demand-paged program text lands**, when what remains is genuin
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
 scheduling rather than a trigger.
 
-> **Implemented for Model A** (2026-10-10, Phase 6 Part H.4), on Part H's measurement rather than
+> **Implemented for Model A** (2026-10-09, Phase 6 Part H.4), on Part H's measurement rather than
 > boot's: a copy of a 256 MiB file on the laptop read it a page a command, 65,536 of them. A fault
 > now reads up to 31 pages ahead of its own in the same IRP — not resident, inside the file, next on
 > the device, within the device's fragment limit — each reserved on the fault's `PendingOperation`
@@ -1740,7 +1740,7 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
 > those twelve gone. **The second**: what a grow adds is not read back (`UNWRITTEN`). **The third**:
 > each server caches its metadata (`libfsserver::cache`), so a directory is read once — under QEMU
-> the four sets went from about 1,645 s to 186. **Measured again** (2026-10-10): 1,362 s against
+> the four sets went from about 1,645 s to 186. **Measured again** (2026-10-09): 1,362 s against
 > Linux's 889 over the fifteen runs, 1.53 times; what was left was a big file's bytes, 4 KiB a
 > command. **The fourth**: more than a page a command — fills read ahead, a write-back writes a run
 > of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
