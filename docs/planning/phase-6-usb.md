@@ -2881,6 +2881,12 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   the four sets from about 1,645 s to 186. Held by a test through each filesystem under a cache that
   evicts all the time, lookup counts, and `boot-probe`'s 64-page file, now at most 32 reads. **Next:
   the laptop measures again**, with the three fixes in.
+- **H.4 measured again on the laptop** (2026-10-10), the three fixes in: **1,362 s for the fifteen
+  runs, where H.3 took 5,919, and 1.53 times Linux's 889**. `small/` on the stick is now as quick as
+  Linux's or quicker; what is left is a big file's bytes, 4 KiB a command — copying `big` to the
+  stick 353 s against 37, within the disk 77 s against 5.6, from the stick 100 s against 22. The
+  table is in the decision log. Next, the maintainer's call: the number (H.5), or the loop on to
+  clustered fills and write-backs, larger zero writes and more than one command in flight.
 - **H.5 The number, and the docs.**
 
 ### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back

@@ -35370,3 +35370,56 @@ CPU-heavy in a debug build — 1,024 of them took 17 seconds in the host suite �
 in release, which is what runs; and `libfs`'s copy asks the servers more than it needs to, the
 source's size and handle separately and whether a listed child is a directory, which the cache now
 makes cheap. The laptop measures next, the three fixes in.
+
+## 2026-10-10 — Phase 6 Part H.4: the laptop again, the three fixes in
+
+**The runs.** The maintainer reinstalled the laptop from `51c70d25` — the Patriot stick serving
+first as the live image and then, rewritten, as the throughput stick in H.3's layout — and ran
+`h3.nx`'s four sets in one sitting, which the dry runs showed measures the same as a boot a set.
+Linux's numbers are H.3's, on the same laptop and stick. **Nitrox took 1,362 s for the fifteen runs,
+where it took 5,919: 4.3 times faster, and 1.53 times Linux's 889 s**, where it was 6.66.
+
+| Set | H.3, Nitrox | H.4, three fixes in | Linux | Now ÷ Linux |
+|---|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 99.76 s | 22.24 s | 4.5 |
+| 1, stick → disk: `small` | 1,364.22 s | 91.74 s | 36.52 s | 2.5 |
+| 1, stick → disk: `tree` | 132.99 s | 30.04 s | 8.72 s | 3.4 |
+| 2, disk → disk: `big` | 317.75 s | 77.27 s | 5.59 s | 13.8 |
+| 2, disk → disk: `small` | 393.57 s | 64.03 s | 9.13 s | 7.0 |
+| 2, disk → disk: `tree` | 146.73 s | 26.57 s | 7.08 s | 3.8 |
+| 3, disk → stick: `big` | 385.14 s | 353.00 s | 37.36 s | 9.4 |
+| 3, disk → stick: `small` | 2,094.19 s | 332.28 s | 518.63 s | 0.6 |
+| 3, disk → stick: `tree` | 186.32 s | 171.89 s | 137.21 s | 1.3 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.96 s | 1.68 s | 1.2 |
+| 4, remove on the disk: `u-small` | 117.36 s | 18.85 s | 2.79 s | 6.8 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 5.47 s | 2.26 s | 2.4 |
+| 4, remove on the stick: `c-big` | 1.02 s | 578 ms | 1.15 s | 0.5 |
+| 4, remove on the stick: `c-small` | 320.24 s | 68.54 s | 76.24 s | 0.9 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 19.64 s | 22.26 s | 0.9 |
+| **All fifteen** | **5,919 s** | **1,362 s** | **889 s** | **1.53** |
+
+**What the counters say now.** Directories are no longer the cost: `small/` from the stick read
+16,443 of its sectors where it read 3,202,635, and writing `small/` and removing `c-small` and
+`c-tree` on the stick are now quicker than Linux's, which mounts it `flush`. **Three runs stand
+out**, all of them a big file's bytes:
+
+- **Copying `big` to the stick, 353 s against 37**: the stick was busy 333 s for 69,796 writes, 4.8
+  ms each — a flash stick answers a small write slowly — and 512.6 MiB written for 256 MiB, FAT's
+  zeroes in 64 KiB writes and then the data a 4 KiB page a write. 65,536 of those writes are the
+  write-back's pages, one each.
+
+- **Copying `big` within the disk, 77 s against 5.6**: 65,811 reads and 131,442 writes, the disk
+  busy 74.8 s, 0.38 ms a command — the source read, the zeroes and the data, every one 4 KiB.
+
+- **Copying `big` from the stick, 100 s against 22**: the same 131,442 writes to the disk, busy 79
+  s, and the stick read 4 KiB at a time.
+
+So what dominates now is **the command's size**: fills, write-backs and ext4's zeroes all move 4 KiB
+a command, where Linux moves a file's data in commands of many pages, and a stick charges
+milliseconds a write whatever its size. `small/` within the disk, 64 s against 9, is mostly the
+metadata a create and a grow still write through, about eleven writes a file beside its data and its
+zeroes. The next candidates are on the plan's list: clustered fills and write-backs, ext4's zeroes
+in large writes (or piece 2, no zeroes), and one command in flight. Whether the loop goes on, and
+where the number is set, is the maintainer's call (H.5).
+
+**Seen on the way**: `clear` is not a program — one more for the list after Part H.
