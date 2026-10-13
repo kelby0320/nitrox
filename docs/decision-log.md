@@ -35554,3 +35554,29 @@ stick.
 number H.5 sets. Copying to the stick is now 368 s for set 3 against Linux's 693: `small/` and
 `tree/` at half Linux's time, `big` at 1.65 times it, and that gap is the zeroes. Whether to set the
 number here or take one of the two costs first is the maintainer's call.
+
+## 2026-10-13 — Phase 6 Part H.5: the number, as measured — Part H complete
+
+**The maintainer's call**: the fourth fix's run is the number. "We've improved things a lot here. I
+think we can just set the numbers the way they are and leave the two items above as additional
+optimizations to pick up later." So the Definition of Done's last item reads as the laptop measured
+it on 2026-10-13, against Linux on the same laptop and stick: copying `big/` to the stick in at most
+1.65 times Linux's time, `small/` in 0.46 of it and `tree/` in 0.49, set 3 in all 0.53 — 368 s
+against 693. The fifteen runs are 647 s against Linux's 889, 1.35 times by their geometric mean,
+where H.3 found 6.66 times by their sum.
+
+**Why stopping here is sound, and not only sufficient.** Both costs left are design questions rather
+than slow code, and each wants a detail pass of its own. **The zeroes** protect what a crash between
+a grow and its write-back leaves in the file; ext4's answer, unwritten extents, keeps that, and
+FAT's has to choose what a crash may expose. **ext4's per-file metadata** is written through as it
+changes, and a batch needs an order that only a journal gives. Neither is a USB question, which is
+what the phase is about, and the stick copies already beat Linux on two of three.
+
+**Recorded**: `TODO(fs-throughput)` closed in `deferred-decisions.md`, and the two costs filed as
+`TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, each with its measurement, its remedy and its
+trigger; the directory scan's entry narrowed, since its trigger fired and the metadata cache
+answered it. **Part H is complete**, and with it every part of the phase. Of the Definition of Done,
+the number is met on the laptop; the first two items — USB input at the greeter, and a FAT32 stick
+through Files — are met in the gates (`check-input --usb`, `check-login --usb`, `check-media`) and
+wait to be checked on the laptop, where Part H's rounds have mounted, written and ejected a stick
+from the shell. The phase closes when they are.

@@ -49,12 +49,11 @@ pub fn po_wait(po: u64) -> (i32, u64) {
 /// trips, which is what made the same-CPU wake latency so acute (see the decision log,
 /// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
 ///
-/// **One block per `sys_io_submit` is a suspect in `TODO(fs-throughput)`** — `copy` and
-/// `remove` are slower on real storage than a 5400 rpm disk accounts for (measured on the
-/// laptop, 2026-09-17), and every metadata read and write a mutation makes comes through here
-/// one 4 KiB block at a time. It is *a* suspect and not a diagnosis: see
-/// `docs/rationale/deferred-decisions.md`, which lists the others and says the measurement
-/// comes first.
+/// **One block per `sys_io_submit` was a suspect in `TODO(fs-throughput)`**, which Phase 6
+/// Part H measured on the laptop and closed. Metadata reads now reach it through the server's
+/// cache, and a grow's zeroes go 64 KiB a command; what still comes through a block at a time is
+/// the metadata a mutation writes, each change as it is made (`TODO(ext4-metadata-writes)` in
+/// `docs/rationale/deferred-decisions.md`).
 pub struct Disk {
     /// The block-device handle (from the setup message).
     device: u64,

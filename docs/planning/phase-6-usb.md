@@ -6,7 +6,10 @@ current status, the full phase list, and the cross-cutting workstreams.
 **Status: scoped 2026-10-01; Part A detailed and built 2026-10-02; Part B detailed 2026-10-03 and
 built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and built 2026-10-06; Part
 E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed and built
-2026-10-07; Part H detailed 2026-10-08, H.1 and H.2 built 2026-10-08.** This
+2026-10-07; Part H detailed 2026-10-08, H.1 and H.2 built 2026-10-08, H.3 measured 2026-10-09, H.4's
+four fixes built 2026-10-09 and measured 2026-10-13, and H.5's number set 2026-10-13 — Part H
+complete; the phase closes with the Definition of Done's first two items checked on the laptop.**
+This
 replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
 decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
 when it is next, as administration's parts did; what is here is the phase's shape, the design each
@@ -2901,7 +2904,11 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   the device twice, and ext4's metadata written through a file at a time — `small/` within the disk
   4.6 times Linux's, its removal 6.8. The table is in the decision log. Next, the maintainer's call:
   the number (H.5), or one of the two.
-- **H.5 The number, and the docs.**
+- **H.5 The number, and the docs** (2026-10-13). **The maintainer's call: the number is the laptop's
+  run as it stands** — copying to the stick within the ratios to Linux measured on 2026-10-13,
+  written into the Definition of Done below — and the two costs left are optimizations for later,
+  filed as `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)` in `deferred-decisions.md`, where
+  `TODO(fs-throughput)` is closed. **Part H complete.**
 
 ### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back
 
@@ -3105,7 +3112,10 @@ On the laptop and in the gates:
   or after it, and each is let go when unplugged.
 - **A FAT32 thumb drive plugged in after boot mounts writable, appears in Files, takes a file saved
   from `nxedit`, and ejects from Files**; unplugged without ejecting, it is torn down cleanly.
-- **A copy to the stick meets the number Part H sets.**
+- **A copy to the stick meets the number Part H sets** — set 2026-10-13 as the laptop measured it,
+  against Linux on the same laptop and stick: copying `big/` to the stick in at most 1.65 times
+  Linux's time, `small/` in 0.46 of it and `tree/` in 0.49, the three together in 0.53 (368 s
+  against 693). Met by that run.
 
 ## What Phase 6 does not do
 

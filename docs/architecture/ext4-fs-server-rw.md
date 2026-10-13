@@ -289,7 +289,9 @@ Each part builds on proven machinery and is independently verifiable.
   new directory block when the last has no slack — landed 2026-07-29.
 
 **Deferred**: jbd2 journaling + replay-on-mount (needs `has_journal` fixtures); `metadata_csum`
-checksums; a periodic writeback daemon; per-page dirty tracking; the standalone `MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
+checksums; metadata written back in batches rather than through, a file at a time
+(`TODO(ext4-metadata-writes)`); unwritten extents in place of a grow's zeroes
+(`TODO(grow-zeroes)`); a periodic writeback daemon; per-page dirty tracking; the standalone `MapRange`/`AllocRange` ops (the resolve reply carries the map today); the fs-server
 open-file cookie; and inode **locality** — a new inode goes in the first group with a free one
 rather than near its parent, which is correct and worse for a seek pattern.
 

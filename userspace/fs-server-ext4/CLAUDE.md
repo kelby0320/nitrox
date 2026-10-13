@@ -72,7 +72,9 @@ handling (the linear walk is backward-compatible).
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
 `docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a deferral
 recorded only in a crate `CLAUDE.md` is one nobody reviews): `metadata_csum` checksums, and jbd2
-journaling + replay (the fixtures are `^has_journal`). Overwrite is data-only (no metadata change)
+journaling + replay (the fixtures are `^has_journal`); metadata written through, a file at a time
+(`TODO(ext4-metadata-writes)`); and a grow's zeroes, which unwritten extents would replace
+(`TODO(grow-zeroes)`). Overwrite is data-only (no metadata change)
 and is the kernel's writeback; the server allocates on growth + creation but never touches file data
 (Model A).
 

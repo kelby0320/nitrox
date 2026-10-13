@@ -122,8 +122,9 @@ fails (PR #365 review, finding 2):
   and be writing them. The clusters are held for `release`, which the loop calls once the kernel
   has answered `File::Forget`.
 
-**The write path batches**, as the throughput deferral requires
-([`deferred-decisions.md`](../rationale/deferred-decisions.md), `TODO(fs-throughput)`):
+**The write path batches**, as the throughput deferral required
+([`deferred-decisions.md`](../rationale/deferred-decisions.md), `TODO(fs-throughput)`, closed by
+Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 - **Allocation is one pass**: first-fit from a hint — FAT32's next-free, then past the last
   allocation, or past the file's own last cluster — so a grow's clusters are contiguous wherever
   the free space is. **All or nothing**: a volume that runs out gives back what it took, and the

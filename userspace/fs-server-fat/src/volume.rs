@@ -346,7 +346,8 @@ impl<'a, R: BlockReader> Fat<'a, R> {
 }
 
 /// **Zeroes written in runs**: ranges handed one at a time, written as each contiguous stretch of
-/// them ends or fills [`SPAN`].
+/// them ends or fills [`SPAN`]. What they cost a copy, a file's bytes written twice, is
+/// `TODO(grow-zeroes)` in `docs/rationale/deferred-decisions.md`.
 struct Zeroer<'f, W> {
     w: &'f W,
     at: u64,

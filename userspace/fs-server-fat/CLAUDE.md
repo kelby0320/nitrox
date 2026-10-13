@@ -45,7 +45,7 @@ loop.
   read `fat-fs-server.md` §5 first. **`crash_tests` crashes each change after every write** and
   checks what is left; every flush in the write path is one its removal fails, so a flush no test
   needs is a question to answer, not one to leave (PR #365 review).
-- **The write path batches** (`TODO(fs-throughput)`): allocation in one pass, zeroes in 64 KiB
+- **The write path batches** (since Part E; Part H measured it): allocation in one pass, zeroes in 64 KiB
   writes, the FAT's dirty sectors written together. `a_one_mebibyte_grow_costs_a_handful_of_writes`
   counts it; a change that makes it slower should say so with a number.
 - **Directories, the FAT and the FSInfo are read with `read_meta`**, through the server's metadata

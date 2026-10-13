@@ -1126,7 +1126,7 @@ fn grow_blocks<RW: BlockReader + BlockWriter>(
         };
         let mut got = Extent::written(lb, phys, len);
         // The run's zeroes in one call, which the device may move in large commands (Phase 6
-        // Part H.4).
+        // Part H.4). Not writing them — unwritten extents — is `TODO(grow-zeroes)`.
         if let Err(e) = rw.write_zeroes(phys * bs as u64, len * bs as u64) {
             give_back(&[run, Some(got)]);
             return Err(e);

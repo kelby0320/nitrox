@@ -1697,6 +1697,12 @@ an htree directory index, or simply a per-directory "first block with room" hint
 across inserts. Trigger: bulk directory creation on a real path — `copy -r` of a large
 tree, or unpacking a package into the store.
 
+> **Narrowed** (2026-10-09, Phase 6 Part H.4): the trigger fired — Part H copied 4,096 files into
+> one directory — and the re-reads were the cost; the server now caches its metadata
+> (`libfsserver::cache`), so a directory's blocks are read from the device once and the scan is
+> memory. On the laptop that copy is busy on the device for 37.9 of its 42.3 s, so the scan is no
+> longer what dominates; an index or a hint stays the fix for when it is.
+
 **ext4 write-path gaps (`fs-server-ext4`).** The write path is deliberately partial, and
 these are the pieces still missing. They were previously recorded only in the crate's
 `CLAUDE.md` — which is precisely how three other deferrals went unreviewed (the 2026-07-24
@@ -1706,7 +1712,8 @@ audit) — so they are mirrored here.
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
 
-**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`, undiagnosed.**
+**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`** — closed by Phase 6 Part
+H (2026-10-13); undiagnosed when filed.
 Observed on the laptop, 2026-09-17, copying and then deleting about 180 MB under `/home`:
 both are slower than a 5400 rpm disk accounts for, and both get worse with larger directories
 (maintainer). **This is the first time either has run against real storage** — every previous
@@ -1746,7 +1753,43 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
 > 124. **Measured again** (2026-10-13): 647 s, 0.73 times Linux's 889, a geometric mean of 1.35 over
 > the runs. Left: the zeroes, a big file's bytes written twice, and ext4's metadata written through
-> a file at a time. Open until H.5 sets the number.
+> a file at a time.
+>
+> **Closed** (2026-10-13, Part H.5, the maintainer's call): the number is the laptop's run as it
+> stands, written into Phase 6's Definition of Done — copying to the stick within the ratios to
+> Linux measured that day. The two costs left are filed as their own deferrals, below:
+> `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`.
+
+**A grow writes zeroes over what it adds — `TODO(grow-zeroes)`.** Both servers zero every block a
+grow allocates, ext4 since administration Part C.1 and FAT from its first version, because a page
+the kernel does not hold used to fill from the device, and a new range must read as zero rather than
+as whatever those blocks last held. Since Phase 6 Part H.4 a grow's reply marks those blocks
+`UNWRITTEN` and the kernel fills them as zero without reading the device, so the zeroes now protect
+one thing only: **what a crash between the grow and the write-back leaves in the file** — zeroes,
+where without them it would be another file's old bytes. The cost: a copied file's bytes cross the
+device twice. On the laptop (2026-10-13) copying `big` to the stick wrote 512.6 MiB for 256, half of
+it FAT's zeroes, and took 1.65 times Linux's time where the stick itself wrote faster than Linux
+drove it; within the disk a third of what moved was ext4's zeroes. Without them, by the busy times,
+`big` to the stick would take about 35 s against Linux's 37. **The remedies differ by filesystem**:
+ext4 has **unwritten extents** — allocated, flagged, read as zero and converted at write-back, the
+second fix's piece 2 in `phase-6-usb.md` — which keep the crash guarantee; FAT has nothing like
+them, so not zeroing there is a choice about what a crash may expose. Linux's `cp` pays none of
+this, since it writes a file in order and its filesystems allocate as the bytes arrive. **Trigger**:
+a number that needs a big file's copy faster, or a filesystem that should not pay for its bytes
+twice.
+
+**ext4 writes its metadata through, a file at a time — `TODO(ext4-metadata-writes)`.** Every change
+a create, a grow, a rename or a removal makes — the inode, the bitmaps, the group descriptor, the
+superblock, the directory block — is written to the device as it is made, one 4 KiB command each,
+and read back through a 1 MiB cache. On the laptop (2026-10-13) copying 4,096 files of 16 KiB within
+the disk cost 9.2 reads and 13 writes a file at 0.42 ms each, 4.6 times Linux's time, and removing
+them 6.2 reads and 9 writes a file, 6.8 times. Linux keeps that metadata in memory and writes it
+back later in large batches, its journal ordering the batches so a crash leaves a consistent
+filesystem. **A batch here needs the same ordering**, which without the journal (deferred above,
+with `metadata_csum`) means either accepting more of what an unclean shutdown can leave, or building
+the journal first. A larger cache would remove some of the reads and none of the writes.
+**Trigger**: many small files on a real path — a package unpacked into the store, a large tree
+restored — or the journal itself.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
