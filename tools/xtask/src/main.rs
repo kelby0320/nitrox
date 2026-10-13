@@ -2575,6 +2575,16 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     with_admin_asked(s, "log view-broker")?;
     s.expect("view: alice admin date — started")?;
     s.expect("/home>")?;
+    //      (c) **The kernel's log** (Phase 6 Part B.7): refused without the `kernel-log` grant,
+    //          and through it a row a line from the start of the kernel's log. That line went to
+    //          the console at boot, long before anything here was typed, so a match can only be
+    //          `log`'s row.
+    s.send("log --kernel")?;
+    s.expect("needs the kernel-log grant")?;
+    s.expect("/home>")?;
+    with_admin_asked(s, "log --kernel | take 4")?;
+    s.expect("CPU tables installed (GDT/TSS/IDT)")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A

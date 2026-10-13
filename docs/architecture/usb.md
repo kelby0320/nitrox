@@ -196,26 +196,29 @@ interface becomes an input node. In order:
 2. **`SET_CONFIGURATION`**, after Configure Endpoint, which is Linux's order: the controller has
    the bandwidth before the device is told. It is the first request with no data stage, which
    `control_out` sends.
-3. **Its report descriptor** — a mouse's since B.3, a keyboard's since B.7 — from the interface,
-   for the length its HID descriptor gives.
-4. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse, and for
+3. **A keyboard's `SET_IDLE (0)`**, so it reports a change and not a held state — before its report
+   descriptor since B.7, which is Linux's order (`usbhid_parse`). A stall is passed over: an unchanged
+   report decodes to nothing.
+4. **Its report descriptor** — a mouse's since B.3, a keyboard's since B.7 — from the interface,
+   for the length its HID descriptor gives. **A stall is asked again**, up to four times with 100 ms
+   between, as Linux asks (`hid_get_class_descriptor`): a Corsair K70 plugged in after boot fell back
+   to boot protocol, where one plugged in before boot read its descriptor.
+5. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse, and for
    a keyboard whose descriptor this driver reads (B.7); boot protocol for any other. A device that
    refuses boot protocol is not bound. One that refuses report protocol is in it already, a
    device's state after a reset.
-5. **`SET_IDLE (0)`** to a keyboard, so it reports a change and not a held state. A refusal is
-   passed over: an unchanged report decodes to nothing.
 6. **A node**, registered under the device's record, and **one Normal TRB** queued, for the
    endpoint's maximum packet, interrupting on completion and on a short packet.
 
 **What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. In
 steps 3 to 6:
 - **a stall is that interface's**: its endpoint stays configured and is never polled, and the
-  others go on. A stalled report descriptor runs the device in boot protocol;
+  others go on. A report descriptor that stalls every try runs the device in boot protocol;
 - **any other failure on the default endpoint ends the binding there**, since the request may still
   be on the endpoint's ring (`control_in`'s rule, which enumeration keeps by ending the device). So
   nothing more is asked of it: that interface is not bound, nor any after it, and those before it
-  stay bound, on their own endpoints. A keyboard whose `SET_IDLE` fails so is past its last request,
-  and is bound, the last (PR #358 review);
+  stay bound, on their own endpoints — a keyboard whose `SET_IDLE` fails so among them, since B.7
+  moved it before the descriptor (it was the last request, and its keyboard bound, PR #358 review);
 - running out of nodes or table room is that interface's alone.
 
 **Polling is the DPC's.** A Transfer Event for any endpoint but the default one goes to the table
@@ -332,8 +335,12 @@ ends a binding*): a write to one is refused at once, `IoError`, as it is to one 
 request went unanswered.
 
 **The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, report
-protocol` — `, its keys a bitmap` for one like the K70, `, boot protocol` for one read in it — and
-`usb: port 10: mouse at /dev/input/raw/3, report protocol, with a wheel`.
+protocol` — `, its keys a bitmap` for one like the K70 — and `usb: port 10: mouse at
+/dev/input/raw/3, report protocol, with a wheel`. **One in boot protocol says why** (B.7): it has
+no report descriptor, its descriptor stalled every try, or its descriptor is not one this driver
+reads, with its length and first bytes; and a descriptor that took more than one try says which
+read it. A session reads these with `with admin log --kernel`
+([`logging.md`](logging.md) § *Relationship to the kernel log*).
 
 ## Mass storage (Part D)
 

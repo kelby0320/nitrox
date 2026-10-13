@@ -35645,3 +35645,46 @@ the next time. Filed rather than guessed at.
 
 **Next**: the laptop — the K70 plugged in after boot, typing at the greeter, which closes the
 Definition of Done's first item and the phase with it.
+
+## 2026-10-13 — Phase 6 Part B.7, a hot-plug: a bind as Linux binds, and the kernel's log in a session
+
+**The laptop's second check.** The K70 typed correctly plugged in before boot, and as before plugged
+in after it — the wrong keys, so a hot-plugged K70 is bound in boot protocol. Both go through the
+same code (`arrive`, `enumerate`, `bind`); what differs is the device, powered for seconds by the
+time a boot binds it and for a fraction of one at a hot-plug. **Why it fell back could not be
+seen**: the bind's line said only "boot protocol", and nothing on the laptop shows the kernel's log
+after boot — the hardware report shows a snapshot taken as it begins, a shutdown's repaint shows the
+shutdown's last rows, and no session could read `/dev/log`.
+
+**The maintainer's calls**: bring reading the kernel's log forward from Part H's list, "as it is now
+needed for debugging"; and grow `log` into the system's log viewer, a source an option — "with admin
+log --kernel will show kernel logs. In the future, something like log --service <service_name> or
+log --application <app_name>" — with one table shape for every source.
+
+**What it is.** **`log --kernel`**: the kernel's log a row a line, in `log`'s table — `principal`
+`kernel`, `sequence` the line's place, `time`, `tier` and `level` null, the last two nullable now
+for every source. **The `kernel-log` grant**: the broker resolves its own `/dev/log`, which the
+kernel answers with a fresh snapshot, and binds that in the view at the same path, readable and
+sizeable; one view a request, so a program reads the log as it stood when it ran. The seeded `admin`
+profile has it, and a host test now holds `admin` to every grant the broker knows. **The bind, as
+Linux binds**: a keyboard's `SET_IDLE` before its report descriptor is read (`usbhid_parse`'s
+order), and a descriptor that stalls asked again, four times in all, 100 ms apart
+(`hid_get_class_descriptor`'s count); **its line now says why a device runs in boot protocol** — no
+descriptor, every try stalled, or one not read, with its length and first bytes — and which try read
+a descriptor that took more than one.
+
+**Not yet known: what the K70 does.** A stall is the suspect — a timeout would have left it unbound,
+and it is bound; a descriptor read whole parses, its own bytes being a host test — but the change
+does not depend on it being right: whatever the laptop's K70 does,
+`with admin log --kernel | filter message ~= /usb/` now says. The retry has no gate, since QEMU's
+devices answer at once.
+
+**Found on the way**: the grant at first failed every `admin` request in the test image — "the
+kernel's log is not there to grant" — and with them `boot-probe`'s view tests. `boot-probe`'s
+namespace binds `/dev/log` already, and a bind over a bound path is refused `AlreadyExists` — which
+accepting that refusal alone, and nothing else, mended; a caller with its own now keeps it, reading
+the kernel's log as it could before. The round that failed is that rule's control. **Held by**
+`test-interactive`'s step 20h: `log --kernel` refused without the grant, then through it the first
+lines of the kernel's log, which went to the console at boot long before the command was typed — and
+a broker that binds nothing there times the step out; the seed's host test, which fails without
+`kernel-log`; and the bind line's wording, a host test of each case.

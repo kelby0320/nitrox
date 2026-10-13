@@ -31,6 +31,7 @@ pub mod args;
 pub mod entropy;
 pub mod format;
 pub mod stage;
+pub mod text;
 /// Calendar arithmetic and duration parsing.
 ///
 /// **Moved out to [`libtime`] in M11 Part E batch 9** and re-exported here, because it grew a

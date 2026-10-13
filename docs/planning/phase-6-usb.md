@@ -872,7 +872,11 @@ a USB one, as it would on Linux.
   keyboard whose descriptor this driver reads now runs in report protocol, as a mouse has since B.3:
   `descriptor::keyboard_layout` over one walk shared with the mouse's reader; a layout of bit runs
   or an array; the keys held as a set of usages, decoded in batches; lights with their report ID.
-  Built 2026-10-13; the laptop checks it.
+  Built 2026-10-13. On the laptop it typed plugged in before boot and not after, so the bind became
+  Linux's — `SET_IDLE` first, a stalled descriptor asked again — its line says why a device runs in
+  boot protocol, and `with admin log --kernel` reads that line in a session, through a new
+  `kernel-log` grant (the maintainer's call, brought forward from Part H's list). The laptop checks
+  it again.
 
 ### Gates
 
@@ -3127,7 +3131,7 @@ On the laptop and in the gates:
 **Checked on the laptop** (2026-10-13): the stick's item whole, and a USB mouse plugged in after
 boot. A USB keyboard's waits for Part B.7 on the laptop: a Corsair K70 typed numbers, sending its
 NKRO bitmap whatever protocol it was asked for, and the System76 Launch's keyboard is behind a hub,
-which Phase 6 leaves out.
+which Phase 6 leaves out. With B.7 the K70 types plugged in before boot, not yet after it.
 
 ## What Phase 6 does not do
 

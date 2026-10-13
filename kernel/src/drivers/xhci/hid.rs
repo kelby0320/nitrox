@@ -506,12 +506,30 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
     for p in prepared.into_iter().flatten() {
         let c = &p.c;
         let what = if c.is_keyboard { "keyboard" } else { "mouse" };
+        // **A keyboard's `SET_IDLE (0)` first**, so it reports a change and not a held state —
+        // before its report descriptor is read since Part B.7, which is Linux's order
+        // (`usbhid_parse`): a Corsair K70 plugged in after boot fell back to boot protocol, and so
+        // to the wrong keys, where one plugged in before boot did not. A stall is passed over: an
+        // unchanged report decodes to nothing. Any other failure ends the binding here, as every
+        // request's does.
+        if c.is_keyboard
+            && let Err(e) = interface_request(x, slot, mem, [0x21, 0x0A, 0, 0, c.interface, 0, 0, 0])
+        {
+            if in_doubt(&e) {
+                crate::kprintln!(
+                    "usb: port {port}: its keyboard's SET_IDLE failed ({e}); not bound, nor anything after it"
+                );
+                in_doubt_at = true;
+                break;
+            }
+            crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); passed over");
+        }
         // **Its layout, from its report descriptor** (Parts B.3 and B.7): report protocol when it
         // describes a plain mouse, or a keyboard this driver reads, boot protocol otherwise. A
         // keyboard is read by its descriptor even where it offers boot protocol: a Corsair K70 says
         // it is in boot protocol and goes on sending its bitmap.
-        let layout = match report_layout(x, slot, mem, c) {
-            Ok(l) => l,
+        let described = match report_layout(x, slot, mem, c) {
+            Ok(d) => d,
             Err(e) => {
                 crate::kprintln!(
                     "usb: port {port}: its {what}'s report descriptor did not read ({e}); \
@@ -521,6 +539,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
                 break;
             }
         };
+        let layout = described.layout();
         if layout.is_some() {
             // A stall is passed over: a device is in report protocol after a reset anyway.
             if let Err(e) = interface_request(x, slot, mem, [0x21, 0x0B, 1, 0, c.interface, 0, 0, 0])
@@ -543,21 +562,6 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             crate::kprintln!("usb: port {port}: its {what} refused boot protocol ({e}); not bound");
             continue;
         }
-        // A keyboard whose SET_IDLE leaves the endpoint in doubt is bound, being past its last
-        // request, and is the last bound.
-        let mut last = false;
-        if c.is_keyboard
-            && let Err(e) = interface_request(x, slot, mem, [0x21, 0x0A, 0, 0, c.interface, 0, 0, 0])
-        {
-            if in_doubt(&e) {
-                crate::kprintln!("usb: port {port}: its keyboard's SET_IDLE failed ({e}); bound, and nothing after it");
-                last = true;
-                in_doubt_at = true;
-            } else {
-                // Harmless: an unchanged report decodes to nothing.
-                crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); bound anyway");
-            }
-        }
         let decoder = match layout {
             Some(Layout::Keyboard(layout)) => Decoder::Keyboard { layout, held: keyboard::Held::NONE },
             Some(Layout::Mouse(layout)) => Decoder::Mouse { layout, buttons: 0 },
@@ -569,9 +573,6 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
         let kind = if c.is_keyboard { DeviceKind::Keyboard } else { DeviceKind::Mouse };
         let Some((node, epoch, served)) = publish(kind, parent) else {
             crate::kprintln!("usb: port {port}: no input node for its {what}; not bound");
-            if last {
-                break;
-            }
             continue;
         };
         let bound = Bound {
@@ -593,23 +594,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
         };
         if !start(x, bound) {
             crate::kprintln!("usb: port {port}: no room to poll its {what}; not bound");
-            if last {
-                break;
-            }
             continue;
         }
-        let how = match layout {
-            Some(Layout::Mouse(l)) if l.wheel.is_some() => ", report protocol, with a wheel",
-            Some(Layout::Mouse(_)) => ", report protocol, with no wheel",
-            Some(Layout::Keyboard(l)) if l.array.is_none() => ", report protocol, its keys a bitmap",
-            Some(Layout::Keyboard(_)) => ", report protocol",
-            None if c.is_keyboard => ", boot protocol",
-            None => ", boot protocol: its report descriptor does not describe a plain mouse",
-        };
-        crate::kprintln!("usb: port {port}: {what} at /dev/input/raw/{served}{how}");
-        if last {
-            break;
-        }
+        crate::kprintln!("usb: port {port}: {what} at /dev/input/raw/{served}{}", Said(&described));
     }
     if in_doubt_at {
         lights_dead(x, slot);
@@ -624,28 +611,105 @@ fn in_doubt(e: &Failed) -> bool {
     !matches!(e, Failed::Code(code::STALL))
 }
 
-/// **A mouse's or keyboard's layout from its report descriptor** (Parts B.3 and B.7): `None` when
-/// it has none, or one this driver does not read, or the device stalled the request, which leaves
-/// boot protocol; an error for any other failure, which may leave the transfer on the default
-/// endpoint's ring.
-fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Result<Option<Layout>, Failed> {
+/// Times a report descriptor is asked for before a stall is its answer: Linux's
+/// (`hid_get_class_descriptor`).
+const DESCRIPTOR_TRIES: u8 = 4;
+/// The pause before asking again after a stall — what a device just plugged in may need to settle.
+const DESCRIPTOR_RETRY_NS: u64 = 100_000_000;
+
+/// **What reading an interface's report descriptor came to** (Parts B.3 and B.7): a layout, or why
+/// the device runs in boot protocol — which the bind's log line says, since a wrong layout is
+/// otherwise only wrong keys on the screen.
+#[derive(Copy, Clone, Debug)]
+enum Described {
+    /// A layout this driver reads, read on this try.
+    Layout(Layout, u8),
+    /// Its HID descriptor names no report descriptor.
+    None,
+    /// The device stalled every try.
+    Stalled(u8),
+    /// It read, on this try, and is not one this driver reads: its length, and its first bytes.
+    Unread { len: u16, head: [u8; 8], tries: u8, keyboard: bool },
+}
+
+impl Described {
+    /// The layout, if there is one.
+    fn layout(&self) -> Option<Layout> {
+        match *self {
+            Described::Layout(l, _) => Some(l),
+            _ => None,
+        }
+    }
+}
+
+/// **How a bound interface's descriptor went**, as its log line ends: its protocol, and in boot
+/// protocol why.
+struct Said<'a>(&'a Described);
+
+impl core::fmt::Display for Said<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let tries = match *self.0 {
+            Described::Layout(Layout::Mouse(l), t) => {
+                f.write_str(if l.wheel.is_some() { ", report protocol, with a wheel" } else { ", report protocol, with no wheel" })?;
+                t
+            }
+            Described::Layout(Layout::Keyboard(l), t) => {
+                f.write_str(if l.array.is_none() { ", report protocol, its keys a bitmap" } else { ", report protocol" })?;
+                t
+            }
+            Described::None => return f.write_str(", boot protocol: it has no report descriptor"),
+            Described::Stalled(n) => return write!(f, ", boot protocol: its report descriptor stalled {n} times"),
+            Described::Unread { keyboard: false, tries, .. } => {
+                f.write_str(", boot protocol: its report descriptor does not describe a plain mouse")?;
+                tries
+            }
+            Described::Unread { len, head, tries, keyboard: true } => {
+                write!(f, ", boot protocol: its {len}-byte report descriptor is not one this driver reads (it begins")?;
+                for b in &head[..head.len().min(len as usize)] {
+                    write!(f, " {b:02x}")?;
+                }
+                f.write_str(")")?;
+                tries
+            }
+        };
+        if tries > 1 { write!(f, "; its report descriptor read on try {tries}") } else { Ok(()) }
+    }
+}
+
+/// **A mouse's or keyboard's layout from its report descriptor** (Parts B.3 and B.7), or why there
+/// is none. **A stall is asked again**, up to [`DESCRIPTOR_TRIES`] times with a pause between, as
+/// Linux asks (Part B.7); each is the request's answer, and the endpoint is recovered after it. An
+/// error for any other failure, which may leave the transfer on the default endpoint's ring.
+fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Result<Described, Failed> {
     if c.report_len == 0 {
-        return Ok(None);
+        return Ok(Described::None);
     }
-    match hub::read_interface_descriptor(x, slot, mem, super::desc::kind::REPORT, c.interface, c.report_len) {
-        Ok(desc) => {
-            let desc = &desc[..c.report_len.min(desc.len() as u16) as usize];
-            Ok(match c.is_keyboard {
-                true => crate::drivers::hid::descriptor::keyboard_layout(desc).map(Layout::Keyboard),
-                false => crate::drivers::hid::descriptor::mouse_layout(desc).map(Layout::Mouse),
-            })
+    for tries in 1..=DESCRIPTOR_TRIES {
+        match hub::read_interface_descriptor(x, slot, mem, super::desc::kind::REPORT, c.interface, c.report_len) {
+            Ok(desc) => {
+                let desc = &desc[..c.report_len.min(desc.len() as u16) as usize];
+                let layout = match c.is_keyboard {
+                    true => crate::drivers::hid::descriptor::keyboard_layout(desc).map(Layout::Keyboard),
+                    false => crate::drivers::hid::descriptor::mouse_layout(desc).map(Layout::Mouse),
+                };
+                let mut head = [0u8; 8];
+                let n = head.len().min(desc.len());
+                head[..n].copy_from_slice(&desc[..n]);
+                return Ok(match layout {
+                    Some(l) => Described::Layout(l, tries),
+                    None => Described::Unread { len: desc.len() as u16, head, tries, keyboard: c.is_keyboard },
+                });
+            }
+            Err(Failed::Code(code::STALL)) => {
+                hub::recover_ep0(x, slot, mem)?;
+                if tries < DESCRIPTOR_TRIES {
+                    hub::sleep(DESCRIPTOR_RETRY_NS);
+                }
+            }
+            Err(e) => return Err(e),
         }
-        Err(Failed::Code(code::STALL)) => {
-            hub::recover_ep0(x, slot, mem)?;
-            Ok(None)
-        }
-        Err(e) => Err(e),
     }
+    Ok(Described::Stalled(DESCRIPTOR_TRIES))
 }
 
 /// The bytes a report in `layout` takes: its last field's end, and the report ID before it.
@@ -1127,6 +1191,40 @@ mod tests {
             |e| delivered += e.len(),
         );
         assert_eq!((steps, delivered), (2, 21), "the first batch, and then the device was gone");
+    }
+
+    /// **A bind's line says how its descriptor went** (Part B.7): its protocol, the try a descriptor
+    /// read on when it took more than one, and in boot protocol why — none, every try stalled, or
+    /// one not read, with its length and first bytes. What the laptop's kernel log is read for when a
+    /// keyboard types the wrong keys.
+    #[test]
+    fn a_bind_line_says_how_its_descriptor_went() {
+        let said = |d: Described| std::format!("{}", Said(&d));
+        let mut bitmap = keyboard::Layout::BOOT;
+        bitmap.array = None;
+        assert_eq!(said(Described::Layout(Layout::Keyboard(bitmap), 1)), ", report protocol, its keys a bitmap");
+        assert_eq!(
+            said(Described::Layout(Layout::Keyboard(keyboard::Layout::BOOT), 2)),
+            ", report protocol; its report descriptor read on try 2"
+        );
+        assert_eq!(said(Described::Layout(Layout::Mouse(mouse::Layout::BOOT), 1)), ", report protocol, with no wheel");
+        assert_eq!(said(Described::None), ", boot protocol: it has no report descriptor");
+        assert_eq!(said(Described::Stalled(4)), ", boot protocol: its report descriptor stalled 4 times");
+        let head = [0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01];
+        assert_eq!(
+            said(Described::Unread { len: 192, head, tries: 1, keyboard: true }),
+            ", boot protocol: its 192-byte report descriptor is not one this driver reads (it begins 05 01 09 06 a1 01 85 01)"
+        );
+        assert_eq!(
+            said(Described::Unread { len: 3, head, tries: 3, keyboard: true }),
+            ", boot protocol: its 3-byte report descriptor is not one this driver reads (it begins 05 01 09); its \
+             report descriptor read on try 3",
+            "no more bytes than it has"
+        );
+        assert_eq!(
+            said(Described::Unread { len: 52, head, tries: 1, keyboard: false }),
+            ", boot protocol: its report descriptor does not describe a plain mouse"
+        );
     }
 
     /// **A new node takes a slot no node has had, then one whose device has departed** (Phase 6 Part

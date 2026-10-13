@@ -3,8 +3,9 @@
 **Status:** Implemented — the in-kernel log (`kernel/src/klog.rs`) and the userspace
 `logging-service`. Verified 2026-08-05. **Read-back built with administration Part E.6
 (2026-09-29)**: the ring answers `Log::Read` on a read session, the `logs` grant binds a read
-endpoint at `/dev/logs`, and `log` reads it; see [Reading it back](#reading-it-back). Last checked
-2026-09-29.
+endpoint at `/dev/logs`, and `log` reads it; see [Reading it back](#reading-it-back). **The kernel's
+log read back too** (Phase 6 Part B.7, 2026-10-13): `log --kernel`, through the `kernel-log` grant —
+see [Relationship to the kernel log](#relationship-to-the-kernel-log). Last checked 2026-10-13.
 
 The userspace **logging service** collects structured log records from any process
 that holds a logging capability, stamps each with trusted provenance, and fans them
@@ -249,6 +250,14 @@ kernel's own `kprint!` capture (a read-only `MemoryObject` snapshot, `dmesg`), t
 aggregates userspace records. Not merged in this slice; `/dev/log` keeps working. A
 future unification — the logging service ingesting the kernel ring as a Kernel-tier
 source — is possible but out of scope.
+
+**Read in one place** since Phase 6 Part B.7: `log` is the system's log viewer, a source an option,
+and **`log --kernel`** reads the kernel's, a row a line in the service log's table — its `principal`
+`kernel`, its `time`, `tier` and `level` null. It needs the view broker's `kernel-log` grant, which
+binds a snapshot of the kernel's `/dev/log` at the same path in a view, taken as the view is made;
+the `admin` profile has it. Until then no session could read the kernel's log at all, and a laptop's
+driver could be diagnosed only from a screen it scrolled off. The two logs stay separate: this reads
+each where it is.
 
 ## Client ergonomics
 
