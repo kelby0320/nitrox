@@ -282,6 +282,18 @@ pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
     Ok(out)
 }
 
+/// **`bytes` without the NULs that end it**: what [`read_file`] read of a snapshot, its padding
+/// trimmed.
+///
+/// **A snapshot is a `MemoryObject`, whose size is its pages'**: the kernel's `/dev/log` is sized
+/// to the bytes logged and zero-pads the last page, leaving the reader to trim (PR #371 review,
+/// finding 1). Read whole and split into lines, the padding was a last line of NULs. A file a
+/// filesystem serves is sized to its bytes, so this is for a reader of text, where a NUL is no
+/// character: a binary file may end in zeroes it means.
+pub fn unpadded(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)]
+}
+
 /// Write `bytes` to `path`, replacing whatever was there.
 ///
 /// **Shrinks before it writes**, for [`copy_file`]'s reason and with the same verification: a
@@ -809,6 +821,17 @@ mod tests {
         }
         // A home given with its separator does not grow a second one.
         assert_eq!(super::places("/home/")[1].path, "/home/Documents");
+    }
+
+    /// **The NULs that end the bytes go, and no others**: one inside a line stays, as does
+    /// everything when nothing pads it; all NULs are nothing.
+    #[test]
+    fn unpadded_trims_the_nuls_that_end_it() {
+        assert_eq!(unpadded(b"a\nb\n\0\0\0"), b"a\nb\n");
+        assert_eq!(unpadded(b"a\0b\0"), b"a\0b", "a NUL inside stays");
+        assert_eq!(unpadded(b"a\nb"), b"a\nb", "nothing to trim");
+        assert_eq!(unpadded(b"\0\0"), b"");
+        assert_eq!(unpadded(b""), b"");
     }
 
     #[test]

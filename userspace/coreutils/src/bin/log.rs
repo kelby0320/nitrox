@@ -139,7 +139,8 @@ fn kernel(stage: &Stage) -> ! {
         }
     };
     let mut out = Out::new(stage);
-    for (i, line) in coreutils::text::lines(&bytes).enumerate() {
+    // The snapshot's last page is padded with NULs, which are not a line.
+    for (i, line) in coreutils::text::lines(libfs::unpadded(&bytes)).enumerate() {
         if !out.kernel_row(i as i64 + 1, line) {
             // Whoever read `log`'s output has stopped reading.
             break;

@@ -2585,6 +2585,12 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     with_admin_asked(s, "log --kernel | take 4")?;
     s.expect("CPU tables installed (GDT/TSS/IDT)")?;
     s.expect("/home>")?;
+    //          **And its last row is its last line**, 20g(d)'s clock, whose own echo the wait there
+    //          consumed. The snapshot's last page is padded with NULs, which were a last row of
+    //          them until `log` trimmed them (PR #371 review, finding 1).
+    with_admin_asked(s, "log --kernel | last 1")?;
+    s.expect("wall clock: set to 1925164800")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
