@@ -35496,3 +35496,61 @@ number of commands, and if the stick is slow per byte rather than per command it
 move — which is the answer the number is set with too. **Left out, as planned**: more than one
 command in flight (NCQ), and raising the USB driver's 64 fragments, which is below the 1 MiB Linux
 gives the same stick — each waits for the laptop to show the need.
+
+## 2026-10-13 — Phase 6 Part H.4: the laptop again, the four fixes in
+
+**The runs.** The maintainer reinstalled the laptop from `c2644f26` and ran `h3.nx`'s four sets in
+one sitting on the Patriot stick, rewritten as before; `throughput-stick --check` found every copy
+as written. Linux's numbers are H.3's. **Nitrox took 647 s for the fifteen runs, where the three
+fixes took 1,362 and H.3 5,919: 0.73 times Linux's 889 s.** That sum flatters it — Linux mounts the
+stick `flush`, and took 519 s on `small/` to the stick alone — so the fairer figure is the geometric
+mean of the fifteen ratios: **1.35**, where it was 2.48.
+
+| Set | H.3 | Three fixes | Four fixes | Linux | Now ÷ Linux |
+|---|---|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 99.76 s | 15.90 s | 22.24 s | 0.71 |
+| 1, stick → disk: `small` | 1,364.22 s | 91.74 s | 68.53 s | 36.52 s | 1.88 |
+| 1, stick → disk: `tree` | 132.99 s | 30.04 s | 12.29 s | 8.72 s | 1.41 |
+| 2, disk → disk: `big` | 317.75 s | 77.27 s | 12.73 s | 5.59 s | 2.28 |
+| 2, disk → disk: `small` | 393.57 s | 64.03 s | 42.31 s | 9.13 s | 4.63 |
+| 2, disk → disk: `tree` | 146.73 s | 26.57 s | 11.59 s | 7.08 s | 1.64 |
+| 3, disk → stick: `big` | 385.14 s | 353.00 s | 61.48 s | 37.36 s | 1.65 |
+| 3, disk → stick: `small` | 2,094.19 s | 332.28 s | 240.13 s | 518.63 s | 0.46 |
+| 3, disk → stick: `tree` | 186.32 s | 171.89 s | 66.76 s | 137.21 s | 0.49 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.96 s | 1.98 s | 1.68 s | 1.18 |
+| 4, remove on the disk: `u-small` | 117.36 s | 18.85 s | 18.97 s | 2.79 s | 6.80 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 5.47 s | 5.31 s | 2.26 s | 2.35 |
+| 4, remove on the stick: `c-big` | 1.02 s | 578 ms | 582 ms | 1.15 s | 0.51 |
+| 4, remove on the stick: `c-small` | 320.24 s | 68.54 s | 68.69 s | 76.24 s | 0.90 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 19.64 s | 19.99 s | 22.26 s | 0.90 |
+| **All fifteen** | **5,919 s** | **1,362 s** | **647 s** | **889 s** | **0.73** |
+
+**The hypothesis held.** Every run that moves a big file's bytes went five to six times faster —
+`big` to the stick 353 s to 61, within the disk 77 to 12.7, from the stick 100 to 15.9, which is now
+quicker than Linux's 22 — and the runs the fix did not touch, the removals, measured the same,
+within a few per cent. The commands are what the design said: a copy of `big` filled in 2,049 IRPs
+of 128 KiB and wrote back in 289 to the disk, about 0.9 MiB each, and in 1,024 of 256 KiB to the
+stick.
+
+**What is left is two costs, neither of them a command's size:**
+
+- **The zeroes.** A grow writes every block it adds, and the copy then writes it again, so a big
+  file's bytes cross the device twice. Copying `big` to the stick wrote 512.6 MiB in 5,284 writes,
+  busy 51.5 s: 9.95 MiB/s, faster than the 6.85 Linux reached on the same stick, and half of it
+  FAT's zeroes. Within the disk 770 MiB moved in 11.7 s of busy time, a third of it ext4's zeroes.
+  Without them the stick would be busy about half as long, and `big` to the stick would take about
+  35 s against Linux's 37 — an estimate from the busy times, which today add up: the run's 61 s is
+  about the stick's 51.5 and the disk's 8.1. What removes them is the second fix's piece 2, not
+  zeroing, which on ext4 is unwritten extents and on FAT a question of what a crash may expose.
+
+- **ext4's metadata, a file at a time.** Copying `small/` within the disk took 42 s against Linux's
+  9: 9.2 reads and 13 writes a file of 16 KiB, at 0.42 ms a command, most of them metadata — a
+  file's source is one read, its zeroes and its data a write each, and the rest is the inode, the
+  bitmaps, the descriptor, the superblock and the directory each written through as they change.
+  Removing it took 19 s against 2.8, at 6.2 reads and 9 writes a file. Linux keeps that metadata in
+  memory and writes it later in large batches, ordered by its journal.
+
+**Where the number stands.** The Definition of Done asks for a copy to the stick that meets the
+number H.5 sets. Copying to the stick is now 368 s for set 3 against Linux's 693: `small/` and
+`tree/` at half Linux's time, `big` at 1.65 times it, and that gap is the zeroes. Whether to set the
+number here or take one of the two costs first is the maintainer's call.

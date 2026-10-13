@@ -2894,6 +2894,13 @@ whole, a `memcpy`, both unmapped, and `SYS_FILE_SYNC`. Underneath, by reading:
   bring in. Under QEMU the four sets went from 186 s to 124; `boot-probe`'s 64-page file from 145
   writes to 25, and a 64-page file read back in 4 reads. **Next: the laptop measures again**, with
   the four fixes in.
+- **H.4 measured again on the laptop** (2026-10-13), the four fixes in: **647 s for the fifteen
+  runs, 0.73 times Linux's 889** — a geometric mean of 1.35 across the runs, from 2.48. The big-file
+  copies went five to six times faster; set 3, the copies to the stick, took 368 s against Linux's
+  693, `big` at 1.65 times Linux's. What is left: the zeroes, which make a big file's bytes cross
+  the device twice, and ext4's metadata written through a file at a time — `small/` within the disk
+  4.6 times Linux's, its removal 6.8. The table is in the decision log. Next, the maintainer's call:
+  the number (H.5), or one of the two.
 - **H.5 The number, and the docs.**
 
 ### H.4's second fix, in detail: a new block's zeroes, and the fill that reads them back

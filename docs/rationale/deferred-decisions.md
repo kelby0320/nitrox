@@ -1744,7 +1744,9 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > Linux's 889 over the fifteen runs, 1.53 times; what was left was a big file's bytes, 4 KiB a
 > command. **The fourth**: more than a page a command — fills read ahead, a write-back writes a run
 > of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
-> 124. Open while Part H's loop runs; the laptop measures next.
+> 124. **Measured again** (2026-10-13): 647 s, 0.73 times Linux's 889, a geometric mean of 1.35 over
+> the runs. Left: the zeroes, a big file's bytes written twice, and ext4's metadata written through
+> a file at a time. Open until H.5 sets the number.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
