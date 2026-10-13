@@ -196,6 +196,16 @@ enum Awaited {
 struct Waiting {
     awaited: Awaited,
     po: PoPtr,
+    /// **The bytes a short Data stage did not move**, from its own event (Phase 6 Part B.7), which
+    /// comes before its Status stage's; the transfer completes with it. `0` for a whole one.
+    short: u32,
+}
+
+impl Waiting {
+    /// A wait for `awaited`, ended by `po`.
+    fn new(awaited: Awaited, po: PoPtr) -> Waiting {
+        Waiting { awaited, po, short: 0 }
+    }
 }
 
 /// A `PendingOperation`, by address: the waiting thread's reference pins it until the record is
@@ -713,20 +723,40 @@ fn on_event(x: &Xhci, trb: &Trb) {
                 hid::on_transfer(x, trb);
             }
         }
-        kind::TRANSFER_EVENT => complete_if(
-            x,
-            |a| match a {
-                Awaited::Transfer { slot, status } => {
-                    slot == trb.slot_id()
-                        && trb.endpoint_id() == context::DCI_EP0
-                        && (trb.pointer() == status || !matches!(trb.completion_code(), code::SUCCESS | code::SHORT_PACKET))
-                }
-                Awaited::Command { .. } => false,
-            },
-            trb.completion_code(),
-            trb.residual() as u64,
-        ),
+        kind::TRANSFER_EVENT => {
+            let done = ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
+            if let Some((w, code, result)) = done {
+                crate::sched::complete_pending_op(w.po.0, code as i32, result);
+            }
+        }
         _ => {}
+    }
+}
+
+/// **An event on a default endpoint, against the waiting record** (Phase 6 Part B.7): the record
+/// taken, with the code and result to complete it with, when the event ends its transfer. **A
+/// short Data stage's own event** keeps the bytes it did not move on the record and ends nothing:
+/// its Status stage follows, and completes the transfer with them — so a transfer's result is what
+/// its Data stage fell short by. The Status stage's event, or an error on any stage, ends it; an
+/// error's result is its own TRB's residual. An event for another slot, or with no transfer
+/// waiting, changes nothing.
+fn ep0_event(waiting: &mut Option<Waiting>, slot: u8, pointer: u64, code: u8, residual: u32) -> Option<(Waiting, u8, u64)> {
+    let w = waiting.as_mut()?;
+    let Awaited::Transfer { slot: awaited, status } = w.awaited else { return None };
+    if awaited != slot {
+        return None;
+    }
+    match code {
+        code::SHORT_PACKET if pointer != status => {
+            w.short = residual;
+            None
+        }
+        code::SUCCESS if pointer != status => None,
+        _ => {
+            let w = waiting.take()?;
+            let result = if pointer == status { w.short } else { residual };
+            Some((w, code, result as u64))
+        }
     }
 }
 
@@ -802,5 +832,44 @@ impl fmt::Display for Ranges<'_> {
             f.write_str("no supported protocol named")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transfer on `slot`'s default endpoint waiting for its Status stage at `status`.
+    fn transfer(slot: u8, status: u64) -> Option<Waiting> {
+        Some(Waiting::new(Awaited::Transfer { slot, status }, PoPtr(core::ptr::null_mut())))
+    }
+
+    /// **A short Data stage's residual is its transfer's result** (Phase 6 Part B.7): its own event
+    /// ends nothing and the Status stage's carries it, so a reader learns how many bytes came. A
+    /// whole one ends with nothing short; an error on the Data stage ends there with its own
+    /// residual; another slot's event, a command's wait, or none leave things as they are.
+    #[test]
+    fn a_short_data_stage_ends_its_transfer_with_what_it_did_not_move() {
+        let (data, status) = (0x1010, 0x1020);
+        let mut w = transfer(3, status);
+        let (_, code, result) = ep0_event(&mut w, 3, status, code::SUCCESS, 0).expect("the Status stage ends it");
+        assert_eq!((code, result, w.is_none()), (code::SUCCESS, 0, true), "whole");
+
+        let mut w = transfer(3, status);
+        assert!(ep0_event(&mut w, 3, data, code::SHORT_PACKET, 64).is_none(), "the Data stage's own event");
+        assert!(w.is_some(), "still waiting for the Status stage");
+        let (_, code, result) = ep0_event(&mut w, 3, status, code::SUCCESS, 0).expect("the Status stage ends it");
+        assert_eq!((code, result), (code::SUCCESS, 64), "short by a packet");
+
+        let mut w = transfer(3, status);
+        let (_, code, result) = ep0_event(&mut w, 3, data, code::STALL, 18).expect("an error ends it");
+        assert_eq!((code, result), (code::STALL, 18));
+
+        let mut w = transfer(3, status);
+        assert!(ep0_event(&mut w, 4, status, code::SUCCESS, 0).is_none(), "another slot's");
+        assert!(w.is_some());
+        let mut c = Some(Waiting::new(Awaited::Command { trb: status }, PoPtr(core::ptr::null_mut())));
+        assert!(ep0_event(&mut c, 3, status, code::SUCCESS, 0).is_none(), "a command's wait");
+        assert!(ep0_event(&mut None, 3, status, code::SUCCESS, 0).is_none(), "nothing waiting");
     }
 }

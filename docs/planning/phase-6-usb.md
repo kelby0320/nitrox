@@ -875,8 +875,10 @@ a USB one, as it would on Linux.
   Built 2026-10-13. On the laptop it typed plugged in before boot and not after, so the bind became
   Linux's — `SET_IDLE` first, a stalled descriptor asked again — its line says why a device runs in
   boot protocol, and `with admin log --kernel` reads that line in a session, through a new
-  `kernel-log` grant (the maintainer's call, brought forward from Part H's list). The laptop checks
-  it again.
+  `kernel-log` grant (the maintainer's call, brought forward from Part H's list). The laptop's log
+  then said why: the K70's descriptor came back without its first 64-byte packet, which a Data stage
+  that did not interrupt on a short packet could not tell — so a short read is now seen, and asked
+  again, as Linux asks. The laptop checks it again.
 
 ### Gates
 

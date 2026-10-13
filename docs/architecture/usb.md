@@ -102,7 +102,11 @@ TRB's address, a transfer by its slot and its Status stage's address — *before
 so no completion can arrive first. The DPC takes a matching record out under a lock and completes
 its operation after releasing it, since completing takes the scheduler's lock and no leaf lock may
 be held across that. A transfer is ended by its Status stage, or by an error on any stage; a short
-Data stage is passed over, since its Status stage follows. **On a timeout the thread takes the
+Data stage is passed over, since its Status stage follows — **but what it fell short by is kept**
+(Phase 6 Part B.7): an IN Data stage interrupts on a short packet, its event leaves its residual on
+the record, and the Status stage completes the transfer with it, so `control_in` returns the bytes
+that came. Until then a device that sent less than asked read as zeroes where the rest should be.
+**On a timeout the thread takes the
 record back**; if the DPC already took it, its completion is on the way and is waited for, so the
 DPC never completes an operation the thread has dropped.
 
@@ -200,9 +204,10 @@ interface becomes an input node. In order:
    descriptor since B.7, which is Linux's order (`usbhid_parse`). A stall is passed over: an unchanged
    report decodes to nothing.
 4. **Its report descriptor** — a mouse's since B.3, a keyboard's since B.7 — from the interface,
-   for the length its HID descriptor gives. **A stall is asked again**, up to four times with 100 ms
-   between, as Linux asks (`hid_get_class_descriptor`): a Corsair K70 plugged in after boot fell back
-   to boot protocol, where one plugged in before boot read its descriptor.
+   for the length its HID descriptor gives. **A stall, or an answer shorter than the descriptor, is
+   asked again**, up to four times with 100 ms between, as Linux asks (`hid_get_class_descriptor`):
+   a Corsair K70 plugged in after boot sent its descriptor without its first 64-byte packet, where
+   one plugged in before boot sent it whole.
 5. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse, and for
    a keyboard whose descriptor this driver reads (B.7); boot protocol for any other. A device that
    refuses boot protocol is not bound. One that refuses report protocol is in it already, a
@@ -213,7 +218,7 @@ interface becomes an input node. In order:
 **What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. In
 steps 3 to 6:
 - **a stall is that interface's**: its endpoint stays configured and is never polled, and the
-  others go on. A report descriptor that stalls every try runs the device in boot protocol;
+  others go on. A report descriptor that never comes back whole runs the device in boot protocol;
 - **any other failure on the default endpoint ends the binding there**, since the request may still
   be on the endpoint's ring (`control_in`'s rule, which enumeration keeps by ending the device). So
   nothing more is asked of it: that interface is not bound, nor any after it, and those before it
@@ -337,9 +342,9 @@ request went unanswered.
 **The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, report
 protocol` — `, its keys a bitmap` for one like the K70 — and `usb: port 10: mouse at
 /dev/input/raw/3, report protocol, with a wheel`. **One in boot protocol says why** (B.7): it has
-no report descriptor, its descriptor stalled every try, or its descriptor is not one this driver
+no report descriptor, its descriptor never came back whole, or its descriptor is not one this driver
 reads, with its length and first bytes; and a descriptor that took more than one try says which
-read it. A session reads these with `with admin log --kernel`
+read it whole, and how many before it came back short or stalled. A session reads these with `with admin log --kernel`
 ([`logging.md`](logging.md) § *Relationship to the kernel log*).
 
 ## Mass storage (Part D)

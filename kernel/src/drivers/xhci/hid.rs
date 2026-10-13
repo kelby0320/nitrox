@@ -611,25 +611,34 @@ fn in_doubt(e: &Failed) -> bool {
     !matches!(e, Failed::Code(code::STALL))
 }
 
-/// Times a report descriptor is asked for before a stall is its answer: Linux's
-/// (`hid_get_class_descriptor`).
+/// Times a report descriptor is asked for before a stall, or a short answer, is the device's last:
+/// Linux's (`hid_get_class_descriptor`, which asks again while fewer bytes than asked came back).
 const DESCRIPTOR_TRIES: u8 = 4;
-/// The pause before asking again after a stall — what a device just plugged in may need to settle.
+/// The pause before asking again — what a device just plugged in may need to settle.
 const DESCRIPTOR_RETRY_NS: u64 = 100_000_000;
+
+/// **The tries before the one that read a report descriptor whole** (Part B.7): how many came back
+/// short, and how many the device stalled.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct Tries {
+    short: u8,
+    stalled: u8,
+}
 
 /// **What reading an interface's report descriptor came to** (Parts B.3 and B.7): a layout, or why
 /// the device runs in boot protocol — which the bind's log line says, since a wrong layout is
 /// otherwise only wrong keys on the screen.
 #[derive(Copy, Clone, Debug)]
 enum Described {
-    /// A layout this driver reads, read on this try.
-    Layout(Layout, u8),
+    /// A layout this driver reads, read whole after these tries.
+    Layout(Layout, Tries),
     /// Its HID descriptor names no report descriptor.
     None,
-    /// The device stalled every try.
-    Stalled(u8),
-    /// It read, on this try, and is not one this driver reads: its length, and its first bytes.
-    Unread { len: u16, head: [u8; 8], tries: u8, keyboard: bool },
+    /// Every try stalled or came back short; the last short one's bytes, and what was asked for.
+    Unanswered { tries: Tries, last: Option<(u16, u16)> },
+    /// It read whole, after these tries, and is not one this driver reads: its length, and its
+    /// first bytes.
+    Unread { len: u16, head: [u8; 8], tries: Tries, keyboard: bool },
 }
 
 impl Described {
@@ -658,7 +667,14 @@ impl core::fmt::Display for Said<'_> {
                 t
             }
             Described::None => return f.write_str(", boot protocol: it has no report descriptor"),
-            Described::Stalled(n) => return write!(f, ", boot protocol: its report descriptor stalled {n} times"),
+            Described::Unanswered { tries, last } => {
+                write!(f, ", boot protocol: its report descriptor never came back whole in {DESCRIPTOR_TRIES} tries")?;
+                write!(f, " ({} short, {} stalled", tries.short, tries.stalled)?;
+                if let Some((got, of)) = last {
+                    write!(f, "; the last short one {got} of {of} bytes")?;
+                }
+                return f.write_str(")");
+            }
             Described::Unread { keyboard: false, tries, .. } => {
                 f.write_str(", boot protocol: its report descriptor does not describe a plain mouse")?;
                 tries
@@ -672,44 +688,62 @@ impl core::fmt::Display for Said<'_> {
                 tries
             }
         };
-        if tries > 1 { write!(f, "; its report descriptor read on try {tries}") } else { Ok(()) }
+        let before = tries.short + tries.stalled;
+        if before == 0 {
+            return Ok(());
+        }
+        write!(f, "; its report descriptor read whole on try {}, after", before + 1)?;
+        match (tries.short, tries.stalled) {
+            (s, 0) => write!(f, " {s} short"),
+            (0, t) => write!(f, " {t} stalled"),
+            (s, t) => write!(f, " {s} short and {t} stalled"),
+        }
     }
 }
 
 /// **A mouse's or keyboard's layout from its report descriptor** (Parts B.3 and B.7), or why there
-/// is none. **A stall is asked again**, up to [`DESCRIPTOR_TRIES`] times with a pause between, as
-/// Linux asks (Part B.7); each is the request's answer, and the endpoint is recovered after it. An
-/// error for any other failure, which may leave the transfer on the default endpoint's ring.
+/// is none. **A stall, or an answer shorter than the descriptor, is asked again**, up to
+/// [`DESCRIPTOR_TRIES`] times with a pause between, as Linux asks (Part B.7): a Corsair K70 plugged
+/// in after boot sent its descriptor without its first packet. A stall is the request's answer, and
+/// the endpoint is recovered after it. An error for any other failure, which may leave the transfer
+/// on the default endpoint's ring.
 fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Result<Described, Failed> {
     if c.report_len == 0 {
         return Ok(Described::None);
     }
-    for tries in 1..=DESCRIPTOR_TRIES {
+    let mut tries = Tries::default();
+    let mut last = None;
+    for n in 1..=DESCRIPTOR_TRIES {
         match hub::read_interface_descriptor(x, slot, mem, super::desc::kind::REPORT, c.interface, c.report_len) {
-            Ok(desc) => {
-                let desc = &desc[..c.report_len.min(desc.len() as u16) as usize];
+            Ok(desc) if desc.len() >= c.report_len as usize => {
+                let desc = &desc[..c.report_len as usize];
                 let layout = match c.is_keyboard {
                     true => crate::drivers::hid::descriptor::keyboard_layout(desc).map(Layout::Keyboard),
                     false => crate::drivers::hid::descriptor::mouse_layout(desc).map(Layout::Mouse),
                 };
                 let mut head = [0u8; 8];
-                let n = head.len().min(desc.len());
-                head[..n].copy_from_slice(&desc[..n]);
+                let k = head.len().min(desc.len());
+                head[..k].copy_from_slice(&desc[..k]);
                 return Ok(match layout {
                     Some(l) => Described::Layout(l, tries),
                     None => Described::Unread { len: desc.len() as u16, head, tries, keyboard: c.is_keyboard },
                 });
             }
+            Ok(desc) => {
+                tries.short += 1;
+                last = Some((desc.len() as u16, c.report_len));
+            }
             Err(Failed::Code(code::STALL)) => {
                 hub::recover_ep0(x, slot, mem)?;
-                if tries < DESCRIPTOR_TRIES {
-                    hub::sleep(DESCRIPTOR_RETRY_NS);
-                }
+                tries.stalled += 1;
             }
             Err(e) => return Err(e),
         }
+        if n < DESCRIPTOR_TRIES {
+            hub::sleep(DESCRIPTOR_RETRY_NS);
+        }
     }
-    Ok(Described::Stalled(DESCRIPTOR_TRIES))
+    Ok(Described::Unanswered { tries, last })
 }
 
 /// The bytes a report in `layout` takes: its last field's end, and the report ID before it.
@@ -1200,32 +1234,45 @@ mod tests {
     #[test]
     fn a_bind_line_says_how_its_descriptor_went() {
         let said = |d: Described| std::format!("{}", Said(&d));
+        let none = Tries::default();
         let mut bitmap = keyboard::Layout::BOOT;
         bitmap.array = None;
-        assert_eq!(said(Described::Layout(Layout::Keyboard(bitmap), 1)), ", report protocol, its keys a bitmap");
+        assert_eq!(said(Described::Layout(Layout::Keyboard(bitmap), none)), ", report protocol, its keys a bitmap");
         assert_eq!(
-            said(Described::Layout(Layout::Keyboard(keyboard::Layout::BOOT), 2)),
-            ", report protocol; its report descriptor read on try 2"
+            said(Described::Layout(Layout::Keyboard(keyboard::Layout::BOOT), Tries { short: 1, stalled: 0 })),
+            ", report protocol; its report descriptor read whole on try 2, after 1 short"
         );
-        assert_eq!(said(Described::Layout(Layout::Mouse(mouse::Layout::BOOT), 1)), ", report protocol, with no wheel");
+        assert_eq!(
+            said(Described::Layout(Layout::Mouse(mouse::Layout::BOOT), Tries { short: 1, stalled: 2 })),
+            ", report protocol, with no wheel; its report descriptor read whole on try 4, after 1 short and 2 stalled"
+        );
         assert_eq!(said(Described::None), ", boot protocol: it has no report descriptor");
-        assert_eq!(said(Described::Stalled(4)), ", boot protocol: its report descriptor stalled 4 times");
+        assert_eq!(
+            said(Described::Unanswered { tries: Tries { short: 3, stalled: 1 }, last: Some((128, 192)) }),
+            ", boot protocol: its report descriptor never came back whole in 4 tries (3 short, 1 stalled; the last \
+             short one 128 of 192 bytes)"
+        );
+        assert_eq!(
+            said(Described::Unanswered { tries: Tries { short: 0, stalled: 4 }, last: None }),
+            ", boot protocol: its report descriptor never came back whole in 4 tries (0 short, 4 stalled)"
+        );
         let head = [0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01];
         assert_eq!(
-            said(Described::Unread { len: 192, head, tries: 1, keyboard: true }),
+            said(Described::Unread { len: 192, head, tries: none, keyboard: true }),
             ", boot protocol: its 192-byte report descriptor is not one this driver reads (it begins 05 01 09 06 a1 01 85 01)"
         );
         assert_eq!(
-            said(Described::Unread { len: 3, head, tries: 3, keyboard: true }),
+            said(Described::Unread { len: 3, head, tries: Tries { short: 0, stalled: 2 }, keyboard: true }),
             ", boot protocol: its 3-byte report descriptor is not one this driver reads (it begins 05 01 09); its \
-             report descriptor read on try 3",
+             report descriptor read whole on try 3, after 2 stalled",
             "no more bytes than it has"
         );
         assert_eq!(
-            said(Described::Unread { len: 52, head, tries: 1, keyboard: false }),
+            said(Described::Unread { len: 52, head, tries: none, keyboard: false }),
             ", boot protocol: its report descriptor does not describe a plain mouse"
         );
     }
+
 
     /// **A new node takes a slot no node has had, then one whose device has departed** (Phase 6 Part
     /// C), and none while every slot is bound: sixteen bound devices, not sixteen ever attached.

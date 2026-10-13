@@ -7848,6 +7848,16 @@ impl Frame {
     }
 }
 
+/// **The shell's last whole window list** in `transcript`: what follows `window list on cli of ` on
+/// the last line holding it **that has ended**. The transcript is read as it arrives, so the shell's
+/// next list may be half there — a line cut after its second window, counted, said two, and once
+/// after its first said one: `check-login --usb`'s two failures in Phase 6 Part B.7's rounds, where
+/// the whole line before it held all three. A match is not a line (PR #352 review).
+fn last_window_list(transcript: &str) -> Option<&str> {
+    let whole = &transcript[..transcript.rfind('\n').map_or(0, |i| i + 1)];
+    let (i, m) = whole.rmatch_indices("window list on cli of ").next()?;
+    whole[i + m.len()..].lines().next()
+}
 
 /// **Paced on the greeter's redraw counter**, because a greeter has no echo. What was typed is
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
@@ -9816,11 +9826,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **And it is a window in its own right**, not a decoration: the taskbar lists it, which is
     // the shell's own account of what exists rather than the editor's.
     let listing = session.transcript();
-    let last = listing
-        .rmatch_indices("window list on cli of ")
-        .next()
-        .map(|(i, m)| listing[i + m.len()..].lines().next().unwrap_or("").to_string())
-        .unwrap_or_default();
+    let last = last_window_list(&listing).unwrap_or_default().to_string();
     // **The entries, not the number.** The number after `of ` is `desktops.len()`, which this
     // gate switched to 2 several steps ago and which is satisfied whatever the taskbar holds — so
     // reading it made this assertion decoration that could not fail (PR #283 review, blocking 3).
@@ -21075,4 +21081,20 @@ mod diag_tests {
         assert_eq!(super::take_utf8(&mut bad), "a\u{FFFD}b");
         assert!(bad.is_empty());
     }
+    /// **The last window list is a whole line's** (Phase 6 Part B.7): a list cut off as it arrived is
+    /// passed over for the whole one before it — the transcript `check-login --usb` kept when it
+    /// failed — and a transcript with no whole list has none.
+    #[test]
+    fn the_last_window_list_is_a_whole_lines() {
+        let kept = "desktop-shell: placed window 24 at 24,150\n\
+                    desktop-shell: window list on cli of 3 [21:  Files] [23:  notes.txt] [24:> window 24]\n\
+                    nxedit: opened another window\n\
+                    desktop-shell: window list on cli of 3 [21:  Files] [23:  notes.t";
+        assert_eq!(last_window_list(kept), Some("3 [21:  Files] [23:  notes.txt] [24:> window 24]"));
+        assert_eq!(last_window_list(kept).map(|l| l.matches('[').count()), Some(3));
+        let ended = format!("{kept}xt] [24:  window 24]\n");
+        assert_eq!(last_window_list(&ended), Some("3 [21:  Files] [23:  notes.txt] [24:  window 24]"));
+        assert_eq!(last_window_list("desktop-shell: window list on cli of 3 [21:  Files]"), None);
+    }
+
 }

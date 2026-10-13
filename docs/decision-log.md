@@ -35688,3 +35688,39 @@ the kernel's log as it could before. The round that failed is that rule's contro
 lines of the kernel's log, which went to the console at boot long before the command was typed — and
 a broker that binds nothing there times the step out; the seed's host test, which fails without
 `kernel-log`; and the bind line's wording, a host test of each case.
+
+## 2026-10-13 — Phase 6 Part B.7, the cause: a report descriptor short by a packet
+
+**The laptop's log said it.** With the K70 plugged in after boot,
+`with admin log --kernel | filter message ~= /usb/` showed its bind: "keyboard at /dev/input/raw/2,
+boot protocol: its 192-byte report descriptor is not one this driver reads (it begins 01 85 02 05 0c
+19 00 2a)". Not a stall. Those are the K70's descriptor from byte 64 on — its first eight are
+`05 01 09 06 a1 01 85 01`, and these sit at 0x40 — so the read came back without its first 64-byte
+packet. The driver could not tell: its Data stage did not interrupt on a short packet, so
+`control_in` took the whole length asked for, the rest zero, and the descriptor was parsed from its
+second packet. Plugged in before boot, the K70 sends it whole. **Linux would not have been caught**:
+`hid_get_class_descriptor` asks again while fewer bytes than the descriptor's came back.
+
+**What it is.** An IN Data stage interrupts on a short packet (ISP); its event leaves the bytes it
+did not move on the waiting record, and the Status stage completes the transfer with them, so
+`control_in` returns the bytes that came (`ep0_event`, a pure function with a host test). A report
+descriptor that comes back short is asked again, as a stall is, four tries 100 ms apart; the bind's
+line counts the short tries and the stalls before the one that read it whole, or says it never came
+back whole, with the last short one's bytes.
+
+**Held by** the event's host test — a whole transfer, one short by a packet, an error on the Data
+stage, another slot's event — with a control each that fails it; the Data stage's encoding pinned
+with ISP; and **a probe under QEMU**, not kept: asking for eight bytes more than each descriptor
+holds made QEMU's xHCI end each read short, and every bind line said "never came back whole in 4
+tries (4 short, 0 stalled; the last short one 63 of 71 bytes)" for its keyboards and 52 of 60 for
+its mice — QEMU raising the event, and the count reaching the line. What no gate can show is the
+K70's own short read and its retry; the laptop's log will say which try read it.
+
+**And `check-login --usb`'s failure, found.** It failed again in this round, at the same step, and
+kept its transcript this time: the last line was the shell's window list cut off as it arrived —
+`window list on cli of 3 [21: Files] [23: notes.t` — after a whole one holding all three windows.
+The gate counted the windows in the last list it could see, whole or not: two here, one the first
+time. **The gate's, not the system's**: it now reads the last list that has ended
+(`last_window_list`, with a host test of that transcript, which fails without the rule), and passed
+three times running under KVM with `--usb` and once without. A match is not a line — PR #352's
+lesson, met again.
