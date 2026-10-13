@@ -35724,3 +35724,19 @@ time. **The gate's, not the system's**: it now reads the last list that has ende
 (`last_window_list`, with a host test of that transcript, which fails without the rule), and passed
 three times running under KVM with `--usb` and once without. A match is not a line — PR #352's
 lesson, met again.
+
+## 2026-10-13 — Phase 6 complete: the K70 types plugged in after boot
+
+**The laptop's third check**, on `9ec0dabc`: the Corsair K70, plugged in after boot, typed at the
+greeter — "It works!", the maintainer's word; no photograph of its bind line, so which try read its
+descriptor whole is not recorded.
+
+**So the Definition of Done is met.** On the laptop: a USB mouse moving the cursor, and a USB
+keyboard typing at the greeter plugged in before boot and after it; a FAT32 stick plugged in after
+boot, mounted writable, shown in Files, saved to from `nxedit`, ejected from Files, and torn down
+when pulled without an eject; and a copy to the stick meeting the number Part H set. Letting a
+keyboard and a mouse go when unplugged is held by the gates — `check-input --usb` unplugs a keyboard
+holding a key down — rather than tried on the laptop. **Phase 6 — USB — is complete**: eight parts,
+A–H, and Part B's seventh step, B.7, which the laptop's check asked for. Left for later, as decided:
+external hubs, the System76 Launch's keyboard among the devices behind one; a grow's zeroes and
+ext4's metadata written a file at a time; and media keys. The syscall consolidation is next.

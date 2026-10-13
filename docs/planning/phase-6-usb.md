@@ -8,7 +8,7 @@ built 2026-10-05; Part C detailed and built 2026-10-05; Part D detailed and buil
 E detailed and built 2026-10-06; Part F detailed and built 2026-10-07; Part G detailed and built
 2026-10-07; Part H detailed 2026-10-08, H.1 and H.2 built 2026-10-08, H.3 measured 2026-10-09, H.4's
 four fixes built 2026-10-09 and measured 2026-10-13, and H.5's number set 2026-10-13 — Part H
-complete; the phase closes with the Definition of Done's first two items checked on the laptop.**
+complete; B.7 built and checked on the laptop 2026-10-13 — Phase 6 complete.**
 This
 replaces the sketch written on 2026-09-10, before Phase 5 and administration. The scope and the
 decisions below were agreed with the maintainer on 2026-10-01. Each part gets its own detail pass
@@ -878,7 +878,7 @@ a USB one, as it would on Linux.
   `kernel-log` grant (the maintainer's call, brought forward from Part H's list). The laptop's log
   then said why: the K70's descriptor came back without its first 64-byte packet, which a Data stage
   that did not interrupt on a short packet could not tell — so a short read is now seen, and asked
-  again, as Linux asks. The laptop checks it again.
+  again, as Linux asks. The laptop confirmed it the same day: the K70 types plugged in after boot.
 
 ### Gates
 
@@ -3133,7 +3133,9 @@ On the laptop and in the gates:
 **Checked on the laptop** (2026-10-13): the stick's item whole, and a USB mouse plugged in after
 boot. A USB keyboard's waits for Part B.7 on the laptop: a Corsair K70 typed numbers, sending its
 NKRO bitmap whatever protocol it was asked for, and the System76 Launch's keyboard is behind a hub,
-which Phase 6 leaves out. With B.7 the K70 types plugged in before boot, not yet after it.
+which Phase 6 leaves out. With B.7 the K70 types plugged in before boot and after it, which meets
+the item; letting a device go when unplugged is the gates' (`check-input --usb`). Every item is met:
+Phase 6 complete, 2026-10-13.
 
 ## What Phase 6 does not do
 

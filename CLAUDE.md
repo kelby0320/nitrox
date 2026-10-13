@@ -528,7 +528,7 @@ refresh is first because the admin tools are UI surfaces. **The refresh is compl
 2026-09-22** — all eleven parts, A–K — and **administration as of 2026-09-30**, all seven parts,
 A–G, the last being an installer that runs in an ordinary session as the view broker's client.
 Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then
-**Phase 6 — USB**, whose eight parts, A–H, are built (2026-10-13) — the last a copy to a USB stick
+**Phase 6 — USB, complete as of 2026-10-13**, all eight parts, A–H, the last a copy to a USB stick
 timed against Linux on the same laptop; then, before Phase 7, a **consolidation of the syscall
 surface**
 (`docs/planning/syscall-surface.md`, planned 2026-10-08); 7–9 are the portable runtime,
