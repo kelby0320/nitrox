@@ -172,9 +172,12 @@ impl Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10])
     }
 
-    /// **An IN Data stage** of `len` bytes into `buffer`.
+    /// **An IN Data stage** of `len` bytes into `buffer`, **interrupting on a short packet** (Phase 6
+    /// Part B.7), so its event says how many bytes it did not move: a device that sends less than was
+    /// asked for — a Corsair K70 plugged in after boot, whose report descriptor came back without its
+    /// first packet — is otherwise read as zeroes where the rest should be.
     pub const fn data_in(buffer: u64, len: u32) -> Trb {
-        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10 | DIR_IN])
+        Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10 | DIR_IN | ISP])
     }
 
     /// **The Status stage**, interrupting on completion: OUT after an IN data stage, IN after an OUT
@@ -494,8 +497,9 @@ mod tests {
     }
 
     /// **A control transfer's three stages**, each field where xHCI 1.2 §6.4.1.2 puts it: a
-    /// GET_DESCRIPTOR(device, 18) as the Setup stage's immediate data, an IN Data stage, and the
-    /// OUT Status stage that follows one, which alone interrupts.
+    /// GET_DESCRIPTOR(device, 18) as the Setup stage's immediate data, an IN Data stage that
+    /// interrupts on a short packet (ISP, bit 2, since Phase 6 Part B.7), and the OUT Status stage
+    /// that follows one, which alone interrupts on completion.
     #[test]
     fn a_control_transfers_stages_encode_as_the_specification_lays_them_out() {
         let get = [0x80, 6, 0, 1, 0, 0, 18, 0];
@@ -503,7 +507,7 @@ mod tests {
         assert_eq!(setup.0, [0x0100_0680, 0x0012_0000, 8, kind::SETUP << 10 | 1 << 6 | 3 << 16]);
         assert_eq!(Trb::setup(get, false).0[3], kind::SETUP << 10 | 1 << 6, "no data stage: TRT 0");
         let data = Trb::data_in(0x1_0000_2000, 18);
-        assert_eq!(data.0, [0x2000, 0x1, 18, kind::DATA << 10 | 1 << 16]);
+        assert_eq!(data.0, [0x2000, 0x1, 18, kind::DATA << 10 | 1 << 16 | 1 << 2]);
         assert_eq!(Trb::status(true).0[3], kind::STATUS << 10 | 1 << 5, "OUT after IN data");
         assert_eq!(Trb::status(false).0[3], kind::STATUS << 10 | 1 << 16 | 1 << 5, "IN with no data");
         let addr = Trb::with_input(kind::ADDRESS_DEVICE, 0x3000, 7);

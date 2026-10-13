@@ -16,8 +16,9 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 ## Structure — and the reason for it
 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
-  `ops`, `repl`, `regex`, `complete`. **No syscalls.** Host-tested
-  (`cargo test -p nxsh --lib`) in a second rather than through a 90-second boot.
+  `ops`, `repl`, `regex`, `complete`, and `timing` (`time`'s line, Phase 6 Part H.2). **No
+  syscalls.** Host-tested (`cargo test -p nxsh --lib`) in a second rather than through a
+  90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
   reader, the filesystem.
 

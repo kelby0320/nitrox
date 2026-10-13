@@ -17,12 +17,20 @@ servers speak one protocol and a fix to it is a fix to both:
 - **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, generic over
   `Volume`, and the one `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
   **through each server's volume**, in that server's crate, against an image its own tools built.
+  A grow's reply marks what the grow added `UNWRITTEN` (`serve_grown`, Phase 6 Part H.4), which
+  `Volume::grow_file` makes true by answering the size it grew from, past which everything reads
+  as zero.
 - **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
-  server uses; and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
+  server uses — but zeroes up to 64 KiB a submit, from a zeroed memory object of its own
+  (`BlockWriter::write_zeroes`, Phase 6 Part H.4); and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
   FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
   **None of the three is `Sync`**: each moves every transfer through one scratch mapping.
+- **`cache.rs`** — **`MetaCache`** (Phase 6 Part H.4), the metadata cache each server serves its
+  filesystem through: a fixed store of 4 KiB blocks, filled only by `BlockReader::read_meta`, every
+  write through to the device and into any copy it holds, `BlockWriter::forget` letting freed blocks
+  go. A server keeps its `Store` in a `static` (`SERVER_BLOCKS`, 1 MiB, `.bss`).
 - **`server.rs`** — the bootstrap and the loop: the setup message, `Ready` or a refusal, the
   forwarding endpoint, directory sessions and their wait slots, a rename resolved ahead of a
   session, `File::Forget` before a file is freed, `File::Touch` by id, and `Meta::Unmount`.
@@ -42,8 +50,18 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
-- **The device layer's granularity is a measured question** (`TODO(fs-throughput)`, Phase 6 Part H).
-  Change what `Disk` moves per submit with a number from the laptop, not a guess.
+- **`read_meta` is for what only the server writes**: directories, inode tables, bitmaps,
+  descriptors, superblocks, extent nodes, the FAT. **Never a file's data**, which the kernel writes
+  to the device behind the server's back — a cached copy of it would be stale. A read left as
+  `read_at` is only slower; one wrongly made `read_meta` returns old bytes. **And whatever a library
+  frees it `forget`s**, so a block that may next be a file's leaves the cache. Each server's crate
+  holds the first in a test that writes data the kernel's way under a cache that evicts all the
+  time, and reads it back; and the second in one that requires what it freed gone from the cache
+  (`MetaCache::holds`) — which the first cannot, since every block that becomes metadata is written
+  whole before it is read, and it passes with no `forget` at all (PR #371 review).
+- **The device layer's granularity is a measured question** (Phase 6 Part H measured it).
+  Change what `Disk` moves per submit with a number from the laptop, not a guess. Its zeroes moved
+  to 64 KiB on one: ext4's grows wrote a block a command, 65,536 for a 256 MiB copy.
 
 ## Capability discipline
 

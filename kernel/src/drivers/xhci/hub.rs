@@ -560,7 +560,7 @@ fn name_of(
 /// request and its default endpoint was recovered. Any other failure is the device's end.
 fn string<'m>(x: &Xhci, port: u8, slot: u8, mem: &'m mut DeviceMem, index: u8, lang: u16) -> Result<Option<&'m [u8]>, (&'static str, Failed)> {
     match control_in(x, slot, mem, get_descriptor(desc::kind::STRING, index, lang, 255), 255) {
-        Ok(()) => Ok(Some(data_bytes(mem, 255))),
+        Ok(_) => Ok(Some(data_bytes(mem, 255))),
         Err(Failed::Code(code::STALL)) => {
             recover_ep0(x, slot, mem).map_err(|e| ("recovering its default endpoint after a stall", e))?;
             crate::kprintln!("usb: port {port}: string {index} stalled; its endpoint is recovered, and it is named without it");
@@ -589,7 +589,8 @@ fn read_descriptor<'m>(x: &Xhci, slot: u8, mem: &'m mut DeviceMem, kind: u8, ind
 }
 
 /// **A GET_DESCRIPTOR to interface `iface`** (Phase 6 Part B.3): a HID report descriptor, up to `len`
-/// bytes and a page. The bytes, as [`read_descriptor`]'s are.
+/// bytes and a page. **The bytes that arrived**, since Part B.7: fewer than asked for when the device
+/// sent less, which a caller that knows the length can tell.
 pub(super) fn read_interface_descriptor<'m>(
     x: &Xhci,
     slot: u8,
@@ -599,8 +600,8 @@ pub(super) fn read_interface_descriptor<'m>(
     len: u16,
 ) -> Result<&'m [u8], Failed> {
     let len = len.min(crate::mm::PAGE_SIZE as u16);
-    control_in(x, slot, mem, [0x81, 6, 0, kind, iface, 0, len as u8, (len >> 8) as u8], len)?;
-    Ok(data_bytes(mem, len))
+    let got = control_in(x, slot, mem, [0x81, 6, 0, kind, iface, 0, len as u8, (len >> 8) as u8], len)?;
+    Ok(data_bytes(mem, got))
 }
 
 /// The eight-byte GET_DESCRIPTOR request.
@@ -615,8 +616,9 @@ fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
 }
 
 /// **A control transfer reading `len` bytes** into the device's data page: Setup, Data, Status,
-/// and a wait for the Status stage's completion or an error on any stage.
-fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<(), Failed> {
+/// and a wait for the Status stage's completion or an error on any stage. **How many bytes
+/// arrived** (Phase 6 Part B.7): `len` less what a short Data stage did not move.
+fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
     // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
     // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
     // the device, and a stall's remains are skipped by `recover_ep0` before another starts.
@@ -633,7 +635,7 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Transfer { slot, status: status_at }, po: PoPtr(po.as_ptr()) });
+    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
     let mut slots = DmaSlots(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, true));
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
@@ -641,7 +643,7 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
     debug_assert_eq!(base + at as u64 * 16, status_at);
     write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
     match wait(x, &po, TRANSFER_NS) {
-        Some((code::SUCCESS, _)) => Ok(()),
+        Some((code::SUCCESS, short)) => Ok(len - short.min(len as u64) as u16),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
     }
@@ -662,7 +664,7 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
     let next = mem.ring.next_slot();
     let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
     let status_at = base + status_slot as u64 * 16;
-    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Transfer { slot, status: status_at }, po: PoPtr(po.as_ptr()) });
+    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
     let mut slots = DmaSlots(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
@@ -698,7 +700,7 @@ pub(super) fn control_out_data(
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Transfer { slot, status: status_at }, po: PoPtr(po.as_ptr()) });
+    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
     let mut slots = DmaSlots(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup_out(request));
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
@@ -724,19 +726,22 @@ fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
             continue;
         };
         let device = match to {
-            LightsTo::Send { slot, interface } => attached
+            LightsTo::Send { slot, interface, report_id } => attached
                 .iter_mut()
                 .enumerate()
-                .find_map(|(port, a)| a.as_mut().filter(|a| a.slot == slot).map(|dev| (port, slot, interface, dev)))
+                .find_map(|(port, a)| {
+                    a.as_mut().filter(|a| a.slot == slot).map(|dev| (port, slot, interface, report_id, dev))
+                })
                 .ok_or(KError::PeerClosed),
             LightsTo::Dead => Err(KError::IoError),
             LightsTo::Gone => Err(KError::PeerClosed),
         };
         let status = match device {
             Err(e) => e as i32,
-            Ok((port, slot, iface, dev)) => {
-                let request = super::hid::set_lights_request(iface);
-                match control_out_data(x, slot, &mut dev._mem, request, &[lights]) {
+            Ok((port, slot, iface, report_id, dev)) => {
+                let request = super::hid::set_lights_request(iface, report_id);
+                let (data, len) = super::hid::lights_data(report_id, lights);
+                match control_out_data(x, slot, &mut dev._mem, request, &data[..len]) {
                     Ok(()) => {
                         if super::hid::lights_taken(node) {
                             crate::kprintln!("usb: port {port}: keyboard lights acknowledged");
@@ -771,7 +776,7 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         let c = x.cmd.lock();
         c.mem.phys().as_u64() + c.ring.next_slot() as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting { awaited: Awaited::Command { trb: sent }, po: PoPtr(po.as_ptr()) });
+    *x.waiting.lock() = Some(Waiting::new(Awaited::Command { trb: sent }, PoPtr(po.as_ptr())));
     {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;

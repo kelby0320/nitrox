@@ -23,9 +23,15 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   host-tested against an `mke2fs` fixture — including `e2fsck` on the mutated image
   after `grow_file`. `no_std`, **no `alloc`**: buffer-based (`read_file` into a
   caller buffer; `map_file`/`grow_file` into caller `BlockRun` slices); parsing +
-  mutation use bounded stack scratch (≤ one 4 KiB block). Do not pull in `alloc` here.
-  Write path: `map_file` (extent → block runs), `grow_file` (block-bitmap allocation +
-  extent-tree extension + inode update).
+  mutation use bounded stack scratch (≤ one 4 KiB block, and one per level of an extent
+  tree). Do not pull in `alloc` here. Write path: `map_file` (extent → block runs),
+  `grow_file` (block-bitmap allocation + extent appends + inode update).
+- **`src/extent.rs` — the extent tree** (Phase 6 Part H.1): looked up a leaf at a time
+  (`Lookup`), appended to atomically (`append`, splitting and deepening as ext4's own appends
+  do), and cut, folded and freed (`truncate`), at any depth. An extent's length is ext4's —
+  above 32,768 an unwritten extent, which maps as a hole. Every map it makes is held to
+  `debugfs`' reading of the same image in its tests. Same rules as `ext4.rs`: `no_std`, no
+  `alloc`, a block of stack per level of the tree, at most five.
 - **`src/mkfs.rs` — making an empty filesystem** (Phase 5 Part H.2). Superblock and backups,
   the group-descriptor table, per-group bitmaps and inode tables, a root directory. Same rules
   as `ext4.rs`: `no_std`, **no `alloc`**, bounded stack scratch of one block — which is why the
@@ -48,26 +54,29 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
   `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
   `MemoryObject`, a write smaller than a block reading the block first (this said
-  "sector-at-a-time" until 2026-10-06). **Alloc-free** — fixed `.bss` buffers, no
-  `#[global_allocator]`.
+  "sector-at-a-time" until 2026-10-06), and a grow's zeroes up to 64 KiB a submit
+  (`write_zeroes`, Phase 6 Part H.4) — **served through `libfsserver::cache::MetaCache`** since
+  Phase 6 Part H.4, so a directory, an inode-table block or a bitmap is read from the device once.
+  **Alloc-free** — fixed `.bss` buffers, the cache's 1 MiB among them, no `#[global_allocator]`.
 
 ## Scope
 
-Implements: superblock (`0xEF53`), block-group descriptors, inodes, the **extent
-tree** (`0xF30A`, walk + in-place extend), a linear `ext4_dir_entry_2` directory walk
-+ **insert** (split an entry's slack), path resolution to a regular file, block-bitmap
-allocation + free-count updates, **inode-bitmap allocation** (new-file creation), and
-file growth. **Reject / skip** (return `FsError::Unsupported`/`Corrupt`): the journal,
-bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, ACLs,
-symlinks, checksums. htree directories need no special handling (the linear walk is
-backward-compatible).
+Implements: superblock (`0xEF53`), block-group descriptors, inodes, the **extent tree** (`0xF30A`,
+at any depth: walk, append, split, cut, free), a linear `ext4_dir_entry_2` directory walk +
+**insert** (split an entry's slack), path resolution to a regular file, block-bitmap allocation +
+free-count updates, **inode-bitmap allocation** (new-file creation), and file growth. **Reject /
+skip** (return `FsError::Unsupported`/`Corrupt`): the journal, bigalloc, inline-data inodes, 64-bit
+block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks, checksums. htree directories need no special
+handling (the linear walk is backward-compatible).
 
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
-`docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a
-deferral recorded only in a crate `CLAUDE.md` is one nobody reviews): extent-tree splitting
-/ index nodes (depth > 0), `metadata_csum` checksums, and jbd2 journaling + replay (the
-fixtures are `^has_journal`). Overwrite is data-only (no metadata change) and is the kernel's writeback;
-the server allocates on growth + creation but never touches file data (Model A).
+`docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a deferral
+recorded only in a crate `CLAUDE.md` is one nobody reviews): `metadata_csum` checksums, and jbd2
+journaling + replay (the fixtures are `^has_journal`); metadata written through, a file at a time
+(`TODO(ext4-metadata-writes)`); and a grow's zeroes, which unwritten extents would replace
+(`TODO(grow-zeroes)`). Overwrite is data-only (no metadata change)
+and is the kernel's writeback; the server allocates on growth + creation but never touches file data
+(Model A).
 
 **Now implemented** (was deferred): **cross-group allocation** (2026-09-17) — both
 allocators walk every block group, so a filesystem is as large as the disk rather than as
@@ -77,7 +86,10 @@ why nothing caught it: use `fixture_blocks` when what you are changing can run o
 Also truncate (2026-07-24), rename, delete (in two halves since 2026-09-24: `unlink_at` and a
 replacing `rename_path` return the inode, `release_inode` frees it), and
 **growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
-another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
+another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries — and
+**extent trees** (Phase 6 Part H.1, 2026-10-08), so a directory no longer stops at about 815
+files with data, a file at four extents, or a removal of a file Linux wrote at its name. A
+grow, create, `mkdir` or rename that fails now gives back what it took.
 
 ## This crate's library has a second consumer
 
@@ -98,9 +110,13 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
 
 ## Forbidden
 
-- `alloc` in the library half (`ext4.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`) — buffer-based only.
+- `alloc` in the library half (`ext4.rs`, `extent.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`) —
+  buffer-based only.
   The list names every module because a rules file that enumerates three of four is one that
   permits the fourth by omission (PR #310 review).
+- Reading **file data with `read_meta`** — the kernel writes it behind the server's back, so a
+  cached copy goes stale. Everything else this library reads is metadata, and reads it with
+  `read_meta`; `read_file` and `read_file_range` read data with `read_at` (Phase 6 Part H.4).
 - Touching **file data** — the kernel owns the data path (Model A); the server writes
   only metadata (bitmaps, extent tree, inode, superblock). **One exception, deliberate**
   (administration Part C.1): `grow_file` writes zeroes over what it adds — the old last block's

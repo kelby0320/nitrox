@@ -915,12 +915,16 @@ pub fn encode_for(path: &str, v: &Val) -> OpResult<Vec<u8>> {
 /// §4: text is wrapped into a single-column `Table<String>`, because there is no such
 /// thing as a raw untyped byte stream in this pipeline model — which is also what let
 /// `open`'s multi-path form absorb `cat` entirely (§10a).
+///
+/// **Text ends at its last character that is not a NUL** ([`libfs::unpadded`]): a snapshot such
+/// as the kernel's `/dev/log` is read whole, its last page padded with NULs, which would be a
+/// last line of them (PR #371 review, finding 1).
 pub fn decode_from(path: &str, bytes: &[u8]) -> OpResult<Val> {
     if path.ends_with(".tsm") {
         let t = Table::decode(bytes).map_err(|_| alloc::format!("`{path}` is not a TSM1 stream"))?;
         return Ok(Val::Data(Value::Table(Arc::new(t))));
     }
-    let text = core::str::from_utf8(bytes)
+    let text = core::str::from_utf8(libfs::unpadded(bytes))
         .map_err(|_| alloc::format!("`{path}` is not valid UTF-8"))?;
     let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
     let rows: Vec<Vec<Value>> = text
@@ -1131,6 +1135,16 @@ mod tests {
         let v = decode_from("notes.txt", b"one\ntwo\n").unwrap();
         assert_eq!(v.render(), "<table 2 rows [line]>");
         assert_eq!(rows(&v).unwrap()[0].render(), "{ line: \"one\" }");
+    }
+
+    /// **A snapshot's padding is no line** (PR #371 review, finding 1): `/dev/log` is read whole,
+    /// its last page padded with NULs. One inside the text is still the text's.
+    #[test]
+    fn text_ends_before_the_nuls_that_pad_it() {
+        let v = decode_from("/dev/log", b"one\ntwo\n\0\0\0").unwrap();
+        assert_eq!(v.render(), "<table 2 rows [line]>");
+        let v = decode_from("/dev/log", b"one\0two\n\0").unwrap();
+        assert_eq!(rows(&v).unwrap()[0].render(), "{ line: \"one\0two\" }");
     }
 
     #[test]

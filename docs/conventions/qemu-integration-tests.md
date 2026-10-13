@@ -174,14 +174,23 @@ manifest data. What a test image's userspace does differently comes from its dat
 the mount manifest, and the `test` store package.
 
 **And its machine has one more disk.** Since administration Part C.5b a test image's ESP carries
-`scratch.img`, an 8 MiB ext4 labelled `nitrox-scratch` holding a `README`, as a second Limine
+`scratch.img`, an 8 MiB ext4 labelled `nitrox-scratch` holding a `README` — and since Phase 6
+Part H.4 `ahead`, a file of 64 pages nothing opens before `boot-probe` — as a second Limine
 module, which the kernel publishes as a RAM disk. It is what the storage service finds to
 auto-mount, since the boot disk holds only `init`'s root and the FAT ESP, and so what lets
-`boot-probe` mount, read and write through `/svc/storage` on every run. The programs are the release
-programs, and a release boot simply has one disk fewer. **The cost is the block devices' order**: a
-RAM disk is published before any partition, so a test image's ESP is `/dev/blk/2` where a release
-image's is `/dev/blk/1`. Nothing may find a device by its index for that reason; the registry says
-what each one is. The two modes differ in:
+`boot-probe` mount, read and write through `/svc/storage` on every run — and, since Phase 6 Part
+H.2, hold the I/O counters to a write: a file of 64 pages synced there must move the scratch disk's
+written bytes and the page cache's write-backs by at least the file's in `io.tsm`, and the disk
+`init`'s root is on must have read something — and since Part H.4 move the scratch disk by no more
+than 40 writes, the data a run of pages a write-back IRP and the zeroes 64 KiB a write, where a page
+a command took 145, and by no read a page, 32 reads in all, since what a grow added fills as zero
+without a read and the server reads its metadata through a cache. Then `ahead` is read back through
+a mapping, as written, in at most eight reads: each fill reads up to 31 pages ahead of its own. `test-interactive` holds `nxsh`'s
+`time` on the release image: its line, of its shape, before the value it passes through. The
+programs are the release programs, and a release boot simply has one disk fewer. **The cost is the
+block devices' order**: a RAM disk is published before any partition, so a test image's ESP is
+`/dev/blk/2` where a release image's is `/dev/blk/1`. Nothing may find a device by its index for
+that reason; the registry says what each one is. The two modes differ in:
 
 |  | `selftest` (`xtask qemu --selftest`) | `test-harness` (`xtask test-qemu`) |
 |---|---|---|

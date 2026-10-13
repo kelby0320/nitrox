@@ -11,7 +11,8 @@ implementer.
 **Status:** Pre-stabilization. Introduced with the fs-server-ext4 read-write slice. **Both ops are
 specified and deferred — nothing sends or answers them** (checked 2026-09-24, the administration
 Part C review). What is live is the **`BlockRun`** wire form, which the `FILE_BLOCKS` resolve reply
-carries ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md)). A
+carries ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md)), and since Phase 6 Part H.4
+(2026-10-09) its **`UNWRITTEN`** flag. A
 **kernel↔server ABI** — the kernel hand-codes that run map (`kernel/src/rsproto.rs`).
 There is no `librsproto` mirror for these ops: the server side is implemented directly by
 the consumer, today `fs-server-ext4`'s `BlockReader`/`BlockWriter` traits over
@@ -40,7 +41,7 @@ Wire length: **24 bytes**. `flags`:
 
 | bit | name | meaning |
 |---|---|---|
-| 0 | `UNWRITTEN` | allocated but never written — reads as zero; the kernel zero-fills the page rather than reading the device |
+| 0 | `UNWRITTEN` | allocated but never written — reads as zero; the kernel zero-fills the page rather than reading the device. **Set by a server on what a grow added, in that grow's reply and no other** — a later map of the same blocks leaves it clear, since the kernel may have written them by then. The kernel fills a page **all of whose blocks** are `UNWRITTEN` or holes without reading the device, and writes such a page back to its blocks like any other (Phase 6 Part H.4). |
 
 `device_lba = 0` marks a **hole** (unallocated); the kernel zero-fills such a page. (A hole and
 an `UNWRITTEN` run both read as zero; they differ only in whether backing blocks exist.)

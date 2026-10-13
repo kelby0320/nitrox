@@ -15,6 +15,7 @@
 //! `docs/spec/device-node.md`.
 
 use crate::io::block::BlockBackend;
+use crate::io::stats::IoStats;
 use crate::libkern::block::{BlockDeviceInfo, BlockKind};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
@@ -280,6 +281,10 @@ pub struct DeviceNode {
     /// The character I/O entry point, present iff this is a `Char` node (the
     /// console). `sys_io_submit`'s char path dispatches a `Read` through it.
     char_backend: Option<CharBackend>,
+    /// **What the device has done** (Phase 6 Part H.2): a disk's driver records each command into
+    /// it, and `/dev/registry/io` serves it. On the node rather than in the driver, since a node
+    /// is never reused and a driver's slot is ([`crate::io::stats`]).
+    io: IoStats,
 }
 
 impl DeviceNode {
@@ -302,6 +307,7 @@ impl DeviceNode {
             block_info: BlockDeviceInfo::default(),
             block_backend: None,
             char_backend: None,
+            io: IoStats::new(),
         })
     }
 
@@ -321,6 +327,7 @@ impl DeviceNode {
             block_info: BlockDeviceInfo::default(),
             block_backend: None,
             char_backend: Some(backend),
+            io: IoStats::new(),
         })
     }
 
@@ -351,6 +358,7 @@ impl DeviceNode {
             ),
             block_backend: Some(backend),
             char_backend: None,
+            io: IoStats::new(),
         })
     }
 
@@ -377,6 +385,11 @@ impl DeviceNode {
     /// What this device is and what to call it (defaulted for non-block nodes).
     pub fn block_info(&self) -> BlockDeviceInfo {
         self.block_info
+    }
+
+    /// What the device has done, for its driver to record into and the registry to read.
+    pub fn io(&self) -> &IoStats {
+        &self.io
     }
 
     /// The block I/O backend, if this is a claimed block device.

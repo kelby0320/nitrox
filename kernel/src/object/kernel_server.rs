@@ -358,6 +358,9 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// - `"changes"` → the change node (Phase 6 Part C): a `Read` on it waits until the table's
 ///   generation is past the read's `offset`, then answers with the generation. How the device
 ///   manager follows the table.
+/// - `"io"` → a fresh read-only [`MemoryObject`] (Phase 6 Part H.2): an `IoHeader` carrying the page
+///   cache's counters, then an `IoRecord` per disk and RAM disk — what each has done since boot
+///   (`crate::libkern::device`).
 ///
 /// **Authority is the binding**, which the kernel makes in the root namespace only: `<id>` is
 /// every raw device there is. `requested` is ignored — the binding's rights cap what the caller
@@ -365,6 +368,16 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if suffix.is_empty() {
         let bytes = match crate::device::registry_snapshot() {
+            Ok(b) => b,
+            Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
+        };
+        return match MemoryObject::try_new_filled(&bytes) {
+            Ok(obj) => complete_with_memobj(obj),
+            Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+        };
+    }
+    if suffix == b"io" {
+        let bytes = match crate::device::io_snapshot() {
             Ok(b) => b,
             Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
         };

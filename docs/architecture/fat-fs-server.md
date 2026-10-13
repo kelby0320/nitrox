@@ -2,7 +2,8 @@
 
 **Status: built — Phase 6 Part E, 2026-10-06; PR #365's review fixes 2026-10-07; a stick mounted
 writable on a live boot too, and ejected by a session, since Part F; a formatter, `mkfs`, since
-Part G; last checked 2026-10-07.**
+Part G; a grow's reply marking what it added `UNWRITTEN`, and its directories read through a
+metadata cache, since Phase 6 Part H.4, 2026-10-09; last checked 2026-10-09.**
 `userspace/fs-server-fat` serves FAT12, FAT16 and FAT32 read-write, with long names, over
 `libfsserver`'s protocol. The storage service spawns it for a FAT on a removable disk, and for any
 FAT an administrator mounts ([`storage.md`](storage.md) §6). Its host tests build images with
@@ -112,15 +113,18 @@ and checks what a crash there would leave: each flush that orders the writes is 
 fails (PR #365 review, finding 2):
 - **A grow** zeroes what it adds on the device first: what the file's own clusters held past its
   end, and every cluster it takes. Then it writes the new chain to the FAT, links it to the file's
-  last cluster and writes that, and only then writes the entry's size and first cluster.
+  last cluster and writes that, and only then writes the entry's size and first cluster. Its reply
+  marks the sectors wholly past the old end `UNWRITTEN` (Phase 6 Part H.4), so the kernel does not
+  read those zeroes back.
 - **A truncate** writes the entry first, then cuts the chain and writes the cut **before** freeing
   what was past it, so no crash leaves the file's chain running into free clusters.
 - **A removal** marks the entries deleted and frees nothing: the kernel may hold the file's pages
   and be writing them. The clusters are held for `release`, which the loop calls once the kernel
   has answered `File::Forget`.
 
-**The write path batches**, as the throughput deferral requires
-([`deferred-decisions.md`](../rationale/deferred-decisions.md), `TODO(fs-throughput)`):
+**The write path batches**, as the throughput deferral required
+([`deferred-decisions.md`](../rationale/deferred-decisions.md), `TODO(fs-throughput)`, closed by
+Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 - **Allocation is one pass**: first-fit from a hint — FAT32's next-free, then past the last
   allocation, or past the file's own last cluster — so a grow's clusters are contiguous wherever
   the free space is. **All or nothing**: a volume that runs out gives back what it took, and the

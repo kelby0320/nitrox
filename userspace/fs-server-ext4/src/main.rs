@@ -17,8 +17,12 @@
 #![no_main]
 
 use fs_server_ext4::{Ext4, ReadOnly};
+use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
 use libfsserver::disk::Disk;
 use libfsserver::server;
+
+/// The metadata cache's memory (Phase 6 Part H.4): all zeroes, so `.bss`.
+static mut STORE: Store<SERVER_BLOCKS> = Store::new();
 
 /// `_start` bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = the
 /// notification channel (unused), `rsi` = the inherited root namespace (unused —
@@ -29,13 +33,16 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     // 1–2. The block device, and whether to serve it read-only, from the setup message.
     let (disk, read_only) = server::bootstrap(control, Disk::new);
     let device = disk.device();
+    // The device through a metadata cache (Phase 6 Part H.4).
+    // SAFETY: `_start` runs once, and this is the only reference `STORE` ever has.
+    let cached = MetaCache::new(&disk, unsafe { &mut *(&raw mut STORE) });
     // 3–6. Check, Ready, serve — a read-only mount through the type that refuses every write,
     //      which also marks each file it resolves read-only.
     if read_only {
-        let ro = ReadOnly(&disk);
+        let ro = ReadOnly(&cached);
         server::run(&Ext4(&ro), control, device)
     } else {
-        server::run(&Ext4(&disk), control, device)
+        server::run(&Ext4(&cached), control, device)
     }
 }
 

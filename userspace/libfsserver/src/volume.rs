@@ -84,8 +84,10 @@ pub trait Volume {
     /// Create the regular file `name` in the directory at `parent`, empty; an existing one is
     /// left as it is.
     fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError>;
-    /// Grow the file at `path` to `size` bytes, what it adds reading as zeroes.
-    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError>;
+    /// Grow the file at `path` to `size` bytes, what it adds reading as zeroes. **The size it had
+    /// before**: everything from there reads as zero, which the server loop tells the kernel
+    /// (Phase 6 Part H.4). A grow to no more than its size changes nothing and answers its size.
+    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError>;
     /// Shrink the file at `path` to `size` bytes. **A file id to forget and then release**, if the
     /// shrink ended one: the server sends `File::Forget` for it, then calls [`Volume::release`].
     fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<Option<u64>, FsError>;

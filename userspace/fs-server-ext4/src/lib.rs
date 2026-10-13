@@ -13,11 +13,12 @@
 //!
 //! No `alloc`: [`read_file`] reads into a caller-provided buffer (the fs-server
 //! passes a bounded scratch ≤ 64 KiB; see [`ext4::MAX_FILE`]). Parsing uses
-//! bounded stack scratch (≤ one filesystem block).
+//! bounded stack scratch: a filesystem block, and one per level of an extent tree.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod ext4;
+mod extent;
 pub mod mkfs;
 pub mod volume;
 
@@ -72,6 +73,96 @@ pub(crate) mod test_support {
             }
             v[start..end].copy_from_slice(buf);
             Ok(())
+        }
+    }
+
+    /// **Commands as `libfsserver::disk::Disk` sends them** (Phase 6 Part H.4), over an
+    /// [`RwImage`]: a read is one command a 4 KiB block it touches, and a write one a block — and
+    /// a read first for each block it writes only part of, which the `Disk` reads to keep the
+    /// rest. What Part H.4's fixes are held by: a count of commands, never a time.
+    pub(crate) struct Counting {
+        pub image: RwImage,
+        pub reads: std::cell::Cell<u64>,
+        pub writes: std::cell::Cell<u64>,
+    }
+    impl Counting {
+        const IO_BLOCK: u64 = 4096;
+        pub(crate) fn new(image: Vec<u8>) -> Counting {
+            Counting { image: RwImage(RefCell::new(image)), reads: 0.into(), writes: 0.into() }
+        }
+        /// `(reads, writes)` so far, and back to nothing.
+        pub(crate) fn take(&self) -> (u64, u64) {
+            (self.reads.take(), self.writes.take())
+        }
+        /// The 4 KiB blocks `[offset, offset + len)` touches, each with whether it is touched whole.
+        fn blocks(offset: u64, len: usize) -> impl Iterator<Item = bool> {
+            let end = offset + len as u64;
+            let first = offset / Self::IO_BLOCK;
+            let last = if len == 0 { first } else { (end - 1) / Self::IO_BLOCK + 1 };
+            (first..last).map(move |b| offset <= b * Self::IO_BLOCK && (b + 1) * Self::IO_BLOCK <= end)
+        }
+    }
+    impl BlockReader for Counting {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.reads.set(self.reads.get() + Self::blocks(offset, buf.len()).count() as u64);
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Counting {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            for whole in Self::blocks(offset, buf.len()) {
+                self.reads.set(self.reads.get() + !whole as u64);
+                self.writes.set(self.writes.get() + 1);
+            }
+            self.image.write_at(offset, buf)
+        }
+        /// As `Disk` writes them: a block's part at each end by `write_at`, whole blocks a
+        /// [`libfsserver::disk::SPAN`] a command.
+        fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+            let (head, whole, tail) = libfsserver::disk::split_zeroes(offset, len);
+            self.write_at(head.start, &vec![0; (head.end - head.start) as usize])?;
+            let n = whole.end - whole.start;
+            self.writes.set(self.writes.get() + n.div_ceil(libfsserver::disk::SPAN as u64));
+            self.image.write_at(whole.start, &vec![0; n as usize])?;
+            self.write_at(tail.start, &vec![0; (tail.end - tail.start) as usize])
+        }
+    }
+
+    /// **An [`RwImage`] whose writes fail** (PR #371 review): from the `n`th on, a device gone bad
+    /// partway through an operation, or the `n`th alone, one command lost. A refused write is `Io`
+    /// and changes nothing.
+    pub(crate) struct Failing {
+        pub image: RwImage,
+        /// Writes asked of it so far, refused ones among them.
+        pub writes: std::cell::Cell<u64>,
+        /// The first write refused, counted from 0.
+        fail_at: u64,
+        /// Whether only that one is.
+        once: bool,
+    }
+    impl Failing {
+        /// Every write from the `n`th on refused.
+        pub(crate) fn after(image: Vec<u8>, n: u64) -> Failing {
+            Failing { image: RwImage(RefCell::new(image)), writes: 0.into(), fail_at: n, once: false }
+        }
+        /// The `n`th write alone refused.
+        pub(crate) fn once(image: Vec<u8>, n: u64) -> Failing {
+            Failing { once: true, ..Failing::after(image, n) }
+        }
+    }
+    impl BlockReader for Failing {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Failing {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            let i = self.writes.get();
+            self.writes.set(i + 1);
+            if i == self.fail_at || (!self.once && i > self.fail_at) {
+                return Err(FsError::Io);
+            }
+            self.image.write_at(offset, buf)
         }
     }
 
@@ -161,12 +252,57 @@ pub(crate) mod test_support {
         let _ = std::fs::remove_dir_all(&dir);
         bytes
     }
+
+    /// **`e2fsck -fn` finds nothing** in the image `img`.
+    pub(crate) fn assert_e2fsck_clean(img: &[u8], tag: &str) {
+        let dir = std::env::temp_dir()
+            .join(format!("nitrox-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, img).unwrap();
+        assert_e2fsck_clean_path(&p, tag);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
+    /// want in memory, or one a gate carved out of an image.
+    ///
+    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
+    /// how the status-only check below survived being noticed; a third copy would be the same
+    /// mistake with the ink still wet (PR #310 review).
+    pub(crate) fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // **The exit status is not the oracle; the output is.** Measured against e2fsck
+        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
+        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
+        // helper trusted the status from the day it was written (2026-07-24), so every test
+        // using it was blind to the whole class of summary-information corruption — which is
+        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
+        //
+        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
+        // prompt is what to look for. The summary line is the other half: without it e2fsck
+        // stopped early and found nothing because it checked nothing.
+        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
+        assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
+        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture, fixture_blocks};
+    use crate::test_support::{
+        Counting, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path,
+        fixture, fixture_blocks,
+    };
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -1019,6 +1155,84 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "inodes-cross-group");
     }
 
+    /// **A directory made past group 0's inodes is counted in its own group** (Phase 6 Part H.1):
+    /// `mkdir` bumped group 0's count of directories wherever the inode came from, which `e2fsck`
+    /// reports once group 0's inodes are gone. Made and removed, clean after each.
+    #[test]
+    fn a_directory_made_past_group_0s_inodes_is_counted_in_its_own_group() {
+        use std::cell::RefCell;
+        let img = fixture_blocks(1024, 24576, 65536, b"x\n");
+        let per_group = rd_u32(&img[1024..2048], 40);
+        let rw = RwImage(RefCell::new(img));
+        let root = ext4::resolve_dir(&rw, b"/").unwrap();
+        for i in 0..per_group {
+            ext4::create_file(&rw, b"/", std::format!("f{i:04}").as_bytes(), TEST_NOW).unwrap();
+        }
+        ext4::mkdir_at(&rw, root, b"late", TEST_NOW).unwrap();
+        let late = ext4::resolve_dir(&rw, b"/late").unwrap();
+        assert!(late > per_group, "the directory's inode {late} is past group 0's {per_group}");
+        assert_e2fsck_clean(&rw.0.borrow(), "mkdir-group-1");
+        ext4::rmdir_at(&rw, root, b"late", TEST_NOW).unwrap();
+        assert_e2fsck_clean(&rw.0.borrow(), "rmdir-group-1");
+    }
+
+    /// **A create, a rename and a `mkdir` that need a directory block the filesystem cannot give
+    /// take nothing with them** (Phase 6 Part H.1). The create once left its inode allocated and
+    /// unattached; the rename removed the old name before the new one failed, and the file had
+    /// none; the `mkdir`, given the last block for its own, kept it and its inode. A full block of
+    /// 200-byte names on a full filesystem, `e2fsck` clean after each.
+    #[test]
+    fn what_a_full_directory_refuses_takes_nothing_with_it() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"x\n")));
+        let free = |rw: &RwImage| (free_blocks(rw), free_inodes(rw));
+        let root = ext4::resolve_dir(&rw, b"/").unwrap();
+        ext4::mkdir_at(&rw, root, b"d", TEST_NOW).unwrap();
+        let d = ext4::resolve_dir(&rw, b"/d").unwrap();
+        let long = |i: usize| {
+            let mut n = std::format!("n{i:02}");
+            while n.len() < 200 {
+                n.push('x');
+            }
+            n
+        };
+        // Records of 208 bytes: nineteen beside `.` and `..` leave 120 of the block.
+        for i in 0..19 {
+            ext4::create_file(&rw, b"/d", long(i).as_bytes(), TEST_NOW).unwrap();
+        }
+        let sb = ext4::read_superblock(&rw).unwrap();
+        let (_, dir) = ext4::resolve_path_ino(&rw, &sb, b"/d").unwrap();
+        assert_eq!(rd_u32(&dir, 4), 4096, "one block of entries");
+        // Every block taken, a block at a time, by a file of one extent.
+        ext4::create_file(&rw, b"/", b"filler", TEST_NOW).unwrap();
+        let mut size = 0;
+        while ext4::grow_file(&rw, b"/filler", size + 4096, TEST_NOW).is_ok() {
+            size += 4096;
+        }
+        let full = free(&rw);
+        assert_eq!(full.0, 0, "the filesystem is full");
+
+        assert_eq!(ext4::create_file(&rw, b"/d", long(19).as_bytes(), TEST_NOW), Err(FsError::TooLarge));
+        assert_eq!(free(&rw), full, "the create gave its inode back");
+        // 220 bytes: no record has the room, and the removed one's is 208.
+        let longer = std::format!("{}{}", long(0), "y".repeat(20));
+        assert_eq!(
+            ext4::rename_at(&rw, d, long(0).as_bytes(), longer.as_bytes(), TEST_NOW),
+            Err(FsError::TooLarge)
+        );
+        assert_eq!(ext4::stat_file(&rw, std::format!("/d/{}", long(0)).as_bytes()), Ok(0), "the old name");
+        assert_eq!(ext4::stat_file(&rw, std::format!("/d/{longer}").as_bytes()), Err(FsError::NotFound));
+        assert_e2fsck_clean(&rw.0.borrow(), "full-create-rename");
+
+        // One block free: the `mkdir` takes it for its own block, then cannot link the directory.
+        ext4::truncate_file(&rw, b"/filler", size - 4096, TEST_NOW).unwrap();
+        let one = free(&rw);
+        assert_eq!(one.0, 1);
+        assert_eq!(ext4::mkdir_at(&rw, d, long(19).as_bytes(), TEST_NOW), Err(FsError::TooLarge));
+        assert_eq!(free(&rw), one, "the mkdir gave its block and its inode back");
+        assert_e2fsck_clean(&rw.0.borrow(), "full-mkdir");
+    }
+
     /// **`e2fsck -fn` on a filesystem we laid out ourselves**, which is the whole point of
     /// `mkfs`: the oracle is somebody else's implementation of the format, and agreeing only
     /// with our own reader would prove nothing.
@@ -1241,47 +1455,6 @@ mod tests {
         );
     }
 
-    fn assert_e2fsck_clean(img: &[u8], tag: &str) {
-        let dir = std::env::temp_dir()
-            .join(std::format!("nitrox-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("img.ext4");
-        std::fs::write(&p, img).unwrap();
-        assert_e2fsck_clean_path(&p, tag);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
-    /// want in memory, or one a gate carved out of an image.
-    ///
-    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
-    /// how the status-only check below survived being noticed; a third copy would be the same
-    /// mistake with the ink still wet (PR #310 review).
-    fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", p.to_str().unwrap()])
-            .output()
-            .unwrap();
-        let text = std::format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // **The exit status is not the oracle; the output is.** Measured against e2fsck
-        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
-        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
-        // helper trusted the status from the day it was written (2026-07-24), so every test
-        // using it was blind to the whole class of summary-information corruption — which is
-        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
-        //
-        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
-        // prompt is what to look for. The summary line is the other half: without it e2fsck
-        // stopped early and found nothing because it checked nothing.
-        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
-        assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
-        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
-    }
-
     /// The inode number of a directory path (for the name-addressed mutation ops).
     fn dir_ino(rw: &RwImage, path: &[u8]) -> u32 {
         ext4::resolve_dir(rw, path).unwrap()
@@ -1343,6 +1516,260 @@ mod tests {
         assert_eq!(ext4::mkdir_at(&rw, sys, b".", TEST_NOW), Err(FsError::Unsupported));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "mkdir");
+    }
+
+    /// **An 8 MiB grow and its removal cost commands a run, not a block** (Phase 6 Part H.4), on
+    /// the device as `libfsserver::disk::Disk` drives it. The laptop's copies spent eight of every
+    /// twelve commands a block allocating — the bitmap, the descriptor and the superblock read and
+    /// written for each — and removing a file the same, eight a block. Measured one block at a
+    /// time, this grow was 10,251 reads and 8,193 writes and the removal 10,271 and 6,150; in runs
+    /// 26 and 2,058, and 61 commands. **And its zeroes 64 KiB a command** (H.4's fourth fix): 2,048
+    /// writes of them were 128 and a write for each run's last part.
+    #[test]
+    fn an_eight_mebibyte_grow_and_its_removal_cost_commands_a_run_not_a_block() {
+        const BLOCKS: u64 = 2048;
+        let rw = Counting::new(fixture(4096, b"seed\n"));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"big", TEST_NOW).unwrap();
+        rw.take();
+
+        ext4::grow_file(&rw, b"/system/big", (BLOCKS * 4096) as usize, TEST_NOW).unwrap();
+        let (reads, writes) = rw.take();
+        assert!(reads <= 32, "{reads} reads to grow {BLOCKS} blocks");
+        // A sixteenth of the blocks' zeroes, a command for each run's ragged end, and the metadata.
+        assert!((BLOCKS / 16..=BLOCKS / 16 + 3 + 16).contains(&writes), "{writes} writes to grow {BLOCKS} blocks");
+        // In the fixture's free stretches — three of them, as one block at a time placed it.
+        let mut runs = [BlockRun::default(); 4];
+        let mapped = ext4::map_file(&rw, b"/system/big", &mut runs).unwrap();
+        let mapped_blocks: u64 = runs[..mapped.runs].iter().map(|r| r.length as u64).sum();
+        assert_eq!((mapped.runs, mapped_blocks), (3, BLOCKS));
+
+        assert_eq!(ext4::unlink_at(&rw, sys, b"big", TEST_NOW), Ok(Some(ino)));
+        ext4::release_inode(&rw, ino, TEST_NOW).unwrap();
+        let (reads, writes) = rw.take();
+        assert!(reads + writes <= 96, "{reads} reads and {writes} writes to remove {BLOCKS} blocks");
+        assert_e2fsck_clean(&rw.image.0.borrow(), "grow-run-remove");
+    }
+
+    /// **A run lands where a block at a time put each of its blocks** (Phase 6 Part H.4):
+    /// [`ext4::alloc_run`] called until it has as many blocks as [`ext4::alloc_block`] called once a
+    /// block, each from the last one's end, takes the same blocks in the same order and leaves the
+    /// image byte for byte the same — across a bitmap with holes of one, two and five, through a
+    /// run cut short by `want`, and over a group's end into the next. And [`ext4::free_run`] of
+    /// runs crossing that end leaves the image as `free_block` of each block does.
+    #[test]
+    fn a_run_lands_where_a_block_at_a_time_put_each_of_its_blocks() {
+        use std::cell::RefCell;
+        // Three groups of 8,192 one-KiB blocks, group 0 given holes: 900 blocks taken, then some
+        // given back — every seventh and the one after it, and every thirteenth's fifth.
+        let base = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"seed\n")));
+        let sb = ext4::read_superblock(&base).unwrap();
+        let first = sb.first_data_block as u64;
+        let taken: Vec<u64> = (0..900).map(|_| ext4::alloc_block(&base, &sb, first).unwrap()).collect();
+        for (i, &blk) in taken.iter().enumerate() {
+            if i % 7 < 2 || i % 13 == 5 {
+                ext4::free_block(&base, &sb, blk).unwrap();
+            }
+        }
+        let image = base.0.borrow().clone();
+        let free_0 = {
+            let mut gd = [0u8; 32];
+            // At one KiB a block the descriptor table starts at block 2.
+            base.read_at(2 * 1024, &mut gd).unwrap();
+            rd_u16(&gd, 12) as u64
+        };
+        let want = free_0 + 600; // past group 0's free blocks, into group 1's
+
+        let (a, b) = (RwImage(RefCell::new(image.clone())), RwImage(RefCell::new(image)));
+        let (mut by_run, mut goal) = (Vec::new(), first + 100);
+        while (by_run.len() as u64) < want {
+            let (phys, len) = ext4::alloc_run(&a, &sb, goal, (want - by_run.len() as u64).min(37)).unwrap();
+            assert!(len >= 1);
+            by_run.extend(phys..phys + len);
+            goal = phys + len;
+        }
+        let (mut by_block, mut goal) = (Vec::new(), first + 100);
+        for _ in 0..want {
+            let phys = ext4::alloc_block(&b, &sb, goal).unwrap();
+            by_block.push(phys);
+            goal = phys + 1;
+        }
+        assert_eq!(by_run, by_block, "the same blocks, in the same order");
+        assert!(by_run.iter().any(|&p| p >= first + 8192), "the runs reached group 1");
+        assert!(*a.0.borrow() == *b.0.borrow(), "the same bitmaps and counts");
+
+        // Freed again in runs that cross group 0's end, and a block at a time.
+        let end_0 = first + 8192;
+        let runs = [(end_0 - 300, 900), (first + 120, 40)];
+        for (phys, len) in runs {
+            ext4::free_run(&a, &sb, phys, len).unwrap();
+            for blk in phys..phys + len {
+                ext4::free_block(&b, &sb, blk).unwrap();
+            }
+        }
+        // Byte for byte is the oracle: `e2fsck` is not, on blocks taken for no file and freed
+        // from the filesystem's own.
+        assert!(*a.0.borrow() == *b.0.borrow(), "freed alike");
+        // Not on the filesystem: refused before anything is written.
+        let before = a.0.borrow().clone();
+        assert_eq!(ext4::free_run(&a, &sb, sb.blocks_count - 2, 5), Err(FsError::Corrupt));
+        assert_eq!(ext4::free_run(&a, &sb, 0, 1).is_err(), first > 0);
+        assert!(*a.0.borrow() == before);
+    }
+
+    /// **Nothing the metadata cache holds goes stale** (Phase 6 Part H.4). Through a cache of eight
+    /// blocks, so it evicts all the time: files made, grown and given data the way the kernel writes
+    /// it — to the device, behind the server — then renamed, removed and released, a directory
+    /// filled, emptied and removed so its blocks become new files' data, and files cut and grown back
+    /// over the bytes the kernel wrote. Every file then reads what it should, the directories list
+    /// what they should, and `e2fsck` finds the filesystem clean.
+    #[test]
+    fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
+        use libfsserver::cache::{MetaCache, Store};
+        use std::cell::RefCell;
+        const SIZE: usize = 6000;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let mut store = Box::new(Store::<8>::new());
+        let c = MetaCache::new(&rw, &mut store);
+        // The kernel's write-back: straight to the image, over the blocks the file's map names.
+        let kernel_writes = |path: &[u8], byte: u8| {
+            let mut runs = [BlockRun::default(); 8];
+            let m = ext4::map_file(&rw, path, &mut runs).unwrap();
+            let mut img = rw.0.borrow_mut();
+            let mut left = m.size;
+            for r in &runs[..m.runs] {
+                for b in 0..r.length as u64 {
+                    let (at, n) = (((r.device_lba + b) * 4096) as usize, left.min(4096));
+                    img[at..at + n].fill(byte);
+                    left -= n;
+                }
+            }
+        };
+        let path = |dir: &str, name: &str| format!("/system/{dir}/{name}").into_bytes();
+
+        let sys = ext4::resolve_dir(&c, b"/system").unwrap();
+        ext4::mkdir_at(&c, sys, b"d1", TEST_NOW).unwrap();
+        for i in 0..200u8 {
+            let name = format!("f{i:03}");
+            ext4::create_file(&c, b"/system/d1", name.as_bytes(), TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &name), SIZE, TEST_NOW).unwrap();
+            kernel_writes(&path("d1", &name), i);
+        }
+        for i in 0..50 {
+            ext4::rename_path(&c, &path("d1", &format!("f{i:03}")), &path("d1", &format!("g{i:03}")), false, TEST_NOW)
+                .unwrap();
+        }
+        let d1 = ext4::resolve_dir(&c, b"/system/d1").unwrap();
+        for i in 50..100 {
+            let ino = ext4::unlink_at(&c, d1, format!("f{i:03}").as_bytes(), TEST_NOW).unwrap().unwrap();
+            ext4::release_inode(&c, ino, TEST_NOW).unwrap();
+        }
+        // A directory of a hundred names, emptied and removed: its blocks are free for data.
+        ext4::mkdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
+        let d2 = ext4::resolve_dir(&c, b"/system/d2").unwrap();
+        for i in 0..100 {
+            let name = format!("a-long-name-to-fill-blocks-{i:03}");
+            ext4::create_file(&c, b"/system/d2", name.as_bytes(), TEST_NOW).unwrap();
+        }
+        for i in 0..100 {
+            let name = format!("a-long-name-to-fill-blocks-{i:03}");
+            let ino = ext4::unlink_at(&c, d2, name.as_bytes(), TEST_NOW).unwrap().unwrap();
+            ext4::release_inode(&c, ino, TEST_NOW).unwrap();
+        }
+        ext4::rmdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
+        for i in 0..20 {
+            let name = format!("n{i:02}");
+            ext4::create_file(&c, b"/system/d1", name.as_bytes(), TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &name), SIZE, TEST_NOW).unwrap();
+            kernel_writes(&path("d1", &name), 0xEE);
+        }
+        // Cut and grown back: what the kernel wrote before the cut stays, and the rest reads zero.
+        for i in 150..160 {
+            ext4::truncate_file(&c, &path("d1", &format!("f{i:03}")), 1000, TEST_NOW).unwrap();
+            ext4::grow_file(&c, &path("d1", &format!("f{i:03}")), SIZE, TEST_NOW).unwrap();
+        }
+        let mut want: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..50u8 {
+            want.push((format!("g{i:03}"), vec![i; SIZE]));
+        }
+        for i in 100..200u8 {
+            let cut = (150..160).contains(&i);
+            let bytes = (0..SIZE).map(|at| if cut && at >= 1000 { 0 } else { i }).collect();
+            want.push((format!("f{i:03}"), bytes));
+        }
+        for i in 0..20 {
+            want.push((format!("n{i:02}"), vec![0xEE; SIZE]));
+        }
+        let mut out = vec![0u8; ext4::MAX_FILE];
+        for (name, bytes) in &want {
+            let n = ext4::read_file(&c, &path("d1", name), &mut out).unwrap();
+            assert!(out[..n] == bytes[..], "{name} reads what was written");
+        }
+        let mut names = names_of(&rw, b"/system/d1");
+        names.retain(|n| n != "." && n != "..");
+        names.sort();
+        let mut expected: Vec<String> = want.iter().map(|(n, _)| n.clone()).collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert!(!names_of(&rw, b"/system").iter().any(|n| n == "d2"));
+        drop(c);
+        assert_e2fsck_clean(&rw.0.borrow(), "meta-cache");
+
+        // **A file's data is never answered from the cache**: read through one large enough to keep
+        // it, written again by the kernel, and read at once — the new bytes, not the ones read.
+        let mut store = Box::new(Store::<64>::new());
+        let c = MetaCache::new(&rw, &mut store);
+        for i in 0..5u8 {
+            let p = path("d1", &format!("g{i:03}"));
+            ext4::read_file(&c, &p, &mut out).unwrap();
+            kernel_writes(&p, 0xA0 + i);
+            let n = ext4::read_file(&c, &p, &mut out).unwrap();
+            assert!(out[..n].iter().all(|&b| b == 0xA0 + i), "g{i:03} reads what the kernel wrote last");
+        }
+    }
+
+    /// **A directory is read from the device once** (Phase 6 Part H.4). Through a server's cache, a
+    /// lookup that misses in a directory of 4,096 names reads the directory, twenty blocks; one that
+    /// finds a file then reads at most that file's inode-table block; and every lookup again reads
+    /// nothing. Uncached, each of them scanned the directory from the device.
+    #[test]
+    fn a_directory_is_read_from_the_device_once_through_the_cache() {
+        use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
+        let rw = Counting::new(fixture_blocks(4096, 16384, 0, b"seed\n"));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::mkdir_at(&rw, sys, b"big", TEST_NOW).unwrap();
+        for i in 0..4096 {
+            ext4::create_file(&rw, b"/system/big", format!("S{i:04}.BIN").as_bytes(), TEST_NOW).unwrap();
+        }
+        // SAFETY: a `Store` of all zeroes is an empty one, and a megabyte is too much to build on a
+        // test's stack, as `Box::new` would.
+        let mut store = unsafe { Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init() };
+        let c = MetaCache::new(&rw, &mut store);
+        let mut runs = [BlockRun::default(); 4];
+        let lookups = ["S1000.BIN", "S3000.BIN", "S4095.BIN"];
+        let uncached = || {
+            rw.take();
+            ext4::map_file(&rw, b"/system/big/S3000.BIN", &mut [BlockRun::default(); 4]).unwrap();
+            rw.take().0
+        };
+        let scan = uncached();
+
+        rw.take();
+        assert_eq!(ext4::map_file(&c, b"/system/big/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+        let (missed, _) = rw.take();
+        for name in lookups {
+            ext4::map_file(&c, format!("/system/big/{name}").as_bytes(), &mut runs).unwrap();
+            let (found, _) = rw.take();
+            assert!(found <= 1, "{name}: {found} reads, its inode's block at most");
+        }
+        for _ in 0..3 {
+            assert_eq!(ext4::map_file(&c, b"/system/big/S9999.BIN", &mut runs).err(), Some(FsError::NotFound));
+            for name in lookups {
+                ext4::map_file(&c, format!("/system/big/{name}").as_bytes(), &mut runs).unwrap();
+            }
+        }
+        assert_eq!(rw.take().0, 0, "every lookup again reads nothing");
+        assert!(missed >= 20 && scan >= 15, "a miss read the directory ({missed}); uncached, a hit did too ({scan})");
     }
 
     #[test]

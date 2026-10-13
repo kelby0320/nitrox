@@ -259,3 +259,117 @@ impl DeviceRecord {
         unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
     }
 }
+
+// --- `/dev/registry/io` (Phase 6 Part H.2) -----------------------------------------------------
+//
+// **What the block devices and the page cache have done since boot**: a header carrying the page
+// cache's counters, then a record per disk and RAM disk — partitions have none, since a window's
+// I/O is counted by its disk's driver. The counts are cumulative: a reader takes two snapshots and
+// subtracts, as `nxsh`'s `time` does through the device manager's `io.tsm`.
+
+/// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
+pub const IO_MAGIC: u32 = 0x534F_4944;
+/// The I/O snapshot layout this kernel writes: 2 since the page cache counts the pages its fills
+/// bring in (Phase 6 Part H.4).
+pub const IO_VERSION: u32 = 2;
+
+/// The page cache's counters, since boot (`file_object::fill_stats`).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CacheCounts {
+    /// Fills that read the device: a page faulted in from its file's blocks and the pages read
+    /// ahead of it, one IRP each.
+    pub fills: u64,
+    /// Nanoseconds those fills took, from the fault to the page's arrival.
+    pub fill_ns: u64,
+    /// Fills over a hole, which read nothing.
+    pub hole_fills: u64,
+    /// Faults that found their page resident.
+    pub hits: u64,
+    /// Pages written back to their files' blocks.
+    pub writeback_pages: u64,
+    /// The write IRPs that carried them.
+    pub writeback_irps: u64,
+    /// Nanoseconds those IRPs took, from submission to completion.
+    pub writeback_ns: u64,
+    /// The pages the fills brought in (version 2).
+    pub fill_pages: u64,
+}
+
+const _: () = assert!(size_of::<CacheCounts>() == 64);
+const _: () = assert!(align_of::<CacheCounts>() == 8);
+
+/// The start of an I/O snapshot: then `count` [`IoRecord`]s.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IoHeader {
+    /// [`IO_MAGIC`].
+    pub magic: u32,
+    /// [`IO_VERSION`].
+    pub version: u32,
+    /// How many records follow. **The length**, as in a registry snapshot.
+    pub count: u32,
+    /// `size_of::<IoRecord>()` as the kernel wrote it.
+    pub record_size: u32,
+    /// The page cache's counters.
+    pub cache: CacheCounts,
+}
+
+const _: () = assert!(size_of::<IoHeader>() == 80);
+const _: () = assert!(align_of::<IoHeader>() == 8);
+const _: () = assert!(offset_of!(IoHeader, magic) == 0);
+const _: () = assert!(offset_of!(IoHeader, count) == 8);
+const _: () = assert!(offset_of!(IoHeader, record_size) == 12);
+const _: () = assert!(offset_of!(IoHeader, cache) == 16);
+
+/// **One block device's counters, since it was registered**: the commands its driver issued and saw
+/// retire, the bytes they moved, and the time they were on the device. One command at a time on
+/// each driver this kernel has, so the time is the device's busy time.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct IoRecord {
+    /// Its registry id: its [`DeviceRecord`] is the one with this `id`.
+    pub id: u32,
+    /// [`DEPARTED`] when the device has left; its counters stay.
+    pub flags: u32,
+    /// Reads that succeeded.
+    pub reads: u64,
+    /// Writes that succeeded.
+    pub writes: u64,
+    /// Flushes of the device's cache that succeeded.
+    pub flushes: u64,
+    /// Commands that failed.
+    pub errors: u64,
+    /// Bytes the reads moved.
+    pub read_bytes: u64,
+    /// Bytes the writes moved.
+    pub written_bytes: u64,
+    /// Nanoseconds commands were on the device, from issue to retirement.
+    pub busy_ns: u64,
+}
+
+const _: () = assert!(size_of::<IoRecord>() == 64);
+const _: () = assert!(align_of::<IoRecord>() == 8);
+const _: () = assert!(offset_of!(IoRecord, id) == 0);
+const _: () = assert!(offset_of!(IoRecord, flags) == 4);
+const _: () = assert!(offset_of!(IoRecord, reads) == 8);
+const _: () = assert!(offset_of!(IoRecord, read_bytes) == 40);
+const _: () = assert!(offset_of!(IoRecord, busy_ns) == 56);
+
+impl IoHeader {
+    /// The header's bytes, as they go on the wire.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `IoHeader` is `repr(C)`, four `u32`s then seven `u64`s, so no padding, fully
+        // initialised.
+        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+    }
+}
+
+impl IoRecord {
+    /// The record's bytes, as they go on the wire.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `IoRecord` is `repr(C)`, two `u32`s then seven `u64`s, so no padding, fully
+        // initialised.
+        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+    }
+}

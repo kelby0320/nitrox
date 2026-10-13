@@ -958,6 +958,7 @@ impl Interp {
                 }
             }
             Expr::Pipeline(stages) => self.pipeline(stages),
+            Expr::Time(timed) => self.time(timed),
             Expr::Call(c) => {
                 // D4: a **local binding wins** over a command name for a bare,
                 // argument-less reference. That is what stops the operator set behaving
@@ -1432,6 +1433,30 @@ impl Interp {
         self.pop_scope();
         self.scopes = saved;
         boundary_value(r?)
+    }
+
+    /// **`time PIPELINE`** (Phase 6 Part H.2, §3): the pipeline evaluated as ever, its value — or its
+    /// failure — passed through, and one line on `stderr` when it ends: the time it took by the
+    /// host's monotonic clock, and what the disks and the page cache did meanwhile, from
+    /// `/dev/devices/io.tsm` read before and after ([`crate::timing`]). Reading the table is a
+    /// resolve the device manager answers from the kernel's counters, so it touches no disk.
+    fn time(&mut self, timed: &Expr) -> Result<Val> {
+        let before = self.io_rows();
+        let started = self.host.now_ns();
+        let result = self.eval(timed);
+        let ended = self.host.now_ns();
+        let after = self.io_rows();
+        let wall = started.zip(ended).map(|(s, e)| e.saturating_sub(s));
+        let mut line = crate::timing::line(wall, before.as_deref(), after.as_deref());
+        line.push('\n');
+        self.host.diag(&line);
+        result
+    }
+
+    /// `io.tsm`'s rows, or `None` where it is not bound or does not read.
+    fn io_rows(&mut self) -> Option<Vec<crate::timing::IoRow>> {
+        let bytes = self.host.read_file(crate::timing::IO_TABLE).ok()?;
+        crate::timing::rows(&bytes)
     }
 
     /// §3's shell-state builtins: they mutate *this* process, which an external program
@@ -3215,6 +3240,119 @@ mod tests {
         let mut interp = Interp::with_host(Box::new(host), Mode::Script);
         let r = interp.run(&script);
         (r, log)
+    }
+
+    /// **`time PIPELINE`** (Phase 6 Part H.2): the whole pipeline after it is timed — both stages
+    /// here, the value `count` gives coming through — and its line goes to `stderr`: the time
+    /// between the host's two clock reads, then, where `io.tsm` reads, what moved, which here is
+    /// nothing. A failure comes through too, with its line said first. And `time` that is not a
+    /// prefix — alone, or assigned to — is an ordinary name.
+    #[test]
+    fn time_passes_a_pipelines_value_through_and_says_how_long_it_took() {
+        let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3]))).with_clock(250_000_000);
+        let (r, log) = run_with(host, "time list /home | count");
+        assert_eq!(r.expect("runs").render(), "3");
+        assert_eq!(log.borrow().runs[0][0].argv, alloc::vec!["list", "/home"]);
+        assert_eq!(log.borrow().diagnostics, ["time: 250 ms\n"], "no io.tsm: the time alone");
+
+        let mut host = MockHost::new().with_program("list", Some(stream("n", &[1]))).with_clock(2_000_000_000);
+        let io = {
+            use libstream::wire::{StreamFlags, Table, TypeTag};
+            let schema = Schema::new()
+                .field("name", TypeTag::String, TypeModifiers::NONE)
+                .field("reads", TypeTag::Int, TypeModifiers::NONE);
+            let rows = alloc::vec![alloc::vec![Value::Str("blk-0".into()), Value::Int(5)]];
+            let mut buf = alloc::vec::Vec::new();
+            Table { flags: StreamFlags::NONE, schema, rows }.encode(&mut buf).expect("encodes");
+            buf
+        };
+        host.files.push((alloc::string::String::from(crate::timing::IO_TABLE), io));
+        let (r, log) = run_with(host, "time list");
+        assert_eq!(r.expect("runs").render(), "<table 1 row [n]>");
+        assert_eq!(log.borrow().diagnostics, ["time: 2.00 s; no disk I/O\n"]);
+
+        let host = MockHost::new().with_failing("list", 2).with_clock(1_000);
+        let (r, log) = run_with(host, "time list");
+        assert!(r.is_err(), "the pipeline's failure is time's");
+        assert_eq!(log.borrow().diagnostics[0], "time: 1 us\n");
+
+        let (r, _) = run_with(MockHost::new(), "let time = 4\ntime");
+        assert_eq!(r.expect("a name").render(), "4");
+    }
+
+    /// **The throughput stick's script, as the maintainer runs it** (Phase 6 Part H.3):
+    /// `cargo xtask throughput-stick` puts `tools/xtask/src/throughput/h3.nx` on the stick, and a
+    /// laptop with no serial port `use`s it at a prompt — where a script that does not parse, or a
+    /// set that runs the wrong copy, costs a boot to find out. Each set: its commands, their
+    /// arguments, in order, each timed but set 4's last, which removes set 1's copies so the next
+    /// round starts where this one did; its answer; and a set out of range refused.
+    #[test]
+    fn the_throughput_sticks_script_runs_each_set_timed() {
+        const H3: &str = include_str!("../../../tools/xtask/src/throughput/h3.nx");
+        let (s, h) = ("/storage/THROUGHPUT", "/home");
+        let copies = |from: &str, to: &str, prefix: &str| -> Vec<Vec<String>> {
+            ["big", "small", "tree"]
+                .iter()
+                .map(|t| {
+                    let src = if from == s { alloc::format!("{s}/{t}") } else { alloc::format!("{from}/t-{t}") };
+                    alloc::vec!["copy".into(), src, alloc::format!("{to}/{prefix}-{t}")]
+                })
+                .collect()
+        };
+        let removes = |dir: &str, prefix: &str| -> Vec<Vec<String>> {
+            ["big", "small", "tree"]
+                .iter()
+                .map(|t| alloc::vec!["remove".into(), "-r".into(), alloc::format!("{dir}/{prefix}-{t}")])
+                .collect()
+        };
+        let round_end: Vec<Vec<String>> =
+            alloc::vec![["remove", "-r", "/home/t-big", "/home/t-small", "/home/t-tree"].map(String::from).to_vec()];
+        // (set, its timed commands, its untimed ones after them, its answer)
+        let sets = [
+            (1, copies(s, h, "t"), alloc::vec![], "set 1 done: photograph the lines, then restart for set 2."),
+            (2, copies(h, h, "u"), alloc::vec![], "set 2 done: photograph the lines, then restart for set 3."),
+            (
+                3,
+                copies(h, s, "c"),
+                alloc::vec![],
+                "set 3 done: photograph the lines. Its copies can be checked on the host now.",
+            ),
+            (
+                4,
+                [removes(h, "u"), removes(s, "c")].concat(),
+                round_end,
+                "set 4 done: photograph the lines, then disk --eject THROUGHPUT. The round is over.",
+            ),
+        ];
+        let host = || {
+            MockHost::new()
+                .with_file("/storage/THROUGHPUT/h3.nx", H3)
+                .with_program("copy", None)
+                .with_program("remove", None)
+                .with_clock(1_000_000_000)
+        };
+        // Two lines at a prompt, as the maintainer types them: the import has to outlive its line.
+        let prompt = |host: MockHost, line: &str| {
+            let mut interp = Interp::with_host(Box::new(host), Mode::Repl);
+            let import = interp.run_line("use \"/storage/THROUGHPUT/h3.nx\" { run }").expect("imports");
+            assert_eq!(import, None, "an import shows nothing");
+            interp.run_line(line).map(|shown| shown.map(|s| String::from(s.trim_end())))
+        };
+        for (set, timed, untimed, answer) in sets {
+            let host = host();
+            let log = host.log();
+            let shown = prompt(host, &alloc::format!("run({set})")).expect("the set runs");
+            assert_eq!(shown.as_deref(), Some(answer), "set {set}");
+            let ran: Vec<Vec<String>> = log.borrow().runs.iter().map(|chain| chain[0].argv.clone()).collect();
+            assert_eq!(ran, [timed.clone(), untimed].concat(), "set {set}'s commands");
+            let lines = alloc::vec!["time: 1.00 s\n"; timed.len()];
+            assert_eq!(log.borrow().diagnostics, lines, "set {set}: what is timed");
+        }
+
+        let host = host();
+        let log = host.log();
+        assert!(prompt(host, "run(5)").expect_err("no set 5").message.contains("the sets are 1 to 4"));
+        assert!(log.borrow().runs.is_empty());
     }
 
     #[test]

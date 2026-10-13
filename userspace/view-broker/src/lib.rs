@@ -77,6 +77,10 @@ pub mod policy {
         /// (administration Part E.6), where a resolve opens a session that answers `Log::Read` —
         /// every service's records, and this broker's audit among them.
         Logs,
+        /// **Reading the kernel's log** (Phase 6 Part B.7): a snapshot of the kernel's `/dev/log`,
+        /// taken as the view is made, bound at `/dev/log` — what `log --kernel` reads. A view is
+        /// made for each request, so a program run in one reads the log as it stood then.
+        KernelLog,
     }
 
     impl Grant {
@@ -91,6 +95,7 @@ pub mod policy {
                 "power" => Some(Grant::Power),
                 "clock" => Some(Grant::Clock),
                 "logs" => Some(Grant::Logs),
+                "kernel-log" => Some(Grant::KernelLog),
                 _ => None,
             }
         }
@@ -106,6 +111,7 @@ pub mod policy {
                 Grant::Power => "power",
                 Grant::Clock => "clock",
                 Grant::Logs => "logs",
+                Grant::KernelLog => "kernel-log",
             }
         }
     }
@@ -120,6 +126,7 @@ pub mod policy {
         Grant::Power,
         Grant::Clock,
         Grant::Logs,
+        Grant::KernelLog,
     ];
 
     /// A profile: a named set of grants. A request names one as its view.
@@ -469,7 +476,8 @@ pub mod policy {
              # Made with this machine's root, by the build or by the installer.\n\
              \n\
              [profile.admin]\n\
-             grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\"]\n\
+             grants = [\"disks\", \"storage\", \"views\", \"accounts\", \"services\", \"power\", \"clock\", \"logs\", \
+             \"kernel-log\"]\n\
              \n\
              [profile.install]\n\
              grants = [\"disks\"]\n\
@@ -1268,6 +1276,8 @@ auth = "password"
         assert!(KNOWN_GRANTS.contains(&Grant::Clock));
         assert_eq!(Grant::from_name("logs"), Some(Grant::Logs));
         assert_eq!(Grant::Logs.name(), "logs");
+        assert_eq!(Grant::from_name("kernel-log"), Some(Grant::KernelLog));
+        assert_eq!(Grant::KernelLog.name(), "kernel-log");
         assert!(KNOWN_GRANTS.contains(&Grant::Logs));
         let e = parse("[profile.admin]\ngrants = [\"teleport\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
@@ -1361,6 +1371,12 @@ auth = "password"
         assert!(matches!(p.decide("alice", "admin", "disk"), Decision::Deny(_)), "the demo account is not in it");
         assert!(matches!(p.decide("carol", "power", "shutdown"), Decision::Allow { auth: Auth::None, .. }));
         assert!(matches!(p.decide("carol", "power", "date"), Decision::Deny(_)));
+        // **`admin` grants everything this broker knows** (Phase 6 Part B.7), as its doc says: a
+        // grant added to the broker and forgotten here is one no installed machine could use.
+        let admin = p.profiles.iter().find(|pr| pr.name == "admin").expect("the admin profile");
+        for g in KNOWN_GRANTS {
+            assert!(admin.grants.contains(g), "the seed's admin lacks {}", g.name());
+        }
     }
 
     /// **The guard at its neighbours.** Only a profile granting `views`, with `run = ["*"]`, for

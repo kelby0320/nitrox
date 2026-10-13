@@ -120,6 +120,7 @@ const TERMINAL_OPERATORS: &[&str] = &["display", "save"];
 fn ends_in_terminal_operator(e: &Expr) -> bool {
     match e {
         Expr::Pipeline(stages) => stages.last().is_some_and(ends_in_terminal_operator),
+        Expr::Time(timed) => ends_in_terminal_operator(timed),
         Expr::Call(c) => TERMINAL_OPERATORS.contains(&c.name.as_str()),
         _ => false,
     }

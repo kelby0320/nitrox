@@ -43,6 +43,7 @@ use super::{RING_TRBS, Xhci};
 use crate::arch::timer::ArchTimer;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, PhysFrag};
+use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
@@ -294,13 +295,15 @@ enum Stage {
     Status { csw_trb: u64 },
 }
 
-/// A command in flight: whose, its tag, where it is, and its deadline.
+/// A command in flight: whose, its tag, where it is, its deadline, and when it was issued — for its
+/// time on the device (Phase 6 Part H.2).
 #[derive(Copy, Clone, Debug)]
 struct Command {
     owner: Owner,
     tag: u32,
     stage: Stage,
     deadline: u64,
+    started: u64,
 }
 
 /// **What went wrong with a command**, recorded by the DPC for the hub thread.
@@ -434,6 +437,8 @@ pub(super) struct Dev {
     /// the disk before the new table is published (PR #369 review).
     rescan: Option<(*mut Irp, u8)>,
     queue: Queue,
+    /// Each published unit's disk node's counters, attached as it is published (Phase 6 Part H.2).
+    counted: [Counted; MAX_LUNS],
 }
 
 // SAFETY: `Dev` holds raw pointers to in-flight IRPs and an operation, which its lock serialises;
@@ -482,6 +487,19 @@ struct IrpCmd {
     len: u32,
     input: bool,
     flush: bool,
+}
+
+impl IrpCmd {
+    /// The IRP's op, by what its command is: what the counters file it under.
+    fn op(&self) -> u32 {
+        if self.flush {
+            IrpOp::Flush as u32
+        } else if self.input {
+            IrpOp::Read as u32
+        } else {
+            IrpOp::Write as u32
+        }
+    }
 }
 
 /// The IRPs waiting for the one in flight, in order.
@@ -610,7 +628,8 @@ impl Dev {
             side.push_td(&data[..frags.len()], |_, _| {});
         }
         let dci = if !no_data && input { self.in_dci } else { self.out_dci };
-        self.inflight = Some(Command { owner, tag: self.tag, stage: Stage::Data { dci }, deadline: now + DEADLINE_NS });
+        self.inflight =
+            Some(Command { owner, tag: self.tag, stage: Stage::Data { dci }, deadline: now + DEADLINE_NS, started: now });
         self.ring(self.out_dci);
         if !no_data && input {
             self.ring(self.in_dci);
@@ -824,6 +843,7 @@ impl Disks {
             }
             dev.inflight = None;
             dev.fault = None;
+            dev.counted[c.lun as usize % MAX_LUNS].record(c.op(), true, c.len as u64, now.saturating_sub(cmd.started));
             // **Not while the hub thread holds the device.** A rescan waiting does not hold it: the
             // queue drains for it, and it takes the device once nothing is left (PR #369 review).
             if !dev.recovering
@@ -997,6 +1017,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: Prepare
         stranded: None,
         rescan: None,
         queue: Queue::new(),
+        counted: [const { Counted::new() }; MAX_LUNS],
     };
     let Some((i, epoch)) = DISKS.take(dev) else {
         crate::kprintln!("usb: port {port}: {MAX_DEVICES} storage devices are bound already; not bound");
@@ -1167,9 +1188,12 @@ impl Binding<'_> {
         let Some(id) = crate::device::register_block_under(node.clone(), parent, "usb-storage") else {
             return false;
         };
-        // Kept with the unit, for a rescan to depart the disk's partitions by (Phase 6 Part G).
+        // Kept with the unit, for a rescan to depart the disk's partitions by (Phase 6 Part G), and
+        // its counters with it (Part H.2).
         if let Some(dev) = DISKS.devs[self.i].lock().as_mut() {
             dev.luns[lun as usize].record = Some(id);
+            // SAFETY: `node` was just registered, and the table holds it for the kernel's lifetime.
+            unsafe { dev.counted[lun as usize].attach(&node) };
         }
         crate::kprintln!(
             "usb: port {port}: LUN {lun}: disk \"{}\", {} blocks of {} bytes, record {id}",
@@ -1577,6 +1601,8 @@ impl Disks {
                     dev.start(next, false, now);
                 }
                 let transferred = if status == 0 { cmd.len as u64 } else { 0 };
+                // Counted, with none of the recovery's time: that was the hub thread's commands.
+                dev.counted[cmd.lun as usize % MAX_LUNS].record(cmd.op(), status == 0, transferred, 0);
                 Action::Complete { irp: cmd.irp, status, transferred }
             }
         }
@@ -1593,7 +1619,8 @@ impl Disks {
         let owner = Owner::Hub { po };
         if status_only {
             let tag = dev.tag;
-            dev.inflight = Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS });
+            dev.inflight =
+                Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS, started: now });
             dev.ask_status();
         } else {
             let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
@@ -1968,6 +1995,7 @@ mod tests {
                 stranded: None,
                 rescan: None,
                 queue: Queue::new(),
+                counted: [const { Counted::new() }; MAX_LUNS],
             }
         }
 
@@ -2045,6 +2073,61 @@ mod tests {
         assert_eq!(fake.trb(1, 1).0[2] & 0x1_FFFF, CBW_LEN as u32, "the next command's wrapper");
         assert_eq!(fake.trb(1, 2).0[0], 0x10_000, "and its data, on OUT for a write");
         assert_eq!(disks.on_transfer(8, 3, code::SUCCESS, at, 1), None, "another slot's event is not this driver's");
+    }
+
+    /// **Each command is counted on its own disk, with its time on the device** (Phase 6 Part H.2):
+    /// from its issue to its status wrapper — a queued write's from when it starts, not from its
+    /// submit — and a command the hub thread recovers as an error, with none of the recovery's time.
+    #[test]
+    fn each_command_is_counted_on_its_disk_with_its_time_on_the_device() {
+        static FIRST: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
+        static OTHER: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let (i, epoch) = disks.take(fake.dev(9)).unwrap();
+        disks.devs[i].lock().as_ref().unwrap().counted[0].attach_static(&FIRST);
+        let ctx = context(i, 0, epoch);
+        let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
+        let mut read = irp(IrpOp::Read, 0, 8192, &frags);
+        disks.submit(&mut read, ctx, 100);
+        let mut write = irp(IrpOp::Write, 0, 512, &frags[..1]);
+        disks.submit(&mut write, ctx, 150);
+        disks.on_transfer(9, 3, code::SUCCESS, 0x20_000, 300);
+        fake.answer(1, 0);
+        let done = disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 400);
+        assert!(matches!(done, Some(Action::Complete { status: 0, .. })));
+        let r = FIRST.record_for(0, 0);
+        assert_eq!((r.reads, r.read_bytes, r.busy_ns), (1, 8192, 300), "issued at 100, its status at 400");
+        // The write started at 400, as the read completed: its 600 are from there, not from 150.
+        disks.on_transfer(9, 4, code::SUCCESS, 0x10_000, 700);
+        fake.answer(2, 0);
+        disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1000);
+        let r = FIRST.record_for(0, 0);
+        assert_eq!((r.writes, r.written_bytes, r.busy_ns), (1, 512, 300 + 600));
+
+        // A flush that fails is the hub thread's to end; ended with an error, it is one.
+        let mut flush = irp(IrpOp::Flush, 0, 0, &[]);
+        disks.submit(&mut flush, ctx, 2000);
+        disks.on_transfer(9, 4, code::SUCCESS, 0, 2100);
+        fake.answer(3, 1);
+        assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 2200), Some(Action::Wake));
+        assert_eq!(FIRST.record_for(0, 0).errors, 0, "not yet: the hub thread has it");
+        let (_, cmd, _) = disks.begin_recovery(i).unwrap();
+        disks.end_recovery(i, cmd, End::Complete(KError::IoError as i32), 9000);
+        let r = FIRST.record_for(0, 0);
+        assert_eq!((r.flushes, r.errors, r.busy_ns), (0, 1, 900), "an error, and no recovery time");
+
+        // Another device's disk counts on its own.
+        let (j, e2) = disks.take(fake.dev(3)).unwrap();
+        disks.devs[j].lock().as_ref().unwrap().counted[0].attach_static(&OTHER);
+        let mut other = irp(IrpOp::Flush, 0, 0, &[]);
+        disks.submit(&mut other, context(j, 0, e2), 10_000);
+        disks.on_transfer(3, 4, code::SUCCESS, 0, 10_050);
+        fake.answer(1, 0);
+        disks.on_transfer(3, 3, code::SUCCESS, csw_trb(&disks, j), 10_100);
+        assert_eq!((OTHER.record_for(0, 0).flushes, OTHER.record_for(0, 0).busy_ns), (1, 100));
+        assert_eq!(FIRST.record_for(0, 0).flushes, 0);
     }
 
     /// **A rescan is held for the hub thread, which takes the device only once its queue has drained**

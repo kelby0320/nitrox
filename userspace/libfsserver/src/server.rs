@@ -25,7 +25,7 @@
 //! A server never holds `BIND_NAMESPACE` (its supervisor binds its endpoint) and receives only the
 //! handles it needs at spawn — see `docs/rationale/why-supervisor-registration.md`.
 
-use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve};
+use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use librsproto::file::{
     DirReplyWriter, forget_request, parse_name_request, parse_read_dir_request, parse_rename_request,
@@ -99,8 +99,13 @@ fn session_capacity() -> usize {
 }
 
 /// Body scratch for a `File::ReadDir` reply (packed entries), before the rsproto header is
-/// prepended into `REPLY_MSG`. Bounded to one IPC payload minus the two headers.
-const DIR_BODY_CAP: usize = MSG_LEN - PAYLOAD_OFF - librsproto::RS_HEADER_LEN;
+/// prepended into `REPLY_MSG`: [`librsproto::RS_MAX_BODY`], what one message carries.
+///
+/// **It was the page less the two headers**, which forgot that a payload leaves room for eight
+/// handles: a page of entries over 3,980 bytes made a reply the kernel refused, the send's failure
+/// went unseen, and the client waited for good — a directory of 126 short names on a FAT stick
+/// (Phase 6 Part H's dry run).
+const DIR_BODY_CAP: usize = librsproto::RS_MAX_BODY;
 static mut DIR_BODY: [u8; DIR_BODY_CAP] = [0; DIR_BODY_CAP];
 
 /// Log `msg` and exit non-zero — the bootstrap failure path. (A server is not a
@@ -343,22 +348,23 @@ fn send_reply(serve_end: u64, count: usize) {
 /// create the file first. Best-effort — any parse / create / grow error is ignored and the
 /// subsequent `serve` maps the file at its current size (the reply reflects that, so a failed
 /// create surfaces as `NotFound`). A truncate that ends a file's id has it forgotten and released
-/// before the reply.
-fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsError> {
+/// before the reply. **The size a grow took the file from**, if one grew it, which the reply marks
+/// past (Phase 6 Part H.4, [`crate::serve::serve_grown`]).
+fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<Option<u64>, FsError> {
     let Ok(m) = librsproto::decode(req) else {
-        return Ok(());
+        return Ok(None);
     };
     if m.op != OP_NS_RESOLVE {
-        return Ok(());
+        return Ok(None);
     }
     let Some(r) = parse_resolve_request(m.body) else {
-        return Ok(());
+        return Ok(None);
     };
     if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
-        return Ok(());
+        return Ok(None);
     }
     let Some(new_size) = parse_resolve_grow_size(m.body) else {
-        return Ok(());
+        return Ok(None);
     };
     // **A read-only mount's refusal is the one failure reported** (administration Part C.3).
     // Every other one falls through, as it always has, and the reply shows the size the file
@@ -381,6 +387,7 @@ fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsEr
         note(vol.create_file(parent, name, now_secs()));
     }
 
+    let mut grown = None;
     if r.flags & RESOLVE_TRUNCATE != 0 {
         // Shrink: free what is past the new end. Never combined with GROW — the two
         // move the allocator in opposite directions, so the flags are exclusive.
@@ -390,9 +397,13 @@ fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<(), FsEr
             Err(e) => note(Err(e)),
         }
     } else {
-        note(vol.grow_file(path, new_size as usize, now_secs()));
+        match vol.grow_file(path, new_size as usize, now_secs()) {
+            Ok(was) if was < new_size as u64 => grown = Some(was),
+            Ok(_) => {}
+            Err(e) => note(Err(e)),
+        }
     }
-    if refused { Err(FsError::ReadOnly) } else { Ok(()) }
+    if refused { Err(FsError::ReadOnly) } else { Ok(grown) }
 }
 
 /// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:
@@ -876,14 +887,16 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
     // SAFETY: DIR_BODY (read) and REPLY_MSG (write) are disjoint statics.
     unsafe {
         let body = core::slice::from_raw_parts((&raw const DIR_BODY) as *const u8, body_len);
-        let rs_len =
-            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_FILE_READ_DIR, request_id, RS_FLAG_REPLY, body, 0) {
-                Some(n) => n,
-                None => return,
-            };
+        // **Never a reply that goes nowhere**: one too long to send is answered with an error,
+        // and a send that fails is said, since its client is waiting for exactly this message.
+        let Some(rs_len) =
+            librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_FILE_READ_DIR, request_id, RS_FLAG_REPLY, body, 0)
+        else {
+            return reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32());
+        };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 0;
-        syscall5(
+        let sent = syscall5(
             SYS_CHANNEL_SEND,
             session_ch,
             (&raw const REPLY_MSG) as u64,
@@ -891,6 +904,9 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
             0,
             SENDMODE_NOBLOCK,
         );
+        if sent != 0 {
+            kprint(b"fs-server: a directory listing's reply would not send; its client waits\n");
+        }
     }
 }
 
@@ -1104,7 +1120,8 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             Err(e) => Served::Error {
                 reply_len: encode_error(reply, request_id, kerror(e).as_i32(), OP_NS_RESOLVE, reason(e)),
             },
-            Ok(()) => serve(vol, req, content, reply),
+            Ok(Some(was)) => serve_grown(vol, req, content, reply, was),
+            Ok(None) => serve(vol, req, content, reply),
         }
     };
 

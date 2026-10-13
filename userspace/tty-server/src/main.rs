@@ -100,8 +100,10 @@ fn sink_write(sink: Sink, bytes: &[u8]) {
     }
 }
 
-/// The most payload one message can carry, leaving room for both headers.
-const MAX_BODY: usize = MSG_LEN - PAYLOAD_OFF - 64;
+/// The most body one message can carry ([`librsproto::RS_MAX_BODY`]). It was the page less the IPC
+/// header and the handles, which left no room for the envelope: a full chunk would make a message
+/// the kernel refuses, and `send_output` drops a send that fails (Phase 6 Part H).
+const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 /// Send one `Tty::Output` message, **blocking if the emulator's ring is full**.
 ///

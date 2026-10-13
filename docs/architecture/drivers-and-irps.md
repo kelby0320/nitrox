@@ -32,7 +32,9 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > § "Flush" added 2026-09-24, with administration Part C.2. § "Module tiers" corrected 2026-10-02
 > (PR #353 review): its rule still made hot-pluggable drivers Tier 2, which Phase 6's decisions
 > reversed. § "A kernel thread that waits" added the same day, with Phase 6 Part A.2's hub thread.
-> § "A block driver behind a bus" added 2026-10-06, with Phase 6 Part D's USB disks.
+> § "A block driver behind a bus" added 2026-10-06, with Phase 6 Part D's USB disks. § "What a disk
+> has done" added 2026-10-08, with Phase 6 Part H.2's counters. The DMA section re-checked
+> 2026-10-09, when Part H.4 made the page cache read and write runs of pages sized by `max_frags`.
 
 ## Three concepts, kept distinct
 
@@ -367,9 +369,12 @@ PRDT). No bounce buffer, no copy.
 publishes it** — [`BlockBackend::max_frags`](../../kernel/src/io/block.rs). AHCI's is
 its command table's PRDT capacity: one page, 128 bytes of command FIS, 16 bytes per
 entry, so **248** entries ≈ 992 KiB of page-aligned transfer. `dispatch_block_irp`
-refuses a larger request with `InvalidArgument`; a partition inherits its disk's limit
-rather than declaring one; the ramdisk declares none (`u32::MAX`), having nothing
-fixed-size to overrun.
+refuses a larger request with `InvalidArgument`, and so does
+`dispatch_block_irp_into_frames`, the page cache's — whose fills and write-backs read
+the limit (`io::block::max_frags`) to size their runs of pages, a page a fragment, at
+most 256, since Phase 6 Part H.4. A partition inherits its disk's limit rather than
+declaring one; the ramdisk declares none (`u32::MAX`), having nothing fixed-size to
+overrun; USB storage's is 64.
 
 ### The RAM disk
 
@@ -450,6 +455,26 @@ a caller holding a block `DeviceNode` handle could make the driver write PRDT en
 past its own command table — after which the controller read descriptors from whatever
 followed and DMAed to the addresses it found there. Splitting a large transfer across
 several commands is the better answer and is `TODO(block-transfer-split)`.
+
+### What a disk has done
+
+*(Phase 6 Part H.2, 2026-10-08.)* **Each disk driver counts the commands it runs** into the counters
+on its disk's node (`kernel/src/io/stats.rs`): reads, writes and flushes that succeeded, commands
+that failed, the bytes moved, and the time each command was on the device — stamped where the
+driver issues it and taken where it retires, so the time an IRP waited in the driver's queue is
+not in it, and with one command at a time the sum is the device's busy time.
+- **AHCI** stamps slot 0's command as it issues it, and counts it where it retires, in the ISR and
+  in the boot's polled path alike.
+- **USB storage** stamps a command as it goes on the rings and counts it at its status wrapper; a
+  command the hub thread recovers counts as its outcome, with none of the recovery's time, which is
+  the hub thread's own commands.
+- **The RAM disk** times its copy.
+
+A partition's I/O is its disk's: the window forwards to the disk's driver, which counts it there.
+**The counters are on the node, not in the driver** — a driver holds its node's (`Counted`),
+attached once the node is registered — because a USB driver's slot goes to the next device to
+arrive and a node never does. `/dev/registry/io` serves them, with the page cache's
+([`device-node.md`](../spec/device-node.md) § *What the disks have done*).
 
 ## Module tiers
 

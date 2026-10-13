@@ -21,10 +21,11 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod block;
+pub mod cache;
 pub mod disk;
 pub mod serve;
 pub mod server;
 pub mod volume;
 
-pub use block::{BlockReader, BlockRun, BlockWriter, FsError, ReadOnly};
+pub use block::{BlockReader, BlockRun, BlockWriter, FsError, RUN_UNWRITTEN, ReadOnly};
 pub use volume::{DirEntry, Mapped, Refusal, Volume};

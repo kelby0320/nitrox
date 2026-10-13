@@ -179,7 +179,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
             return Err(FsError::NotFound);
         }
         let mut e = [0u8; 32];
-        self.r.read_at(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
+        self.r.read_meta(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
         let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
         let named = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
         if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || named != c {
@@ -205,7 +205,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
     fn raw_entry(&self, g: &Geometry, cache: &mut Cache, dir: Dir, slot: u32) -> Result<[u8; 32], FsError> {
         let at = dir::slot_byte(self.r, g, cache, dir, slot)?.ok_or(FsError::Corrupt)?;
         let mut e = [0u8; 32];
-        self.r.read_at(at, &mut e)?;
+        self.r.read_meta(at, &mut e)?;
         Ok(e)
     }
 
@@ -346,7 +346,8 @@ impl<'a, R: BlockReader> Fat<'a, R> {
 }
 
 /// **Zeroes written in runs**: ranges handed one at a time, written as each contiguous stretch of
-/// them ends or fills [`SPAN`].
+/// them ends or fills [`SPAN`]. What they cost a copy, a file's bytes written twice, is
+/// `TODO(grow-zeroes)` in `docs/rationale/deferred-decisions.md`.
 struct Zeroer<'f, W> {
     w: &'f W,
     at: u64,
@@ -420,7 +421,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             return Ok(None);
         }
         let mut s = [0u8; SECTOR as usize];
-        self.r.read_at(g.fsinfo as u64 * SECTOR as u64, &mut s)?;
+        self.r.read_meta(g.fsinfo as u64 * SECTOR as u64, &mut s)?;
         let sig = |at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
         Ok((sig(0) == 0x4161_5252 && sig(484) == 0x6141_7272 && sig(508) == 0xAA55_0000).then_some(s))
     }
@@ -563,12 +564,13 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Grow the file at `path` to `size` bytes**, what it adds reading as zeroes on the device:
     /// what its own clusters held past its end, and every cluster taken — as near its last one as
     /// the free space allows, so it stays in few runs. A size at or below the file's is nothing to
-    /// do; one past FAT's 4 GiB less a byte, or more than the volume has free, is `TooLarge`.
-    pub fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+    /// do; one past FAT's 4 GiB less a byte, or more than the volume has free, is `TooLarge`. **The
+    /// size the file had**, from which it reads as zero (Phase 6 Part H.4).
+    pub fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
         self.change(|g, cache| {
             let f = self.file(g, cache, path)?;
             if size <= f.size as usize {
-                return Ok(());
+                return Ok(f.size as u64);
             }
             let size = u32::try_from(size).map_err(|_| FsError::TooLarge)?;
             let (old, new_end) = (f.size as u64, size as u64);
@@ -616,7 +618,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if first != f.cluster {
                 self.ids.borrow_mut().put(first, f.dir, f.slot);
             }
-            Ok(())
+            Ok(old)
         })
     }
 
@@ -907,7 +909,7 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
         Fat::create_file(self, parent, name, now)
     }
 
-    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
+    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
         Fat::grow_file(self, path, size, now)
     }
 

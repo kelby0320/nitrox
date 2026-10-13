@@ -4,6 +4,7 @@
 //! - [`block`] — building/dispatching a block IRP through a device's
 //!   [`BlockBackend`](block::BlockBackend).
 //! - [`ramdisk`] — a RAM-backed block device for bring-up.
+//! - [`stats`] — what each block device has done, kept by its driver (Phase 6 Part H.2).
 //!
 //! The async model — `sys_io_submit` → `Irp` → device → completion IRQ → DPC →
 //! `PendingOperation` → `sys_wait` — is `docs/architecture/drivers-and-irps.md`.
@@ -13,6 +14,7 @@
 pub mod block;
 pub mod irp;
 pub mod ramdisk;
+pub mod stats;
 
 use crate::dpc::Dpc;
 use crate::libkern::handle::KObjectType;

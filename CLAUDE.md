@@ -76,6 +76,8 @@ cargo xtask check-storage  # that stick beside a copy of the release disk; the h
 cargo xtask check-media    # the live desktop: a stick plugged in, shown in Files, saved to, ejected
 cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
+cargo xtask throughput-stick # the stick Part H's copies are timed with, and the scripts that time them
+cargo xtask throughput-stick --check PATH # read it back: an image, or the stick where it is mounted
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -118,11 +120,18 @@ SATA disk the image boots from is the one record flagged `boot`. Since Part G **
 published with its size, and written past 2 TiB by `boot-probe` — the host finds the sector in the
 image, where a block number cut to 32 bits would have put it 2 TiB lower; and `boot-probe`'s
 `Reread`s, refused for a mounted device and the boot disk, and taken for the stick, whose partition
-the kernel's rescan replaces with the watch pinged though no mount changed.
+the kernel's rescan replaces with the watch pinged though no mount changed. Since Part H.2
+`boot-probe` holds the **I/O counters** to a write: a file synced on the scratch disk moves its
+written bytes and the page cache's write-backs in `/dev/devices/io.tsm` by at least the file's —
+and, since Part H.4, by no more than 40 writes, its data a run of pages an IRP and its zeroes
+64 KiB a write, with no read a page: what a grow added fills as zero without one, and the server
+reads its metadata once. A file the build put there reads back as written in at most eight reads,
+each fill reading up to 31 pages ahead.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 36 steps,
-expect-driven rather than sleep-driven.
+the real prompt over the serial console and matches on what comes back — 37 steps,
+expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
+line, of its shape, before the value it passes through.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
 a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell
@@ -519,7 +528,9 @@ refresh is first because the admin tools are UI surfaces. **The refresh is compl
 2026-09-22** — all eleven parts, A–K — and **administration as of 2026-09-30**, all seven parts,
 A–G, the last being an installer that runs in an ordinary session as the view broker's client.
 Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then
-**Phase 6 — USB**; then, before Phase 7, a **consolidation of the syscall surface**
+**Phase 6 — USB, complete as of 2026-10-13**, all eight parts, A–H, the last a copy to a USB stick
+timed against Linux on the same laptop; then, before Phase 7, a **consolidation of the syscall
+surface**
 (`docs/planning/syscall-surface.md`, planned 2026-10-08); 7–9 are the portable runtime,
 networking, and the browser. See `docs/decision-log.md` for the current implementation phase and
 `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

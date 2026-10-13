@@ -334,6 +334,181 @@ pub fn records(bytes: &[u8]) -> Result<Records<'_>, SnapshotError> {
     Ok(Records { bytes, count, next: 0, generation })
 }
 
+// --- `/dev/registry/io` (Phase 6 Part H.2) -----------------------------------------------------
+
+/// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
+pub const IO_MAGIC: u32 = 0x534F_4944;
+/// The I/O snapshot layout this build reads: 2 since the page cache counts the pages its fills
+/// bring in (Phase 6 Part H.4).
+pub const IO_VERSION: u32 = 2;
+
+/// The page cache's counters, since boot.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CacheCounts {
+    /// Fills that read the device, one IRP each — a page and those read ahead of it.
+    pub fills: u64,
+    /// Nanoseconds those fills took.
+    pub fill_ns: u64,
+    /// Fills over a hole, which read nothing.
+    pub hole_fills: u64,
+    /// Faults that found their page resident.
+    pub hits: u64,
+    /// Pages written back to their files' blocks.
+    pub writeback_pages: u64,
+    /// The write IRPs that carried them.
+    pub writeback_irps: u64,
+    /// Nanoseconds those IRPs took.
+    pub writeback_ns: u64,
+    /// The pages the fills brought in (version 2).
+    pub fill_pages: u64,
+}
+
+const _: () = assert!(size_of::<CacheCounts>() == 64);
+
+/// The start of an I/O snapshot: then `count` [`IoRecord`]s.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IoHeader {
+    /// [`IO_MAGIC`].
+    pub magic: u32,
+    /// [`IO_VERSION`].
+    pub version: u32,
+    /// How many records follow — the length, as in a registry snapshot.
+    pub count: u32,
+    /// `size_of::<IoRecord>()` as the kernel wrote it.
+    pub record_size: u32,
+    /// The page cache's counters.
+    pub cache: CacheCounts,
+}
+
+const _: () = assert!(size_of::<IoHeader>() == 80);
+const _: () = assert!(align_of::<IoHeader>() == 8);
+const _: () = assert!(offset_of!(IoHeader, cache) == 16);
+
+/// One disk's or RAM disk's counters, since it was registered.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct IoRecord {
+    /// Its registry id: its [`DeviceRecord`] is the one with this `id`.
+    pub id: u32,
+    /// [`DEPARTED`] when it has left; its counters stay.
+    pub flags: u32,
+    /// Reads that succeeded.
+    pub reads: u64,
+    /// Writes that succeeded.
+    pub writes: u64,
+    /// Flushes that succeeded.
+    pub flushes: u64,
+    /// Commands that failed.
+    pub errors: u64,
+    /// Bytes the reads moved.
+    pub read_bytes: u64,
+    /// Bytes the writes moved.
+    pub written_bytes: u64,
+    /// Nanoseconds commands were on the device.
+    pub busy_ns: u64,
+}
+
+const _: () = assert!(size_of::<IoRecord>() == 64);
+const _: () = assert!(align_of::<IoRecord>() == 8);
+const _: () = assert!(offset_of!(IoRecord, flags) == 4);
+const _: () = assert!(offset_of!(IoRecord, reads) == 8);
+const _: () = assert!(offset_of!(IoRecord, read_bytes) == 40);
+const _: () = assert!(offset_of!(IoRecord, busy_ns) == 56);
+
+impl IoRecord {
+    /// Whether the device has left.
+    pub fn is_departed(&self) -> bool {
+        self.flags & DEPARTED as u32 != 0
+    }
+}
+
+/// An I/O snapshot, read: the page cache's counters, and the records in table order.
+pub struct IoSnapshot<'a> {
+    /// The page cache's counters.
+    pub cache: CacheCounts,
+    bytes: &'a [u8],
+    count: usize,
+}
+
+impl IoSnapshot<'_> {
+    /// How many records it holds.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Record `i`, in table order.
+    pub fn get(&self, i: usize) -> Option<IoRecord> {
+        if i >= self.count {
+            return None;
+        }
+        let off = size_of::<IoHeader>() + i * size_of::<IoRecord>();
+        let b = &self.bytes[off..off + size_of::<IoRecord>()];
+        let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+        let w = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap_or([0; 4]));
+        Some(IoRecord {
+            id: w(0),
+            flags: w(4),
+            reads: q(8),
+            writes: q(16),
+            flushes: q(24),
+            errors: q(32),
+            read_bytes: q(40),
+            written_bytes: q(48),
+            busy_ns: q(56),
+        })
+    }
+
+    /// Every record, in table order.
+    pub fn iter(&self) -> impl Iterator<Item = IoRecord> + '_ {
+        (0..self.count).filter_map(|i| self.get(i))
+    }
+}
+
+/// Read `bytes`, as `/dev/registry/io` serves them — padding and all. **The header's count, not the
+/// page**, as for [`records`].
+pub fn io(bytes: &[u8]) -> Result<IoSnapshot<'_>, SnapshotError> {
+    if bytes.len() < size_of::<IoHeader>() {
+        return Err(SnapshotError::Short);
+    }
+    let word = |off: usize| u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+    if word(0) != IO_MAGIC {
+        return Err(SnapshotError::BadMagic);
+    }
+    if word(4) != IO_VERSION {
+        return Err(SnapshotError::BadVersion);
+    }
+    if word(12) as usize != size_of::<IoRecord>() {
+        return Err(SnapshotError::BadRecordSize);
+    }
+    let count = word(8) as usize;
+    let need = count
+        .checked_mul(size_of::<IoRecord>())
+        .and_then(|n| n.checked_add(size_of::<IoHeader>()))
+        .ok_or(SnapshotError::Truncated)?;
+    if need > bytes.len() {
+        return Err(SnapshotError::Truncated);
+    }
+    let q = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+    let cache = CacheCounts {
+        fills: q(16),
+        fill_ns: q(24),
+        hole_fills: q(32),
+        hits: q(40),
+        writeback_pages: q(48),
+        writeback_irps: q(56),
+        writeback_ns: q(64),
+        fill_pages: q(72),
+    };
+    Ok(IoSnapshot { cache, bytes, count })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +623,48 @@ mod tests {
         assert_eq!((r.id, r.kind()), (7, DeviceKind::Mouse));
         assert!(DeviceRecord::read(&buf[1..144]).is_none());
         assert!(DeviceRecord::read(&buf[1..146]).is_none());
+    }
+
+    /// **An I/O snapshot reads by its header's count**, each field at its offset — bytes laid out
+    /// by hand as the kernel's `repr(C)` writes them, not by this crate's own structs — and a
+    /// wrong magic, version, record size or count is refused.
+    #[test]
+    fn an_io_snapshot_reads_its_counted_records_and_refuses_the_rest() {
+        let mut page = [0u8; 4096];
+        let put32 = |p: &mut [u8], at: usize, v: u32| p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |p: &mut [u8], at: usize, v: u64| p[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        put32(&mut page, 0, IO_MAGIC);
+        put32(&mut page, 4, IO_VERSION);
+        put32(&mut page, 8, 2);
+        put32(&mut page, 12, 64);
+        for (k, v) in [11u64, 12, 13, 14, 15, 16, 17, 18].iter().enumerate() {
+            put64(&mut page, 16 + 8 * k, *v);
+        }
+        for (n, id) in [(0usize, 3u32), (1, 4)] {
+            let at = 80 + n * 64;
+            put32(&mut page, at, id);
+            put32(&mut page, at + 4, if n == 1 { DEPARTED as u32 } else { 0 });
+            for k in 0..7 {
+                put64(&mut page, at + 8 + 8 * k, (id as u64) * 100 + k as u64);
+            }
+        }
+        let snap = io(&page).unwrap();
+        assert_eq!(snap.len(), 2, "two, though the page holds room for sixty");
+        assert_eq!((snap.cache.fills, snap.cache.writeback_ns, snap.cache.fill_pages), (11, 17, 18));
+        let r: [IoRecord; 2] = [snap.get(0).unwrap(), snap.get(1).unwrap()];
+        assert_eq!((r[0].id, r[0].reads, r[0].busy_ns, r[0].is_departed()), (3, 300, 306, false));
+        assert_eq!((r[1].id, r[1].read_bytes, r[1].is_departed()), (4, 404, true));
+        assert_eq!(snap.iter().count(), 2);
+
+        let refused = |at: usize, v: u32| {
+            let mut p = page;
+            put32(&mut p, at, v);
+            io(&p).err()
+        };
+        assert_eq!(refused(0, REGISTRY_MAGIC), Some(SnapshotError::BadMagic), "a registry snapshot is not one");
+        assert_eq!(refused(4, 1), Some(SnapshotError::BadVersion), "the layout before fill_pages");
+        assert_eq!(refused(12, 144), Some(SnapshotError::BadRecordSize));
+        assert_eq!(refused(8, 64), Some(SnapshotError::Truncated), "more than the page holds");
+        assert_eq!(io(&page[..79]).err(), Some(SnapshotError::Short));
     }
 }

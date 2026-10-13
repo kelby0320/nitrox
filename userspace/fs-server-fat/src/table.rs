@@ -86,7 +86,7 @@ impl Cache {
     /// Read FAT sector `sector` into slot `i`.
     fn load<R: BlockReader>(&mut self, r: &R, g: &Geometry, i: usize, sector: u32) -> Result<usize, FsError> {
         self.slots[i].sector = u32::MAX;
-        r.read_at(g.fat_byte(0) + sector as u64 * SECTOR as u64, &mut self.slots[i].data)?;
+        r.read_meta(g.fat_byte(0) + sector as u64 * SECTOR as u64, &mut self.slots[i].data)?;
         self.slots[i].sector = sector;
         self.slots[i].used = self.clock;
         Ok(i)
@@ -326,12 +326,14 @@ impl Cache {
         Err(FsError::TooLarge)
     }
 
-    /// **Free the chain from `first`**, every cluster of it, bounded as a walk is.
+    /// **Free the chain from `first`**, every cluster of it, bounded as a walk is. A freed cluster
+    /// is forgotten by a metadata cache, since it may next be a file's (Phase 6 Part H.4).
     pub fn free_chain<RW: BlockReader + BlockWriter>(&mut self, rw: &RW, g: &Geometry, first: u32) -> Result<(), FsError> {
         let mut c = first;
         for _ in 0..g.clusters {
             let next = self.next_rw(rw, g, c)?;
             self.set(rw, g, c, 0)?;
+            rw.forget(g.cluster_sector(c) * SECTOR as u64, g.cluster_bytes() as u64);
             match next {
                 Next::Cluster(n) => c = n,
                 Next::End => return Ok(()),

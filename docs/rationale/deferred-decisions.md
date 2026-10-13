@@ -309,7 +309,8 @@ per-fault re-resolution showing up in profiles. The page cache is built behind a
 **fill-producer seam** so the **Model-A** extent fill (Phase 3, zero-copy block reads)
 slots in *alongside* `ReadRange` without a redesign.
 
-**Demand-fault fill: one page per fault, no read-ahead.** The kernel fills **exactly one
+**Demand-fault fill: one page per fault, no read-ahead** — implemented for Model A by Phase 6
+Part H.4 (below). The kernel filled **exactly one
 4 KiB page per fault** (`FileObject::fault_in_page` reserves a single index). What that
 costs depends on which data path the filesystem uses, and the two are very different:
 
@@ -373,6 +374,13 @@ most of what read-ahead would buy here and is the thing to do first. **New trigg
 read-ahead: after demand-paged program text lands**, when what remains is genuinely fill cost.
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
 scheduling rather than a trigger.
+
+> **Implemented for Model A** (2026-10-09, Phase 6 Part H.4), on Part H's measurement rather than
+> boot's: a copy of a 256 MiB file on the laptop read it a page a command, 65,536 of them. A fault
+> now reads up to 31 pages ahead of its own in the same IRP — not resident, inside the file, next on
+> the device, within the device's fragment limit — each reserved on the fault's `PendingOperation`
+> (`FileObject::begin_fill`), and a write-back writes a run of pages an IRP. Model B still fills a
+> page a `ReadRange`, and has no consumer.
 
 **A departed USB device keeps its record — `TODO(usb-departed-records)`.** Phase 6 Part A registers
 a node and a record for every arrival, and a record's id is its place, which `/dev/registry/<id>`
@@ -1077,6 +1085,10 @@ additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised
 > the kernel** into the same `InputEvent` records the PS/2 driver emits, as PS/2 decodes scancodes
 > there (Phase 6 Parts B and C). **HID report descriptors** stay deferred, until a device needs one
 > — a tablet, extra keys. Multitouch and gestures stay deferred with them.
+>
+> **Narrowed twice** (Phase 6 Parts B.3 and B.7): a mouse's report descriptor is read for its wheel,
+> and since 2026-10-13 a keyboard's for its keys — a Corsair K70 answers boot protocol and sends its
+> NKRO bitmap regardless. A tablet's, media keys and extra keys stay deferred.
 
 **Input: `EV_ABS` device-space → screen-space mapping.** Absolute coordinates are meaningless
 without knowing the device's resolution and the screen's, and nothing decides who maps them.
@@ -1689,28 +1701,23 @@ an htree directory index, or simply a per-directory "first block with room" hint
 across inserts. Trigger: bulk directory creation on a real path — `copy -r` of a large
 tree, or unpacking a package into the store.
 
+> **Narrowed** (2026-10-09, Phase 6 Part H.4): the trigger fired — Part H copied 4,096 files into
+> one directory — and the re-reads were the cost; the server now caches its metadata
+> (`libfsserver::cache`), so a directory's blocks are read from the device once and the scan is
+> memory. On the laptop that copy is busy on the device for 37.9 of its 42.3 s, so the scan is no
+> longer what dominates; an index or a hint stays the fix for when it is.
+
 **ext4 write-path gaps (`fs-server-ext4`).** The write path is deliberately partial, and
 these are the pieces still missing. They were previously recorded only in the crate's
 `CLAUDE.md` — which is precisely how three other deferrals went unreviewed (the 2026-07-24
 audit) — so they are mirrored here.
 
-- **Extent-tree splitting / index nodes (depth > 0).** `i_block` holds four inline leaf
-  extents; a file or directory needing a fifth non-contiguous extent gets `Unsupported`.
-  Measured boundary on 4 KiB blocks (2026-07-29): creating **empty files** in one directory
-  is unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
-  extent covers them), while creating **subdirectories** stops at **~814**, because each
-  `mkdir` allocates the child's own block between the parent's and so fragments it. **Files
-  with data stop there too**: host probes on a fresh filesystem (the PR #370 review's, and its
-  author's) were refused at about the 815th of 4,096 files of 16 KiB, since each file's data lands
-  between the directory's growth blocks as a subdirectory's block does. **Triggered** by Part H's
-  own fixture, and met by any folder of a thousand photos copied to `/home`. **Scheduled**
-  (2026-10-08, the maintainer's call): Phase 6 Part H, before the laptop's runs
-  ([`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*).
 - **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
 
-**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`, undiagnosed.**
+**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`** — closed by Phase 6 Part
+H (2026-10-13); undiagnosed when filed.
 Observed on the laptop, 2026-09-17, copying and then deleting about 180 MB under `/home`:
 both are slower than a 5400 rpm disk accounts for, and both get worse with larger directories
 (maintainer). **This is the first time either has run against real storage** — every previous
@@ -1738,6 +1745,55 @@ first time somebody is waiting on it, or the next phase that moves bulk data —
 > `time` and I/O counters, the laptop measured beside Linux on the same machine, and the cost that
 > dominates fixed and measured again — below the syscall surface. Extent trees in `fs-server-ext4`
 > come first (after the PR #370 review), since a directory of the files it copies needs them.
+>
+> **Measured** (2026-10-09, Part H.3): 6.7 times Linux's time on the laptop over fifteen runs, 12 to
+> 67 times on its hard drive — device-bound, one 4 KiB command at a time, ext4 spending twelve a
+> block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
+> those twelve gone. **The second**: what a grow adds is not read back (`UNWRITTEN`). **The third**:
+> each server caches its metadata (`libfsserver::cache`), so a directory is read once — under QEMU
+> the four sets went from about 1,645 s to 186. **Measured again** (2026-10-09): 1,362 s against
+> Linux's 889 over the fifteen runs, 1.53 times; what was left was a big file's bytes, 4 KiB a
+> command. **The fourth**: more than a page a command — fills read ahead, a write-back writes a run
+> of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
+> 124. **Measured again** (2026-10-13): 647 s, 0.73 times Linux's 889, a geometric mean of 1.35 over
+> the runs. Left: the zeroes, a big file's bytes written twice, and ext4's metadata written through
+> a file at a time.
+>
+> **Closed** (2026-10-13, Part H.5, the maintainer's call): the number is the laptop's run as it
+> stands, written into Phase 6's Definition of Done — copying to the stick within the ratios to
+> Linux measured that day. The two costs left are filed as their own deferrals, below:
+> `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`.
+
+**A grow writes zeroes over what it adds — `TODO(grow-zeroes)`.** Both servers zero every block a
+grow allocates, ext4 since administration Part C.1 and FAT from its first version, because a page
+the kernel does not hold used to fill from the device, and a new range must read as zero rather than
+as whatever those blocks last held. Since Phase 6 Part H.4 a grow's reply marks those blocks
+`UNWRITTEN` and the kernel fills them as zero without reading the device, so the zeroes now protect
+one thing only: **what a crash between the grow and the write-back leaves in the file** — zeroes,
+where without them it would be another file's old bytes. The cost: a copied file's bytes cross the
+device twice. On the laptop (2026-10-13) copying `big` to the stick wrote 512.6 MiB for 256, half of
+it FAT's zeroes, and took 1.65 times Linux's time where the stick itself wrote faster than Linux
+drove it; within the disk a third of what moved was ext4's zeroes. Without them, by the busy times,
+`big` to the stick would take about 35 s against Linux's 37. **The remedies differ by filesystem**:
+ext4 has **unwritten extents** — allocated, flagged, read as zero and converted at write-back, the
+second fix's piece 2 in `phase-6-usb.md` — which keep the crash guarantee; FAT has nothing like
+them, so not zeroing there is a choice about what a crash may expose. Linux's `cp` pays none of
+this, since it writes a file in order and its filesystems allocate as the bytes arrive. **Trigger**:
+a number that needs a big file's copy faster, or a filesystem that should not pay for its bytes
+twice.
+
+**ext4 writes its metadata through, a file at a time — `TODO(ext4-metadata-writes)`.** Every change
+a create, a grow, a rename or a removal makes — the inode, the bitmaps, the group descriptor, the
+superblock, the directory block — is written to the device as it is made, one 4 KiB command each,
+and read back through a 1 MiB cache. On the laptop (2026-10-13) copying 4,096 files of 16 KiB within
+the disk cost 9.2 reads and 13 writes a file at 0.42 ms each, 4.6 times Linux's time, and removing
+them 6.2 reads and 9 writes a file, 6.8 times. Linux keeps that metadata in memory and writes it
+back later in large batches, its journal ordering the batches so a crash leaves a consistent
+filesystem. **A batch here needs the same ordering**, which without the journal (deferred above,
+with `metadata_csum`) means either accepting more of what an unclean shutdown can leave, or building
+the journal first. A larger cache would remove some of the reads and none of the writes.
+**Trigger**: many small files on a real path — a package unpacked into the store, a large tree
+restored — or the journal itself.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
@@ -2290,6 +2346,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Extent-tree splitting and index nodes (`fs-server-ext4`) | 2026-10-08 | **Phase 6 Part H.1**, `userspace/fs-server-ext4/src/extent.rs`: a tree appended to, split and deepened as ext4's own appends leave one, cut and folded back into the inode, and freed whole, at any depth; held to `debugfs`' reading of every map and to `e2fsck -fn`. **The trigger arrived on review**: the entry said creating *files* in one directory was unbounded, which held for empty files only — with data, the PR #370 review's probe and its author's stopped at about the 815th, and Part H's tree to copy holds 4,096. Checking it found four more in the same code, fixed with it: a removed file with a tree freed nothing, a failed grow kept every block it took, a 32,768-block extent read as a hole, and an unwritten extent as its blocks' old contents ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md) § *The extent tree*). |
 | Saying why a stick did not mount (`unmounted-why`) | 2026-10-07 | **The storage table's `note` column, Phase 6 Part G** — why a filesystem found is not mounted, in the words of the service's log line, which comes from the same function; `disk --list` shows it. Files does not: its Drives lists mounts, and a stick that needs formatting is formatted with `with admin disk --format`. [`storage.md`](../architecture/storage.md) §9. |
 | Read-write FAT | 2026-10-06 | **`fs-server-fat`, Phase 6 Part E** — FAT12, FAT16 and FAT32 read-write with long names, on `libfsserver`'s protocol beside `fs-server-ext4`. The trigger arrived from another direction than the one the entry named, a USB stick rather than an ESP update (2026-09-10), and the read-only first step was skipped, since a stick is written to. Files are mapped in 512-byte sectors and named by their first cluster; clusters under a page are refused, so no Nitrox ESP is served (`TODO(fat-small-clusters)`); the storage service mounts a FAT on a removable disk alone. [`fat-fs-server.md`](../architecture/fat-fs-server.md). |
 | A grace period for `with` (`view-grace`) | 2026-10-01 | **Remembered per session, terminal and view, for five minutes** — the laptop polish's Part A. `with` sends a one-time `Tty::Token` from its terminal and the broker redeems it with `tty-server` over its own channel, so a caller cannot claim another terminal; a refused password, `with --forget` and the session's end forget it. `boot-probe` holds the forgery control. |

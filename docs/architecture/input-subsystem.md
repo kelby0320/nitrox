@@ -75,7 +75,9 @@ Each of those pushes on a different seam, and the seams are not in the same plac
 
 - **HID report descriptors are a parsing problem**, not a device problem. A descriptor is
   close to a bytecode; parsing one in ring 0 to find out where the X axis lives is an
-  attack surface with no upside.
+  attack surface with no upside. *(Since Phase 6 Parts B.3 and B.7 the kernel parses a mouse's
+  and a keyboard's all the same, the USB stack being a kernel driver: one small walk, every length
+  a device states checked, reading only what those two need — [`usb.md`](usb.md).)*
 - **Pointer acceleration, tap-to-click and palm rejection are policy**, and the argument is
   already settled in this project for a weaker case: `display-substrate.md` §5 puts
   keycode→character in userspace because "a keyboard layout should not be a kernel
@@ -426,7 +428,8 @@ sandboxed compositor a construction rather than a feature.
   Tier 1 kernel driver, so its keyboard and mouse decode boot-protocol reports into this record
   format in the kernel, as the PS/2 driver decodes scancodes; decoding in `input-server` would have
   put a second format before it. A mouse's report descriptor is read for its wheel since Part
-  B.2; a tablet and extra keys stay deferred.
+  B.3, and a keyboard's for its keys since Part B.7 — a Corsair K70 sends a bitmap whatever
+  protocol it is asked for; a tablet, media keys and extra keys stay deferred.
 - **Multitouch slots, gesture recognition.** Land in the `input-server` or `libinput` when there is
   hardware to justify them. Neither requires a kernel change, which is the point of the
   arrangement.

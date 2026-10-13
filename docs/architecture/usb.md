@@ -1,8 +1,9 @@
 # USB
 
 **Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05),
-Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06), and
-Part G's sixteen-byte commands and rescan (2026-10-07)**
+Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06),
+Part G's sixteen-byte commands and rescan (2026-10-07), Part H.2's counters (2026-10-08), and
+Part B.7's keyboards read by their report descriptors (2026-10-13)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
@@ -101,7 +102,11 @@ TRB's address, a transfer by its slot and its Status stage's address — *before
 so no completion can arrive first. The DPC takes a matching record out under a lock and completes
 its operation after releasing it, since completing takes the scheduler's lock and no leaf lock may
 be held across that. A transfer is ended by its Status stage, or by an error on any stage; a short
-Data stage is passed over, since its Status stage follows. **On a timeout the thread takes the
+Data stage is passed over, since its Status stage follows — **but what it fell short by is kept**
+(Phase 6 Part B.7): an IN Data stage interrupts on a short packet, its event leaves its residual on
+the record, and the Status stage completes the transfer with it, so `control_in` returns the bytes
+that came. Until then a device that sent less than asked read as zeroes where the rest should be.
+**On a timeout the thread takes the
 record back**; if the DPC already took it, its completion is on the way and is waited for, so the
 DPC never completes an operation the thread has dropped.
 
@@ -195,32 +200,39 @@ interface becomes an input node. In order:
 2. **`SET_CONFIGURATION`**, after Configure Endpoint, which is Linux's order: the controller has
    the bandwidth before the device is told. It is the first request with no data stage, which
    `control_out` sends.
-3. **A mouse's report descriptor** (B.3), from the interface, for the length its HID descriptor
-   gives.
-4. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse; boot
-   protocol for every keyboard and any other mouse. A keyboard that refuses boot protocol is not
-   bound. A mouse that refuses report protocol is in it already, a device's state after a reset.
-5. **`SET_IDLE (0)`** to a keyboard, so it reports a change and not a held state. A refusal is
-   passed over: an unchanged report decodes to nothing.
+3. **A keyboard's `SET_IDLE (0)`**, so it reports a change and not a held state — before its report
+   descriptor since B.7, which is Linux's order (`usbhid_parse`). A stall is passed over: an unchanged
+   report decodes to nothing.
+4. **Its report descriptor** — a mouse's since B.3, a keyboard's since B.7 — from the interface,
+   for the length its HID descriptor gives. **A stall, or an answer shorter than the descriptor, is
+   asked again**, up to four times with 100 ms between, as Linux asks (`hid_get_class_descriptor`):
+   a Corsair K70 plugged in after boot sent its descriptor without its first 64-byte packet, where
+   one plugged in before boot sent it whole.
+5. **`SET_PROTOCOL`**: report protocol for a mouse whose descriptor describes a plain mouse, and for
+   a keyboard whose descriptor this driver reads (B.7); boot protocol for any other. A device that
+   refuses boot protocol is not bound. One that refuses report protocol is in it already, a
+   device's state after a reset.
 6. **A node**, registered under the device's record, and **one Normal TRB** queued, for the
    endpoint's maximum packet, interrupting on completion and on a short packet.
 
 **What ends a binding.** A failure in step 1 or 2 is the device's, and ends every interface's. In
 steps 3 to 6:
 - **a stall is that interface's**: its endpoint stays configured and is never polled, and the
-  others go on. A stalled report descriptor runs the mouse in boot protocol;
+  others go on. A report descriptor that never comes back whole runs the device in boot protocol;
 - **any other failure on the default endpoint ends the binding there**, since the request may still
   be on the endpoint's ring (`control_in`'s rule, which enumeration keeps by ending the device). So
   nothing more is asked of it: that interface is not bound, nor any after it, and those before it
-  stay bound, on their own endpoints. A keyboard whose `SET_IDLE` fails so is past its last request,
-  and is bound, the last (PR #358 review);
+  stay bound, on their own endpoints — a keyboard whose `SET_IDLE` fails so among them, since B.7
+  moved it before the descriptor (it was the last request, and its keyboard bound, PR #358 review);
 - running out of nodes or table room is that interface's alone.
 
 **Polling is the DPC's.** A Transfer Event for any endpoint but the default one goes to the table
 of bound endpoints, by slot and Device Context Index. On success or a short packet:
 - the report — the TRB's length less the residual — is copied out of its buffer;
-- it is decoded against the endpoint's last report (`kernel/src/drivers/hid/`), and the events go
-  to the node's ring, stamped at the MSI's interrupt tail;
+- it is decoded against what the device held after its last (`kernel/src/drivers/hid/`), and the
+  events go to the node's ring, stamped at the MSI's interrupt tail — **in batches** when one report
+  changes more keys than a batch holds, twenty (B.7), each decoded under the table's lock and pushed
+  after it;
 - the same TRB is queued again with a doorbell;
 - a read parked on the node is completed, as the PS/2 driver's are, through `drivers::input`.
 
@@ -238,14 +250,27 @@ what changed. A `SYN_DROPPED` would make the input layer forget every held modif
 review).
 
 **The reports** (`drivers::hid`, which knows nothing of USB):
-- **A keyboard's** eight bytes, against the last report: releases first, keys then modifiers, then
-  presses, modifiers then keys, then `SYN_REPORT`. Usages become keycodes through a table beside
-  the PS/2 driver's scancode table, evdev's numbering; a usage with no keycode is dropped. A report
-  of `ErrorRollOver` is not kept, since decoding it would release every held key.
+- **A keyboard's**, by its layout (B.7): read into the set of the Keyboard page's usages it holds —
+  keys and modifiers alike, the modifiers being 0xE0–0xE7 — and decoded against the set before:
+  releases first, keys then modifiers, then presses, modifiers then keys, then `SYN_REPORT`. Usages
+  become keycodes through a table beside the PS/2 driver's scancode table, evdev's numbering; a
+  usage with no keycode changes the set and gives no event. A report of `ErrorRollOver` is not kept,
+  since decoding it would release every held key, nor is one under another report ID — a Corsair
+  K70's media keys and mouse arrive on its keyboard's endpoint as reports 2 and 5. In boot protocol
+  the layout is fixed: the modifiers' byte, a reserved one, and six slots. **In report protocol it
+  is the report descriptor's**: the first application collection whose usage is *Keyboard* or
+  *Keypad*, and in it one input report's Keyboard-page fields — a bit each, as the modifiers and an
+  NKRO keyboard's bitmap are, in up to four runs, or one array of slots, each a usage counted from
+  its logical minimum — with the report ID before them when the device numbers its reports. A key
+  field it does not read, or keys past a report a TRB carries, leaves boot protocol. **Why every
+  keyboard with such a descriptor is read by it**: a Corsair K70 RGB MK.2 answers `GET_PROTOCOL`
+  boot and sends its 21-byte bitmap report whatever it is asked (found on the laptop, 2026-10-13);
+  read as a boot report, its report ID was Control held and its `a` an `m`.
 - **A mouse's**, by its layout: where its buttons, X, Y and wheel are. Button changes, then
   `REL_X`, `REL_Y` and `REL_WHEEL` when non-zero, then `SYN_REPORT` — the PS/2 driver's shape. In
   boot protocol the layout is fixed: three buttons, then X and Y as signed bytes, and no wheel. **In
-  report protocol it is the report descriptor's** (B.3), read by a small parser:
+  report protocol it is the report descriptor's** (B.3), read by a small parser — one walk of the
+  items, which the keyboard's reader shares (B.7), every length a device states checked there:
   - it reads short items only, within the descriptor's length, and finds the first application
     collection whose usage is *Mouse* or *Pointer*;
   - in one input report it finds the buttons, relative X and Y, and the wheel, with the report
@@ -277,8 +302,8 @@ exists. It asked the i8042 alone until B.2, and on a machine without one it held
 every keyboard's ring when it ends.
 
 **Departure** (Part C), in the hub thread, in this order:
-1. **what each bound interface holds is released**: a keyboard's last report decoded against an
-   empty one, its keys then its modifiers; a mouse's held buttons from its decoder's state, which
+1. **what each bound interface holds is released**: a keyboard's held keys against none, its
+   keys then its modifiers, in batches when it held more than one batch's (B.7); a mouse's held buttons from its decoder's state, which
    works whatever its report ID. QEMU sends nothing for a key held when its device goes, so this is
    the only release there is;
 2. **its endpoints leave the DPC's table**, so the DPC cannot touch a report buffer the release is
@@ -298,8 +323,11 @@ every keyboard's ring when it ends.
 leaves for the hub thread, since the default endpoint is the thread's: a request is one control
 transfer at a time, waited for. The write waits in a slot per node, a later one replacing it, and
 the thread is woken. It sends a **`SET_REPORT`** to the keyboard's interface — an Output report,
-type 2, with no report ID — with the byte as its one-byte Data stage, OUT, then an IN Status stage,
-and completes the write with how that went:
+type 2, with the report ID its descriptor gives the lights, `0` for none (B.7) — with the byte as
+its Data stage, after the ID when there is one, OUT, then an IN Status stage, and completes the
+write with how that went. **A keyboard whose descriptor puts Num, Caps and Scroll Lock anywhere but
+its output report's first three bits takes no lights**: a write to it is refused `IoError`, as for
+one in doubt below. Otherwise:
 - acknowledged: done, and the first time per keyboard a line, `usb: port 9: keyboard lights
   acknowledged`;
 - a stall: the default endpoint is recovered and the write fails, `IoError`;
@@ -311,8 +339,13 @@ and completes the write with how that went:
 ends a binding*): a write to one is refused at once, `IoError`, as it is to one whose lights
 request went unanswered.
 
-**The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, boot
-protocol`, and `usb: port 10: mouse at /dev/input/raw/3, report protocol, with a wheel`.
+**The log** adds a line per bound interface: `usb: port 9: keyboard at /dev/input/raw/2, report
+protocol` — `, its keys a bitmap` for one like the K70 — and `usb: port 10: mouse at
+/dev/input/raw/3, report protocol, with a wheel`. **One in boot protocol says why** (B.7): it has
+no report descriptor, its descriptor never came back whole, or its descriptor is not one this driver
+reads, with its length and first bytes; and a descriptor that took more than one try says which
+read it whole, and how many before it came back short or stalled. A session reads these with `with admin log --kernel`
+([`logging.md`](logging.md) § *Relationship to the kernel log*).
 
 ## Mass storage (Part D)
 
@@ -403,6 +436,13 @@ slot is disabled, since until then the controller may still move its data. **The
 slots under an epoch**, as the input nodes are: a handle to a departed stick's node is refused
 rather than served the next stick's. Each publish leaks its partition windows, as at boot
 (`TODO(usb-departed-records)`).
+
+**A disk's commands are counted** (Part H.2) into its node's counters: each stamped as it goes on
+the rings and counted at its status wrapper, so a command's time is the stick's, not its wait in the
+queue; a command the hub thread recovers counts as its outcome, with none of the recovery's time. A
+unit's counters are attached as it is published, and are the node's, so the next device in the
+slot starts its own ([`drivers-and-irps.md`](drivers-and-irps.md) § *What a disk has done*). The
+hub thread's own commands — the table read where a disk arrives — are not counted.
 
 **A stick pulled while mounted**, end to end: its I/O fails `PeerClosed` at once; the storage
 service, told by the device manager, tears its mount down ([`storage.md`](storage.md) §6a); the

@@ -340,6 +340,10 @@ const POWER_GRANT: &[u8] = b"/dev/power";
 const LOG_READ_ENDPOINT: &[u8] = b"/log/read-endpoint";
 /// Where the `logs` grant is bound in a view.
 const LOGS_GRANT: &[u8] = b"/dev/logs";
+/// **The kernel's log**, where the root namespace binds it and where the `kernel-log` grant binds a
+/// snapshot of it in a view (Phase 6 Part B.7): one path, so `log --kernel` reads where a program in
+/// the root namespace would.
+const KERNEL_LOG: &[u8] = b"/dev/log";
 /// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
 /// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
@@ -1409,6 +1413,34 @@ impl Broker {
                     if !bound {
                         close(view_ns);
                         return fail(self, &mut p, "the logging service's read endpoint is not there to grant");
+                    }
+                }
+                // **Reading the kernel's log** (Phase 6 Part B.7): the kernel answers a resolve of
+                // `/dev/log` with a fresh snapshot, so the one taken here is the log as this view
+                // is made, bound at the same path as a direct handle — readable and sizeable, and
+                // nothing more.
+                Grant::KernelLog => {
+                    let snapshot = ns_lookup(self.root_ns, KERNEL_LOG, RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER);
+                    // SAFETY: a namespace this broker made, a valid path, and a handle it holds — a
+                    // direct-handle bind, so no subtree base.
+                    let result = match snapshot {
+                        0 => -1,
+                        _ => unsafe {
+                            let (p, l) = (KERNEL_LOG.as_ptr() as u64, KERNEL_LOG.len() as u64);
+                            syscall6(SYS_NS_BIND, view_ns, p, l, snapshot, 0, 0)
+                        },
+                    };
+                    // **A caller whose namespace binds `/dev/log` already keeps its own**: it reads
+                    // the kernel's log without the grant, as `boot-probe`'s does, and a bind over a
+                    // bound path is refused.
+                    let bound = result == 0 || result == KError::AlreadyExists.as_i32() as i64;
+                    if snapshot != 0 {
+                        // The bind took its own reference.
+                        close(snapshot);
+                    }
+                    if !bound {
+                        close(view_ns);
+                        return fail(self, &mut p, "the kernel's log is not there to grant");
                     }
                 }
                 // **Setting the clock** (administration Part E.5): `SYSTEM_CLOCK` in the spawn

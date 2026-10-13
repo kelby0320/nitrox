@@ -12,6 +12,16 @@ pub trait BlockReader {
     /// failed read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError>;
 
+    /// **Read metadata**: bytes only this server writes — a directory, an inode table, a bitmap, a
+    /// group descriptor, a superblock, an extent node, a FAT — which may be answered from a cache
+    /// ([`crate::cache::MetaCache`], Phase 6 Part H.4). **Never a file's data**, which the kernel
+    /// writes to the device behind the server's back: read that with [`read_at`](Self::read_at). A
+    /// read left as `read_at` is only slower; one wrongly made here could be stale. By default, a
+    /// read.
+    fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.read_at(offset, buf)
+    }
+
     /// Whether this is a **read-only mount** — `true` only for [`ReadOnly`]. What the block-file
     /// reply marks a file with comes from here, so the mark and the refusal of every write are
     /// one fact, the type the server serves through.
@@ -54,6 +64,25 @@ pub enum FsError {
 /// read-write server implements it over `sys_io_submit` writes.
 pub trait BlockWriter {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
+
+    /// **Write `len` zeroes from `offset`** — what a grow writes over the blocks it allocates. A
+    /// device that can moves them in large commands ([`crate::disk::Disk`]: 64 KiB a command, Phase
+    /// 6 Part H.4); by default, a 4 KiB `write_at` at a time.
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        static ZERO: [u8; 4096] = [0; 4096];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(ZERO.len() as u64) as usize;
+            self.write_at(offset + done, &ZERO[..n])?;
+            done += n as u64;
+        }
+        Ok(())
+    }
+
+    /// **`len` bytes from `offset` are no longer metadata** — freed, so they may become a file's
+    /// data, which the kernel writes behind the server's back: a cache lets them go (Phase 6 Part
+    /// H.4). By default, nothing.
+    fn forget(&self, _offset: u64, _len: u64) {}
 }
 
 /// **A read-only mount** (administration Part C.3): reads pass through to the device, and every
@@ -68,6 +97,10 @@ pub struct ReadOnly<'a, R: BlockReader>(pub &'a R);
 impl<R: BlockReader> BlockReader for ReadOnly<'_, R> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         self.0.read_at(offset, buf)
+    }
+
+    fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.0.read_meta(offset, buf)
     }
 
     fn read_only(&self) -> bool {
@@ -92,3 +125,9 @@ pub struct BlockRun {
     pub length: u32,
     pub flags: u32,
 }
+
+/// [`BlockRun::flags`] bit 0, **`UNWRITTEN`**: the run's blocks read as zero, so the kernel fills a
+/// page of them without reading the device, and writes it back to them as to any other. The server
+/// loop sets it on what a grow just added, in that grow's reply only (Phase 6 Part H.4,
+/// `docs/spec/rsproto-block-ops.md`).
+pub const RUN_UNWRITTEN: u32 = 1 << 0;

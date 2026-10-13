@@ -1,16 +1,24 @@
-//! `log` — read the service log back (administration Part E.6).
+//! `log` — read a log back: the service log (administration Part E.6), or the kernel's (Phase 6
+//! Part B.7). **The system's log viewer**, a source an option: `--kernel` today, and `--service`
+//! and `--application` when what tells them apart in the service log is designed.
 //!
 //! ```text
-//! with admin log               # every record the logging service still holds
-//! with admin log view-broker   # one principal's: here, the view broker's, its audit among them
+//! with admin log                              # every record the logging service still holds
+//! with admin log view-broker                  # one principal's: the view broker's, its audit too
+//! with admin log --kernel | last 20           # the kernel's log, its last twenty lines
+//! with admin log --kernel | filter message ~= /usb/
 //! ```
 //!
-//! **It needs the `logs` grant**, which binds the logging service's read endpoint at `/dev/logs`;
-//! a resolve there opens a read session, on which `Log::Read` answers from the service's ring
-//! (`rsproto-log-ops.md`). Without it `/dev/logs` is not there, and `log` says to use `with`.
-//! `/dev/log` is the kernel's own log, which this does not read.
+//! **The service log needs the `logs` grant**, which binds the logging service's read endpoint at
+//! `/dev/logs`; a resolve there opens a read session, on which `Log::Read` answers from the
+//! service's ring (`rsproto-log-ops.md`). **The kernel's needs the `kernel-log` grant**, which binds
+//! a snapshot of the kernel's `/dev/log` at the same path, taken as the view is made. Without a
+//! grant its path is not there, and `log` says which grant to ask `with` for.
 //!
-//! It emits `Table<{sequence, time, principal, tier, level, message}>`, oldest first:
+//! **One table shape for every source**, so a pipeline reads any of them alike:
+//! `Table<{sequence, time, principal, tier, level, message}>`, oldest first. A kernel row is a line
+//! of the kernel's log: its `principal` is `kernel`, its `sequence` its line's place in the log, and
+//! its `time`, `tier` and `level` null, which the kernel's lines do not carry. A service row:
 //! - `sequence` — the logging service's count, which orders the records: `time` can step.
 //! - `time` — the wall clock when the service took the record, in Unix epoch seconds as `list`'s
 //!   `modified` is; null for one taken while the clock was not set.
@@ -32,7 +40,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::parse;
+use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
 use libkern::error::KError;
@@ -48,16 +56,26 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `logs` grant binds the logging service's read endpoint.
 const LOGS: &[u8] = b"/dev/logs";
+/// Where the `kernel-log` grant binds a snapshot of the kernel's log (Phase 6 Part B.7).
+const KERNEL_LOG: &[u8] = b"/dev/log";
+
+/// The options: one source today besides the service log.
+const FLAGS: &[Flag] = &[Flag::long_only("kernel", "read the kernel's log instead of the service log")];
 
 const HELP: &[u8] = b"usage: log [PRINCIPAL]\n\
+    \x20      log --kernel\n\
     \n\
-    Read the service log back, oldest first: every record the logging service still holds, or\n\
-    PRINCIPAL's alone. Emits Table<{sequence: Int, time: Int?, principal: String, tier: String,\n\
-    level: String, message: String}> on stdout. `time` is Unix epoch seconds, and null for a\n\
-    record taken while the clock was not set.\n\
+    Read a log back, oldest first. With no option, the service log: every record the logging\n\
+    service still holds, or PRINCIPAL's alone. With --kernel, the kernel's log, a row a line.\n\
+    Emits Table<{sequence: Int, time: Int?, principal: String, tier: String?, level: String?,\n\
+    message: String}> on stdout. `time` is Unix epoch seconds, and null for a record taken while\n\
+    the clock was not set. A kernel row's principal is `kernel`, its sequence its line's place,\n\
+    and its time, tier and level null.\n\
     \n\
-    It needs the logs grant: run it as `with admin log`.\n\
+    The service log needs the logs grant and the kernel's the kernel-log grant: run it as\n\
+    `with admin log`.\n\
     \n\
+    \x20     --kernel  read the kernel's log instead of the service log\n\
     \x20     --help    show this help and exit\n\
     \x20     --version show version information and exit\n";
 
@@ -66,7 +84,7 @@ const VERSION: &[u8] = b"log (nitrox coreutils) 0.1.0\n";
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let stage = Stage::enter(notif, ns, endpoint, arg0);
-    let args = match parse(&stage.argv, &[]) {
+    let args = match parse(&stage.argv, FLAGS) {
         Ok(a) => a,
         Err(_) => stage.die(b"log: unrecognized option (try --help)\n", EXIT_USAGE),
     };
@@ -75,6 +93,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     }
     if args.version() {
         stage.answer(VERSION);
+    }
+    if args.has("kernel") {
+        if !args.operands.is_empty() {
+            stage.die(b"log: --kernel takes no PRINCIPAL (try --help)\n", EXIT_USAGE);
+        }
+        kernel(&stage);
     }
     let principal = match args.operands.as_slice() {
         [] => None,
@@ -98,6 +122,32 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
     out.finish(&stage);
     exit(code)
+}
+
+/// **The kernel's log, a row a line** (Phase 6 Part B.7), from the snapshot the `kernel-log` grant
+/// bound, and exit.
+fn kernel(stage: &Stage) -> ! {
+    let bytes = match libfs::read_file(stage.namespace, KERNEL_LOG) {
+        Ok(b) => b,
+        Err(libfs::FileError::NotFound) => stage.die(
+            b"log: cannot read the kernel's log here -- that needs the kernel-log grant: `with admin log --kernel`\n",
+            EXIT_FAILURE,
+        ),
+        Err(e) => {
+            let why = format!("log: the kernel's log did not read ({e:?})\n");
+            stage.die(why.as_bytes(), EXIT_FAILURE)
+        }
+    };
+    let mut out = Out::new(stage);
+    // The snapshot's last page is padded with NULs, which are not a line.
+    for (i, line) in coreutils::text::lines(libfs::unpadded(&bytes)).enumerate() {
+        if !out.kernel_row(i as i64 + 1, line) {
+            // Whoever read `log`'s output has stopped reading.
+            break;
+        }
+    }
+    out.finish(stage);
+    exit(EXIT_OK)
 }
 
 /// **Read the ring from the start**, a reply at a time, until a reply holds nothing, writing
@@ -160,12 +210,13 @@ impl Out {
             return Out::Console;
         };
         let nullable = TypeModifiers::NULLABLE;
+        // `tier` and `level` nullable since Phase 6 Part B.7: a kernel row has neither.
         let schema = Schema::new()
             .field("sequence", TypeTag::Int, TypeModifiers::NONE)
             .field("time", TypeTag::Int, nullable)
             .field("principal", TypeTag::String, TypeModifiers::NONE)
-            .field("tier", TypeTag::String, TypeModifiers::NONE)
-            .field("level", TypeTag::String, TypeModifiers::NONE)
+            .field("tier", TypeTag::String, nullable)
+            .field("level", TypeTag::String, nullable)
             .field("message", TypeTag::String, TypeModifiers::NONE);
         let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
         if tw.write_schema(StreamFlags::NONE, &schema).is_err() {
@@ -205,6 +256,27 @@ impl Out {
                     lossy(rec.message)
                 );
                 kprint(line.as_bytes());
+                true
+            }
+        }
+    }
+
+    /// Write line `sequence` of the kernel's log; `false` once nobody reads what is written.
+    fn kernel_row(&mut self, sequence: i64, line: &[u8]) -> bool {
+        match self {
+            Out::Table(tw) => {
+                let row: Vec<Value> = alloc::vec![
+                    Value::Int(sequence),
+                    Value::Null,
+                    Value::Str(String::from("kernel")),
+                    Value::Null,
+                    Value::Null,
+                    Value::Str(lossy(line)),
+                ];
+                tw.write_row(&row).is_ok()
+            }
+            Out::Console => {
+                kprint(format!("[{sequence}] - kernel: {}\n", lossy(line)).as_bytes());
                 true
             }
         }

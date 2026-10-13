@@ -981,6 +981,15 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Ident(name));
         }
 
+        // **`time PIPELINE`** (Phase 6 Part H.2, §3): at a head and followed by an argument, the
+        // word times the whole pipeline after it — every stage, so `time list /home | count`
+        // times both. Alone, or before `=`, it is a name like any other (D9).
+        if name == "time" && at_head && !forced_external && self.peek()? != Tok::LParen && self.starts_an_argument()? {
+            self.head_ok = true;
+            let timed = self.expr()?;
+            return Ok(Expr::Time(Box::new(timed)));
+        }
+
         // A `(` immediately after the head is the parens/named-argument convention
         // (§5b) — a `def` call, or an operator written in call form.
         if self.peek()? == Tok::LParen {

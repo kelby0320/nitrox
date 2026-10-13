@@ -12,7 +12,7 @@
 //! this module touches no syscalls. An error reply carries the op of its request so
 //! the kernel routes it to the right pending operation (lookup vs fill).
 
-use crate::{BlockRun, FsError, Mapped, Refusal, Volume};
+use crate::{BlockRun, FsError, Mapped, RUN_UNWRITTEN, Refusal, Volume};
 use libkern::KError;
 use librsproto::error::{ERROR_BODY_LEN, error_body};
 use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
@@ -74,6 +74,32 @@ pub fn serve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut
 /// capped at [`MAX_FILE`]). The `request_id` is echoed; a malformed/oversized
 /// request or any [`FsError`] yields an error reply.
 pub fn serve_resolve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut [u8]) -> Served {
+    resolve(vol, request, content, reply, None)
+}
+
+/// [`serve_resolve`] for a resolve whose grow took the file from `grown_from` bytes: **what the grow
+/// added is marked [`RUN_UNWRITTEN`]** in the reply's map ([`mark_grown`]), so the kernel fills it as
+/// zero without reading it (Phase 6 Part H.4). [`Volume::grow_file`] promises that it reads as zero.
+/// Only this reply marks it: a later resolve maps the same blocks unmarked, and the device then holds
+/// the zeroes or what was written over them.
+pub fn serve_grown<V: Volume>(
+    vol: &V,
+    request: &[u8],
+    content: &mut [u8],
+    reply: &mut [u8],
+    grown_from: u64,
+) -> Served {
+    resolve(vol, request, content, reply, Some(grown_from))
+}
+
+/// [`serve_resolve`] and [`serve_grown`]: `grown_from`, if a grow took the file from that size.
+fn resolve<V: Volume>(
+    vol: &V,
+    request: &[u8],
+    content: &mut [u8],
+    reply: &mut [u8],
+    grown_from: Option<u64>,
+) -> Served {
     // Decode the envelope first — recover the `request_id` even if the rest is
     // unusable, so the error reply still correlates to the right lookup.
     let msg = match decode(request) {
@@ -111,7 +137,11 @@ pub fn serve_resolve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], rep
                 // A read-only mount's files are marked so: the kernel installs them without
                 // `MAP_WRITE` (administration Part C.3).
                 let flags = if vol.read_only() { FILE_BLOCKS_READ_ONLY } else { 0 };
-                match model_a_reply(reply, request_id, &m, &runs[..m.runs], flags) {
+                let n = match grown_from {
+                    Some(was) if m.block_size > 0 => mark_grown(&mut runs, m.runs, was.div_ceil(m.block_size as u64)),
+                    _ => m.runs,
+                };
+                match model_a_reply(reply, request_id, &m, &runs[..n], flags) {
                     Some(reply_len) => Served::LazyBlocks { reply_len },
                     None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
                 }
@@ -195,6 +225,40 @@ fn model_a_reply(reply: &mut [u8], request_id: u64, m: &Mapped, runs: &[BlockRun
         off += BLOCK_RUN_WIRE_LEN;
     }
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
+}
+
+/// **Mark what a grow added** (Phase 6 Part H.4): of the first `n` runs, every one from file block
+/// `fresh` on — the first block wholly past the file's old end — is flagged [`RUN_UNWRITTEN`], and
+/// one across `fresh` is split in two, so the blocks before it go on reading from the device. A
+/// hole stays a hole. With no room left to split, the run across is left as it is, and reads from
+/// the device, which holds zeroes there: slower, never wrong. How many runs there are after.
+pub(crate) fn mark_grown(runs: &mut [BlockRun], n: usize, fresh: u64) -> usize {
+    let (mut n, mut i) = (n.min(runs.len()), 0);
+    while i < n {
+        let r = runs[i];
+        let end = r.file_block + r.length as u64;
+        if r.device_lba == 0 || end <= fresh {
+            i += 1;
+        } else if r.file_block >= fresh {
+            runs[i].flags |= RUN_UNWRITTEN;
+            i += 1;
+        } else if n < runs.len() {
+            let before = (fresh - r.file_block) as u32;
+            runs.copy_within(i + 1..n, i + 2);
+            runs[i].length = before;
+            runs[i + 1] = BlockRun {
+                file_block: fresh,
+                device_lba: r.device_lba + before as u64,
+                length: r.length - before,
+                flags: r.flags | RUN_UNWRITTEN,
+            };
+            n += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    n
 }
 
 /// Build a success `ReadRangeReply` (the `content_len` bytes ride in `handles[0]`)
@@ -301,6 +365,41 @@ pub fn reason(e: FsError) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **What a grow added is marked, and nothing before it** (Phase 6 Part H.4): runs wholly past
+    /// the old end flagged `UNWRITTEN`, a run across it split so its first blocks keep reading from
+    /// the device, a hole left a hole, and — with no room to split — the run across left whole and
+    /// unflagged, which reads the zeroes on the device: slower, never a block of data read as zero.
+    #[test]
+    fn a_grows_reply_marks_what_it_added_and_nothing_before_it() {
+        let run = |file_block, device_lba, length| BlockRun { file_block, device_lba, length, flags: 0 };
+        let fresh =
+            |file_block, device_lba, length| BlockRun { flags: RUN_UNWRITTEN, ..run(file_block, device_lba, length) };
+        let mut runs = [BlockRun::default(); 6];
+        runs[..4].copy_from_slice(&[run(0, 100, 3), run(3, 200, 4), run(7, 0, 2), run(9, 300, 5)]);
+        let n = mark_grown(&mut runs, 4, 5);
+        assert_eq!(
+            runs[..n],
+            [run(0, 100, 3), run(3, 200, 2), fresh(5, 202, 2), run(7, 0, 2), fresh(9, 300, 5)],
+            "split at block 5; the hole left alone"
+        );
+
+        // On a boundary: nothing split, nothing before it marked.
+        let mut runs = [run(0, 100, 3), run(3, 200, 4), BlockRun::default()];
+        assert_eq!(mark_grown(&mut runs, 2, 3), 2);
+        assert_eq!(runs[..2], [run(0, 100, 3), fresh(3, 200, 4)]);
+
+        // No room to split: the run across stays whole and unmarked; what follows is marked.
+        let mut runs = [run(0, 100, 3), run(3, 200, 4)];
+        assert_eq!(mark_grown(&mut runs, 2, 1), 2);
+        assert_eq!(runs, [run(0, 100, 3), fresh(3, 200, 4)]);
+
+        // A grow from nothing marks everything, and one that added nothing past the map marks none.
+        let mut runs = [run(0, 100, 3)];
+        assert_eq!((mark_grown(&mut runs, 1, 0), runs[0]), (1, fresh(0, 100, 3)));
+        let mut runs = [run(0, 100, 3)];
+        assert_eq!((mark_grown(&mut runs, 1, 3), runs[0]), (1, run(0, 100, 3)));
+    }
 
     #[test]
     fn a_reason_longer_than_the_limit_is_cut_rather_than_refused() {

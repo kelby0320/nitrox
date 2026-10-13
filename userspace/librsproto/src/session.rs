@@ -387,5 +387,4 @@ pub(crate) fn po_wait(po: u64) -> (i32, u64) {
 
 /// The most entries one `ReadDir` reply can carry — the bound a caller sizes a per-reply
 /// entry array against. (Real entries are larger: every name costs at least one byte.)
-pub const MAX_REPLY_ENTRIES: usize =
-    (IPC_MSG_SIZE - PAYLOAD_OFF - RS_HEADER_LEN) / DIR_ENTRY_PREFIX_LEN;
+pub const MAX_REPLY_ENTRIES: usize = crate::RS_MAX_BODY / DIR_ENTRY_PREFIX_LEN;

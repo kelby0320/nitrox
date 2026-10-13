@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`. This is the language
-reference: grammar, operators and semantics. Sections describing `form` and the display
-integration are **not built** and are tracked in
+**Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
+(2026-10-08), §3. This is the language reference: grammar, operators and semantics. Sections
+describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
 Working capture of shell design decisions. Semantics (execution model, error handling, type
@@ -262,10 +262,28 @@ for scripts that want it.
 
   | Category | Examples | Why |
   |---|---|---|
-  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail` | Pure syntax, not commands at all |
+  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail`, and `time` as a prefix | Pure syntax, not commands at all |
   | Shell-state builtins | `cd`, `exit` | Must mutate the shell's own process state; an external process structurally can't reach back and do this |
   | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `parse`, `format`, `last`, `skip`, `dedupe`, and the §10b families | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
+
+  **`time PIPELINE`** (Phase 6 Part H.2, 2026-10-08) times a pipeline: it runs as ever and yields
+  its value — or its failure — and when it ends a line goes to `stderr` saying how long it took, by
+  the kernel's monotonic clock, and what each disk and the page cache did meanwhile, from the device
+  manager's `/dev/devices/io.tsm` read before and after
+  ([`device-manager.md`](../architecture/device-manager.md) § 5):
+
+  ```text
+  time: 12.34 s; blk-0: 1,200 reads 4.8 MiB, 300 writes 5.0 MiB, busy 3.21 s; page-cache: 1,200 fills 4.7 MiB, 300 write-backs 1.2 MiB
+  ```
+
+  A device whose counts did not move is left out, and so is a count that did not; with no table
+  bound, the line is the time alone; with nothing moved, `no disk I/O`. **It is a prefix, not a
+  command**: at a statement's or a stage's head and followed by an argument, `time` takes the
+  whole pipeline after it — `time list /home | count` times both stages. Alone, or before `=`,
+  it is an ordinary name (D9), and `^time` reaches a program of that name. The line is plain
+  ASCII, since it is read off a screen during a measurement and off a serial console by
+  `test-interactive`.
 
   **`with` is taken, by an external program** (administration Part A, 2026-09-23): `with VIEW
   PROGRAM ARGS…` runs a program in a view, through the view broker. It is recorded here so that a
@@ -278,6 +296,8 @@ for scripts that want it.
 low-level byte-redirect case remains, because TSM1 already auto-wraps unstructured text output
 into a single-column `Table<String>`; there's no such thing as a raw untyped byte stream in this
 pipeline model to begin with. Format inferred from extension (`.csv`, `.json`, `.txt`, `.tsm`).
+**Text ends at its last character that is not a NUL** (PR #371 review): a snapshot such as the
+kernel's `/dev/log` is read whole, its last page padded with NULs, which were a last line of them.
 
 **`open` accepts multiple paths, concatenating them into one stream** — `open a.txt b.txt`. This
 absorbs `cat`'s job entirely (§10a); "open these paths as one stream" is a more natural reading of
@@ -1299,7 +1319,7 @@ it applies rather than either camp uninspected:**
 | `account` | the accounts | `--list` emits `Table<{name, home, sessions, administers}>`, from any session: the view broker's `Accounts`. `--password` changes the person's own, asking for the current one and then a new one twice, on the stage's terminal with echo off, through the session's `/dev/views`. `--add NAME`, `--remove NAME [--home]` and `--password NAME` need the broker's `accounts` grant: without it they fail naming `with`. `--password NAME --users FILE` edits a users file directly, with no service, for recovery from the live image. Each change says what happened as a sentence, the broker's own, on `stderr` and the console; a password is never read from a stream, echoed, or logged (administration Part D.4, [`rsproto-views-ops.md`](rsproto-views-ops.md)). |
 | `service` | the system's services | `--list` emits `service-mgr`'s `Table<{name, state, restarts}>`, from any session: `/dev/services/all.tsm`. `--start`, `--stop` and `--restart NAME` each wait for it to have happened and emit a one-row `Table<{name, state}>`, and need the view broker's `services` grant: without it they fail naming `with`; an `essential` service's stop and restart are refused whoever asks (administration Part E.2, [`rsproto-services-ops.md`](rsproto-services-ops.md)). |
 | `shutdown` | stopping the machine | Stops every session and service, writes back and unmounts every filesystem, and halts, saying when it is safe to turn the machine off; `--reboot` restarts it instead. Emits nothing: its line goes to the terminal and the console, and the session ends with the machine. Needs the view broker's `power` grant, which the seeded policy gives everyone for it: `with power shutdown`. Without it, fails naming `with` (administration Part E.4, [`power.md`](../architecture/power.md)). |
-| `log` | the service log | `log [PRINCIPAL]` emits `Table<{sequence, time, principal, tier, level, message}>`, oldest first: every record the logging service still keeps, or `PRINCIPAL`'s and its named sources' (`heartbeat.worker`). `time` is Unix epoch seconds as `list`'s `modified` is, and null for a record taken while the clock was not set; `sequence` is the order, since the clock can be set. Needs the `logs` grant (`with admin log …`); that the oldest records are no longer kept is said on stderr, and so are any the ring dropped while it was read (administration Part E.6). Not `/dev/log`, the kernel's own log. |
+| `log` | the system's logs | `log [PRINCIPAL]` emits `Table<{sequence, time, principal, tier, level, message}>`, oldest first: every record the logging service still keeps, or `PRINCIPAL`'s and its named sources' (`heartbeat.worker`). `time` is Unix epoch seconds as `list`'s `modified` is, and null for a record taken while the clock was not set; `sequence` is the order, since the clock can be set. Needs the `logs` grant (`with admin log …`); that the oldest records are no longer kept is said on stderr, and so are any the ring dropped while it was read (administration Part E.6). Not `/dev/log`, the kernel's own log. **`log --kernel`** (Phase 6 Part B.7) emits the same table for the kernel's log, a row a line: `principal` `kernel`, `sequence` the line's place, and `time`, `tier` and `level` null, which the kernel's lines do not carry — so `tier` and `level` are nullable for every source. It needs the `kernel-log` grant, and the service log the `logs` grant: `with admin log --kernel | last 20`. A source is an option: `--service` and `--application` are to come, when what tells them apart in the service log is designed. |
 
 ### 10e. Aliasing — namespace binding, not a new shell feature
 

@@ -86,8 +86,8 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
         ext4::create_file(self.0, parent, name, now).map(drop)
     }
 
-    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<(), FsError> {
-        ext4::grow_file(self.0, path, size, now).map(drop)
+    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
+        ext4::grow_file_from(self.0, path, size, now).map(|(was, _)| was as u64)
     }
 
     /// An ext4 file keeps its inode at any size, so a truncate ends no id.
@@ -319,6 +319,59 @@ mod tests {
             }
             _ => panic!("expected a LazyBlocks reply"),
         }
+    }
+
+    /// **A grow's reply marks the blocks it added `UNWRITTEN`, and only that reply** (Phase 6 Part
+    /// H.4): through ext4's volume, a file grown from 4,196 bytes to five blocks of 4 KiB is replied
+    /// with blocks 2 to 4 marked — the first two are its old ones, the second holding its old end —
+    /// and a plain resolve of it after marks nothing, since by then the kernel may have written them.
+    #[test]
+    fn a_grows_reply_marks_the_blocks_it_added_and_a_plain_resolve_does_not() {
+        use crate::test_support::RwImage;
+        use libfsserver::RUN_UNWRITTEN;
+        use libfsserver::serve::serve_grown;
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        vol.create_file(b"/system", b"g", 0).unwrap();
+        assert_eq!(vol.grow_file(b"/system/g", 4196, 0), Ok(0), "grown from nothing");
+        let was = vol.grow_file(b"/system/g", 5 * 4096, 0).unwrap();
+        assert_eq!(was, 4196, "the size it grew from");
+        assert_eq!(vol.grow_file(b"/system/g", 100, 0), Ok(5 * 4096), "a grow to less answers its size");
+
+        // `(file block, length, flags)` of each run a block-file reply carries.
+        let runs_of = |served: Served, reply: &[u8]| match served {
+            Served::LazyBlocks { reply_len } => {
+                let b = decode(&reply[..reply_len]).unwrap().body;
+                let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+                (0..u32_at(12) as usize)
+                    .map(|i| 32 + 24 * i)
+                    .map(|at| (u64_at(at), u32_at(at + 16), u32_at(at + 20)))
+                    .collect::<Vec<_>>()
+            }
+            _ => panic!("expected a LazyBlocks reply"),
+        };
+        let (req, req_len) = make_lazy_request(13, b"system/g");
+        let mut content = [0u8; ext4::MAX_FILE];
+        let mut reply = [0u8; 4096];
+        let grown = runs_of(serve_grown(&vol, &req[..req_len], &mut content, &mut reply, was), &reply);
+        let blocks_flagged = |want: u32| -> Vec<u64> {
+            grown.iter().filter(|r| r.2 == want).flat_map(|&(fb, len, _)| fb..fb + len as u64).collect()
+        };
+        assert_eq!((blocks_flagged(RUN_UNWRITTEN), blocks_flagged(0)), (vec![2, 3, 4], vec![0, 1]), "{grown:?}");
+        // What is marked reads zero on the device, as the flag promises.
+        let mut runs = [crate::BlockRun::default(); 4];
+        let m = ext4::map_file(&rw, b"/system/g", &mut runs).unwrap();
+        for b in 2..5u64 {
+            let r = runs[..m.runs].iter().find(|r| b >= r.file_block && b < r.file_block + r.length as u64).unwrap();
+            let mut block = [0xFFu8; 4096];
+            rw.read_at((r.device_lba + b - r.file_block) * 4096, &mut block).unwrap();
+            assert!(block.iter().all(|&x| x == 0), "block {b} reads zero on the device");
+        }
+
+        let later = runs_of(serve(&vol, &req[..req_len], &mut content, &mut reply), &reply);
+        assert!(later.iter().all(|&(_, _, flags)| flags == 0), "{later:?}");
+        assert_eq!(later.iter().map(|&(_, len, _)| len as u64).sum::<u64>(), 5);
     }
 
     /// **A read-only mount marks what it resolves** — the flag at 24 of the block-file body,

@@ -127,8 +127,6 @@ fn build_frags(
 /// handle: `OutOfMemory` if the fragment list or the IRP cannot be allocated,
 /// `Unsupported` if the node carries no block backend, and `InvalidArgument` if the
 /// transfer needs more fragments than the device can describe in one command.
-/// *(Distinct from [`dispatch_block_irp_into_frame`], whose `Err` really is allocation
-/// failure alone — a single page is always one fragment.)*
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -208,16 +206,30 @@ pub fn dispatch_block_irp(
     Ok(())
 }
 
+/// **The most fragments `device` describes in one command** — its
+/// [`max_frags`](BlockBackend::max_frags) — or `None` for a node with no block backend. What
+/// sizes the page cache's runs ([`dispatch_block_irp_into_frames`]).
+pub fn max_frags(device: &ObjectRef) -> Option<u32> {
+    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
+    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    dn.block_backend().map(|b| b.max_frags)
+}
+
 /// Dispatch a block IRP that transfers `length` bytes between device byte offset
-/// `dev_offset` and a **single physical `frame`** (a page-cache frame), completing `po`.
-/// Unlike [`dispatch_block_irp`] the DMA target is a raw frame, not a `MemoryObject` — the
-/// **Model A** page-cache fill (a disk read straight into the cache page, zero-copy). `pin`
-/// is an owning reference that keeps the frame's owner (the `FileObject`) alive for the
-/// IRP's lifetime — the box holds it in the `_buffer` slot. `length` must be `≤ PAGE_SIZE`.
-/// Returns `Err` only on allocation failure (the caller rolls back `po`).
-pub fn dispatch_block_irp_into_frame(
+/// `dev_offset` and **physical `frames`**, a page each and in order (page-cache frames),
+/// completing `po`. Unlike [`dispatch_block_irp`] the DMA target is raw frames, not a
+/// `MemoryObject` — the **Model A** page cache's fills and write-backs, zero-copy, and since
+/// Phase 6 Part H.4 a run of a file's pages in one command. `pin` is an owning reference that
+/// keeps the frames' owner (the `FileObject`) alive for the IRP's lifetime — the box holds it in
+/// the `_buffer` slot. `length` must be `≤ frames.len() * PAGE_SIZE`.
+///
+/// `Err` before anything starts, for the caller to roll `po` back: `OutOfMemory` on allocation
+/// failure, `Unsupported` for a node with no block backend, and `InvalidArgument` for more
+/// frames than the device describes in one command — a caller sizes its runs by
+/// [`max_frags`].
+pub fn dispatch_block_irp_into_frames(
     device: &ObjectRef,
-    frame: PhysAddr,
+    frames: &[PhysAddr],
     pin: ObjectRef,
     po: &ObjectRef,
     opcode: IoOpcode,
@@ -227,9 +239,16 @@ pub fn dispatch_block_irp_into_frame(
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+    if length > (frames.len() * PAGE_SIZE) as u64 {
+        return Err(KError::InvalidArgument);
+    }
 
-    // One page-sized fragment covering `[0, length)` of the single frame.
-    let frags = build_frags(&[frame], 0, length)?;
+    // A page-sized fragment for each frame `[0, length)` covers, refused past the device's limit
+    // as [`dispatch_block_irp`] refuses one.
+    let frags = build_frags(frames, 0, length)?;
+    if frags.len() > backend.max_frags as usize {
+        return Err(KError::InvalidArgument);
+    }
 
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
@@ -355,6 +374,13 @@ pub fn reclaim_completed() {
         drop(unsafe { KBox::from_raw(core::ptr::NonNull::new_unchecked(head)) });
         head = next;
     }
+}
+
+/// [`irp_complete_dpc`], for another module's host test to complete an IRP its recording device
+/// took, as the device's completion would.
+#[cfg(test)]
+pub(crate) fn complete_for_test(irp: *mut Irp) {
+    irp_complete_dpc(irp as *mut ());
 }
 
 /// The IRP completion DPC: signal the request's `PendingOperation` with the IRP's terminal
@@ -772,6 +798,63 @@ mod tests {
         assert_eq!(seen.0.borrow().len(), 1, "nothing more reached the disk");
         assert!(!window_busy(&part), "every submit counted out");
         assert!(!window_busy(&disk));
+    }
+
+    /// **Page-cache frames go to the device as one IRP, and more than it takes are refused before
+    /// anything reaches it** (Phase 6 Part H.4): eight frames to a device taking eight fragments
+    /// arrive as one IRP of eight, in order; nine are refused `InvalidArgument`, as is a length past
+    /// the frames given.
+    #[test]
+    fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
+        use crate::libkern::block::BlockKind;
+        use crate::libkern::handle::KObjectType;
+        use crate::object::PendingOperation;
+        use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
+        use core::cell::RefCell;
+        init_global_heap();
+        /// Each IRP that reached the device, with its fragments.
+        struct Seen(RefCell<std::vec::Vec<(*mut Irp, std::vec::Vec<PhysFrag>)>>);
+        fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
+            // SAFETY: `ctx` is the test's `Seen`; `irp` is a live IRP whose buffer describes `count`
+            // fragments.
+            unsafe {
+                let b = (*irp).buffer;
+                let frags = core::slice::from_raw_parts(b.frags as *const PhysFrag, b.count as usize).to_vec();
+                (*(ctx as *const Seen)).0.borrow_mut().push((irp, frags));
+            }
+        }
+        fn disk_poll(_: *mut ()) {}
+        let seen = Seen(RefCell::new(std::vec::Vec::new()));
+        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
+        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
+        let (disk, po) = unsafe {
+            (
+                ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode),
+                ObjectRef::from_raw(
+                    KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
+                    KObjectType::PendingOperation,
+                ),
+            )
+        };
+        let frames: std::vec::Vec<PhysAddr> = (0..9).map(|i| PhysAddr(0x10_0000 + i * 0x3000)).collect();
+        let page = PAGE_SIZE as u64;
+        let write = |frames: &[PhysAddr], length| {
+            dispatch_block_irp_into_frames(&disk, frames, disk.clone(), &po, IoOpcode::Write, 4096, length)
+        };
+        assert_eq!(write(&frames, 9 * page), Err(KError::InvalidArgument), "nine frames, eight fragments");
+        assert_eq!(write(&frames[..8], 9 * page), Err(KError::InvalidArgument), "a length past the frames");
+        assert!(seen.0.borrow().is_empty(), "nothing reached the device");
+        write(&frames[..8], 8 * page).unwrap();
+        let (irp, frags) = seen.0.borrow_mut().pop().unwrap();
+        let expected: std::vec::Vec<PhysFrag> = frames[..8].iter().map(|f| PhysFrag { base: f.0, len: page }).collect();
+        assert_eq!(frags, expected, "a fragment a frame, in order");
+        // SAFETY: the IRP is live until it is completed below.
+        unsafe { assert_eq!(((*irp).op, (*irp).offset, (*irp).length), (IrpOp::Write as u32, 4096, 8 * page)) };
+        // Completed as the device would complete it, and its box reclaimed.
+        irp_complete_dpc(irp as *mut ());
+        reclaim_completed();
     }
 
     #[test]

@@ -26,8 +26,9 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::libkern::device::{
-    BOOT, DEPARTED, DeviceKind, DeviceRecord, MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED,
-    OUTCOME_DECLINED, OUTCOME_NONE, REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
+    BOOT, CacheCounts, DEPARTED, DeviceKind, DeviceRecord, IO_MAGIC, IO_VERSION, IoHeader, IoRecord,
+    MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED, OUTCOME_NONE,
+    REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
 };
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::lockrank::LockRank;
@@ -428,6 +429,41 @@ impl Registry {
     }
 }
 
+impl Registry {
+    /// **Every disk's and RAM disk's counters** (Phase 6 Part H.2), a record each in table order,
+    /// departed ones flagged — a partition has none, its I/O being its disk's.
+    pub fn io_records(&self) -> Result<KVec<IoRecord>, AllocError> {
+        let mut out: KVec<IoRecord> = KVec::new();
+        for (id, e) in self.entries.iter().enumerate() {
+            if !matches!(e.kind, DeviceKind::Disk | DeviceKind::RamDisk) {
+                continue;
+            }
+            let flags = if e.departed { DEPARTED as u32 } else { 0 };
+            out.try_push(node_of_ref(&e.node).io().record_for(id as u32, flags))?;
+        }
+        Ok(out)
+    }
+}
+
+/// The bytes `/dev/registry/io` serves: an [`IoHeader`] carrying the page cache's counters and the
+/// count, then the records. `records` is [`Registry::io_records`]; `cache` the page cache's.
+pub fn io_bytes(records: &[IoRecord], cache: CacheCounts) -> Result<KVec<u8>, AllocError> {
+    let header = IoHeader {
+        magic: IO_MAGIC,
+        version: IO_VERSION,
+        count: records.len() as u32,
+        record_size: core::mem::size_of::<IoRecord>() as u32,
+        cache,
+    };
+    let mut out: KVec<u8> = KVec::new();
+    out.try_reserve(core::mem::size_of::<IoHeader>() + records.len() * core::mem::size_of::<IoRecord>())?;
+    out.try_extend_from_slice(header.as_bytes())?;
+    for r in records.iter() {
+        out.try_extend_from_slice(r.as_bytes())?;
+    }
+    Ok(out)
+}
+
 /// The node `node` pins, for a reference not yet in a table.
 fn node_of_ref(node: &ObjectRef) -> &DeviceNode {
     // SAFETY: callers pass references to `DeviceNode`s — every registration site builds one.
@@ -617,6 +653,23 @@ pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
     DEVICES.lock().snapshot_bytes(|d| {
         outcomes.iter().find(|(a, _)| *a == address(d)).map(|&(_, o)| o)
     })
+}
+
+/// What `/dev/registry/io` serves (Phase 6 Part H.2): the page cache's counters and every disk's.
+pub fn io_snapshot() -> Result<KVec<u8>, AllocError> {
+    let records = DEVICES.lock().io_records()?;
+    let s = crate::object::file_object::fill_stats::snapshot();
+    let cache = CacheCounts {
+        fills: s.fills,
+        fill_ns: s.fill_ns,
+        hole_fills: s.hole_fills,
+        hits: s.hits,
+        writeback_pages: s.writeback_pages,
+        writeback_irps: s.writeback_irps,
+        writeback_ns: s.writeback_ns,
+        fill_pages: s.fill_pages,
+    };
+    io_bytes(&records, cache)
 }
 
 // --- `/dev/registry/changes` (Phase 6 Part C) -----------------------------------
@@ -1206,6 +1259,37 @@ mod tests {
         assert_eq!((recs[at as usize].parent, recs[at as usize + 1].parent), (kbd, at));
         r.depart(kbd);
         assert!(r.node(at).is_none() && r.node(at + 1).is_none(), "the disk and its partition depart with it");
+    }
+
+    /// **`/dev/registry/io`: a record per disk and RAM disk, with what its node counted** (Phase 6
+    /// Part H.2) — none for a partition, whose I/O its disk's driver counts, and a departed disk's
+    /// kept and flagged. The header counts the records and carries the page cache's counters.
+    #[test]
+    fn the_io_records_are_every_disks_counters_and_no_partitions() {
+        init_global_heap();
+        let (mut r, disk, _) = booted();
+        let counted = crate::io::stats::Counted::new();
+        // SAFETY: `disk` is held by `r` for the rest of the test, which is all this needs.
+        unsafe { counted.attach(&disk) };
+        counted.record(crate::io::irp::IrpOp::Read as u32, true, 4096, 100);
+        counted.record(crate::io::irp::IrpOp::Write as u32, true, 512, 50);
+        let recs = r.io_records().unwrap();
+        assert_eq!(recs.iter().map(|x| x.id).collect::<std::vec::Vec<_>>(), [3, 4], "the disk and the RAM disk");
+        assert_eq!((recs[0].reads, recs[0].read_bytes, recs[0].writes, recs[0].busy_ns), (1, 4096, 1, 150));
+        assert_eq!((recs[1].reads, recs[1].flags), (0, 0));
+
+        r.depart(3);
+        let recs = r.io_records().unwrap();
+        assert_eq!((recs[0].flags, recs[0].reads), (DEPARTED as u32, 1), "departed, its counts kept");
+
+        let cache = CacheCounts { fills: 7, writeback_pages: 3, fill_pages: 40, ..CacheCounts::default() };
+        let bytes = io_bytes(&recs, cache).unwrap();
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!((word(0), word(4), word(8), word(12)), (IO_MAGIC, IO_VERSION, 2, 64));
+        assert_eq!(bytes.len(), 80 + 2 * 64);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 7, "the cache's fills");
+        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 40, "and the pages they brought in");
+        assert_eq!(&bytes[80..144], recs[0].as_bytes());
     }
 
     /// **The boot disk is flagged, once, and nothing else is** (Phase 6 Part D): the disk's record

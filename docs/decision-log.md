@@ -34965,3 +34965,840 @@ the two planning documents.
   points at `copy-limit`; Part H's owed docs drop the item this PR already did; and
   `syscall-abi.md` no longer calls the syncs "the one documented exemption" from async-first,
   naming spawn's fills, `power` and `debug_kprint` beside them.
+
+## 2026-10-08 — Phase 6 Part H.1, built: extent trees
+
+`fs-server-ext4` writes, cuts and frees an extent tree at any depth (`extent.rs`), where it wrote
+only the inode's four extents: a fifth was refused, about 815 files with data filled a directory on
+4 KiB blocks, and a file with a tree — which Linux writes — was read here and never freed.
+
+- **Appends leave the shape ext4's own appends leave.** A full leaf in the inode moves into a block
+  below it *before* the extent is added (`ext4_ext_grow_indepth`'s order), giving one leaf of five
+  rather than one of four and one of one; a full leaf below gains a sibling to its right holding the
+  new extent alone; a full index the same. So every node but the last at its level is full, and
+  `e2fsck`, which offers to narrow or shorten a tree that could be, finds nothing to offer — its
+  prompts are what the host tests' helper fails on. An append is atomic: on an error it has
+  written nothing reachable and gives back every tree block it took. A tree block's goal is the
+  first data block, so it fills an early gap rather than the block a file's next data continues
+  into.
+- **A cut folds.** Truncating frees every block from a logical block on and each tree block left
+  empty, then folds what is left back into the inode while it fits — `e2fsck` otherwise offers
+  to, and undoing a failed grow needs it, since the grow may have deepened the tree before it
+  failed. A file is freed whole by cutting at `0`; a failed grow is undone by cutting where it began
+  and writing the inode to match.
+- **A lookup reads a leaf once.** `Lookup` keeps the leaf a walk is in, so a block map, a directory
+  scan or a read costs a read per leaf rather than a descent per block; the block map is built a
+  segment of the tree at a time.
+- **An extent's length is ext4's**: `ee_len` up to 32,768 written, above it unwritten. The masked
+  top bit made a full 32,768-block extent read as a hole and an unwritten one read its blocks' old
+  contents. **An unwritten extent maps as a hole**, so a write into one is not written back, as
+  into any hole: the data path's existing contract rather than a new one, now written down in
+  `filesystem-data-path.md`. Converting unwritten extents on a writable mount, or allocating holes
+  at a write, is what would change that, and nothing writes into either yet.
+- **What fails takes nothing with it.** The plan's three — a failed grow, a create whose directory
+  cannot grow, the 815th file's unattached inode — and two more found writing them: **a rename**
+  in a directory that could not take the new name removed the old one first and left the file with
+  none, and now puts it back, its record's room still free; and **`mkdir` counted every directory
+  in group 0's `bg_used_dirs_count`** wherever its inode came from, which `e2fsck` reports once
+  group 0's inodes are gone — now its own group's. A failed `mkdir` gives back its inode, its
+  block and that count.
+
+**Tested against e2fsprogs**: every map compared with `debugfs`' reading of the same image, and
+`e2fsck -fn` clean, for 4,096 files of 16 KiB in one directory, created and removed; two files
+grown a block at a time in turn to two levels at 1 and 4 KiB, cut back through each level, grown
+and emptied; a two-level tree `mke2fs -d` wrote, read, cut and removed; `ee_len` `0x8000` and an
+unwritten extent on bytes this server did not write; a 32,768-block append; a full index below the
+inode, built with two-entry nodes since one of ext4's is 7,056 extents away, read back through
+`Lookup`; blocks past `i_size`; and each failure. Twenty-one controls, each against the code it
+guards; twenty fail. The survivor is a cut emptying a child it descended into, which only a tree
+whose index key is below its child's first extent reaches — `e2fsck` calls that invalid — and the
+branch is kept, commented, to free such a node rather than leave it. **The 4,096-file test costs
+about 30 s in a debug build** (1.3 s in release): its directory scans are the cost Part H measures,
+and it stays at the tree to copy's size.
+
+**Gates**: the eight that write ext4 — `test-qemu` and `check-storage` under TCG and KVM,
+`check-install`, `check-recovery`, `check-shutdown` and `test-interactive` — pass on the new server,
+the full set left for the part's PR. Host tests: 3,320. ABI hash: no impact.
+
+## 2026-10-08 — Phase 6 Part H.2, built: the instruments
+
+What Part H measures with, built: `time PIPELINE` in `nxsh`, the block drivers' and the page cache's
+counters behind it, served at `/dev/registry/io` and as the device manager's `io.tsm`, and `cargo
+xtask throughput-stick`, the tree the laptop's runs copy.
+
+- **The counters are on the device's node, not in its driver** (`kernel/src/io/stats.rs`). The
+  plan said "kept by the driver", and the driver is what counts — AHCI where slot 0 issues and
+  retires, USB storage where a command goes on the rings and where its status wrapper arrives, the
+  RAM disk around its copy — but a USB driver's slot goes to the next device to arrive, so
+  counters kept there would have carried one stick's totals into the next. A driver holds its
+  node's (`Counted`), attached once the node is registered, which the table keeps for the boot.
+- **A command's time is its time on the device**: stamped at issue, taken at retirement, so an
+  IRP's wait in a driver's queue is not in it, and with one command at a time each disk's sum is
+  its busy time — which is what H.4 reads to call a run device-bound. A USB command the hub
+  thread recovers counts as its outcome with none of the recovery's time, that being the hub
+  thread's own commands, which are not counted; nor is the table read where a disk arrives.
+- **`io.tsm` is a row per present disk and the page cache's**, the cache's fills and write-backs in
+  a disk's columns and their time in `busy_ns`, which overlaps the disks' time rather than adding
+  to it. Read afresh at every resolve, since the counts move with every command; the directory
+  lists it after `all.tsm`, which `boot-probe`'s device check now counts.
+- **`time` is a prefix keyword**, at a head and followed by an argument, so `time list /home |
+  count` times both stages; alone or before `=` it is a name. Its line goes to `stderr`, plain
+  ASCII, since it is read off a screen and off a serial console that drops anything else — which is
+  why it says `us`. The host gained a monotonic clock (`Host::now_ns`).
+- **The stick's files are named as a camera names its photos**, `B00.BIN`, `S0000.BIN`,
+  `T0000.BIN`: with long names alike `mcopy` searched for a `~N` alias for each, scanning the
+  directory for every candidate, and writing the image ran past ten minutes; with short names it
+  takes nineteen seconds. Every name is unique, so a file's pattern is its name's and `--check`
+  verifies a copy wherever it was put.
+
+**The first numbers**, from the gates rather than the laptop: `boot-probe`'s file of eight pages
+moved the scratch disk's writes by 48 — eight pages and forty of `fs-server-ext4`'s metadata — and
+`time list /dev/devices` on the release image took 35 ms, 30 reads on `blk-0`. Tests: `boot-probe`
+holds the counters to a synced write on every `--selftest` gate's machine, and `test-interactive`
+`time`'s line on the release image; host tests for each driver's counting, the snapshot, the table,
+the reader and the line; `--check` run against an image with a file changed, one gone and a
+directory copied. Twelve controls, every one failing — the two gate-level ones, the RAM disk
+counting nothing and `time` printing nothing, by their gates. **Gates**: `test-qemu`,
+`test-interactive`, `check-storage` under TCG and KVM, `check-live`, `check-media`, `check-shutdown`
+and `check-images` pass; the full set is left for the part's PR. Host tests: 3,334. ABI hash: no
+impact — the snapshot's records are `abi-sync-check`'s, and `DeviceNode`'s fields are no hash input.
+
+## 2026-10-08 — Phase 6 Part H: a dry run, and a listing that filled its page
+
+Before handing the laptop's runs to the maintainer, H.3 was dry-run under QEMU: the commands typed
+on serial at a copy of the release disk grown to 1.5 GiB, the throughput stick attached — to find
+what would stop a run, not to time one. **`copy` of `small/` never returned.** Bisected on sticks of
+generated directories, `list` of a FAT directory hung at 126 files and not at 120; probes on both
+sides of a page showed the server build a reply of 4,038 bytes of entries and the client never see
+it.
+
+**The cause**: `libfsserver` sized a directory reply's body as the page less the IPC and RS
+headers, 4,044 bytes, but a message's payload is the page less its header *and the room for eight
+handles*, 4,008 — so a body over 3,980 made a message the kernel refused. The send was `NOBLOCK`
+and its result ignored, and the client's round trip waits with no deadline, so the listing hung for
+good and Ctrl-C, a request to a process blocked in `sys_wait`, did nothing. 120 short names packed
+into 3,972 bytes and fit; 126 into 4,038. The loop is both filesystems', so an ext4 directory with
+a page of long names would have hung the same way; no gate listed one.
+
+**The class, fixed**: four more buffers subtracted the handles and forgot the envelope —
+`device-mgr`'s and `profile-server`'s directory replies, `tty-server`'s output chunks and `nxterm`'s
+input. `tty-server`'s comment said it left room for both headers, and by its code a full chunk of a
+program's output would have been dropped the same way: the send fails and nothing looks.
+`librsproto::RS_MAX_BODY` (3,980) is now the one cap every body is sized by, and **`encode` refuses
+a longer message**, so no buffer can build one the kernel would refuse. The file server answers a
+directory reply it cannot build with an error and logs a send that fails. Pinned by a codec test at
+the cap and one past it, and by `boot-probe` listing 200 files whose pages fill to the cap. The
+client's want of a deadline is the larger question the hang raised, and is left, recorded: a server
+that never answers still hangs its client — the shape of administration Part C.5b's first
+`SUBNAMESPACE` reply, whose failed send answered nothing and left a forwarded resolve waiting.
+
+**With the fix the dry run finished** — under KVM on the development machine with image files for
+disks, so a check of the runs' shape and not the number. Every command returned, the stick ejected
+and `--check` found every byte of it as written. Copying `big/` (256 MiB in 32 files), `small/` (64
+MiB in 4,096 files, one directory) and `tree/` (64 MiB in 1,024 files, 16 directories) took 71 s,
+625 s and 36 s from the stick to `/home`; 60 s, 135 s and 37 s within `/home`; 26 s, 685 s and 25 s
+from `/home` to the stick; and `remove -r` of the copies 40 s, 31 s and 13 s. **The counters point
+H.4 at two costs**, as counts and not yet causes. Every ext4 I/O is one 4 KiB block, and ext4 issues
+about five writes and six reads per data block copied in and three writes and five reads per block
+removed. And a file of `small/`, 4,096 to a directory, costs hundreds of reads where that directory
+is: 782 on the stick's FAT copying out of it, nearly all of them a sector, and 917 copying into it,
+against about 29 a file out of `tree/`'s 64-entry directories; and 377 on ext4 within `/home`. The
+per-file work grows with the directory, and the stick was busy 489 s of the 625. The root's
+`e2fsck -fn` afterwards found only 12,288 blocks of group 0 marked in use and counted free, and a
+fresh disk showed the same before it booted: the dry run's own preparation, a `dd conv=sparse`
+writing the grown filesystem back, skips all-zero sectors and so left the bitmap's padding from
+before the grow. Prepared without it, the disk checks clean.
+
+## 2026-10-08 — Phase 6 Part H.3: the runs scripted
+
+The maintainer asked whether H.3's runs could be scripted: four sets, a boot each, the same under
+Linux, and a check of the stick — dozens of typed steps, and H.4's loop repeats them. Most of it
+can. `cargo xtask throughput-stick` now puts two scripts on the stick beside the tree, from
+`tools/xtask/src/throughput/`. **`h3.nx`** is a module `use`d at a prompt —
+`use "/storage/THROUGHPUT/h3.nx" { run }`, then `run(1)` to `run(4)`, a boot each — each command
+timed and each set saying what comes next. **`linux.sh`** runs the same four sets under Linux on the
+same laptop, stick and partition, mounting the partition itself, dropping the page cache before each
+step and timing a `sync` inside it, and writes the times to `RESULTS/` on the stick. It refuses a
+stick or partition left mid-run and removes only what it made. **`--check` reads the stick mounted**
+as well as an image, so it needs no `sudo`, and prints what `RESULTS/` holds.
+
+**What stays by hand**: the reinstall, which asks its questions; a restart and a graphical login per
+set, as the plan has it — though the page cache keeps only files in use or dirty, and the first dry
+run, every set in one boot, read the same blocks in sets 2 to 4 as this one, a boot each, to within
+half a percent, so the restarts may go; and **photographing `time`'s lines**. A script run as
+`nxsh FILE` builds its host with no terminal, so everything it says — `time`'s line, `fail`, a parse
+error, a stage's failure — goes to `kprint`, which on the laptop reaches nobody once the display is
+handed out: a script that fails there fails silently. `nxsh --help` was moved to the terminal it was
+handed for exactly this reason (the laptop polish's Part E) and the rest of script mode was not. A
+module `use`d at a prompt speaks through the prompt's host, which has the terminal, so `h3.nx` is
+run that way. **The maintainer chose to fix the gap in this part, after the laptop's runs.**
+
+**Found on the way.** The first `h3.nx` computed its paths, and did not parse: `copy (…)` is a call
+whatever the whitespace, so a command's first argument cannot be computed (`shell-language.md` §
+8c-1). A host test, `the_throughput_sticks_script_runs_each_set_timed`, runs the real file at a mock
+prompt, two lines as typed, and holds each set's commands, which are timed, and its answer; the
+paths are now written out. `linux.sh`'s first cleanup was installed before its check for a scratch
+directory left by an earlier run, so refusing one would have deleted it. A `clean()` for set 1's
+copies read as a step between sets, so set 4 now removes them, untimed. And the names are lowercase,
+`.nx` not `.sh`: the tree's capitals are short names for `mcopy`'s sake, which two files do not
+need, and `nxsh` is not a POSIX shell.
+
+**Verified**: the host test, with controls (a wrong destination, and set 4's untimed removal timed,
+each fail it); `linux.sh` against stubbed `mount`, `blkid` and the like, through a full run and each
+refusal; `--check` of a directory, finding a copy one byte long; and the four sets under QEMU on the
+release image, a boot each, through `use` at the real prompt: every command returned, the stick
+checked whole after, the root's `e2fsck -fn` clean, and `/home` left as a fresh disk's. Removing
+`c-small` from the stick took 93 s, which the first dry run never measured.
+
+## 2026-10-09 — Phase 6 Part H.3: the laptop, beside Linux
+
+**The runs.** The maintainer reinstalled the laptop from `07cb7b94` and ran `h3.nx`'s four sets on
+it, then `linux.sh` from an Ubuntu 26.04.1 live session on the same laptop, stick and partition. The
+internal disk is a Seagate ST1000LM035, a 1 TB **hard drive**; the stick a 16 GB Patriot on USB 3.
+**One stick served both**: the maintainer's only USB 3 stick took Ubuntu, and its `writable`
+partition was replaced by the throughput tree's FAT, copied byte for byte out of
+`throughput-stick.img` — the layout booted under QEMU with `linux.sh` run in it first, against the
+dry run's disk. The stick checked whole after each half. Every Nitrox set started from a fresh boot,
+and Linux dropped its page cache before each step and timed a `sync` with it.
+
+| Set | Nitrox | Linux | Nitrox ÷ Linux |
+|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 22.24 s | 12.4 |
+| 1, stick → disk: `small` | 1,364.22 s | 36.52 s | 37.4 |
+| 1, stick → disk: `tree` | 132.99 s | 8.72 s | 15.3 |
+| 2, disk → disk: `big` | 317.75 s | 5.59 s | 56.8 |
+| 2, disk → disk: `small` | 393.57 s | 9.13 s | 43.1 |
+| 2, disk → disk: `tree` | 146.73 s | 7.08 s | 20.7 |
+| 3, disk → stick: `big` | 385.14 s | 37.36 s | 10.3 |
+| 3, disk → stick: `small` | 2,094.19 s | 518.63 s | 4.0 |
+| 3, disk → stick: `tree` | 186.32 s | 137.21 s | 1.4 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.68 s | 66.7 |
+| 4, remove on the disk: `u-small` | 117.36 s | 2.79 s | 42.1 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 2.26 s | 21.4 |
+| 4, remove on the stick: `c-big` | 1.02 s | 1.15 s | 0.9 |
+| 4, remove on the stick: `c-small` | 320.24 s | 76.24 s | 4.2 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 22.26 s | 1.1 |
+| **All fifteen** | **5,919 s** | **889 s** | **6.7** |
+
+**What the counters say.** Nearly every Nitrox run is device-bound — the disk's or the stick's busy
+time within a few percent of the wall time — and every command is one 4 KiB block, or one 512-byte
+sector where FAT reads a directory, one at a time. Four costs, in the order the counts put them:
+**ext4 spends twelve commands a block copied** and eight a block removed — the allocator reading and
+writing the bitmap, descriptor and superblock for every block, five reads and three writes; a
+zeroing write; the page cache filling the new page from the device before it is overwritten; and the
+copy's own read and write. **A file's directory work grows with its directory**: `small/` costs 782
+reads a file out of the stick's FAT, 917 into it and 432 within ext4, against about 29 out of
+`tree/`'s 64-entry directories. **A copy onto the FAT stick moves its bytes twice**: 512.6 MiB
+written and 256.6 MiB read to copy 256 MiB. And under all of it, **one command at a time**: the disk
+answered one in about 0.4 ms, so even a copy of `big` at two commands a block would take about 50 s
+against Linux's 5.6.
+
+**Found on the way, and left for after Part H** — the maintainer's call: none blocks the performance
+work, and they join a list of the same kind. Twice after a **restart** the xHCI saw no USB device at
+all, neither one present at the boot nor one plugged in later, until a full power-off — though set 2
+ran after one; `kernel/src/power.rs` resets the machine with the controller still running, which
+Linux stops first, but that is a suspect and not a cause. A script run as `nxsh FILE` says
+everything — `time`'s line, `fail`, a parse error — through `kprint`, which on the laptop reaches
+nobody; a session cannot read the kernel log at all; `use "./h3.nx"` does not resolve against the
+working directory; and `cd -` is not a thing. The first of these the maintainer had agreed to fix in
+this part; it now waits with the rest.
+
+## 2026-10-09 — Phase 6 Part H.4, the first fix: ext4 allocates and frees a run at a time
+
+**Why this first.** The maintainer's call, between the two costs H.3 put on top. FAT's directory
+work is the larger in seconds — about 3,060 of the stick's busy time across sets 1, 3 and 4 — but a
+stick Linux finds slow too; ext4's allocator is where Nitrox is furthest from Linux, 12 to 67 times
+on the laptop's disk, and eight of the twelve commands a block copied.
+
+**What it was.** `alloc_block` took one block a call: it read the group descriptor, the block bitmap
+and the superblock, and wrote all three back. The descriptor's and the superblock's writes are each
+part of a block, which `libfsserver::disk::Disk` reads first, so a block cost five reads and three
+writes, and `grow_file` called it for every block it added. `free_block` was its mirror, and the
+extent tree freed an extent a block at a time — removing an 8 MiB file was 16,421 commands, 16,430 a
+file on the laptop.
+
+**What it is.** `alloc_run(goal, want)` takes as many free blocks in a row as it is asked for in one
+pass over a group's bitmap and writes the three once; `free_run` clears a run a group at a time.
+`alloc_block` and `free_block` are runs of one, so every single-block caller is unchanged.
+`grow_file` asks for runs, joining a run that continues the last into its extent up to ext4's
+longest, and the extent tree frees an extent with one call. **Where blocks land is unchanged**: a
+run starts where one block would have and ends at the first block in use, where the next call starts
+as before — held byte for byte against the one-block allocator across a bitmap with holes and a
+group's end. One difference inside a grow: an extent-tree block a grow needs is now taken after a
+whole run, where it was taken after the run's first block, so it no longer lands inside a run. And a
+freed run counts only the bits it found set, so a run freed twice is not counted free twice.
+
+**Held by counts**, as the plan has every fix: a host test through a device that charges commands as
+`Disk` sends them, in which growing a file by 8 MiB costs at most 32 reads and 2,064 writes — 2,048
+of them its zeroes; measured, 26 and 2,058, where a block at a time cost 10,251 and 8,193 — and
+removing it at most 96 commands, measured 61 where it was 16,421; and `boot-probe`'s file on the
+scratch disk, now 64 pages, which must move the disk by no more than a read and two writes a page
+and 96 and 48 besides — 115 reads and 144 writes, where a block at a time made 427 and 328 and fails
+it. Four controls each fail a test: asking for runs of one, freeing an extent a block at a time, a
+run that runs past a block in use, and a free that does not stop at a group's end.
+
+**Under QEMU**, the four sets again on the same disk, before and after — counts are what to read
+here, not the times:
+
+| Under QEMU, the disk's counts | A block at a time: reads, writes, time | A run at a time |
+|---|---|---|
+| Set 1, `big` from the stick | 397,003, 327,948, 66.2 s | 69,487, 131,441, 31.8 s |
+| Set 2, `big` | 465,614, 327,948, 55.7 s | 138,099, 131,441, 19.5 s |
+| Set 2, `tree` | 373,172, 90,315, 39.1 s | 296,379, 44,236, 23.8 s |
+| Set 2, `small` | 1,535,645, 114,801, 129.3 s | 1,474,203, 77,939, 107.6 s |
+| Set 4, remove `u-big` | 328,956, 196,810, 43.0 s | 1,446, 304, 0.16 s |
+| Set 4, remove `u-small` | 316,256, 73,801, 41.5 s | 254,821, 36,940, 19.9 s |
+| Set 4, remove `u-tree` | 123,046, 55,466, 18.6 s | 46,246, 9,386, 3.8 s |
+
+A copy of `big` now writes exactly two commands a block, its zeroes and its data; removing a large
+file costs almost nothing. What `small` still spends is its directories, and set 3 writes only the
+stick, so it is unchanged. The root checked clean after the four sets.
+
+**Next**, from what is left on the disk: **the zeroes and the fill** — a grow writes zeroes over
+every block, and the page cache reads them back before the writer overwrites them, two of the four
+commands a copied block still costs. Ending them changes what the kernel and a server agree a new
+block holds, which is the block-run protocol's, so it gets a short detail pass before it is built.
+Then FAT's and ext4's directory work, and one command in flight. The laptop measures again when a
+batch of these has changed the picture, rather than after each.
+
+## 2026-10-09 — Phase 6 Part H.4, the second fix: a grow's blocks are not read back
+
+**The detail pass**, in `phase-6-usb.md` § *H.4's second fix, in detail*, split the zeroes a grow
+writes from the read that brought them back. The maintainer took piece 1, the read, now, and left
+piece 2, the zeroes, for a measurement to ask for; asked what extent splitting buys, the answer is
+recorded there too — piece 2 converts whole extents and needs none, and splitting is for
+preallocation, punching holes, and writing into a sparse or preallocated file Linux made, none of
+them Phase 6's.
+
+**What it is.** `rsproto-block-ops.md` had specified a `BlockRun` flag, `UNWRITTEN` — "reads as
+zero; the kernel zero-fills the page rather than reading the device" — since the read-write slice,
+on the run map the `FILE_BLOCKS` reply carries; nothing set it and nothing read it. Now the server
+loop sets it, in `libfsserver` for both filesystems: `Volume::grow_file` answers the size the file
+grew from, its contract already being that everything past that reads as zero, and `serve_grown`
+marks every run from the first block wholly past it, splitting a run across that block, in the
+grow's reply only. The kernel fills a page **all of whose blocks** are `UNWRITTEN` or holes without
+an IRP (`fill_block_in`), and writes such a page back as any other — the write-back keeps
+`device_block_in`, which ignores the flag, since one lookup for both would read the flag as a hole
+and skip the write.
+
+**Why it is safe.** A live object never gives a ready page back — a frame goes with the object or a
+truncate, and only a failed fill loses its page early — so a page filled as zero stays until it is
+written back, and the flag only describes what a block holds before the object's first write. A
+later reply maps the same blocks unmarked, and the device holds the zeroes or what was written over
+them: slower, never wrong. The zeroes stay on the device, so a crash before the write-back reads
+zero, never another file's bytes.
+
+**Held by**: a kernel test (a grown page reads nothing and is written back; at 1 KiB blocks, a page
+with one old block is read whole, and grown blocks beside a hole read nothing); a unit test of the
+marking (a run across the old end split, a hole left, no room to split leaving the run whole and
+unmarked); one through each server's volume — ext4 grown from 4,196 bytes marks blocks 2 to 4, FAT
+grown from 1,000 bytes marks sectors 2 to 23, each read zero on the device, and a plain resolve
+marks nothing; and `boot-probe`'s 64-page file, now at most 80 reads in all — 58, where filling each
+page made 115 to 122. Five controls each fail a test: a write-back through the fill's lookup, a page
+zero-filled when any block of it is marked rather than every one, the marking not stopping at the
+old end, a plain resolve marked, and a kernel that ignores the flag, which `test-qemu` fails at 122
+reads.
+
+**Under QEMU**, the four sets again on the same disk; the counts are what to read:
+
+| Under QEMU, the device's reads | Before: reads, time | After: reads, time |
+|---|---|---|
+| Set 1, `big` from the stick: the disk | 69,487, 31.8 s | 3,953, 23.2 s |
+| Set 2, `big` within the disk | 138,099, 19.5 s | 72,564, 15.0 s |
+| Set 2, `tree` | 296,379, 23.8 s | 279,992, 22.4 s |
+| Set 3, `big` to the stick: the stick | 66,835, 26.0 s | 1,298, 15.1 s |
+| Set 3, `tree` to the stick: the stick | 58,773, 24.5 s | 42,389, 22.4 s |
+
+A copy of `big` into ext4 now reads almost nothing from the disk it writes — what is left is the
+source's own reads within the disk — and a copy onto the FAT stick reads nothing back from it. A
+copied block costs three commands on ext4 — the zeroes, the data, and the source's read — and the
+directories are what `small` spends. The stick checked whole and the root clean after the round, its
+bitmap the same as a freshly prepared disk's.
+
+## 2026-10-09 — Phase 6 Part H.4, the third fix: each server caches its metadata
+
+**What dominated.** With the allocator and the read-back gone, a copy's time was its directories.
+Measured on the host through each server's own code, every operation re-walked its path and
+re-scanned its directory from the device: in a directory of 4,096 names, ext4 spent about 21 reads
+to find a file, 50 to create one and 29 to grow it, and FAT 127 commands to find a file — a
+directory read a sector a command — and 260 to create one. A copied file is about eight such
+operations (`libfs`'s copy asks whether the source is a directory, its size, whether the destination
+exists, opens the source, then creates the destination and grows it), which is the 356 to 782 reads
+a file the runs counted.
+
+**What it is.** `libfsserver::cache::MetaCache`, a store of 4 KiB blocks in front of each server's
+device — 1 MiB, a `static` in `.bss` — least recently used goes. **Only what the server alone writes
+goes in it**: `BlockReader` gains `read_meta`, which the libraries call for their own structures —
+ext4's directories, inode tables, bitmaps, descriptors, superblock and extent nodes; FAT's
+directories, FAT and FSInfo — and every other read, a file's data above all, stays `read_at` and
+reaches the device, since the kernel writes data there behind the server's back. A missed call site
+is only slower; a data read made `read_meta` would answer old bytes. **Every write goes to the
+device and into any cached copy**, a failed one letting the copy go; and `BlockWriter` gains
+`forget`, which ext4's `free_run` and FAT's `free_chain` call, so a freed block — which may next be
+a file's — leaves the cache. The default methods keep every other reader and writer as it was, the
+installer's among them. A directory is now read from the device once, in whole blocks.
+
+**Held by**: the cache's own tests (a metadata block read once, data every time; a write updating
+the copy, a failed one dropping it, `forget` dropping it; the oldest going; a partition's ragged end
+read as asked); a test through each filesystem under a cache of eight blocks, so it evicts all the
+time — files made, grown and written the kernel's way, renamed, removed and released, a directory's
+blocks freed into new files' data, files cut and grown back — after which every file reads what was
+written, the directory lists what it should, and `e2fsck` or `fsck.fat -n` is clean; then, through a
+larger cache, a file read, rewritten by the kernel and read at once must read the new bytes; a
+lookup count in each, a directory read once and every lookup after it reading nothing; and
+`boot-probe`'s 64-page file, now at most 32 reads — 12, where the uncached servers made 51 to 58.
+Controls: a cache that does not update its copies on a write fails both filesystems' tests, a file's
+data read with `read_meta` fails each of them at the re-read, and a server whose cache answers
+nothing fails `test-qemu`.
+
+**Under QEMU**, the four sets again on the same disk:
+
+| Under QEMU | Before: time, the device's reads | After |
+|---|---|---|
+| Set 1, `small` from the stick: the stick | 613.5 s, 3,202,635 | 46.5 s, 16,443 |
+| Set 1, `tree` from the stick | 25.7 s | 8.7 s |
+| Set 2, `small` within the disk | 105.9 s, 1,457,826 | 14.1 s, 50,065 |
+| Set 2, `tree` within the disk | 22.4 s, 279,992 | 5.3 s, 24,880 |
+| Set 3, `small` to the stick: the stick | 683.3 s, 3,741,159 | 41.5 s, 12,369 |
+| Set 4, remove `u-small` on the disk | 19.8 s | 4.9 s |
+| Set 4, remove `c-small` on the stick | 68.8 s | 2.7 s |
+| The four sets, as the driver timed them | 663 + 143 + 721 + 118 s | 75 + 34 + 61 + 16 s |
+
+The stick checked whole and the root clean after the round, its bitmap the same as a freshly
+prepared disk's. **Also seen on the way, and left alone**: a FAT create in a large directory is
+CPU-heavy in a debug build — 1,024 of them took 17 seconds in the host suite — and 50 times faster
+in release, which is what runs; and `libfs`'s copy asks the servers more than it needs to, the
+source's size and handle separately and whether a listed child is a directory, which the cache now
+makes cheap. The laptop measures next, the three fixes in.
+
+## 2026-10-09 — Phase 6 Part H.4: the laptop again, the three fixes in
+
+**The runs.** The maintainer reinstalled the laptop from `51c70d25` — the Patriot stick serving
+first as the live image and then, rewritten, as the throughput stick in H.3's layout — and ran
+`h3.nx`'s four sets in one sitting, which the dry runs showed measures the same as a boot a set.
+Linux's numbers are H.3's, on the same laptop and stick. **Nitrox took 1,362 s for the fifteen runs,
+where it took 5,919: 4.3 times faster, and 1.53 times Linux's 889 s**, where it was 6.66.
+
+| Set | H.3, Nitrox | H.4, three fixes in | Linux | Now ÷ Linux |
+|---|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 99.76 s | 22.24 s | 4.5 |
+| 1, stick → disk: `small` | 1,364.22 s | 91.74 s | 36.52 s | 2.5 |
+| 1, stick → disk: `tree` | 132.99 s | 30.04 s | 8.72 s | 3.4 |
+| 2, disk → disk: `big` | 317.75 s | 77.27 s | 5.59 s | 13.8 |
+| 2, disk → disk: `small` | 393.57 s | 64.03 s | 9.13 s | 7.0 |
+| 2, disk → disk: `tree` | 146.73 s | 26.57 s | 7.08 s | 3.8 |
+| 3, disk → stick: `big` | 385.14 s | 353.00 s | 37.36 s | 9.4 |
+| 3, disk → stick: `small` | 2,094.19 s | 332.28 s | 518.63 s | 0.6 |
+| 3, disk → stick: `tree` | 186.32 s | 171.89 s | 137.21 s | 1.3 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.96 s | 1.68 s | 1.2 |
+| 4, remove on the disk: `u-small` | 117.36 s | 18.85 s | 2.79 s | 6.8 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 5.47 s | 2.26 s | 2.4 |
+| 4, remove on the stick: `c-big` | 1.02 s | 578 ms | 1.15 s | 0.5 |
+| 4, remove on the stick: `c-small` | 320.24 s | 68.54 s | 76.24 s | 0.9 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 19.64 s | 22.26 s | 0.9 |
+| **All fifteen** | **5,919 s** | **1,362 s** | **889 s** | **1.53** |
+
+**What the counters say now.** Directories are no longer the cost: `small/` from the stick read
+16,443 of its sectors where it read 3,202,635, and writing `small/` and removing `c-small` and
+`c-tree` on the stick are now quicker than Linux's, which mounts it `flush`. **Three runs stand
+out**, all of them a big file's bytes:
+
+- **Copying `big` to the stick, 353 s against 37**: the stick was busy 333 s for 69,796 writes, 4.8
+  ms each — a flash stick answers a small write slowly — and 512.6 MiB written for 256 MiB, FAT's
+  zeroes in 64 KiB writes and then the data a 4 KiB page a write. 65,536 of those writes are the
+  write-back's pages, one each.
+
+- **Copying `big` within the disk, 77 s against 5.6**: 65,811 reads and 131,442 writes, the disk
+  busy 74.8 s, 0.38 ms a command — the source read, the zeroes and the data, every one 4 KiB.
+
+- **Copying `big` from the stick, 100 s against 22**: the same 131,442 writes to the disk, busy 79
+  s, and the stick read 4 KiB at a time.
+
+So what dominates now is **the command's size**: fills, write-backs and ext4's zeroes all move 4 KiB
+a command, where Linux moves a file's data in commands of many pages, and a stick charges
+milliseconds a write whatever its size. `small/` within the disk, 64 s against 9, is mostly the
+metadata a create and a grow still write through, about eleven writes a file beside its data and its
+zeroes. The next candidates are on the plan's list: clustered fills and write-backs, ext4's zeroes
+in large writes (or piece 2, no zeroes), and one command in flight. Whether the loop goes on, and
+where the number is set, is the maintainer's call (H.5).
+
+**Seen on the way**: `clear` is not a program — one more for the list after Part H.
+
+## 2026-10-09 — Phase 6 Part H.4, the fourth fix: more than a page a command
+
+**What dominated.** After three fixes the laptop's copies of `big` were bound by commands of 4 KiB:
+the page cache filled a page a command and wrote one back a command, and ext4's grow wrote its
+zeroes a block a command — 65,811 reads and 131,442 writes to copy 256 MiB within the disk. The
+detail pass (`phase-6-usb.md` § *H.4's fourth fix, in detail*) took Linux as the reference, at the
+maintainer's asking, and the maintainer chose all three pieces and each device's own limit, since a
+device kind still to come, NVMe say, publishes its own.
+
+**What it is.** **Write-back in runs**: `FileObject::writeback` writes the resident pages in the
+file's order, a run of them an IRP — pages next to each other in the file and on the device, up to
+the device's `max_frags`, a page a fragment, and at most `RUN_MAX_PAGES`, 256 (1 MiB, about Linux's
+request to a SATA disk). Each run is decided under the object's lock as its IRP is issued, so a
+`Forget` stops the write-back before its next run, as it stopped one before its next page. **A fill
+that reads ahead**: a fault on a Model A page reserves up to 31 pages after it — not resident,
+inside the file, next on the device, none reading as zero — `Loading` on the fault's
+`PendingOperation`, and one IRP fills them all, 128 KiB as Linux's default; a fault on one of them
+waits on that fill, as a second faulter of a page does. A fill that read ahead and failed is tried
+again for the faulted page alone before the fault fails, as Linux does, since the error may have
+been on a page it never asked for. **ext4's zeroes in 64 KiB writes**: `BlockWriter::write_zeroes`,
+a loop of `write_at` by default, which `libfsserver::disk::Disk` answers from a zeroed 64 KiB memory
+object of its own, unmapped. The kernel's block layer gained `dispatch_block_irp_into_frames`,
+refusing more frames than the device describes as `dispatch_block_irp` refuses more fragments, and
+`max_frags` to size a run by.
+
+**And one format change the detail pass did not foresee.** `/dev/registry/io` counted the page
+cache's fills and served `fills × 4 KiB` as their bytes; a fill now reads many pages, so it gains
+`fill_pages` and goes to **version 2** (`docs/spec/device-node.md`), and `io.tsm`'s `page-cache` row
+reports `read_bytes` from it. The kernel and `libkern` of one image agree on it; no syscall and no
+ABI-hash input changed — the kernel exports no symbols, and `Irp`, `IoOp` and `KError` are as they
+were.
+
+**Held by**: kernel host tests driving the real write-back loop (`write_runs`, with the IRP left to
+a closure that records it) — 100 contiguous pages as IRPs of 64 and 36 on a device taking 64, in the
+file's order though faulted in reverse; a run ended by a gap on the device, a hole, a page missing
+or still filling, and the file's end; a `Forget` mid-way stopping it at the next run, a refusal
+ending it; 1 KiB blocks — and read-ahead tests through `begin_fill`: its run reserved on the fault's
+PO, stopped by a jump on the device, a resident page in either state, `UNWRITTEN` blocks, a hole,
+the map's end and the file's end, nothing for a forgotten file; a fill driven through `start_fill`
+to a recording device taking eight fragments, read as one IRP of eight pages; the frames dispatch
+refusing nine frames to that device, and a length past the frames. In `libfsserver`, how `Disk`
+splits zeroes, and the metadata cache zeroing its copies or, on a failed write, letting them go; in
+ext4, the 8 MiB grow's writes, whose 2,048 of zeroes are now 128 and a shorter one ending each run.
+**Controls**, each failing its test: for write-back, no limit, no contiguity, a filling page
+written, no sort, no skip past a run, no file-size bound, `dead` ignored, the IRP not ended, the
+lookup's fallback gone; for read-ahead, none at all, the resident mask ignored, no contiguity, no
+file-size bound, the pages not on the PO, the device's limit ignored, `dead` ignored; the dispatch's
+two refusals gone; the cache's copies not zeroed, kept on a failed write, or zeroed by the default
+loop; ext4 zeroing a block a write. A fill told not to read ahead reads its page alone, and ignoring
+the flag fails that test; but the fault path's own retry, which sets it, waits on the scheduler,
+which no host test has, and a read-ahead's rollback when its IRP cannot be built is an allocation
+failure — those two paths have no control. **`boot-probe`** now bounds the scratch disk's writes at
+40 — a page a write-back IRP put back fails it, at 86 — and reads back `ahead`, a 64-page file the
+build puts on the scratch filesystem for it, which nothing opens first: as written, in at most eight
+reads — no read-ahead fails it, at 64.
+
+**Under QEMU**, the four sets on the same disk, the stick checked whole and the root clean after the
+round:
+
+| Under QEMU, the same disk | After the third fix | After the fourth |
+|---|---|---|
+| The four sets, as the driver timed them | 75 + 34 + 61 + 16 s | 48 + 16 + 44 + 16 s |
+| Copy `big` within the disk: the disk's commands | — | 2,332 reads, 4,755 writes |
+| Copy `big` to the stick: the stick's writes, the page cache's write-backs | — | 5,284, 1,024 |
+| `boot-probe`'s 64-page file: the scratch disk's writes | 145 | 25 (16 once `ahead` moved the layout) |
+| `boot-probe` reading back `ahead`, 64 pages in three extents | — | 4 reads |
+
+The laptop measures next, the four fixes in: the hypothesis is that those runs were bound by the
+number of commands, and if the stick is slow per byte rather than per command its time will barely
+move — which is the answer the number is set with too. **Left out, as planned**: more than one
+command in flight (NCQ), and raising the USB driver's 64 fragments, which is below the 1 MiB Linux
+gives the same stick — each waits for the laptop to show the need.
+
+## 2026-10-13 — Phase 6 Part H.4: the laptop again, the four fixes in
+
+**The runs.** The maintainer reinstalled the laptop from `c2644f26` and ran `h3.nx`'s four sets in
+one sitting on the Patriot stick, rewritten as before; `throughput-stick --check` found every copy
+as written. Linux's numbers are H.3's. **Nitrox took 647 s for the fifteen runs, where the three
+fixes took 1,362 and H.3 5,919: 0.73 times Linux's 889 s.** That sum flatters it — Linux mounts the
+stick `flush`, and took 519 s on `small/` to the stick alone — so the fairer figure is the geometric
+mean of the fifteen ratios: **1.35**, where it was 2.48.
+
+| Set | H.3 | Three fixes | Four fixes | Linux | Now ÷ Linux |
+|---|---|---|---|---|---|
+| 1, stick → disk: `big` | 275.27 s | 99.76 s | 15.90 s | 22.24 s | 0.71 |
+| 1, stick → disk: `small` | 1,364.22 s | 91.74 s | 68.53 s | 36.52 s | 1.88 |
+| 1, stick → disk: `tree` | 132.99 s | 30.04 s | 12.29 s | 8.72 s | 1.41 |
+| 2, disk → disk: `big` | 317.75 s | 77.27 s | 12.73 s | 5.59 s | 2.28 |
+| 2, disk → disk: `small` | 393.57 s | 64.03 s | 42.31 s | 9.13 s | 4.63 |
+| 2, disk → disk: `tree` | 146.73 s | 26.57 s | 11.59 s | 7.08 s | 1.64 |
+| 3, disk → stick: `big` | 385.14 s | 353.00 s | 61.48 s | 37.36 s | 1.65 |
+| 3, disk → stick: `small` | 2,094.19 s | 332.28 s | 240.13 s | 518.63 s | 0.46 |
+| 3, disk → stick: `tree` | 186.32 s | 171.89 s | 66.76 s | 137.21 s | 0.49 |
+| 4, remove on the disk: `u-big` | 111.98 s | 1.96 s | 1.98 s | 1.68 s | 1.18 |
+| 4, remove on the disk: `u-small` | 117.36 s | 18.85 s | 18.97 s | 2.79 s | 6.80 |
+| 4, remove on the disk: `u-tree` | 48.41 s | 5.47 s | 5.31 s | 2.26 s | 2.35 |
+| 4, remove on the stick: `c-big` | 1.02 s | 578 ms | 582 ms | 1.15 s | 0.51 |
+| 4, remove on the stick: `c-small` | 320.24 s | 68.54 s | 68.69 s | 76.24 s | 0.90 |
+| 4, remove on the stick: `c-tree` | 24.03 s | 19.64 s | 19.99 s | 22.26 s | 0.90 |
+| **All fifteen** | **5,919 s** | **1,362 s** | **647 s** | **889 s** | **0.73** |
+
+**The hypothesis held.** Every run that moves a big file's bytes went five to six times faster —
+`big` to the stick 353 s to 61, within the disk 77 to 12.7, from the stick 100 to 15.9, which is now
+quicker than Linux's 22 — and the runs the fix did not touch, the removals, measured the same,
+within a few per cent. The commands are what the design said: a copy of `big` filled in 2,049 IRPs
+of 128 KiB and wrote back in 289 to the disk, about 0.9 MiB each, and in 1,024 of 256 KiB to the
+stick.
+
+**What is left is two costs, neither of them a command's size:**
+
+- **The zeroes.** A grow writes every block it adds, and the copy then writes it again, so a big
+  file's bytes cross the device twice. Copying `big` to the stick wrote 512.6 MiB in 5,284 writes,
+  busy 51.5 s: 9.95 MiB/s, faster than the 6.85 Linux reached on the same stick, and half of it
+  FAT's zeroes. Within the disk 770 MiB moved in 11.7 s of busy time, a third of it ext4's zeroes.
+  Without them the stick would be busy about half as long, and `big` to the stick would take about
+  35 s against Linux's 37 — an estimate from the busy times, which today add up: the run's 61 s is
+  about the stick's 51.5 and the disk's 8.1. What removes them is the second fix's piece 2, not
+  zeroing, which on ext4 is unwritten extents and on FAT a question of what a crash may expose.
+
+- **ext4's metadata, a file at a time.** Copying `small/` within the disk took 42 s against Linux's
+  9: 9.2 reads and 13 writes a file of 16 KiB, at 0.42 ms a command, most of them metadata — a
+  file's source is one read, its zeroes and its data a write each, and the rest is the inode, the
+  bitmaps, the descriptor, the superblock and the directory each written through as they change.
+  Removing it took 19 s against 2.8, at 6.2 reads and 9 writes a file. Linux keeps that metadata in
+  memory and writes it later in large batches, ordered by its journal.
+
+**Where the number stands.** The Definition of Done asks for a copy to the stick that meets the
+number H.5 sets. Copying to the stick is now 368 s for set 3 against Linux's 693: `small/` and
+`tree/` at half Linux's time, `big` at 1.65 times it, and that gap is the zeroes. Whether to set the
+number here or take one of the two costs first is the maintainer's call.
+
+## 2026-10-13 — Phase 6 Part H.5: the number, as measured — Part H complete
+
+**The maintainer's call**: the fourth fix's run is the number. "We've improved things a lot here. I
+think we can just set the numbers the way they are and leave the two items above as additional
+optimizations to pick up later." So the Definition of Done's last item reads as the laptop measured
+it on 2026-10-13, against Linux on the same laptop and stick: copying `big/` to the stick in at most
+1.65 times Linux's time, `small/` in 0.46 of it and `tree/` in 0.49, set 3 in all 0.53 — 368 s
+against 693. The fifteen runs are 647 s against Linux's 889, 1.35 times by their geometric mean,
+where H.3 found 6.66 times by their sum.
+
+**Why stopping here is sound, and not only sufficient.** Both costs left are design questions rather
+than slow code, and each wants a detail pass of its own. **The zeroes** protect what a crash between
+a grow and its write-back leaves in the file; ext4's answer, unwritten extents, keeps that, and
+FAT's has to choose what a crash may expose. **ext4's per-file metadata** is written through as it
+changes, and a batch needs an order that only a journal gives. Neither is a USB question, which is
+what the phase is about, and the stick copies already beat Linux on two of three.
+
+**Recorded**: `TODO(fs-throughput)` closed in `deferred-decisions.md`, and the two costs filed as
+`TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, each with its measurement, its remedy and its
+trigger; the directory scan's entry narrowed, since its trigger fired and the metadata cache
+answered it. **Part H is complete**, and with it every part of the phase. Of the Definition of Done,
+the number is met on the laptop; the first two items — USB input at the greeter, and a FAT32 stick
+through Files — are met in the gates (`check-input --usb`, `check-login --usb`, `check-media`) and
+wait to be checked on the laptop, where Part H's rounds have mounted, written and ejected a stick
+from the shell. The phase closes when they are.
+
+## 2026-10-13 — Phase 6 Part B.7: a keyboard read by its report descriptor
+
+**The laptop's check of the Definition of Done**, after H.5. The maintainer confirmed the FAT32
+stick's item whole — plugged in after boot, shown in Files, saved to from `nxedit`, ejected from
+Files, and pulled without an eject — and a USB mouse moving the cursor, plugged in after boot. Two
+keyboards did not type. **A System76 Launch**, whose keyboard is behind its own built-in hub, as the
+mouse was when plugged into it: external hubs are out of Phase 6, and stay out — "hubs later", the
+maintainer's call. **A Corsair K70 RGB MK.2**, plugged in after boot, typed numbers.
+
+**What the K70 does**, read on the development machine under Linux, where it types. Its boot
+interface's report descriptor is 192 bytes: report 1 a keyboard — a modifier byte, then a bit for
+each usage 0x00–0x97 — consumer keys as report 2, two vendor reports, and a mouse as report 5. Asked
+for boot protocol as Nitrox asks, from a script over usbfs: `GET_PROTOCOL` answered boot before and
+after, `SET_PROTOCOL` and `SET_IDLE` were taken, and every report was 21 bytes of report 1 — `a` as
+`01 00 10 …`, `b` as `01 00 20 …`, Shift as `01 02 00 …`. Read as a boot report, its ID was Left
+Control held and a bitmap byte a key: `a` came out `m`, and `b` `3`. Linux never asks for boot
+protocol, which is why it works there; Corsair ships a BIOS mode for hosts that do.
+
+**The maintainer's call**: read a keyboard by its report descriptor, as a mouse has been since B.3,
+now — "Yes, go ahead with B.6, hubs later" — numbered B.7 when the plan turned out to have a B.6
+already, Part B's docs.
+
+**What it is.** **One walk of a descriptor's items** (`descriptor::walk`) for both readers, so every
+length a device states is checked once: the mouse's reader moved onto it unchanged, its tests
+passing as they were, and an output report — which only a keyboard's lights need — is counted apart,
+one that runs long passed over rather than ending the walk. **`keyboard_layout`** reads the first
+*Keyboard* or *Keypad* collection's Keyboard-page fields in one input report: a bit each, in up to
+four runs — the modifiers and an NKRO bitmap — or one array of slots, a usage each counted from its
+logical minimum; and its lights, where Num, Caps and Scroll Lock are its output report's first three
+bits. A key field it does not read, or a field past a report a TRB carries, gives no layout. **The
+decoder holds the set of usages held**, so a bitmap and an array decode alike against the set
+before, in the boot decoder's order, and **a change of more than twenty keys comes in batches** from
+the same report, each pushed after the table's lock is let go, as a departure's releases are. A
+report under another ID is passed over: the K70's media keys and mouse arrive on its keyboard's
+endpoint. **Every keyboard whose descriptor reads runs in report protocol**, boot protocol
+otherwise, as a mouse does; QEMU's keyboard reads as exactly the boot layout. **Its lights carry
+their report ID**: the K70's are report 1, a two-byte `SET_REPORT`; a keyboard whose lights are
+elsewhere takes none.
+
+**Held by** host tests on the K70's own bytes — its descriptor, copied from sysfs, read as report
+1's modifiers and 152-bit bitmap with report 1's lights, and the eight reports it sent, decoded to
+what was typed, where the boot layout gives Control and `m` — and on QEMU's descriptor, read as the
+boot layout; a second report's keys and a collection before the keyboard's not taken; a layout
+refused for no letters, a key field wider than a bit, a fifth run of bits — four taken — and a field
+past 64 bytes, at its neighbour too; lights not in the first three bits, or present but a bit along,
+not taken; a bitmap's report, another report's ID, a short report and `ErrorRollOver` in a bitmap;
+fifty-eight keys in one report delivered in three batches, and released in batches; and the lights
+request with an ID. Each guard has a control that fails its test. **The binding's choice of report
+protocol for a keyboard has no host test** — it is the hub thread's, against hardware — and no gate
+can tell it from boot protocol, since QEMU's keyboard sends the same report in either; the laptop is
+its test.
+
+**Gates**, under KVM as CI runs them: `test-qemu`, `check-input --usb`, `check-report --usb`,
+`check-input` and `check-terminal` passed — `check-input --usb` and `check-report --usb` typing on a
+USB keyboard alone — and `test-qemu`'s log shows both its USB keyboards bound in report protocol,
+the first acknowledging its lights. **`check-login --usb` failed once**: after New Window the
+shell's last window list held the browser alone, where the editor's two windows were expected. The
+keyboard path had worked in that run — Ctrl+Shift+N reached the editor, which opened its second
+window — and it passed sixteen times after, five of them in the round's own order. That step kept no
+transcript, so the cause is not known; it keeps one now (`guest-transcript-check-login.log`), for
+the next time. Filed rather than guessed at.
+
+**Next**: the laptop — the K70 plugged in after boot, typing at the greeter, which closes the
+Definition of Done's first item and the phase with it.
+
+## 2026-10-13 — Phase 6 Part B.7, a hot-plug: a bind as Linux binds, and the kernel's log in a session
+
+**The laptop's second check.** The K70 typed correctly plugged in before boot, and as before plugged
+in after it — the wrong keys, so a hot-plugged K70 is bound in boot protocol. Both go through the
+same code (`arrive`, `enumerate`, `bind`); what differs is the device, powered for seconds by the
+time a boot binds it and for a fraction of one at a hot-plug. **Why it fell back could not be
+seen**: the bind's line said only "boot protocol", and nothing on the laptop shows the kernel's log
+after boot — the hardware report shows a snapshot taken as it begins, a shutdown's repaint shows the
+shutdown's last rows, and no session could read `/dev/log`.
+
+**The maintainer's calls**: bring reading the kernel's log forward from Part H's list, "as it is now
+needed for debugging"; and grow `log` into the system's log viewer, a source an option — "with admin
+log --kernel will show kernel logs. In the future, something like log --service <service_name> or
+log --application <app_name>" — with one table shape for every source.
+
+**What it is.** **`log --kernel`**: the kernel's log a row a line, in `log`'s table — `principal`
+`kernel`, `sequence` the line's place, `time`, `tier` and `level` null, the last two nullable now
+for every source. **The `kernel-log` grant**: the broker resolves its own `/dev/log`, which the
+kernel answers with a fresh snapshot, and binds that in the view at the same path, readable and
+sizeable; one view a request, so a program reads the log as it stood when it ran. The seeded `admin`
+profile has it, and a host test now holds `admin` to every grant the broker knows. **The bind, as
+Linux binds**: a keyboard's `SET_IDLE` before its report descriptor is read (`usbhid_parse`'s
+order), and a descriptor that stalls asked again, four times in all, 100 ms apart
+(`hid_get_class_descriptor`'s count); **its line now says why a device runs in boot protocol** — no
+descriptor, every try stalled, or one not read, with its length and first bytes — and which try read
+a descriptor that took more than one.
+
+**Not yet known: what the K70 does.** A stall is the suspect — a timeout would have left it unbound,
+and it is bound; a descriptor read whole parses, its own bytes being a host test — but the change
+does not depend on it being right: whatever the laptop's K70 does,
+`with admin log --kernel | filter message ~= /usb/` now says. The retry has no gate, since QEMU's
+devices answer at once.
+
+**Found on the way**: the grant at first failed every `admin` request in the test image — "the
+kernel's log is not there to grant" — and with them `boot-probe`'s view tests. `boot-probe`'s
+namespace binds `/dev/log` already, and a bind over a bound path is refused `AlreadyExists` — which
+accepting that refusal alone, and nothing else, mended; a caller with its own now keeps it, reading
+the kernel's log as it could before. The round that failed is that rule's control. **Held by**
+`test-interactive`'s step 20h: `log --kernel` refused without the grant, then through it the first
+lines of the kernel's log, which went to the console at boot long before the command was typed — and
+a broker that binds nothing there times the step out; the seed's host test, which fails without
+`kernel-log`; and the bind line's wording, a host test of each case.
+
+## 2026-10-13 — Phase 6 Part B.7, the cause: a report descriptor short by a packet
+
+**The laptop's log said it.** With the K70 plugged in after boot,
+`with admin log --kernel | filter message ~= /usb/` showed its bind: "keyboard at /dev/input/raw/2,
+boot protocol: its 192-byte report descriptor is not one this driver reads (it begins 01 85 02 05 0c
+19 00 2a)". Not a stall. Those are the K70's descriptor from byte 64 on — its first eight are
+`05 01 09 06 a1 01 85 01`, and these sit at 0x40 — so the read came back without its first 64-byte
+packet. The driver could not tell: its Data stage did not interrupt on a short packet, so
+`control_in` took the whole length asked for, the rest zero, and the descriptor was parsed from its
+second packet. Plugged in before boot, the K70 sends it whole. **Linux would not have been caught**:
+`hid_get_class_descriptor` asks again while fewer bytes than the descriptor's came back.
+
+**What it is.** An IN Data stage interrupts on a short packet (ISP); its event leaves the bytes it
+did not move on the waiting record, and the Status stage completes the transfer with them, so
+`control_in` returns the bytes that came (`ep0_event`, a pure function with a host test). A report
+descriptor that comes back short is asked again, as a stall is, four tries 100 ms apart; the bind's
+line counts the short tries and the stalls before the one that read it whole, or says it never came
+back whole, with the last short one's bytes.
+
+**Held by** the event's host test — a whole transfer, one short by a packet, an error on the Data
+stage, another slot's event — with a control each that fails it; the Data stage's encoding pinned
+with ISP; and **a probe under QEMU**, not kept: asking for eight bytes more than each descriptor
+holds made QEMU's xHCI end each read short, and every bind line said "never came back whole in 4
+tries (4 short, 0 stalled; the last short one 63 of 71 bytes)" for its keyboards and 52 of 60 for
+its mice — QEMU raising the event, and the count reaching the line. What no gate can show is the
+K70's own short read and its retry; the laptop's log will say which try read it.
+
+**And `check-login --usb`'s failure, found.** It failed again in this round, at the same step, and
+kept its transcript this time: the last line was the shell's window list cut off as it arrived —
+`window list on cli of 3 [21: Files] [23: notes.t` — after a whole one holding all three windows.
+The gate counted the windows in the last list it could see, whole or not: two here, one the first
+time. **The gate's, not the system's**: it now reads the last list that has ended
+(`last_window_list`, with a host test of that transcript, which fails without the rule), and passed
+three times running under KVM with `--usb` and once without. A match is not a line — PR #352's
+lesson, met again.
+
+## 2026-10-13 — Phase 6 complete: the K70 types plugged in after boot
+
+**The laptop's third check**, on `9ec0dabc`: the Corsair K70, plugged in after boot, typed at the
+greeter — "It works!", the maintainer's word; no photograph of its bind line, so which try read its
+descriptor whole is not recorded.
+
+**So the Definition of Done is met.** On the laptop: a USB mouse moving the cursor, and a USB
+keyboard typing at the greeter plugged in before boot and after it; a FAT32 stick plugged in after
+boot, mounted writable, shown in Files, saved to from `nxedit`, ejected from Files, and torn down
+when pulled without an eject; and a copy to the stick meeting the number Part H set. Letting a
+keyboard and a mouse go when unplugged is held by the gates — `check-input --usb` unplugs a keyboard
+holding a key down — rather than tried on the laptop. **Phase 6 — USB — is complete**: eight parts,
+A–H, and Part B's seventh step, B.7, which the laptop's check asked for. Left for later, as decided:
+external hubs, the System76 Launch's keyboard among the devices behind one; a grow's zeroes and
+ext4's metadata written a file at a time; and media keys. The syscall consolidation is next.
+
+## 2026-10-13 — PR #371's review: the kernel log's padding, a waiter's retry, what a cut frees
+
+A fresh session reviewed PR #371: one blocking finding and four worth fixing, all in error paths or
+in what guards them. Each is fixed.
+
+1. **`log --kernel`'s last row was the snapshot's padding.** `/dev/log` is a `MemoryObject`, sized
+   to its pages and the last zero-padded for the reader to trim; `log` split it whole, so
+   `| last 20` gave nineteen lines and a row of NULs — 2,715 of them in the reviewer's boot.
+   `libfs::unpadded` trims the NULs that end a read, and `log --kernel` reads through it, as does
+   `nxsh`'s `open` of text: with the grant a session can `open /dev/log`, and would meet the same
+   row by the same path. `test-interactive`'s step 20h now reads `log --kernel | last 1` and expects
+   20g's clock line.
+
+2. **A cut that failed partway handed back a corrupt root.** `extent::cut` zeroed each entry as it
+   freed it and counted what was left at the end, so an error between returned a root whose
+   `eh_entries` counted a zeroed entry — which a failed grow and a failed directory insert write to
+   the disk, every lookup past it `Corrupt` — and a leaf on the disk still listing what was freed.
+   **Now out of the tree on the disk first, then freed**: a node drops what goes, its header
+   counting what is left, and is written — a tree block to its block, the root to the inode, so
+   `truncate` takes where the inode is — before any block it dropped is freed; `fold` writes the
+   root before it frees the child it took in. **A sweep over every write found the class wider**: a
+   truncate whose last write, the inode, was lost left the inode on the disk mapping every block it
+   had freed — so the root is written first too, which costs a truncate whose root changes one more
+   write of its inode — and a release freed a file's blocks from a copy before the inode, so a lost
+   inode write left a live inode mapping them. `release_inode` and `rmdir_at` free the inode first
+   and its blocks last. A failure now leaks what it had not reached, which `e2fsck` gives back.
+   **Not changed**: the allocator's own writes — a bitmap, then a descriptor, then the superblock —
+   are in that order with no undo, so a lost one leaves a count behind its bitmap, which `e2fsck`
+   repairs and which claims no block twice.
+
+3. **A thread waiting on a read-ahead page took a fatal fault for an error elsewhere in the run.**
+   The filler tried its own page again alone; a second faulter waiting on the same PO, for a page
+   the read-ahead reserved, took the failure as its own — two processes sharing a binary, and one
+   killed for a page that reads. A waiter now tries again too, once: a fault fails at its second
+   failed fill. The reviewer could not run it, since no host test reached `fault_in_page`; its loop
+   now takes its waits (`fault_in_page_with`), and a host test plays the disk and the other
+   faulters. Of H.4's two paths with no control, the fault's retry now has one; a read-ahead's
+   rollback when its IRP cannot be built still has none.
+
+4. **Nothing failed without the libraries' `forget`.** Every block that becomes metadata is written
+   whole through the cache before it is read, so the reviewer could build no stale read — `forget`
+   guards a path that does not exist yet — while `libfsserver/CLAUDE.md` said each server's test
+   held it. `MetaCache::holds`, and a test in each server: ext4's tree block and a directory's
+   blocks, and FAT's directory clusters, each read through the cache and held, are not held once
+   freed. The rules file now says which test holds what.
+
+5. **Two undo lines had no test**: `append` giving back the tree blocks it took, and a failed grow
+   writing its inode. An append that loses a write once its leaf is taken now gives the leaf back
+   with `e2fsck` clean, and a grow refused after cutting the blocks past the end leaves the
+   filesystem clean — without the write, `e2fsck` finds `i_blocks` 192 where it should be 8. They
+   survived beyond the one the H.1 entry names.
+
+**Controls**, each failing its test: (1) `log` without the trim, at step 20h (a timeout on the NUL
+row), and `open` without it; (2) the header and the node written after the frees, as they were; the
+node alone written after; the root never written; `fold` freeing before it writes; a release, and a
+directory's removal, freeing the blocks first; (3) no waiter retry; no filler retry; a waiter's
+retry unbounded, which reads the bad page a third time; (4) each library's `forget` deleted; (5)
+each undo line deleted. The sweeps lose each write of a cut, a truncate, a release and a directory's
+removal in turn, and refuse every write from each on. Host tests 3,386. **Full gate set (fgb86):
+44/44** on `d71152db`, every gate under TCG and every CI `--kvm` variant; `boot-probe`'s scratch
+file moved the same 8 reads and 16 writes as before the fixes.

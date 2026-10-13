@@ -4,6 +4,7 @@
 use crate::{BlockReader, BlockWriter, FsError};
 use core::cell::Cell;
 use core::marker::PhantomData;
+use core::ops::Range;
 use libkern::*;
 
 /// One page; the scratch buffer's size.
@@ -48,12 +49,11 @@ pub fn po_wait(po: u64) -> (i32, u64) {
 /// trips, which is what made the same-CPU wake latency so acute (see the decision log,
 /// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
 ///
-/// **One block per `sys_io_submit` is a suspect in `TODO(fs-throughput)`** — `copy` and
-/// `remove` are slower on real storage than a 5400 rpm disk accounts for (measured on the
-/// laptop, 2026-09-17), and every metadata read and write a mutation makes comes through here
-/// one 4 KiB block at a time. It is *a* suspect and not a diagnosis: see
-/// `docs/rationale/deferred-decisions.md`, which lists the others and says the measurement
-/// comes first.
+/// **One block per `sys_io_submit` was a suspect in `TODO(fs-throughput)`**, which Phase 6
+/// Part H measured on the laptop and closed. Metadata reads now reach it through the server's
+/// cache, and a grow's zeroes go 64 KiB a command; what still comes through a block at a time is
+/// the metadata a mutation writes, each change as it is made (`TODO(ext4-metadata-writes)` in
+/// `docs/rationale/deferred-decisions.md`).
 pub struct Disk {
     /// The block-device handle (from the setup message).
     device: u64,
@@ -61,9 +61,22 @@ pub struct Disk {
     scratch: u64,
     /// `scratch`, mapped R/W into this process — where read sectors land.
     scratch_addr: u64,
+    /// **[`SPAN`] bytes of zeroes**, a `MemoryObject` never written — created zeroed — so a grow's
+    /// zeroes go to the device in large commands ([`BlockWriter::write_zeroes`], Phase 6 Part H.4).
+    zeroes: u64,
     /// **Not `Sync`**: every transfer passes through the one scratch, which two threads would
     /// share (Phase 6 Part G.2, found moving [`PartitionIo`] beside it).
     _one_thread: PhantomData<Cell<()>>,
+}
+
+/// **How [`Disk`] writes `len` zeroes from `offset`**, as byte ranges `(head, whole, tail)`, any of
+/// them empty: the part of a block at each end, each written by `write_at`, which reads the block
+/// first, and between them whole blocks, in commands of up to [`SPAN`].
+pub fn split_zeroes(offset: u64, len: u64) -> (Range<u64>, Range<u64>, Range<u64>) {
+    let end = offset + len;
+    let first = offset.next_multiple_of(IO_BLOCK as u64).min(end);
+    let last = (end / IO_BLOCK as u64 * IO_BLOCK as u64).max(first);
+    (offset..first, first..last, last..end)
 }
 
 impl Disk {
@@ -81,7 +94,12 @@ impl Disk {
         if scratch_addr < 0 {
             return Err(b"fs-server: scratch map failed\n");
         }
-        Ok(Disk { device, scratch, scratch_addr: scratch_addr as u64, _one_thread: PhantomData })
+        // SAFETY: register-only syscall; a new memory object is zeroed.
+        let zeroes = unsafe { syscall4(SYS_MEMORY_CREATE, SPAN as u64, 0, 0, 0) };
+        if zeroes < 0 {
+            return Err(b"fs-server: zero span create failed\n");
+        }
+        Ok(Disk { device, scratch, scratch_addr: scratch_addr as u64, zeroes: zeroes as u64, _one_thread: PhantomData })
     }
 
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
@@ -155,6 +173,30 @@ impl BlockReader for Disk {
 }
 
 impl BlockWriter for Disk {
+    /// **Whole blocks in commands of up to [`SPAN`]**, from the zero span; a part of a block at
+    /// either end goes through [`write_at`](Self::write_at) ([`split_zeroes`]).
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        static ZERO: [u8; IO_BLOCK] = [0; IO_BLOCK];
+        let (head, whole, tail) = split_zeroes(offset, len);
+        self.write_at(head.start, &ZERO[..(head.end - head.start) as usize])?;
+        let mut at = whole.start;
+        while at < whole.end {
+            let n = (whole.end - at).min(SPAN as u64);
+            let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: self.zeroes, buf_offset: 0, offset: at, length: n };
+            // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
+            let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
+            if po < 0 {
+                return Err(FsError::Io);
+            }
+            let (status, result) = po_wait(po as u64);
+            if status != 0 || result != n {
+                return Err(FsError::Io);
+            }
+            at += n;
+        }
+        self.write_at(tail.start, &ZERO[..(tail.end - tail.start) as usize])
+    }
+
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -448,6 +490,24 @@ impl Drop for PartitionIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A run of zeroes splits into a block's part at each end and whole blocks between**, which
+    /// cover it exactly — aligned, ragged at either end or both, inside one block, across one
+    /// boundary, and empty.
+    #[test]
+    fn zeroes_split_into_a_ragged_head_whole_blocks_and_a_ragged_tail() {
+        const B: u64 = IO_BLOCK as u64;
+        assert_eq!(split_zeroes(B, 32 * B), (B..B, B..33 * B, 33 * B..33 * B), "aligned: whole blocks alone");
+        assert_eq!(split_zeroes(B + 100, 2 * B), (B + 100..2 * B, 2 * B..3 * B, 3 * B..3 * B + 100));
+        assert_eq!(split_zeroes(100, 200), (100..300, 300..300, 300..300), "inside one block: a head alone");
+        assert_eq!(split_zeroes(B - 1, 2), (B - 1..B, B..B, B..B + 1), "across one boundary, no whole block");
+        assert_eq!(split_zeroes(5 * B, 0), (5 * B..5 * B, 5 * B..5 * B, 5 * B..5 * B));
+        for (offset, len) in [(0, 1), (4095, 4097), (12_345, 1_000_000), (B, B - 1)] {
+            let (h, w, t) = split_zeroes(offset, len);
+            assert!(h.start == offset && h.end == w.start && w.end == t.start && t.end == offset + len);
+            assert!(w.start % B == 0 && w.end % B == 0 && h.end - h.start < B && t.end - t.start < B);
+        }
+    }
 
     /// **The chunks a request moves in** cover it exactly: sector-aligned, contiguous, none over
     /// [`SPAN`], and the request's bytes within each — for aligned and unaligned starts and ends,

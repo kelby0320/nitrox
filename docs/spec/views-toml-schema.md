@@ -15,7 +15,7 @@ syntax. A view is a profile's grants added to the caller's own namespace; see
 
 ```toml
 [profile.admin]
-grants = ["disks", "storage", "views", "accounts", "services", "power", "clock", "logs"]
+grants = ["disks", "storage", "views", "accounts", "services", "power", "clock", "logs", "kernel-log"]
 
 [profile.install]
 grants = ["disks"]
@@ -73,7 +73,8 @@ names its line.
 | `services` | `service-mgr`'s admin endpoint at `/dev/services/admin`: starting, stopping and restarting services ([`rsproto-services-ops.md`](rsproto-services-ops.md)). `service-mgr` refuses an `essential` service's stop and restart itself, whoever holds this. Listing the services needs no grant: every session's `/dev/services` is the table | Part E.2b |
 | `power` | `service-mgr`'s power endpoint at `/dev/power`: a session there takes `Shutdown`, to halt or reboot the machine, and nothing else ([`rsproto-services-ops.md`](rsproto-services-ops.md) § `Shutdown`). **The seeded policy gives it to everyone**, for `shutdown` alone and with no password, as a desktop's power button would; `admin` has it too | Part E.4d |
 | `clock` | **nothing**: it is `SYSTEM_CLOCK` in the program's spawn, the kernel capability `sys_clock_set` asks for, so `date --set` can set the wall clock and the machine's hardware clock ([`syscall-abi.md`](syscall-abi.md) § `sys_clock_set`). The one grant that is not a binding. **The program's children get it only if it passes it on.** `nxsh` does, passing its stages whatever it holds, so `with admin nxsh` is a shell whose `date --set` works, as its stages reach the view's bindings | Part E.5 |
-| `logs` | the logging service's read endpoint at `/dev/logs`: a resolve there opens a read session, whose `Read` answers from the service's ring — every service's records, and the view broker's audit among them ([`rsproto-log-ops.md`](rsproto-log-ops.md)). **Not** `/dev/log`, the kernel's own log. The broker holds the endpoint for the boot once it has been granted, as `power`'s | Part E.6 |
+| `logs` | the logging service's read endpoint at `/dev/logs`: a resolve there opens a read session, whose `Read` answers from the service's ring — every service's records, and the view broker's audit among them ([`rsproto-log-ops.md`](rsproto-log-ops.md)). **Not** `/dev/log`, the kernel's own log, which is `kernel-log`'s. The broker holds the endpoint for the boot once it has been granted, as `power`'s | Part E.6 |
+| `kernel-log` | **a snapshot of the kernel's log** at `/dev/log`, where the root namespace binds the kernel's own: the broker resolves its `/dev/log`, which the kernel answers with a fresh read-only snapshot, and binds that, readable and sizeable, in the view. **Taken as the view is made** — one is made for each request, so a program run in it reads the log as it stood then. What `log --kernel` reads ([`shell-language.md`](shell-language.md) §10d) | Phase 6 Part B.7 |
 
 Each later part of the administration phase adds its grant to this table.
 

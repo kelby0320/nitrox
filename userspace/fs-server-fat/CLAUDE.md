@@ -27,7 +27,8 @@ loop.
   The boot sector is written last. Its tests hold each type and cluster size at its boundary's
   neighbours to `fsck.fat -n`, mtools and `Fat`.
 - **`src/main.rs`** — the `[[bin]]`: `server::bootstrap` with `SectorDisk::new`, then `server::run`
-  over a `Fat`, through `ReadOnly` for a read-only mount. Alloc-free.
+  over a `Fat`, through `ReadOnly` for a read-only mount — **and through `libfsserver`'s
+  `MetaCache`** since Phase 6 Part H.4, whose 1 MiB is a `static`. Alloc-free.
 
 ## Rules
 
@@ -44,9 +45,12 @@ loop.
   read `fat-fs-server.md` §5 first. **`crash_tests` crashes each change after every write** and
   checks what is left; every flush in the write path is one its removal fails, so a flush no test
   needs is a question to answer, not one to leave (PR #365 review).
-- **The write path batches** (`TODO(fs-throughput)`): allocation in one pass, zeroes in 64 KiB
+- **The write path batches** (since Part E; Part H measured it): allocation in one pass, zeroes in 64 KiB
   writes, the FAT's dirty sectors written together. `a_one_mebibyte_grow_costs_a_handful_of_writes`
   counts it; a change that makes it slower should say so with a number.
+- **Directories, the FAT and the FSInfo are read with `read_meta`**, through the server's metadata
+  cache; **a file's data with `read_at`**, since the kernel writes it behind the server's back.
+  `free_chain` `forget`s each cluster it frees (Phase 6 Part H.4).
 - **A filesystem found dirty stays dirty** at its unmount. Nothing here repairs one.
 - **Tests run against the host's tools**: `mformat`, `mkfs.fat`, `mcopy` and `mdir` build and read
   the images, and **`fsck.fat -n` must find every image clean after every change**. A test of a

@@ -18,6 +18,7 @@
 //!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
 //!   check-live      boot the live image as a USB stick with no disk; mount, greeter, and a write
 //!   check-media     the live desktop: a stick plugged in, shown in Files, saved to, ejected
+//!   throughput-stick write the image of the stick Phase 6 Part H's copies are timed with; `--check`
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -558,6 +559,7 @@ fn main() -> ExitCode {
         Some("check-report") => cmd_check_report(accel, usb, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
+        Some("throughput-stick") => cmd_throughput_stick(&qargs),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq, usb, gate_size),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
@@ -609,6 +611,8 @@ fn print_help() {
            \x20                USB keyboard and mouse, so every key and click is USB's\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
+           throughput-stick  write the stick Part H's copies are timed with; `--check IMAGE`\n  \
+           \x20                reads one back and checks every file by its pattern\n  \
            preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
            shot              boot the release image and photograph the desktop; `shot all`, or\n  \
            \x20                one of greeter|desktop|apps|windows|terminal|hover|files|editor|overview\n  \
@@ -1704,6 +1708,24 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 5d'. **`time PIPELINE`** (Phase 6 Part H.2): the pipeline's value comes through — the listing,
+    //     the device manager's `io.tsm` in it — and when the pipeline ends, before the value is
+    //     shown, a line saying how long it took and what the disks did, read from that table. The
+    //     line is held to its shape: `time: `, which the typed command does not contain, then a
+    //     number and a unit.
+    let before = s.transcript().len();
+    s.send("time list /dev/devices")?;
+    s.expect("io.tsm")?;
+    s.expect("/home>")?;
+    let out = s.transcript()[before..].to_string();
+    let line = out.split("time: ").nth(1).and_then(|rest| rest.lines().next()).unwrap_or("");
+    let timed = line.starts_with(|c: char| c.is_ascii_digit())
+        && [" us", " ms", " s"].iter().any(|u| line.split(';').next().is_some_and(|t| t.ends_with(u)));
+    if !timed || out.find("time: ") > out.rfind("io.tsm") {
+        return Err(format!("`time` printed no line of its shape before the listing: {out:?}").into());
+    }
+    steps += 1;
+
     // 5e. **The machine's filesystems** (administration Part C.6). The session's `/dev/storage` is
     //     the storage service at the base `/info`: `list` names a table per device, and the row
     //     mounted at `/` is `init`'s root, matched on `blk-2` and `init`, which the command does not
@@ -2552,6 +2574,22 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //          matched here can only be the row.
     with_admin_asked(s, "log view-broker")?;
     s.expect("view: alice admin date — started")?;
+    s.expect("/home>")?;
+    //      (c) **The kernel's log** (Phase 6 Part B.7): refused without the `kernel-log` grant,
+    //          and through it a row a line from the start of the kernel's log. That line went to
+    //          the console at boot, long before anything here was typed, so a match can only be
+    //          `log`'s row.
+    s.send("log --kernel")?;
+    s.expect("needs the kernel-log grant")?;
+    s.expect("/home>")?;
+    with_admin_asked(s, "log --kernel | take 4")?;
+    s.expect("CPU tables installed (GDT/TSS/IDT)")?;
+    s.expect("/home>")?;
+    //          **And its last row is its last line**, 20g(d)'s clock, whose own echo the wait there
+    //          consumed. The snapshot's last page is padded with NULs, which were a last row of
+    //          them until `log` trimmed them (PR #371 review, finding 1).
+    with_admin_asked(s, "log --kernel | last 1")?;
+    s.expect("wall clock: set to 1925164800")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -4733,6 +4771,208 @@ fn fat32_stick(path: &Path, work: &Path) -> R<()> {
     println!(
         "xtask: the FAT stick: FAT32 of {clusters} 4 KiB clusters, its data from sector {data}, off \
          a 4 KiB boundary ✓"
+    );
+    Ok(())
+}
+
+// --- The throughput stick (Phase 6 Part H.2) -------------------------------------------------------
+
+/// The label `throughput-stick` gives its FAT.
+const THROUGHPUT_LABEL: &str = "THROUGHPUT";
+
+/// **What the throughput stick holds**, as `(directory, name, bytes)` — the tree Phase 6 Part H's
+/// laptop runs copy, the same every run (`docs/planning/phase-6-usb.md` § *Part H in detail*):
+/// - `big/`: 32 files of 8 MiB — the per-byte cost, at the copy limit;
+/// - `small/`: 4,096 files of 16 KiB in one directory — the per-file cost, and the directory scan;
+/// - `tree/`: 16 directories of 64 files of 64 KiB — a home's shape.
+///
+/// **Every name is unique**, so a file's pattern can be its name's: a copy checks wherever it was
+/// put and whatever its directory was called. **And every name is a FAT short name already** — eight
+/// characters, a dot, three, as a camera names its photos — because `mcopy` given four thousand long
+/// names alike searches for a free `~N` alias for each, scanning the directory for every candidate:
+/// with `small-0000.bin` and its kind, writing the image ran past ten minutes. The check compares
+/// names without case, since a short name's case is a matter of display.
+fn throughput_files() -> Vec<(String, String, u64)> {
+    const KIB: u64 = 1024;
+    let mut out = Vec::new();
+    for i in 0..32 {
+        out.push(("big".to_string(), format!("B{i:02}.BIN"), 8 * 1024 * KIB));
+    }
+    for i in 0..4096 {
+        out.push(("small".to_string(), format!("S{i:04}.BIN"), 16 * KIB));
+    }
+    for d in 0..16 {
+        for i in 0..64 {
+            out.push((format!("tree/d{d:02}"), format!("T{:04}.BIN", d * 64 + i), 64 * KIB));
+        }
+    }
+    out
+}
+
+/// **A file's bytes, by its name**: xorshift64 seeded by the name's FNV-1a hash, eight bytes a step.
+fn throughput_pattern(name: &str, len: u64) -> Vec<u8> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let mut x = h | 1;
+    let mut out = Vec::with_capacity(len as usize + 8);
+    while (out.len() as u64) < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len as usize);
+    out
+}
+
+/// **`cargo xtask throughput-stick`** (Phase 6 Part H.2): write `tools/build-cache/throughput-stick.img`
+/// — a GiB, sparse, an MBR naming one FAT32 partition from 1 MiB with 4 KiB clusters, holding
+/// [`throughput_files`] and [`THROUGHPUT_SCRIPTS`] — to write to a stick. Half of it is free, for the
+/// run that copies the tree back onto the stick. **`--check PATH`** reads an image — or the stick
+/// read back into one, its device given the permission, or the stick mounted — and checks every
+/// pattern file on it, wherever it is.
+fn cmd_throughput_stick(args: &[String]) -> R<()> {
+    if let Some(i) = args.iter().position(|a| a == "--check") {
+        let path = args.get(i + 1).ok_or("`--check` takes the image or device to read")?;
+        return check_throughput_stick(Path::new(path));
+    }
+    for tool in ["mformat", "mcopy"] {
+        require_tool(tool)?;
+    }
+    const MIB: u64 = 1024 * 1024;
+    let path = build_cache().join("throughput-stick.img");
+    let _ = fs::remove_file(&path);
+    fs::create_dir_all(build_cache())?;
+    fs::File::create(&path)?.set_len(1024 * MIB)?;
+    let count = (1024 * 2048 - 2048) as u32;
+    write_mbr(&path, 2048, count, 0x0C)?;
+    let at = format!("{}@@{MIB}", path.display());
+    run(mtools_cmd("mformat")
+        .arg("-i").arg(&at)
+        .arg("-F").arg("-c").arg("8")
+        .arg("-T").arg(count.to_string())
+        .arg("-v").arg(THROUGHPUT_LABEL)
+        .arg("::"))?;
+    let src = build_cache().join("throughput-src");
+    let _ = fs::remove_dir_all(&src);
+    let files = throughput_files();
+    for (dir, name, len) in &files {
+        fs::create_dir_all(src.join(dir))?;
+        fs::write(src.join(dir).join(name), throughput_pattern(name, *len))?;
+    }
+    for (name, body) in THROUGHPUT_SCRIPTS {
+        fs::write(src.join(name), body)?;
+    }
+    let mut mcopy = mtools_cmd("mcopy");
+    mcopy.arg("-s").arg("-i").arg(&at).arg(src.join("big")).arg(src.join("small")).arg(src.join("tree"));
+    for (name, _) in THROUGHPUT_SCRIPTS {
+        mcopy.arg(src.join(name));
+    }
+    run(mcopy.arg("::"))?;
+    fs::remove_dir_all(&src)?;
+    let total: u64 = files.iter().map(|f| f.2).sum();
+    println!(
+        "xtask: the throughput stick at {}: {} files, {} MiB — big/ 32 of 8 MiB, small/ 4,096 of 16 KiB, \
+         tree/ 16 directories of 64 of 64 KiB — and h3.nx and linux.sh, which run the sets.\n  Write it to a \
+         stick with `sudo dd if={} of=/dev/sdX bs=4M conv=fsync,nocreat`, and check the device is a block \
+         device first.",
+        path.display(),
+        files.len(),
+        total / MIB,
+        path.display()
+    );
+    Ok(())
+}
+
+/// **The scripts the stick carries** (Phase 6 Part H.3), as `(name on the stick, text)`: `h3.nx`
+/// runs the laptop's sets in `nxsh`, one a boot, and `linux.sh` the same four under Linux on the
+/// same laptop, writing its times to `RESULTS/` on the stick. The check counts them among the other
+/// files and prints what `RESULTS/` holds.
+const THROUGHPUT_SCRIPTS: [(&str, &str); 2] =
+    [("h3.nx", include_str!("throughput/h3.nx")), ("linux.sh", include_str!("throughput/linux.sh"))];
+
+/// **Every pattern file on a throughput stick, checked** (Phase 6 Part H.2): `img`'s first MBR
+/// partition — or the whole of it, with no MBR — copied off by `mcopy`, every file whose name is
+/// the stick's checked against its pattern wherever it is, and the tree `throughput-stick` wrote
+/// required whole where it wrote it. Copies the laptop's runs made are checked too, and counted.
+/// **`img` may be the stick mounted** (Part H.3) — a directory, read where the desktop put it, so
+/// the check needs no `sudo` — and what `linux.sh` wrote to `RESULTS/` is printed either way.
+fn check_throughput_stick(img: &Path) -> R<()> {
+    use std::io::Read;
+    let extracted = !img.is_dir();
+    let out = if extracted { build_cache().join("throughput-check") } else { img.to_path_buf() };
+    if extracted {
+        require_tool("mcopy")?;
+        let mut mbr = [0u8; 512];
+        fs::File::open(img)?.read_exact(&mut mbr)?;
+        let first = u32::from_le_bytes([mbr[454], mbr[455], mbr[456], mbr[457]]) as u64;
+        let offset = if mbr[510..512] == [0x55, 0xAA] && mbr[450] != 0 && first != 0 { first * 512 } else { 0 };
+        let _ = fs::remove_dir_all(&out);
+        fs::create_dir_all(&out)?;
+        run(mtools_cmd("mcopy").arg("-s").arg("-i").arg(format!("{}@@{offset}", img.display())).arg("::/*").arg(&out))?;
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![out.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir)? {
+            let p = e?.path();
+            if p.is_dir() { stack.push(p) } else { found.push(p) }
+        }
+    }
+    let lens: std::collections::HashMap<String, u64> =
+        throughput_files().into_iter().map(|(_, name, len)| (name, len)).collect();
+    let (mut good, mut bad, mut others) = (0usize, Vec::new(), 0usize);
+    for p in &found {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_uppercase();
+        let Some(&len) = lens.get(&name) else {
+            others += 1;
+            continue;
+        };
+        if fs::read(p)? == throughput_pattern(&name, len) {
+            good += 1;
+        } else {
+            bad.push(p.strip_prefix(&out).unwrap_or(p).display().to_string());
+        }
+    }
+    let present: std::collections::HashSet<String> = found
+        .iter()
+        .filter_map(|p| p.strip_prefix(&out).ok()?.to_str().map(str::to_ascii_uppercase))
+        .collect();
+    let missing: Vec<String> = throughput_files()
+        .iter()
+        .map(|(dir, name, _)| format!("{dir}/{name}"))
+        .filter(|path| !present.contains(&path.to_ascii_uppercase()))
+        .collect();
+    let mut results: Vec<&PathBuf> = found
+        .iter()
+        .filter(|p| p.parent().and_then(|d| d.file_name()).is_some_and(|d| d.eq_ignore_ascii_case("RESULTS")))
+        .collect();
+    results.sort();
+    for p in results {
+        println!("xtask: {}:\n{}", p.strip_prefix(&out).unwrap_or(p).display(), String::from_utf8_lossy(&fs::read(p)?));
+    }
+    if extracted {
+        let _ = fs::remove_dir_all(&out);
+    }
+    if !bad.is_empty() || !missing.is_empty() {
+        return Err(format!(
+            "the throughput stick does not check: {} files differ from their patterns (first: {:?}), \
+             {} of the tree it was written with are missing (first: {:?})",
+            bad.len(),
+            bad.first(),
+            missing.len(),
+            missing.first()
+        )
+        .into());
+    }
+    let tree = throughput_files().len();
+    println!(
+        "xtask: the throughput stick checks: {good} pattern files, every byte as written — the tree's \
+         {tree} where it was written and {} copies — and {others} other files ✓",
+        good - tree
     );
     Ok(())
 }
@@ -7614,6 +7854,16 @@ impl Frame {
     }
 }
 
+/// **The shell's last whole window list** in `transcript`: what follows `window list on cli of ` on
+/// the last line holding it **that has ended**. The transcript is read as it arrives, so the shell's
+/// next list may be half there — a line cut after its second window, counted, said two, and once
+/// after its first said one: `check-login --usb`'s two failures in Phase 6 Part B.7's rounds, where
+/// the whole line before it held all three. A match is not a line (PR #352 review).
+fn last_window_list(transcript: &str) -> Option<&str> {
+    let whole = &transcript[..transcript.rfind('\n').map_or(0, |i| i + 1)];
+    let (i, m) = whole.rmatch_indices("window list on cli of ").next()?;
+    whole[i + m.len()..].lines().next()
+}
 
 /// **Paced on the greeter's redraw counter**, because a greeter has no echo. What was typed is
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
@@ -9582,17 +9832,17 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **And it is a window in its own right**, not a decoration: the taskbar lists it, which is
     // the shell's own account of what exists rather than the editor's.
     let listing = session.transcript();
-    let last = listing
-        .rmatch_indices("window list on cli of ")
-        .next()
-        .map(|(i, m)| listing[i + m.len()..].lines().next().unwrap_or("").to_string())
-        .unwrap_or_default();
+    let last = last_window_list(&listing).unwrap_or_default().to_string();
     // **The entries, not the number.** The number after `of ` is `desktops.len()`, which this
     // gate switched to 2 several steps ago and which is satisfied whatever the taskbar holds — so
     // reading it made this assertion decoration that could not fail (PR #283 review, blocking 3).
     // The windows are the bracketed `[id:label]` items.
     let count = last.matches('[').count();
     if count < 3 {
+        // **The transcript, kept**: the list says what the shell showed and not why, and this
+        // failed once in seventeen runs under KVM with nothing kept to read (Phase 6 Part B.7's
+        // gate round, 2026-10-13).
+        let _ = fs::write(build_cache().join("guest-transcript-check-login.log"), session.transcript());
         let _ = session.child.kill();
         return Err(format!(
             "after New Window the shell lists {count} window(s) on this desktop — the browser, \
@@ -18799,9 +19049,15 @@ const SCRATCH_ESP_PATH: &str = "/boot/scratch.img";
 const SCRATCH_README: &str = "nitrox-scratch: a test image's second filesystem, mounted by the storage service\n";
 /// Its size: room for the probe's writes, and little to load.
 const SCRATCH_MIB: u64 = 8;
+/// **A file of [`SCRATCH_AHEAD_PAGES`] pages on the scratch filesystem**, byte `i` being `i % 251`,
+/// which `boot-probe` reads through a mapping to see fills read ahead (Phase 6 Part H.4): nothing
+/// opens it before then, so its pages come from the device.
+const SCRATCH_AHEAD: &str = "ahead";
+/// Its length in pages: two fills' worth at 32 pages a fill.
+const SCRATCH_AHEAD_PAGES: usize = 64;
 
 /// Build the test image's scratch filesystem at `out`: an ext4 labelled [`SCRATCH_LABEL`] holding a
-/// `README`, with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
+/// `README` and [`SCRATCH_AHEAD`], with the feature set `fs-server-ext4` reads. A bare filesystem, with no partition
 /// table, so its label is its own.
 fn build_scratch_fs(out: &Path) -> R<()> {
     let staging = out.with_extension("staging");
@@ -18810,6 +19066,7 @@ fn build_scratch_fs(out: &Path) -> R<()> {
     }
     fs::create_dir_all(&staging)?;
     fs::write(staging.join("README"), SCRATCH_README)?;
+    fs::write(staging.join(SCRATCH_AHEAD), (0..SCRATCH_AHEAD_PAGES * 4096).map(|i| (i % 251) as u8).collect::<Vec<u8>>())?;
     let _ = fs::remove_file(out);
     fs::File::create(out)?.set_len(SCRATCH_MIB * 1024 * 1024)?;
     run(Command::new("mke2fs")
@@ -19564,6 +19821,31 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The throughput stick's tree**: its three parts at the sizes the plan names, 384 MiB in all,
+    /// and every name once — which is what lets a copy be checked by its name wherever it was put.
+    #[test]
+    fn the_throughput_tree_is_the_plans_and_its_names_are_unique() {
+        let files = super::throughput_files();
+        let in_dir = |d: &str| files.iter().filter(|f| f.0 == d || f.0.starts_with(&format!("{d}/"))).count();
+        assert_eq!((in_dir("big"), in_dir("small"), in_dir("tree")), (32, 4096, 1024));
+        assert_eq!(files.iter().map(|f| f.2).sum::<u64>(), 384 << 20);
+        let names: std::collections::HashSet<&String> = files.iter().map(|f| &f.1).collect();
+        assert_eq!(names.len(), files.len(), "a name twice could not be checked by its name");
+        let short = |n: &str| n.split_once('.').is_some_and(|(b, e)| b.len() <= 8 && e.len() == 3)
+            && n.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'.');
+        assert!(files.iter().all(|f| short(&f.1)), "every name a FAT short name, as mcopy needs");
+    }
+
+    /// A pattern is its name's alone, the same each time, and its length to the byte.
+    #[test]
+    fn a_throughput_pattern_is_its_names_and_its_lengths() {
+        let a = super::throughput_pattern("S0001.BIN", 16 * 1024);
+        assert_eq!(a, super::throughput_pattern("S0001.BIN", 16 * 1024));
+        assert_ne!(a, super::throughput_pattern("S0002.BIN", 16 * 1024));
+        assert_eq!(super::throughput_pattern("x", 13).len(), 13);
+        assert_eq!(&super::throughput_pattern("x", 13)[..], &super::throughput_pattern("x", 64)[..13]);
+    }
 
     /// **The manager lists at least the first round's devices** (PR #356 review): the lines the
     /// three runs of fgb68 and before gave pass, and the reviewer's control — a manager that
@@ -20805,4 +21087,20 @@ mod diag_tests {
         assert_eq!(super::take_utf8(&mut bad), "a\u{FFFD}b");
         assert!(bad.is_empty());
     }
+    /// **The last window list is a whole line's** (Phase 6 Part B.7): a list cut off as it arrived is
+    /// passed over for the whole one before it — the transcript `check-login --usb` kept when it
+    /// failed — and a transcript with no whole list has none.
+    #[test]
+    fn the_last_window_list_is_a_whole_lines() {
+        let kept = "desktop-shell: placed window 24 at 24,150\n\
+                    desktop-shell: window list on cli of 3 [21:  Files] [23:  notes.txt] [24:> window 24]\n\
+                    nxedit: opened another window\n\
+                    desktop-shell: window list on cli of 3 [21:  Files] [23:  notes.t";
+        assert_eq!(last_window_list(kept), Some("3 [21:  Files] [23:  notes.txt] [24:> window 24]"));
+        assert_eq!(last_window_list(kept).map(|l| l.matches('[').count()), Some(3));
+        let ended = format!("{kept}xt] [24:  window 24]\n");
+        assert_eq!(last_window_list(&ended), Some("3 [21:  Files] [23:  notes.txt] [24:  window 24]"));
+        assert_eq!(last_window_list("desktop-shell: window list on cli of 3 [21:  Files]"), None);
+    }
+
 }

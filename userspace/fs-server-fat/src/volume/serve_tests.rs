@@ -86,6 +86,55 @@ fn a_file_is_replied_in_sectors_with_its_first_cluster_as_its_id() {
     assert_eq!(resolve(&Fat::new(&ro), b"file.bin").unwrap().flags, FILE_BLOCKS_READ_ONLY);
 }
 
+/// **A grow's reply marks the sectors it added `UNWRITTEN`, which read zero on the device, and a
+/// plain resolve marks none** (Phase 6 Part H.4). A FAT file is replied in sectors, so a file grown
+/// from 1,000 bytes is marked from sector 2 — the first wholly past its old end — through the end of
+/// the clusters it took, its first two sectors read from the device as ever.
+#[test]
+fn a_grows_reply_marks_the_sectors_it_added_and_they_read_zero() {
+    use libfsserver::RUN_UNWRITTEN;
+    use libfsserver::serve::serve_grown;
+    const NOW: i64 = 1_791_244_800;
+    let img = mformat(64, &["-F", "-c", "8"]);
+    put(&img, "file.bin", &pattern(1000, 4));
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let was = Volume::grow_file(&fat, b"/file.bin", 3 * 4096, NOW).unwrap();
+    assert_eq!(was, 1000);
+
+    // `(sector, device sector, length, flags)` of each run a block-file reply carries.
+    let runs_of = |served: Served, reply: &[u8]| match served {
+        Served::LazyBlocks { reply_len } => {
+            let b = decode(&reply[..reply_len]).unwrap().body;
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+            (0..u32_at(12) as usize)
+                .map(|i| 32 + 24 * i)
+                .map(|at| (u64_at(at), u64_at(at + 8), u32_at(at + 16), u32_at(at + 20)))
+                .collect::<Vec<_>>()
+        }
+        _ => panic!("expected a LazyBlocks reply"),
+    };
+    let mut content = [0u8; MAX_FILE];
+    let mut reply = [0u8; 4096];
+    let runs = runs_of(serve_grown(&fat, &lazy_request(9, b"file.bin"), &mut content, &mut reply, was), &reply);
+    let marked: Vec<(u64, u64)> = runs
+        .iter()
+        .filter(|r| r.3 == RUN_UNWRITTEN)
+        .flat_map(|&(fb, dev, len, _)| (0..len as u64).map(move |i| (fb + i, dev + i)))
+        .collect();
+    assert_eq!(marked.iter().map(|&(s, _)| s).collect::<Vec<_>>(), (2..24).collect::<Vec<_>>(), "{runs:?}");
+    assert!(runs.iter().filter(|r| r.0 < 2).all(|r| r.3 == 0), "{runs:?}");
+    for (_, dev) in marked {
+        let mut sector = [0xFFu8; 512];
+        disk.read_at(dev * 512, &mut sector).unwrap();
+        assert_eq!(sector, [0u8; 512], "a marked sector reads zero on the device");
+    }
+
+    let later = runs_of(serve(&fat, &lazy_request(9, b"file.bin"), &mut content, &mut reply), &reply);
+    assert!(later.iter().all(|r| r.3 == 0), "{later:?}");
+}
+
 /// **A file in more fragments than a reply holds is refused `TooLarge`**, as ext4's is: mtools
 /// fills the 70 holes left by deleting every other one-cluster file.
 #[test]
