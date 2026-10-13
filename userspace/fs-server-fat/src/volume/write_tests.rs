@@ -659,6 +659,50 @@ fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
     }
 }
 
+/// **What FAT frees leaves the metadata cache** (PR #371 review, finding 4), as ext4's test holds
+/// it: a directory's clusters, read through the cache and so held, are not held once the directory
+/// is removed — clusters that may next be a file's data, which the kernel writes behind the server.
+/// Nothing reads such a cluster back today, since a cluster that becomes a directory's is written
+/// whole first: without `forget` every other test passes.
+#[test]
+fn what_fat_frees_leaves_the_metadata_cache() {
+    use libfsserver::cache::{MetaCache, Store};
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    let mut store = Box::new(Store::<64>::new());
+    let cached = MetaCache::new(&disk, &mut store);
+    let fat = Fat::new(&cached);
+    let root = fat.resolve_dir(b"/").unwrap();
+    fat.mkdir_at(root, b"d", NOW).unwrap();
+    let d = fat.resolve_dir(b"/d").unwrap();
+    let name = |i: usize| format!("a long name to fill a directory {i:03}.txt");
+    for i in 0..80 {
+        fat.create_file(b"/d", name(i).as_bytes(), NOW).unwrap();
+    }
+    for i in 0..80 {
+        if let Some(id) = fat.unlink_at(d, name(i).as_bytes(), NOW).unwrap() {
+            fat.release(id, NOW).unwrap();
+        }
+    }
+    let g = fat.geometry().unwrap().clone();
+    let mut clusters = Vec::new();
+    fat.cache.borrow_mut().walk(&cached, &g, d as u32, |_, c| {
+        clusters.push(c);
+        true
+    })
+    .unwrap();
+    fat.read_dir(d, 0, |_| true).unwrap();
+    let at = |c: u32| g.cluster_sector(c) * 512;
+    assert!(clusters.len() > 1, "a directory of {} clusters", clusters.len());
+    assert!(clusters.iter().all(|&c| cached.holds(at(c))), "each read through the cache, so held");
+
+    fat.rmdir_at(root, b"d", NOW).unwrap();
+    for c in clusters {
+        let (first, last) = (at(c), at(c) + g.cluster_bytes() as u64 - 1);
+        assert!(!cached.holds(first) && !cached.holds(last), "cluster {c} is free and still held");
+    }
+}
+
 /// **A directory is read from the device once** (Phase 6 Part H.4), as ext4's test holds it. FAT
 /// read a directory a sector a command, and every lookup read it again: in a directory of 4,096
 /// names, 127 commands to find a file half way, measured. Through a server's cache, a lookup that

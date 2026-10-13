@@ -128,6 +128,44 @@ pub(crate) mod test_support {
         }
     }
 
+    /// **An [`RwImage`] whose writes fail** (PR #371 review): from the `n`th on, a device gone bad
+    /// partway through an operation, or the `n`th alone, one command lost. A refused write is `Io`
+    /// and changes nothing.
+    pub(crate) struct Failing {
+        pub image: RwImage,
+        /// Writes asked of it so far, refused ones among them.
+        pub writes: std::cell::Cell<u64>,
+        /// The first write refused, counted from 0.
+        fail_at: u64,
+        /// Whether only that one is.
+        once: bool,
+    }
+    impl Failing {
+        /// Every write from the `n`th on refused.
+        pub(crate) fn after(image: Vec<u8>, n: u64) -> Failing {
+            Failing { image: RwImage(RefCell::new(image)), writes: 0.into(), fail_at: n, once: false }
+        }
+        /// The `n`th write alone refused.
+        pub(crate) fn once(image: Vec<u8>, n: u64) -> Failing {
+            Failing { once: true, ..Failing::after(image, n) }
+        }
+    }
+    impl BlockReader for Failing {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Failing {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            let i = self.writes.get();
+            self.writes.set(i + 1);
+            if i == self.fail_at || (!self.once && i > self.fail_at) {
+                return Err(FsError::Io);
+            }
+            self.image.write_at(offset, buf)
+        }
+    }
+
     /// A `BlockReader` over an in-memory image. Its writes are refused, so a test reading through
     /// a server's [`crate::Ext4`] volume, which takes a writer, cannot change it.
     pub(crate) struct ImageReader(pub Vec<u8>);

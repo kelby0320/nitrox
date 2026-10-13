@@ -25,6 +25,8 @@ ext4 defines it; and a grow, a create, a `mkdir` or a rename that fails takes no
 time**, and **a grow's reply marks what it added `UNWRITTEN`**, so its zeroes are not read back —
 § *Part D* — and the server reads its metadata through **a cache**, so a directory is read from the
 device once (`libfsserver::cache`). And (2026-10-09) **a grow writes its zeroes 64 KiB a command**.
+PR #371's review (2026-10-13): **what is freed is out of the tree on the disk first** — § *The
+extent tree*.
 
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
@@ -137,6 +139,19 @@ create whose directory cannot grow gives its inode back; a `mkdir` gives back it
 and its group's count of directories, which is now **its own group's** — it was always group 0's;
 and a rename within a directory that cannot take the new name puts the old one back, where the
 file had been left with none.
+
+**What is freed is out of the tree on the disk first** (PR #371 review, 2026-10-13). A cut takes an
+extent out of its node — the node's header counting what is left — and writes the node, a tree block
+to its block and the inode's root to the inode, before it frees any block the extent held; a fold
+writes the root before it frees the child it took in; and a release, of a file or an empty
+directory, frees the inode before its blocks. So a cut stopped by an error, or by a device that
+refuses every write from some point on, leaves a tree that reads and maps nothing it freed, and what
+it had not reached leaks, which `e2fsck` gives back. It once freed first and wrote the node after:
+an error between handed back a root counting an entry it had zeroed, which a failed grow wrote to
+the disk with every lookup past it `Corrupt`, and a leaf, or a truncated or released inode, could be
+left on the disk mapping blocks free for the next file. It costs a truncate whose root changes one
+more write of its inode. Held by host tests that lose each write of a cut, a truncate, a release and
+a directory's removal in turn, and that refuse every write from each on.
 
 The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
 -fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both

@@ -35740,3 +35740,63 @@ holding a key down — rather than tried on the laptop. **Phase 6 — USB — is
 A–H, and Part B's seventh step, B.7, which the laptop's check asked for. Left for later, as decided:
 external hubs, the System76 Launch's keyboard among the devices behind one; a grow's zeroes and
 ext4's metadata written a file at a time; and media keys. The syscall consolidation is next.
+
+## 2026-10-13 — PR #371's review: the kernel log's padding, a waiter's retry, what a cut frees
+
+A fresh session reviewed PR #371: one blocking finding and four worth fixing, all in error paths or
+in what guards them. Each is fixed.
+
+1. **`log --kernel`'s last row was the snapshot's padding.** `/dev/log` is a `MemoryObject`, sized
+   to its pages and the last zero-padded for the reader to trim; `log` split it whole, so
+   `| last 20` gave nineteen lines and a row of NULs — 2,715 of them in the reviewer's boot.
+   `libfs::unpadded` trims the NULs that end a read, and `log --kernel` reads through it, as does
+   `nxsh`'s `open` of text: with the grant a session can `open /dev/log`, and would meet the same
+   row by the same path. `test-interactive`'s step 20h now reads `log --kernel | last 1` and expects
+   20g's clock line.
+
+2. **A cut that failed partway handed back a corrupt root.** `extent::cut` zeroed each entry as it
+   freed it and counted what was left at the end, so an error between returned a root whose
+   `eh_entries` counted a zeroed entry — which a failed grow and a failed directory insert write to
+   the disk, every lookup past it `Corrupt` — and a leaf on the disk still listing what was freed.
+   **Now out of the tree on the disk first, then freed**: a node drops what goes, its header
+   counting what is left, and is written — a tree block to its block, the root to the inode, so
+   `truncate` takes where the inode is — before any block it dropped is freed; `fold` writes the
+   root before it frees the child it took in. **A sweep over every write found the class wider**: a
+   truncate whose last write, the inode, was lost left the inode on the disk mapping every block it
+   had freed — so the root is written first too, which costs a truncate whose root changes one more
+   write of its inode — and a release freed a file's blocks from a copy before the inode, so a lost
+   inode write left a live inode mapping them. `release_inode` and `rmdir_at` free the inode first
+   and its blocks last. A failure now leaks what it had not reached, which `e2fsck` gives back.
+   **Not changed**: the allocator's own writes — a bitmap, then a descriptor, then the superblock —
+   are in that order with no undo, so a lost one leaves a count behind its bitmap, which `e2fsck`
+   repairs and which claims no block twice.
+
+3. **A thread waiting on a read-ahead page took a fatal fault for an error elsewhere in the run.**
+   The filler tried its own page again alone; a second faulter waiting on the same PO, for a page
+   the read-ahead reserved, took the failure as its own — two processes sharing a binary, and one
+   killed for a page that reads. A waiter now tries again too, once: a fault fails at its second
+   failed fill. The reviewer could not run it, since no host test reached `fault_in_page`; its loop
+   now takes its waits (`fault_in_page_with`), and a host test plays the disk and the other
+   faulters. Of H.4's two paths with no control, the fault's retry now has one; a read-ahead's
+   rollback when its IRP cannot be built still has none.
+
+4. **Nothing failed without the libraries' `forget`.** Every block that becomes metadata is written
+   whole through the cache before it is read, so the reviewer could build no stale read — `forget`
+   guards a path that does not exist yet — while `libfsserver/CLAUDE.md` said each server's test
+   held it. `MetaCache::holds`, and a test in each server: ext4's tree block and a directory's
+   blocks, and FAT's directory clusters, each read through the cache and held, are not held once
+   freed. The rules file now says which test holds what.
+
+5. **Two undo lines had no test**: `append` giving back the tree blocks it took, and a failed grow
+   writing its inode. An append that loses a write once its leaf is taken now gives the leaf back
+   with `e2fsck` clean, and a grow refused after cutting the blocks past the end leaves the
+   filesystem clean — without the write, `e2fsck` finds `i_blocks` 192 where it should be 8. They
+   survived beyond the one the H.1 entry names.
+
+**Controls**, each failing its test: (1) `log` without the trim, at step 20h (a timeout on the NUL
+row), and `open` without it; (2) the header and the node written after the frees, as they were; the
+node alone written after; the root never written; `fold` freeing before it writes; a release, and a
+directory's removal, freeing the blocks first; (3) no waiter retry; no filler retry; a waiter's
+retry unbounded, which reads the bad page a third time; (4) each library's `forget` deleted; (5)
+each undo line deleted. The sweeps lose each write of a cut, a truncate, a release and a directory's
+removal in turn, and refuse every write from each on. Host tests 3,386.

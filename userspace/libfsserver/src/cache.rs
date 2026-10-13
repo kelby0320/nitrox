@@ -88,6 +88,13 @@ impl<'a, D: BlockReader + BlockWriter, const N: usize> MetaCache<'a, D, N> {
     pub fn device(&self) -> &D {
         self.dev
     }
+
+    /// **Whether the cache holds the block `offset` is in** — what a server's test asks of the
+    /// blocks it freed, which it must have let go ([`BlockWriter::forget`]) though nothing it does
+    /// today would read them back stale (PR #371 review, finding 4).
+    pub fn holds(&self, offset: u64) -> bool {
+        self.store.borrow().slot_of(offset / BLOCK as u64).is_some()
+    }
 }
 
 impl<D: BlockReader + BlockWriter, const N: usize> BlockReader for MetaCache<'_, D, N> {
@@ -270,7 +277,9 @@ mod tests {
         c.read_meta(BLOCK as u64, &mut b).unwrap();
         assert_eq!((b, dev.taken()), ([1, 9, 9, 1], (1, 0)), "a failed write's block is read again");
 
+        assert!(c.holds(BLOCK as u64 + 5) && !c.holds(2 * BLOCK as u64), "the block read, and no other");
         c.forget(BLOCK as u64, BLOCK as u64);
+        assert!(!c.holds(BLOCK as u64));
         dev.bytes.borrow_mut()[BLOCK] = 42; // the kernel, writing what is now a file's block
         c.read_meta(BLOCK as u64, &mut b).unwrap();
         assert_eq!((b[0], dev.taken()), (42, (1, 0)), "a forgotten block is read afresh");

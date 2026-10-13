@@ -30,7 +30,7 @@
 //! which writes back no page over one (`filesystem-data-path.md`).
 //!
 //! No `alloc`, as the rest of the library: a walk holds one block per level of the tree on the
-//! stack, and there are at most [`MAX_DEPTH`] levels below the inode.
+//! stack, and a cut two, and there are at most [`MAX_DEPTH`] levels below the inode.
 
 use crate::ext4::{MAX_BLOCK, Superblock, alloc_block, free_block};
 use crate::{BlockReader, BlockWriter, FsError, rd_u16, rd_u32};
@@ -566,17 +566,34 @@ fn new_node<RW: BlockReader + BlockWriter>(
 /// what is left back into the inode while it fits there. `i_blocks` loses everything freed.
 ///
 /// Cut at `0`, it frees the file whole and leaves the inode an empty leaf.
+///
+/// **`at` is where the inode is on the disk**: whenever the root drops something, the inode is
+/// written there with the new root before what it dropped is freed, as each tree block is (PR #371
+/// review, finding 2), so no write lost after leaves it mapping a freed block. Its caller writes it
+/// again once this returns, with `i_blocks` and whatever else changed. `None` for an inode already
+/// freed, whose blocks an error here only leaks.
 pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     inode: &mut [u8; 256],
     keep: u64,
+    at: Option<u64>,
 ) -> Result<(), FsError> {
     let mut root = [0u8; 60];
     root.copy_from_slice(&inode[ROOT]);
     let h = header(&root, ROOT_ENTRIES)?;
     let mut freed = 0u64;
-    let done = cut(rw, sb, &mut root, h, keep, &mut freed).and_then(|_| fold(rw, sb, &mut root, &mut freed));
+    let before = *inode;
+    let mut persist = |root: &[u8]| match at {
+        Some(off) => {
+            let mut bytes = before;
+            bytes[ROOT].copy_from_slice(&root[..60]);
+            rw.write_at(off, &bytes[..sb.inode_len()])
+        }
+        None => Ok(()),
+    };
+    let done = cut(rw, sb, &mut root, h, keep, &mut freed, &mut persist)
+        .and_then(|_| fold(rw, sb, &mut root, &mut freed, &mut persist));
     // Whatever was freed before an error is gone from the tree too, so the inode takes both.
     inode[ROOT].copy_from_slice(&root);
     count(inode, sb, -(freed as i64));
@@ -584,7 +601,17 @@ pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
 }
 
 /// Cut `node` at `keep`, returning whether it changed. A child left empty is freed and dropped; a
-/// node left empty itself is its caller's to free.
+/// node left empty itself is its caller's to free. `persist` writes `node` where it lives: a tree
+/// block to its block, the root to the inode.
+///
+/// **Out of the tree, then freed** (PR #371 review, finding 2): what `node` drops is gone from it
+/// — its header counting what is left, and on the disk — before any of it is freed, so a cut
+/// stopped by an error leaves a tree that reads and maps nothing it freed. An
+/// error freeing leaks what is left, which `e2fsck` gives back, rather than leaving blocks free
+/// and still mapped for the next file to be given. It once freed first and counted at the end: an
+/// error between handed back a root counting an entry it had zeroed, which two callers write to
+/// the disk, every lookup past it `Corrupt` — and a tree block on the disk still listing what was
+/// freed.
 fn cut<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
@@ -592,60 +619,81 @@ fn cut<RW: BlockReader + BlockWriter>(
     h: Header,
     keep: u64,
     freed: &mut u64,
+    persist: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
 ) -> Result<bool, FsError> {
     let bs = sb.block_size as usize;
+    // What the node keeps: the entries that begin below `keep`. Every one dropped is checked
+    // before anything changes.
     let mut n = h.entries;
-    let mut changed = false;
     while n > 0 {
         if h.depth == 0 {
             let x = read_extent(node, n - 1)?;
-            if x.end() <= keep {
+            if x.lblock < keep {
                 break;
             }
-            if x.lblock >= keep {
-                free_run(rw, sb, x.phys, x.len, freed)?;
-                node[at(n - 1)..at(n)].fill(0);
-                n -= 1;
-                changed = true;
-                continue;
+            if !on_device(sb, x.phys, x.len) {
+                return Err(FsError::Corrupt);
             }
-            let kept = keep - x.lblock;
-            free_run(rw, sb, x.phys + kept, x.len - kept, freed)?;
-            write_extent(node, n - 1, Extent { len: kept, ..x });
-            changed = true;
+        } else if read_index(node, n - 1).0 < keep {
             break;
         }
-        let (first, child) = read_index(node, n - 1);
-        if first >= keep {
-            free_tree(rw, sb, child, h.depth - 1, freed)?;
-            node[at(n - 1)..at(n)].fill(0);
-            n -= 1;
-            changed = true;
-            continue;
+        n -= 1;
+    }
+    let dropped = n;
+    // The last entry kept may run past `keep`: a leaf's extent is shortened, freeing its tail,
+    // and an index's child is cut — on its own block, before this one changes — and dropped if
+    // that leaves it empty.
+    let mut tail = None;
+    let mut emptied = None;
+    if n > 0 && h.depth == 0 {
+        let x = read_extent(node, n - 1)?;
+        if x.end() > keep {
+            let kept = keep - x.lblock;
+            if !on_device(sb, x.phys + kept, x.len - kept) {
+                return Err(FsError::Corrupt);
+            }
+            write_extent(node, n - 1, Extent { len: kept, ..x });
+            tail = Some((x.phys + kept, x.len - kept));
         }
-        // The child across `keep`. Every child before it ends before `first`, so it is the last.
+    } else if n > 0 {
+        let child = read_index(node, n - 1).1;
         let mut buf = [0u8; MAX_BLOCK];
         let ch = read_node(rw, sb, child, h.depth - 1, &mut buf)?;
-        if cut(rw, sb, &mut buf[..bs], ch, keep, freed)? {
-            // Emptied only when its index entry's key is below its first extent, which `e2fsck`
-            // calls invalid and neither ext4 nor this server writes — but which reads, so it is
-            // freed rather than left in the tree with nothing in it.
-            if rd_u16(&buf, 2) == 0 {
-                free_block(rw, sb, child)?;
-                *freed += 1;
-                node[at(n - 1)..at(n)].fill(0);
-                n -= 1;
-                changed = true;
-            } else {
-                rw.write_at(child * bs as u64, &buf[..bs])?;
-            }
+        // Emptied only when its index entry's key is below its first extent, which `e2fsck` calls
+        // invalid and neither ext4 nor this server writes — but which reads, so it is freed rather
+        // than left in the tree with nothing in it.
+        let mut write = |node: &[u8]| rw.write_at(child * bs as u64, &node[..bs]);
+        if cut(rw, sb, &mut buf[..bs], ch, keep, freed, &mut write)? && rd_u16(&buf, 2) == 0 {
+            emptied = Some(child);
+            n -= 1;
         }
-        break;
     }
-    if changed {
-        node[2..4].copy_from_slice(&(n as u16).to_le_bytes());
+    if n == h.entries && tail.is_none() {
+        return Ok(false);
     }
-    Ok(changed)
+    // What goes, kept aside, then out of the node: zeroed and counted gone, and on the disk.
+    let mut gone = [0u8; MAX_BLOCK];
+    gone[at(dropped)..at(h.entries)].copy_from_slice(&node[at(dropped)..at(h.entries)]);
+    node[at(n)..at(h.entries)].fill(0);
+    node[2..4].copy_from_slice(&(n as u16).to_le_bytes());
+    persist(node)?;
+    // Then freed.
+    if let Some((phys, len)) = tail {
+        free_run(rw, sb, phys, len, freed)?;
+    }
+    if let Some(child) = emptied {
+        *freed += 1;
+        free_block(rw, sb, child)?;
+    }
+    for i in dropped..h.entries {
+        if h.depth == 0 {
+            let x = read_extent(&gone, i)?;
+            free_run(rw, sb, x.phys, x.len, freed)?;
+        } else {
+            free_tree(rw, sb, read_index(&gone, i).1, h.depth - 1, freed)?;
+        }
+    }
+    Ok(true)
 }
 
 /// Free tree block `blk`, `depth` levels above the leaves, and everything under it.
@@ -666,13 +714,15 @@ fn free_tree<RW: BlockReader + BlockWriter>(
             free_tree(rw, sb, read_index(&buf, i).1, depth - 1, freed)?;
         }
     }
-    free_block(rw, sb, blk)?;
     *freed += 1;
-    Ok(())
+    free_block(rw, sb, blk)
 }
 
 /// Free `len` blocks from `phys`, refusing a run that is not all on the filesystem: one
 /// [`ext4::free_run`], a bitmap pass a group (Phase 6 Part H.4), where it was one a block.
+///
+/// **Counted before it is freed**: its caller has already taken it out of the tree, so `i_blocks`
+/// agrees with the tree whether the free succeeds or not.
 fn free_run<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
@@ -683,9 +733,8 @@ fn free_run<RW: BlockReader + BlockWriter>(
     if !on_device(sb, phys, len) {
         return Err(FsError::Corrupt);
     }
-    crate::ext4::free_run(rw, sb, phys, len)?;
     *freed += len;
-    Ok(())
+    crate::ext4::free_run(rw, sb, phys, len)
 }
 
 /// Fold the tree back into the inode while it fits there: an index root over one child of four
@@ -693,12 +742,14 @@ fn free_run<RW: BlockReader + BlockWriter>(
 /// empty leaf.
 ///
 /// Without it a cut leaves a tree `e2fsck` calls one level too deep, which it offers to rebuild —
-/// and an undone grow a tree the inode on the disk does not describe.
+/// and an undone grow a tree the inode on the disk does not describe. The root is persisted, as
+/// [`cut`] persists it, before the child it took in is freed.
 fn fold<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     root: &mut [u8; 60],
     freed: &mut u64,
+    persist: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
 ) -> Result<(), FsError> {
     loop {
         let h = header(root, ROOT_ENTRIES)?;
@@ -720,8 +771,9 @@ fn fold<RW: BlockReader + BlockWriter>(
         set_header(&mut new, ch.entries, ROOT_ENTRIES, ch.depth);
         new[ENTRY..at(ch.entries)].copy_from_slice(&buf[ENTRY..at(ch.entries)]);
         *root = new;
-        free_block(rw, sb, child)?;
+        persist(root)?;
         *freed += 1;
+        free_block(rw, sb, child)?;
     }
 }
 
@@ -729,7 +781,7 @@ fn fold<RW: BlockReader + BlockWriter>(
 mod tests {
     use super::*;
     use crate::ext4::{self, inode_offset, read_superblock, resolve_path_ino};
-    use crate::test_support::{ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, fixture_blocks};
+    use crate::test_support::{Failing, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, fixture_blocks};
     use crate::BlockRun;
     use std::cell::RefCell;
 
@@ -1077,6 +1129,104 @@ mod tests {
         assert_eq!(free_blocks(&rw), before + 2 - 4);
     }
 
+    /// **A grow that fails after cutting the blocks past the end leaves the filesystem clean** (PR
+    /// #371 review, finding 5): the grow's undo writes the inode, without which it keeps the
+    /// `i_blocks` of the blocks the grow appended and the undo gave back.
+    #[test]
+    fn a_grow_that_fails_after_cutting_past_the_end_leaves_the_filesystem_clean() {
+        let path = "/system/current-generation";
+        let rw = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"x\n")));
+        ext4::grow_file(&rw, path.as_bytes(), 3 * 4096, TEST_NOW).unwrap();
+        // The file says one block; its extent still holds three.
+        let sb = read_superblock(&rw).unwrap();
+        let (ino, _) = resolve_path_ino(&rw, &sb, path.as_bytes()).unwrap();
+        let at = inode_offset(&rw, &sb, ino).unwrap();
+        BlockWriter::write_at(&rw, at + 4, &4096u32.to_le_bytes()).unwrap();
+        let before = free_blocks(&rw);
+
+        assert_eq!(ext4::grow_file(&rw, path.as_bytes(), 32 << 20, TEST_NOW), Err(FsError::TooLarge));
+        assert_eq!(free_blocks(&rw), before + 2, "the two past the end went back, and all it took");
+        assert_eq!(blocks_in(&agrees(&rw, path, "past-the-end-refused")), 1);
+        assert_e2fsck_clean(&rw.0.borrow(), "past-the-end-refused");
+    }
+
+    /// **An append that loses a write gives back the tree blocks it took** (PR #371 review, finding
+    /// 5): a fifth extent on an inode holding four moves them into a leaf below it, and a write lost
+    /// from the leaf's own on fails the append. Free blocks, the bitmaps and the inode are as they
+    /// were. The writes before are the leaf's allocation, whose own failures are its own.
+    #[test]
+    fn an_append_that_loses_a_write_gives_back_the_tree_blocks_it_took() {
+        let (img, inode, was) = interleaved(4);
+        let sb = read_superblock(&ImageReader(img.clone())).unwrap();
+        // Past `/b`'s block after `/a`'s last, so it continues neither.
+        let x = Extent::written(4, was[3] + 2, 1);
+        let all = Failing::after(img.clone(), u64::MAX);
+        let mut grown = inode;
+        append(&all, &sb, &mut grown, x).unwrap();
+        assert_eq!(header(&grown[ROOT], ROOT_ENTRIES).unwrap().depth, 1, "the four moved below the inode");
+        let before = free_blocks(&RwImage(RefCell::new(img.clone())));
+        for n in 3..all.writes.get() {
+            let rw = Failing::once(img.clone(), n);
+            let mut after = inode;
+            assert_eq!(append(&rw, &sb, &mut after, x), Err(FsError::Io), "write {n}");
+            assert_eq!(after, inode, "write {n}: the inode as it was");
+            assert_eq!(free_blocks(&rw.image), before, "write {n}: the leaf given back");
+            assert_e2fsck_clean(&rw.image.0.borrow(), &format!("append-lost-{n}"));
+        }
+    }
+
+    /// **What ext4 frees leaves the metadata cache** (PR #371 review, finding 4): a file's tree
+    /// blocks and a directory's blocks, each read through the cache and so held, are not held once
+    /// freed — a block that may next be a file's data, which the kernel writes behind the server.
+    /// Nothing reads such a block back today, since every block that becomes metadata is written
+    /// whole first: without `forget` every other test passes. In 4 KiB blocks, the cache's own, so
+    /// a block held is the block freed and not a neighbour.
+    #[test]
+    fn what_ext4_frees_leaves_the_metadata_cache() {
+        use libfsserver::cache::{MetaCache, Store};
+        let rw = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"x\n")));
+        let mut store = Box::new(Store::<64>::new());
+        let c = MetaCache::new(&rw, &mut store);
+        let sb = read_superblock(&c).unwrap();
+        let root = ext4::resolve_dir(&c, b"/").unwrap();
+        // A file of six one-block extents, so a leaf below its inode.
+        for f in [&b"a"[..], b"b"] {
+            ext4::create_file(&c, b"/", f, TEST_NOW).unwrap();
+        }
+        for i in 1..=6 {
+            for f in [&b"/a"[..], b"/b"] {
+                ext4::grow_file(&c, f, i * 4096, TEST_NOW).unwrap();
+            }
+        }
+        // A directory of three blocks, emptied.
+        ext4::mkdir_at(&c, root, b"d", TEST_NOW).unwrap();
+        let name = |i: usize| format!("a name long enough that a hundred fill a block {i:03}");
+        for i in 0..200 {
+            ext4::create_file(&c, b"/d", name(i).as_bytes(), TEST_NOW).unwrap();
+        }
+        let d = ext4::resolve_dir(&c, b"/d").unwrap();
+        for i in 0..200 {
+            let ino = ext4::unlink_at(&c, d, name(i).as_bytes(), TEST_NOW).unwrap().unwrap();
+            ext4::release_inode(&c, ino, TEST_NOW).unwrap();
+        }
+        let (a, inode) = resolve_path_ino(&c, &sb, b"/a").unwrap();
+        let tree = tree_blocks(&c, &sb, &inode);
+        let (_, inode) = resolve_path_ino(&c, &sb, b"/d").unwrap();
+        let mut map = Lookup::new(&inode);
+        let dir: Vec<u64> = (0..3).map(|lb| map.block(&c, &sb, lb).unwrap()).collect();
+        ext4::read_dir(&c, d, 0, |_, _, _| true).unwrap();
+        let freed: Vec<u64> = tree.iter().chain(&dir).copied().collect();
+        assert_eq!((tree.len(), dir.iter().all(|&b| b != 0)), (1, true), "a leaf, and three directory blocks");
+        assert!(freed.iter().all(|&b| c.holds(b * 4096)), "each read through the cache, so held");
+
+        assert_eq!(ext4::unlink_at(&c, root, b"a", TEST_NOW), Ok(Some(a)));
+        ext4::release_inode(&c, a, TEST_NOW).unwrap();
+        ext4::rmdir_at(&c, root, b"d", TEST_NOW).unwrap();
+        for b in freed {
+            assert!(!c.holds(b * 4096), "block {b} is free and still held");
+        }
+    }
+
     /// **A full index below the inode splits too**, and the inode takes the new index beside the
     /// old. Built with nodes of two entries, where ext4's hold 84 at the least: a full index below
     /// the inode is otherwise 7,056 extents away. `e2fsck` and `debugfs` refuse a node that small,
@@ -1122,7 +1272,7 @@ mod tests {
         }
 
         // Cut back to the four: the new leaf and index go, and the inode folds the old index in.
-        truncate(&rw, &sb, &mut inode, 8).unwrap();
+        truncate(&rw, &sb, &mut inode, 8, None).unwrap();
         assert_eq!(free_blocks(&rw), before + 1 + 1, "the extent's block, and the folded index");
         let root = header(&inode[ROOT], ROOT_ENTRIES).unwrap();
         assert_eq!((root.entries, root.depth), (2, 1), "the inode indexes the two leaves");
@@ -1130,8 +1280,152 @@ mod tests {
         assert_eq!(map.block(&rw, &sb, 6).unwrap(), data[3]);
         assert_eq!(map.block(&rw, &sb, 8).unwrap(), 0);
         // And to nothing: every block given back.
-        truncate(&rw, &sb, &mut inode, 0).unwrap();
+        truncate(&rw, &sb, &mut inode, 0, None).unwrap();
         assert_eq!(free_blocks(&rw), initial);
         assert_eq!(header(&inode[ROOT], ROOT_ENTRIES).unwrap().entries, 0);
+    }
+
+    /// The tree blocks under `inode`'s root, at every level.
+    fn tree_blocks<R: BlockReader>(r: &R, sb: &Superblock, inode: &[u8; 256]) -> Vec<u64> {
+        fn walk<R: BlockReader>(r: &R, sb: &Superblock, node: &[u8], h: Header, out: &mut Vec<u64>) {
+            for i in (0..h.entries).filter(|_| h.depth > 0) {
+                let child = read_index(node, i).1;
+                out.push(child);
+                let mut buf = [0u8; MAX_BLOCK];
+                let ch = read_node(r, sb, child, h.depth - 1, &mut buf).unwrap();
+                walk(r, sb, &buf, ch, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(r, sb, &inode[ROOT], header(&inode[ROOT], ROOT_ENTRIES).unwrap(), &mut out);
+        out
+    }
+
+    /// **What a cut stopped by an error must leave**: `inode`'s tree reads at every level, maps each
+    /// block of `was` — the file's map before the cut — as it did or, from `keep` on, not at all,
+    /// and is in use wherever it maps a block or is built of one.
+    fn left_whole<R: BlockReader>(r: &R, sb: &Superblock, inode: &[u8; 256], was: &[u64], keep: u64, tag: &str) {
+        let mut map = Lookup::new(inode);
+        for (lb, &before) in (0u64..).zip(was) {
+            let now = map.block(r, sb, lb).unwrap_or_else(|e| panic!("{tag}: block {lb} reads {e:?}"));
+            assert!(now == before || (now == 0 && lb >= keep), "{tag}: block {lb} maps {now}, was {before}");
+            assert!(now == 0 || ext4::block_in_use(r, sb, now), "{tag}: block {lb} maps {now}, which is free");
+        }
+        for blk in tree_blocks(r, sb, inode) {
+            assert!(ext4::block_in_use(r, sb, blk), "{tag}: tree block {blk} is free");
+        }
+    }
+
+    /// An image whose `/a` and `/b` were grown a block at a time in turn, to `blocks` one-block
+    /// extents each, in 1 KiB blocks — four fit in the inode — with `/a`'s inode and map.
+    fn interleaved(blocks: u64) -> (Vec<u8>, [u8; 256], Vec<u64>) {
+        let rw = RwImage(RefCell::new(fixture_blocks(1024, 4096, 0, b"x\n")));
+        for f in [&b"a"[..], b"b"] {
+            ext4::create_file(&rw, b"/", f, TEST_NOW).unwrap();
+        }
+        for i in 1..=blocks as usize {
+            for f in [&b"/a"[..], b"/b"] {
+                ext4::grow_file(&rw, f, i * 1024, TEST_NOW).unwrap();
+            }
+        }
+        let sb = read_superblock(&rw).unwrap();
+        let (_, inode) = resolve_path_ino(&rw, &sb, b"/a").unwrap();
+        let mut map = Lookup::new(&inode);
+        let was = (0..blocks).map(|lb| map.block(&rw, &sb, lb).unwrap()).collect();
+        let img = rw.0.borrow().clone();
+        (img, inode, was)
+    }
+
+    /// **A cut stopped at any write leaves a tree that reads and maps nothing it freed** (PR #371
+    /// review, finding 2), every write from that one on refused — a device gone bad. Two extents
+    /// in the inode, as the review found it, and twelve in a leaf below it, cut inside the leaf, to
+    /// few enough to fold into the inode, and to nothing. The cut once freed first and counted at
+    /// the end: stopped between, it handed back a root counting an entry it had zeroed, every
+    /// lookup past it `Corrupt`, and a leaf on the disk still listing what it had freed.
+    #[test]
+    fn a_cut_stopped_at_any_write_leaves_a_tree_that_maps_nothing_it_freed() {
+        for (blocks, keeps, want_depth) in [(2u64, &[0u64, 1][..], 0u16), (12, &[0, 3, 5], 1)] {
+            let (img, inode, was) = interleaved(blocks);
+            assert_eq!(header(&inode[ROOT], ROOT_ENTRIES).unwrap().depth, want_depth);
+            let sb = read_superblock(&ImageReader(img.clone())).unwrap();
+            for &keep in keeps {
+                let all = Failing::after(img.clone(), u64::MAX);
+                truncate(&all, &sb, &mut inode.clone(), keep, None).unwrap();
+                for n in 0..all.writes.get() {
+                    let rw = Failing::after(img.clone(), n);
+                    let mut cut = inode;
+                    let tag = format!("{blocks} extents cut to {keep}, every write from {n} refused");
+                    assert_eq!(truncate(&rw, &sb, &mut cut, keep, None), Err(FsError::Io), "{tag}");
+                    left_whole(&rw, &sb, &cut, &was, keep, &tag);
+                }
+            }
+        }
+    }
+
+    /// **And the inode on the disk agrees**, every write from one on refused or that one alone
+    /// lost: a truncate writes the inode before freeing what its root drops, and a release — of a
+    /// file, or of an empty directory — frees the inode before its blocks. Each once returned with
+    /// a live inode on the disk mapping blocks it had freed — a truncate whose last write, the
+    /// inode, was lost, among them.
+    #[test]
+    fn a_truncate_or_a_release_stopped_at_any_write_leaves_no_inode_mapping_what_it_freed() {
+        let models: [(&str, fn(Vec<u8>, u64) -> Failing); 2] =
+            [("refused from", Failing::after), ("lost", Failing::once)];
+        // Four extents in the inode, cut inside it; twelve in a leaf, cut inside the leaf and to
+        // three, which fold into the inode.
+        for (blocks, keeps) in [(4u64, &[1u64][..]), (12, &[5, 3])] {
+            let (img, _, was) = interleaved(blocks);
+            let sb = read_superblock(&ImageReader(img.clone())).unwrap();
+            for &keep in keeps {
+                let size = keep as usize * 1024;
+                let all = Failing::after(img.clone(), u64::MAX);
+                ext4::truncate_file(&all, b"/a", size, TEST_NOW).unwrap();
+                for (how, failing) in models {
+                    for n in 0..all.writes.get() {
+                        let rw = failing(img.clone(), n);
+                        let tag = format!("{blocks} extents truncated to {keep}, write {n} {how}");
+                        assert_eq!(ext4::truncate_file(&rw, b"/a", size, TEST_NOW), Err(FsError::Io), "{tag}");
+                        left_whole(&rw, &sb, &resolve_path_ino(&rw, &sb, b"/a").unwrap().1, &was, keep, &tag);
+                    }
+                }
+            }
+        }
+        let (img, _, was) = interleaved(12);
+        let sb = read_superblock(&ImageReader(img.clone())).unwrap();
+        let (ino, _) = resolve_path_ino(&ImageReader(img.clone()), &sb, b"/a").unwrap();
+        let all = Failing::after(img.clone(), u64::MAX);
+        ext4::release_inode(&all, ino, TEST_NOW).unwrap();
+        for (how, failing) in models {
+            for n in 0..all.writes.get() {
+                let rw = failing(img.clone(), n);
+                let tag = format!("a release, write {n} {how}");
+                assert_eq!(ext4::release_inode(&rw, ino, TEST_NOW), Err(FsError::Io), "{tag}");
+                let inode = resolve_path_ino(&rw, &sb, b"/a").unwrap().1;
+                // A freed inode maps nothing `e2fsck` counts; a live one must map only what is in use.
+                if rd_u16(&inode, 26) > 0 {
+                    left_whole(&rw, &sb, &inode, &was, 0, &tag);
+                }
+            }
+        }
+
+        let made = RwImage(RefCell::new(img));
+        let root = ext4::resolve_dir(&made, b"/").unwrap();
+        ext4::mkdir_at(&made, root, b"d", TEST_NOW).unwrap();
+        let d = ext4::resolve_dir(&made, b"/d").unwrap();
+        let was = [Lookup::new(&ext4::read_inode(&made, &sb, d).unwrap()).block(&made, &sb, 0).unwrap()];
+        let img = made.0.into_inner();
+        let all = Failing::after(img.clone(), u64::MAX);
+        ext4::rmdir_at(&all, root, b"d", TEST_NOW).unwrap();
+        for (how, failing) in models {
+            for n in 0..all.writes.get() {
+                let rw = failing(img.clone(), n);
+                let tag = format!("a directory's removal, write {n} {how}");
+                assert_eq!(ext4::rmdir_at(&rw, root, b"d", TEST_NOW), Err(FsError::Io), "{tag}");
+                let inode = ext4::read_inode(&rw, &sb, d).unwrap();
+                if rd_u16(&inode, 26) > 0 {
+                    left_whole(&rw, &sb, &inode, &was, 0, &tag);
+                }
+            }
+        }
     }
 }

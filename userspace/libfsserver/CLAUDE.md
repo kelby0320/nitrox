@@ -55,8 +55,10 @@ servers speak one protocol and a fix to it is a fix to both:
   to the device behind the server's back — a cached copy of it would be stale. A read left as
   `read_at` is only slower; one wrongly made `read_meta` returns old bytes. **And whatever a library
   frees it `forget`s**, so a block that may next be a file's leaves the cache. Each server's crate
-  holds this in a test that writes data the kernel's way under a cache that evicts all the time, and
-  reads it back.
+  holds the first in a test that writes data the kernel's way under a cache that evicts all the
+  time, and reads it back; and the second in one that requires what it freed gone from the cache
+  (`MetaCache::holds`) — which the first cannot, since every block that becomes metadata is written
+  whole before it is read, and it passes with no `forget` at all (PR #371 review).
 - **The device layer's granularity is a measured question** (Phase 6 Part H measured it).
   Change what `Disk` moves per submit with a number from the laptop, not a guess. Its zeroes moved
   to 64 KiB on one: ext4's grows wrote a block a command, 65,536 for a 256 MiB copy.

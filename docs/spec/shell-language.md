@@ -296,6 +296,8 @@ for scripts that want it.
 low-level byte-redirect case remains, because TSM1 already auto-wraps unstructured text output
 into a single-column `Table<String>`; there's no such thing as a raw untyped byte stream in this
 pipeline model to begin with. Format inferred from extension (`.csv`, `.json`, `.txt`, `.tsm`).
+**Text ends at its last character that is not a NUL** (PR #371 review): a snapshot such as the
+kernel's `/dev/log` is read whole, its last page padded with NULs, which were a last line of them.
 
 **`open` accepts multiple paths, concatenating them into one stream** — `open a.txt b.txt`. This
 absorbs `cat`'s job entirely (§10a); "open these paths as one stream" is a more natural reading of

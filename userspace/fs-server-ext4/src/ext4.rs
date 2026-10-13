@@ -150,6 +150,11 @@ impl Superblock {
         data.div_ceil(self.blocks_per_group as u64).max(1) as u32
     }
 
+    /// How much of an inode this server reads and writes: its size, up to 256 bytes.
+    pub(crate) fn inode_len(&self) -> usize {
+        (self.inode_size as usize).min(256)
+    }
+
     /// The first block of `group`.
     fn group_start(&self, group: u32) -> u64 {
         self.first_data_block as u64 + group as u64 * self.blocks_per_group as u64
@@ -347,7 +352,7 @@ pub fn check_device<R: BlockReader>(r: &R) -> Result<(), Unservable> {
 }
 
 /// Read inode `ino` into a fixed 256-byte buffer (inodes are ≤ 256 bytes here).
-fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 256], FsError> {
+pub(crate) fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 256], FsError> {
     if ino == 0 {
         return Err(FsError::Corrupt);
     }
@@ -748,6 +753,19 @@ fn bit_set(map: &mut [u8], i: usize) {
     map[i / 8] |= 1 << (i % 8);
 }
 
+/// Whether block `blk`'s bit is set in its group's bitmap: what a test asks of every block a tree
+/// maps.
+#[cfg(test)]
+pub(crate) fn block_in_use<R: BlockReader>(r: &R, sb: &Superblock, blk: u64) -> bool {
+    let rel = blk - sb.first_data_block as u64;
+    let (group, index) = ((rel / sb.blocks_per_group as u64) as u32, (rel % sb.blocks_per_group as u64) as usize);
+    let mut gd = [0u8; 64];
+    r.read_at(sb.group_desc_offset(group), &mut gd[..(sb.desc_size as usize).min(64)]).unwrap();
+    let mut byte = [0u8; 1];
+    r.read_at(rd_u32(&gd, 0) as u64 * sb.block_size as u64 + index as u64 / 8, &mut byte).unwrap();
+    !bit_clear(&byte, index % 8)
+}
+
 /// Resolve an absolute path to `(inode_number, inode_bytes)`, walking directories from the
 /// root inode. The number is what the write path needs to locate the inode on disk, and what
 /// names a file to the kernel.
@@ -1062,7 +1080,7 @@ pub fn grow_file_from<RW: BlockReader + BlockWriter>(
     let grown = (|| {
         // Blocks past the end — an `fallocate` that kept the size leaves them — would sit under
         // the extents this appends, so they go first.
-        extent::truncate(rw, &sb, &mut inode, cur_blocks)?;
+        extent::truncate(rw, &sb, &mut inode, cur_blocks, Some(off))?;
         // The old last block past the old end: a truncate leaves the bytes it cut there.
         let within = cur_size % bs;
         if within != 0 {
@@ -1075,7 +1093,7 @@ pub fn grow_file_from<RW: BlockReader + BlockWriter>(
     })();
     if let Err(e) = grown {
         // The runs already appended go back; the inode is written since a cut can fold its root.
-        let _ = extent::truncate(rw, &sb, &mut inode, cur_blocks);
+        let _ = extent::truncate(rw, &sb, &mut inode, cur_blocks, Some(off));
         let _ = rw.write_at(off, &inode[..isize]);
         return Err(e);
     }
@@ -1300,7 +1318,7 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
     buf[8..8 + name.len()].copy_from_slice(name);
     if let Err(e) = rw.write_at(phys * sb.block_size as u64, &buf[..bs]) {
         // The block goes back, and the inode is written since a cut can fold its root.
-        let _ = extent::truncate(rw, sb, dir_inode, nblocks);
+        let _ = extent::truncate(rw, sb, dir_inode, nblocks, Some(off));
         let _ = rw.write_at(off, &dir_inode[..(sb.inode_size as usize).min(256)]);
         return Err(e);
     }
@@ -1547,6 +1565,10 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
 /// Free every block of `inode` — its data and its extent tree's own blocks, at any depth. Does
 /// not touch the inode itself: the cut is made on a copy.
 ///
+/// **Called once the inode is freed** (PR #371 review, finding 2), so an error here leaks what is
+/// left, which `e2fsck` gives back. Called first, as it was, a lost write after it left a live
+/// inode mapping blocks this had freed, for the next file to be given.
+///
 /// Until Phase 6 Part H.1 a tree was refused here, after [`unlink_at`] had already taken the
 /// file's name, so removing a file with one left an unattached inode holding all its blocks.
 fn free_inode_blocks<RW: BlockReader + BlockWriter>(
@@ -1555,7 +1577,7 @@ fn free_inode_blocks<RW: BlockReader + BlockWriter>(
     inode: &[u8; 256],
 ) -> Result<(), FsError> {
     let mut copy = *inode;
-    extent::truncate(rw, sb, &mut copy, 0)
+    extent::truncate(rw, sb, &mut copy, 0, None)
 }
 
 /// Remove the directory entry `name` from directory-inode bytes `dir_inode`, returning the
@@ -1788,7 +1810,7 @@ fn drop_link<RW: BlockReader + BlockWriter>(
     Ok(None)
 }
 
-/// **Free an inode no name reaches any more** — its data blocks, then the inode itself: the
+/// **Free an inode no name reaches any more** — the inode itself, then its blocks: the
 /// second half of [`unlink_at`], or of a [`rename_path`] that replaced a file. A server calls
 /// it only once the kernel has answered `File::Forget` for the inode, so nothing the kernel
 /// issued can still land in these blocks (administration Part C.1b).
@@ -1806,8 +1828,9 @@ pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64)
     if rd_u16(&inode, 0) & S_IFMT != S_IFREG || rd_u16(&inode, 26) == 0 {
         return Err(FsError::NotFound);
     }
-    free_inode_blocks(rw, &sb, &inode)?;
-    free_inode(rw, &sb, ino, false, now)
+    // The inode, then its blocks: a failure between leaks them rather than mapping them freed.
+    free_inode(rw, &sb, ino, false, now)?;
+    free_inode_blocks(rw, &sb, &inode)
 }
 
 /// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds
@@ -1846,11 +1869,12 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
     }
 
     dir_remove(rw, &sb, &parent, name)?;
-    free_inode_blocks(rw, &sb, &sub)?;
     free_inode(rw, &sb, sub_ino, true, now)?;
     adjust_links(rw, &sb, dir_ino, -1)?; // the subdir's `..` no longer links the parent
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
-    Ok(())
+    // Its blocks last, as `release_inode`'s: a failure before leaves them allocated, and nothing
+    // reaches them after.
+    free_inode_blocks(rw, &sb, &sub)
 }
 
 /// Point the existing entry `name` in `dir_inode` at a different inode, in place.
@@ -2102,8 +2126,10 @@ pub fn truncate_file<RW: BlockReader + BlockWriter>(
     // part of the file, exactly as a regular write leaves slack in the last block.
     let keep_blocks = new_size.div_ceil(bs) as u64;
 
-    // The tree is cut where the kept blocks end; it counts what it frees in `i_blocks`.
-    extent::truncate(rw, &sb, &mut inode, keep_blocks)?;
+    // The tree is cut where the kept blocks end; it counts what it frees in `i_blocks`, and writes
+    // the inode before freeing what its root drops.
+    let off = inode_offset(rw, &sb, ino)?;
+    extent::truncate(rw, &sb, &mut inode, keep_blocks, Some(off))?;
 
     // i_size (lo @4, hi @108).
     inode[4..8].copy_from_slice(&(new_size as u32).to_le_bytes());
@@ -2111,9 +2137,7 @@ pub fn truncate_file<RW: BlockReader + BlockWriter>(
         inode[108..112].copy_from_slice(&((new_size as u64 >> 32) as u32).to_le_bytes());
     }
     stamp(&mut inode, now, sb.inode_size, Stamp::Modified);
-
-    let off = inode_offset(rw, &sb, ino)?;
-    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
+    rw.write_at(off, &inode[..sb.inode_len()])?;
     Ok(new_size)
 }
 
