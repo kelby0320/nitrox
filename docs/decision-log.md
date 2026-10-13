@@ -35799,4 +35799,6 @@ node alone written after; the root never written; `fold` freeing before it write
 directory's removal, freeing the blocks first; (3) no waiter retry; no filler retry; a waiter's
 retry unbounded, which reads the bad page a third time; (4) each library's `forget` deleted; (5)
 each undo line deleted. The sweeps lose each write of a cut, a truncate, a release and a directory's
-removal in turn, and refuse every write from each on. Host tests 3,386.
+removal in turn, and refuse every write from each on. Host tests 3,386. **Full gate set (fgb86):
+44/44** on `d71152db`, every gate under TCG and every CI `--kvm` variant; `boot-probe`'s scratch
+file moved the same 8 reads and 16 writes as before the fixes.

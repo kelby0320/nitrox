@@ -606,12 +606,11 @@ pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
 ///
 /// **Out of the tree, then freed** (PR #371 review, finding 2): what `node` drops is gone from it
 /// — its header counting what is left, and on the disk — before any of it is freed, so a cut
-/// stopped by an error leaves a tree that reads and maps nothing it freed. An
-/// error freeing leaks what is left, which `e2fsck` gives back, rather than leaving blocks free
-/// and still mapped for the next file to be given. It once freed first and counted at the end: an
-/// error between handed back a root counting an entry it had zeroed, which two callers write to
-/// the disk, every lookup past it `Corrupt` — and a tree block on the disk still listing what was
-/// freed.
+/// stopped by an error leaves a tree that reads and maps nothing it freed. An error freeing leaks
+/// what is left, which `e2fsck` gives back, rather than leaving blocks free and still mapped for
+/// the next file to be given. It once freed first and counted at the end: an error between handed
+/// back a root counting an entry it had zeroed, which two callers write to the disk, every lookup
+/// past it `Corrupt` — and a tree block on the disk still listing what was freed.
 fn cut<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
