@@ -129,9 +129,11 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   A file read through — a copy's source, an image being loaded — reads in 128 KiB commands, Linux's
   default read-ahead, rather than a page each. A fill that read ahead and failed is tried again for
   the faulted page alone before the fault fails, as Linux does: the error may have been on a page it
-  never asked for. The **Model B** producer carries `{server, file-suffix}`
-  and fills via `ReadRange` — the variant a non-block fs-server uses. A file has one producer, fixed
-  by its filesystem's class.
+  never asked for. **So is a fill a second faulter waited on** (PR #371 review), which may have been
+  another fault's read-ahead; a fault fails at its second failed fill, and two processes sharing a
+  binary are not both failed by a bad block only one read reached. The **Model B** producer carries
+  `{server, file-suffix}` and fills via `ReadRange` — the variant a non-block fs-server uses. A file
+  has one producer, fixed by its filesystem's class.
 - **Writable mappings, and dirty per object**: `sys_memory_map` grants `MAP_WRITE` on a
   `FileObject` when requested and permitted, and a store faults in a writable PTE. The object
   counts its writable mappings, and one mapped writable is **dirty** (§ *One object per file*).

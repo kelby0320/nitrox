@@ -944,17 +944,32 @@ impl FileObject {
     /// acknowledged a TLB shootdown and the machine stopped. Whoever wakes first settles the
     /// page, so no waiter spins on a completed fill whose filler has not run yet.
     ///
-    /// A failed fill fails every faulter that waited on it, and leaves the page out of the
-    /// cache for the next fault to try again. **One that read ahead is first tried again for the
-    /// faulted page alone** (Phase 6 Part H.4), as Linux does: the error may have been on a page
-    /// after it, which this fault never asked for. A faulter that cannot register on a PO — at
+    /// A failed fill leaves its pages out of the cache for the next fault to try again. **One
+    /// that read ahead is first tried again for the faulted page alone** (Phase 6 Part H.4), as
+    /// Linux does: the error may have been on a page after it, which this fault never asked for.
+    /// **So is one a faulter waited on** (PR #371 review, finding 3): it may have been another
+    /// fault's read-ahead, failed by a page this one never asked for either, and a faulter fails
+    /// only when a fill of its page alone has. A faulter that cannot register on a PO — at
     /// `PendingOperation::MAX_WAITERS` — parks a millisecond and looks again, rather than
     /// spinning.
     pub fn fault_in_page(file_obj: &ObjectRef, index: usize) -> Option<PhysAddr> {
+        Self::fault_in_page_with(file_obj, index, &mut wait_for_fill, &mut park_briefly)
+    }
+
+    /// [`fault_in_page`](Self::fault_in_page) with its waits given: `wait` blocks on a fill's PO
+    /// and says whether the fill succeeded, and `park` passes a moment. The kernel's are the
+    /// scheduler's; a host test's play the device and a second faulter.
+    fn fault_in_page_with(
+        file_obj: &ObjectRef,
+        index: usize,
+        wait: &mut dyn FnMut(&ObjectRef) -> bool,
+        park: &mut dyn FnMut(),
+    ) -> Option<PhysAddr> {
         debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
-        // Whether this fault's fill may read ahead: not again after one that did and failed.
+        // Whether this fault's fill may read ahead, and whether a failed fill may be tried again:
+        // neither after a failure, so a fault fails at the second.
         let mut read_ahead = true;
         loop {
             match fo.reserve_fault(index) {
@@ -980,7 +995,7 @@ impl FileObject {
                         );
                         return None;
                     }
-                    let ok = wait_for_fill(&po);
+                    let ok = wait(&po);
                     // The faulted page, and any read ahead of it on the same PO.
                     let pages = match started_kind {
                         FillStart::DeviceIo(pages) => {
@@ -1014,13 +1029,18 @@ impl FileObject {
                 }
                 Fault::Wait(po) => {
                     fill_stats::SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    let ok = wait_for_fill(&po);
+                    let ok = wait(&po);
                     fo.settle(index, &po, ok);
+                    if !ok && read_ahead {
+                        // Perhaps another fault's read-ahead, failed past this page.
+                        read_ahead = false;
+                        continue;
+                    }
                     if !ok {
                         return None;
                     }
                 }
-                Fault::Busy => park_briefly(),
+                Fault::Busy => park(),
                 Fault::Oom => return None,
             }
         }
@@ -2280,6 +2300,149 @@ mod tests {
         // SAFETY: as above.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
         crate::io::block::complete_for_test(irp);
+        crate::io::block::reclaim_completed();
+    }
+
+    /// The IRPs a [`held_disk_file`]'s disk took and has not completed.
+    struct Held(core::cell::RefCell<std::vec::Vec<*mut crate::io::irp::Irp>>);
+
+    /// **A 20-page file on a disk that holds each IRP for the test to complete**: one run at
+    /// device block 1000 in 4 KiB blocks, and eight fragments an IRP.
+    fn held_disk_file(held: &Held) -> ObjectRef {
+        use crate::io::block::BlockBackend;
+        use crate::io::irp::Irp;
+        use crate::libkern::block::BlockKind;
+        fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
+            // SAFETY: `ctx` is the test's `Held`.
+            unsafe { (*(ctx as *const Held)).0.borrow_mut().push(irp) };
+        }
+        fn disk_poll(_: *mut ()) {}
+        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: held as *const Held as *mut (), max_frags: 8 };
+        let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
+        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let reg = registration();
+        let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
+        let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
+        // SAFETY: as above.
+        let cand = unsafe { ObjectRef::from_raw(KBox::into_raw(cand).as_ptr() as *mut (), KObjectType::FileObject) };
+        let f = FileObject::cache_in(&reg, cand).unwrap();
+        let mut runs = KVec::new();
+        runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
+        file_of(&f).resize(20 * PAGE_SIZE, runs).unwrap();
+        f
+    }
+
+    /// **The disk's side, then the scheduler's**: every IRP `held` completes, failed if it reads
+    /// page `bad`, each recorded in `reads` as (first page, pages); then whether `po`'s fill
+    /// succeeded, as a fault woken from it learns.
+    fn complete_held(held: &Held, reads: &core::cell::RefCell<std::vec::Vec<(u64, u64)>>, bad: u64, po: &ObjectRef) -> bool {
+        let irps: std::vec::Vec<_> = held.0.borrow_mut().drain(..).collect();
+        for irp in irps {
+            // SAFETY: the IRP is live until it is completed here; this is the device's side.
+            unsafe {
+                let (first, pages) = ((*irp).offset / 4096 - 1000, (*irp).length / PAGE_SIZE as u64);
+                reads.borrow_mut().push((first, pages));
+                ((*irp).status, (*irp).transferred) = if (first..first + pages).contains(&bad) {
+                    (crate::syscall::error::KError::IoError as i32, 0)
+                } else {
+                    (0, (*irp).length)
+                };
+            }
+            crate::io::block::complete_for_test(irp);
+        }
+        assert!(reads.borrow().len() < 16, "a fault that never gives up");
+        crate::sched::pending_op_completion(po.as_ptr()).0 == 0
+    }
+
+    /// **A fault waiting on another's read-ahead is not failed by a page it never asked for** (PR
+    /// #371 review, finding 3). Three faults of one file, as processes running one binary make:
+    /// page 0's reads ahead to page 7, and before it wakes, faults of pages 3 and 5 wait on that
+    /// read. The disk fails any read of page 5. Each fault tries its page again alone: page 3's
+    /// and page 0's have it, and page 5's fails, after one read alone and no more.
+    #[test]
+    fn a_failed_read_ahead_fails_only_the_faults_of_the_page_that_failed() {
+        use core::cell::RefCell;
+        init_global_heap();
+        let held = Held(RefCell::new(std::vec::Vec::new()));
+        let f = held_disk_file(&held);
+        let reads = RefCell::new(std::vec::Vec::new());
+        let disk = |po: &ObjectRef| complete_held(&held, &reads, 5, po);
+
+        let (mut page_3, mut page_5) = (None, None);
+        let mut first = true;
+        let mut wait_0 = |po: &ObjectRef| -> bool {
+            let ok = disk(po);
+            if core::mem::take(&mut first) {
+                // Before page 0's fault wakes, the others fault: each page is still its read's.
+                for k in [3, 5] {
+                    match file_of(&f).reserve_fault(k) {
+                        Fault::Wait(on) => assert_eq!(on.as_ptr(), po.as_ptr(), "page {k} waits on page 0's read"),
+                        _ => panic!("page {k} is not being read"),
+                    }
+                }
+                page_3 = FileObject::fault_in_page_with(&f, 3, &mut |po| disk(po), &mut || panic!());
+                page_5 = FileObject::fault_in_page_with(&f, 5, &mut |po| disk(po), &mut || panic!());
+            }
+            ok
+        };
+        let page_0 = FileObject::fault_in_page_with(&f, 0, &mut wait_0, &mut || panic!());
+
+        assert_eq!(*reads.borrow(), [(0, 8), (3, 1), (5, 1), (0, 1)], "the read ahead, then each page alone");
+        for (k, got) in [(0, page_0), (3, page_3)] {
+            assert!(got.is_some(), "page {k}'s fault failed for page 5's error");
+            assert_eq!(file_of(&f).lookup(k), got.map(|frame| (frame, PageState::Ready)));
+        }
+        assert_eq!(page_5, None, "page 5 does not read");
+        assert_eq!(file_of(&f).lookup(5), None, "and is left for the next fault to try");
+        crate::io::block::reclaim_completed();
+    }
+
+    /// **A fault fails at its second failed fill, waited on or its own.** Page 5's fault waits on
+    /// page 0's read-ahead, which fails; before it wakes, page 0's fault has let its pages go and
+    /// another fault of page 5 has started a read of its own, so the first finds page 5 being
+    /// read again and waits on that. It fails too, and the fault fails, rather than reading page 5
+    /// a third time.
+    #[test]
+    fn a_fault_fails_at_its_second_failed_fill() {
+        use core::cell::RefCell;
+        init_global_heap();
+        let held = Held(RefCell::new(std::vec::Vec::new()));
+        let f = held_disk_file(&held);
+        let reads = RefCell::new(std::vec::Vec::new());
+        let fo = file_of(&f);
+
+        // Page 0's fault, by hand: its read ahead to page 7, page 5 among them.
+        let (frame, read_0) = miss(fo, 0);
+        assert_eq!(fo.start_fill(&f, 0, frame, &read_0, true), FillStart::DeviceIo(8));
+        let mut read_5 = None;
+        let mut waits = 0;
+        let mut wait = |po: &ObjectRef| -> bool {
+            waits += 1;
+            let ok = complete_held(&held, &reads, 5, po);
+            if waits == 1 {
+                // Page 0's fault wakes first and lets its pages go, as `fault_in_page` does.
+                assert!(!ok);
+                fo.finish_io();
+                for k in 0..8 {
+                    fo.settle(k, &read_0, false);
+                }
+                // Another fault of page 5 starts its read.
+                let (frame, po) = miss(fo, 5);
+                assert_eq!(fo.start_fill(&f, 5, frame, &po, true), FillStart::DeviceIo(8));
+                read_5 = Some(po);
+            }
+            ok
+        };
+        assert_eq!(FileObject::fault_in_page_with(&f, 5, &mut wait, &mut || panic!()), None);
+        assert_eq!(*reads.borrow(), [(0, 8), (5, 8)], "two reads, both failed, and no third");
+        // The other fault of page 5 lets its read go.
+        fo.finish_io();
+        let read_5 = read_5.unwrap();
+        for k in 5..13 {
+            fo.settle(k, &read_5, false);
+        }
         crate::io::block::reclaim_completed();
     }
 
