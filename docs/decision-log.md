@@ -35580,3 +35580,68 @@ the number is met on the laptop; the first two items — USB input at the greete
 through Files — are met in the gates (`check-input --usb`, `check-login --usb`, `check-media`) and
 wait to be checked on the laptop, where Part H's rounds have mounted, written and ejected a stick
 from the shell. The phase closes when they are.
+
+## 2026-10-13 — Phase 6 Part B.7: a keyboard read by its report descriptor
+
+**The laptop's check of the Definition of Done**, after H.5. The maintainer confirmed the FAT32
+stick's item whole — plugged in after boot, shown in Files, saved to from `nxedit`, ejected from
+Files, and pulled without an eject — and a USB mouse moving the cursor, plugged in after boot. Two
+keyboards did not type. **A System76 Launch**, whose keyboard is behind its own built-in hub, as the
+mouse was when plugged into it: external hubs are out of Phase 6, and stay out — "hubs later", the
+maintainer's call. **A Corsair K70 RGB MK.2**, plugged in after boot, typed numbers.
+
+**What the K70 does**, read on the development machine under Linux, where it types. Its boot
+interface's report descriptor is 192 bytes: report 1 a keyboard — a modifier byte, then a bit for
+each usage 0x00–0x97 — consumer keys as report 2, two vendor reports, and a mouse as report 5. Asked
+for boot protocol as Nitrox asks, from a script over usbfs: `GET_PROTOCOL` answered boot before and
+after, `SET_PROTOCOL` and `SET_IDLE` were taken, and every report was 21 bytes of report 1 — `a` as
+`01 00 10 …`, `b` as `01 00 20 …`, Shift as `01 02 00 …`. Read as a boot report, its ID was Left
+Control held and a bitmap byte a key: `a` came out `m`, and `b` `3`. Linux never asks for boot
+protocol, which is why it works there; Corsair ships a BIOS mode for hosts that do.
+
+**The maintainer's call**: read a keyboard by its report descriptor, as a mouse has been since B.3,
+now — "Yes, go ahead with B.6, hubs later" — numbered B.7 when the plan turned out to have a B.6
+already, Part B's docs.
+
+**What it is.** **One walk of a descriptor's items** (`descriptor::walk`) for both readers, so every
+length a device states is checked once: the mouse's reader moved onto it unchanged, its tests
+passing as they were, and an output report — which only a keyboard's lights need — is counted apart,
+one that runs long passed over rather than ending the walk. **`keyboard_layout`** reads the first
+*Keyboard* or *Keypad* collection's Keyboard-page fields in one input report: a bit each, in up to
+four runs — the modifiers and an NKRO bitmap — or one array of slots, a usage each counted from its
+logical minimum; and its lights, where Num, Caps and Scroll Lock are its output report's first three
+bits. A key field it does not read, or a field past a report a TRB carries, gives no layout. **The
+decoder holds the set of usages held**, so a bitmap and an array decode alike against the set
+before, in the boot decoder's order, and **a change of more than twenty keys comes in batches** from
+the same report, each pushed after the table's lock is let go, as a departure's releases are. A
+report under another ID is passed over: the K70's media keys and mouse arrive on its keyboard's
+endpoint. **Every keyboard whose descriptor reads runs in report protocol**, boot protocol
+otherwise, as a mouse does; QEMU's keyboard reads as exactly the boot layout. **Its lights carry
+their report ID**: the K70's are report 1, a two-byte `SET_REPORT`; a keyboard whose lights are
+elsewhere takes none.
+
+**Held by** host tests on the K70's own bytes — its descriptor, copied from sysfs, read as report
+1's modifiers and 152-bit bitmap with report 1's lights, and the eight reports it sent, decoded to
+what was typed, where the boot layout gives Control and `m` — and on QEMU's descriptor, read as the
+boot layout; a second report's keys and a collection before the keyboard's not taken; a layout
+refused for no letters, a key field wider than a bit, a fifth run of bits — four taken — and a field
+past 64 bytes, at its neighbour too; lights not in the first three bits, or present but a bit along,
+not taken; a bitmap's report, another report's ID, a short report and `ErrorRollOver` in a bitmap;
+fifty-eight keys in one report delivered in three batches, and released in batches; and the lights
+request with an ID. Each guard has a control that fails its test. **The binding's choice of report
+protocol for a keyboard has no host test** — it is the hub thread's, against hardware — and no gate
+can tell it from boot protocol, since QEMU's keyboard sends the same report in either; the laptop is
+its test.
+
+**Gates**, under KVM as CI runs them: `test-qemu`, `check-input --usb`, `check-report --usb`,
+`check-input` and `check-terminal` passed — `check-input --usb` and `check-report --usb` typing on a
+USB keyboard alone — and `test-qemu`'s log shows both its USB keyboards bound in report protocol,
+the first acknowledging its lights. **`check-login --usb` failed once**: after New Window the
+shell's last window list held the browser alone, where the editor's two windows were expected. The
+keyboard path had worked in that run — Ctrl+Shift+N reached the editor, which opened its second
+window — and it passed sixteen times after, five of them in the round's own order. That step kept no
+transcript, so the cause is not known; it keeps one now (`guest-transcript-check-login.log`), for
+the next time. Filed rather than guessed at.
+
+**Next**: the laptop — the K70 plugged in after boot, typing at the greeter, which closes the
+Definition of Done's first item and the phase with it.

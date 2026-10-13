@@ -9817,6 +9817,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The windows are the bracketed `[id:label]` items.
     let count = last.matches('[').count();
     if count < 3 {
+        // **The transcript, kept**: the list says what the shell showed and not why, and this
+        // failed once in seventeen runs under KVM with nothing kept to read (Phase 6 Part B.7's
+        // gate round, 2026-10-13).
+        let _ = fs::write(build_cache().join("guest-transcript-check-login.log"), session.transcript());
         let _ = session.child.kill();
         return Err(format!(
             "after New Window the shell lists {count} window(s) on this desktop — the browser, \

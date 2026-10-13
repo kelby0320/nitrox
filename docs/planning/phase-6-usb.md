@@ -20,7 +20,7 @@ part builds to, and the gate that closes it. **Nothing below describes current b
 | | |
 |---|---|
 | **In** | **An xHCI host-controller driver**, one for both machines. **USB enumeration** at boot and after it, with devices that **arrive and depart**. **HID keyboards and mice** in boot protocol. **USB mass storage** as block devices, with **MBR** partition tables and whole-disk filesystems beside GPT. **`fs-server-fat`**, read-write. **Removable media** a session can use and eject. **Formatting and partitioning** (`disk --format`, `disk --partition`). **Copy throughput**, measured on the laptop and then fixed where it is worst. |
-| **Out** | **Kernel modules** (Tier 2), and with them module matching. I²C-HID. USB tablets and other absolute pointers. HID report descriptors beyond a mouse's (revised 2026-10-03, Part B). USB 3 streams and UAS. Isochronous transfers (audio, webcams). External hubs. USB device mode. exFAT. |
+| **Out** | **Kernel modules** (Tier 2), and with them module matching. I²C-HID. USB tablets and other absolute pointers. HID report descriptors beyond a mouse's and a keyboard's (revised 2026-10-03, Part B, and 2026-10-13, B.7). USB 3 streams and UAS. Isochronous transfers (audio, webcams). External hubs. USB device mode. exFAT. |
 | **Before it** | Five small items from the laptop install, in [their own plan](laptop-polish.md), the grace period for `with` among them. |
 
 ## Decisions, 2026-10-01
@@ -866,6 +866,13 @@ a USB one, as it would on Linux.
     its tests are the lights' (`libinput`) and the node's (`drivers::input`), and the setup bytes
     have their own.
 - **B.6 Docs.** Below.
+- **B.7 A keyboard read by its report descriptor** (2026-10-13, after the laptop's check of the
+  Definition of Done; the maintainer's call, hubs left for later). A Corsair K70 RGB MK.2 typed
+  numbers: it answers boot protocol and sends its 21-byte NKRO bitmap whatever it is asked. Every
+  keyboard whose descriptor this driver reads now runs in report protocol, as a mouse has since B.3:
+  `descriptor::keyboard_layout` over one walk shared with the mouse's reader; a layout of bit runs
+  or an array; the keys held as a set of usages, decoded in batches; lights with their report ID.
+  Built 2026-10-13; the laptop checks it.
 
 ### Gates
 
@@ -3117,17 +3124,23 @@ On the laptop and in the gates:
   Linux's time, `small/` in 0.46 of it and `tree/` in 0.49, the three together in 0.53 (368 s
   against 693). Met by that run.
 
+**Checked on the laptop** (2026-10-13): the stick's item whole, and a USB mouse plugged in after
+boot. A USB keyboard's waits for Part B.7 on the laptop: a Corsair K70 typed numbers, sending its
+NKRO bitmap whatever protocol it was asked for, and the System76 Launch's keyboard is behind a hub,
+which Phase 6 leaves out.
+
 ## What Phase 6 does not do
 
 - **Kernel modules**, and matching devices to modules (the decision above).
 - **I²C-HID**: the trackpad already works through the i8042. Its native interface is what
   two-finger scrolling needs, and Part B's report-descriptor parser is the first piece of it: later,
   as its own item.
-- **Absolute pointers, and report descriptors beyond a mouse's**: a tablet, a touchscreen, extra
-  keys, and a horizontal wheel.
+- **Absolute pointers, and report descriptors beyond a mouse's and a keyboard's**: a tablet, a
+  touchscreen, media and extra keys, and a horizontal wheel.
 - **USB 3 streams and UAS**: one bulk-only command at a time.
 - **Isochronous transfers**: audio, webcams.
-- **External hubs**: devices on the controller's own ports only.
+- **External hubs**: devices on the controller's own ports only — the System76 Launch's keyboard
+  among them, behind its own hub (2026-10-13; later, the maintainer's call).
 - **USB device mode.**
 - **exFAT.**
 - **Per-session visibility under `/storage`**: a stick is reachable by every session, as every

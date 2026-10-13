@@ -1085,6 +1085,10 @@ additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised
 > the kernel** into the same `InputEvent` records the PS/2 driver emits, as PS/2 decodes scancodes
 > there (Phase 6 Parts B and C). **HID report descriptors** stay deferred, until a device needs one
 > — a tablet, extra keys. Multitouch and gestures stay deferred with them.
+>
+> **Narrowed twice** (Phase 6 Parts B.3 and B.7): a mouse's report descriptor is read for its wheel,
+> and since 2026-10-13 a keyboard's for its keys — a Corsair K70 answers boot protocol and sends its
+> NKRO bitmap regardless. A tablet's, media keys and extra keys stay deferred.
 
 **Input: `EV_ABS` device-space → screen-space mapping.** Absolute coordinates are meaningless
 without knowing the device's resolution and the screen's, and nothing decides who maps them.

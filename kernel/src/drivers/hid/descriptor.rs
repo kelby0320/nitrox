@@ -1,31 +1,51 @@
-//! **A HID report descriptor, read for a mouse's layout** (Phase 6 Part B.3): where its report
-//! keeps its buttons, X, Y and wheel, so a mouse in report protocol is read by what it says.
+//! **A HID report descriptor, read for a mouse's or a keyboard's layout** (Phase 6 Parts B.3 and
+//! B.7): where its report keeps a mouse's buttons, X, Y and wheel, or a keyboard's modifiers and
+//! keys, so a device in report protocol is read by what it says.
 //!
 //! HID 1.11 §6.2.2: a descriptor is a sequence of items, each a prefix byte — its size, type and
 //! tag — and up to four bytes of data. *Global* items (usage page, logical extents, report size,
 //! count and ID) hold until changed; *local* ones (usages) describe the next *main* item only; a
 //! main item — Input, Output, Feature, Collection, End Collection — consumes them. Each Input item
-//! is `count` fields of `size` bits, packed from the least significant bit, counted per report ID.
+//! is `count` fields of `size` bits, packed from the least significant bit, counted per report ID;
+//! Output items count their own reports the same way.
 //!
-//! **Only what a plain mouse needs is read**, and anything else gives `None`, which runs the mouse in
-//! boot protocol instead: the first application collection whose usage is *Mouse* or *Pointer*,
-//! one input report with relative X and Y, its buttons 1–3, and a wheel if it has one. A horizontal
-//! wheel and buttons past the third are walked past, since nothing above the kernel carries them.
-//! Every length is checked against the bytes in hand, as every other descriptor reader in this
-//! driver checks: a descriptor that runs past them is read no further.
+//! **One walk reads the items** ([`walk`]) and hands each collection and each Input and Output item
+//! to a reader of the device's kind, so every length a device states is checked in one place, as
+//! every other descriptor reader in this driver checks: a descriptor that runs past its bytes is
+//! read no further.
+//!
+//! **Only what this driver needs is read**, and anything else gives `None`, which runs the device in
+//! boot protocol instead:
+//! - **a mouse** ([`mouse_layout`]): the first application collection whose usage is *Mouse* or
+//!   *Pointer*, one input report with relative X and Y, its buttons 1–3, and a wheel if it has one.
+//!   A horizontal wheel and buttons past the third are walked past, since nothing above the kernel
+//!   carries them;
+//! - **a keyboard** ([`keyboard_layout`]): the first application collection whose usage is
+//!   *Keyboard* or *Keypad*, the Keyboard page's fields of one input report — a bit each, as the
+//!   modifiers and an NKRO bitmap are, or an array of slots — and its Num, Caps and Scroll Lock
+//!   lights if they are an output report's first three bits. Consumer keys are walked past.
 
+use super::keyboard::{self, Array, Bits, Lights};
 use super::mouse::{Field, Layout};
 
 /// Usage pages.
 const PAGE_GENERIC_DESKTOP: u16 = 0x01;
+const PAGE_KEYBOARD: u16 = 0x07;
+const PAGE_LEDS: u16 = 0x08;
 const PAGE_BUTTON: u16 = 0x09;
 
 /// Generic Desktop usages.
 const USAGE_POINTER: u16 = 0x01;
 const USAGE_MOUSE: u16 = 0x02;
+const USAGE_KEYBOARD: u16 = 0x06;
+const USAGE_KEYPAD: u16 = 0x07;
 const USAGE_X: u16 = 0x30;
 const USAGE_Y: u16 = 0x31;
 const USAGE_WHEEL: u16 = 0x38;
+
+/// LED usages: Num Lock, Caps Lock, Scroll Lock — the first three bits of a boot keyboard's lights.
+const LED_NUM: u16 = 0x01;
+const LED_SCROLL: u16 = 0x03;
 
 /// Main item tags (type 0).
 const MAIN_INPUT: u8 = 0x8;
@@ -47,21 +67,22 @@ const LOCAL_USAGE_MIN: u8 = 0x1;
 const LOCAL_USAGE_MAX: u8 = 0x2;
 /// A collection's type: Application.
 const COLLECTION_APPLICATION: u32 = 0x01;
-/// An Input item's flags: Constant, and Variable rather than Array.
+/// An Input or Output item's flags: Constant, Variable rather than Array, and Relative.
 const INPUT_CONSTANT: u32 = 1 << 0;
 const INPUT_VARIABLE: u32 = 1 << 1;
 const INPUT_RELATIVE: u32 = 1 << 2;
 
 /// Usages a main item takes, one local list at most this long.
 const USAGES_MAX: usize = 16;
-/// Report IDs whose bit offsets are tracked.
+/// Report IDs whose bit offsets are tracked, of each kind.
 const IDS_MAX: usize = 16;
 /// Push depth.
 const STACK_MAX: usize = 4;
 /// The longest report a layout may describe, in bits: what a TRB asks for, 64 bytes.
 const REPORT_BITS_MAX: u32 = 64 * 8;
-/// The longest input report the walk accepts at all, in bits: a report descriptor names the length
-/// of reports a device may send on any interface, and one longer than a page is no mouse's.
+/// The longest report the walk accepts at all, in bits: a report descriptor names the length of
+/// reports a device may send on any interface, and one longer than a page is no mouse's or
+/// keyboard's.
 const REPORT_BITS_LIMIT: u32 = 4096 * 8;
 
 /// The global items that hold until changed.
@@ -74,9 +95,72 @@ struct Globals {
     id: u8,
 }
 
-/// **The mouse layout `desc` describes**, or `None` for one that does not describe a plain mouse,
-/// or does not parse.
-pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
+/// Which report an item adds to: an input report, or an output one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Main {
+    Input,
+    Output,
+}
+
+/// **One Input or Output item, as the walk meets it**: `count` fields of `size` bits from bit
+/// `start` of report `id` of its kind, counted after any report ID; its flags; and the logical
+/// minimum and usages in force.
+struct Item<'a> {
+    main: Main,
+    id: u8,
+    start: u32,
+    size: u32,
+    count: u32,
+    flags: u32,
+    logical_min: i32,
+    usages: &'a [u32],
+    usage_min: Option<u32>,
+    usage_max: Option<u32>,
+}
+
+impl Item<'_> {
+    /// **Field `f`'s usage**: counted from the usage minimum, or the list's — its last standing for
+    /// every field past it — or `None` for no usage, or one past the usage maximum.
+    fn usage(&self, f: u32) -> Option<u32> {
+        let usage = match (self.usage_min, self.usages.last()) {
+            (Some(min), _) => min.saturating_add(f),
+            (None, Some(_)) => self.usages[(f as usize).min(self.usages.len() - 1)],
+            (None, None) => return None,
+        };
+        if self.usage_max.is_some_and(|m| usage > m) { None } else { Some(usage) }
+    }
+
+    /// Whether its fields are data and variables: a value each, rather than constant padding or an
+    /// array of usages.
+    fn variable(&self) -> bool {
+        self.flags & INPUT_CONSTANT == 0 && self.flags & INPUT_VARIABLE != 0
+    }
+}
+
+/// What [`walk`] meets, in order.
+enum Event<'a> {
+    /// A collection opens: its type, and the first usage before it.
+    Open { kind: u32, usage: Option<u32> },
+    /// The innermost open collection closes.
+    Close,
+    /// An Input or Output item with fields of a bit or more.
+    Item(Item<'a>),
+}
+
+/// **Walk `desc`**, handing `visit` each collection as it opens and closes and each Input and Output
+/// item whose fields have a bit or more. Whether any Input item has a report ID — whether input
+/// reports are prefixed by one — or `None` for a descriptor that does not parse: one that runs past
+/// its bytes, a Pop with nothing pushed, input reports under more than [`IDS_MAX`] IDs, or an input
+/// report whose size overflows or runs past [`REPORT_BITS_LIMIT`].
+///
+/// **A device's sizes are taken as untrusted**: a count and size whose product overflows, or a
+/// report past any a TRB could carry, ends the walk rather than overflow or loop for ever. **A field
+/// of no bits reads nothing**, so an item of them is passed over whatever its count says: its
+/// product is zero, so no count is too large for either guard, and walking its fields was a loop as
+/// long as the count — 19 s for one item (PR #358 review). An output report that runs long, or a
+/// seventeenth output ID, is not an error: its items are passed over, since only a keyboard's lights
+/// are read from one.
+fn walk(desc: &[u8], mut visit: impl FnMut(Event<'_>)) -> Option<bool> {
     let mut g = Globals::default();
     let mut stack = [Globals::default(); STACK_MAX];
     let mut depth = 0usize;
@@ -85,16 +169,12 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
     let mut n_usages = 0usize;
     let mut usage_min: Option<u32> = None;
     let mut usage_max: Option<u32> = None;
-    // Bits so far in each report, by ID.
-    let mut offsets = [(0u8, 0u32); IDS_MAX];
-    let mut n_ids = 0usize;
+    // Bits so far in each report, by ID: input reports, then output ones.
+    let mut inputs = [(0u8, 0u32); IDS_MAX];
+    let mut n_inputs = 0usize;
+    let mut outputs = [(0u8, 0u32); IDS_MAX];
+    let mut n_outputs = 0usize;
     let mut uses_ids = false;
-    // Collections: how deep, and how deep the mouse's application collection began.
-    let mut collection_depth = 0u32;
-    let mut mouse_at: Option<u32> = None;
-    let mut mouse_done = false;
-    // What is found, in the first input report that has X.
-    let mut found = Found::default();
 
     let mut i = 0usize;
     while i < desc.len() {
@@ -122,65 +202,50 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
             0 => {
                 match tag {
                     MAIN_COLLECTION => {
-                        collection_depth += 1;
                         let usage = usages.first().copied().filter(|_| n_usages > 0);
-                        let is_mouse = matches!(usage, Some(u) if u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_MOUSE)
-                            || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_POINTER));
-                        if unsigned == COLLECTION_APPLICATION && mouse_at.is_none() && !mouse_done && is_mouse {
-                            mouse_at = Some(collection_depth);
-                        }
+                        visit(Event::Open { kind: unsigned, usage });
                     }
-                    MAIN_END_COLLECTION => {
-                        if mouse_at == Some(collection_depth) {
-                            mouse_at = None;
-                            mouse_done = true;
-                        }
-                        collection_depth = collection_depth.saturating_sub(1);
-                    }
-                    MAIN_INPUT => {
-                        uses_ids |= g.id != 0;
-                        let slot = id_slot(&mut offsets, &mut n_ids, g.id)?;
-                        let start = offsets[slot].1;
-                        // **A device's sizes are taken as untrusted**: a count and size whose
-                        // product overflows, or a report past any a TRB could carry, is not a plain
-                        // mouse's, and the walk ends rather than overflow or loop for ever.
-                        let end = g.size.checked_mul(g.count).and_then(|bits| start.checked_add(bits))?;
-                        if end > REPORT_BITS_LIMIT {
-                            return None;
-                        }
-                        let in_mouse = mouse_at.is_some();
-                        // **A field of no bits reads nothing**, so an item of them is passed over
-                        // whatever its count says. Its product above is zero, so no count is too
-                        // large for either guard, and walking its fields was a loop as long as the
-                        // count: 19 s for one item (PR #358 review). With a bit or more per field,
-                        // the limit above bounds every report's fields, and so the walk.
-                        if in_mouse
-                            && g.size > 0
-                            && unsigned & INPUT_CONSTANT == 0
-                            && unsigned & INPUT_VARIABLE != 0
-                        {
-                            for f in 0..g.count {
-                                let usage = if let Some(min) = usage_min {
-                                    min.saturating_add(f)
-                                } else if n_usages > 0 {
-                                    usages[(f as usize).min(n_usages - 1)]
-                                } else {
-                                    continue;
-                                };
-                                if usage_max.is_some_and(|m| usage > m) {
-                                    continue;
+                    MAIN_END_COLLECTION => visit(Event::Close),
+                    MAIN_INPUT | MAIN_OUTPUT => {
+                        let (main, offsets, n) = if tag == MAIN_INPUT {
+                            uses_ids |= g.id != 0;
+                            (Main::Input, &mut inputs, &mut n_inputs)
+                        } else {
+                            (Main::Output, &mut outputs, &mut n_outputs)
+                        };
+                        let slot = id_slot(offsets, n, g.id);
+                        let end = slot.and_then(|s| {
+                            let end = g.size.checked_mul(g.count).and_then(|bits| offsets[s].1.checked_add(bits))?;
+                            Some((s, end)).filter(|_| end <= REPORT_BITS_LIMIT)
+                        });
+                        match (main, end) {
+                            (_, Some((s, end))) => {
+                                if g.size > 0 {
+                                    visit(Event::Item(Item {
+                                        main,
+                                        id: g.id,
+                                        start: offsets[s].1,
+                                        size: g.size,
+                                        count: g.count,
+                                        flags: unsigned,
+                                        logical_min: g.logical_min,
+                                        usages: &usages[..n_usages],
+                                        usage_min,
+                                        usage_max,
+                                    }));
                                 }
-                                let field = Field {
-                                    offset: (start + f * g.size) as u16,
-                                    size: g.size.min(255) as u8,
-                                    signed: g.logical_min < 0,
-                                };
-                                found.take(usage, field, unsigned & INPUT_RELATIVE != 0, g.id);
+                                offsets[s].1 = end;
+                            }
+                            (Main::Input, None) => return None,
+                            // Its report's later items start past the limit, so are passed over too.
+                            (Main::Output, None) => {
+                                if let Some(s) = slot {
+                                    offsets[s].1 = REPORT_BITS_LIMIT + 1;
+                                }
                             }
                         }
-                        offsets[slot].1 = end;
                     }
-                    MAIN_OUTPUT | MAIN_FEATURE => {}
+                    MAIN_FEATURE => {}
                     _ => {}
                 }
                 // A main item consumes the local items.
@@ -222,7 +287,84 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
             _ => {}
         }
     }
+    Some(uses_ids)
+}
+
+/// **The application collection a reader wants**, followed as the walk opens and closes them: the
+/// first whose usage `wanted` accepts, and only it.
+#[derive(Default)]
+struct Within {
+    depth: u32,
+    at: Option<u32>,
+    done: bool,
+}
+
+impl Within {
+    /// Follow `event`; whether the walk is now inside the wanted collection.
+    fn follow(&mut self, event: &Event<'_>, wanted: impl Fn(u32) -> bool) -> bool {
+        match *event {
+            Event::Open { kind, usage } => {
+                self.depth += 1;
+                if kind == COLLECTION_APPLICATION && self.at.is_none() && !self.done && usage.is_some_and(&wanted) {
+                    self.at = Some(self.depth);
+                }
+            }
+            Event::Close => {
+                if self.at == Some(self.depth) {
+                    self.at = None;
+                    self.done = true;
+                }
+                self.depth = self.depth.saturating_sub(1);
+            }
+            Event::Item(_) => {}
+        }
+        self.at.is_some()
+    }
+}
+
+/// **The mouse layout `desc` describes**, or `None` for one that does not describe a plain mouse,
+/// or does not parse.
+pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
+    let mut within = Within::default();
+    let mut found = Found::default();
+    let is_mouse =
+        |u: u32| u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_MOUSE) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_POINTER);
+    let uses_ids = walk(desc, |event| {
+        let inside = within.follow(&event, is_mouse);
+        let Event::Item(item) = event else { return };
+        if !inside || item.main != Main::Input || !item.variable() {
+            return;
+        }
+        for f in 0..item.count {
+            let Some(usage) = item.usage(f) else { continue };
+            let field = Field {
+                offset: (item.start + f * item.size) as u16,
+                size: item.size.min(255) as u8,
+                signed: item.logical_min < 0,
+            };
+            found.take(usage, field, item.flags & INPUT_RELATIVE != 0, item.id);
+        }
+    })?;
     found.layout(uses_ids)
+}
+
+/// **The keyboard layout `desc` describes** (Phase 6 Part B.7), or `None` for one this driver does
+/// not read — no keyboard collection, keys in no field it knows, more runs of bits than a layout
+/// holds, a report past any a TRB could carry — or one that does not parse.
+pub fn keyboard_layout(desc: &[u8]) -> Option<keyboard::Layout> {
+    let mut within = Within::default();
+    let mut keys = Keys::default();
+    let is_keyboard =
+        |u: u32| u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYBOARD) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYPAD);
+    let uses_ids = walk(desc, |event| {
+        let inside = within.follow(&event, is_keyboard);
+        if let Event::Item(item) = event
+            && inside
+        {
+            keys.take(&item);
+        }
+    })?;
+    keys.layout(uses_ids)
 }
 
 /// A usage as page and ID together, as a four-byte usage item gives it.
@@ -241,6 +383,139 @@ fn id_slot(offsets: &mut [(u8, u32); IDS_MAX], n: &mut usize, id: u8) -> Option<
     offsets[*n] = (id, 0);
     *n += 1;
     Some(*n - 1)
+}
+
+/// **What the keyboard walk found** (Phase 6 Part B.7): the key report's ID and fields, and its
+/// lights.
+#[derive(Default)]
+struct Keys {
+    /// The input report the keys are in: the first with a Keyboard-page field. Fields from another
+    /// are not taken.
+    id: Option<u8>,
+    bits: [Option<Bits>; keyboard::BITS_MAX],
+    array: Option<Array>,
+    /// A key field this driver does not read: more runs of bits than a layout holds, a second array,
+    /// or a variable field wider than a bit. The layout is refused rather than read in part.
+    unread: bool,
+    /// The output report the lights are in, and each light's bit there: Num, Caps, Scroll Lock.
+    lights_id: Option<u8>,
+    lights: [Option<u32>; 3],
+}
+
+impl Keys {
+    /// Take `item`, inside the keyboard's collection.
+    fn take(&mut self, item: &Item<'_>) {
+        match item.main {
+            Main::Input => self.take_input(item),
+            Main::Output => self.take_output(item),
+        }
+    }
+
+    /// An input item: its Keyboard-page fields, a bit each or an array of slots.
+    fn take_input(&mut self, item: &Item<'_>) {
+        if item.flags & INPUT_CONSTANT != 0 {
+            return;
+        }
+        let Some(first) = item.usage(0).or(item.usage_min) else { return };
+        if (first >> 16) as u16 != PAGE_KEYBOARD {
+            return;
+        }
+        match self.id {
+            None => self.id = Some(item.id),
+            Some(id) if id != item.id => return,
+            Some(_) => {}
+        }
+        if item.flags & INPUT_VARIABLE == 0 {
+            // **An array**: each slot a usage, counted from the usage minimum.
+            let first = first & 0xFFFF;
+            if self.array.is_some() || item.size > 16 || item.count > 255 || item.usage_min.is_none() || first > 0xFF {
+                self.unread = true;
+                return;
+            }
+            self.array = Some(Array {
+                offset: item.start as u16,
+                count: item.count as u8,
+                size: item.size as u8,
+                first: first as u8,
+                logical_min: item.logical_min,
+            });
+            return;
+        }
+        if item.size != 1 {
+            self.unread = true;
+            return;
+        }
+        for f in 0..item.count {
+            let Some(usage) = item.usage(f) else { continue };
+            if (usage >> 16) as u16 != PAGE_KEYBOARD || usage & 0xFFFF > 0xFF {
+                continue;
+            }
+            self.add_bit(item.start + f, usage as u8);
+        }
+    }
+
+    /// Bit `offset` is key `usage`: the run it continues, or a new one.
+    fn add_bit(&mut self, offset: u32, usage: u8) {
+        let runs = self.bits.iter_mut().flatten();
+        for run in runs {
+            if run.offset as u32 + run.count as u32 == offset && run.first as u32 + run.count as u32 == usage as u32 {
+                run.count += 1;
+                return;
+            }
+        }
+        match self.bits.iter_mut().find(|b| b.is_none()) {
+            Some(free) => *free = Some(Bits { offset: offset as u16, first: usage, count: 1 }),
+            None => self.unread = true,
+        }
+    }
+
+    /// An output item: the lights it carries, a bit each.
+    fn take_output(&mut self, item: &Item<'_>) {
+        if !item.variable() || item.size != 1 {
+            return;
+        }
+        for f in 0..item.count {
+            let Some(usage) = item.usage(f) else { continue };
+            let led = usage as u16;
+            if (usage >> 16) as u16 != PAGE_LEDS || !(LED_NUM..=LED_SCROLL).contains(&led) {
+                continue;
+            }
+            if self.lights_id.is_some_and(|id| id != item.id) {
+                continue;
+            }
+            self.lights_id = Some(item.id);
+            self.lights[(led - LED_NUM) as usize].get_or_insert(item.start + f);
+        }
+    }
+
+    /// **The layout, if it is one this driver reads**: a field holding the letters — a run of bits
+    /// over `a`, or an array — every field inside a report a TRB can carry, and no field left
+    /// unread. Lights only where Num, Caps and Scroll Lock are their report's first three bits.
+    fn layout(self, uses_ids: bool) -> Option<keyboard::Layout> {
+        const A: u32 = 0x04;
+        if self.unread {
+            return None;
+        }
+        let letters = self.array.is_some()
+            || self.bits.iter().flatten().any(|b| (b.first as u32..b.first as u32 + b.count as u32).contains(&A));
+        if !letters {
+            return None;
+        }
+        let room = REPORT_BITS_MAX - if uses_ids { 8 } else { 0 };
+        let ends = self.bits.iter().flatten().map(|b| b.offset as u32 + b.count as u32);
+        let array_end = self.array.map(|a| a.offset as u32 + a.count as u32 * a.size as u32);
+        if ends.chain(array_end).any(|end| end > room) {
+            return None;
+        }
+        let lights = (self.lights == [Some(0), Some(1), Some(2)])
+            .then(|| Lights { report_id: self.lights_id.filter(|&id| id != 0) });
+        Some(keyboard::Layout {
+            report_id: if uses_ids { self.id } else { None },
+            bits: self.bits,
+            array: self.array,
+            lights,
+        })
+    }
 }
 
 /// What the walk found: the first X's report, and its fields.
@@ -333,6 +608,26 @@ mod tests {
         0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01,
         0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
         0x75, 0x08, 0x15, 0x00, 0x25, 0xFF, 0x05, 0x07, 0x19, 0x00, 0x29, 0xFF, 0x81, 0x00, 0xC0,
+    ];
+
+    /// **A Corsair K70 RGB MK.2's boot interface** (`1b1c:1b49`), read from a real one by Linux
+    /// (`report_descriptor` in sysfs, 2026-10-13): report 1 a keyboard — the modifiers, then a bit
+    /// for each usage 0x00–0x97, and Num, Caps and Scroll Lock as an output — then consumer keys as
+    /// report 2, two vendor reports, and a mouse as report 5. It answers boot protocol and sends
+    /// report 1 regardless, which is what Part B.7 reads it by.
+    const K70: [u8; 192] = [
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+        0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x19, 0x00, 0x29, 0x97, 0x15, 0x00, 0x25, 0x01,
+        0x75, 0x01, 0x95, 0x98, 0x81, 0x02, 0x05, 0x08, 0x19, 0x01, 0x29, 0x03, 0x25, 0x01, 0x75, 0x01,
+        0x95, 0x03, 0x91, 0x02, 0x75, 0x05, 0x95, 0x01, 0x91, 0x01, 0xC0, 0x05, 0x0C, 0x09, 0x01, 0xA1,
+        0x01, 0x85, 0x02, 0x05, 0x0C, 0x19, 0x00, 0x2A, 0xFF, 0x0F, 0x15, 0x00, 0x26, 0xFF, 0x0F, 0x75,
+        0x10, 0x95, 0x02, 0x81, 0x00, 0xC0, 0x06, 0xC0, 0xFF, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x03, 0x15,
+        0x00, 0x26, 0xFF, 0x00, 0x95, 0x3F, 0x75, 0x08, 0x09, 0x02, 0x81, 0x02, 0xC0, 0x06, 0xC2, 0xFF,
+        0x09, 0x03, 0xA1, 0x01, 0x85, 0x0E, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x95, 0x3F, 0x75, 0x08, 0x09,
+        0x03, 0x81, 0x02, 0xC0, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x05, 0x09, 0x01, 0xA1, 0x00,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x20, 0x15, 0x00, 0x25, 0x01, 0x95, 0x20, 0x75, 0x01, 0x81, 0x02,
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x01, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02,
+        0x81, 0x06, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0,
     ];
 
     fn signed(offset: u16, size: u8) -> Field {
@@ -457,5 +752,164 @@ mod tests {
         assert_eq!(mouse_layout(&[0x26, 0xFF]), None, "a two-byte item with one byte");
         assert_eq!(mouse_layout(&[0xB4]), None, "Pop with an empty stack");
         assert_eq!(mouse_layout(&[]), None);
+    }
+
+    /// **QEMU's keyboard reads as a boot keyboard** (Part B.7): its descriptor is the boot report's
+    /// — modifiers, a reserved byte, six slots, and five lights of which the first three are Num,
+    /// Caps and Scroll Lock — so report protocol reads it exactly as boot protocol did.
+    #[test]
+    fn qemus_keyboard_reads_as_the_boot_layout() {
+        assert_eq!(keyboard_layout(&QEMU_KEYBOARD), Some(keyboard::Layout::BOOT));
+        assert_eq!(keyboard_layout(&QEMU_MOUSE), None, "a mouse is not a keyboard");
+    }
+
+    /// **The K70's layout**: report 1, the modifiers and a 152-bit bitmap after its ID, and its
+    /// lights in output report 1 — and nothing taken from the consumer, vendor or mouse reports
+    /// after the keyboard's collection.
+    #[test]
+    fn the_k70_reads_as_its_modifiers_and_a_bitmap() {
+        let l = keyboard_layout(&K70).expect("a keyboard this driver reads");
+        assert_eq!(l.report_id, Some(1));
+        assert_eq!(
+            l.bits,
+            [Some(Bits { offset: 0, first: 0xE0, count: 8 }), Some(Bits { offset: 8, first: 0, count: 152 }), None, None]
+        );
+        assert_eq!(l.array, None);
+        assert_eq!(l.lights, Some(Lights { report_id: Some(1) }));
+        assert_eq!(l.report_bytes(), 21, "the 21 bytes a K70 sends");
+    }
+
+    /// **The K70's own reports, as it sent them** with boot protocol asked for (2026-10-13): `a`
+    /// pressed and released, `b`, then Left Shift held over `a`. Read by the boot layout these gave
+    /// `m`, `3` and a Control held throughout; read by its own, what was typed.
+    #[test]
+    fn the_k70s_reports_type_what_was_pressed() {
+        use crate::libkern::input::*;
+        let layout = keyboard_layout(&K70).unwrap();
+        let report = |mods: u8, keys: u8| {
+            let mut r = [0u8; 21];
+            (r[0], r[1], r[2]) = (1, mods, keys);
+            r
+        };
+        let sent = [
+            report(0, 0x10),
+            report(0, 0),
+            report(0, 0x20),
+            report(0, 0),
+            report(2, 0),
+            report(2, 0x10),
+            report(2, 0),
+            report(0, 0),
+        ];
+        let (a, b) = (30, 48);
+        let want: [&[(u16, i32)]; 8] = [
+            &[(a, KEY_PRESS)],
+            &[(a, KEY_RELEASE)],
+            &[(b, KEY_PRESS)],
+            &[(b, KEY_RELEASE)],
+            &[(KEY_LEFTSHIFT, KEY_PRESS)],
+            &[(a, KEY_PRESS)],
+            &[(a, KEY_RELEASE)],
+            &[(KEY_LEFTSHIFT, KEY_RELEASE)],
+        ];
+        let mut held = keyboard::Held::NONE;
+        for (r, want) in sent.iter().zip(want) {
+            let mut out = [InputEvent::default(); keyboard::EVENTS_MAX];
+            let (n, more) = keyboard::decode(&layout, &mut held, r, 7, &mut out).expect("its keyboard report");
+            assert!(!more);
+            let keys: Vec<(u16, i32)> = out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).collect();
+            assert_eq!(keys, want, "report {r:02x?}");
+        }
+        assert_eq!(held, keyboard::Held::NONE, "nothing held at the end");
+        // What boot protocol made of the first: Control and `m`.
+        let mut out = [InputEvent::default(); keyboard::EVENTS_MAX];
+        let mut nothing = keyboard::Held::NONE;
+        let (n, _) = keyboard::decode(&keyboard::Layout::BOOT, &mut nothing, &sent[0], 7, &mut out).unwrap();
+        let keys: Vec<u16> = out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| e.code).collect();
+        assert_eq!(keys, [KEY_LEFTCTRL, 50], "the fault as the laptop showed it");
+    }
+
+    /// **What is not a keyboard this driver reads gives no layout**: no field over the letters, a
+    /// variable key field wider than a bit, more runs of bits than a layout holds, and keys past a
+    /// report a TRB carries. Lights anywhere but the first three bits are not taken, and the keys
+    /// still are.
+    #[test]
+    fn what_is_not_a_readable_keyboard_gives_no_layout() {
+        // The keyboard's collection with only the modifiers: no letters.
+        let mods_only = [
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+            0x95, 0x08, 0x81, 0x02, 0xC0,
+        ];
+        assert_eq!(keyboard_layout(&mods_only), None, "no letters");
+        // The K70's bitmap as two-bit fields.
+        let mut wide = K70;
+        let at = K70.windows(4).position(|w| w == [0x75, 0x01, 0x95, 0x98]).expect("the bitmap's size and count");
+        wide[at + 1] = 0x02;
+        assert_eq!(keyboard_layout(&wide), None, "a variable key field wider than a bit");
+        // Five keys a bit each, no two next to each other: five runs, with the modifiers six.
+        let mut scattered = mods_only[..22].to_vec();
+        scattered.extend_from_slice(&[
+            0x09, 0x04, 0x09, 0x06, 0x09, 0x08, 0x09, 0x0A, 0x09, 0x0C, 0x95, 0x05, 0x81, 0x02, 0xC0,
+        ]);
+        assert_eq!(keyboard_layout(&scattered), None, "more runs than a layout holds");
+        let mut four = mods_only[..22].to_vec();
+        four.extend_from_slice(&[0x09, 0x04, 0x09, 0x06, 0x09, 0x08, 0x95, 0x03, 0x81, 0x02, 0xC0]);
+        assert!(keyboard_layout(&four).is_some(), "four runs fit: the neighbour of the limit");
+        // The bitmap pushed past a TRB's 64 bytes by padding before it: with the ID, the modifiers'
+        // byte and its 152 bits, 344 bits of padding end it at the 64th byte, and 345 one bit past.
+        let padded = |bits: u16| {
+            let mut d = K70.to_vec();
+            let usage_min = d.windows(2).position(|w| w == [0x19, 0x00]).expect("the bitmap's usage minimum");
+            let [lo, hi] = bits.to_le_bytes();
+            d.splice(usage_min..usage_min, [0x75, 0x01, 0x96, lo, hi, 0x81, 0x01]);
+            d
+        };
+        assert_eq!(keyboard_layout(&padded(344)).map(|l| l.report_bytes()), Some(64), "ending at the 64th byte");
+        assert_eq!(keyboard_layout(&padded(345)), None, "a field past 64 bytes");
+        // QEMU's lights with Caps Lock first: the keys read, no lights.
+        let mut swapped = QEMU_KEYBOARD;
+        let at = QEMU_KEYBOARD.windows(4).position(|w| w == [0x19, 0x01, 0x29, 0x05]).expect("the lights' usages");
+        swapped[at + 1] = 0x02;
+        let l = keyboard_layout(&swapped).expect("its keys");
+        assert_eq!((l.array.is_some(), l.lights), (true, None));
+        // All three lights, a bit along: a padding bit before them.
+        let mut shifted = QEMU_KEYBOARD.to_vec();
+        let leds = shifted.windows(2).position(|w| w == [0x95, 0x05]).expect("the lights' count");
+        shifted.splice(leds..leds, [0x95, 0x01, 0x75, 0x01, 0x91, 0x01]);
+        let l = keyboard_layout(&shifted).expect("its keys");
+        assert_eq!((l.array.is_some(), l.lights), (true, None), "lights not in the first three bits");
+    }
+
+    /// **The keys are one report's** (Part B.7): the first with a Keyboard-page field. A second
+    /// report's keys in the same collection are not taken, here a bitmap as report 2 after report
+    /// 1's modifiers and slots.
+    #[test]
+    fn the_keys_are_the_first_reports() {
+        let d = [
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, // keyboard, report 1
+            0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, // modifiers
+            0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x00, 0x2A, 0xFF, 0x00, 0x81, 0x00, // six slots
+            // Report 2: a..z, a bit each.
+            0x85, 0x02, 0x19, 0x04, 0x29, 0x1D, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x1A, 0x81, 0x02,
+            0xC0,
+        ];
+        let l = keyboard_layout(&d).expect("report 1's keyboard");
+        assert_eq!(l.report_id, Some(1));
+        assert_eq!(l.bits, [Some(Bits { offset: 0, first: 0xE0, count: 8 }), None, None, None], "none of report 2's");
+        assert_eq!(l.array, Some(Array { offset: 8, count: 6, size: 8, first: 0, logical_min: 0 }));
+    }
+
+    /// **Only the keyboard's collection is read**: a collection before it with Keyboard-page fields
+    /// of its own — here a Consumer Control's, as report 3 — is not the keyboard's.
+    #[test]
+    fn keys_outside_the_keyboard_collection_are_not_its() {
+        let mut d = vec![
+            0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, // Consumer Control, report 3
+            0x05, 0x07, 0x19, 0x04, 0x29, 0x1D, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x1A, 0x81, 0x02, 0xC0,
+        ];
+        d.extend_from_slice(&K70);
+        let l = keyboard_layout(&d).expect("the keyboard after it");
+        assert_eq!(l.report_id, Some(1));
+        assert_eq!(l.bits[1], Some(Bits { offset: 8, first: 0, count: 152 }));
     }
 }

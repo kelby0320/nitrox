@@ -724,19 +724,22 @@ fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
             continue;
         };
         let device = match to {
-            LightsTo::Send { slot, interface } => attached
+            LightsTo::Send { slot, interface, report_id } => attached
                 .iter_mut()
                 .enumerate()
-                .find_map(|(port, a)| a.as_mut().filter(|a| a.slot == slot).map(|dev| (port, slot, interface, dev)))
+                .find_map(|(port, a)| {
+                    a.as_mut().filter(|a| a.slot == slot).map(|dev| (port, slot, interface, report_id, dev))
+                })
                 .ok_or(KError::PeerClosed),
             LightsTo::Dead => Err(KError::IoError),
             LightsTo::Gone => Err(KError::PeerClosed),
         };
         let status = match device {
             Err(e) => e as i32,
-            Ok((port, slot, iface, dev)) => {
-                let request = super::hid::set_lights_request(iface);
-                match control_out_data(x, slot, &mut dev._mem, request, &[lights]) {
+            Ok((port, slot, iface, report_id, dev)) => {
+                let request = super::hid::set_lights_request(iface, report_id);
+                let (data, len) = super::hid::lights_data(report_id, lights);
+                match control_out_data(x, slot, &mut dev._mem, request, &data[..len]) {
                     Ok(()) => {
                         if super::hid::lights_taken(node) {
                             crate::kprintln!("usb: port {port}: keyboard lights acknowledged");
