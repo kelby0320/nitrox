@@ -1,9 +1,9 @@
 # Before Phase 7: the harness, the code's hygiene, and what the laptop found
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
-2026-10-14.** Each other part gets its detail pass when it is next. Seven parts, A–G, in the order
-below. Part E is the syscall-surface consolidation, planned separately in
-[`syscall-surface.md`](syscall-surface.md).
+2026-10-14; A.1 and A.2 built 2026-10-14.** Each other part gets its detail pass when it is next.
+Seven parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned
+separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -95,10 +95,11 @@ author's session. A commit a sub-part.
 
 - `.claude/skills/pr-review/SKILL.md` — the launcher, `/pr-review <N>`. It sets
   `disable-model-invocation: true`, so only the maintainer starts a review: starting one is the
-  opt-in to a multi-agent run. It runs the saved workflow `pr-review` with `args: {pr: N}` and
-  nothing of the author's, and the author session waits — no `cargo`, no QEMU — until the review
+  opt-in to a multi-agent run. It runs the saved workflow `pr-review-workflow` with `args: {pr: N}`
+  and nothing of the author's, and the author session waits — no `cargo`, no QEMU — until the review
   is posted.
-- `.claude/workflows/pr-review.js` — the workflow: the four stages below.
+- `.claude/workflows/pr-review-workflow.js` — the workflow: the four stages below. Not `pr-review`:
+  a saved workflow is also listed as a skill of its name, which would take the launcher's.
 - `.claude/skills/pr-review/reviewer.md` — what every one of its agents reads first: today's
   skill's rules (the reviewer is not the author, demonstrate or label, which docs describe today,
   the failure modes), rewritten for an agent given one lens.

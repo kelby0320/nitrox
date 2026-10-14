@@ -35866,3 +35866,25 @@ settled, beyond the plan:
   author's checkout: it lists its files with git instead. And a past head already on `main` has an
   empty diff against `origin/main` (`3cdd0c28`): the base is the head's merge base with the PR's
   `baseRefOid`, `822a42e5` for PR #371, 86 files.
+
+## 2026-10-14 — Before Phase 7, Parts A.1 and A.2: the review workflow and the author's side
+
+- **The review is a saved workflow**, `.claude/workflows/pr-review-workflow.js`, which `/pr-review`
+  starts with the PR number alone. Its rules are files the agents read: `reviewer.md` for every one,
+  `scope.md`, a file a lens, `verify.md` and `report.md`. `/pr-review-solo` is one agent reading the
+  same files in turn; `/address-review` is the author's side, writing each finding's outcome to
+  `.claude/review-outcomes.tsv`.
+- **Not named `pr-review`**: a saved workflow is listed as a skill of its own name, so a workflow
+  `pr-review` took the launcher's name and was offered to the model as one it could start. Found by
+  the skills list itself the moment the file existed.
+- **Its control flow is tested against stubbed agents** in Node, outside the repo — no runtime for
+  it here or in CI: a stop at the scope, five lenses with findings needing a boot, four with none,
+  eleven findings, and a reviewer and a verifier that die. Each case stays within ten agents, each
+  finding reaches one verifier, only the last verifier may boot QEMU, a refuted finding is dropped,
+  and one whose verifier died is kept, unverified. What only a real run can show — the prompts, the
+  worktrees, the posted comment — the first review shows.
+- **`check-docs` lists its files with git** (tracked, and untracked but not ignored), so a review's
+  worktree under the ignored `.claude/worktrees/` is no longer read as this repo's docs: with one
+  present the old walk fails, the new listing passes. It reads two files the walk never did, the
+  root `CLAUDE.md` — whose two deliberate examples of a missing doc now carry the `allow-missing`
+  marker — and `assets/wallpapers/README.md`.
