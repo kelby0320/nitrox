@@ -11,9 +11,9 @@ disk, a table and a count; sends, then records; allocates, then links:
 2. Ask whether the rest of the system can live with that state: a tree that still reads, a count
    that still matches, a handle still owned, no block both free and in use, no waiter waiting
    forever.
-3. Demonstrate with the crate's failure injection where it has one — `fs-server-ext4`'s
-   `test_support::Failing` fails the nth write, or every write from the nth — or a probe that
-   returns an error at the step. Fail each step in turn: a sweep finds more than one case.
+3. Demonstrate with the crate's failure injection where it has one — a writer that fails the nth
+   write, or every write from the nth — or with a probe that returns an error at the step. Fail each
+   step in turn: a sweep finds more than one case.
 
 Also: a result discarded with `let _ =` where it matters, a retry with no bound, a cleanup that
 can run twice, and a resource released on one path and not on its sibling.

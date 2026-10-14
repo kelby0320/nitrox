@@ -11,7 +11,7 @@ latest head.
 
 Run the saved workflow `pr-review-workflow` with `args: {pr: <number>}`, adding `head: "<commit>"`
 when one was given. **Pass nothing else**: no summary of the change, no hints, nothing from this
-session. The workflow's agents share none of the author's context, which is what makes them a
+session. The workflow's agents share none of the author's conversation, which is what makes them a
 review.
 
 While it runs, change nothing on the branch and run no `cargo` and no QEMU: its agents build and

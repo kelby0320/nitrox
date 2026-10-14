@@ -35888,3 +35888,12 @@ settled, beyond the plan:
   present the old walk fails, the new listing passes. It reads two files the walk never did, the
   root `CLAUDE.md` — whose two deliberate examples of a missing doc now carry the `allow-missing`
   marker — and `assets/wallpapers/README.md`.
+- **A review judges the head as if it were new**: no reviewer reads the PR's comments or earlier
+  reviews, a commit after the head, or a decision-log entry dated after it. The maintainer asked
+  whether a trial on PR #371 could be clean; it could not. Its review and its fix commits are a
+  command away from any agent; the reviewer's own error-path lens and deletion check were written
+  from that review, one lens naming a helper its fix added; and **a review agent reads the memory
+  index**, as the second session always did, so "sharing none of the author's context" is now
+  "conversation". The trial moves to PR #365 at `55e6bd18`, the head its review saw — seven known
+  findings that shaped nothing here — and each agent's transcript is read afterwards for anything it
+  should not have looked at.

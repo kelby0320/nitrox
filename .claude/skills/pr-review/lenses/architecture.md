@@ -11,6 +11,6 @@ For a change to the kernel, a syscall, the ABI or a wire format.
 - **The ABI.** A layout changed on one side of the boundary only. `abi-sync-check` covers part of
   this; say what it does not.
 - **Wire formats.** A layout changed with no version bump; a reader that trusts a length.
-- **The kernel's rules.** No external crates; nothing from `arch::x86_64` outside `kernel/src/arch/`;
-  the lock order in `kernel/docs/lock-ordering.md`; no allocating or freeing in a DPC or an
-  interrupt handler.
+- **The kernel's rules.** No external crates; nothing from `arch::x86_64` outside
+  `kernel/src/arch/`; the lock order in `kernel/docs/lock-ordering.md`; no allocating or freeing in
+  a DPC or an interrupt handler.

@@ -34,10 +34,10 @@ Six phases in, three costs had grown that no single feature would fix:
 
 ## Part A — the harness
 
-**A.1 A review in this session, by agents that share none of its context.** A skill the author
+**A.1 A review in this session, by agents that share none of its conversation.** A skill the author
 session runs with a PR number. It starts a saved workflow in `.claude/workflows/`, which is given
-the PR number and nothing else, so the author cannot steer it. **At most ten agents** a review
-(the maintainer's token budget):
+the PR number and nothing else, so the author cannot steer it. **At most ten agents** a review (the
+maintainer's token budget):
 
 1. **Scope**, one agent: the diff, the `CLAUDE.md` files that govern it, the tests it adds, and
    which reviewers below apply.
@@ -162,7 +162,7 @@ bonus. It costs one review's tokens, so it is the maintainer's call.
 
 **Root `CLAUDE.md`'s review rule** changes with it, in the first PR: the reviewer is still not the
 author, but the author starts it — a workflow given only the PR number, sharing none of the author's
-context — and the second worktree retires.
+conversation — and the second worktree retires.
 
 ### A.2 Addressing a review
 

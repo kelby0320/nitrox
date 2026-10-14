@@ -12,6 +12,14 @@ evidence.
 add a temporary test — and you restore every probe before you return. Your worktree is yours
 alone, so `git checkout -- <file>` restores safely there; check that it did.
 
+## Review the head as if it were new
+
+Judge the code, not what anyone has said about it. Do not read the PR's comments or earlier
+reviews (`gh pr view --comments`, the comments and reviews APIs), any commit after the head (the
+log of `origin/main` or another branch past it), or a decision-log entry dated after it. A review
+led by an earlier one finds what that one found; and a review of a past head, run to measure the
+reviewer, measures nothing once it has read the answers.
+
 ## The diff
 
 Review `git diff <base> <head>`, the two commits the scope named: the whole branch, not its last
