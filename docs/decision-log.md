@@ -35858,3 +35858,11 @@ settled, beyond the plan:
 - **The comment check's hook is the check**: the built xtask, run on the edit's text through a
   `PostToolUse` hook answering in `additionalContext`, so the two cannot disagree; silent when xtask
   is not built.
+- **Three corrections from PR #373's review**, each reproduced first. The built xtask panics when
+  run directly — `main()` reads the commit through `repo_root()`, which needs `CARGO_MANIFEST_DIR`,
+  set only by `cargo` — so the hook would have failed as quietly as it succeeds: `hook-comments` is
+  dispatched first and finds the repository from git, and a test runs the built binary as the hook
+  does. `check-docs` walks `.claude/` on disk, so a review's worktree there failed it in the
+  author's checkout: it lists its files with git instead. And a past head already on `main` has an
+  empty diff against `origin/main` (`3cdd0c28`): the base is the head's merge base with the PR's
+  `baseRefOid`, `822a42e5` for PR #371, 86 files.
