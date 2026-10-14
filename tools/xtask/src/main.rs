@@ -9815,18 +9815,19 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //
     // `Ctrl+Shift+N`, with Shift because `Ctrl+N` is "new" in the singular everywhere and an
     // editor's singular is a buffer.
+    //
+    // The shell logs the placement only after the compositor answers it, by which time the window
+    // is configured and the editor may already have said so: the two lines come in either order.
+    let from = session.transcript().len();
     qmp.send_key("ctrl", true)?;
     qmp.send_key("shift", true)?;
     press(&mut qmp, "n")?;
     qmp.send_key("shift", false)?;
     qmp.send_key("ctrl", false)?;
-    // **The shell's line comes first, and that ordering is structural rather than lucky**:
-    // `Child::open_sized` creates the window and `Session::create` waits for its first
-    // `Configure`, which the shell sends after placing it — so the client cannot report a window
-    // it does not yet have.
-    session.expect("desktop-shell: placed window ")?;
-    let placed = session.rest_of_line()?;
-    session.expect("nxedit: opened another window")?;
+    let any = |_: &str| true;
+    let wait = std::time::Duration::from_secs(45);
+    let placed = session.line_since(from, "desktop-shell: placed window ", any, wait)?;
+    session.line_since(from, "nxedit: opened another window", any, wait)?;
     println!("  ok: a second top-level window from one process: {}", placed.trim());
 
     // **And it is a window in its own right**, not a decoration: the taskbar lists it, which is
@@ -10007,6 +10008,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
     type_into_menu(&mut qmp, &mut session, "nxterm")?;
+    // The terminal's lines and the shell's placement of its window come in either order.
+    let launched = session.transcript().len();
     press(&mut qmp, "ret")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: applications menu closed")?;
@@ -10017,8 +10020,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `MAX_LOGGED_GEOMETRY` geometry lines per session and this run passed that long ago, which
     // is why step 11 hardcodes the editor's size too. A point a little inside the top-left is
     // in the grid whatever the size, and needs no second number.
-    session.expect("desktop-shell: placed window ")?;
-    let placed = session.rest_of_line()?;
+    let any = |_: &str| true;
+    let wait = std::time::Duration::from_secs(45);
+    let placed = session.line_since(launched, "desktop-shell: placed window ", any, wait)?;
     let (_, tx, ty) = parse_placement(&placed)
         .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Below the title bar and the terminal's own menu bar, and well inside the frame.
@@ -10038,8 +10042,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the very next run the shell came up *before* the press receipt, so the click's own wait ate
     // them and the gate hung on a line already in the transcript. The window has been placed by
     // here, which is all a click needs.
-    session.expect("nxterm: hosting a shell")?;
-    session.expect("nxsh: up")?;
+    session.line_since(launched, "nxterm: hosting a shell", any, wait)?;
+    session.line_since(launched, "nxsh: up", any, wait)?;
     click_at(&mut qmp, &mut session, tx + 100, ty + TITLE_BAR_H + MENU_BAR_H + 40)?;
 
     // `touch ./` — typed — then the paste, then a suffix. **The suffix is what makes the
