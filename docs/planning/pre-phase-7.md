@@ -21,9 +21,9 @@ Six phases in, three costs had grown that no single feature would fix:
 
 | Measure | Today |
 |---|---|
-| `//` comment lines to code lines, all Rust (doc comments not counted) | 28,076 to 176,452 — **0.16**; 16 of 43 crates over 0.15, the highest 0.35 |
-| Doc comment lines (`///`, `//!`), outside the ratio | 51,910 — 0.29 of the code |
-| Comment lines citing a PR number / naming a phase, part or milestone | 1,089 / 2,799, more than half of them in doc comments |
+| Comment lines to code lines, all Rust | 79,986 to 176,452 — **0.45**: doc comments 0.29, the rest 0.16 |
+| Public items and fields, a one-line doc comment each | about 7,200 — 0.04 of the code |
+| Comment lines citing a PR number / naming a phase, part or milestone | 1,089 / 2,799 |
 | Comment blocks of ten lines or more | 1,454 (the longest 108) |
 | `rustfmt`, at `max_width = 120` and `use_small_heuristics = "Max"` | about 22,000 diff lines in 290 files |
 | `clippy` | at least 180 warnings, userspace's count stopping at a crate that fails; 46 errors from default-deny lints, 44 of them `not_unsafe_ptr_arg_deref` in the kernel |
@@ -61,14 +61,15 @@ than assumed. The current skill reviews A.1's own PR.
 on it, push back with evidence where it is wrong, defer an optional one with a `TODO` and its
 entry, and run the control that shows each fix's test fails without it.
 
-**A.3 `cargo xtask check-comments`**, in CI, on a branch's diff against `main`. **`//` comments
-count; doc comments do not** — they are the documentation, their own thing. It measures what a diff
-introduces: a line moved or only re-indented is not new, so the reformat and the splits are not read
-as new comments. New comment lines over **0.15** of new code lines fail it, with an allowance of a
-few lines so a small fix's one `SAFETY` comment passes; a diff that removes more comment lines than
-it adds passes whatever its ratio; and a reference to a PR, a review, a phase or a part in any new
-comment, doc comments included, fails it. **A hook after each edit** of a Rust file nudges the
-author above **0.1**. Every failure says how to fix it. The details are the detail pass's.
+**A.3 `cargo xtask check-comments`**, in CI, on a branch's diff against `main`. **Every comment in a
+Rust source file counts, doc comments included**, as in the table above; the markdown under `docs/`
+is documentation, not code, and is not measured. The check measures what a diff introduces: a line
+moved or only re-indented is not new, so the reformat and the splits are not read as new comments.
+New comment lines over **0.15** of new code lines fail it, with an allowance of a few lines so a
+small fix's one `SAFETY` comment passes; a diff that removes more comment lines than it adds passes
+whatever its ratio; and a reference to a PR, a review, a phase or a part in a new comment fails it.
+**A hook after each edit** of a Rust file nudges the author above **0.1**. Every failure says how to
+fix it. The details are the detail pass's.
 
 **A.4 `cargo xtask check-size`**, in CI: a Rust file over **1,000 lines** fails it, unless it is on
 a baseline list of today's 64, **each at its length today**, which it may not pass and which falls
@@ -94,11 +95,11 @@ Each touches nearly every crate, which is why all of it comes before the syscall
 - **B.3 CI in parallel.** The QEMU job split across runners sharing one image build, aiming at
   about 6 minutes; each gate's duration recorded; and each gate asked what it catches that no
   other does, merging or retiring only where the answer is nothing.
-- **B.4 The comments.** Every crate's `//` comments to **0.15** of its code or under — 16 of 43 are
-  over today — keeping only what the code cannot say: `SAFETY` comments, `TODO(tag)`s and the
-  invariants a comment states stay, shortened. In every comment, doc comments included, no reference
-  to a PR, a review, a phase or a part, and no narrated history; doc comments otherwise stay the
-  documentation they are. One PR, a commit a crate.
+- **B.4 The comments.** Every crate to **0.15** or under, doc comments counted: no references to
+  PRs, reviews, phases or parts, no narrated history, comments only where the code cannot say it.
+  A one-line doc comment on each public item stays — 0.04 of the code — and so do `SAFETY`
+  comments, `TODO(tag)`s and the invariants a comment states, shortened; what goes is mostly the
+  long doc blocks and the inline essays. One PR, a commit a crate.
 - **B.5 The long files.** `tools/xtask/src/main.rs` first, into a module a gate and shared modules
   for QEMU, QMP, the serial console and reading the screen; then the six others over 5,000 lines
   (`libui/widget.rs`, `nxfiles`, `desktop-shell`, `bootprobe.rs`, `nxedit`, `nxsh/eval.rs`).
@@ -158,8 +159,7 @@ several branches at once, which waits on the gates leaving this machine.
 - CI fails a branch that is not `rustfmt`-clean, has a `clippy` warning, adds comments over 0.15
   of its code, cites a PR or phase in a comment, or grows a file past 1,000 lines or past its
   listed length.
-- `//` comments at 0.15 of code or under in every crate, and no comment citing a PR or a phase;
-  no file over 5,000 lines.
+- Comments at 0.15 of code or under in every crate; no file over 5,000 lines.
 - CI's wall clock about 6 minutes.
 - Part C's fixes in, the stick's light confirmed on the laptop; Part D's causes found and fixed;
   Part E done as its plan says; Parts F and G built.
