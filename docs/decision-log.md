@@ -35834,3 +35834,35 @@ Part E. Their decisions, the day it was planned:
 - **The order: the harness, then the hygiene, then the fixes**, before the syscall work, since the
   reformat, the lint fixes and the comment cleanup each touch nearly every crate and would conflict
   with it.
+
+## 2026-10-14 — Before Phase 7, Part A detailed: the review, its author's side, two checks
+
+**Part A's detail pass** ([`pre-phase-7.md`](planning/pre-phase-7.md) § *Part A in detail*). What it
+settled, beyond the plan:
+
+- **Two PRs.** A.1 and A.2 first, reviewed by the old skill from a second session one last time;
+  then A.3, A.4 and A.5, the new reviewer's first real review. The old skill stays as
+  `pr-review-solo`, reading the same rules as the workflow's agents — the cheaper review, and the
+  one that can review the PR that replaces `pr-review` itself.
+- **A review is the maintainer's to start**: `/pr-review` is user-invocable only, since starting it
+  is the opt-in to a multi-agent run, and the author session waits — no `cargo`, no QEMU — until it
+  posts.
+- **Worktrees, probed**: an isolated agent starts in `.claude/worktrees/agent-<id>` on a new branch
+  at the author session's commit, with no build output, so each review agent checks out the PR's
+  head itself and builds cold, in seconds. No reviewer boots QEMU; one verifier, run after the
+  others, does it for the findings that need a boot.
+- **Measured by outcome**: each finding's fate in `.claude/review-outcomes.tsv`, written when the
+  author addresses the review, so a fix rate per lens shows which lenses earn their tokens. An
+  acceptance run on PR #371's pre-review head, where five findings are known, is offered at one
+  review's cost.
+- **The comment check's hook is the check**: the built xtask, run on the edit's text through a
+  `PostToolUse` hook answering in `additionalContext`, so the two cannot disagree; silent when xtask
+  is not built.
+- **Three corrections from PR #373's review**, each reproduced first. The built xtask panics when
+  run directly — `main()` reads the commit through `repo_root()`, which needs `CARGO_MANIFEST_DIR`,
+  set only by `cargo` — so the hook would have failed as quietly as it succeeds: `hook-comments` is
+  dispatched first and finds the repository from git, and a test runs the built binary as the hook
+  does. `check-docs` walks `.claude/` on disk, so a review's worktree there failed it in the
+  author's checkout: it lists its files with git instead. And a past head already on `main` has an
+  empty diff against `origin/main` (`3cdd0c28`): the base is the head's merge base with the PR's
+  `baseRefOid`, `822a42e5` for PR #371, 86 files.

@@ -1,8 +1,9 @@
 # Before Phase 7: the harness, the code's hygiene, and what the laptop found
 
-**Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call).** Not detailed: each
-part gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
-syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
+**Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
+2026-10-14.** Each other part gets its detail pass when it is next. Seven parts, A–G, in the order
+below. Part E is the syscall-surface consolidation, planned separately in
+[`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -66,20 +67,184 @@ Rust source file counts, doc comments included**, as in the table above; the mar
 is documentation, not code, and is not measured. The check measures what a diff introduces: a line
 moved or only re-indented is not new, so the reformat and the splits are not read as new comments.
 New comment lines over **0.15** of new code lines fail it, with an allowance of a few lines so a
-small fix's one `SAFETY` comment passes; a diff that removes more comment lines than it adds passes
-whatever its ratio; and a reference to a PR, a review, a phase or a part in a new comment fails it.
-**A hook after each edit** of a Rust file nudges the author above **0.1**. Every failure says how to
-fix it. The details are the detail pass's.
+small fix's one `SAFETY` comment passes; a diff that adds no more comment lines than it removes
+passes whatever its ratio; and a reference to a PR, a review, a phase or a part in a new comment
+fails it. **A hook after each edit** of a Rust file nudges the author above **0.1**. Every failure
+says how to fix it. The details are the detail pass's.
 
 **A.4 `cargo xtask check-size`**, in CI: a Rust file over **1,000 lines** fails it, unless it is on
 a baseline list of today's 64, **each at its length today**, which it may not pass and which falls
 as the file shrinks; a file leaves the list under 1,000. The message says how to split: by
 responsibility, and tests into a sibling `tests.rs`, as `fs-server-fat` does.
 
-**A.5 A shorter root `CLAUDE.md`.** About 150 lines, from 536: the gate catalogue moves to
+**A.5 A shorter root `CLAUDE.md`.** At most 200 lines, from 537: the gate catalogue moves to
 [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md), every subdirectory
-`CLAUDE.md` is indexed, and the rules A.3, A.4 and Part B make mechanical are stated once,
-briefly. `check-docs` holds the index complete.
+`CLAUDE.md` is indexed, and the rules A.3, A.4 and Part B make mechanical are stated once, briefly.
+`check-docs` holds the index complete.
+
+## Part A in detail
+
+*Detailed 2026-10-14.* Where the outline above and this differ, this is the plan. **Two PRs.** The
+first holds A.1 and A.2, and the old skill reviews it from a second session one last time. The
+second holds A.3, A.4 and A.5, and is the new reviewer's first real review, started from the
+author's session. A commit a sub-part.
+
+### A.1 The review
+
+**Where it lives.**
+
+- `.claude/skills/pr-review/SKILL.md` — the launcher, `/pr-review <N>`. It sets
+  `disable-model-invocation: true`, so only the maintainer starts a review: starting one is the
+  opt-in to a multi-agent run. It runs the saved workflow `pr-review` with `args: {pr: N}` and
+  nothing of the author's, and the author session waits — no `cargo`, no QEMU — until the review
+  is posted.
+- `.claude/workflows/pr-review.js` — the workflow: the four stages below.
+- `.claude/skills/pr-review/reviewer.md` — what every one of its agents reads first: today's
+  skill's rules (the reviewer is not the author, demonstrate or label, which docs describe today,
+  the failure modes), rewritten for an agent given one lens.
+- `.claude/skills/pr-review/lenses/` — one file a lens, and `verify.md` and `report.md`. <!-- check-docs: allow-missing -->
+- `.claude/skills/pr-review-solo/SKILL.md` — today's way, kept: one agent in a second session,
+  reading `reviewer.md` and every lens itself. It reviews the first PR, whose own `pr-review` is <!-- check-docs: allow-missing -->
+  the new launcher, and it stays the cheaper review when tokens are short.
+
+**Each agent in its own worktree.** A worktree-isolated agent starts in
+`.claude/worktrees/agent-<id>`, on a new branch at the author session's commit, with no build output
+(probed 2026-10-14). So each agent's first step is to fetch `pull/<N>/head` and check out the head
+the scope agent named, and its first host-test build costs seconds. `.claude/worktrees/` goes in
+`.gitignore`, and **`check-docs` lists its files with git**
+(`git ls-files --cached --others --exclude-standard`) rather than walking the disk, where it reads
+`.claude/` and a review's worktree under it as the repo's own docs (found by PR #373's review, a
+worktree failing it in the author's checkout). The listing brings in the root `CLAUDE.md`, which the
+walk never read; its two deliberate examples of a missing doc take the `allow-missing` marker. The
+runtime removes a worktree left unchanged; the report agent removes any other the review left.
+
+**The stages, at most ten agents.**
+
+1. **Scope**, one agent. It fetches the PR and checks CI is green on the head it reviews, stopping
+   otherwise as today. It returns the head and base commits — **the base being the merge base of the
+   head with the PR's `baseRefOid`**, which every agent diffs against, never `gh pr diff`, which
+   shows the PR's last head — and the files changed, the `CLAUDE.md` files governing them, the tests
+   added or changed, and whether the kernel, a syscall or a wire format is touched.
+2. **Reviewers**, four or five in parallel: logic and boundaries; error paths and partial state;
+   tests; rules and docs; and architecture and the ABI when the scope says so. Each reports
+   everything suspicious with its evidence — precision is the verifiers' job — as findings: a
+   file and line, one sentence, a failure scenario, the evidence, and whether it was
+   demonstrated.
+   - **Tests** carries today's flagship check, breaking the production code under each new test,
+     and a second: delete each new line of error handling and run the crate's tests. A line
+     nothing fails without is a finding (PR #371's finding 5).
+   - **Error paths** asks, of each operation that writes in steps, what a failure at each step
+     leaves behind, and uses a crate's failure injection where it has one (`fs-server-ext4`'s
+     `Failing`).
+   - No reviewer boots QEMU. A finding only a boot can show says so.
+3. **Verification**, up to three agents, once every reviewer has returned — the one barrier, so
+   duplicates across lenses merge first. The findings go out in batches, and each verifier is
+   told to refute each one in its batch: demonstrated, refuted, or unverified with what would
+   settle it. Findings that need a boot go to one verifier that runs after the others, so a
+   single agent boots QEMU and nothing runs beside it.
+4. **Report**, one agent. It ranks what survived, holds the blocking set to defects that must
+   not merge, posts one comment (`gh pr comment`), removes leftover worktrees, and returns the
+   summary.
+
+One scope agent, five reviewers, three verifiers and a report make ten; with four reviewers there
+is room for a fourth verifier.
+
+**Measured.** Each finding's fate goes in `.claude/review-outcomes.tsv`: the PR, the finding, its
+lens and severity, the verifier's verdict, and what became of it — fixed, refuted or deferred.
+A.2 writes it. A fix rate per lens says which lenses earn their tokens.
+
+**Acceptance: PR #371 again.** The workflow also takes `args: {pr, head}`, to review a past head.
+Run on PR #371 as it stood before its review (`3cdd0c28`), its base is `822a42e5`, the merge base
+with #371's base, giving the 86 files the review saw — `origin/main` would give none, the head being
+on it now — and it should find that review's five findings; the two the sweep after it found are a
+bonus. It costs one review's tokens, so it is the maintainer's call.
+
+**Root `CLAUDE.md`'s review rule** changes with it, in the first PR: the reviewer is still not the
+author, but the author starts it — a workflow given only the PR number, sharing none of the author's
+context — and the second worktree retires.
+
+### A.2 Addressing a review
+
+`.claude/skills/address-review/SKILL.md`, which the author runs when a review is posted:
+
+1. Read the review and each finding's evidence.
+2. **Reproduce each finding before changing anything**, or show that it does not reproduce. A
+   refuted finding is answered with what was run.
+3. Fix it with a test that fails without the fix — run that control — and sweep its class: the
+   finding's siblings, and for an error path every failing write.
+4. Defer an optional finding with a `TODO(tag)` and its `deferred-decisions.md` entry, or decline
+   it with a reason.
+5. Record each finding's outcome in `.claude/review-outcomes.tsv`.
+6. Commit, push, and answer on the PR with what was done about each.
+
+It may not mark a finding fixed without its control, or reword a finding to fit its fix.
+
+### A.3 `check-comments`
+
+**What counts.** A comment line is one whose trimmed text starts with `//`, doc comments included. A
+code line is any other line that is not blank, a line of code with a trailing comment among them.
+Rust files only. The tree has no multi-line `/* */` comment to count, and a `/*` it does hold is in
+a string or labels the code beside it.
+
+**What is new.** The diff from the merge base with `main`, or on a push to `main` from the merge's
+first parent. An added line is new unless the same trimmed text was removed elsewhere in the diff,
+by a move or a re-indent; each removed line answers one added line.
+
+**The rules.** Each failure names the file and line and says how to fix it.
+
+- New comment lines may be at most 0.15 of new code lines, plus 3, so that a small fix's
+  `SAFETY` comment passes.
+- A diff that adds no more comment lines than it removes passes, whatever its ratio.
+- A new comment line holding a reference fails: `PR #12`, `(#123)`, `Phase 6`, `Part H.4`,
+  `M14 Part`, `slice 3`, `finding 2`. Today 1,079 comment lines cite `PR #N` and 2,485 a part.
+
+**In CI**, in the build-and-test job, whose checkout then needs the history (`fetch-depth: 0`).
+
+**The hook.** A `PostToolUse` hook on `Edit|MultiEdit|Write` runs the built
+`tools/target/release/xtask hook-comments` on the edit's text, so the classification is the check's
+own, no `cargo` stands in the way, and an unbuilt xtask means silence. Above 0.1 with at least three
+new comment lines, or on a reference, it answers through `hookSpecificOutput.additionalContext`: the
+ratio, and to cut the comment to what the code cannot say. It never blocks. **Run directly, today's
+xtask panics before it dispatches anything**: `main()` reads the commit through `repo_root()`, which
+needs `CARGO_MANIFEST_DIR`, set only by `cargo` (PR #373's review). So `hook-comments` is dispatched
+first and finds the repository from git, not from `cargo`'s environment — or the hook would fail
+exactly as quietly as it succeeds. The input's field names, which the documentation does not give,
+are confirmed by capturing an edit's.
+
+**Tests, on the host:** each rule on either side of its line — 0.15 exactly and one line over, the
+allowance at 3 and 4, as many comment lines added as removed and one more; a move and a re-indent
+not counted; each reference and a near miss of each (a part in prose, a hex colour); a string
+holding `/*` or `//`; the hook's input read; and **the built binary run as the hook runs it**, on a
+captured input, answering with its `additionalContext`.
+
+The code goes in `tools/xtask/src/comments.rs`, since A.4 holds `main.rs` where it is.
+
+### A.4 `check-size`
+
+`tools/xtask/src/size.rs`, and a baseline, `tools/xtask/size-baseline.toml`: each tracked Rust
+file over 1,000 lines today, with its length. It reads `git ls-files`, so build output and
+worktrees are never seen.
+
+- A file over 1,000 lines and not listed fails, with how to split it: by responsibility, and
+  tests into a sibling `tests.rs`.
+- A listed file longer than its entry fails.
+- A listed file shorter than its entry, or at 1,000 lines or fewer, fails until the entry is
+  lowered or removed. `cargo xtask check-size --update` does both and never raises an entry.
+
+In CI beside A.3. **Tests, on the host:** a file at 1,000 lines and at 1,001, one at its entry
+and one over, a stale entry, and `--update` lowering and refusing to raise.
+
+### A.5 A shorter root `CLAUDE.md`
+
+**At most 200 lines**, held by `check-docs`, from 537. `check-docs` first moves out of `main.rs`
+into a module of its own, since A.4 holds `main.rs` at its length and A.5's checks would otherwise
+grow it.
+
+- **Moved:** every paragraph about a gate, verbatim, to a new section of
+  [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md). The command list stays,
+  a line a command.
+- **Added:** an index of every `CLAUDE.md` in the tree, a line each — sixteen today, where it
+  names five — which `check-docs` holds complete; and the comment and size rules, a line each.
 
 ## Part B — the code's hygiene
 
