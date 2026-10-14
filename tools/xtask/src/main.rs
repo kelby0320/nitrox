@@ -17337,28 +17337,14 @@ fn cmd_check_docs() -> R<()> {
     // cannot do without re-reading it once per link.
     let mut anchor_refs: Vec<(PathBuf, usize, PathBuf, String)> = Vec::new();
 
-    // Everything that documents this project, not just `docs/`. The `CLAUDE.md` files are
-    // instructions Claude Code loads directly, and `.claude/skills/` defines the review
-    // procedure — both cite doc paths, and both were missed by an earlier version of this
-    // gate that walked `docs/` alone. `docs/history/` was dissolved while `SKILL.md` still
-    // told a reviewer to file decisions there, and nothing caught it.
-    let mut roots: Vec<PathBuf> = ["docs", ".claude", "kernel", "userspace", "tools"]
-        .iter()
-        .map(|d| root.join(d))
-        .collect();
-    roots.retain(|p| p.exists());
+    // Every Markdown file git knows or would: the `CLAUDE.md` files and the skills cite doc
+    // paths as `docs/` does. Listed by git, not walked, so an ignored review worktree under
+    // `.claude/worktrees/` is never read as this repo's docs.
+    let md_files = git_md_files(&root)?;
 
     // Every `*.md` basename in the repo, so a bare backticked filename can be resolved.
-    let mut known_md: Vec<String> = Vec::new();
-    for r in &roots {
-        visit_md_files_skipping(r, &["target", "build-cache"], &mut |p| {
-            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                known_md.push(n.to_string());
-            }
-            Ok(())
-        })?;
-    }
-    known_md.push("CLAUDE.md".into());
+    let known_md: Vec<String> =
+        md_files.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from)).collect();
 
     let mut check = |path: &Path| -> R<()> {
         let text = fs::read_to_string(path)?;
@@ -17470,8 +17456,8 @@ fn cmd_check_docs() -> R<()> {
         Ok(())
     };
 
-    for r in &roots {
-        visit_md_files_skipping(r, &["target"], &mut check)?;
+    for p in &md_files {
+        check(p)?;
     }
 
     // 1b (continued). Resolve the collected heading links, reading each target once.
@@ -18154,27 +18140,21 @@ fn heading_anchors(text: &str) -> Vec<String> {
     out
 }
 
-fn visit_md_files_skipping(
-    dir: &Path,
-    skip: &[&str],
-    f: &mut dyn FnMut(&Path) -> R<()>,
-) -> R<()> {
-    if !dir.exists() {
-        return Ok(());
+fn git_md_files(root: &Path) -> R<Vec<PathBuf>> {
+    let out = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.md"])
+        .current_dir(root)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("git ls-files: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if skip.contains(&name) {
-                continue;
-            }
-            visit_md_files_skipping(&path, skip, f)?;
-        } else if path.extension().map_or(false, |e| e == "md") {
-            f(&path)?;
-        }
-    }
-    Ok(())
+    Ok(out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+        .filter(|p| p.is_file())
+        .collect())
 }
 
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each. Like
