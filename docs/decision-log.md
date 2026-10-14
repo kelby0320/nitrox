@@ -35812,10 +35812,14 @@ Part E. Their decisions, the day it was planned:
 - **`rustfmt`, with one reformat of the whole tree** — about 22,000 diff lines in 290 files at the
   closest settings, measured — which the maintainer will not review; the working rule never to run
   `cargo fmt`, kept because there was no configuration, ends with it.
-- **Comments at 0.1 of code for new code, and existing code cleaned to about 0.15** — the
-  maintainer's figures from another codebase; today's is 0.45, with 1,089 comment lines citing a PR
-  and 2,799 naming a phase or part. History belongs in git and this log, not beside the code.
-  Cleaning the existing comments is one large PR.
+- **Comments at 0.1 of code for new code, and existing code cleaned to about 0.15, every comment
+  counted, doc comments included** — the maintainer's figures from another codebase. Today's is
+  0.45, doc comments 0.29 of it, with 1,089 comment lines citing a PR and 2,799 naming a phase or
+  part; a one-line doc comment on each public item and field would cost 0.04, so the cleanup cuts
+  mostly long doc blocks and inline essays. History belongs in git and this log, not beside the
+  code. Cleaning the existing comments is one large PR. The check measures what a diff introduces —
+  a moved or re-indented line is not a new comment — so the reformat and the splits pass it, as does
+  a diff that removes more comment lines than it adds.
 - **Reviews run from the author's session** by a workflow given only the PR number, so the author
   cannot steer it — **at most ten agents a review**, the maintainer's token budget weighed against
   breadth — each agent that changes code in a worktree of its own, and one at a time booting QEMU.

@@ -21,11 +21,12 @@ Six phases in, three costs had grown that no single feature would fix:
 
 | Measure | Today |
 |---|---|
-| Comment lines to code lines, all Rust | 79,986 to 176,452 — **0.45** |
+| Comment lines to code lines, all Rust | 79,986 to 176,452 — **0.45**: doc comments 0.29, the rest 0.16 |
+| Public items and fields, a one-line doc comment each | about 7,200 — 0.04 of the code |
 | Comment lines citing a PR number / naming a phase, part or milestone | 1,089 / 2,799 |
 | Comment blocks of ten lines or more | 1,454 (the longest 108) |
 | `rustfmt`, at `max_width = 120` and `use_small_heuristics = "Max"` | about 22,000 diff lines in 290 files |
-| `clippy` | about 210 warnings; 46 errors from default-deny lints, 44 of them `not_unsafe_ptr_arg_deref` in the kernel |
+| `clippy` | at least 180 warnings, userspace's count stopping at a crate that fails; 46 errors from default-deny lints, 44 of them `not_unsafe_ptr_arg_deref` in the kernel |
 | Files over 1,000 / 2,000 / 5,000 lines | 64 / 24 / 7 of 418; `tools/xtask/src/main.rs` 21,106 |
 | CI, wall clock | about 15 min, nearly all one QEMU job running fourteen gates in series; `check-images` alone 3.6 min |
 | A worktree's first host-test build | 2–12 s and 70–190 MB, measured for `fs-server-ext4`, `nxsh` and the kernel |
@@ -60,14 +61,19 @@ than assumed. The current skill reviews A.1's own PR.
 on it, push back with evidence where it is wrong, defer an optional one with a `TODO` and its
 entry, and run the control that shows each fix's test fails without it.
 
-**A.3 `cargo xtask check-comments`**, in CI, on a branch's diff against `main`: added comment
-lines over **0.15** of added code lines fail it, and so does a reference to a PR, a review, a
-phase or a part in an added comment. **A hook after each edit** of a Rust file nudges the author
-above **0.1**. Every failure says how to fix it.
+**A.3 `cargo xtask check-comments`**, in CI, on a branch's diff against `main`. **Every comment
+counts, doc comments included**, as in the table above. It measures what a diff introduces: a
+line moved or only re-indented is not new, so the reformat and the splits are not read as new
+comments. New comment lines over **0.15** of new code lines fail it, with an allowance of a few
+lines so a small fix's one `SAFETY` comment passes; a diff that removes more comment lines than it
+adds passes whatever its ratio; and a reference to a PR, a review, a phase or a part in a new
+comment fails it. **A hook after each edit** of a Rust file nudges the author above **0.1**.
+Every failure says how to fix it. The details are the detail pass's.
 
 **A.4 `cargo xtask check-size`**, in CI: a Rust file over **1,000 lines** fails it, unless it is on
-a baseline list of today's 64, which may shrink and not grow. The message says how to split:
-by responsibility, and tests into a sibling `tests.rs`, as `fs-server-fat` does.
+a baseline list of today's 64, **each at its length today**, which it may not pass and which falls
+as the file shrinks; a file leaves the list under 1,000. The message says how to split: by
+responsibility, and tests into a sibling `tests.rs`, as `fs-server-fat` does.
 
 **A.5 A shorter root `CLAUDE.md`.** About 150 lines, from 536: the gate catalogue moves to
 [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md), every subdirectory
@@ -88,9 +94,11 @@ Each touches nearly every crate, which is why all of it comes before the syscall
 - **B.3 CI in parallel.** The QEMU job split across runners sharing one image build, aiming at
   about 6 minutes; each gate's duration recorded; and each gate asked what it catches that no
   other does, merging or retiring only where the answer is nothing.
-- **B.4 The comments.** Every crate to **0.15** or under: no references to PRs, reviews, phases or
-  parts, no narrated history, comments only where the code cannot say it. `SAFETY` comments,
-  `TODO(tag)`s and the invariants a comment states stay, shortened. One PR, a commit a crate.
+- **B.4 The comments.** Every crate to **0.15** or under, doc comments counted: no references to
+  PRs, reviews, phases or parts, no narrated history, comments only where the code cannot say it.
+  A one-line doc comment on each public item stays — 0.04 of the code — and so do `SAFETY`
+  comments, `TODO(tag)`s and the invariants a comment states, shortened; what goes is mostly the
+  long doc blocks and the inline essays. One PR, a commit a crate.
 - **B.5 The long files.** `tools/xtask/src/main.rs` first, into a module a gate and shared modules
   for QEMU, QMP, the serial console and reading the screen; then the six others over 5,000 lines
   (`libui/widget.rs`, `nxfiles`, `desktop-shell`, `bootprobe.rs`, `nxedit`, `nxsh/eval.rs`).
@@ -115,7 +123,8 @@ needs none of them.
 ## Part D — two bugs to find
 
 - **`nxterm` showing output only after the pointer moves**: every time in the laptop's runs 3
-  and 4, so the QEMU dry-run tooling from Phase 6 Part H can make it happen on purpose.
+  and 4. The QEMU dry runs of Phase 6 Part H may reproduce it if run from `nxterm` — those
+  recorded were typed on serial, which never passes through it — and trying that comes first.
 - **The Applications menu's search clearing while typing**: intermittent; a reliable way to make
   it happen comes first.
 
@@ -147,7 +156,8 @@ several branches at once, which waits on the gates leaving this machine.
 - A PR is reviewed from the author's session by the A.1 workflow, within ten agents, and its
   findings' outcomes recorded.
 - CI fails a branch that is not `rustfmt`-clean, has a `clippy` warning, adds comments over 0.15
-  of its code, cites a PR or phase in a comment, or grows a file over 1,000 lines.
+  of its code, cites a PR or phase in a comment, or grows a file past 1,000 lines or past its
+  listed length.
 - Comments at 0.15 of code or under in every crate; no file over 5,000 lines.
 - CI's wall clock about 6 minutes.
 - Part C's fixes in, the stick's light confirmed on the laptop; Part D's causes found and fixed;
