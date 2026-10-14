@@ -1,8 +1,8 @@
 # Before Phase 7: the harness, the code's hygiene, and what the laptop found
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
-2026-10-14; A.1 and A.2 built 2026-10-14.** Each other part gets its detail pass when it is next.
-Seven parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned
+2026-10-14; A.1, A.2 and A.6 built 2026-10-14.** Each other part gets its detail pass when it is
+next. Seven parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned
 separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
@@ -81,6 +81,11 @@ responsibility, and tests into a sibling `tests.rs`, as `fs-server-fat` does.
 [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md), every subdirectory
 `CLAUDE.md` is indexed, and the rules A.3, A.4 and Part B make mechanical are stated once, briefly.
 `check-docs` holds the index complete.
+
+**A.6 Who does the work** (added 2026-10-14, after the review's first trial). The session the
+maintainer talks to stays on Opus and the author. It hands bounded work — mechanical, or checked by
+a named test — to an `implementer` subagent on Sonnet, and reads every diff before committing. The
+review splits the same way: Opus for the lenses that find subtle defects, Sonnet for the rest.
 
 ## Part A in detail
 
@@ -246,6 +251,25 @@ grow it.
   a line a command.
 - **Added:** an index of every `CLAUDE.md` in the tree, a line each — sixteen today, where it
   names five — which `check-docs` holds complete; and the comment and size rules, a line each.
+
+### A.6 Who does the work
+
+- **`.claude/agents/implementer.md`**, `model: sonnet`: one work item from the author's brief, in
+  the files it names; the directory's `CLAUDE.md` rules and the comment rules; the host tests of
+  what it changed; no commit, no push, no QEMU. Its last message says what it changed, what it ran,
+  and what it was unsure of.
+- **Root `CLAUDE.md`, *Who does the work***: what the author hands over — `clippy` warnings, comment
+  cleanup, moves, docs, small fixes with a clear spec and test — and what it keeps: design and
+  detail passes, the kernel's `unsafe`, memory and concurrency, filesystem write paths, drivers,
+  syscall and ABI changes, debugging, review findings. A delegated commit says
+  `Implemented-By: implementer (Sonnet)`, so the outcomes file can compare its findings with the
+  rest.
+- **The review by model**: the logic, error-path and architecture lenses on the session's model; the
+  scope (low effort), the tests and rules-and-docs lenses, the verifiers and the report (medium
+  effort) on Sonnet. Reviewers are told to go after what matters most first and stop when digging
+  turns up only optional notes; verifiers, to reproduce a finding's own demonstration first.
+- **Measured against the all-Opus trial**: a second run on PR #365 at `55e6bd18`, against what the
+  first found.
 
 ## Part B — the code's hygiene
 

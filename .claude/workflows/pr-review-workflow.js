@@ -12,6 +12,9 @@ export const meta = {
 
 const MAX_AGENTS = 10
 const DIR = '.claude/skills/pr-review'
+// The session's model (Opus) where a lens finds subtle defects; Sonnet for mechanical or
+// reproduction-heavy stages.
+const SONNET = 'sonnet'
 
 const pr = Number(args && args.pr)
 if (!Number.isInteger(pr) || pr <= 0) {
@@ -22,8 +25,8 @@ const pinned = args.head ? String(args.head) : null
 const LENSES = [
   { key: 'logic', title: 'logic and boundaries' },
   { key: 'error-paths', title: 'error paths and partial state' },
-  { key: 'tests', title: 'tests' },
-  { key: 'rules-and-docs', title: 'rules and docs' },
+  { key: 'tests', title: 'tests', model: SONNET },
+  { key: 'rules-and-docs', title: 'rules and docs', model: SONNET },
   { key: 'architecture', title: 'architecture and the ABI', only: s => s.touches_kernel_or_abi },
 ]
 
@@ -96,7 +99,7 @@ phase('Scope')
 const scope = await agent(
   `Scope Nitrox PR #${pr} for review${pinned ? `, at head ${pinned} rather than the PR's latest` : ''}. ` +
     `Read ${DIR}/scope.md and follow it. If you stop, still fill every field: empty strings, empty lists, false.`,
-  { label: 'scope', phase: 'Scope', schema: SCOPE, isolation: 'worktree' },
+  { label: 'scope', phase: 'Scope', schema: SCOPE, isolation: 'worktree', model: SONNET, effort: 'low' },
 )
 if (!scope) throw new Error('the scope agent returned nothing')
 if (!scope.ok) {
@@ -123,12 +126,16 @@ const lenses = LENSES.filter(l => !l.only || l.only(scope))
 const reviews = await parallel(
   lenses.map(l => () =>
     agent(
-      `You review Nitrox PR #${pr} through one lens: ${l.title}. ${setup(`${DIR}/lenses/${l.key}.md`)}\n\n${context}\n\n` +
+      `You review Nitrox PR #${pr} through one lens: ${l.title}. ` +
+        `${setup(`${DIR}/lenses/${l.key}.md`)}\n\n${context}\n\n` +
         `Report everything suspicious in your lens, with its evidence: verifiers will try to refute each finding, ` +
-        `so do not hold back a real doubt, and do not pad. Do not boot QEMU; a finding only a boot can show is needs_boot. ` +
+        `so do not hold back a real doubt, and do not pad. Go after what matters most first — a wrong ` +
+        `result or a crash before a missing test of a trivial path — and stop when further digging turns up ` +
+        `only optional notes. ` +
+        `Do not boot QEMU; a finding only a boot can show is needs_boot. ` +
         `In held_up, list briefly what you checked that held, such as a mutation a test caught. ` +
         `Restore every probe. Return this worktree's absolute path.`,
-      { label: `review:${l.key}`, phase: 'Review', schema: FOUND, isolation: 'worktree' },
+      { label: `review:${l.key}`, phase: 'Review', schema: FOUND, isolation: 'worktree', model: l.model },
     ),
   ),
 )
@@ -165,18 +172,31 @@ const verify = (batch, mayBoot) =>
   (mayBoot
     ? 'You alone in this review may boot QEMU, one gate at a time; nothing else runs beside you. '
     : 'Do not boot QEMU. ') +
+  `Reproduce each finding's own demonstration first; when it holds and nothing undercuts it, move on. ` +
   `Restore every probe. Return this worktree's absolute path and one verdict for each finding, by id.\n\n` +
   `Findings:\n${JSON.stringify(batch, null, 1)}`
 
 const verified = await parallel(
   batches.map((b, i) => () =>
-    agent(verify(b, false), { label: `verify:${i + 1}`, phase: 'Verify', schema: VERIFIED, isolation: 'worktree' }),
+    agent(verify(b, false), {
+      label: `verify:${i + 1}`,
+      phase: 'Verify',
+      schema: VERIFIED,
+      isolation: 'worktree',
+      model: SONNET,
+    }),
   ),
 )
 // After the others, so the one agent booting QEMU has the machine to itself.
 if (boot.length) {
   verified.push(
-    await agent(verify(boot, true), { label: 'verify:boot', phase: 'Verify', schema: VERIFIED, isolation: 'worktree' }),
+    await agent(verify(boot, true), {
+      label: 'verify:boot',
+      phase: 'Verify',
+      schema: VERIFIED,
+      isolation: 'worktree',
+      model: SONNET,
+    }),
   )
 }
 
@@ -207,7 +227,7 @@ const posted = await agent(
     `Worktrees to remove: ${worktrees.join(' ') || 'none'}\n\n` +
     `What the reviewers checked that held:\n${heldUp.join('\n') || 'nothing listed'}\n\n` +
     `Findings that survived verification:\n${JSON.stringify(survived, null, 1)}`,
-  { label: 'report', phase: 'Report' },
+  { label: 'report', phase: 'Report', model: SONNET, effort: 'medium' },
 )
 
 return { pr, head: scope.head, base: scope.base, counts, posted }

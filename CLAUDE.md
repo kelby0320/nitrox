@@ -398,6 +398,17 @@ second session, and cheaper. The author acts on a review with **`/address-review
 finding, fix it with a control, sweep its class, and record the outcome in
 `.claude/review-outcomes.tsv`. The reviewers' rules are in `.claude/skills/pr-review/`.
 
+## Who does the work
+
+The session the maintainer talks to runs on Opus and stays the author: it designs, decides and
+commits. **It hands bounded work to the `implementer` subagent** (`.claude/agents/implementer.md`,
+Sonnet): `clippy` warnings, comment cleanup, code moved between files, docs updates, and small fixes
+whose spec and test are clear. **It keeps** design and detail passes, the kernel's `unsafe`, memory
+and concurrency code, filesystem write paths, drivers, syscall and ABI changes, debugging, and
+review findings. A brief names the files, the change, the rules that apply, the tests to run and
+what done means. The author reads every delegated diff and runs its tests and gates before
+committing, and a delegated commit says so: `Implemented-By: implementer (Sonnet)`.
+
 ## Repository layout
 
 ```

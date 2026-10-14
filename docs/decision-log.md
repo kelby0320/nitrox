@@ -35897,3 +35897,29 @@ settled, beyond the plan:
   "conversation". The trial moves to PR #365 at `55e6bd18`, the head its review saw — seven known
   findings that shaped nothing here — and each agent's transcript is read afterwards for anything it
   should not have looked at.
+
+## 2026-10-14 — Before Phase 7: the review's first run, and Part A.6, who does the work
+
+- **The workflow's first run**: PR #365 at `55e6bd18`, the head its review saw, 56 files. Ten
+  agents, 48 minutes, all Opus: 97,000 tokens out, and 209 million read from the cache — the cost is
+  turns times context, each tool call reading the whole context again — about 3% of the maintainer's
+  week. The rules-and-docs reviewer alone took 231 turns and 57 million tokens, the tests reviewer
+  154 and 37 million. **Clean**: every agent's commands were read afterwards, and none read the PR's
+  comments, a later commit or a later decision-log entry.
+- **What it found**: 32 findings, none refuted, 29 reported. Of the original review's seven, four
+  outright — the long-name panic, the directory session outliving its directory (raised to
+  blocking), the untested write order, the kernel's overflow — and one in part (the short chain's
+  check untested, not the read that skips it). It missed two: a repartitioned stick mounted twice,
+  and a long name over 255 bytes unreachable. About 23 findings the original had not; two checked on
+  `main` on 2026-10-14 — `block_map` reserving a server's run count before checking the body, and a
+  FAT rename whose failed delete leaves two names on one chain — are real and still there.
+- **So the review splits by model** (A.6): the logic, error-path and architecture lenses stay on the
+  session's model; the scope, the tests and rules-and-docs lenses, the verifiers and the report go
+  to Sonnet, with reviewers told to go after what matters first. A second run on #365 measures it.
+- **And so does implementation** (A.6): the maintainer keeps the session on Opus, as the author, and
+  declined the session-wide mode that plans on Opus and codes on Sonnet — on hard concurrency or
+  filesystem code it would hand the risky edits over too. The author hands bounded work to an
+  `implementer` subagent on Sonnet (`.claude/agents/implementer.md`), reads every diff, and marks
+  the commit, so the outcomes file can say whether delegated work draws more findings. Named by
+  alias, so the newest Sonnet is used; the maintainer reports Sonnet 5.5, which this session will
+  see once restarted.
