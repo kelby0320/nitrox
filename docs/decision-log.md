@@ -35802,3 +35802,35 @@ each undo line deleted. The sweeps lose each write of a cut, a truncate, a relea
 removal in turn, and refuse every write from each on. Host tests 3,386. **Full gate set (fgb86):
 44/44** on `d71152db`, every gate under TCG and every CI `--kvm` variant; `boot-probe`'s scratch
 file moved the same 8 reads and 16 writes as before the fixes.
+
+## 2026-10-13 — Before Phase 7: the harness, the code's hygiene, then the syscall surface
+
+**Phase 6 merged (PR #371), and the maintainer set the work before Phase 7**, planned in
+[`pre-phase-7.md`](planning/pre-phase-7.md): seven parts, A–G, the syscall-surface consolidation its
+Part E. Their decisions, the day it was planned:
+
+- **`rustfmt`, with one reformat of the whole tree** — about 22,000 diff lines in 290 files at the
+  closest settings, measured — which the maintainer will not review; the working rule never to run
+  `cargo fmt`, kept because there was no configuration, ends with it.
+- **Comments at 0.1 of code for new code, and existing code cleaned to about 0.15, every comment
+  counted, doc comments included** — the maintainer's figures from another codebase. The markdown
+  under `docs/` is not code and is not measured. Today's is 0.45, doc comments 0.29 of it, with
+  1,089 comment lines citing a PR and 2,799 naming a phase or part; a one-line doc comment on each
+  public item and field would cost 0.04, so the cleanup cuts mostly long doc blocks and inline
+  essays. History belongs in git and this log, not beside the code. Cleaning the existing comments
+  is one large PR. The check measures what a diff introduces — a moved or re-indented line is not a
+  new comment — so the reformat and the splits pass it, as does a diff that removes more comment
+  lines than it adds.
+- **Reviews run from the author's session** by a workflow given only the PR number, so the author
+  cannot steer it — **at most ten agents a review**, the maintainer's token budget weighed against
+  breadth — each agent that changes code in a worktree of its own, and one at a time booting QEMU.
+  It replaces a second session on a second worktree. Shaped by what the reviewers this was compared
+  with do: parallel reviewers each with one lens, an agent that tries to refute each finding, and a
+  measure of how many findings get fixed (Anthropic's code-review plugin and hosted Code Review,
+  Cursor's Bugbot, OpenAI's Codex). Breaking the tests stays its strongest check.
+- **A 1,000-line limit on Rust files**, with today's 64 longer files on a list that may only shrink,
+  and `tools/xtask/src/main.rs` (21,106 lines) split first.
+- **`Super+A` stays** the Applications menu; `Super` alone waits for a launcher.
+- **The order: the harness, then the hygiene, then the fixes**, before the syscall work, since the
+  reformat, the lint fixes and the comment cleanup each touch nearly every crate and would conflict
+  with it.

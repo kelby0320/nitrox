@@ -529,8 +529,9 @@ refresh is first because the admin tools are UI surfaces. **The refresh is compl
 A–G, the last being an installer that runs in an ordinary session as the view broker's client.
 Phases are **not renumbered**: the numbers appear throughout an append-only decision log. Then
 **Phase 6 — USB, complete as of 2026-10-13**, all eight parts, A–H, the last a copy to a USB stick
-timed against Linux on the same laptop; then, before Phase 7, a **consolidation of the syscall
-surface**
-(`docs/planning/syscall-surface.md`, planned 2026-10-08); 7–9 are the portable runtime,
-networking, and the browser. See `docs/decision-log.md` for the current implementation phase and
+timed against Linux on the same laptop; then, before Phase 7, **a body of work planned in
+`docs/planning/pre-phase-7.md`** (2026-10-13): the review harness, the code's hygiene — `rustfmt`,
+`clippy`, comments and file size held by CI — fixes from the laptop, and the **consolidation of the
+syscall surface** (`docs/planning/syscall-surface.md`, planned 2026-10-08) as its Part E; 7–9 are
+the portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and
 `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
