@@ -1655,9 +1655,6 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
     }
 }
 
-/// Wake every thread blocked on `channel` (its queue just went non-empty).
-/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
-/// Mirrors [`fire_timer`]'s waiter-drain.
 /// Ask `process` to exit: enqueue [`KIND_TERMINATE_REQUESTED`] on **its own**
 /// notification channel and wake anything blocked there (§11h).
 ///
@@ -1682,6 +1679,9 @@ pub fn request_terminate(process: *mut ()) -> bool {
     true
 }
 
+/// Wake every thread blocked on `channel` (its queue just went non-empty).
+/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
+/// Mirrors [`fire_timer`]'s waiter-drain.
 fn signal_channel(g: &mut SchedState, channel: *mut ()) {
     let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
     // SAFETY: live channel, `SCHED` held — drains its waiter list.
@@ -1892,17 +1892,6 @@ pub enum ForwardOutcome {
     PeerClosed,
 }
 
-/// Originate a forwarded namespace lookup: under one `SCHED` hold, reserve the
-/// registration's (single) pending-lookup slot — assigning a `request_id` and
-/// recording the lookup `po` / `owner_pid` / requested `Rights` — stamp that id
-/// into the already-built `Namespace::Resolve` request `msg`, and push the request
-/// into the server's inbox (the peer of the registration's kernel endpoint),
-/// waking the server's blocked receivers. The lookup PO is left **uncompleted**
-/// (the server's reply completes it later, inline in its send — see
-/// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` /
-/// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
-/// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
-/// the caller pins it (and `po`) for the call.
 /// Push a **fire-and-forget** message into a registration's server inbox: no pending slot,
 /// no `request_id`, no reply expected. `true` if it was queued.
 ///
@@ -1938,6 +1927,17 @@ pub unsafe fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
     }
 }
 
+/// Originate a forwarded namespace lookup: under one `SCHED` hold, reserve the
+/// registration's (single) pending-lookup slot — assigning a `request_id` and
+/// recording the lookup `po` / `owner_pid` / requested `Rights` — stamp that id
+/// into the already-built `Namespace::Resolve` request `msg`, and push the request
+/// into the server's inbox (the peer of the registration's kernel endpoint),
+/// waking the server's blocked receivers. The lookup PO is left **uncompleted**
+/// (the server's reply completes it later, inline in its send — see
+/// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` /
+/// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
+/// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
+/// the caller pins it (and `po`) for the call.
 ///
 /// # Safety
 ///
@@ -2053,8 +2053,8 @@ pub unsafe fn us_forward_originate_fill(
 /// `File::ReadRange` reply's, for the caller to land (copy the bytes into the
 /// frame, mark the page ready, complete the PO). `None` if it does not correlate
 /// (duplicate / stale). Takes `SCHED`; the returned [`PendingFill`]'s `po` /
-/// `file_obj` are dropped by the caller **outside** `SCHED`. The caller pins `reg`
-/// (via the send's endpoint peer, valid for the call).
+/// `file_obj` are dropped by the caller **outside** `SCHED`. The caller pins `reg`: the
+/// reference [`us_forward_reg_for_send`] returned.
 ///
 /// # Safety
 ///
@@ -2062,23 +2062,23 @@ pub unsafe fn us_forward_originate_fill(
 /// holds.
 pub unsafe fn us_forward_take_pending_fill(reg: *mut (), request_id: u64) -> Option<PendingFill> {
     let _g = SCHED.lock();
-    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
-    // `SCHED` held.
+    // SAFETY: `reg` is a live registration the caller's reference pins; `SCHED` held.
     unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) }
 }
 
 /// If a send on `send_endpoint` targets the kernel's end of a Userspace Server
 /// channel — i.e. its **peer** carries a
 /// [`UserspaceServerReg`](crate::object::UserspaceServerReg) back-pointer — return
-/// that registration (the send is a forwarded-lookup *reply* the kernel completes
-/// inline). `None` for an ordinary channel send or a closed peer. Takes `SCHED`
-/// (the accessor contract). The caller pins `send_endpoint` (its send handle).
+/// a new reference to that registration (the send is a forwarded-lookup *reply* the kernel
+/// completes inline). `None` for an ordinary channel send, a closed peer, or a registration
+/// already being destroyed. Acquired under `SCHED`: the back-pointer is uncounted, and once
+/// `SCHED` is released another CPU may drop the registration's last binding.
 ///
 /// # Safety
 ///
 /// `send_endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller
 /// holds.
-pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
+pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRef> {
     let _g = SCHED.lock();
     // SAFETY: `send_endpoint` is pinned by the caller; `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(send_endpoint) };
@@ -2087,7 +2087,12 @@ pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()>
     }
     // SAFETY: `peer` is the surviving endpoint (the kernel end); `SCHED` held.
     let reg = unsafe { IpcChannel::us_reg_of(peer) };
-    if reg.is_null() { None } else { Some(reg) }
+    if reg.is_null() {
+        return None;
+    }
+    // SAFETY: a registration clears this back-pointer under `SCHED` before it is freed, so
+    // `reg` is whole while `SCHED` is held; `try_acquire` refuses one already at zero.
+    unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }
 }
 
 /// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything
@@ -2143,17 +2148,18 @@ pub unsafe fn us_reg_detach(reg: *mut ()) {
 /// Record the endpoint → registration back-pointer that makes `endpoint` the
 /// kernel's end of a Userspace Server channel: a reply sent to it (by the server,
 /// on its peer) is then completed inline rather than enqueued. Called by
-/// `sys_ns_bind` once the `UserspaceServer` binding owns the registration. Takes
-/// `SCHED` (the accessor contract). The caller pins `endpoint` (its bound handle).
+/// `sys_ns_bind` once the `UserspaceServer` binding owns the registration, with a reference of
+/// its own still held: an unbind on another thread may drop the binding's. Takes `SCHED` (the
+/// accessor contract). The caller pins `endpoint` (its bound handle).
 ///
 /// # Safety
 ///
-/// `endpoint` points at a live `IpcChannel` and `reg` at the live `UserspaceServerReg` its binding
-/// owns, each pinned for the call by the caller.
-pub unsafe fn us_server_attach(endpoint: *mut (), reg: *mut ()) {
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds,
+/// and `reg` is a `UserspaceServerReg`.
+pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) {
     let _g = SCHED.lock();
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
-    unsafe { IpcChannel::set_us_reg(endpoint, reg) };
+    unsafe { IpcChannel::set_us_reg(endpoint, reg.as_ptr()) };
 }
 
 /// If `endpoint` already backs a Userspace Server registration, return a **new owned
@@ -2196,7 +2202,7 @@ pub unsafe fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
 /// reply's, for the caller to complete (cross-context install + signal). `None`
 /// if the reply does not correlate (duplicate / stale). Takes `SCHED`; the
 /// returned [`PendingLookup`]'s `po` is dropped by the caller **outside** `SCHED`.
-/// The caller pins `reg` (via the send's endpoint peer, valid for the call).
+/// The caller pins `reg`: the reference [`us_forward_reg_for_send`] returned.
 ///
 /// # Safety
 ///
@@ -2204,8 +2210,7 @@ pub unsafe fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
 /// holds.
 pub unsafe fn us_forward_take_pending(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
     let _g = SCHED.lock();
-    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
-    // `SCHED` held.
+    // SAFETY: `reg` is a live registration the caller's reference pins; `SCHED` held.
     unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) }
 }
 

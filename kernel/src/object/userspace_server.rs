@@ -646,6 +646,40 @@ mod tests {
         drop(keepalive);
     }
 
+    /// A reply holds the registration it was routed to: the last binding, dropped on another CPU
+    /// between the lookup and the reply's completion, cannot free it under the reply.
+    #[test]
+    fn a_reply_holds_the_registration_it_found() {
+        init_global_heap();
+        let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+        // SAFETY: `into_raw` yields each endpoint's single creation reference; adopt it.
+        let k_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        // SAFETY: as above.
+        let s_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        let k_ptr = k_ref.as_ptr();
+        let r = UserspaceServerReg::try_new(k_ref).unwrap();
+        // SAFETY: adopt the creation reference; it stands for the binding's.
+        let binding =
+            unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
+        // SAFETY: `k_ptr` is the endpoint the registration holds.
+        unsafe { crate::sched::us_server_attach(k_ptr, &binding) };
+
+        // SAFETY: `s_ref` pins the server's end.
+        let reply =
+            unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.expect("routed to the registration");
+        let destroyed = test_probe::userspace_server_reg_destroys();
+        drop(binding);
+        assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed, "freed under the reply");
+        // SAFETY: `reply` pins the registration.
+        assert!(unsafe { crate::sched::us_forward_take_pending(reply.as_ptr(), 1) }.is_none());
+
+        drop(reply);
+        assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed + 1);
+        // SAFETY: `s_ref` pins the server's end, whose peer closed with the registration.
+        assert!(unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.is_none());
+        drop(s_ref);
+    }
+
     /// Only a pointer that still names *this* registration may be cleared:
     /// `us_server_attach` can retarget an endpoint, and a dying predecessor must not
     /// stomp its live successor's reply routing.
