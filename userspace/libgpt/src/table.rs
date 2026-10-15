@@ -33,16 +33,19 @@ pub const FIRST_USABLE: u64 = 2 + ARRAY_BLOCKS;
 pub const BLOCK: usize = 512;
 
 /// The EFI system partition's type GUID, `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`.
+#[rustfmt::skip]
 pub const TYPE_EFI_SYSTEM: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
 /// The Linux filesystem type GUID, `0FC63DAF-8483-4772-8E79-3D69D8477DE4` — what `mke2fs` images
 /// and every Linux root carry, and what this system's own images already use.
+#[rustfmt::skip]
 pub const TYPE_LINUX_FS: [u8; 16] = [
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
 /// Microsoft basic data, `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` — what a FAT on a GPT is typed, by
 /// Windows, macOS and Linux alike (Phase 6 Part G.2).
+#[rustfmt::skip]
 pub const TYPE_BASIC_DATA: [u8; 16] = [
     0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
 ];
