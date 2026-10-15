@@ -1,9 +1,10 @@
 # Before Phase 7: the harness, the code's hygiene, and what the laptop found
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
-2026-10-14; A.1, A.2 and A.6 built 2026-10-14.** Each other part gets its detail pass when it is
-next. Seven parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned
-separately in [`syscall-surface.md`](syscall-surface.md).
+2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
+built.** Each other part gets its detail pass when it is next. Seven parts, A–G, in the order
+below. Part E is the syscall-surface consolidation, planned separately in
+[`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -87,11 +88,15 @@ maintainer talks to stays on Opus and the author. It hands bounded work — mech
 a named test — to an `implementer` subagent on Sonnet, and reads every diff before committing. The
 review splits the same way: Opus for the lenses that find subtle defects, Sonnet for the rest.
 
+**A.7 A bug bash** (added 2026-10-14, after the review's second trial found bugs still in `main`).
+The review's machinery aimed at a subsystem rather than a diff, for Part D: a saved workflow the
+maintainer starts per subsystem, its findings a triage list.
+
 ## Part A in detail
 
 *Detailed 2026-10-14.* Where the outline above and this differ, this is the plan. **Two PRs.** The
 first holds A.1 and A.2, and the old skill reviews it from a second session one last time. The
-second holds A.3, A.4 and A.5, and is the new reviewer's first real review, started from the
+second holds A.3, A.4, A.5 and A.7, and is the new reviewer's first real review, started from the
 author's session. A commit a sub-part.
 
 ### A.1 The review
@@ -278,6 +283,24 @@ grow it.
 - **Measured against the all-Opus trial**: a second run on PR #365 at `55e6bd18`, against what the
   first found.
 
+### A.7 A bug bash
+
+- **`/bug-bash <subsystem>`**, the maintainer's to start as `/pr-review` is, runs a saved workflow
+  with the subsystem's name and directories alone, from a list kept beside the skill. Its agents
+  start from `main` in worktrees of their own.
+- **A scope**, on Sonnet: the subsystem's entry points, where data from another process, a device or
+  a disk comes in, the `CLAUDE.md` files that govern it, and the deferrals already known — a
+  `TODO(tag)` with its `deferred-decisions.md` entry is not a finding.
+- **Reviewers**: logic, error paths, and a new **trust boundary** lens — data another process, a
+  device or a disk supplies, trusted unchecked, which most of PR #365's worst findings were — on
+  Opus; architecture on Opus for the kernel alone; tests on Sonnet. No rules-and-docs: a doc that
+  drifted is not a bug. With no diff to cover, each starts at the entry points and the trust
+  boundaries.
+- **A QEMU boot**, one agent, for findings that need one; **a report**, on Sonnet, returning the
+  subsystem's findings — file and line, scenario, evidence, severity — which the author appends to
+  `docs/planning/bug-bash.md`, so no agent writes in the author's checkout.
+- **At most eight agents** a run, and one run a subsystem, so the maintainer watches the spend.
+
 ## Part B — the code's hygiene
 
 Each touches nearly every crate, which is why all of it comes before the syscall work does.
@@ -318,15 +341,29 @@ needs none of them.
 - `disk --eject` of a USB stick stops it (SCSI `START STOP UNIT`), so its light goes out; the
   laptop confirms it.
 
-## Part D — two bugs to find
+## Part D — a bug bash
 
-- **`nxterm` showing output only after the pointer moves**: every time in the laptop's runs 3
-  and 4. The QEMU dry runs of Phase 6 Part H may reproduce it if run from `nxterm` — those
-  recorded were typed on serial, which never passes through it — and trying that comes first.
-- **The Applications menu's search clearing while typing**: intermittent; a reliable way to make
-  it happen comes first.
+After Part B, so the reformat and the splits do not move the lines a finding names, and so
+`clippy`'s soundness errors are fixed before the bash would find them again; before Part E, whose
+changes reach the same code. **Every finding goes in `docs/planning/bug-bash.md`** and is triaged
+with the maintainer — fix, schedule, or won't fix — and reproduced before it is fixed, with a test
+that fails without the fix.
 
-Each closes with its cause shown and a test that fails without the fix.
+- **The two bugs from the laptop.** `nxterm` showing output only after the pointer moves, every time
+  in the laptop's runs 3 and 4: the QEMU dry runs of Phase 6 Part H may reproduce it if run from
+  `nxterm` — those recorded were typed on serial, which never passes through it — and trying that
+  comes first. The Applications menu's search clearing while typing, intermittent: a reliable way to
+  make it happen comes first.
+- **What PR #365's two trial reviews found and `main` still has**: the kernel reserving a server's
+  run count unchecked, a rename leaving two names on one chain, FAT16's cluster count unbounded, and
+  the rest — each checked against `main` first.
+- **The bash, with A.7, riskiest first**: the kernel's syscall boundary and its objects (handles,
+  IPC, namespaces, the page cache); kernel memory (`mm`, address spaces, copies to and from user
+  memory); the filesystems (`fs-server-ext4`, `fs-server-fat`, `libfsserver`); the drivers (xHCI and
+  HID parsing, AHCI, PS/2); protocol parsing (`librsproto`, `libstream`); the security services
+  (`auth-service`, the view broker, `session-mgr`, `libusers`); the scheduler and waiting; storage
+  and supervision (`storage-service`, `device-mgr`, `init`, `service-mgr`). Eight runs at first,
+  each the maintainer's to start; more later as the budget allows.
 
 ## Part E — the syscall surface
 
@@ -351,12 +388,13 @@ several branches at once, which waits on the gates leaving this machine.
 
 ## Definition of done
 
-- A PR is reviewed from the author's session by the A.1 workflow, within ten agents, and its
+- A PR is reviewed from the author's session by the A.1 workflow, within eight agents, and its
   findings' outcomes recorded.
 - CI fails a branch that is not `rustfmt`-clean, has a `clippy` warning, adds comments over 0.15
   of its code, cites a PR or phase in a comment, or grows a file past 1,000 lines or past its
   listed length.
 - Comments at 0.15 of code or under in every crate; no file over 5,000 lines.
 - CI's wall clock about 6 minutes.
-- Part C's fixes in, the stick's light confirmed on the laptop; Part D's causes found and fixed;
-  Part E done as its plan says; Parts F and G built.
+- Part C's fixes in, the stick's light confirmed on the laptop; Part D's bash run on its eight
+  subsystems and every finding in `bug-bash.md` triaged, the ones marked fix fixed; Part E done as
+  its plan says; Parts F and G built.
