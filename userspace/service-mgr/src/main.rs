@@ -2081,24 +2081,25 @@ impl Mgr {
             }
         }
         let root = self.services.serve;
-        while root != 0 {
-            match recv_request(root) {
-                Ok(Some((op, request_id, body))) => self.answer_resolve(root, op, request_id, &body, false),
-                Ok(None) => break,
-                Err(()) => {
-                    close(root);
-                    self.services.serve = 0;
-                    break;
+        if root != 0 {
+            loop {
+                match recv_request(root) {
+                    Ok(Some((op, request_id, body))) => self.answer_resolve(root, op, request_id, &body, false),
+                    Ok(None) => break,
+                    Err(()) => {
+                        close(root);
+                        self.services.serve = 0;
+                        break;
+                    }
                 }
             }
         }
         // A session endpoint's holders are the logins and what they spawn; this manager holds its
         // other end, so it cannot close.
         let session = self.services.session_serve;
-        while session != 0 {
-            match recv_request(session) {
-                Ok(Some((op, request_id, body))) => self.answer_resolve(session, op, request_id, &body, true),
-                _ => break,
+        if session != 0 {
+            while let Ok(Some((op, request_id, body))) = recv_request(session) {
+                self.answer_resolve(session, op, request_id, &body, true);
             }
         }
     }

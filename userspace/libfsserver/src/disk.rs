@@ -427,13 +427,21 @@ impl PartitionIo {
         Ok(())
     }
 
-    /// The scratch's first `n` bytes, `n` at most [`WINDOW_SPAN`].
-    fn scratch(&self, n: usize) -> &mut [u8] {
-        assert!(n <= WINDOW_SPAN);
+    /// Copy scratch bytes `[from, from + dst.len())` out into `dst`.
+    fn copy_out(&self, from: usize, dst: &mut [u8]) {
+        assert!(from + dst.len() <= WINDOW_SPAN);
         // SAFETY: `new` mapped `WINDOW_SPAN` read-write bytes at `scratch_addr`, which stay mapped
-        // until `drop`; `n` is within them; and the type is not `Sync` and no method holds the
-        // slice past its own use, so nothing else refers to the mapping while this does.
-        unsafe { core::slice::from_raw_parts_mut(self.scratch_addr as *mut u8, n) }
+        // until `drop`, and the range is within them; `dst` is a distinct buffer of the caller's.
+        unsafe {
+            core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len())
+        };
+    }
+
+    /// Copy `src` into scratch bytes `[from, from + src.len())`.
+    fn copy_in(&self, from: usize, src: &[u8]) {
+        assert!(from + src.len() <= WINDOW_SPAN);
+        // SAFETY: as for `copy_out`, the other way.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.scratch_addr as *mut u8).add(from), src.len()) };
     }
 }
 
@@ -462,7 +470,7 @@ impl BlockReader for PartitionIo {
                 window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
             self.submit(IO_OPCODE_READ, start, span)?;
             let take = (buf.len() - done).min(span as usize - intra);
-            buf[done..done + take].copy_from_slice(&self.scratch(span as usize)[intra..intra + take]);
+            self.copy_out(intra, &mut buf[done..done + take]);
             done += take;
         }
         Ok(())
@@ -481,7 +489,7 @@ impl BlockWriter for PartitionIo {
             if intra != 0 || take != span as usize {
                 self.submit(IO_OPCODE_READ, start, span)?;
             }
-            self.scratch(span as usize)[intra..intra + take].copy_from_slice(&buf[done..done + take]);
+            self.copy_in(intra, &buf[done..done + take]);
             self.submit(IO_OPCODE_WRITE, start, span)?;
             done += take;
         }

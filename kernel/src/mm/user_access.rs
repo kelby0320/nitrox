@@ -237,6 +237,7 @@ pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     if n == 0 {
         // SAFETY: `T` is zero-sized, so there is only one possible
         // value and no bytes need be initialised.
+        #[allow(clippy::uninit_assumed_init, reason = "a zero-sized T has no bytes to initialise")]
         return Ok(unsafe { MaybeUninit::<T>::uninit().assume_init() });
     }
     validate_user_range(addr, n as u64)?;
