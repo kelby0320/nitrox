@@ -35992,3 +35992,44 @@ settled, beyond the plan:
   `clippy`'s soundness errors are fixed first; before Part E, which reaches the same code. Findings
   go in one triage file, `docs/planning/bug-bash.md`, appended by the author from each run's report,
   and are triaged with the maintainer: fix, schedule, or won't fix.
+
+## 2026-10-14 — Before Phase 7: Part A's checks, the bug bash, and a shorter `CLAUDE.md`
+
+Part A's second PR: A.3, A.4, A.5 and A.7, a commit each.
+
+- **`check-comments` (A.3)** counts a line whose trimmed text starts with `//` as a comment and
+  takes the branch's diff from its merge base: an added line is not new when the same trimmed
+  text was removed elsewhere in the diff, and untracked Rust files count whole. New comments at
+  most 0.15 of new code plus 3; a diff adding no more comment lines than it removes passes; a new
+  comment citing a PR, issue, finding, phase, part, milestone part or slice fails. In CI on a
+  pull request against its base branch, on a push to `main` against the merge's first parent.
+- **The hook's input, captured rather than assumed**: an `Edit` carries `old_string` and
+  `new_string`, a `Write` `content`, with the file it replaced in `tool_response.originalFile`
+  (`null` for a new file). `MultiEdit` is not a tool this harness offers, so the hook matches
+  `Edit|Write`. `hook-comments` is dispatched before `main()` reads `CARGO_MANIFEST_DIR`, which
+  only `cargo` sets; a host test runs the built binary without it. An edit adding three comment
+  lines, one citing a part, drew the nudge in this session.
+- **`check-size` (A.4)**: `tools/xtask/size-baseline.toml` lists the 64 Rust files over 1,000
+  lines with their lengths; `--update` lowers and removes entries and never raises or adds one.
+  `main.rs`'s entry fell from 21,144 to 20,576 when `check-docs` moved out.
+- **The root `CLAUDE.md` (A.5) went from 554 lines to 196**, held at 200 by `check-docs`. Beyond
+  the gate paragraphs the plan named, two more passages moved verbatim to fit: the `--grab` and
+  chord paragraphs, to `qemu-integration-tests.md` beside the gates, and the long form of which docs
+  describe today, to a new `docs/conventions/documentation.md`; the root keeps the rule in five
+  bullets. Status keeps the current phase only; its history is in this log. Moving the gates into a
+  conventions doc put their cited paths under `check-docs`: eight more, all present. The index of
+  the sixteen other `CLAUDE.md` files is held complete both ways.
+- **`/bug-bash` (A.7)** shares the review's logic, error-path and architecture lenses, reworded for
+  code under review rather than a diff, and has its own trust-boundary and tests lenses, rules,
+  scope, verify and report. Its report returns the section the author appends; if the report dies,
+  the workflow returns the findings unwritten rather than losing a hunt. The architecture lens
+  joins a subsystem with a path under `kernel/`.
+- **A workflow script may not read the clock or `Math.random()`**: the runtime throws, to keep a
+  resume deterministic. A first draft dated its report with `new Date()`, which would have thrown
+  after the whole hunt. The tests' harness, now `.claude/workflows/harness.mjs` and shared by both
+  workflows' tests, refuses them too, and **CI now runs both tests** — reversing the entry above's
+  "nothing in CI runs them", since a harness shared by two could break one unseen.
+- **The first delegations (A.6)**: `check-size`, and the move of `check-docs` into
+  `tools/xtask/src/docs.rs`. The author caught one gap in the first — a listed entry at or under
+  1,000 lines whose file sat at it passed, against the brief — and the implementer flagged an
+  orphaned doc comment in the second, which went.

@@ -8,7 +8,10 @@ each `/bug-bash` run, a section a subsystem.
 
 The author appends each run's findings as its report gives them, a checkbox each:
 
-- `[ ] **ID** file:line — the defect in a sentence. Scenario. Evidence. Severity.`
+- `[ ] **ID** file:line — the defect in a sentence. Scenario. Evidence. Lens. Severity.`
+
+Each run's findings come as one section, headed with the subsystem and the commit of `main` it
+hunted, in the shape `.claude/skills/bug-bash/report.md` gives.
 
 The ID is the subsystem's short name and a number, such as `kobj-3`. Triage, with the maintainer,
 adds one word after the severity: **fix** (in Part D), **later** (with a `TODO(tag)` and its
