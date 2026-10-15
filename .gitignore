@@ -5,6 +5,9 @@ target/
 # xtask-managed cache: fetched Limine binaries, assembled disk image.
 tools/build-cache/
 
+# A review agent's worktree, made and removed by the review workflow.
+.claude/worktrees/
+
 # Editor / OS noise
 *.swp
 *.swo

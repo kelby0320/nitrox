@@ -16,5 +16,5 @@
 
   "_comment_hooks": "Reserved for future use. Hooks like InstructionsLoaded can be useful for debugging which CLAUDE.md files are being loaded; uncomment when needed.",
 
-  "_comment_subagents": "Subagent configurations go in .claude/subagents/ if used. Not currently configured."
+  "_comment_subagents": "Subagent definitions are in .claude/agents/: implementer, the Sonnet agent the author session hands bounded work to (see CLAUDE.md, Who does the work)."
 }

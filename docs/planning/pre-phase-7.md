@@ -1,9 +1,9 @@
 # Before Phase 7: the harness, the code's hygiene, and what the laptop found
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
-2026-10-14.** Each other part gets its detail pass when it is next. Seven parts, A–G, in the order
-below. Part E is the syscall-surface consolidation, planned separately in
-[`syscall-surface.md`](syscall-surface.md).
+2026-10-14; A.1, A.2 and A.6 built 2026-10-14.** Each other part gets its detail pass when it is
+next. Seven parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned
+separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -34,10 +34,10 @@ Six phases in, three costs had grown that no single feature would fix:
 
 ## Part A — the harness
 
-**A.1 A review in this session, by agents that share none of its context.** A skill the author
+**A.1 A review in this session, by agents that share none of its conversation.** A skill the author
 session runs with a PR number. It starts a saved workflow in `.claude/workflows/`, which is given
-the PR number and nothing else, so the author cannot steer it. **At most ten agents** a review
-(the maintainer's token budget):
+the PR number and nothing else, so the author cannot steer it. **At most ten agents** a review (the
+maintainer's token budget):
 
 1. **Scope**, one agent: the diff, the `CLAUDE.md` files that govern it, the tests it adds, and
    which reviewers below apply.
@@ -82,6 +82,11 @@ responsibility, and tests into a sibling `tests.rs`, as `fs-server-fat` does.
 `CLAUDE.md` is indexed, and the rules A.3, A.4 and Part B make mechanical are stated once, briefly.
 `check-docs` holds the index complete.
 
+**A.6 Who does the work** (added 2026-10-14, after the review's first trial). The session the
+maintainer talks to stays on Opus and the author. It hands bounded work — mechanical, or checked by
+a named test — to an `implementer` subagent on Sonnet, and reads every diff before committing. The
+review splits the same way: Opus for the lenses that find subtle defects, Sonnet for the rest.
+
 ## Part A in detail
 
 *Detailed 2026-10-14.* Where the outline above and this differ, this is the plan. **Two PRs.** The
@@ -95,10 +100,11 @@ author's session. A commit a sub-part.
 
 - `.claude/skills/pr-review/SKILL.md` — the launcher, `/pr-review <N>`. It sets
   `disable-model-invocation: true`, so only the maintainer starts a review: starting one is the
-  opt-in to a multi-agent run. It runs the saved workflow `pr-review` with `args: {pr: N}` and
-  nothing of the author's, and the author session waits — no `cargo`, no QEMU — until the review
+  opt-in to a multi-agent run. It runs the saved workflow `pr-review-workflow` with `args: {pr: N}`
+  and nothing of the author's, and the author session waits — no `cargo`, no QEMU — until the review
   is posted.
-- `.claude/workflows/pr-review.js` — the workflow: the four stages below.
+- `.claude/workflows/pr-review-workflow.js` — the workflow: the four stages below. Not `pr-review`:
+  a saved workflow is also listed as a skill of its name, which would take the launcher's.
 - `.claude/skills/pr-review/reviewer.md` — what every one of its agents reads first: today's
   skill's rules (the reviewer is not the author, demonstrate or label, which docs describe today,
   the failure modes), rewritten for an agent given one lens.
@@ -107,16 +113,18 @@ author's session. A commit a sub-part.
   reading `reviewer.md` and every lens itself. It reviews the first PR, whose own `pr-review` is <!-- check-docs: allow-missing -->
   the new launcher, and it stays the cheaper review when tokens are short.
 
-**Each agent in its own worktree.** A worktree-isolated agent starts in
-`.claude/worktrees/agent-<id>`, on a new branch at the author session's commit, with no build output
-(probed 2026-10-14). So each agent's first step is to fetch `pull/<N>/head` and check out the head
-the scope agent named, and its first host-test build costs seconds. `.claude/worktrees/` goes in
+**Each agent in its own worktree.** A workflow's agent starts in `.claude/worktrees/wf_<run>-<n>`,
+on a branch `worktree-wf_<run>-<n>` at `main` — not at the author session's commit, as this said
+until PR #374's review: the first probe ran with the session on `main` — and with no build output.
+So the rules a review's agents read are `main`'s: a PR that changes them is reviewed by the rules it
+would replace. So each agent's first step is to fetch `pull/<N>/head` and check out the head the
+scope agent named, and its first host-test build costs seconds. `.claude/worktrees/` goes in
 `.gitignore`, and **`check-docs` lists its files with git**
 (`git ls-files --cached --others --exclude-standard`) rather than walking the disk, where it reads
 `.claude/` and a review's worktree under it as the repo's own docs (found by PR #373's review, a
 worktree failing it in the author's checkout). The listing brings in the root `CLAUDE.md`, which the
 walk never read; its two deliberate examples of a missing doc take the `allow-missing` marker. The
-runtime removes a worktree left unchanged; the report agent removes any other the review left.
+report agent removes the run's worktrees, found by the scope's own path, and their branches.
 
 **The stages, at most ten agents.**
 
@@ -137,17 +145,19 @@ runtime removes a worktree left unchanged; the report agent removes any other th
      leaves behind, and uses a crate's failure injection where it has one (`fs-server-ext4`'s
      `Failing`).
    - No reviewer boots QEMU. A finding only a boot can show says so.
-3. **Verification**, up to three agents, once every reviewer has returned — the one barrier, so
-   duplicates across lenses merge first. The findings go out in batches, and each verifier is
-   told to refute each one in its batch: demonstrated, refuted, or unverified with what would
-   settle it. Findings that need a boot go to one verifier that runs after the others, so a
+3. **Verification**, *dropped after the second run, 2026-10-14 (A.6)*: across both runs it refuted
+   none of 59 findings, so only a finding that needs a QEMU boot still goes to a verifier, one agent
+   after the reviewers. Planned as: up to three agents, once every reviewer has returned — the one
+   barrier, so duplicates across lenses merge first. The findings go out in batches, and each
+   verifier is told to refute each one in its batch: demonstrated, refuted, or unverified with what
+   would settle it. Findings that need a boot go to one verifier that runs after the others, so a
    single agent boots QEMU and nothing runs beside it.
 4. **Report**, one agent. It ranks what survived, holds the blocking set to defects that must
    not merge, posts one comment (`gh pr comment`), removes leftover worktrees, and returns the
    summary.
 
-One scope agent, five reviewers, three verifiers and a report make ten; with four reviewers there
-is room for a fourth verifier.
+One scope agent, five reviewers, a boot verifier and a report make eight, under the ten the
+maintainer allowed.
 
 **Measured.** Each finding's fate goes in `.claude/review-outcomes.tsv`: the PR, the finding, its
 lens and severity, the verifier's verdict, and what became of it — fixed, refuted or deferred.
@@ -161,7 +171,7 @@ bonus. It costs one review's tokens, so it is the maintainer's call.
 
 **Root `CLAUDE.md`'s review rule** changes with it, in the first PR: the reviewer is still not the
 author, but the author starts it — a workflow given only the PR number, sharing none of the author's
-context — and the second worktree retires.
+conversation — and the second worktree retires.
 
 ### A.2 Addressing a review
 
@@ -245,6 +255,28 @@ grow it.
   a line a command.
 - **Added:** an index of every `CLAUDE.md` in the tree, a line each — sixteen today, where it
   names five — which `check-docs` holds complete; and the comment and size rules, a line each.
+
+### A.6 Who does the work
+
+- **`.claude/agents/implementer.md`**, `model: sonnet`: one work item from the author's brief, in
+  the files it names; the directory's `CLAUDE.md` rules and the comment rules; the host tests of
+  what it changed; no commit, no push, no QEMU. Its last message says what it changed, what it ran,
+  and what it was unsure of.
+- **Root `CLAUDE.md`, *Who does the work***: what the author hands over — `clippy` warnings, comment
+  cleanup, moves, docs, small fixes with a clear spec and test — and what it keeps: design and
+  detail passes, the kernel's `unsafe`, memory and concurrency, filesystem write paths, drivers,
+  syscall and ABI changes, debugging, review findings. A delegated commit says
+  `Implemented-By: implementer (Sonnet)`, so the outcomes file can compare its findings with the
+  rest.
+- **The review by model**: the logic, error-path and architecture lenses on the session's model; the
+  scope (low effort), the tests and rules-and-docs lenses, the verifiers and the report (medium
+  effort) on Sonnet. Reviewers are told to go after what matters most first and stop when digging
+  turns up only optional notes; verifiers, to reproduce a finding's own demonstration first. **The
+  second run** (Sonnet 5.5 where above): 19 minutes against 48, 83 million cache-read tokens against
+  209, the same four of the original seven found; its Sonnet verifiers ran three to six commands
+  each, so verification went too.
+- **Measured against the all-Opus trial**: a second run on PR #365 at `55e6bd18`, against what the
+  first found.
 
 ## Part B — the code's hygiene
 

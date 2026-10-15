@@ -17337,28 +17337,15 @@ fn cmd_check_docs() -> R<()> {
     // cannot do without re-reading it once per link.
     let mut anchor_refs: Vec<(PathBuf, usize, PathBuf, String)> = Vec::new();
 
-    // Everything that documents this project, not just `docs/`. The `CLAUDE.md` files are
-    // instructions Claude Code loads directly, and `.claude/skills/` defines the review
-    // procedure — both cite doc paths, and both were missed by an earlier version of this
-    // gate that walked `docs/` alone. `docs/history/` was dissolved while `SKILL.md` still
-    // told a reviewer to file decisions there, and nothing caught it.
-    let mut roots: Vec<PathBuf> = ["docs", ".claude", "kernel", "userspace", "tools"]
-        .iter()
-        .map(|d| root.join(d))
-        .collect();
-    roots.retain(|p| p.exists());
+    // Every Markdown file git knows or would: the `CLAUDE.md` files and the skills cite doc
+    // paths as `docs/` does. Listed by git, not walked, so an ignored review worktree under
+    // `.claude/worktrees/` is never read as this repo's docs.
+    let md_files = git_md_files(&root)?;
+    md_listing_has_root(&md_files, &root)?;
 
     // Every `*.md` basename in the repo, so a bare backticked filename can be resolved.
-    let mut known_md: Vec<String> = Vec::new();
-    for r in &roots {
-        visit_md_files_skipping(r, &["target", "build-cache"], &mut |p| {
-            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                known_md.push(n.to_string());
-            }
-            Ok(())
-        })?;
-    }
-    known_md.push("CLAUDE.md".into());
+    let known_md: Vec<String> =
+        md_files.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from)).collect();
 
     let mut check = |path: &Path| -> R<()> {
         let text = fs::read_to_string(path)?;
@@ -17470,8 +17457,8 @@ fn cmd_check_docs() -> R<()> {
         Ok(())
     };
 
-    for r in &roots {
-        visit_md_files_skipping(r, &["target"], &mut check)?;
+    for p in &md_files {
+        check(p)?;
     }
 
     // 1b (continued). Resolve the collected heading links, reading each target once.
@@ -18154,27 +18141,41 @@ fn heading_anchors(text: &str) -> Vec<String> {
     out
 }
 
-fn visit_md_files_skipping(
-    dir: &Path,
-    skip: &[&str],
-    f: &mut dyn FnMut(&Path) -> R<()>,
-) -> R<()> {
-    if !dir.exists() {
+fn git_md_files(root: &Path) -> R<Vec<PathBuf>> {
+    let out = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.md"])
+        .current_dir(root)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("git ls-files: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(md_paths(root, &out.stdout).into_iter().filter(|p| p.is_file()).collect())
+}
+
+/// The paths in `git ls-files -z` output, each once: a file unmerged mid-merge is listed once a stage.
+fn md_paths(root: &Path, listing: &[u8]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = listing
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// A listing without the root `CLAUDE.md` is not this repository's: run from outside a checkout of
+/// it, git lists nothing, and every check would pass on no files.
+fn md_listing_has_root(files: &[PathBuf], root: &Path) -> R<()> {
+    if files.iter().any(|p| *p == root.join("CLAUDE.md")) {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if skip.contains(&name) {
-                continue;
-            }
-            visit_md_files_skipping(&path, skip, f)?;
-        } else if path.extension().map_or(false, |e| e == "md") {
-            f(&path)?;
-        }
-    }
-    Ok(())
+    Err(format!(
+        "check-docs: git listed {} Markdown file(s) under {} and not its CLAUDE.md; run it from a git checkout",
+        files.len(),
+        root.display()
+    )
+    .into())
 }
 
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each. Like
@@ -19824,6 +19825,30 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_listed_once_a_merge_stage_is_checked_once() {
+        let root = std::path::Path::new("/r");
+        let paths = super::md_paths(root, b"docs/a.md\0x.md\0x.md\0x.md\0");
+        assert_eq!(paths, [root.join("docs/a.md"), root.join("x.md")]);
+    }
+
+    #[test]
+    fn a_listing_without_the_root_claude_md_is_refused() {
+        let root = std::path::Path::new("/r");
+        assert!(super::md_listing_has_root(&[], root).is_err());
+        assert!(super::md_listing_has_root(&[root.join("docs/CLAUDE.md")], root).is_err());
+        assert!(super::md_listing_has_root(&[root.join("docs/a.md"), root.join("CLAUDE.md")], root).is_ok());
+    }
+
+    #[test]
+    fn this_checkout_lists_its_docs_and_none_of_its_build_output() {
+        let root = super::repo_root();
+        let files = super::git_md_files(&root).unwrap();
+        assert!(files.contains(&root.join("CLAUDE.md")));
+        assert!(files.contains(&root.join("docs/decision-log.md")));
+        assert!(!files.iter().any(|p| p.components().any(|c| c.as_os_str() == "target")));
+    }
+
     use super::*;
 
     /// **The throughput stick's tree**: its three parts at the sizes the plan names, 384 MiB in all,

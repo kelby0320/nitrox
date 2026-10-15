@@ -387,12 +387,29 @@ Don't run kernel code on the host. Don't run `cargo build` directly in the kerne
 
 ## Review workflow
 
-Every PR gets reviewed by a **separate, fresh Claude Code session** — `/pr-review <N>`,
-defined in `.claude/skills/pr-review/SKILL.md`. The point of the split is that the
-reviewer does not inherit the author's context, so it cannot inherit the author's blind
-spots. The reviewer reports and does not edit; findings come back to the working session.
+Every PR is reviewed by agents that share none of the author's conversation; they read the
+`CLAUDE.md` files and the memory index, as any session does. **`/pr-review <N>`**, which only the
+maintainer starts, runs the workflow `.claude/workflows/pr-review-workflow.js` from the author's
+session, given the PR number alone: a scope agent, reviewers with one lens each — Opus for logic,
+error paths and architecture, Sonnet for the rest — a QEMU boot for the findings that need one, and
+a report posted to the PR: at most eight agents, each in a worktree of its own. The author never
+starts it and passes it nothing, and while it runs changes nothing on the branch and runs no `cargo`
+or QEMU. **`/pr-review-solo`** is the same review by one agent in a second session, and cheaper. The
+author acts on a review with **`/address-review`**: reproduce each finding, fix it with a control,
+sweep its class, and record the outcome in `.claude/review-outcomes.tsv`. The reviewers' rules are
+in `.claude/skills/pr-review/`, and the workflow's control flow has tests with its agents stubbed:
+`node .claude/workflows/pr-review-workflow.test.mjs`.
 
-If you are the working session, do not run it on your own work — you are the author.
+## Who does the work
+
+The session the maintainer talks to runs on Opus and stays the author: it designs, decides and
+commits. **It hands bounded work to the `implementer` subagent** (`.claude/agents/implementer.md`,
+Sonnet): `clippy` warnings, comment cleanup, code moved between files, docs updates, and small fixes
+whose spec and test are clear. **It keeps** design and detail passes, the kernel's `unsafe`, memory
+and concurrency code, filesystem write paths, drivers, syscall and ABI changes, debugging, and
+review findings. A brief names the files, the change, the rules that apply, the tests to run and
+what done means. The author reads every delegated diff and runs its tests and gates before
+committing, and a delegated commit says so: `Implemented-By: implementer (Sonnet)`.
 
 ## Repository layout
 
@@ -450,7 +467,7 @@ wrong about how something works:
 builds it should carry that move as a checkbox, because the doc is otherwise the thing
 nobody remembers to update.
 
-**Filenames carry no version number.** `foo-design-v1.2.md` guarantees link rot on every
+**Filenames carry no version number.** `foo-design-v1.2.md` guarantees link rot on every <!-- check-docs: allow-missing -->
 revision — renaming it breaks every inbound reference, which is a self-inflicted source of
 exactly the drift these rules exist to prevent. The version belongs in the doc's Status
 line; git carries the history. (`archive/os-design-v5.1.md` is the exception: there the
@@ -484,7 +501,7 @@ When working in a subdirectory, Claude Code lazily loads the subdirectory's `CLA
 
 ## Cross-cutting conventions
 
-- **Markdown for documentation.** No Sphinx, no MkDocs. Plain `.md` files with Mermaid for diagrams where helpful. Cross-link via relative paths.
+- **Markdown for documentation.** No Sphinx, no MkDocs. Plain `.md` files with Mermaid for diagrams where helpful. Cross-link via relative paths. <!-- check-docs: allow-missing -->
 - **TOML for configuration.** `init.toml`, service declarations, profile manifests. No YAML, no JSON5.
 - **All public items have doc comments.** Use `cargo doc` for code-level reference.
 - **`#[repr(C)]` for any type crossing the kernel/userspace boundary.** Layout must be predictable.

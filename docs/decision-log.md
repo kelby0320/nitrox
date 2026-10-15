@@ -35866,3 +35866,112 @@ settled, beyond the plan:
   author's checkout: it lists its files with git instead. And a past head already on `main` has an
   empty diff against `origin/main` (`3cdd0c28`): the base is the head's merge base with the PR's
   `baseRefOid`, `822a42e5` for PR #371, 86 files.
+
+## 2026-10-14 — Before Phase 7, Parts A.1 and A.2: the review workflow and the author's side
+
+- **The review is a saved workflow**, `.claude/workflows/pr-review-workflow.js`, which `/pr-review`
+  starts with the PR number alone. Its rules are files the agents read: `reviewer.md` for every one,
+  `scope.md`, a file a lens, `verify.md` and `report.md`. `/pr-review-solo` is one agent reading the
+  same files in turn; `/address-review` is the author's side, writing each finding's outcome to
+  `.claude/review-outcomes.tsv`.
+- **Not named `pr-review`**: a saved workflow is listed as a skill of its own name, so a workflow
+  `pr-review` took the launcher's name and was offered to the model as one it could start. Found by
+  the skills list itself the moment the file existed.
+- **Its control flow is tested against stubbed agents** in Node, outside the repo — no runtime for
+  it here or in CI: a stop at the scope, five lenses with findings needing a boot, four with none,
+  eleven findings, and a reviewer and a verifier that die. Each case stays within ten agents, each
+  finding reaches one verifier, only the last verifier may boot QEMU, a refuted finding is dropped,
+  and one whose verifier died is kept, unverified. What only a real run can show — the prompts, the
+  worktrees, the posted comment — the first review shows.
+- **`check-docs` lists its files with git** (tracked, and untracked but not ignored), so a review's
+  worktree under the ignored `.claude/worktrees/` is no longer read as this repo's docs: with one
+  present the old walk fails, the new listing passes. It reads two files the walk never did, the
+  root `CLAUDE.md` — whose two deliberate examples of a missing doc now carry the `allow-missing`
+  marker — and `assets/wallpapers/README.md`.
+- **A review judges the head as if it were new**: no reviewer reads the PR's comments or earlier
+  reviews, a commit after the head, or a decision-log entry dated after it. The maintainer asked
+  whether a trial on PR #371 could be clean; it could not. Its review and its fix commits are a
+  command away from any agent; the reviewer's own error-path lens and deletion check were written
+  from that review, one lens naming a helper its fix added; and **a review agent reads the memory
+  index**, as the second session always did, so "sharing none of the author's context" is now
+  "conversation". The trial moves to PR #365 at `55e6bd18`, the head its review saw — seven known
+  findings that shaped nothing here — and each agent's transcript is read afterwards for anything it
+  should not have looked at.
+
+## 2026-10-14 — Before Phase 7: the review's first run, and Part A.6, who does the work
+
+- **The workflow's first run**: PR #365 at `55e6bd18`, the head its review saw, 56 files. Ten
+  agents, 48 minutes, all Opus: 97,000 tokens out, and 209 million read from the cache — the cost is
+  turns times context, each tool call reading the whole context again — about 3% of the maintainer's
+  week. The rules-and-docs reviewer alone took 231 turns and 57 million tokens, the tests reviewer
+  154 and 37 million. **Clean**: every agent's commands were read afterwards, and none read the PR's
+  comments, a later commit or a later decision-log entry.
+- **What it found**: 32 findings, none refuted, 29 reported. Of the original review's seven, four
+  outright — the long-name panic, the directory session outliving its directory (raised to
+  blocking), the untested write order, the kernel's overflow — and one in part (the short chain's
+  check untested, not the read that skips it). It missed two: a repartitioned stick mounted twice,
+  and a long name over 255 bytes unreachable. About 23 findings the original had not; two checked on
+  `main` on 2026-10-14 — `block_map` reserving a server's run count before checking the body, and a
+  FAT rename whose failed delete leaves two names on one chain — are real and still there.
+- **So the review splits by model** (A.6): the logic, error-path and architecture lenses stay on the
+  session's model; the scope, the tests and rules-and-docs lenses, the verifiers and the report go
+  to Sonnet, with reviewers told to go after what matters first. A second run on #365 measures it.
+- **And so does implementation** (A.6): the maintainer keeps the session on Opus, as the author, and
+  declined the session-wide mode that plans on Opus and codes on Sonnet — on hard concurrency or
+  filesystem code it would hand the risky edits over too. The author hands bounded work to an
+  `implementer` subagent on Sonnet (`.claude/agents/implementer.md`), reads every diff, and marks
+  the commit, so the outcomes file can say whether delegated work draws more findings. Named by
+  alias, so the newest Sonnet is used; the maintainer reports Sonnet 5.5, which this session will
+  see once restarted.
+
+## 2026-10-14 — Before Phase 7, Part A.6: the review's second run, and verification dropped
+
+- **The second run, split by model**, Sonnet 5.5 where A.6 put it: 19 minutes against the first's
+  48, 83 million cache-read tokens against 209 — the three Opus reviewers 76 million of them, as
+  many as before — 34,000 out against 97,000, 302 tool calls against 664. **Clean**, read afterwards
+  like the first. Of PR #365's original seven it found four, as the first did, but not the same
+  four: it found in full the read that reports bytes a short chain never held, which the first had
+  in part, and missed the untested write order, which the first found. Both missed the repartitioned
+  stick and the long name over 255 bytes. The new findings largely agree between the runs — the
+  kernel reserving a server's run count unchecked, a rename leaving two names on one chain, FAT16's
+  cluster count unbounded, `allocate` leaking despite "all or nothing", a volume marked clean after
+  a failed write, a directory move checked after it is written — which is what makes them
+  believable.
+- **So the review keeps the split and drops verification.** Across both runs the verifiers refuted
+  none of 59 findings, and on Sonnet each ran three to six commands for nine findings. Precision
+  comes from elsewhere: each reviewer demonstrates a finding or marks it, and `/address-review`
+  reproduces each before fixing it. One verifier remains, for findings only a QEMU boot can show,
+  after the reviewers; reviewers now give each finding its severity. At most eight agents. The
+  report agent, which returned a summary in place of what it posted, is told its last message is the
+  body.
+
+## 2026-10-14 — Before Phase 7, PR #374's review: how the review workflow fails
+
+- **The workflow's first review of an unmerged PR**, #374 itself: six agents, nine minutes, about
+  560,000 tokens; 15 findings — one blocking, three worth fixing, eleven optional — all about how
+  the workflow fails, the outcomes file, or `check-docs`'s new listing. **Each reproduced first**,
+  and each fixed with a check that fails without the fix; one half of one declined.
+- **How the workflow fails, now said**: a lens that returns nothing is named to the report, which
+  calls the review incomplete rather than sound, and with every lens gone nothing is posted and the
+  run is an error; a boot verdict counts only for a finding the verifier was given; a pinned head
+  the scope does not return is an error; the architecture lens follows the changed paths as well as
+  the scope's word; a boot-checked finding takes the verifier's demonstration and its duplicate; the
+  eight-agent cap is checked; a report that returns nothing is an error.
+- **Worktrees removed by the run, not by what agents say**: the scope returns its own path, the
+  run's prefix comes from it, and the report removes that prefix's worktrees and their branches, so
+  a dead agent's worktree goes too and no other path can be named. Each of the three runs had left
+  its `worktree-wf_*` branches — twenty, all reachable from `main`, now deleted.
+- **Corrected: a workflow's worktrees start at `main`**, not at the author session's commit as the
+  Part A detail entry above says: every branch the three runs left was at `main`'s commit, the PR
+  branch's not, and the first probe had run with the session on `main`. So a review's agents read
+  the rules `main` has — a PR changing them is reviewed by the rules it would replace — and #374's
+  own reviewers, finding none there, read them from the author's checkout.
+- **The rest**: the scope requires at least one CI run on the head, since none at all was vacuously
+  green; the outcomes file gains a `head` column, and `/address-review` records outcomes after the
+  fixing commit exists. `check-docs` refuses a listing without the root `CLAUDE.md` — from a copy
+  inside an ignored directory git listed nothing and every check passed — and lists a file once
+  however many merge stages name it; host tests hold both, and one the real listing. Declined: that
+  it needs git, which every checkout and CI has.
+- **The workflow's checks are kept beside it**, `.claude/workflows/pr-review-workflow.test.mjs`, run
+  with `node`: 19 checks with every agent stubbed, each fix's undoing failing one; nothing in CI
+  runs them.
