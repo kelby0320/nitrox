@@ -68,6 +68,19 @@ on:
       - 'userspace/libsurface/**'
       - 'userspace/compositor/**'
       - 'tools/xtask/src/main.rs'
+      # What every crate is built with: a change here rebuilds all of it.
+      - 'rust-toolchain.toml'
+      - 'userspace/rust-toolchain.toml'
+      - 'userspace/x86_64-unknown-nitrox.json'
+      - '.cargo/config.toml'
+      - 'kernel/.cargo/config.toml'
+      - 'userspace/.cargo/config.toml'
+      - 'kernel/Cargo.toml'
+      - 'userspace/Cargo.toml'
+      - 'tools/Cargo.toml'
+      - 'kernel/Cargo.lock'
+      - 'userspace/Cargo.lock'
+      - 'tools/Cargo.lock'
       - '.github/workflows/input.yml'
   pull_request:
     branches: [main]

@@ -65,6 +65,19 @@ on:
       # corrupt file would, on the guest side only, as a font that does not parse. That is the
       # break this entry is here for.
       - 'assets/fonts/**'
+      # What every crate is built with: a change here rebuilds all of it.
+      - 'rust-toolchain.toml'
+      - 'userspace/rust-toolchain.toml'
+      - 'userspace/x86_64-unknown-nitrox.json'
+      - '.cargo/config.toml'
+      - 'kernel/.cargo/config.toml'
+      - 'userspace/.cargo/config.toml'
+      - 'kernel/Cargo.toml'
+      - 'userspace/Cargo.toml'
+      - 'tools/Cargo.toml'
+      - 'kernel/Cargo.lock'
+      - 'userspace/Cargo.lock'
+      - 'tools/Cargo.lock'
       - '.github/workflows/display.yml'
   pull_request:
     branches: [main]
