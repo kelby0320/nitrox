@@ -91,20 +91,55 @@ struct Tally {
 }
 
 /// An added line is new unless the same trimmed text was removed elsewhere: a move or a re-indent.
+/// Which of `lines` are a `// SAFETY:` comment or a doc comment's `# Safety` section: the rules
+/// require both, so neither is counted. `adjacent(i)` says whether line `i` follows line `i - 1`.
+fn safety_lines(lines: &[&str], adjacent: impl Fn(usize) -> bool) -> Vec<bool> {
+    let mut out = vec![false; lines.len()];
+    let mut inside = false;
+    for (i, line) in lines.iter().enumerate() {
+        if kind(line) != Kind::Comment || (i > 0 && !adjacent(i)) {
+            inside = false;
+        }
+        if kind(line) == Kind::Comment {
+            let t = line.trim();
+            let doc = t.starts_with("///") || t.starts_with("//!");
+            let b = body(t);
+            if b.starts_with("SAFETY:") || (doc && b == "# Safety") {
+                inside = true;
+            } else if doc && b.starts_with("# ") {
+                inside = false;
+            }
+            out[i] = inside;
+        }
+    }
+    out
+}
+
 fn tally(change: &Change) -> Tally {
     let mut removed: HashMap<&str, usize> = HashMap::new();
     for r in &change.removed {
         *removed.entry(r.trim()).or_default() += 1;
     }
+    let removed_lines: Vec<&str> = change.removed.iter().map(String::as_str).collect();
+    let removed_safety = safety_lines(&removed_lines, |_| true);
+    let added_lines: Vec<&str> = change.added.iter().map(|a| a.text.as_str()).collect();
+    let added_safety = safety_lines(&added_lines, |i| {
+        let (a, b) = (&change.added[i - 1], &change.added[i]);
+        a.file == b.file && a.line + 1 == b.line
+    });
     let mut t = Tally {
-        removed_comments: change.removed.iter().filter(|r| kind(r) == Kind::Comment).count(),
+        removed_comments: removed_lines
+            .iter()
+            .zip(&removed_safety)
+            .filter(|(r, s)| !**s && kind(r) == Kind::Comment)
+            .count(),
         ..Tally::default()
     };
     let mut run: Option<(String, usize, usize)> = None;
     let mut prev: Option<&Added> = None;
-    for a in &change.added {
+    for (a, &safety) in change.added.iter().zip(&added_safety) {
         let k = kind(&a.text);
-        if k == Kind::Comment {
+        if k == Kind::Comment && !safety {
             t.added_comments += 1;
         }
         let trimmed = a.text.trim();
@@ -115,7 +150,12 @@ fn tally(change: &Change) -> Tally {
             }
             _ => false,
         };
-        let new_comment = !moved && k == Kind::Comment;
+        if !moved && safety {
+            if let Some(why) = reference(trimmed) {
+                t.references.push((a.file.clone(), a.line, why));
+            }
+        }
+        let new_comment = !moved && k == Kind::Comment && !safety;
         if new_comment {
             t.new_comments += 1;
             let wrapped = || {
@@ -549,6 +589,48 @@ mod tests {
         let gone: Vec<&str> = gone.iter().map(String::as_str).collect();
         assert!(!over_limit(&tally(&change(&added, &gone))));
         assert!(over_limit(&tally(&change(&added, &gone[1..]))));
+    }
+
+    #[test]
+    fn safety_comments_are_neither_comment_nor_code() {
+        let t =
+            tally(&change(&["// SAFETY: the pointer is live.", "// It came from the caller.", "unsafe { f() };"], &[]));
+        assert_eq!((t.new_comments, t.new_code, t.added_comments), (0, 1, 0));
+        let t = tally(&change(
+            &[
+                "/// Frees it.",
+                "///",
+                "/// # Safety",
+                "///",
+                "/// It must be live.",
+                "/// # Panics",
+                "/// Never.",
+                "pub unsafe fn f() {}",
+            ],
+            &[],
+        ));
+        assert_eq!((t.new_comments, t.new_code), (4, 1), "the doc and its other sections count");
+        let after = tally(&change(&["// SAFETY: live.", "unsafe { f() };", "// an essay"], &[]));
+        assert_eq!(after.new_comments, 1, "a comment after the code is not the SAFETY comment's");
+        let mut many: Vec<&str> = vec!["// SAFETY: one"; 40];
+        many.push("unsafe { f() };");
+        assert!(!over_limit(&tally(&change(&many, &[]))));
+    }
+
+    #[test]
+    fn a_removed_safety_comment_does_not_pay_for_an_essay() {
+        let t = tally(&change(
+            &["// an essay", "// more of it", "// and more", "// still more", "f();"],
+            &["// SAFETY: a", "// b", "// c", "// d"],
+        ));
+        assert_eq!(t.removed_comments, 0);
+        assert!(over_limit(&t));
+    }
+
+    #[test]
+    fn a_safety_comment_still_may_not_cite_history() {
+        let t = tally(&change(&["// SAFETY: as Part H.4 found, live.", "unsafe { f() };"], &[]));
+        assert_eq!(t.references.len(), 1);
     }
 
     #[test]
