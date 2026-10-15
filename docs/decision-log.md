@@ -36127,3 +36127,11 @@ second declined.
   old reader; and a QEMU probe — the PS/2 DPC stalled 50 ms between delivery and hand-back on every
   other keyboard delivery, idle reclaim of PS/2 reads off — under which `check-terminal` panicked
   the same way on the old code and passed with the fix, reads waiting out each stall.
+- **PR #377's review**: tests now drive each driver's own read through a delivery in flight — a
+  second read on another thread must not park until the first is handed back, and then must — so
+  a call site that drops its reclaim or parks on `Retry` fails a test; PS/2's and the console's
+  reads take their state as an argument to make that possible. A departure's thread-context take
+  no longer marks a read in flight; `read_or_park` returns `Submitted`, which has no `Retry`; and
+  `dpc.rs` no longer claims a DPC runs on one CPU — every CPU drains the one queue, and a DPC
+  queued again while it runs can run on two at once, which is why a larger slot could not bound
+  the race. A test grew `hid.rs` past its size entry, so its tests moved to `hid/tests.rs`.

@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
-use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader};
+use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
 use crate::libkern::IrqSpinLock;
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
@@ -252,11 +252,21 @@ fn submit_read(
     if index >= DEV_COUNT {
         return Err(KError::InvalidArgument);
     }
-    let max_len = input::read_len(max_len)?;
+    read(&PS2, index, buffer, po, buf_offset, input::read_len(max_len)?)
+}
+
+fn read(
+    ps2: &IrqSpinLock<Inner>,
+    index: usize,
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    max_len: usize,
+) -> Result<(), KError> {
     let mut tmp = [0u8; DRAIN_MAX];
-    let found = input::read_or_park(reclaim_completed, || {
+    let found = input::read_or_park(|| reclaim(ps2), || {
         let now = crate::arch::Timer::read_ns();
-        let mut g = PS2.lock();
+        let mut g = ps2.lock();
         let dev = &mut g.devices[index];
         let found = dev.read_now(&mut tmp[..max_len], now);
         if found == ReadNow::Empty {
@@ -265,11 +275,11 @@ fn submit_read(
         found
     });
     match found {
-        ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
-        ReadNow::Empty | ReadNow::Retry => {}
-        ReadNow::Busy => return Err(KError::WouldBlock),
+        Submitted::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
+        Submitted::Parked => {}
+        Submitted::Busy => return Err(KError::WouldBlock),
         // The i8042's devices never depart.
-        ReadNow::Gone => return Err(KError::PeerClosed),
+        Submitted::Gone => return Err(KError::PeerClosed),
     }
     Ok(())
 }
@@ -330,16 +340,20 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
 /// Safe to run concurrently with a DPC on another CPU: the DPC owns its entry outright until
 /// it publishes it, so there is nothing here to race with.
 pub fn reclaim_completed() {
+    reclaim(&PS2);
+}
+
+fn reclaim(ps2: &IrqSpinLock<Inner>) {
     for index in 0..DEV_COUNT {
         // Take under the lock, drop outside it: a drop reaches the allocator.
-        let owed = PS2.lock().devices[index].take_owed();
+        let owed = ps2.lock().devices[index].take_owed();
         drop(owed);
     }
     // And the lights writes the DPC completed; then a write that waited for a slot, and the
     // write that waited behind it.
     let mut done: [Option<LightsDone>; 4] = [const { None }; 4];
     let started = {
-        let mut g = PS2.lock();
+        let mut g = ps2.lock();
         for (slot, out) in g.lights_done.iter_mut().zip(done.iter_mut()) {
             if slot.as_ref().is_some_and(|d| d.state == Completion::Completed) {
                 *out = slot.take();
@@ -648,7 +662,22 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::libkern::input::{KEY_UP, LIGHT_CAPS};
+    use crate::libkern::input::{INPUT_EVENT_LEN, KEY_PRESS, KEY_UP, LIGHT_CAPS};
+
+    #[test]
+    fn a_keyboard_read_waits_out_the_delivery_before_it() {
+        input::test_support::a_read_waits_out_the_delivery_before_it(
+            IrqSpinLock::new(LockRank::Leaf, Inner::new()),
+            |ps2, buf, po| read(ps2, DEV_KEYBOARD, buf, po, 0, INPUT_EVENT_LEN),
+            |ps2| {
+                let mut g = ps2.lock();
+                g.devices[DEV_KEYBOARD].ring.push(InputEvent::key(30, KEY_PRESS, 1));
+                g.devices[DEV_KEYBOARD].take_ready(&mut [0u8; DRAIN_MAX], 0).unwrap().0
+            },
+            |ps2, first| ps2.lock().devices[DEV_KEYBOARD].owe(first),
+            |ps2| ps2.lock().devices[DEV_KEYBOARD].has_parked(),
+        );
+    }
 
     fn decoded(b: KeyboardByte) -> Option<scancode::Decoded> {
         match b {

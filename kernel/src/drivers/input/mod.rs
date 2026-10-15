@@ -74,6 +74,19 @@ pub enum ReadNow {
     Retry,
 }
 
+/// What a read's submission came to: [`ReadNow`] with its `Retry` waited out by [`read_or_park`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// This many bytes drained into the caller's scratch.
+    Drained(usize),
+    /// The read is parked until events arrive.
+    Parked,
+    /// Another read is already parked.
+    Busy,
+    /// The device has gone and its ring is drained.
+    Gone,
+}
+
 /// **One node's reader side**: its ring, the read parked on it, and a finished read owed to
 /// thread context. Its owner keeps it under a lock.
 pub struct Reader {
@@ -135,11 +148,16 @@ impl Reader {
     /// **The DPC's half**: take the parked read if the ring has something for it, and drain into
     /// `scratch` what it asked for. The read is the caller's alone from here until [`Reader::owe`].
     pub fn take_ready(&mut self, scratch: &mut [u8], now_ns: u64) -> Option<(ParkedRead, usize)> {
+        let taken = self.take_parked(scratch, now_ns);
+        self.delivering |= taken.is_some();
+        taken
+    }
+
+    fn take_parked(&mut self, scratch: &mut [u8], now_ns: u64) -> Option<(ParkedRead, usize)> {
         if self.parked.is_none() || self.ring.is_empty() {
             return None;
         }
         let read = self.parked.take()?;
-        self.delivering = true;
         let len = read.max_len.min(scratch.len());
         let n = self.ring.drain_into(&mut scratch[..len], now_ns);
         Some((read, n))
@@ -163,12 +181,13 @@ impl Reader {
     }
 
     /// **The device has gone** (Phase 6 Part C). What the ring holds is still read, and a read after
-    /// that is [`ReadNow::Gone`]. A read parked on an empty ring is handed back, for the caller to
-    /// [`refuse`] outside the lock; the caller takes a read the ring can answer with
-    /// [`take_ready`](Self::take_ready) first, so the releases a departure pushed reach it.
-    pub fn retire(&mut self) -> Option<ParkedRead> {
+    /// that is [`ReadNow::Gone`]. The parked read is handed back, in thread context, not owed: with
+    /// what the ring answers it, for the caller to [`deliver`], or to [`refuse`] on an empty ring.
+    pub fn retire(&mut self, scratch: &mut [u8], now_ns: u64) -> (Option<(ParkedRead, usize)>, Option<ParkedRead>) {
+        let ready = self.take_parked(scratch, now_ns);
         self.retired = true;
-        if self.ring.is_empty() { self.parked.take() } else { None }
+        let refused = if self.ring.is_empty() { self.parked.take() } else { None };
+        (ready, refused)
     }
 }
 
@@ -188,17 +207,19 @@ pub fn read_len(max_len: u64) -> Result<usize, KError> {
     if len == 0 { Err(KError::InvalidArgument) } else { Ok(len) }
 }
 
-/// **A read's submission**: `attempt` until it is not [`ReadNow::Retry`], `reclaim` before each, so
-/// a read waits out the delivery before it — a few instructions on another CPU — rather than
-/// parking beside it. Thread context.
-pub fn read_or_park(mut reclaim: impl FnMut(), mut attempt: impl FnMut() -> ReadNow) -> ReadNow {
+/// **A read's submission**: `attempt`, which parks on [`ReadNow::Empty`], until it is not
+/// [`ReadNow::Retry`], `reclaim` before each, so a read waits out the delivery before it — a few
+/// instructions on another CPU — rather than parking beside it. Thread context.
+pub fn read_or_park(mut reclaim: impl FnMut(), mut attempt: impl FnMut() -> ReadNow) -> Submitted {
     loop {
         reclaim();
-        let found = attempt();
-        if found != ReadNow::Retry {
-            return found;
+        match attempt() {
+            ReadNow::Drained(n) => return Submitted::Drained(n),
+            ReadNow::Empty => return Submitted::Parked,
+            ReadNow::Busy => return Submitted::Busy,
+            ReadNow::Gone => return Submitted::Gone,
+            ReadNow::Retry => core::hint::spin_loop(),
         }
-        core::hint::spin_loop();
     }
 }
 
@@ -324,14 +345,14 @@ mod tests {
         let mut r = Reader::new();
         let mut out = [0u8; DRAIN_MAX];
         r.ring.push(key(30));
-        assert!(r.retire().is_none(), "nothing parked");
+        assert!(r.retire(&mut out, 0).1.is_none(), "nothing parked");
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(INPUT_EVENT_LEN), "its events still read");
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Gone);
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Gone, "and stays gone");
 
         let mut parked = Reader::new();
         parked.park(read(INPUT_EVENT_LEN));
-        assert!(parked.retire().is_some(), "a read waiting on an empty ring is handed back");
+        assert!(parked.retire(&mut out, 0).1.is_some(), "a read waiting on an empty ring is handed back");
         assert!(!parked.has_parked());
         assert_eq!(parked.read_now(&mut out, 0), ReadNow::Gone);
     }
@@ -345,7 +366,7 @@ mod tests {
         let mut out = [0u8; DRAIN_MAX];
         assert!(r.offer(&[key(30)]), "taken while the device is here");
         r.ring.push(key(31));
-        assert!(r.retire().is_none());
+        assert!(r.retire(&mut [0u8; DRAIN_MAX], 0).1.is_none());
         assert!(!r.offer(&[key(32)]), "and not after it has gone");
         assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(2 * INPUT_EVENT_LEN), "only what came before");
         assert_eq!(InputEvent::read(&out[INPUT_EVENT_LEN..]).map(|e| e.code), Some(31));
@@ -396,9 +417,33 @@ mod tests {
 
     #[test]
     fn read_or_park_reclaims_before_every_attempt() {
-        let (mut reclaims, mut answers) = (0, [ReadNow::Retry, ReadNow::Retry, ReadNow::Empty].into_iter());
-        let found = read_or_park(|| reclaims += 1, || answers.next().unwrap());
-        assert_eq!((found, reclaims), (ReadNow::Empty, 3));
+        let calls = core::cell::RefCell::new(std::vec::Vec::new());
+        let mut answers = [ReadNow::Retry, ReadNow::Retry, ReadNow::Empty].into_iter();
+        let found = read_or_park(
+            || calls.borrow_mut().push("reclaim"),
+            || {
+                calls.borrow_mut().push("attempt");
+                answers.next().unwrap()
+            },
+        );
+        assert_eq!(found, Submitted::Parked);
+        assert_eq!(*calls.borrow(), ["reclaim", "attempt", "reclaim", "attempt", "reclaim", "attempt"]);
+    }
+
+    /// A departure answers its parked read in thread context, so nothing is left in flight; and a
+    /// retired reader is gone before anything owed would make it wait.
+    #[test]
+    fn retiring_leaves_no_delivery_in_flight() {
+        init_global_heap();
+        let mut r = Reader::new();
+        let mut scratch = [0u8; DRAIN_MAX];
+        r.park(read(INPUT_EVENT_LEN));
+        r.ring.push(key(30));
+        let (ready, refused) = r.retire(&mut scratch, 0);
+        assert!(ready.is_some() && refused.is_none(), "the ring answers it");
+        assert!(!r.delivering);
+        r.to_drop = Some(read(INPUT_EVENT_LEN));
+        assert_eq!(r.read_now(&mut scratch, 0), ReadNow::Gone);
     }
 
     /// **A finished read is dropped only by thread context.** Handing it back destroys nothing;
@@ -446,5 +491,42 @@ mod tests {
         assert_eq!(read_len(INPUT_EVENT_LEN as u64), Ok(INPUT_EVENT_LEN));
         assert_eq!(read_len(INPUT_EVENT_LEN as u64 - 1), Err(KError::InvalidArgument));
         assert_eq!(read_len(u32::MAX as u64), Ok(DRAIN_MAX));
+    }
+}
+
+/// **Drives a driver's own read through the race**: a read parks and its DPC takes it; a second
+/// read, on another thread, must not park until the first is handed back, and then must.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::drivers::adopt;
+    use crate::libkern::handle::KObjectType;
+    use crate::mm::PAGE_SIZE;
+    use crate::object::{MemoryObject, ObjectRef, PendingOperation};
+    use crate::syscall::error::KError;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    pub(crate) fn a_read_waits_out_the_delivery_before_it<S: Send + Sync + 'static, T>(
+        state: S,
+        read: fn(&S, &ObjectRef, &ObjectRef) -> Result<(), KError>,
+        take: fn(&S) -> T,
+        owe: fn(&S, T),
+        parked: fn(&S) -> bool,
+    ) {
+        crate::mm::test_support::init_global_heap();
+        let state = Arc::new(state);
+        let buf = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+        let po = || adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        assert_eq!(read(&state, &buf, &po()), Ok(()));
+        let first = take(&state);
+        let (done, answer) = mpsc::channel();
+        let (second, buf2, po2) = (state.clone(), buf.clone(), po());
+        std::thread::spawn(move || done.send(read(&second, &buf2, &po2)).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!parked(&state), "parked beside a delivery in flight");
+        owe(&state, first);
+        let r = answer.recv_timeout(Duration::from_secs(10)).expect("still waiting once the first was handed back");
+        assert_eq!(r, Ok(()));
+        assert!(parked(&state), "parked once the first was reclaimed");
     }
 }

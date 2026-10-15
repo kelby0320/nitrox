@@ -12,14 +12,12 @@
 //! `InterruptObject`), so queuing one allocates nothing — the queue is a
 //! pre-reserved list of node pointers.
 //!
-//! ## Single-CPU stand-in (SMP trajectory)
+//! ## One queue, drained by every CPU
 //!
-//! DPCs are inherently per-CPU (a DPC queued by an ISR runs on the CPU that took
-//! the interrupt). The single global queue here stands in for per-CPU queues,
-//! exactly like the single global `SCHED`/`current` in [`crate::sched`]: the
-//! public API ([`enqueue`] / [`run_pending`]) always means "the current CPU's
-//! queue", so the Phase-3 SMP refactor that makes the scheduler per-CPU makes
-//! this per-CPU too — a storage change, not an API change.
+//! The queue is global, and every CPU drains it at its interrupt tails — the timer's and a
+//! device's — so a DPC runs on whichever CPU gets to it first. `queued` is cleared before the
+//! handler runs, so a DPC queued again while it runs can run on a second CPU at the same time:
+//! a handler must tolerate a concurrent instance of itself.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,9 +42,8 @@ pub struct Dpc {
     queued: AtomicBool,
 }
 
-// SAFETY: a `Dpc` is enqueued and run only on the single CPU that owns the
-// queue (interrupt context, IF=0 — no concurrent access); the thread-safety of
-// the raw `ctx` pointer is the handler's own concern. These impls let a `Dpc`
+// SAFETY: shared across CPUs, a `Dpc` is only read but for `queued`, which is atomic; the
+// thread-safety of the raw `ctx` pointer is the handler's own concern. These impls let a `Dpc`
 // be a `static` and be shared by `&Dpc` across the enqueue/run boundary.
 unsafe impl Sync for Dpc {}
 unsafe impl Send for Dpc {}
@@ -91,8 +88,8 @@ pub fn enqueue(dpc: &Dpc) {
     enqueue_into(&DPC_QUEUE, dpc);
 }
 
-/// Run every pending DPC on the current CPU's queue, looping until empty so a
-/// DPC that enqueues another is caught. Call at the interrupt-dispatch tail.
+/// Run every pending DPC, looping until empty so a DPC that enqueues another is caught. Call at
+/// the interrupt-dispatch tail.
 ///
 /// Runs with IF=0 (interrupt context — the gate masks interrupts), so no nested
 /// IRQ can enqueue mid-drain and no re-entrancy guard is needed. Each handler
@@ -141,9 +138,9 @@ fn run_pending_in(queue: &IrqSpinLock<KVec<usize>>) {
             break;
         }
         for &addr in &buf[..n] {
-            // SAFETY: `addr` is a live `&Dpc` registered by `enqueue`; single-CPU
-            // and IF=0, so it is not concurrently mutated. Clear `queued` BEFORE
-            // running so the handler may re-enqueue this same DPC.
+            // SAFETY: `addr` is a live `&Dpc` registered by `enqueue`, whose fields never change
+            // but the atomic `queued`. Clear `queued` BEFORE running so the handler may
+            // re-enqueue this same DPC.
             let dpc = unsafe { &*(addr as *const Dpc) };
             dpc.queued.store(false, Ordering::Release);
             (dpc.handler)(dpc.ctx);
