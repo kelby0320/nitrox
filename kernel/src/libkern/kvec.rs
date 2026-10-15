@@ -246,7 +246,7 @@ impl<T> Drop for KVec<T> {
         if self.cap != 0 && mem::size_of::<T>() != 0 {
             // SAFETY: in that case `ptr` came from `kmalloc` and `clear`
             // left no live elements behind.
-            kfree(self.ptr.as_ptr() as *mut u8);
+            unsafe { kfree(self.ptr.as_ptr() as *mut u8) };
         }
     }
 }

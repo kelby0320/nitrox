@@ -131,7 +131,8 @@ impl Nodes {
             drop(old);
             let waiting = self.lights.lock()[index].take();
             if let Some((po, _)) = waiting {
-                crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0);
+                // SAFETY: `po` is the lights write's `PendingOperation` reference, taken from its slot.
+                unsafe { crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0) };
                 drop(po);
             }
         }
@@ -169,7 +170,8 @@ impl Nodes {
         }
         let waiting = self.lights.lock()[index].take();
         if let Some((po, _)) = waiting {
-            crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0);
+            // SAFETY: `po` is the lights write's `PendingOperation` reference, taken from its slot.
+            unsafe { crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0) };
             drop(po);
         }
         self.states[index].store(RETIRED, Ordering::Release);
@@ -273,7 +275,8 @@ impl Nodes {
         }
         let superseded = self.lights.lock()[index].replace((po.clone(), lights));
         if let Some((old, _)) = superseded {
-            crate::sched::complete_pending_op(old.as_ptr(), 0, 1);
+            // SAFETY: `old` is the superseded write's `PendingOperation` reference.
+            unsafe { crate::sched::complete_pending_op(old.as_ptr(), 0, 1) };
             drop(old);
         }
         x.hid_lights.store(true, Ordering::Release);

@@ -188,7 +188,8 @@ fn read(
         Submitted::Drained(n) => {
             // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
             unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
-            crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
+            // SAFETY: `po` pins the read's `PendingOperation`.
+            unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64) };
             Ok(())
         }
         Submitted::Parked => Ok(()),
@@ -209,7 +210,8 @@ fn console_intr_dpc(_ctx: *mut ()) {
         // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a local
         // — unreachable from any other CPU until it is published below.
         unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
-        crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64);
+        // SAFETY: `pr` owns the reference pinning its `PendingOperation`.
+        unsafe { crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64) };
         // **Nothing is dropped here, deliberately.** This DPC used to release the parked
         // read's `po`/`buffer` refs, justified by "refcount decrements only — the caller's
         // handles keep the objects alive". That is false: nothing cancels a parked read, so

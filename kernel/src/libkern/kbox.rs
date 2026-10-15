@@ -153,7 +153,7 @@ impl<T> Drop for KBox<T> {
             // SAFETY: for a non-ZST the pointer came from `kmalloc`;
             // `kfree` recovers the size class from the slab descriptor,
             // so no layout needs to be threaded through.
-            kfree(self.ptr.as_ptr() as *mut u8);
+            unsafe { kfree(self.ptr.as_ptr() as *mut u8) };
         }
     }
 }

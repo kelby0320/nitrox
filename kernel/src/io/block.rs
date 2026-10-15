@@ -365,8 +365,12 @@ pub fn reclaim_completed() {
 
 /// [`irp_complete_dpc`], for another module's host test to complete an IRP its recording device
 /// took, as the device's completion would.
+///
+/// # Safety
+///
+/// `irp` is the in-flight IRP of a box `dispatch_block_irp` armed, completed once.
 #[cfg(test)]
-pub(crate) fn complete_for_test(irp: *mut Irp) {
+pub(crate) unsafe fn complete_for_test(irp: *mut Irp) {
     irp_complete_dpc(irp as *mut ());
 }
 
@@ -382,7 +386,8 @@ fn irp_complete_dpc(ctx: *mut ()) {
         (irp.status, irp.transferred, irp.completion as *mut ())
     };
     // Deliver the outcome through the PO (result payload = bytes transferred).
-    crate::sched::complete_pending_op(po, status, transferred);
+    // SAFETY: the box's `_po` pins the `PendingOperation` until thread context reclaims the box.
+    unsafe { crate::sched::complete_pending_op(po, status, transferred) };
     // **Hand the box to thread context; do not drop it here.** Dropping releases
     // `_po`/`_buffer`/`_device` and the `frags` backing, and every one of those reaches
     // `SlabCache::free`, whose lock is a plain `SpinLock` — preemption off, interrupts on.

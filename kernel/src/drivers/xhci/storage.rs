@@ -888,7 +888,8 @@ fn act(a: Action, x: Option<&Xhci>) {
     match a {
         Action::None => {}
         Action::Complete { irp, status, transferred } => complete(irp, status, transferred),
-        Action::Hub { po } => crate::sched::complete_pending_op(po, 0, 0),
+        // SAFETY: the hub thread holds `po`'s reference while its command is in flight, waiting on it.
+        Action::Hub { po } => unsafe { crate::sched::complete_pending_op(po, 0, 0) },
         Action::Wake => {
             if let Some(x) = x {
                 // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
@@ -1424,7 +1425,8 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
     }
     let at = crate::arch::Timer::read_ns();
     let signalled = matches!(
-        crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at),
+        // SAFETY: `po` pins the `PendingOperation` waited on.
+        unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at) },
         crate::sched::WaitResult::Signaled(_)
     );
     if !signalled {
@@ -1435,7 +1437,9 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
             // go: so `po` is not dropped until then, as `hub::wait` waits (PR #363 review).
             TakeBack::OnItsWay => {
                 use crate::sched::{WaitResult, wait_on};
-                let done = || matches!(wait_on(&[po.as_ptr() as usize], u64::MAX, 0), WaitResult::Signaled(_));
+                // SAFETY: `po` pins the `PendingOperation` waited on, and outlives the closure.
+                let done =
+                    || matches!(unsafe { wait_on(&[po.as_ptr() as usize], u64::MAX, 0) }, WaitResult::Signaled(_));
                 while !done() {
                     hub::sleep(1_000_000);
                 }

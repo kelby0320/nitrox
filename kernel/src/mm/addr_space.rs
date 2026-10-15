@@ -546,7 +546,8 @@ impl AddressSpace {
         }
         let refused = |object: ObjectRef, e: MapError| {
             if writable {
-                FileObject::writable_unmapped(object.as_ptr());
+                // SAFETY: `object` pins the `FileObject` the mapping counted.
+                unsafe { FileObject::writable_unmapped(object.as_ptr()) };
             }
             Err((object, e))
         };

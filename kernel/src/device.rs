@@ -751,7 +751,8 @@ fn answer(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, generation: u64) 
     // checked its type and the range.
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
     mo.copy_in(buf_offset as usize, &generation.to_le_bytes());
-    crate::sched::complete_pending_op(po.as_ptr(), 0, 8);
+    // SAFETY: `po` pins the request's `PendingOperation`.
+    unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 8) };
 }
 
 /// [`CharBackend::submit_read`] for `/dev/registry/changes`: **answer at once if the table is past
@@ -1368,11 +1369,8 @@ mod tests {
         assert!(!unsafe { crate::sched::pending_op_is_signaled(behind.as_ptr()) });
         assert_eq!(read(&behind, 4, 8), Ok(()));
         // SAFETY: `behind` is a live `PendingOperation` reference held across the call.
-        assert_eq!(
-            unsafe { crate::sched::pending_op_completion(behind.as_ptr()) },
-            (0, 8),
-            "behind, so answered at once"
-        );
+        let answered = unsafe { crate::sched::pending_op_completion(behind.as_ptr()) };
+        assert_eq!(answered, (0, 8), "behind, so answered at once");
 
         let ahead: [ObjectRef; WAITERS_MAX] = core::array::from_fn(|_| po());
         for p in &ahead {

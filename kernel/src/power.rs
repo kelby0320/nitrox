@@ -124,9 +124,9 @@ fn flush_every_disk() {
         if n == 0 || now >= deadline {
             break;
         }
-        // `flushing` pins every operation waited on. Out of memory to wait with is a flush that
+        // SAFETY: `flushing` pins every operation waited on. Out of memory to wait with is a flush that
         // does not finish, as far as the log is concerned.
-        let waited = crate::sched::wait_on(&waiting[..n], deadline, now);
+        let waited = unsafe { crate::sched::wait_on(&waiting[..n], deadline, now) };
         if let crate::sched::WaitResult::OutOfMemory = waited {
             break;
         }

@@ -309,7 +309,8 @@ impl Drop for Vma {
     fn drop(&mut self) {
         if self.mapping == MappingKind::FileBacked && self.prot.contains(Protection::WRITE) {
             if let Some(obj) = self.object.as_ref() {
-                crate::object::FileObject::writable_unmapped(obj.as_ptr());
+                // SAFETY: `obj` is the VMA's reference to its `FileObject`.
+                unsafe { crate::object::FileObject::writable_unmapped(obj.as_ptr()) };
             }
         }
     }

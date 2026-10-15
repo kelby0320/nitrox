@@ -726,7 +726,8 @@ fn on_event(x: &Xhci, trb: &Trb) {
             let done =
                 ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
             if let Some((w, code, result)) = done {
-                crate::sched::complete_pending_op(w.po.0, code as i32, result);
+                // SAFETY: the waiting thread's reference pins `w.po` until its operation completes.
+                unsafe { crate::sched::complete_pending_op(w.po.0, code as i32, result) };
             }
         }
         _ => {}
@@ -775,7 +776,8 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
         if w.as_ref().is_some_and(|w| matches(w.awaited)) { w.take() } else { None }
     };
     if let Some(w) = taken {
-        crate::sched::complete_pending_op(w.po.0, code as i32, result);
+        // SAFETY: the waiting thread's reference pins `w.po` until its operation completes.
+        unsafe { crate::sched::complete_pending_op(w.po.0, code as i32, result) };
     }
 }
 
@@ -801,7 +803,9 @@ pub fn settle(bound_ns: u64) {
     let x = unsafe { &*x };
     let now = crate::arch::Timer::read_ns();
     let po = x.first_round.as_ptr();
-    if !matches!(crate::sched::wait_on(&[po as usize], now + bound_ns, now), crate::sched::WaitResult::Signaled(_)) {
+    // SAFETY: `x.first_round` pins the `PendingOperation` at `po` for the controller's life.
+    let waited = unsafe { crate::sched::wait_on(&[po as usize], now + bound_ns, now) };
+    if !matches!(waited, crate::sched::WaitResult::Signaled(_)) {
         crate::kprintln!(
             "usb: the first round was not done in {} ms; what is still enumerating arrives later",
             bound_ns / 1_000_000

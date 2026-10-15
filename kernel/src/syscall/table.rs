@@ -792,7 +792,8 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
 pub fn sys_process_terminate(process_h: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(process_h, pid, Rights::SIGNAL, KObjectType::Process)?;
-    if !crate::sched::request_terminate(ok.object.as_ptr()) {
+    // SAFETY: `ok.object` pins the `Process` its lookup type-checked.
+    if !unsafe { crate::sched::request_terminate(ok.object.as_ptr()) } {
         return Err(KError::Unsupported);
     }
     Ok(0)
@@ -1711,13 +1712,15 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
         crate::entropy::SeedWaitReg::AlreadySeeded(r) => {
             // Seeded between the check and the register: complete now so the wait
             // returns at once and the caller re-reads (→ synchronous fill).
-            crate::sched::complete_pending_op(r.as_ptr(), 0, 0);
+            // SAFETY: `r` is the seed waiter's `PendingOperation` reference.
+            unsafe { crate::sched::complete_pending_op(r.as_ptr(), 0, 0) };
             drop(r);
         }
         crate::entropy::SeedWaitReg::Full(r) => {
             // Too many concurrent unseeded readers (pathological): tell the caller
             // to retry. `WouldBlock` is the negative status it reads from the PO.
-            crate::sched::complete_pending_op(r.as_ptr(), KError::WouldBlock as i32, 0);
+            // SAFETY: `r` is the seed waiter's `PendingOperation` reference.
+            unsafe { crate::sched::complete_pending_op(r.as_ptr(), KError::WouldBlock as i32, 0) };
             drop(r);
         }
     }
@@ -1785,7 +1788,8 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
         // Pre-signal the PO with the outcome (no waiters yet → just records it).
         // `ns_ok` / `po_ref` are still held here (refcounts, no lock), so this —
         // which takes `SCHED` — performs no `ObjectRef` drop under the lock.
-        Some((status, result)) => crate::sched::complete_pending_op(po_ptr, status, result),
+        // SAFETY: `po_ref` pins the `PendingOperation` at `po_ptr`.
+        Some((status, result)) => unsafe { crate::sched::complete_pending_op(po_ptr, status, result) },
         // Left pending: the forwarded request was delivered; the server's reply
         // completes the PO. `po_ref` drops at return (the forwarding path cloned
         // its own reference into the registration's pending-lookup table).
@@ -2088,7 +2092,8 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     // A zero-length request is a legal no-op: pre-signal the PO and return.
     if op.length == 0 {
-        crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0);
+        // SAFETY: `po_ref` pins the `PendingOperation`.
+        unsafe { crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0) };
         return Ok(po_h.bits() as isize);
     }
 
@@ -2229,7 +2234,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
     // Block (or fast-path). `refs` pin every waited object until its result is read: a sibling
     // thread may close a handle meanwhile, leaving these the last references.
     let now = Timer::read_ns();
-    let result = crate::sched::wait_on(&objs[..count], deadline_ns, now);
+    // SAFETY: `refs` pins each object in `objs`, a waitable its lookup type-checked.
+    let result = unsafe { crate::sched::wait_on(&objs[..count], deadline_ns, now) };
 
     match result {
         crate::sched::WaitResult::Signaled(bits) => {
@@ -2555,7 +2561,8 @@ fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
     let wait_on = match r.forget_file(file_id, &answer) {
         Forgotten::Later(po) => po,
         Forgotten::Now => {
-            crate::sched::complete_pending_op(answer.as_ptr(), 0, 0);
+            // SAFETY: `answer` is the `PendingOperation` this created.
+            unsafe { crate::sched::complete_pending_op(answer.as_ptr(), 0, 0) };
             answer.clone()
         }
     };
@@ -2718,7 +2725,8 @@ fn complete_resolve_reply(
     // kernel's PO clone outside `SCHED`; commit the transfer move by closing the sender's
     // handles.
     if let Some((status, result)) = outcome {
-        crate::sched::complete_pending_op(pl.po.as_ptr(), status, result);
+        // SAFETY: `pl` owns the lookup's `PendingOperation` reference.
+        unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
     }
     drop(pl);
     for i in 0..count {
@@ -3285,7 +3293,8 @@ fn complete_read_range_reply(
 
     // Complete the fill PO (one-shot); release the kernel's clones outside `SCHED`;
     // commit the transfer move by closing the sender's handles.
-    crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0);
+    // SAFETY: `pf` owns the fill's `PendingOperation` reference.
+    unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
     drop(pf);
     for i in 0..count {
         close_and_release(RawHandle(h_raw[i]), pid);

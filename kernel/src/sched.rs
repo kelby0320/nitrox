@@ -1666,7 +1666,11 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
 ///
 /// `false` when the target has no notification channel attached — it can never be asked,
 /// which the caller reports rather than silently succeeding at.
-pub fn request_terminate(process: *mut ()) -> bool {
+///
+/// # Safety
+///
+/// `process` points at a live `Process`, pinned for the call by a reference the caller holds.
+pub unsafe fn request_terminate(process: *mut ()) -> bool {
     let mut g = SCHED.lock();
     // SAFETY: the caller pins `process` through its Process handle for this call.
     let chan = unsafe { &*(process as *const crate::object::Process) }.notification_channel_ptr();
@@ -1773,7 +1777,11 @@ pub unsafe fn pending_op_completion(po: *mut ()) -> (i32, u64) {
 /// resolution finished synchronously, so the PO is completed in place. The PO has
 /// no waiters yet (it was just created), so the wake loop is a no-op; the caller's
 /// later `sys_wait` takes the already-signalled fast path. One-shot.
-pub fn complete_pending_op(po: *mut (), status: i32, result: u64) {
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn complete_pending_op(po: *mut (), status: i32, result: u64) {
     let mut g = SCHED.lock();
     signal_pending_op_with_result(&mut g, po, status, result);
 }
@@ -2706,7 +2714,13 @@ pub enum WaitResult {
 ///
 /// Registration + block happen under a single `SCHED` hold, so a waker cannot
 /// slip between them (single-CPU, interrupts masked) — no lost wakeup.
-pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
+///
+/// # Safety
+///
+/// Each of `objs` is the address of a live `Timer`, `NotificationChannel`, `IpcChannel`,
+/// `PendingOperation` or `InterruptObject`, pinned by a reference the caller holds until this
+/// returns.
+pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
     debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
     let me_ptr;
     {
